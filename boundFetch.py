@@ -1,5 +1,6 @@
 import csv
 import time
+import os
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -27,7 +28,7 @@ header_titles = [header.text for header in headers]
 # Sort the table by clicking on the table header (sorting by rebounds)
 header_to_sort = driver.find_element(By.XPATH, '//th[text()="REB"]')
 header_to_sort.click()
-time.sleep(1)  # Replace with a more reliable wait condition
+time.sleep(3)  # If this takes any longer than 3 seconds you're a certified dial-up warrior
 
 # Locate the dropdown by the known prefix of the class name
 dropdown_prefix = "DropDown_select"  # This is the consistent prefix of the class name
@@ -44,8 +45,14 @@ all_option.click()
 current_time = datetime.now()
 timestamp = current_time.strftime("%Y%m%d_%H%M%S")
 
+# save .csv files to archive folder
+directory = "ReboundsArchive"
+if not os.path.exists(directory):
+    os.makedirs(directory)
+    print(f"Directory '{directory}' created")
+
 # Open a new CSV file with the timestamp in the name to save the data
-filename = f'rebounding_data_{timestamp}.csv'
+filename = f'ReboundsArchive/rebounding_data_{timestamp}.csv'
 with open(filename, 'w', newline='') as file:
     writer = csv.writer(file)
     writer.writerow(header_titles)  # Write the headers to the CSV
