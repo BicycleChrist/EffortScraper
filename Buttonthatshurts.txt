@@ -1,0 +1,6 @@
+ 
+onetrust-close-btn-handler onetrust-close-btn-ui banner-close-button ot-close-icon
+
+
+xbutton = WebDriverWait(driver,3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".onetrust-close-btn-handler.onetrust-close-btn-ui.banner-close-button.ot-close-icon")))
+xbutton.click()

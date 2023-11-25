@@ -8,15 +8,19 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.common.exceptions import TimeoutException
 
 # Set up the Firefox options and WebDriver
 service = FirefoxService()
 options = FirefoxOptions()
-# options.add_argument('-headless')  # Uncomment if you run in headless mode
+options.add_argument('-headless')  # Uncomment if you run in headless mode
+options.add_argument("--window-size=1920,2160") # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
+#options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/120.0-1")
 driver = webdriver.Firefox(service=service, options=options)
 
 # Open the webpage
 driver.get('https://www.nba.com/stats/players/rebounding?LastNGames=1')
+
 
 # Wait for the table data to load
 table = WebDriverWait(driver, 10).until(
@@ -25,8 +29,28 @@ table = WebDriverWait(driver, 10).until(
 headers = table.find_elements(By.TAG_NAME, 'th')
 header_titles = [header.text for header in headers]
 
+if len(header_titles) > 9:
+    header_titles[9] = "SecondaryAssists"
+if len(header_titles) > 10:
+    header_titles[10] = "PotentialAssists"
+if len(header_titles) > 11:
+    header_titles[11] = "AssistPointsCreated"
+
+
+
+driver.get_screenshot_as_file("debug_screenshot.png")
+
+xbutton = WebDriverWait(driver,3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".onetrust-close-btn-handler.onetrust-close-btn-ui.banner-close-button.ot-close-icon")))
+xbutton.click()
 # Sort the table by clicking on the table header (sorting by rebounds)
 header_to_sort = driver.find_element(By.XPATH, '//th[text()="REB"]')
+
+header_to_sort = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, '//th[text()="REB"]')))
+
+
+time.sleep(6)  # Allow time for any elements that are loafing it
+header_to_sort = driver.find_element(By.XPATH, '//th[text()="REB"]')
+time.sleep(1)
 header_to_sort.click()
 time.sleep(3)  # If this takes any longer than 3 seconds you're a certified dial-up warrior
 
@@ -53,6 +77,8 @@ if not os.path.exists(directory):
 
 # Open a new CSV file with the timestamp in the name to save the data
 filename = f'ReboundsArchive/rebounding_data_{timestamp}.csv'
+table = WebDriverWait(driver, 10).until(
+    EC.presence_of_element_located((By.CLASS_NAME, 'nba-stats-content-block')))
 with open(filename, 'w', newline='') as file:
     writer = csv.writer(file)
     writer.writerow(header_titles)  # Write the headers to the CSV
