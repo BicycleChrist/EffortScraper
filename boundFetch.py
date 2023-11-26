@@ -1,3 +1,5 @@
+import random
+import numpy as np
 import csv
 import time
 import os
@@ -14,8 +16,7 @@ from selenium.common.exceptions import TimeoutException
 service = FirefoxService()
 options = FirefoxOptions()
 options.add_argument('-headless')  # Uncomment if you run in headless mode
-options.add_argument("--window-size=1920,2160") # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
-#options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/120.0-1")
+options.add_argument("--window-size=1920,1080") # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
 driver = webdriver.Firefox(service=service, options=options)
 
 # Open the webpage
@@ -47,12 +48,12 @@ header_to_sort = driver.find_element(By.XPATH, '//th[text()="REB"]')
 
 header_to_sort = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, '//th[text()="REB"]')))
 
-
-time.sleep(6)  # Allow time for any elements that are loafing it
+# using numpy & random to vary wait times cuz why not
+time.sleep(np.random.uniform(5.0,6.0))  # Allow time for any elements that are loafing it
 header_to_sort = driver.find_element(By.XPATH, '//th[text()="REB"]')
-time.sleep(1)
+time.sleep(np.random.uniform(0.8,1.1))
 header_to_sort.click()
-time.sleep(3)  # If this takes any longer than 3 seconds you're a certified dial-up warrior
+time.sleep(np.random.uniform(2.75,3.25))  # If this takes any longer than 3 seconds you're a certified dial-up warrior
 
 # Locate the dropdown by the known prefix of the class name
 dropdown_prefix = "DropDown_select"  # This is the consistent prefix of the class name

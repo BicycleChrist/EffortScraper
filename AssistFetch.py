@@ -52,11 +52,11 @@ if len(header_titles) > 11:
     header_titles[11] = "AssistPointsCreated"
 
 # Sort the table by clicking on the table header (sorting by rebounds)
-time.sleep(4)
+time.sleep(np.random.uniform(3.80,6.0))
 header_to_sort = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, '//th[text()="AST"]')))
-time.sleep(1)
+time.sleep(np.random.uniform(1.0,1.45))
 header_to_sort.click()
-time.sleep(5)  # Replace with a more reliable wait condition
+time.sleep(np.random.uniform(4.0,5.35))  # Replace with a more reliable wait condition
 
 # Locate the dropdown by the known prefix of the class name
 dropdown_prefix = "DropDown_select"  # This is the consistent prefix of the class name
