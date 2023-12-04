@@ -1,0 +1,16 @@
+# EffortScraper
+Dadmin, BicycleChrist, and Dan go on a trip down DataAcquisition drive. 
+
+Just trying to overcome the cronjob woopty doo. Drinking NBA.com's mileshake
+
+
+Directions:
+
+1. Download python if not already installed
+2. Create Folder for Virtual enviroment 
+3. Set up virtual enviorment within terminal or choice of IDE within created folder
+4. Download selenium within the virtual enviroment 
+5. Open terminal, run "source venv/bin/activate" or the command specific to the OS your using to activate the VE
+6. python3 boundFetch/AssistFetch.py
+7. view .csv file output in the Rebounds/Assists Archive folder.
+8. Put on a huge NBA slam with the provided addtional conviction of viewing advanced rebounding/passing statistics. 

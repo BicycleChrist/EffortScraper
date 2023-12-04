@@ -1,0 +1,42 @@
+ 
+/bin/sh: line 1: /home/retupmoc/PycharmProjects/dimeFetch/AutoAssistFetch.bash: Permission denied
+Traceback (most recent call last):
+  File "/home/retupmoc/PycharmProjects/dimeFetch/AssistFetch.py", line 18, in <module>
+    driver = webdriver.Firefox(service=service, options=options)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/firefox/webdriver.py", line 67, in __init__
+    super().__init__(command_executor=executor, options=options)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 208, in __init__
+    self.start_session(capabilities)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 292, in start_session
+    response = self.execute(Command.NEW_SESSION, caps)["value"]
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 347, in execute
+    self.error_handler.check_response(response)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/errorhandler.py", line 229, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.WebDriverException: Message: Invalid Host header localhost:51759
+
+1
+2
+3
+Logski
+['PLAYER', 'TEAM', 'GP', 'W', 'L', 'MIN', 'PASSES\nMADE', 'PASSES\nRECEIVED', 'AST', 'SECONDARY\nAST', 'POTENTIAL\nAST', '', 'AST PTS\nCREATED', 'AST\nADJ', 'AST TO\nPASS%', 'AST TO\nPASS% ADJ']
+There was an error managing firefox (error sending request for url (https://github.com/mozilla/geckodriver/releases/latest): error trying to connect: dns error: failed to lookup address information: Try again); using driver found in the cache
+Traceback (most recent call last):
+  File "/home/retupmoc/PycharmProjects/dimeFetch/AssistFetch.py", line 18, in <module>
+    driver = webdriver.Firefox(service=service, options=options)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/firefox/webdriver.py", line 67, in __init__
+    super().__init__(command_executor=executor, options=options)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 208, in __init__
+    self.start_session(capabilities)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 292, in start_session
+    response = self.execute(Command.NEW_SESSION, caps)["value"]
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/webdriver.py", line 347, in execute
+    self.error_handler.check_response(response)
+  File "/home/retupmoc/PycharmProjects/dimeFetch/venv/lib/python3.11/site-packages/selenium/webdriver/remote/errorhandler.py", line 229, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.WebDriverException: Message: Invalid Host header localhost:37703
+
