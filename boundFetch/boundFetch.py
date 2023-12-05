@@ -1,23 +1,24 @@
+import os
 import random
-import numpy as np
 import csv
 import time
-import os
+import numpy as np
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 
-# Set up the Firefox options and WebDriver
-service = FirefoxService()
-options = FirefoxOptions()
-options.add_argument('-headless')  # Uncomment if you run in headless mode
-options.add_argument("--window-size=1920,1080") # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
-driver = webdriver.Firefox(service=service, options=options)
+# Set up the WebDriver
+chrome_service = ChromeService(executable_path='/usr/bin/chromedriver')
+chrome_options = ChromeOptions()
+#chrome_options.add_argument('-headless')  # Uncomment if you run in headless mode
+chrome_options.add_argument("--window-size=1920,1080")  # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
+driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
+
+print("Drinking NBA.com's milkshake")
 
 # Open the webpage
 driver.get('https://www.nba.com/stats/players/rebounding?LastNGames=1')
@@ -89,6 +90,9 @@ with open(filename, 'w', newline='') as file:
         cols = row.find_elements(By.TAG_NAME, 'td')
         # Write the columns to the CSV
         writer.writerow([col.text for col in cols])
+
+
+print("NBA.com's milkshake all sucked up")
 
 # Close the driver
 driver.quit()
