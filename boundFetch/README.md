@@ -1,9 +1,7 @@
 # EffortScraper
 Dadmin, BicycleChrist, and Dan go on a trip down DataAcquisition drive. 
 
-Sadly, our drive came to a semi dead end, although not a complete waste of gas. NBA.com gives everything they have to cool one off once the agent switches the selenium browser from non-headless mode to headless mode. 
-I was not able to get the java script to load with the browser in headless mode despite the numerous work arounds attempted, so this script is limited to use within non-headless mode. If some web scraping chief 
-out there could show us the ways of overcoming these blocks that are put in by NBA.com/New Relic, it would be greatly appreciated. 
+Just need someone to be a winner and show us how to get selenium and docker to cooperate 
 
 Directions:
 
