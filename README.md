@@ -1,7 +1,7 @@
 # EffortScraper
 Dadmin, BicycleChrist, and Dan go on a trip down DataAcquisition drive. 
 
-Just trying to overcome the cronjob woopty doo. Drinking NBA.com's mileshake
+Drinking NBA.com's mileshake
 
 
 Directions:
