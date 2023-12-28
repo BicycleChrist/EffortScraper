@@ -12,26 +12,10 @@ import pathlib
 import pprint
 import json
 
-GridVarSelect = "Column"
-CurrentRow = 0
-CurrentColumn = 2
-
-
-
-def NextCoord():
-    if GridVarSelect == "Row":
-        global CurrentRow
-        CurrentRow += 1
-    else:
-        global CurrentColumn
-        CurrentColumn += 1
-    return CurrentRow, CurrentColumn
-
 
 class TkApp(tk.Frame):
-    def __init__(self, master=None, title="Statsuck"):
+    def __init__(self, master=None):
         super().__init__(master)
-        self.master.title(title)
         self.grid()
 
         # Dropdown menu
@@ -51,19 +35,15 @@ class TkApp(tk.Frame):
 
         # Notebook frame #1
         self.notebook = ttk.Notebook(self.master)
-        self.notebook_frame = tk.Frame(self.notebook, width=8, height=1)
-        self.notebook.add(self.notebook_frame, text="NBAstats")
-        self.notebook.grid(row=0, column=0, padx=1, pady=0)
+        #self.notebook_frame = tk.Frame(self.notebook, width=8, height=1)
+        #self.notebook.add(self.notebook_frame, text="NBAstats")
+        #self.notebook.grid(row=0, column=0, padx=1, pady=0)
 
         # Frame number 2 (sabersuck)
-        self.sabersuck_frame = SaberSuckPage(self.notebook)  # Use the new SaberSuckPage class
+        self.sabersuck_frame = SaberSuckPage(self.master)  # Use the new SaberSuckPage class
         self.notebook.add(self.sabersuck_frame, text="sabersuck")
 
-        # Bind tab change event
-        self.notebook.bind("<<NotebookTabChanged>>", on_tab_changed)  # Note: Removed self.
 
-        self.xdelta = 2
-        self.ydelta = 2
 
     # placeholder
     def fetch_stats(self):
@@ -233,24 +213,28 @@ def MapMulti(first, *rest):
 #MapMulti("TEAM", "PLAYER", "PotentialAssists")
 
 #Switch tabs, similar to the functionality in EIFV2
-def on_tab_changed(event):
-    selected_tab = NBAStatsApp.notebook.index(NBAStatsApp.notebook.select())
+def on_tab_changed(self, event):
+        selected_tab = self.notebook.index(self.notebook.select())
 
-    # Show/hide the frames based on the selected tab
-    if selected_tab == 0:  # NBAstats tab
-        NBAStatsApp.sabersuck_frame.pack_forget()
-        NBAStatsApp.nbastats_frame.pack(expand=True, fill="both")
-    elif selected_tab == 1:  # sabersuck tab
-        NBAStatsApp.nbastats_frame.pack_forget()
-        # Add code to show the content of the sabersuck page
-        # For now, we can just pack the frame
-        NBAStatsApp.sabersuck_frame.pack(expand=True, fill="both")
+        # Hide the frames based on the selected tab
+        self.sabersuck_frame.grid_forget()
+        self.nbastats_frame.grid_forget()
+
+        # Show the selected frame
+        if selected_tab == 0:  # NBAstats tab
+            self.nbastats_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
+        elif selected_tab == 1:  # sabersuck tab
+            self.sabersuck_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
+
+
+
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     NBAStatsApp = TkApp(root)
-    NBAStatsApp.notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+    NBAStatsApp.notebook.add(NBAStatsApp, text="NBAstats")
+    #NBAStatsApp.notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
     #FD = FileDialog(NBAStatsApp)  #???
     #CreateButton(root, "ChooseCSV", OpenFileDialog_NoPandas)
     for name in jsonmap.keys():

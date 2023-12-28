@@ -1,5 +1,4 @@
 import os
-import random
 import csv
 import time
 import numpy as np
@@ -8,15 +7,15 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
 
-# Set up the WebDriver
-chrome_service = ChromeService(executable_path='/usr/bin/chromedriver')
-chrome_options = ChromeOptions()
-#chrome_options.add_argument('-headless')  # Uncomment if you run in headless mode
-chrome_options.add_argument("--window-size=1920,1080")  # Not sure if setting the window at full screen shits out, or if we need to make the window smaller
-driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
+# Set up the Firefox options and WebDriver
+service = FirefoxService()
+options = FirefoxOptions()
+options.add_argument('-headless')  # Uncomment if you run in headless mode
+options.add_argument("--window-size=1920x,1080")
+driver = webdriver.Firefox(service=service, options=options)
 
 print("Drinking NBA.com's milkshake")
 
@@ -31,16 +30,16 @@ table = WebDriverWait(driver, 10).until(
 headers = table.find_elements(By.TAG_NAME, 'th')
 header_titles = [header.text for header in headers]
 
-if len(header_titles) > 9:
-    header_titles[9] = "SecondaryAssists"
-if len(header_titles) > 10:
-    header_titles[10] = "PotentialAssists"
+if len(header_titles) > 7:
+    header_titles[7] = "ContestedRebs"
+if len(header_titles) > 8:
+    header_titles[8] = "ContestedRebs%"
 if len(header_titles) > 11:
-    header_titles[11] = "AssistPointsCreated"
+    header_titles[11] = "DeferredRebChances"
+if len(header_titles) > 12:
+    header_titles[12] = "AdjRebChance%"
 
-
-
-driver.get_screenshot_as_file("debug_screenshot.png")
+#driver.get_screenshot_as_file("debug_screenshot.png")
 
 xbutton = WebDriverWait(driver,3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".onetrust-close-btn-handler.onetrust-close-btn-ui.banner-close-button.ot-close-icon")))
 xbutton.click()

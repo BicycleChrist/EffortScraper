@@ -1,3 +1,7 @@
-_pycache__
+__pycache__
 AutoAssistFetch.bash
 AutoBoundFetch.bash
+pybaseball
+venv
+.idea
+.git

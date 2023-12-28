@@ -1,8 +1,10 @@
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
-import baseball_scraper
-from baseball_scraper import statcast, batting_stats, pitching_stats, playerid_lookup
+from pybaseball import statcast, batting_stats, pitching_stats, playerid_lookup, statcast_pitcher
+
+from pybaseball import cache
+cache.enable()
 
 class SaberSuckPage(tk.Frame):
     def __init__(self, master=None):
@@ -57,9 +59,8 @@ class SaberSuckPage(tk.Frame):
         # Validate date input
         start_date = self.start_date_var.get()
         end_date = self.end_date_var.get()
-        player_name = self.player_name_entry.get()
 
-        if selected_option == self.stat_types[0] or not start_date or not end_date:
+        if selected_option not in self.stat_types or not start_date or not end_date:
             messagebox.showerror("Error", "Please select a valid stats type and enter start and end dates.")
             return
 
@@ -67,8 +68,10 @@ class SaberSuckPage(tk.Frame):
             if selected_option == "Statcast":
                 data = statcast(start_dt=start_date, end_dt=end_date)
             elif selected_option == "Pitching Stats":
+                player_name = self.player_name_entry.get()
                 data = pitching_stats(player_name, start_date, end_date)
             elif selected_option == "Batting Stats":
+                player_name = self.player_name_entry.get()
                 data = batting_stats(player_name, start_date, end_date)
 
             # Display the result in the Textbox
@@ -89,12 +92,17 @@ class SaberSuckPage(tk.Frame):
         player_name = self.player_search_entry.get()
 
         if not player_name:
-            messagebox.showerror("Error", "Please enter a player name for lookup.")
-            return
+            player_name = "clayton kershaw"
+            #messagebox.showerror("Error", "Please enter a player name for lookup.")
+            #return
 
         try:
-            player_info = playerid_lookup(player_name)
-            messagebox.showinfo("Player Lookup", f"Player ID: {player_info['mlb_id']}")
+            player_info = playerid_lookup(player_name.split(' ')[1], player_name.split(' ')[0])
+            start_date = self.start_date_var.get()
+            end_date = self.end_date_var.get()
+            newdata = statcast_pitcher(start_date, end_date, player_info['key_mlbam'].array[0])
+            self.display_data_in_textbox(newdata)
+            #messagebox.showinfo("Player Lookup", f"Player ID: {player_info}")
         except Exception as e:
             messagebox.showerror("Error", f"Error looking up player: {str(e)}")
 

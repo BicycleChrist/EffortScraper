@@ -17,7 +17,14 @@ pydantic==2.5.2
 pyparsing==3.1.1
 pytz==2023.3.post1
 requests==2.31.0
+types-requests
 selenium==4.15.2
 six==1.16.0
 soupsieve==2.5
 urllib3==1.26.18
+lxml
+tqdm
+pyarrow
+pygithub
+scipy
+matplotlib
