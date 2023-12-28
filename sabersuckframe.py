@@ -9,7 +9,7 @@ cache.enable()
 class SaberSuckPage(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
-        self.grid()
+        self.pack()
 
         # Dropdown menu for stat types
         self.stat_types = ["Statcast", "Pitching Stats", "Batting Stats"]
@@ -42,7 +42,7 @@ class SaberSuckPage(tk.Frame):
         self.player_search_entry.grid(row=0, column=6, padx=2, pady=2)
 
         # Empty Textbox
-        self.data_textbox = tk.Text(self, width=210, height=42)
+        self.data_textbox = tk.Text(self, width=210, height=45)
         self.data_textbox.grid(row=1, column=0, columnspan=7, padx=10, pady=10)
 
         # Button to trigger data retrieval

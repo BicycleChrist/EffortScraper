@@ -16,41 +16,36 @@ import json
 class TkApp(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
-        self.grid()
+        self.pack()
 
         # Dropdown menu
         self.stats_var = tk.StringVar()
         self.stats_var.set("Select Stats Type")
-        self.stats_dropdown = ttk.Combobox(self.master, textvariable=self.stats_var,
-                                           values=["Rebounding", "Passing"])
-        self.stats_dropdown.grid(row=0, column=1, padx=2, pady=2)
+        self.stats_dropdown = ttk.Combobox(self, textvariable=self.stats_var, values=["Rebounding", "Passing"])
+        self.stats_dropdown.pack(side=tk.TOP, padx=0, pady=0)
 
         # Fetch button
-        self.fetch_button = tk.Button(self.master, text="Fetch", command=self.fetch_stats)
-        self.fetch_button.grid(row=0, column=2, padx=5, pady=0)
+        self.fetch_button = tk.Button(self, text="Fetch", command=self.fetch_stats)
+        self.fetch_button.pack(side=tk.TOP, padx=0, pady=5)
 
         # Textbox to display data
-        self.data_textbox = ScrolledText(self.master, width=200)
-        self.data_textbox.grid(row=1, column=1, padx=5, pady=5)
+        self.data_textbox = ScrolledText(self, height=105, width=225)
+        self.data_textbox.pack(side=tk.LEFT, padx=5, pady=5)
 
         # Notebook frame #1
-        self.notebook = ttk.Notebook(self.master)
-        #self.notebook_frame = tk.Frame(self.notebook, width=8, height=1)
-        #self.notebook.add(self.notebook_frame, text="NBAstats")
-        #self.notebook.grid(row=0, column=0, padx=1, pady=0)
-
-        # Frame number 2 (sabersuck)
-        self.sabersuck_frame = SaberSuckPage(self.master)  # Use the new SaberSuckPage class
-        self.notebook.add(self.sabersuck_frame, text="sabersuck")
+        self.notebook = ttk.Notebook(self)
 
 
+        # Add NBAstats frame to the notebook but hide it initially
+        self.nbastats_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.nbastats_frame, text="NBAstats")
 
-    # placeholder
+    # Placeholder
     def fetch_stats(self):
         print("pretending to fetch stats")
         self.data_textbox.insert(tk.END, "legit stats:\n 1 2 3 4 5\n 69")
 
-    # why is this even a member function?
+    # Function to fetch real stats
     def fetch_stats_real(self):
         stats_type = self.stats_var.get()
 
@@ -72,6 +67,12 @@ class TkApp(tk.Frame):
         except pd.errors.EmptyDataError:
             self.data_textbox.delete(1.0, tk.END)
             self.data_textbox.insert(tk.END, "No data available.")
+
+    # Add NBAstats frame to the notebook
+        self.nbastats_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.nbastats_frame, text="NBAstats")
+
+
 
 
 csv_subdir = pathlib.Path("CSV")
@@ -217,8 +218,8 @@ def on_tab_changed(self, event):
         selected_tab = self.notebook.index(self.notebook.select())
 
         # Hide the frames based on the selected tab
-        self.sabersuck_frame.grid_forget()
-        self.nbastats_frame.grid_forget()
+        self.sabersuck_frame.pack_forget()
+        self.nbastats_frame.pack_forget()
 
         # Show the selected frame
         if selected_tab == 0:  # NBAstats tab
@@ -270,4 +271,4 @@ if __name__ == "__main__":
     #    # how the fuck do we select columns/rows?
     #    NBAStatsApp.data_textbox.insert(tk.END, loadedCSV.to_string(index=False))
 
-    NBAStatsApp.mainloop()
+    #NBAStatsApp.mainloop()
