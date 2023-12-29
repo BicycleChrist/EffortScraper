@@ -3,7 +3,6 @@ import tkinter.filedialog
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from tkinter.filedialog import FileDialog
-from sabersuckframe import SaberSuckPage  # Import the new class
 import subprocess
 import pandas as pd
 import csv
@@ -254,21 +253,3 @@ if __name__ == "__main__":
 
     hugemap = MapStatCategories('PLAYER', 'PotentialAssists')
     pprint.pprint(hugemap)
-
-
-
-
-
-
-    #choice = pickFile(NBAStatsApp, 0)
-    #if choice is not None:
-    #    loadedCSV = loadCSV(choice)
-    #else:
-    #    loadedCSV = loadCSV("passing_data")
-    #if loadedCSV is not None:
-    #    print(loadedCSV)
-    #    saveCSV(loadedCSV, "resaved")
-    #    # how the fuck do we select columns/rows?
-    #    NBAStatsApp.data_textbox.insert(tk.END, loadedCSV.to_string(index=False))
-
-    #NBAStatsApp.mainloop()

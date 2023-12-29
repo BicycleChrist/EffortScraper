@@ -5,3 +5,6 @@ pybaseball
 venv
 .idea
 .git
+.venv
+.log
+.kate-swp
