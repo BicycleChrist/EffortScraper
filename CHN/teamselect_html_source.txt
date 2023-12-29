@@ -1,0 +1,88 @@
+
+	<label>
+		<form action="/php/pagehandler.php" method="post" target="_self">
+		<select name="uri" class="redirect stdDrop">
+			<option value="">Team Page</option>
+			<option value="">**Atlantic Hockey**</option>
+			<option value="/reports/team/Air-Force/1">Air Force</option>
+			<option value="/reports/team/American-International/5">AIC</option>
+			<option value="/reports/team/Army/6">Army</option>
+			<option value="/reports/team/Bentley/8">Bentley</option>
+			<option value="/reports/team/Canisius/13">Canisius</option>
+			<option value="/reports/team/Holy-Cross/23">Holy Cross</option>
+			<option value="/reports/team/Mercyhurst/28">Mercyhurst</option>
+			<option value="/reports/team/Niagara/39">Niagara</option>
+			<option value="/reports/team/RIT/49">RIT</option>
+			<option value="/reports/team/Robert-Morris/50">Robert Morris (2023)</option>
+			<option value="/reports/team/Sacred-Heart/51">Sacred Heart</option>
+			<option value=""> </option>
+			<option value="">**Big Ten**</option>
+			<option value="/reports/team/Michigan/31">Michigan</option>
+			<option value="/reports/team/Michigan-State/32">Michigan State</option>
+			<option value="/reports/team/Minnesota/34">Minnesota</option>
+			<option value="/reports/team/Notre-Dame/43">Notre Dame</option>
+			<option value="/reports/team/Ohio-State/44">Ohio State</option>
+			<option value="/reports/team/Penn-State/60">Penn State</option>
+			<option value="/reports/team/Wisconsin/58">Wisconsin</option>
+			<option value=""> </option>
+            <option value="">**CCHA**</option>
+            <option value="/reports/team/Augustana/64">Augustana (2023)</option>
+            <option value="/reports/team/Bemidji-State/7">Bemidji State</option>
+            <option value="/reports/team/Bowling-Green/11">Bowling Green</option>
+            <option value="/reports/team/Ferris-State/21">Ferris State</option>
+            <option value="/reports/team/Lake-Superior/24">Lake Superior</option>
+            <option value="/reports/team/Michigan-Tech/33">Michigan Tech</option>
+            <option value="/reports/team/Minnesota-State/35">Minnesota State</option>
+            <option value="/reports/team/Northern-Michigan/42">Northern Michigan</option>
+            <option value="/reports/team/St-Thomas/63">St. Thomas/63</option>
+            <option value=""> </option>
+			<option value="">**ECAC**</option>
+			<option value="/reports/team/Brown/12">Brown</option>
+			<option value="/reports/team/Clarkson/14">Clarkson</option>
+			<option value="/reports/team/Colgate/15">Colgate</option>
+			<option value="/reports/team/Cornell/18">Cornell</option>
+			<option value="/reports/team/Dartmouth/19">Dartmouth</option>
+			<option value="/reports/team/Harvard/22">Harvard</option>
+			<option value="/reports/team/Princeton/45">Princeton</option>
+			<option value="/reports/team/Quinnipiac/47">Quinnipiac</option>
+			<option value="/reports/team/Rensselaer/48">Rensselaer</option>
+			<option value="/reports/team/St-Lawrence/53">St. Lawrence</option>
+			<option value="/reports/team/Union/54">Union</option>
+			<option value="/reports/team/Yale/59">Yale</option>
+			<option value=""> </option>
+			<option value="">**Hockey East**</option>
+			<option value="/reports/team/Boston-College/9">Boston C.</option>
+			<option value="/reports/team/Boston-University/10">Boston U.</option>
+			<option value="/reports/team/Connecticut/17">Connecticut</option>
+			<option value="/reports/team/Maine/25">Maine</option>
+			<option value="/reports/team/Massachusetts/27">Massachusetts</option>
+			<option value="/reports/team/UMass-Lowell/26">Mass.-Lowell</option>
+			<option value="/reports/team/Merrimack/29">Merrimack</option>
+			<option value="/reports/team/New-Hampshire/38">New Hampshire</option>
+			<option value="/reports/team/Northeastern/41">Northeastern</option>
+			<option value="/reports/team/Providence/46">Providence</option>
+			<option value="/reports/team/Vermont/55">Vermont</option>
+			<option value=""> </option>
+			<option value="">**NCHC**</option>
+			<option value="/reports/team/Colorado-College/16">Colorado College</option>
+			<option value="/reports/team/Denver/20">Denver</option>
+			<option value="/reports/team/Miami/30">Miami</option>
+			<option value="/reports/team/Minnesota-Duluth/36">Minnesota-Duluth</option>
+			<option value="/reports/team/Nebraska-Omaha/37">Nebraska-Omaha</option>
+			<option value="/reports/team/North-Dakota/40">North Dakota</option>
+			<option value="/reports/team/St-Cloud-State/52">St. Cloud</option>
+			<option value="/reports/team/Western-Michigan/57">Western Michigan</option>
+			<option value=""> </option>
+			<option value="">**Independent**</option>
+			<!--<option value="/reports/team/Alabama-Huntsville/2">Alabama-Huntsville</option>-->
+			<option value="/reports/team/Alaska/4">Alaska</option>
+			<option value="/reports/team/Alaska-Anchorage/3">Alaska-Anchorage</option>
+			<option value="/reports/team/Arizona-State/61">Arizona State</option>
+			<option value="/reports/team/Lindenwood/433">Lindenwood</option>
+			<option value="/reports/team/Long-Island/62">Long Island</option>
+			<option value="/reports/team/Stonehill/422">Stonehill</option>
+			<!--<option value="/reports/team/Utica/356">Utica</option>-->
+		</select>
+		</form>
+	</label>
+

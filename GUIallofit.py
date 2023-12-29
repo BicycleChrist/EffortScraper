@@ -1,53 +1,30 @@
-import tkinter as tk
-import tkinter.filedialog
+import tkinter
 from tkinter import ttk
-from tkinter.scrolledtext import ScrolledText
-from tkinter.filedialog import FileDialog
 from sabersuckframe import SaberSuckPage  # Import the new class
-import subprocess
-import pandas as pd
-import csv
-import pathlib
-
-import pprint
-import json
-
 import statsuckGUI
-import sabersuckframe
+from CHN.CHNscrape import CHN_TeamIDs
 
-class TkApp(ttk.Notebook):
+class TabbedGUI(ttk.Notebook):
+    WidgetStorage = {}
     def __init__(self, master=None, title="Statsuck"):
         super().__init__(master)
         self.master.title(title)
-        self.pack()
+        self.pack(expand=1, fill="both")  # Use pack instead of grid
 
-import tkinter as tk
-from tkinter import ttk
-from tkinter.scrolledtext import ScrolledText
-from sabersuckframe import SaberSuckPage
-import subprocess
-import pandas as pd
-import csv
-import pathlib
-
-import pprint
-import json
-
-class TkApp(tk.Tk):  # Change to subclass of tk.Tk
-    def __init__(self, master=None, title="Statsuck"):
-        super().__init__(master)
-        self.title(title)
+    def AddTab(self, name, new_widget_class):
+        new_widget = new_widget_class(self)
+        self.WidgetStorage[name] = new_widget
+        self.add(new_widget, text=name)
+        return new_widget
 
 if __name__ == "__main__":
-    root = TkApp()
-    mainapp = ttk.Notebook(root)
+    root = tkinter.Tk()
+    mainapp = TabbedGUI(root)
 
-    tab0 = statsuckGUI.TkApp(mainapp)
-    mainapp.add(tab0, text="NBAtab")
-
-    tab1 = sabersuckframe.SaberSuckPage(mainapp)
-    mainapp.add(tab1, text="MLBtab")
-
-    mainapp.pack(expand=1, fill="both")  # Use pack instead of grid
+    mainapp.AddTab("NBAtab", statsuckGUI.TkApp)
+    mainapp.AddTab("MLBtab", SaberSuckPage)
+    chnframe = mainapp.AddTab("CHN", tkinter.Text)
+    chnframe.insert(tkinter.END, "epic placeholder text!")
+    mainapp.WidgetStorage["CHN"].insert(tkinter.END, "test2")
 
     root.mainloop()
