@@ -1,5 +1,7 @@
 import pprint
 import pathlib
+import requests
+from bs4 import BeautifulSoup
 
 CHN_TeamIDs = {
     "Air-Force": 1,
@@ -102,3 +104,73 @@ def GenerateAllURLs(stats=True, schedules=True):
         suffix = f"{name}/{ID}"
         GeneratedURLs[name] = [f"{prefix}/{suffix}" for prefix in subpaths]
     return GeneratedURLs
+
+def download_skater_table(teamname):
+    # Ensure the teamname is in the correct format for the URL
+    formatted_teamname = teamname
+    url = f"https://www.collegehockeynews.com/stats/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
+
+    # Specify the path for saving the HTML file
+    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'skater_table.html'
+
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content using BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the table with class 'data sortable sticky'
+        skater_table = soup.find('table', {'class': 'data sortable sticky'})
+
+        # Save the HTML content to the specified file path
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(str(skater_table))
+
+        print(f"Skater table for {teamname} saved at: {file_path}")
+
+    else:
+        print(f"Failed to download skater table for {teamname}. Status code: {response.status_code}")
+
+
+def download_goalie_table(teamname):
+    # Ensure the teamname is in the correct format for the URL
+    formatted_teamname = teamname
+    url = f"https://www.collegehockeynews.com/stats/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
+
+    # Specify the path for saving the HTML file
+    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'goalie_table.html'
+
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content using BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the table with id 'goalies' and class 'data sortable border'
+        goalie_table = soup.find('table', {'id': 'goalies', 'class': 'data sortable'})
+
+        # Save the HTML content to the specified file path
+        # Maybe convert to .csv at some point?
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(str(goalie_table))
+
+        print(f"Goalie table for {teamname} saved at: {file_path}")
+
+    else:
+        print(f"Failed to download goalie table for {teamname}. Status code: {response.status_code}")
+
+# Gather data for single team :
+team_name = "RIT"
+download_skater_table(team_name)
+download_goalie_table(team_name)
+
+# When you want it all! CHN might get upset
+#def download_all_team_data():
+    #for team_name, team_id in CHN_TeamIDs.items():
+        #download_skater_table(team_name)
+        #download_goalie_table(team_name)
+#download_all_team_data()
