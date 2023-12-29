@@ -2,6 +2,8 @@ import pprint
 import pathlib
 import requests
 from bs4 import BeautifulSoup
+import re
+
 
 CHN_TeamIDs = {
     "Air-Force": 1,
@@ -163,10 +165,86 @@ def download_goalie_table(teamname):
     else:
         print(f"Failed to download goalie table for {teamname}. Status code: {response.status_code}")
 
+
+def download_schedule_table(teamname):
+    # Use the original team name for the directory
+    formatted_teamname = teamname
+    url = f"https://www.collegehockeynews.com/schedules/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
+
+    # Specify the path for saving the HTML file
+    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'schedule_table.html'
+
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content using BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the div with class 'norint nomobileonly' and get the parent table
+        schedule_table = soup.find('table', {'class': 'data schedule'})
+
+
+        # Save the HTML content to the specified file path
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(str(schedule_table))
+
+        print(f"Schedule table for {teamname} saved at: {file_path}")
+
+    else:
+        print(f"Failed to download schedule table for {teamname}. Status code: {response.status_code}")
+
+
+
+#TODO:Figure out how to suck up box score. Urls for box scores are formatted: "https://www.collegehockeynews.com/box/final/20231103/afa/nia/", with data and then team vs team. afa is Air-Force academy and nia is Niagara. Need more dictionary for team abbreviations I guess. All other necessary data can be sourced from the schedule tables.
+
+
+def download_box_score_from_schedule(team_name):
+    # Ensure team name is in the correct format for the URL
+    formatted_team_name = team_name.replace("-", "").replace(" ", "")
+
+    # Construct the schedule URL
+    url = f"https://www.collegehockeynews.com/schedules/team/{formatted_team_name}"
+
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content using BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the box score link with class 'noprint', 'lomobile', and 'centerb'
+        box_score_link = soup.find('a', {'class': 'noprint.lomobile.center.b'})
+
+        if box_score_link:
+            # Box score link is present, download the box score
+            box_score_url = box_score_link.get('href')
+            download_box_score(team_name, box_score_url)
+        else:
+            # No box score link available
+            print(f"No box score available for {team_name}")
+
+    else:
+        print(f"Failed to fetch schedule for {team_name}. Status code: {response.status_code}")
+
+# Example usage for box score rip:
+#team_name = "RIT"
+#download_box_score_from_schedule(team_name)
+
+
+
+
+# Example usage for schedule rip:
+#download_schedule_table("RIT")
+
+
 # Gather data for single team :
-team_name = "RIT"
+team_name = "Denver"
 download_skater_table(team_name)
 download_goalie_table(team_name)
+
 
 # When you want it all! CHN might get upset
 #def download_all_team_data():
