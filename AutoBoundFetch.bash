@@ -1,5 +1,5 @@
 #!/bin/sh
-cd /home/retupmoc/PycharmProjects/EffortScraper
+cd ~/PycharmProjects/EffortScraper
 
 # Activate virtual environment
 source venv/bin/activate
