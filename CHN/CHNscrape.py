@@ -2,8 +2,25 @@ import pprint
 import pathlib
 import requests
 from bs4 import BeautifulSoup
-import re
 
+CHN_URL = "www.collegehockeynews.com"
+
+# maps to URL segment, and any attributes required for BeautifulSoup lookup
+CHN_table_categories = {
+    "skater": {
+        'urlseg': 'stats',
+        'htmlattrs': {'class': 'data sortable sticky'},
+    },
+    "goalie": {
+        'urlseg': 'stats',
+        'htmlattrs': {'id': 'goalies', 'class': 'data sortable'},
+    },
+    "schedule": {
+        'urlseg': 'schedules',
+        'htmlattrs': {'class': 'data schedule'},
+    },
+}
+# TODO: possibly write a class instead
 
 CHN_TeamIDs = {
     "Air-Force": 1,
@@ -75,6 +92,8 @@ CHN_TeamIDs = {
     #"Alabama-Huntsville": 2,
 }
 
+# reverse-lookup (teamname by ID)
+reversedict = {v:k for k,v in CHN_TeamIDs.items()}
 
 # returns path for single subdirectory or all
 def ExpectedSubdir(teamname=None):
@@ -107,148 +126,73 @@ def GenerateAllURLs(stats=True, schedules=True):
         GeneratedURLs[name] = [f"{prefix}/{suffix}" for prefix in subpaths]
     return GeneratedURLs
 
-def download_skater_table(teamname):
-    # Ensure the teamname is in the correct format for the URL
-    formatted_teamname = teamname
-    url = f"https://www.collegehockeynews.com/stats/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
 
-    # Specify the path for saving the HTML file
-    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'skater_table.html'
+# 'team/teamname/ID' is often appended to URLs
+# if you pass a base URL, it will return a concatenated string
+def GetURLSuffix(teamname, prefix=None):
+    suffix = f"team/{teamname}/{CHN_TeamIDs[teamname]}"
+    if prefix is None: return suffix
+    if prefix.endswith('/'): return f"{prefix}{suffix}"
+    return f"{prefix}/{suffix}"
 
-    # Send a GET request to the URL
-    response = requests.get(url)
+def ValidateSelections(categories:list):
+    if len(categories) == 0:
+        print("nothing selected")
+        return False
+    isValid=True
+    for arg in categories:
+        if arg not in CHN_table_categories.keys():
+            print(f"invalid category: {arg}")
+            print(f"available options are: {CHN_table_categories.keys()}")
+            isValid = False
+    return isValid
 
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        # Parse the HTML content using BeautifulSoup
+def DownloadTeamData(teamname, *categories):
+    if not ValidateSelections(list(categories)):
+        print("cancelling download")
+        return
+    for arg in categories:
+        baseurl = f"{CHN_URL}/{CHN_table_categories[arg]['urlseg']}"
+        url = GetURLSuffix(teamname, baseurl)
+        # TODO: check for repeat urls (skater and goalie come from same page)
+        save_path = ExpectedSubdir(teamname) / f"{arg}_table.html"
+
+        response = requests.get(url)
+        match response.status_code:
+            case 200: pass
+            case 404: print(f"404 URL not found: {url}"); continue
+            case _: print(f"{response.status_code} URL returned not-good response: {url}"); continue
+        # TODO: refactor into seperate functions
         soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Find the table with class 'data sortable sticky'
-        skater_table = soup.find('table', {'class': 'data sortable sticky'})
-
-        # Save the HTML content to the specified file path
-        with open(file_path, 'w', encoding='utf-8') as file:
-            file.write(str(skater_table))
-
-        print(f"Skater table for {teamname} saved at: {file_path}")
-
-    else:
-        print(f"Failed to download skater table for {teamname}. Status code: {response.status_code}")
+        found_table = soup.find('table', attrs=CHN_table_categories[arg]['htmlattrs'])
+        with open(save_path, 'w', encoding='utf-8') as file:
+            file.write(found_table.decode(pretty_print=True))
+        print(f"{arg} table for {teamname} saved at: {save_path}")
 
 
-def download_goalie_table(teamname):
-    # Ensure the teamname is in the correct format for the URL
-    formatted_teamname = teamname
-    url = f"https://www.collegehockeynews.com/stats/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
-
-    # Specify the path for saving the HTML file
-    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'goalie_table.html'
-
-    # Send a GET request to the URL
-    response = requests.get(url)
-
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Find the table with id 'goalies' and class 'data sortable border'
-        goalie_table = soup.find('table', {'id': 'goalies', 'class': 'data sortable'})
-
-        # Save the HTML content to the specified file path
-        # Maybe convert to .csv at some point?
-        with open(file_path, 'w', encoding='utf-8') as file:
-            file.write(str(goalie_table))
-
-        print(f"Goalie table for {teamname} saved at: {file_path}")
-
-    else:
-        print(f"Failed to download goalie table for {teamname}. Status code: {response.status_code}")
-
-
-def download_schedule_table(teamname):
-    # Use the original team name for the directory
-    formatted_teamname = teamname
-    url = f"https://www.collegehockeynews.com/schedules/team/{formatted_teamname}/{CHN_TeamIDs[teamname]}"
-
-    # Specify the path for saving the HTML file
-    file_path = pathlib.Path.cwd() / 'teamdata' / formatted_teamname / 'schedule_table.html'
-
-    # Send a GET request to the URL
-    response = requests.get(url)
-
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Find the div with class 'norint nomobileonly' and get the parent table
-        schedule_table = soup.find('table', {'class': 'data schedule'})
-
-
-        # Save the HTML content to the specified file path
-        with open(file_path, 'w', encoding='utf-8') as file:
-            file.write(str(schedule_table))
-
-        print(f"Schedule table for {teamname} saved at: {file_path}")
-
-    else:
-        print(f"Failed to download schedule table for {teamname}. Status code: {response.status_code}")
-
-
-
-#TODO:Figure out how to suck up box score. Urls for box scores are formatted: "https://www.collegehockeynews.com/box/final/20231103/afa/nia/", with data and then team vs team. afa is Air-Force academy and nia is Niagara. Need more dictionary for team abbreviations I guess. All other necessary data can be sourced from the schedule tables.
-
-
-def download_box_score_from_schedule(team_name):
-    # Ensure team name is in the correct format for the URL
-    formatted_team_name = team_name.replace("-", "").replace(" ", "")
-
-    # Construct the schedule URL
-    url = f"https://www.collegehockeynews.com/schedules/team/{formatted_team_name}"
-
-    # Send a GET request to the URL
-    response = requests.get(url)
-
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        # Parse the HTML content using BeautifulSoup
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Find the box score link with class 'noprint', 'lomobile', and 'centerb'
-        box_score_link = soup.find('a', {'class': 'noprint.lomobile.center.b'})
-
-        if box_score_link:
-            # Box score link is present, download the box score
-            box_score_url = box_score_link.get('href')
-            download_box_score(team_name, box_score_url)
-        else:
-            # No box score link available
-            print(f"No box score available for {team_name}")
-
-    else:
-        print(f"Failed to fetch schedule for {team_name}. Status code: {response.status_code}")
-
-# Example usage for box score rip:
-#team_name = "RIT"
-#download_box_score_from_schedule(team_name)
-
-
-
-
-# Example usage for schedule rip:
-#download_schedule_table("RIT")
-
-
-# Gather data for single team :
-team_name = "Denver"
-download_skater_table(team_name)
-download_goalie_table(team_name)
-
-
+# TODO: get robots.txt
 # When you want it all! CHN might get upset
-#def download_all_team_data():
-    #for team_name, team_id in CHN_TeamIDs.items():
-        #download_skater_table(team_name)
-        #download_goalie_table(team_name)
-#download_all_team_data()
+#def download_all_team_data():  # TODO: You know 'GenerateAllURLs' was specifically written for this, right??
+#    for team_name, team_id in CHN_TeamIDs.items():
+#        download_skater_table(team_name)
+#        download_goalie_table(team_name)
+
+
+# could probably just add this as another category
+def FindBoxScoreURLs(filepath):
+    with open(filepath, 'r', encoding='utf-8') as file:
+        soup = BeautifulSoup(file, 'html.parser')
+        # this is the same table you find in 'DownloadTeamData' with the 'schedule' category
+        table = soup.find(attrs={'class': 'data schedule'})
+        box_score_links = table.find_all('a', text='Box')
+        box_score_urls = [f"{CHN_URL}{link.get('href')}" for link in box_score_links]
+    return box_score_urls
+
+
+if __name__ == "__main__":
+    schedulefile = pathlib.Path.cwd() / "examples" / "schedule.html"
+    if not schedulefile.exists():
+        print(f"ERROR: schedulefile not found at: {schedulefile.absolute()}")
+        SystemExit()  # TODO: add error handling more proper than 'print & SystemExit' to this file
+
+    FindBoxScoreURLs(schedulefile)
