@@ -195,4 +195,5 @@ if __name__ == "__main__":
         print(f"ERROR: schedulefile not found at: {schedulefile.absolute()}")
         SystemExit()  # TODO: add error handling more proper than 'print & SystemExit' to this file
 
-    FindBoxScoreURLs(schedulefile)
+    boxscore_urls = FindBoxScoreURLs(schedulefile)
+    pprint.pprint(boxscore_urls)
