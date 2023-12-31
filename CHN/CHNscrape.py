@@ -203,16 +203,34 @@ def ConstructURLs(teamname, *categories):
 # pass a function to isolate the desired element within the webpage
 # save_path is the location to dump the target element, not the webpage's source
 def DownloadTeamData(url, save_path, searchmethod):
-    response = requests.get(url, timeout=5)
-    match response.status_code:
-        case 200: pass
-        case 404: print(f"404 URL not found: {url}"); return None
-        case _: print(f"{response.status_code} URL returned not-good response: {url}"); return None
-    soup = BeautifulSoup(response.text, 'html.parser')
-    found_table = searchmethod(soup)
-    with open(save_path, 'w', encoding='utf-8') as file:
-        file.write(found_table.decode())
-    return found_table
+    try:
+        response = requests.get(url, timeout=5, allow_redirects=False)
+        if response.status_code == 200:
+            if response.is_redirect:
+                # Check if it's a redirect to the schedules page
+                redirected_url = response.headers.get('Location', '')
+                if "schedules" in redirected_url:
+                    print(f"Skipping {url}, likely an exhibition match vs a scrub directional school.")
+                    return None
+            soup = BeautifulSoup(response.text, 'html.parser')
+            found_table = searchmethod(soup)
+            if found_table is not None:
+                with open(save_path, 'w', encoding='utf-8') as file:
+                    file.write(str(found_table))
+                return found_table
+            else:
+                print(f"No table found on {url}.")
+        elif response.status_code == 404:
+            print(f"404 URL not found: {url}")
+        elif response.status_code == 302:
+            print(f"Skipping {url}, school likley got booted from D1")
+        else:
+            print(f"{response.status_code} URL returned not-good response: {url}")
+    except Exception as e:
+        print(f"Error accessing {url}: {e}")
+
+    return None
+
 
 
 # TODO: get robots.txt
@@ -272,16 +290,26 @@ def GetPage(teamname, category, savesources=True):
     if newtargets := ConstructURLs(teamname, category):
         url, filepath = newtargets
         searchmethod = ConstructMethod(category)
+        print(f"Scraping {teamname} - {category}...")
         table = DownloadTeamData(url, filepath, searchmethod)
-        if savesources:
+        if table is not None and savesources:
             sourcepath = ExpectedPath(teamname, category, tosavedsource=True)
             assert sourcepath is not None
             with open(sourcepath, 'w', encoding='utf-8') as sourcedump:
-                sourcedump.write(table.decode())
+                if table is not None:
+                    sourcedump.write(str(table))
+        print(f"Done scraping {teamname} - {category}")
         return table
     # fallthrough if no new targets
     print("ERROR: failed to construct target URLs")
     return None
+
+
+
+def AllofIt():
+    for teamname in CHN_TeamIDs.keys():
+        for category in CHN_table_categories.keys():
+            GetPage(teamname, category)
 
 
 if __name__ == "__main__":
@@ -308,3 +336,7 @@ if __name__ == "__main__":
         newpage = GetPage("RIT", "skater")
         somelinks = SpiderLinks("Wisconsin", "metrics")
         print("success")
+
+
+# Call the function to start the download process
+AllofIt()
