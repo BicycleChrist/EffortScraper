@@ -5,24 +5,39 @@ from bs4 import BeautifulSoup
 
 CHN_URL = "www.collegehockeynews.com"
 
-# TODO: add searchmethod lambdas to CHN_table_categories
+# base function for navigating to table in webpage in BeautifulSoup
+def GenericSearchmethod(soupdata, tagattrs):
+    found_table = soupdata.find('table', attrs=tagattrs)
+    return found_table
 
 # maps to URL segment, and any attributes required for BeautifulSoup lookup
 CHN_table_categories = {
     "skater": {
         'urlseg': 'stats',
+        'searchmethod': GenericSearchmethod,
         'htmlattrs': {'class': 'data sortable sticky'},
     },
     "goalie": {
         'urlseg': 'stats',
+        'searchmethod': GenericSearchmethod,
         'htmlattrs': {'id': 'goalies', 'class': 'data sortable'},
     },
     "schedule": {
         'urlseg': 'schedules',
+        'searchmethod': GenericSearchmethod,
         'htmlattrs': {'class': 'data schedule'},
     },
 }
 # TODO: possibly write a class instead
+
+
+# for convenience
+def ConstructMethod(category):
+    if not ValidateSelections([category]): return lambda *_ : "badlambda"
+    method = CHN_table_categories[category]['searchmethod']
+    attrs = CHN_table_categories[category]['htmlattrs']
+    return lambda soupthing: method(soupthing, attrs)
+
 
 CHN_TeamIDs = {
     "Air-Force": 1,
@@ -95,7 +110,7 @@ CHN_TeamIDs = {
 }
 
 # reverse-lookup (teamname by ID)
-reversedict = {v:k for k,v in CHN_TeamIDs.items()}
+reversedict_TeamIDs = {v:k for k,v in CHN_TeamIDs.items()}
 
 
 # returns path for single subdirectory or all
@@ -103,7 +118,7 @@ def ExpectedSubdir(teamname=None, category=None):
     cwd = pathlib.Path.cwd()
     if cwd.name != "CHN":
         print("you're in the wrong directory")
-        SystemExit()
+        return []
     # return a single path if a teamname is given
     if teamname is not None:
         return cwd / 'teamdata' / teamname
@@ -118,15 +133,20 @@ def CreateSubdirectories():
     return
 
 
-# TODO: write ExpectedPath to take a category, and return full filepath
-def ExpectedPath(teamname, category):
+def ExpectedPath(teamname, category, *, tosavedsource=False, ensure_exists=True):
     cwd = pathlib.Path.cwd()
     if cwd.name != "CHN":
         print("you're in the wrong directory")
-        SystemExit()
-    filename = "placeholder.html"   # TODO: this
-    subdirs = cwd / 'teamdata' / teamname
-    return subdirs / category / filename
+        return None
+    if not ValidateSelections([category]): return None
+    subdir = cwd / 'teamdata' / teamname
+    filename = f"{category}_table.html"
+    if tosavedsource:
+        subdir = cwd / 'savedsources' / CHN_table_categories[category]['urlseg']
+        filename = f"{CHN_TeamIDs[teamname]}.html"
+    if ensure_exists and not subdir.exists(): subdir.mkdir(parents=True)
+    return subdir / filename
+
 
 def GenerateAllURLs(stats=True, schedules=True):
     baseURL = "www.collegehockeynews.com"
@@ -166,28 +186,30 @@ def ValidateSelections(categories:list):
 def ConstructURLs(teamname, *categories):
     if not ValidateSelections(list(categories)):
         print("cancelling download")
-        return
+        return None
     newfiles = []
     for arg in categories:
         baseurl = f"{CHN_URL}/{CHN_table_categories[arg]['urlseg']}"
         url = GetURLSuffix(teamname, baseurl)
         if not url.startswith('https://'): url = f"https://{url}"
         # TODO: check for repeat urls (skater and goalie come from same page)
-        save_path = ExpectedPath(teamname, arg)
+        save_path = ExpectedPath(teamname, arg, tosavedsource=False)
         newfiles.append({arg: (url, save_path)})
+        if len(categories) == 1:
+            return (url, save_path)
     return newfiles
 
 
+# pass a function to isolate the desired element within the webpage
+# save_path is the location to dump the target element, not the webpage's source
 def DownloadTeamData(url, save_path, searchmethod):
-    response = requests.get(url)
+    response = requests.get(url, timeout=5)
     match response.status_code:
         case 200: pass
         case 404: print(f"404 URL not found: {url}"); return None
         case _: print(f"{response.status_code} URL returned not-good response: {url}"); return None
-    # TODO: refactor into seperate functions
     soup = BeautifulSoup(response.text, 'html.parser')
-    #found_table = soup.find('table', attrs=CHN_table_categories[arg]['htmlattrs'])
-    found_table = searchmethod(soup)    # TODO: lambdas
+    found_table = searchmethod(soup)
     with open(save_path, 'w', encoding='utf-8') as file:
         file.write(found_table.decode())
     return found_table
@@ -199,10 +221,6 @@ def DownloadTeamData(url, save_path, searchmethod):
 #    for team_name, team_id in CHN_TeamIDs.items():
 #        download_skater_table(team_name)
 #        download_goalie_table(team_name)
-
-
-def PlaceHolder_searchmethod(soupdata):
-    pass
 
 
 def Spidermethod(soupdata, linktext):
@@ -232,18 +250,61 @@ def SpiderLinks(teamname, targetlinktype="boxscore"):
         with open(expectedpath, 'r', encoding='utf-8') as file:
             table = BeautifulSoup(file, 'html.parser')
     else:
-        table = DownloadTeamData(teamname, parent_pagetype)
-    links = spidermap[targetlinktype]["searchmethod"](table)
-    return links
+        if newtargets := ConstructURLs(teamname, parent_pagetype):
+            url, save_path = newtargets
+            searchmethod = ConstructMethod(parent_pagetype)
+            table = DownloadTeamData(url, save_path, searchmethod)
+        else:
+            print("ERROR: failed to construct target URLs")
+            return []
+    return spidermap[targetlinktype]["searchmethod"](table)
+
+#def GetPages(teamname, category, **kwargs):
+#    teams = kwargs.get('teams', [teamname])
+#    categories = kwargs.get('categories', [category])
+#    for teamname in teams:
+#        if newtargets := ConstructURLs(teamname, *categories):
+#            url, save_path = newtargets
+#            searchmethod = CHN_table_categories[parent_pagetype]['searchmethod']
+#            table = DownloadTeamData(url, save_path, searchmethod)
+
+def GetPage(teamname, category, savesources=True):
+    if newtargets := ConstructURLs(teamname, category):
+        url, filepath = newtargets
+        searchmethod = ConstructMethod(category)
+        table = DownloadTeamData(url, filepath, searchmethod)
+        if savesources:
+            sourcepath = ExpectedPath(teamname, category, tosavedsource=True)
+            assert sourcepath is not None
+            with open(sourcepath, 'w', encoding='utf-8') as sourcedump:
+                sourcedump.write(table.decode())
+        return table
+    # fallthrough if no new targets
+    print("ERROR: failed to construct target URLs")
+    return None
 
 
-if __name__ == "__ma    in__":
-    schedulefile = pathlib.Path.cwd() / "examples" / "schedule.html"
-    if not schedulefile.exists():
-        print(f"ERROR: schedulefile not found at: {schedulefile.absolute()}")
-        SystemExit()  # TODO: add error handling more proper than 'print & SystemExit' to this file
+if __name__ == "__main__":
+    TESTING_MODE_FLAG = False
+    # testing-mode disables downloading and file-searching,
+    # and bypasses normal program logic. Don't write real code like this.
+    if TESTING_MODE_FLAG:
+        print('\n', '='*10, "TESTING MODE", '='*10, '\n')
+        from examples.ExampleSetup import LoadExample
+        #examplesoup = LoadExample(usedump=False)  # webpage source
+        examplesoup = LoadExample(usedump=True)  # dumpedtable
+        testmethod = CHN_table_categories["schedule"]['searchmethod']
+        testattrs = CHN_table_categories["schedule"]['htmlattrs']
+        testparse = testmethod(examplesoup, testattrs)
+        pprint.pprint(testparse)
 
-    boxscore_urls = SpiderLinks(schedulefile)
-    metrics_urls = SpiderLinks(schedulefile)
-    pprint.pprint(boxscore_urls)
-    pprint.pprint(metrics_urls)
+        print('\n\nSpiderlinks:')
+        example_boxscore_links = spidermap["boxscore"]["searchmethod"](examplesoup)
+        pprint.pprint(example_boxscore_links)
+
+    # real
+    if not TESTING_MODE_FLAG:   # do NOT rewrite to an 'else' statement
+        assert TESTING_MODE_FLAG == False
+        newpage = GetPage("RIT", "skater")
+        somelinks = SpiderLinks("Wisconsin", "metrics")
+        print("success")

@@ -11,3 +11,15 @@ venv
 activate
 CHN/teamdata/
 CHN/boxscores/
+.venv/
+.idea/
+.vscode/
+.git/
+__pycache__/
+CSV/
+JSON/
+**.log
+.run/
+teamdata/
+savedsources/
+
