@@ -5,6 +5,8 @@ from bs4 import BeautifulSoup
 
 CHN_URL = "www.collegehockeynews.com"
 
+# TODO: add searchmethod lambdas to CHN_table_categories
+
 # maps to URL segment, and any attributes required for BeautifulSoup lookup
 CHN_table_categories = {
     "skater": {
@@ -95,8 +97,9 @@ CHN_TeamIDs = {
 # reverse-lookup (teamname by ID)
 reversedict = {v:k for k,v in CHN_TeamIDs.items()}
 
+
 # returns path for single subdirectory or all
-def ExpectedSubdir(teamname=None):
+def ExpectedSubdir(teamname=None, category=None):
     cwd = pathlib.Path.cwd()
     if cwd.name != "CHN":
         print("you're in the wrong directory")
@@ -114,6 +117,16 @@ def CreateSubdirectories():
         # creates any missing parent directories as well! make sure you check current path!
     return
 
+
+# TODO: write ExpectedPath to take a category, and return full filepath
+def ExpectedPath(teamname, category):
+    cwd = pathlib.Path.cwd()
+    if cwd.name != "CHN":
+        print("you're in the wrong directory")
+        SystemExit()
+    filename = "placeholder.html"   # TODO: this
+    subdirs = cwd / 'teamdata' / teamname
+    return subdirs / category / filename
 
 def GenerateAllURLs(stats=True, schedules=True):
     baseURL = "www.collegehockeynews.com"
@@ -135,6 +148,7 @@ def GetURLSuffix(teamname, prefix=None):
     if prefix.endswith('/'): return f"{prefix}{suffix}"
     return f"{prefix}/{suffix}"
 
+
 def ValidateSelections(categories:list):
     if len(categories) == 0:
         print("nothing selected")
@@ -147,27 +161,36 @@ def ValidateSelections(categories:list):
             isValid = False
     return isValid
 
-def DownloadTeamData(teamname, *categories):
+
+# returns list of dicts mapping category to (url, save_path)
+def ConstructURLs(teamname, *categories):
     if not ValidateSelections(list(categories)):
         print("cancelling download")
         return
+    newfiles = []
     for arg in categories:
         baseurl = f"{CHN_URL}/{CHN_table_categories[arg]['urlseg']}"
         url = GetURLSuffix(teamname, baseurl)
+        if not url.startswith('https://'): url = f"https://{url}"
         # TODO: check for repeat urls (skater and goalie come from same page)
-        save_path = ExpectedSubdir(teamname) / f"{arg}_table.html"
+        save_path = ExpectedPath(teamname, arg)
+        newfiles.append({arg: (url, save_path)})
+    return newfiles
 
-        response = requests.get(url)
-        match response.status_code:
-            case 200: pass
-            case 404: print(f"404 URL not found: {url}"); continue
-            case _: print(f"{response.status_code} URL returned not-good response: {url}"); continue
-        # TODO: refactor into seperate functions
-        soup = BeautifulSoup(response.text, 'html.parser')
-        found_table = soup.find('table', attrs=CHN_table_categories[arg]['htmlattrs'])
-        with open(save_path, 'w', encoding='utf-8') as file:
-            file.write(found_table.decode(pretty_print=True))
-        print(f"{arg} table for {teamname} saved at: {save_path}")
+
+def DownloadTeamData(url, save_path, searchmethod):
+    response = requests.get(url)
+    match response.status_code:
+        case 200: pass
+        case 404: print(f"404 URL not found: {url}"); return None
+        case _: print(f"{response.status_code} URL returned not-good response: {url}"); return None
+    # TODO: refactor into seperate functions
+    soup = BeautifulSoup(response.text, 'html.parser')
+    #found_table = soup.find('table', attrs=CHN_table_categories[arg]['htmlattrs'])
+    found_table = searchmethod(soup)    # TODO: lambdas
+    with open(save_path, 'w', encoding='utf-8') as file:
+        file.write(found_table.decode())
+    return found_table
 
 
 # TODO: get robots.txt
@@ -178,22 +201,49 @@ def DownloadTeamData(teamname, *categories):
 #        download_goalie_table(team_name)
 
 
-# could probably just add this as another category
-def FindBoxScoreURLs(filepath):
-    with open(filepath, 'r', encoding='utf-8') as file:
-        soup = BeautifulSoup(file, 'html.parser')
-        # this is the same table you find in 'DownloadTeamData' with the 'schedule' category
-        table = soup.find(attrs={'class': 'data schedule'})
-        box_score_links = table.find_all('a', text='Box')
-        box_score_urls = [f"{CHN_URL}{link.get('href')}" for link in box_score_links]
+def PlaceHolder_searchmethod(soupdata):
+    pass
+
+
+def Spidermethod(soupdata, linktext):
+    box_score_links = soupdata.find_all('a', text=linktext)
+    box_score_urls = [f"{CHN_URL}{link.get('href')}" for link in box_score_links]
     return box_score_urls
 
 
-if __name__ == "__main__":
+spidermap = {
+    "boxscore": {
+        "parentcategory": "schedule",
+        "searchmethod": lambda soupthing: Spidermethod(soupthing, 'Box'),
+    },
+    "metrics": {
+        "parentcategory": "schedule",
+        "searchmethod": lambda soupthing: Spidermethod(soupthing, 'Metrics')
+    },
+}
+
+
+# because this function only applies to schedule-pages, we know the filepath given only the teamname
+def SpiderLinks(teamname, targetlinktype="boxscore"):
+    # ensuring parent webpage is already downloaded
+    parent_pagetype = spidermap[targetlinktype]["parentcategory"]
+    expectedpath = ExpectedPath(teamname, parent_pagetype)
+    if expectedpath.exists():
+        with open(expectedpath, 'r', encoding='utf-8') as file:
+            table = BeautifulSoup(file, 'html.parser')
+    else:
+        table = DownloadTeamData(teamname, parent_pagetype)
+    links = spidermap[targetlinktype]["searchmethod"](table)
+    return links
+
+
+if __name__ == "__ma    in__":
     schedulefile = pathlib.Path.cwd() / "examples" / "schedule.html"
     if not schedulefile.exists():
         print(f"ERROR: schedulefile not found at: {schedulefile.absolute()}")
         SystemExit()  # TODO: add error handling more proper than 'print & SystemExit' to this file
 
-    boxscore_urls = FindBoxScoreURLs(schedulefile)
+    boxscore_urls = SpiderLinks(schedulefile)
+    metrics_urls = SpiderLinks(schedulefile)
     pprint.pprint(boxscore_urls)
+    pprint.pprint(metrics_urls)
