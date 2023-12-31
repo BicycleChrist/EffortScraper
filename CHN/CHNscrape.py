@@ -41,7 +41,7 @@ def ConstructMethod(category):
 
 CHN_TeamIDs = {
     "Air-Force": 1,
-    "American-International": 5,
+    "American-Intl": 5,
     "Army": 6,
     "Bentley": 8,
     "Canisius": 13,
