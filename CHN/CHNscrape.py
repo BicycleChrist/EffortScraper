@@ -164,9 +164,11 @@ def GenerateAllURLs(stats=True, schedules=True):
 # if you pass a base URL, it will return a concatenated string
 def GetURLSuffix(teamname, prefix=None):
     suffix = f"team/{teamname}/{CHN_TeamIDs[teamname]}"
-    if prefix is None: return suffix
-    if prefix.endswith('/'): return f"{prefix}{suffix}"
-    return f"{prefix}/{suffix}"
+    if prefix is None or prefix.startswith(('http://', 'https://')):
+        return f"{prefix}/{suffix}"
+    return f"https://{prefix}/{suffix}"
+
+
 
 
 def ValidateSelections(categories:list):
@@ -189,9 +191,10 @@ def ConstructURLs(teamname, *categories):
         return None
     newfiles = []
     for arg in categories:
-        baseurl = f"{CHN_URL}/{CHN_table_categories[arg]['urlseg']}"
+        baseurl = f"https://{CHN_URL}/{CHN_table_categories[arg]['urlseg']}"
         url = GetURLSuffix(teamname, baseurl)
-        if not url.startswith('https://'): url = f"https://{url}"
+        if not url.startswith('https://'):
+            url = f"https://{url}"
         # TODO: check for repeat urls (skater and goalie come from same page)
         save_path = ExpectedPath(teamname, arg, tosavedsource=False)
         newfiles.append({arg: (url, save_path)})
@@ -305,13 +308,6 @@ def GetPage(teamname, category, savesources=True):
     return None
 
 
-
-def AllofIt():
-    for teamname in CHN_TeamIDs.keys():
-        for category in CHN_table_categories.keys():
-            GetPage(teamname, category)
-
-
 if __name__ == "__main__":
     TESTING_MODE_FLAG = False
     # testing-mode disables downloading and file-searching,
@@ -334,9 +330,7 @@ if __name__ == "__main__":
     if not TESTING_MODE_FLAG:   # do NOT rewrite to an 'else' statement
         assert TESTING_MODE_FLAG == False
         newpage = GetPage("RIT", "skater")
-        somelinks = SpiderLinks("Wisconsin", "metrics")
+        MetricsLinks = SpiderLinks("Maine", "metrics")
         print("success")
+        print(MetricsLinks)
 
-
-# Call the function to start the download process
-AllofIt()
