@@ -1,7 +1,7 @@
 import pathlib
 from bs4 import BeautifulSoup
 from datetime import datetime
-
+import argparse
 
 # TODO: add "both"
 # options are "source", "parsed"
@@ -14,7 +14,7 @@ def GetSavePath(leagueselect="nhl", purpose="source"):
     }
     if not purpose in subdirs.keys():
         print(f"invalid selection for purpose: {purpose}")
-        print(f"valid options are: {subdirs.keys}")
+        print(f"valid options are: {(subdirs.keys())}")
         return None
     savepath = cwd / subdirs[purpose] / f"{leagueselect}.html"
     return savepath
@@ -119,4 +119,8 @@ if __name__ == "__main__":
     table = ParseUB(soup)
     dandict = dan_html_extractor(table)
    # pprint.pprint(dandict)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--leagueselect", default="nhl", help="Select the league (default: nhl)")
+    args = parser.parse_args()
+    soup = LoadPagesource(args.leagueselect)
     print("plsdon'texit")
