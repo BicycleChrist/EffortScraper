@@ -37,11 +37,15 @@ def get_static_tables(team_abbr, date_folder):
     except requests.exceptions.RequestException as e:
         print(f"Error accessing the webpage: {e}")
 
+
+
 def allofit(date_folder):
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(get_static_tables, team, date_folder) for team in nhl_teams]
         for future in futures:
             future.result()
+
+
 
 def download_file(team_abbr, link, base_url, date_folder):
     directory_path = os.path.join('nhlteamreports', team_abbr, 'generalTRdata', date_folder, 'rollingavggraphs')
@@ -78,8 +82,44 @@ def download_charts(base_url, date_folder):
 
     print("All files have been downloaded.")
 
+
+def fetch_season_data(start_year, end_year):
+    base_url = "https://www.naturalstattrick.com/teamtable.php"
+    eng_data_folder = "ENGdataYbY"
+
+    # Create the ENGdataYbY directory if it does not exist
+    eng_data_path = os.path.join('nhlteamreports', eng_data_folder)
+    if not os.path.exists(eng_data_path):
+        os.makedirs(eng_data_path)
+
+    for year in range(start_year, end_year, 3):
+        from_season = f"{year}{year + 1:02d}"
+        thru_season = f"{min(year + 2, end_year - 1)}{min(year + 3, end_year):02d}"
+        url = f"{base_url}?fromseason={from_season}&thruseason={thru_season}&stype=2&sit=ena&score=all&rate=n&team=all&loc=B&gpf=410&fd=&td="
+
+        response = requests.get(url)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            tables = soup.find_all("table")
+            if tables:
+                df = pd.read_html(str(tables[0]))[0]
+                # Save each season's data to a separate CSV file
+                csv_filename = f"{from_season}-{thru_season}_ENGdata.csv"
+                df.to_csv(os.path.join(eng_data_path, csv_filename), index=False)
+                print(f"Data for seasons {from_season}-{thru_season} saved to {csv_filename}")
+            else:
+                print(f"No table found for seasons {from_season}-{thru_season}")
+        else:
+            print(f"Failed to retrieve data for seasons {from_season}-{thru_season}")
+
+
+
+
+
 # Main execution logic
 if __name__ == "__main__":
     current_date = datetime.now().strftime('%Y-%m-%d')
     allofit(current_date)
     download_charts("https://www.naturalstattrick.com/teams/20232024/charts/pos_rolling/", current_date)
+    # Fetch data from 2007-2008 to 2023-2024
+    #season_data = fetch_season_data(2007, 2024)
