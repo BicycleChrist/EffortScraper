@@ -13,6 +13,20 @@ nhl_teams = [
     'SEA', 'STL', 'T.B', 'TOR', 'VGK', 'WSH', 'WPG', 'VAN'
 ]
 
+site_directory_paths = [
+/playerreport.php
+/gameflow.php
+/dl.php
+/hm.php
+/game.php
+/linestats.php?
+/graphs/
+/heatmaps/
+/images/
+/DataTables-1.10.3/
+]
+
+
 def get_static_tables(team_abbr, date_folder):
     url = f"https://www.naturalstattrick.com/teamreport.php?team={team_abbr}"
     base_folder_path = "nhlteamreports"  # Main folder
@@ -119,7 +133,7 @@ def fetch_season_data(start_year, end_year):
 # Main execution logic
 if __name__ == "__main__":
     current_date = datetime.now().strftime('%Y-%m-%d')
-    allofit(current_date)
-    download_charts("https://www.naturalstattrick.com/teams/20232024/charts/pos_rolling/", current_date)
-    # Fetch data from 2007-2008 to 2023-2024
-    #season_data = fetch_season_data(2007, 2024)
+    #allofit(current_date)
+    #download_charts("https://www.naturalstattrick.com/teams/20232024/charts/pos_rolling/", current_date)
+    # Fetch data from 2007-2008 to 2023-2024 (presently for empty net goals)
+    season_data = fetch_season_data(2007, 2024)
