@@ -14,16 +14,16 @@ nhl_teams = [
 ]
 
 site_directory_paths = [
-/playerreport.php
-/gameflow.php
-/dl.php
-/hm.php
-/game.php
-/linestats.php?
-/graphs/
-/heatmaps/
-/images/
-/DataTables-1.10.3/
+"/playerreport.php"
+"/gameflow.php"
+"/dl.php"
+"/hm.php"
+"/game.php"
+"/linestats.php?"
+"/graphs/"
+"/heatmaps/"
+"/images/"
+"/DataTables-1.10.3/"
 ]
 
 

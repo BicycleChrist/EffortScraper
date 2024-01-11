@@ -5,7 +5,7 @@ url = "https://www.naturalstattrick.com/playerlist.php"
 
 def download_html(url, file_name):
     response = requests.get(url)
-    response.raise_for_status()  # Raises an HTTPError if the HTTP request returned an unsuccessful status code
+    response.raise_for_status()  # never gotten denied but I suppose ill keep it in
 
     with open(file_name, 'w', encoding='utf-8') as file:
         file.write(response.text)
@@ -19,7 +19,7 @@ def parse_player_names_ids(file_path):
     soup = BeautifulSoup(html_content, 'html.parser')
     players = {}
 
-    # Find all 'a' tags with 'href' attributes containing 'playerreport.php'
+    # sniff out 'a' tags with 'href' attributes containing 'playerreport.php'
     player_links = soup.find_all('a', href=lambda href: href and 'playerreport.php' in href)
 
     # Iterate over each link, extract the player name and ID, and add to the dictionary
@@ -34,13 +34,13 @@ def parse_player_names_ids(file_path):
 
     return players
 
-# Function to write player data to a file
+# write player data to a file
 def write_players_to_file(players_dict, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
         for name, player_id in players_dict.items():
             file.write(f"{name}: {player_id}\n")
 
-# Parse the HTML and get a dictionary of player names and IDs
+# Parse the HTML
 download_html(url, "playerlist.html")
 file_path = "playerlist.html"  # HTML file path
 players_dict = parse_player_names_ids(file_path)
