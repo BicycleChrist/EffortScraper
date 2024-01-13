@@ -22,4 +22,7 @@ JSON/
 .run/
 teamdata/
 savedsources/
-
+NHLvacuum/nhlstatvacc.py
+NHLvacuum/daily_game_scores
+NHLvacuum/nhlteamreports
+somepaths.py
