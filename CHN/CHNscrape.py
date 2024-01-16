@@ -41,7 +41,8 @@ def ConstructMethod(category):
 
 CHN_TeamIDs = {
     "Air-Force": 1,
-    "American-Intl": 5,
+    #"American-International": 5,  # the site no longer uses this one, it redirects
+    "American-Intl": 5,  # use this one to avoid redirect
     "Army": 6,
     "Bentley": 8,
     "Canisius": 13,
@@ -226,7 +227,7 @@ def DownloadTeamData(url, save_path, searchmethod):
         elif response.status_code == 404:
             print(f"404 URL not found: {url}")
         elif response.status_code == 302:
-            print(f"Skipping {url}, school likley got booted from D1")
+            print(f"Skipping {url}, due to page redirect")
         else:
             print(f"{response.status_code} URL returned not-good response: {url}")
     except Exception as e:
@@ -329,7 +330,7 @@ if __name__ == "__main__":
     # real
     if not TESTING_MODE_FLAG:   # do NOT rewrite to an 'else' statement
         assert TESTING_MODE_FLAG == False
-        newpage = GetPage("RIT", "skater")
+        newpage = GetPage("American-Intl", "skater")
         MetricsLinks = SpiderLinks("Maine", "metrics")
         print("success")
         print(MetricsLinks)
