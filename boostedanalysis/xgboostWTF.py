@@ -6,11 +6,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import numpy as np
 import joblib
 import os
-from somepaths import basefolder
-
 
 # Load data
-file_path = (basefolder / 'nflrip/newdata/weekly_data_2018_2019.csv')
+file_path = '/home/retupmoc/PycharmProjects/EffortScraper/boostedanalysis/weekly_data_2020_2021.csv'
 df = pd.read_csv(file_path)
 
 # Drop non-predictive columns
@@ -21,20 +19,21 @@ target = 'receiving_yards'
 y = df[target]
 
 # Select only the relevant independent variables
-include_cols = ['targets', 'target_share', 'air_yards_share', 'wopr']
+include_cols = ['targets', 'target_share', 'air_yards_share', 'wopr'].
 X = df[include_cols]
 
 # Split the dataset into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # Initialize the XGBoost regressor
-xgb_regressor = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=420)
+xgb_regressor = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
 
 # Train the model on the training set
 xgb_regressor.fit(X_train, y_train)
 
 # Predict on the test set
 y_pred = xgb_regressor.predict(X_test)
+
 # Evaluate the model
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 mae = mean_absolute_error(y_test, y_pred)
