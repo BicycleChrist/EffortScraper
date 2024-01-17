@@ -1,0 +1,190 @@
+Los Angeles Kings vs Washington Capitals
+	 - Final Score: 3  4
+	 - Best Odds: (['-182', '+174'])
+	syntheticHold: 1.9%
+Calgary Flames vs Chicago Blackhawks
+	 - Final Score: 3  4
+	 - Best Odds: (['-223', '+205'])
+	syntheticHold: 2.25%
+Arizona Coyotes vs Winnipeg Jets
+	eventStart: 315:56P2
+	 - Best Odds: (['-146', '+135'])
+	syntheticHold: 1.87%
+Anaheim Ducks vs Detroit Red Wings
+	eventStart: 0110:55P1
+	 - Best Odds: (['-154', '+153'])
+	syntheticHold: 0.78%
+Philadelphia Flyers vs Pittsburgh Penguins
+	eventStart: 1/083:00 PM
+	 - Best Odds: (['-120', '+112'])
+	syntheticHold: 1.69%
+New York Rangers vs Vancouver Canucks
+	eventStart: 1/083:00 PM
+	 - Best Odds: (['+123', '-135'])
+	syntheticHold: 2.24%
+Dallas Stars vs Minnesota Wild
+	eventStart: 1/084:00 PM
+	 - Best Odds: (['-133', '+127'])
+	syntheticHold: 1.65%
+Boston Bruins vs Colorado Avalanche
+	eventStart: 1/085:00 PM
+	 - Best Odds: (['+115', '-125'])
+	syntheticHold: 2.03%
+San Jose Sharks vs Toronto Maple Leafs
+	eventStart: 1/093:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Los Angeles Kings vs Tampa Bay Lightning
+	eventStart: 1/093:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Buffalo Sabres vs Seattle Kraken
+	eventStart: 1/093:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+New York Islanders vs Vancouver Canucks
+	eventStart: 1/093:30 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Anaheim Ducks vs Nashville Predators
+	eventStart: 1/094:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Columbus Blue Jackets vs Winnipeg Jets
+	eventStart: 1/094:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Florida Panthers vs St. Louis Blues
+	eventStart: 1/094:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Chicago Blackhawks vs Edmonton Oilers
+	eventStart: 1/094:30 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Calgary Flames vs Ottawa Senators
+	eventStart: 1/095:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Arizona Coyotes vs Boston Bruins
+	eventStart: 1/095:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+Montreal Canadiens vs Philadelphia Flyers
+	eventStart: 1/103:00 PM
+	 - Best Odds: ([])
+	syntheticHold: 
+	8: -200  +170
+	67: -182  +174
+	78: -200  +165
+	66: -186  +174
+	60: -196  +165
+	2: -196  +162
+	8: -245  +203
+	67: -223  +208
+	78: -240  +195
+	66: -225  +194
+	60: -238  +200
+	2: -240  +195
+	8: -155  +135
+	67: -147  +127
+	78: -160  +135
+	66: -146  +136
+	60: -149  +130
+	2: -146  +122
+	8: -168  +146
+	67: -160  +153
+	78: -165  +140
+	66: -174  +150
+	60: -154  +135
+	2: -170  +140
+	8: -125  +105
+	67: -120  +108
+	78: -125  +105
+	66: 
+	60: -125  +105
+	2: 
+	8: +123  -143
+	67: +122  -135
+	78: +120  -140
+	66: 
+	60: +120  -141
+	2: +118  -142
+	8: -140  +120
+	67: -133  +122
+	78: -140  +120
+	66: 
+	60: -141  +120
+	2: -140  +116
+	8: +106  -126
+	67: +115  -127
+	78: +110  -130
+	66: 
+	60: +115  -135
+	2: +112  -134
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 
+	8: 
+	67: 
+	78: 
+	66: 
+	60: 
+	2: 

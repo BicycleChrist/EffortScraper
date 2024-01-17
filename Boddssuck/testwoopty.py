@@ -2,8 +2,18 @@ import pathlib
 from bs4 import BeautifulSoup
 import argparse
 
-# List to store formatted strings
-formatted_strings = []
+
+nhl_teams = [
+    'Anaheim Ducks', 'Arizona Coyotes', 'Boston Bruins', 'Buffalo Sabres',
+    'Calgary Flames', 'Carolina Hurricanes', 'Chicago Blackhawks',
+    'Colorado Avalanche', 'Columbus Blue Jackets', 'Dallas Stars', 'Detroit Red Wings',
+    'Edmonton Oilers', 'Florida Panthers', 'Los Angeles Kings', 'Minnesota Wild',
+    'Montreal Canadiens', 'Nashville Predators', 'New Jersey Devils', 'New York Islanders',
+    'New York Rangers', 'Ottawa Senators', 'Philadelphia Flyers', 'Pittsburgh Penguins',
+    'San Jose Sharks', 'Seattle Kraken', 'St. Louis Blues', 'Tampa Bay Lightning',
+    'Toronto Maple Leafs', 'Vegas Golden Knights', 'Washington Capitals',
+    'Winnipeg Jets', 'Vancouver Canucks'
+]
 
 
 def GetSavePath(leagueselect="nhl", purpose="source"):
@@ -39,69 +49,71 @@ def ParseUB(page_source: BeautifulSoup):
 
 
 def dan_html_extractor(soup):
-    global formatted_strings  # Use the global variable
-
-    processed_teams = set()
-
-    # List of NHL teams
-    nhl_teams = [
-        'Anaheim Ducks', 'Arizona Coyotes', 'Boston Bruins', 'Buffalo Sabres',
-        'Calgary Flames', 'Carolina Hurricanes', 'Chicago Blackhawks',
-        'Colorado Avalanche', 'Columbus Blue Jackets', 'Dallas Stars', 'Detroit Red Wings',
-        'Edmonton Oilers', 'Florida Panthers', 'Los Angeles Kings', 'Minnesota Wild',
-        'Montreal Canadiens', 'Nashville Predators', 'New Jersey Devils', 'New York Islanders',
-        'New York Rangers', 'Ottawa Senators', 'Philadelphia Flyers', 'Pittsburgh Penguins',
-        'San Jose Sharks', 'Seattle Kraken', 'St. Louis Blues', 'Tampa Bay Lightning',
-        'Toronto Maple Leafs', 'Vegas Golden Knights', 'Washington Capitals',
-        'Winnipeg Jets'
-    ]
-
+    all_cell_data = []
     row_elements = soup.find_all('div', {'role': 'row'})
-    if len(row_elements) == 0:
-        return formatted_strings
-
     for row_element in row_elements:
         # Skip if it's a header row
         if 'header' in row_element.get('class', ''):
             continue
-
-        cell_data = {}
+        # TODO: associate rows with cells
         for cell in row_element.find_all('div', {'role': 'gridcell'}):
-            col_id = cell.get('col-id')
-            cell_value = cell.text.strip()
-            cell_data[col_id] = cell_value
+            cell_data = {}
+            cell_data['col-id'] = cell.get('col-id', -1)
+            cell_data['value'] = cell.text.strip()
+            all_cell_data.append(cell_data)
+    return all_cell_data
 
-        if 'eventStart' in cell_data:
-            if 'Final' in cell_data['eventStart']:
-                cell_data['Status'] = 'Final'
-                event_start = cell_data['eventStart'].replace('Final', '').strip()
-                if event_start.isdigit() and len(event_start) == 2:
-                    event_start = f"{event_start[0]} {event_start[1]}"
 
-                # Find the team in the row
-                team_name = next((team for team in nhl_teams if team in cell_data.get('eventId', '')), None)
+def FormatColumnString(cell_data):
+    if cell_data['col-id'] == -1:
+        return "invalid"
+    if cell_data['col-id'] == 'eventId':
+        # Find the teams in the row
+        team_names = [team for team in nhl_teams if team in cell_data['value']]
+        #assert (len(team_names) == 2)
+        if not (len(team_names) == 2):
+            return f"{team_names}"
+        team_name = team_names[0]
+        opposing_team_name = team_names[1]
+        return f"{team_name} vs {opposing_team_name}"
 
-                if team_name and team_name not in processed_teams:
-                    processed_teams.add(team_name)
+    if cell_data['col-id'] == 'eventStart':
+        if 'Final' in cell_data['value']:
+            # cell_data['Status'] = 'Final'
+            event_start = cell_data['value'].replace('Final', '').strip()
+            # add a space between the digits
+            if event_start.isdigit() and len(event_start) == 2:
+                event_start = f"{event_start[0]} {event_start[1]}"
+            return f" - Final Score: {event_start[:2]} {event_start[2:]}"
+        else:   # TODO: more complex formatting for all possible layouts
+            return f"eventStart: {cell_data['value']}"
 
-                    # Find the opposing team
-                    opposing_team_name = next(
-                        (opposing_team for opposing_team in nhl_teams if
-                         opposing_team in cell_data.get('eventId', '') and opposing_team != team_name), None)
+    if cell_data['col-id'] == "bestLine":
+        odds = [s for s in cell_data['value'].split(' ') if len(s) > 0]  # there are two spaces in the string
+        #return f" - Best Odds: ({odds[0], odds[1]})"
+        return f" - Best Odds: ({odds})"
 
-                    if opposing_team_name:
-                        odds_team1, odds_team2 = cell_data.get('bestLine', '').split()
-                        formatted_strings.append(
-                            f"{team_name} vs {opposing_team_name} - Final Score: {event_start[:2]} {event_start[2:]} - Best Odds: ({odds_team1}, {odds_team2})"
-                        )
+    return f"{cell_data['col-id']}: {cell_data['value']}"
 
+
+def FormatCellData(all_cell_data):
+    formatted_strings = []
+    working_string = ''
+    for cell_data in all_cell_data:
+        if cell_data['col-id'] == 'eventId':  # start new row
+            if len(working_string) > 0:
+                formatted_strings.append(working_string)
+            working_string = FormatColumnString(cell_data)
+        else:
+            working_string = working_string + '\n\t' + FormatColumnString(cell_data)
+    formatted_strings.append(working_string)  # assume we have the full final row
     return formatted_strings
 
 
-def write_to_text_file(output_file="tickertapeformattedinfo.txt"):
+def write_to_text_file(inputtext, output_file="tickertapeformattedinfo.txt"):
     with open(output_file, 'w', encoding='utf-8') as file:
-        for ttstringd_string in formatted_strings:
-            file.write(f"{formatted_string}\n")
+        for ttstringd_string in inputtext:
+            file.write(f"{ttstringd_string}\n")
 
 
 if __name__ == "__main__":
@@ -111,16 +123,10 @@ if __name__ == "__main__":
 
     soup = LoadPagesource(args.leagueselect)
     table = ParseUB(soup)
-    dan_html_extractor(table)
-    write_to_text_file(output_file="tickertapeformattedinfo.txt")
+    intermediate_output = dan_html_extractor(table)
+    formatted_output = FormatCellData(intermediate_output)
+    write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
 
-    for formatted_string in formatted_strings:
+    for formatted_string in formatted_output:
         print(formatted_string)
-
-
-
-
-
-
-
 

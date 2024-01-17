@@ -27,3 +27,6 @@ NHLvacuum/daily_game_scores
 NHLvacuum/nhlteamreports
 somepaths.py
 **.csv
+Boddssuck/**.html
+Boddssuck/**.txt
+Boddssuck/parsedpage/
