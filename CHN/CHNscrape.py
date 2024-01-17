@@ -10,6 +10,7 @@ def GenericSearchmethod(soupdata, tagattrs):
     found_table = soupdata.find('table', attrs=tagattrs)
     return found_table
 
+
 # maps to URL segment, and any attributes required for BeautifulSoup lookup
 CHN_table_categories = {
     "skater": {
@@ -290,14 +291,25 @@ def SpiderLinks(teamname, targetlinktype="boxscore"):
 #            searchmethod = CHN_table_categories[parent_pagetype]['searchmethod']
 #            table = DownloadTeamData(url, save_path, searchmethod)
 
+
+# TODO: refactor into several functions
 def GetPage(teamname, category, savesources=True):
+    sourcepath = ExpectedPath(teamname, category, tosavedsource=True)
+    extractpath = ExpectedPath(teamname, category)
+    if extractpath.exists():  # load local file if it exists
+        print("loading from local file")
+        with open(extractpath, 'r', encoding='utf-8') as file:
+            soup = BeautifulSoup(file, 'html.parser')
+            searchmethod = ConstructMethod(category)
+            found_table = searchmethod(soup)
+        return found_table
+    # TODO: re-parse saved pagesource instead of redownloading if extract doesn't exist
     if newtargets := ConstructURLs(teamname, category):
         url, filepath = newtargets
         searchmethod = ConstructMethod(category)
         print(f"Scraping {teamname} - {category}...")
         table = DownloadTeamData(url, filepath, searchmethod)
         if table is not None and savesources:
-            sourcepath = ExpectedPath(teamname, category, tosavedsource=True)
             assert sourcepath is not None
             with open(sourcepath, 'w', encoding='utf-8') as sourcedump:
                 if table is not None:
@@ -327,11 +339,11 @@ if __name__ == "__main__":
         example_boxscore_links = spidermap["boxscore"]["searchmethod"](examplesoup)
         pprint.pprint(example_boxscore_links)
 
-    # real
+    # real code
     if not TESTING_MODE_FLAG:   # do NOT rewrite to an 'else' statement
         assert TESTING_MODE_FLAG == False
         newpage = GetPage("American-Intl", "skater")
         MetricsLinks = SpiderLinks("Maine", "metrics")
         print("success")
+        #print(newpage)
         print(MetricsLinks)
-
