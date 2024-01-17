@@ -31,3 +31,4 @@ scipy
 matplotlib
 scikit-learn
 xgboost
+joblib
