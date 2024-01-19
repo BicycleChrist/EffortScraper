@@ -1,0 +1,254 @@
+
+	<a>Index of Seasons</a>				<div>
+								<ul class="linear">
+												<li>
+					<a href="/schedules/?season=20232024">					2023‑24					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20222023">					2022‑23					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20212022">					2021‑22					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20202021">					2020‑21					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20192020">					2019‑20					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20182019">					2018‑19					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20172018">					2017‑18					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20162017">					2016‑17					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20152016">					2015‑16					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20142015">					2014‑15					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20132014">					2013‑14					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20122013">					2012‑13					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20112012">					2011‑12					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20102011">					2010‑11					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20092010">					2009‑10					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20082009">					2008‑09					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20072008">					2007‑08					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20062007">					2006‑07					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20052006">					2005‑06					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20042005">					2004‑05					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20032004">					2003‑04					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20022003">					2002‑03					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20012002">					2001‑02					</a>				</li>
+												<li>
+					<a href="/schedules/?season=20002001">					2000‑01					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19992000">					1999‑00					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19981999">					1998‑99					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19971998">					1997‑98					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19961997">					1996‑97					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19951996">					1995‑96					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19941995">					1994‑95					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19931994">					1993‑94					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19921993">					1992‑93					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19911992">					1991‑92					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19901991">					1990‑91					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19891990">					1989‑90					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19881989">					1988‑89					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19871988">					1987‑88					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19861987">					1986‑87					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19851986">					1985‑86					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19841985">					1984‑85					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19831984">					1983‑84					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19821983">					1982‑83					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19811982">					1981‑82					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19801981">					1980‑81					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19791980">					1979‑80					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19781979">					1978‑79					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19771978">					1977‑78					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19761977">					1976‑77					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19751976">					1975‑76					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19741975">					1974‑75					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19731974">					1973‑74					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19721973">					1972‑73					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19711972">					1971‑72					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19701971">					1970‑71					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19691970">					1969‑70					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19681969">					1968‑69					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19671968">					1967‑68					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19661967">					1966‑67					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19651966">					1965‑66					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19641965">					1964‑65					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19631964">					1963‑64					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19621963">					1962‑63					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19611962">					1961‑62					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19601961">					1960‑61					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19591960">					1959‑60					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19581959">					1958‑59					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19571958">					1957‑58					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19561957">					1956‑57					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19551956">					1955‑56					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19541955">					1954‑55					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19531954">					1953‑54					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19521953">					1952‑53					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19511952">					1951‑52					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19501951">					1950‑51					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19491950">					1949‑50					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19481949">					1948‑49					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19471948">					1947‑48					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19461947">					1946‑47					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19451946">					1945‑46					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19441945">					1944‑45					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19431944">					1943‑44					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19421943">					1942‑43					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19411942">					1941‑42					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19401941">					1940‑41					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19391940">					1939‑40					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19381939">					1938‑39					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19371938">					1937‑38					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19361937">					1936‑37					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19351936">					1935‑36					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19341935">					1934‑35					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19331934">					1933‑34					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19321933">					1932‑33					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19311932">					1931‑32					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19301931">					1930‑31					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19291930">					1929‑30					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19281929">					1928‑29					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19271928">					1927‑28					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19261927">					1926‑27					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19251926">					1925‑26					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19241925">					1924‑25					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19231924">					1923‑24					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19221923">					1922‑23					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19211922">					1921‑22					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19201921">					1920‑21					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19191920">					1919‑20					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19181919">					1918‑19					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19171918">					1917‑18					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19161917">					1916‑17					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19151916">					1915‑16					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19141915">					1914‑15					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19131914">					1913‑14					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19121913">					1912‑13					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19111912">					1911‑12					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19101911">					1910‑11					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19091910">					1909‑10					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19081909">					1908‑09					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19071908">					1907‑08					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19061907">					1906‑07					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19051906">					1905‑06					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19041905">					1904‑05					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19031904">					1903‑04					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19021903">					1902‑03					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19011902">					1901‑02					</a>				</li>
+												<li>
+					<a href="/schedules/?season=19001901">					1900‑01					</a>				</li>
+							</ul>
+				</div>
+

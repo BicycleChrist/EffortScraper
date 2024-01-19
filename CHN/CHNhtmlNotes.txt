@@ -11,6 +11,11 @@ CssSelect:li.full:nth-child(4) > a:nth-child(1)
 table class ="data schedule"
 div class = "noprint nomobileonly"
 
+schedules can be looked up by date rather than team
+https://www.collegehockeynews.com/schedules/?date=20231004
+or by season:
+https://www.collegehockeynews.com/schedules/?season=20232024
+
 Box score within schedule page attributes:
 div id ="content"
 class = "box"

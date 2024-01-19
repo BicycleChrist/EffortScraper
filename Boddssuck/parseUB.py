@@ -118,9 +118,10 @@ if __name__ == "__main__":
     soup = LoadPagesource("nhl")
     table = ParseUB(soup)
     dandict = dan_html_extractor(table)
-   # pprint.pprint(dandict)
+    #pprint.pprint(dandict)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagueselect", default="nhl", help="Select the league (default: nhl)")
     args = parser.parse_args()
-    soup = LoadPagesource(args.leagueselect)
+    newsoup = LoadPagesource(args.leagueselect)
     print("plsdon'texit")

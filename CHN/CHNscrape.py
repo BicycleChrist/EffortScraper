@@ -12,6 +12,7 @@ def GenericSearchmethod(soupdata, tagattrs):
 
 
 # maps to URL segment, and any attributes required for BeautifulSoup lookup
+# TODO: add boxscores
 CHN_table_categories = {
     "skater": {
         'urlseg': 'stats',
@@ -28,6 +29,9 @@ CHN_table_categories = {
         'searchmethod': GenericSearchmethod,
         'htmlattrs': {'class': 'data schedule'},
     },
+    "boxscores": {  # I don't think this really makes sense
+        'urlseg': 'box',  # might need to append 'metrics.php' or /box/final/...
+    },
 }
 # TODO: possibly write a class instead
 
@@ -40,6 +44,7 @@ def ConstructMethod(category):
     return lambda soupthing: method(soupthing, attrs)
 
 
+# TODO: move this into the other file
 CHN_TeamIDs = {
     "Air-Force": 1,
     #"American-International": 5,  # the site no longer uses this one, it redirects
@@ -110,6 +115,15 @@ CHN_TeamIDs = {
     #"Utica": 356,
     #"Alabama-Huntsville": 2,
 }
+
+# TODO: map team-names to abbreviations (mostly used internally for hrefs)
+# you can potentially automate this by visiting each team's page and checking the url for their logo
+# the xpath is:
+# /html/body/div[1]/div[2]/div[1]/div/img
+# from https://www.collegehockeynews.com/reports/team/Maine/25
+
+# TODO: map team-ids to team-logos
+
 
 # reverse-lookup (teamname by ID)
 reversedict_TeamIDs = {v:k for k,v in CHN_TeamIDs.items()}
@@ -246,22 +260,31 @@ def DownloadTeamData(url, save_path, searchmethod):
 #        download_goalie_table(team_name)
 
 
+# TODO: exhibition games will provide a boxscore link, but the page just says 'Game Not Available'
+    # and they don't provide a metrics link
 def Spidermethod(soupdata, linktext):
     box_score_links = soupdata.find_all('a', text=linktext)
     box_score_urls = [f"{CHN_URL}{link.get('href')}" for link in box_score_links]
     return box_score_urls
 
 
+# encodingmethod is the function that generates the filename from url
 spidermap = {
     "boxscore": {
         "parentcategory": "schedule",
         "searchmethod": lambda soupthing: Spidermethod(soupthing, 'Box'),
+        #"encodingmethod": lambda url:
+        # TODO: encode the teamnames into the filename, under a folder that's just the date
     },
     "metrics": {
         "parentcategory": "schedule",
-        "searchmethod": lambda soupthing: Spidermethod(soupthing, 'Metrics')
+        "searchmethod": lambda soupthing: Spidermethod(soupthing, 'Metrics'),
+        "encodingmethod": lambda url: url.split('gd=')[1],
     },
 }
+# TODO: somehow associate the metrics and boxscore with the schedule.html they came from, the date, and/or game-id
+# and somehow make it possible to lookup games with any combination of those
+# also, the schedule htmls will now need to encode the date-range/seasons they contain.
 
 
 # because this function only applies to schedule-pages, we know the filepath given only the teamname
@@ -291,6 +314,12 @@ def SpiderLinks(teamname, targetlinktype="boxscore"):
 #            searchmethod = CHN_table_categories[parent_pagetype]['searchmethod']
 #            table = DownloadTeamData(url, save_path, searchmethod)
 
+
+# TODO: schedules can be looked up by date(/schedules/?date=20231004) or season(?season=20232024)
+# TODO: you can also just look at .../teamhistory/, or append the season to the team url, like:
+# https://www.collegehockeynews.com/schedules/team/Air-Force/1/20232024
+# TODO: create a list (or dict) from SeasonIndex.txt (those are the only valid values in the url when searching by season)
+# Nevermind, it's literally just two years concatenated together. Validate it I guess.
 
 # TODO: refactor into several functions
 def GetPage(teamname, category, savesources=True):

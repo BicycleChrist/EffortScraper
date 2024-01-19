@@ -14,7 +14,8 @@ def DownloadUBpage(leagueselect="nhl"):
     #page_source = driver.page_source
     #current_date = datetime.now().strftime("%Y%m%d")
     #filename = f"nhlodds_{current_date}.txt"
-    savepath = cwd / "pagesource" / f"{leagueselect}{current_date}.html"
+    #savepath = cwd / "pagesource" / f"{leagueselect}{current_date}.html"
+    savepath = cwd / "pagesource" / f"{leagueselect}.html"
     with open(savepath, 'w', encoding='utf-8') as file:
         file.write(driver.page_source)
     print(f"Results saved to: {savepath}")
