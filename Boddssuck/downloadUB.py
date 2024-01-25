@@ -30,5 +30,6 @@ if __name__ == "__main__":
     options.add_argument("--headless")
     driver = webdriver.Firefox(options=options, keep_alive=True)
     driver.implicitly_wait(6)
+    driver.set_window_size(5760, 3240)  # forces the whole table to load (no horizontal scrolling)
     DownloadUBpage("nhl")
     driver.quit()

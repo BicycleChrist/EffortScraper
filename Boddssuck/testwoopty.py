@@ -41,27 +41,72 @@ def LoadPagesource(leagueselect="nhl"):
         return soup
 
 
+# TODO: also return the header-rows for the table
 def ParseUB(page_source: BeautifulSoup):
     top_container = page_source.find('div', attrs={'class': 'd-flex flex-grow-1'})
     top_container = top_container.find('div', attrs={'class': 'ag-theme-alpine-dark'})
+    header_row = top_container.find('div', attrs={'class': "ag-header"})
     toptable = top_container.find('div', attrs={'class': "ag-body-viewport"})
-    return toptable
+    return toptable, header_row
+
+
+# we need aria-colindex to associate headers with cells;
+# for some reason headers don't have 'col-id'; only the cells (and the don't match)
+
+# TODO: parse the logo's filename out of the header cell's image url
+# encoded in the 'style' attribute
+# background-image: url("https://assets.unabated.com/sportsbooks/logos/bovada.svg");
+# we can't use the 'title' because there are random things appended to it ("Real-Time", etc),
+# and we need to know the file-extension
+
+# Also, the page seems to unload any columns that are horizontally scrolled out of view
+# make sure that isn't affecting the download script
+
+# aria-colindex is defined in the same div as
+# class="ag-header-cell" role="columnheader"
+# the image-url is nested a few levels inside that, child of class "market-header"
+
+# TODO: use simple string splitting instead of regex
+import re
+
+def dan_parse_header(soup):
+    header_data = {}
+    header_row = soup.find('div', {'class': 'ag-header-viewport'})  # this is the section that has all the logos
+    # the left-side section of the header row ('Best-Line', 'Hold', score, etc.) is the sibling element 'ag-pinned-left-header'
+    #header_cells = header_row.find_all('div', {'role': 'columnheader'})
+    header_cells = header_row.find_all('div', {'class': 'ag-header-cell'})
+    for header_cell in header_cells:
+        col_index = header_cell.get('aria-colindex', -1)
+        # Extract logo filename if present
+        market_header = header_cell.find('div', {'class': 'market-header'})
+        if market_header:
+            child_div = list(market_header.descendants)[0]
+            style = child_div.get('style', '')
+            logo_url_match = re.search(r'url\("([^"]+)"\)', style)
+            if logo_url_match:
+                logo_url = logo_url_match.group(1)
+                filename = logo_url.split('/')[-1]  # Extract filename from URL
+                header_data[col_index] = filename
+    return header_data
 
 
 def dan_html_extractor(soup):
     all_cell_data = []
     row_elements = soup.find_all('div', {'role': 'row'})
     for row_element in row_elements:
-        # Skip if it's a header row
-        if 'header' in row_element.get('class', ''):
-            continue
-        # TODO: associate rows with cells
+        row_index = row_element.get('aria-rowindex', -1)
         for cell in row_element.find_all('div', {'role': 'gridcell'}):
-            cell_data = {}
-            cell_data['col-id'] = cell.get('col-id', -1)
-            cell_data['value'] = cell.text.strip()
+            cell_data = {
+                'aria-colindex': cell.get('aria-colindex', -1),
+                'col-id': cell.get('col-id', -1),
+                'value': cell.text.strip(),
+                'comp-id': cell.get('comp-id', -1),
+                'aria-rowindex': row_index
+            }
             all_cell_data.append(cell_data)
-    return all_cell_data
+
+    return all_cell_data, header_data
+
 
 
 def FormatColumnString(cell_data):
@@ -122,11 +167,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     soup = LoadPagesource(args.leagueselect)
-    table = ParseUB(soup)
-    intermediate_output = dan_html_extractor(table)
-    formatted_output = FormatCellData(intermediate_output)
-    write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
+    table, header_row = ParseUB(soup)
+    whatever = dan_parse_header(soup)
+    print(whatever)
+    #intermediate_output, intermediate_headers = dan_html_extractor(table)
+    #formatted_output = FormatCellData(intermediate_output)
+    #write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
+    #print(intermediate_output)
 
-    for formatted_string in formatted_output:
-        print(formatted_string)
+    #for formatted_string in formatted_output:
+    #    print(formatted_string)
 
