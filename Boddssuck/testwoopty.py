@@ -1,6 +1,7 @@
 import pathlib
 from bs4 import BeautifulSoup
 import argparse
+import pprint
 
 
 nhl_teams = [
@@ -76,7 +77,8 @@ def dan_parse_header(soup):
     #header_cells = header_row.find_all('div', {'role': 'columnheader'})
     header_cells = header_row.find_all('div', {'class': 'ag-header-cell'})
     for header_cell in header_cells:
-        col_index = header_cell.get('aria-colindex', -1)
+        aria_col_index = header_cell.get('aria-colindex', -1)
+        col_index = header_cell.get('col-id', 'invalid')
         # Extract logo filename if present
         market_header = header_cell.find('div', {'class': 'market-header'})
         if market_header:
@@ -86,7 +88,8 @@ def dan_parse_header(soup):
             if logo_url_match:
                 logo_url = logo_url_match.group(1)
                 filename = logo_url.split('/')[-1]  # Extract filename from URL
-                header_data[col_index] = filename
+                #header_data[aria_col_index] = (filename, col_index)
+                header_data[aria_col_index] = filename
     return header_data
 
 
@@ -105,10 +108,11 @@ def dan_html_extractor(soup):
             }
             all_cell_data.append(cell_data)
 
-    return all_cell_data, header_data
+    return all_cell_data
 
 
-
+# TODO: apparently 'col-id' has a different use in the left and right sides of the table
+# in the first it's the title of the column, in the right it's just a numeric UID?
 def FormatColumnString(cell_data):
     if cell_data['col-id'] == -1:
         return "invalid"
@@ -142,17 +146,37 @@ def FormatColumnString(cell_data):
 
 
 def FormatCellData(all_cell_data):
+    moneylinemap = {}  # storing the cells containing odds so we can lookup the sportsbook names and format by row
     formatted_strings = []
     working_string = ''
+    rowmap = {}
+    listindex = 0
     for cell_data in all_cell_data:
         if cell_data['col-id'] == 'eventId':  # start new row
-            if len(working_string) > 0:
+            if len(working_string) > 0:  # prevent pushing an empty string on first iteration
+                current_rowindex = cell_data['aria-rowindex']
                 formatted_strings.append(working_string)
+                rowmap[current_rowindex] = {'listindex': listindex, 'aria-rowindex': current_rowindex}
+                listindex += 1
             working_string = FormatColumnString(cell_data)
+        # all the cells containing odds are listed AFTER you've traversed all the initial game-info columns
+        # so you have to associate the odds with rows/games post-hoc
+        elif cell_data['col-id'].isdigit():  # this attribute is used as an id in the right-side of the table
+            bookname = booknames[cell_data['aria-colindex']]  # not doing lookup here because there's no easy way to pass it into this function
+            bookname = bookname.split('.')[0]  # removing file-extension
+            if cell_data['aria-rowindex'] not in moneylinemap:
+                moneylinemap[cell_data['aria-rowindex']] = []
+            if cell_data['value'] == '':
+                continue
+            moneylinemap[cell_data['aria-rowindex']].append(f"{bookname}: {cell_data['value']}")
+            #working_string = working_string + f"{bookname}: {cell_data['value']} : {cell_data['aria-rowindex']}"
         else:
             working_string = working_string + '\n\t' + FormatColumnString(cell_data)
     formatted_strings.append(working_string)  # assume we have the full final row
-    return formatted_strings
+    # jank workaround for finding rowindex for last line
+    lastrowindex = all_cell_data[-1]['aria-rowindex']
+    rowmap[lastrowindex] = {'listindex': listindex, 'aria-rowindex': lastrowindex}
+    return formatted_strings, moneylinemap, rowmap
 
 
 def write_to_text_file(inputtext, output_file="tickertapeformattedinfo.txt"):
@@ -168,13 +192,20 @@ if __name__ == "__main__":
 
     soup = LoadPagesource(args.leagueselect)
     table, header_row = ParseUB(soup)
-    whatever = dan_parse_header(soup)
-    print(whatever)
-    #intermediate_output, intermediate_headers = dan_html_extractor(table)
-    #formatted_output = FormatCellData(intermediate_output)
+    booknames = dan_parse_header(soup)
+    pprint.pprint(booknames)
+    #pprint.pprint(header_row)
+
+    intermediate_output = dan_html_extractor(table)
+    formatted_output, moneylines, rowmapthing = FormatCellData(intermediate_output)
     #write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
     #print(intermediate_output)
 
-    #for formatted_string in formatted_output:
-    #    print(formatted_string)
-
+    #pprint.pprint(moneylines)
+    for magicnumbers in rowmapthing.values():
+        #print(magicnumbers)
+        print(formatted_output[magicnumbers['listindex']])
+        if len(moneylines) > 0:  # TODO: check if there's any odds listed. This doesn't work because all books have a default entry (an empty string)
+            print(f"\t--------MONEYLINES--------")
+        for odds in moneylines[magicnumbers['aria-rowindex']]:
+            print(f"\t\t{odds}")
