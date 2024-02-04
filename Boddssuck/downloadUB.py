@@ -4,9 +4,12 @@ from selenium.webdriver.firefox.options import Options
 from time import sleep
 import pathlib
 
+from LeagueMap import *
+TEAMLIST = leaguemap[DEFAULT_LEAGUE_SELECT]
 
-def DownloadUBpage(leagueselect="nhl"):
-    url = f"https://unabated.com/{leagueselect}/odds"
+
+def DownloadUBpage(leagueselect):
+    url = f"https://unabated.com/{leagueselect.lower()}/odds"   # url must be lowercase
     driver.get(url)
     sleep(5)  # Wait for the JavaScript to execute (you may need to adjust the wait time)
     # TODO: better wait condition (find element consistently-present across pages to wait on)
@@ -31,5 +34,5 @@ if __name__ == "__main__":
     driver = webdriver.Firefox(options=options, keep_alive=True)
     driver.implicitly_wait(6)
     driver.set_window_size(5760, 3240)  # forces the whole table to load (no horizontal scrolling)
-    DownloadUBpage("nhl")
+    DownloadUBpage(DEFAULT_LEAGUE_SELECT)
     driver.quit()

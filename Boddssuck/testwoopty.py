@@ -3,21 +3,11 @@ from bs4 import BeautifulSoup
 import argparse
 import pprint
 
-
-nhl_teams = [
-    'Anaheim Ducks', 'Arizona Coyotes', 'Boston Bruins', 'Buffalo Sabres',
-    'Calgary Flames', 'Carolina Hurricanes', 'Chicago Blackhawks',
-    'Colorado Avalanche', 'Columbus Blue Jackets', 'Dallas Stars', 'Detroit Red Wings',
-    'Edmonton Oilers', 'Florida Panthers', 'Los Angeles Kings', 'Minnesota Wild',
-    'Montreal Canadiens', 'Nashville Predators', 'New Jersey Devils', 'New York Islanders',
-    'New York Rangers', 'Ottawa Senators', 'Philadelphia Flyers', 'Pittsburgh Penguins',
-    'San Jose Sharks', 'Seattle Kraken', 'St. Louis Blues', 'Tampa Bay Lightning',
-    'Toronto Maple Leafs', 'Vegas Golden Knights', 'Washington Capitals',
-    'Winnipeg Jets', 'Vancouver Canucks'
-]
+from LeagueMap import *
+TEAMLIST = leaguemap[DEFAULT_LEAGUE_SELECT]
 
 
-def GetSavePath(leagueselect="nhl", purpose="source"):
+def GetSavePath(leagueselect, purpose="source"):
     cwd = pathlib.Path.cwd()
     assert cwd.name == "Boddssuck", "you're in the wrong directory"
     subdirs = {
@@ -32,7 +22,7 @@ def GetSavePath(leagueselect="nhl", purpose="source"):
     return savepath
 
 
-def LoadPagesource(leagueselect="nhl"):
+def LoadPagesource(leagueselect):
     filepath = GetSavePath(leagueselect, "source")
     if not filepath:
         print(f"LoadPagesource could not get filepath for: {leagueselect}")
@@ -117,7 +107,7 @@ def FormatColumnString(cell_data):
         return "invalid"
     if cell_data['col-id'] == 'eventId':
         # Find the teams in the row
-        team_names = [team for team in nhl_teams if team in cell_data['value']]
+        team_names = [team for team in TEAMLIST if team in cell_data['value']]
         #assert (len(team_names) == 2)
         if not (len(team_names) == 2):
             return f"{team_names}"
@@ -140,6 +130,22 @@ def FormatColumnString(cell_data):
         odds = [s for s in cell_data['value'].split(' ') if len(s) > 0]  # there are two spaces in the string
         #return f" - Best Odds: ({odds[0], odds[1]})"
         return f" - Best Odds: ({odds})"
+
+    # examplestring = '+2.5 -122-2.5 +108'
+    # if it's just a number instead of a label, we're dealing with one of the 'odds' cells
+    if cell_data['col-id'].isdigit():
+        match cell_data['value'].split():
+            case [spread1, midbad, odds2]:
+                match midbad.split(('+', '-')):
+                    case []
+                odds1, spread2 = midbad
+                lines = [
+                    [spread1, odds1],
+                    [spread2, odds2],
+                ]
+
+            case _:
+                print("no match")
 
     return f"{cell_data['col-id']}: {cell_data['value']}"
 
@@ -188,8 +194,11 @@ def write_to_text_file(inputtext, output_file="tickertapeformattedinfo.txt"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--leagueselect", default="nhl", help="Select the league (default: nhl)")
+    parser.add_argument("--leagueselect", default=DEFAULT_LEAGUE_SELECT, help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})")
     args = parser.parse_args()
+    TEAMLIST = leaguemap[args.leagueselect]
+    # updating the default doesn't actually affect anything; default-parameters in functions will still use the original value
+    DEFAULT_LEAGUE_SELECT = leaguemap[args.leagueselect]
 
     soup = LoadPagesource(args.leagueselect)
     table, header_row = ParseUB(soup)
@@ -211,3 +220,6 @@ if __name__ == "__main__":
             print(f"\t--------MONEYLINES--------")
         for odds in moneylines[magicnumbers['aria-rowindex']]:
             print(f"\t\t{odds}")
+
+
+    print("plsdontexit")
