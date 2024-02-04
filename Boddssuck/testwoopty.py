@@ -42,7 +42,6 @@ def LoadPagesource(leagueselect="nhl"):
         return soup
 
 
-# TODO: also return the header-rows for the table
 def ParseUB(page_source: BeautifulSoup):
     top_container = page_source.find('div', attrs={'class': 'd-flex flex-grow-1'})
     top_container = top_container.find('div', attrs={'class': 'ag-theme-alpine-dark'})
@@ -151,13 +150,15 @@ def FormatCellData(all_cell_data):
     working_string = ''
     rowmap = {}
     listindex = 0
+    current_rowindex = 0
+
     for cell_data in all_cell_data:
         if cell_data['col-id'] == 'eventId':  # start new row
             if len(working_string) > 0:  # prevent pushing an empty string on first iteration
-                current_rowindex = cell_data['aria-rowindex']
                 formatted_strings.append(working_string)
                 rowmap[current_rowindex] = {'listindex': listindex, 'aria-rowindex': current_rowindex}
                 listindex += 1
+            current_rowindex = cell_data['aria-rowindex']
             working_string = FormatColumnString(cell_data)
         # all the cells containing odds are listed AFTER you've traversed all the initial game-info columns
         # so you have to associate the odds with rows/games post-hoc
@@ -172,10 +173,10 @@ def FormatCellData(all_cell_data):
             #working_string = working_string + f"{bookname}: {cell_data['value']} : {cell_data['aria-rowindex']}"
         else:
             working_string = working_string + '\n\t' + FormatColumnString(cell_data)
+
     formatted_strings.append(working_string)  # assume we have the full final row
     # jank workaround for finding rowindex for last line
-    lastrowindex = all_cell_data[-1]['aria-rowindex']
-    rowmap[lastrowindex] = {'listindex': listindex, 'aria-rowindex': lastrowindex}
+    rowmap[current_rowindex] = {'listindex': listindex, 'aria-rowindex': current_rowindex}
     return formatted_strings, moneylinemap, rowmap
 
 
@@ -193,7 +194,7 @@ if __name__ == "__main__":
     soup = LoadPagesource(args.leagueselect)
     table, header_row = ParseUB(soup)
     booknames = dan_parse_header(soup)
-    pprint.pprint(booknames)
+    #pprint.pprint(booknames)
     #pprint.pprint(header_row)
 
     intermediate_output = dan_html_extractor(table)
@@ -202,6 +203,7 @@ if __name__ == "__main__":
     #print(intermediate_output)
 
     #pprint.pprint(moneylines)
+    #pprint.pprint(rowmapthing)
     for magicnumbers in rowmapthing.values():
         #print(magicnumbers)
         print(formatted_output[magicnumbers['listindex']])
