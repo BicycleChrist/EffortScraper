@@ -2,6 +2,7 @@ import pathlib
 from bs4 import BeautifulSoup
 import argparse
 import pprint
+import more_itertools
 
 from LeagueMap import *
 TEAMLIST = leaguemap[DEFAULT_LEAGUE_SELECT]
@@ -100,6 +101,20 @@ def dan_html_extractor(soup):
     return all_cell_data
 
 
+def SplitNumbers(text):
+    splits = [*more_itertools.split_before(text, lambda c: (c.startswith('+') or c.startswith('-')))]
+    if len(splits) == 2:
+        firstline = str(''.join(splits[0]))
+        secondline = str(''.join(splits[1]))
+    elif len(splits) == 4:
+        firstline = str(''.join(splits[0])) + str(''.join(splits[1])) + '\n'
+        secondline = str(''.join(splits[2])) + str(''.join(splits[3]))
+    else:
+        print("unexpected length post-split")
+        return []
+    return [firstline, secondline]
+
+
 # TODO: apparently 'col-id' has a different use in the left and right sides of the table
 # in the first it's the title of the column, in the right it's just a numeric UID?
 def FormatColumnString(cell_data):
@@ -131,22 +146,6 @@ def FormatColumnString(cell_data):
         #return f" - Best Odds: ({odds[0], odds[1]})"
         return f" - Best Odds: ({odds})"
 
-    # examplestring = '+2.5 -122-2.5 +108'
-    # if it's just a number instead of a label, we're dealing with one of the 'odds' cells
-    if cell_data['col-id'].isdigit():
-        match cell_data['value'].split():
-            case [spread1, midbad, odds2]:
-                match midbad.split(('+', '-')):
-                    case []
-                odds1, spread2 = midbad
-                lines = [
-                    [spread1, odds1],
-                    [spread2, odds2],
-                ]
-
-            case _:
-                print("no match")
-
     return f"{cell_data['col-id']}: {cell_data['value']}"
 
 
@@ -175,7 +174,14 @@ def FormatCellData(all_cell_data):
                 moneylinemap[cell_data['aria-rowindex']] = []
             if cell_data['value'] == '':
                 continue
-            moneylinemap[cell_data['aria-rowindex']].append(f"{bookname}: {cell_data['value']}")
+            # if it's just a number instead of a label, we're dealing with one of the 'odds' cells
+            oddslines = SplitNumbers(cell_data['value'])
+            # additional formatting to indent second line for oddslines with 4 numbers in them
+            if DEFAULT_LEAGUE_SELECT in FOURNUMBER_SPREAD_LEAGUES:
+                additionalspaces = len(bookname)
+                oddslines[1] = '\t\t  ' + ' '*additionalspaces + oddslines[1]
+            resultstring = ''.join(x for x in oddslines)
+            moneylinemap[cell_data['aria-rowindex']].append(f"{bookname}: {resultstring}")
             #working_string = working_string + f"{bookname}: {cell_data['value']} : {cell_data['aria-rowindex']}"
         else:
             working_string = working_string + '\n\t' + FormatColumnString(cell_data)
@@ -198,7 +204,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     TEAMLIST = leaguemap[args.leagueselect]
     # updating the default doesn't actually affect anything; default-parameters in functions will still use the original value
-    DEFAULT_LEAGUE_SELECT = leaguemap[args.leagueselect]
+    DEFAULT_LEAGUE_SELECT = args.leagueselect
 
     soup = LoadPagesource(args.leagueselect)
     table, header_row = ParseUB(soup)
