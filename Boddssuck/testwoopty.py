@@ -96,8 +96,21 @@ def dan_html_extractor(soup):
                 'comp-id': cell.get('comp-id', -1),
                 'aria-rowindex': row_index
             }
+            if cell_data['col-id'] == 'eventStart':  # TODO: might need to handle this differently if the game started ('final' and stuff)
+                deep = cell
+                lastchild = list(deep.descendants)
+                if 'OT' in cell_data['value']:  # game in overtime
+                    overtime_str = lastchild[-1]
+                    # -4 == 'Final'
+                    finalscores = lastchild[-10], lastchild[-7]
+                    cell_data['value'] = f"Final ({overtime_str}) {finalscores[0]}, {finalscores[1]}"
+                elif 'Final' in cell_data['value']:
+                    finalscores = lastchild[-7], lastchild[-4]
+                    cell_data['value'] = f"Final {finalscores[0]}, {finalscores[1]}"
+                else:
+                    time, date = lastchild[-1], lastchild[-3]  # -2 is the span containing the time
+                    cell_data['value'] = f"{time}, {date}"
             all_cell_data.append(cell_data)
-
     return all_cell_data
 
 
@@ -109,6 +122,8 @@ def SplitNumbers(text):
     elif len(splits) == 4:
         firstline = str(''.join(splits[0])) + str(''.join(splits[1])) + '\n'
         secondline = str(''.join(splits[2])) + str(''.join(splits[3]))
+    elif len(splits) == 0:
+        return []
     else:
         print("unexpected length post-split")
         return []
@@ -125,10 +140,13 @@ def FormatColumnString(cell_data):
         team_names = [team for team in TEAMLIST if team in cell_data['value']]
         #assert (len(team_names) == 2)
         if not (len(team_names) == 2):
+            print("did not find two teams")
             return f"{team_names}"
-        team_name = team_names[0]
-        opposing_team_name = team_names[1]
-        return f"{team_name} vs {opposing_team_name}"
+        # ordering the team names correctly
+        if cell_data['value'].startswith(team_names[0]):
+            return f"{team_names[0]} vs {team_names[1]}"
+        else:
+            return f"{team_names[1]} vs {team_names[0]}"
 
     if cell_data['col-id'] == 'eventStart':
         if 'Final' in cell_data['value']:
@@ -137,14 +155,19 @@ def FormatColumnString(cell_data):
             # add a space between the digits
             if event_start.isdigit() and len(event_start) == 2:
                 event_start = f"{event_start[0]} {event_start[1]}"
-            return f" - Final Score: {event_start[:2]} {event_start[2:]}"
+            #return f" - Final Score: {event_start[:2]} {event_start[2:]}"
+            return f" - Final Score: {event_start}"
         else:   # TODO: more complex formatting for all possible layouts
             return f"eventStart: {cell_data['value']}"
 
     if cell_data['col-id'] == "bestLine":
-        odds = [s for s in cell_data['value'].split(' ') if len(s) > 0]  # there are two spaces in the string
-        #return f" - Best Odds: ({odds[0], odds[1]})"
-        return f" - Best Odds: ({odds})"
+        bestodds = SplitNumbers(cell_data['value'])
+        if len(bestodds) == 0:
+            return f" - Best Odds: empty"
+        additionalspaces = len('- Best Odds: ')
+        bestodds[1] = '\t ' + ' '*additionalspaces + bestodds[1]
+        #odds = [s for s in cell_data['value'].split(' ') if len(s) > 0]  # there are two spaces in the string
+        return f" - Best Odds: {bestodds[0]}{bestodds[1]}"
 
     return f"{cell_data['col-id']}: {cell_data['value']}"
 
@@ -192,7 +215,9 @@ def FormatCellData(all_cell_data):
     return formatted_strings, moneylinemap, rowmap
 
 
-def write_to_text_file(inputtext, output_file="tickertapeformattedinfo.txt"):
+def write_tickertape(inputtext):
+    cwd = pathlib.Path.cwd()
+    output_file = cwd / "tickertape_outputs" / f"{DEFAULT_LEAGUE_SELECT}.txt"
     with open(output_file, 'w', encoding='utf-8') as file:
         for ttstringd_string in inputtext:
             file.write(f"{ttstringd_string}\n")
@@ -214,6 +239,7 @@ if __name__ == "__main__":
 
     intermediate_output = dan_html_extractor(table)
     formatted_output, moneylines, rowmapthing = FormatCellData(intermediate_output)
+    output_storage = []
     #write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
     #print(intermediate_output)
 
@@ -222,10 +248,12 @@ if __name__ == "__main__":
     for magicnumbers in rowmapthing.values():
         #print(magicnumbers)
         print(formatted_output[magicnumbers['listindex']])
+        output_storage.append(formatted_output[magicnumbers['listindex']])
         if len(moneylines) > 0:  # TODO: check if there's any odds listed. This doesn't work because all books have a default entry (an empty string)
             print(f"\t--------MONEYLINES--------")
         for odds in moneylines[magicnumbers['aria-rowindex']]:
             print(f"\t\t{odds}")
+            #output_storage.append(moneylines[magicnumbers['aria-rowindex']])
 
-
+    write_tickertape(output_storage)
     print("plsdontexit")
