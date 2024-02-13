@@ -1,4 +1,6 @@
-DEFAULT_LEAGUE_SELECT = "NFL"
+import ncaa_cbb_teamnames
+
+DEFAULT_LEAGUE_SELECT = "NCAAB"
 FOURNUMBER_SPREAD_LEAGUES = ["NBA", "NFL"]
 
 nhl_teams = [
@@ -26,7 +28,7 @@ nba_teams = {
     "Golden State Warriors": "GSW",
     "Houston Rockets": "HOU",
     "Indiana Pacers": "IND",
-    "Los Angeles Clippers": "LAC",
+    "LA Clippers": "LAC",  # #2 team in LA so the get the abbrev
     "Los Angeles Lakers": "LAL",
     "Memphis Grizzlies": "MEM",
     "Miami Heat": "MIA",
@@ -81,10 +83,46 @@ nfl_teams = {
     'Washington Commanders': 'WAS'
 }
 
+mlb_teams = {
+    'Arizona Diamondbacks': 'Phoenix',
+    'Atlanta Braves': 'Atlanta',
+    'Baltimore Orioles': 'Baltimore',
+    'Boston Red Sox': 'Boston',
+    'Chicago White Sox': 'Chicago',
+    'Chicago Cubs': 'Chicago',
+    'Cincinnati Reds': 'Cincinnati',
+    'Cleveland Guardians': 'Cleveland',
+    'Colorado Rockies': 'Denver',
+    'Detroit Tigers': 'Detroit',
+    'Houston Astros': 'Houston',
+    'Kansas City Royals': 'Kansas City',
+    'Los Angeles Angels': 'Los Angeles',
+    'Los Angeles Dodgers': 'Los Angeles',
+    'Miami Marlins': 'Miami',
+    'Milwaukee Brewers': 'Milwaukee',
+    'Minnesota Twins': 'Minneapolis',
+    'New York Yankees': 'New York',
+    'New York Mets': 'New York',
+    'Oakland Athletics': 'Oakland',
+    'Philadelphia Phillies': 'Philadelphia',
+    'Pittsburgh Pirates': 'Pittsburgh',
+    'San Diego Padres': 'San Diego',
+    'San Francisco Giants': 'San Francisco',
+    'Seattle Mariners': 'Seattle',
+    'St. Louis Cardinals': 'St. Louis',
+    'Tampa Bay Rays': 'Tampa Bay',
+    'Texas Rangers': 'Arlington',
+    'Toronto Blue Jays': 'Toronto',
+    'Washington Nationals': 'Washington, D.C.'
+}
+
+
 leaguemap = {
     "NHL": nhl_teams,
     "NBA": nba_teams.keys(),
     "NFL": nfl_teams.keys(),
+    "MLB": mlb_teams.keys(),
+    "NCAAB": ncaa_cbb_teamnames.ncaa_college_teams
 }
 
 

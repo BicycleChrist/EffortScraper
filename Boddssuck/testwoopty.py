@@ -115,7 +115,8 @@ def dan_html_extractor(soup):
 
 
 def SplitNumbers(text):
-    splits = [*more_itertools.split_before(text, lambda c: (c.startswith('+') or c.startswith('-')))]
+    # we're splitting on 'P' because sometimes the odds lines have 'PK'; meaning "Pick'em"
+    splits = [*more_itertools.split_before(text, lambda c: (c == '+' or c == '-' or c == 'P'))]
     if len(splits) == 2:
         firstline = str(''.join(splits[0]))
         secondline = str(''.join(splits[1]))
@@ -129,6 +130,7 @@ def SplitNumbers(text):
         return []
     return [firstline, secondline]
 
+unrecognized_set = set()
 
 # TODO: apparently 'col-id' has a different use in the left and right sides of the table
 # in the first it's the title of the column, in the right it's just a numeric UID?
@@ -140,7 +142,13 @@ def FormatColumnString(cell_data):
         team_names = [team for team in TEAMLIST if team in cell_data['value']]
         #assert (len(team_names) == 2)
         if not (len(team_names) == 2):
-            print("did not find two teams")
+            for recognized in team_names:
+                unrecognized = ''.join((cell_data['value'].partition(recognized)[0],
+                                       cell_data['value'].partition(recognized)[2]))
+                unrecognized = unrecognized.strip('1234567890')
+                print(f"did not find two teams; \n\trecognized: {recognized}\n\t unrecognized: {unrecognized}\n")
+                global unrecognized_set
+                unrecognized_set.add(unrecognized)
             return f"{team_names}"
         # ordering the team names correctly
         if cell_data['value'].startswith(team_names[0]):
@@ -257,3 +265,6 @@ if __name__ == "__main__":
 
     write_tickertape(output_storage)
     print("plsdontexit")
+    print("unrecognized names:\n")
+    for name in unrecognized_set:
+        print(f'\t"{name}",')
