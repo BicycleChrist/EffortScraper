@@ -1,7 +1,7 @@
 import ncaa_cbb_teamnames
 
 DEFAULT_LEAGUE_SELECT = "NCAAB"
-FOURNUMBER_SPREAD_LEAGUES = ["NBA", "NFL"]
+FOURNUMBER_SPREAD_LEAGUES = ["NBA", "NFL", "NCAAB"]
 
 nhl_teams = [
     'Anaheim Ducks', 'Arizona Coyotes', 'Boston Bruins', 'Buffalo Sabres',

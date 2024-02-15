@@ -141,7 +141,7 @@ def FormatColumnString(cell_data):
         line = cell_data['value'].strip('1234567890 ')
         # Find the teams in the row
         matching_team_names = [team for team in TEAMLIST if line.startswith(team) or line.endswith(team)]
-        longest_matches = [None,None]
+        longest_matches = [None, None]
         for name in matching_team_names:
             if line.startswith(name):
                 targetindex = 0
@@ -154,12 +154,16 @@ def FormatColumnString(cell_data):
         team_names = [name for name in longest_matches if name is not None]
         #assert (len(team_names) == 2)
         if not (len(team_names) == 2):
+            global unrecognized_set
+            if len(team_names) == 0:
+                stripped_line = cell_data['value'].strip('1234567890 ')
+                unrecognized_set.add(stripped_line)
+                print(f"did not find either team; \n\t unrecognized: {stripped_line}\n")
             for recognized in team_names:
                 unrecognized = ''.join((cell_data['value'].partition(recognized)[0],
                                        cell_data['value'].partition(recognized)[2]))
-                unrecognized = unrecognized.strip('1234567890')
+                unrecognized = unrecognized.strip('1234567890 ')
                 print(f"did not find two teams; \n\trecognized: {recognized}\n\t unrecognized: {unrecognized}\n")
-                global unrecognized_set
                 unrecognized_set.add(unrecognized)
             return f"{team_names}"
         # ordering the team names correctly
