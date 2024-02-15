@@ -138,8 +138,20 @@ def FormatColumnString(cell_data):
     if cell_data['col-id'] == -1:
         return "invalid"
     if cell_data['col-id'] == 'eventId':
+        line = cell_data['value'].strip('1234567890 ')
         # Find the teams in the row
-        team_names = [team for team in TEAMLIST if team in cell_data['value']]
+        matching_team_names = [team for team in TEAMLIST if line.startswith(team) or line.endswith(team)]
+        longest_matches = [None,None]
+        for name in matching_team_names:
+            if line.startswith(name):
+                targetindex = 0
+            elif line.endswith(name):
+                targetindex = 1
+            if longest_matches[targetindex] is None:
+                longest_matches[targetindex] = name
+            elif len(longest_matches[targetindex]) < len(name):
+                longest_matches[targetindex] = name
+        team_names = [name for name in longest_matches if name is not None]
         #assert (len(team_names) == 2)
         if not (len(team_names) == 2):
             for recognized in team_names:
@@ -197,7 +209,7 @@ def FormatCellData(all_cell_data):
             current_rowindex = cell_data['aria-rowindex']
             working_string = FormatColumnString(cell_data)
         # all the cells containing odds are listed AFTER you've traversed all the initial game-info columns
-        # so you have to associate the odds with rows/games post-hoc
+        # so you have to associate the odds with rows/games ad-hoc
         elif cell_data['col-id'].isdigit():  # this attribute is used as an id in the right-side of the table
             bookname = booknames[cell_data['aria-colindex']]  # not doing lookup here because there's no easy way to pass it into this function
             bookname = bookname.split('.')[0]  # removing file-extension
