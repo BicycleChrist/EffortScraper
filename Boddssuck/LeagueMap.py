@@ -1,7 +1,36 @@
 import ncaa_cbb_teamnames
 
-DEFAULT_LEAGUE_SELECT = "NCAAB"
+DEFAULT_LEAGUE_SELECT = "NHL"
 FOURNUMBER_SPREAD_LEAGUES = ["NBA", "NFL", "NCAAB"]
+# TODO: replaces usages of 'FOURNUMBER_SPREAD_LEAGUES' with a lookup into OddsFormat
+
+OddsFormat = {
+    "Moneyline": {
+        "FOURNUMBER_FORMAT": False,
+        "NumberFormat": [int, float, int, float],
+    },
+    "Spread": {
+        "FOURNUMBER_FORMAT": True,
+    },
+    "Total": {
+        "FOURNUMBER_FORMAT": True,
+    },
+    "Combined": {
+        "FOURNUMBER_FORMAT": True,
+    },
+}
+
+# we intend to use the NumberFormat like this:
+def ConvertTextToNumbers(listofstrings=['55', '1.3', '99', '2.2'], OddsFormatSelection="Moneyline"):
+    actualnumbers = []
+    for numtype, numtext in zip(OddsFormat[OddsFormatSelection]["NumberFormat"], listofstrings):
+        actualnumber = numtype(numtext)
+        actualnumbers.append(actualnumber)
+        print(actualnumber)
+        print(f"actualnumber x 2 = {actualnumber * 2}")
+    return actualnumbers
+# beware of the mutable default-argument bullshit (listofstrings)
+
 
 nhl_teams = [
     'Anaheim Ducks', 'Arizona Coyotes', 'Boston Bruins', 'Buffalo Sabres',
@@ -124,5 +153,4 @@ leaguemap = {
     "MLB": mlb_teams.keys(),
     "NCAAB": ncaa_cbb_teamnames.ncaa_college_teams
 }
-
 

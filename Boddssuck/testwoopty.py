@@ -8,23 +8,41 @@ from LeagueMap import *
 TEAMLIST = leaguemap[DEFAULT_LEAGUE_SELECT]
 
 
-def GetSavePath(leagueselect, purpose="source"):
+def GetSavePath(leagueselect, purpose="source", oddsformat="Spread"):
     cwd = pathlib.Path.cwd()
     assert cwd.name == "Boddssuck", "you're in the wrong directory"
     subdirs = {
         "source": "pagesource",
         "parsed": "parsedpage",
     }
-    if not purpose in subdirs.keys():
+    if leagueselect not in leaguemap.keys():
+        print(f"invalid selection for league: {leagueselect}")
+        print(f"valid options are: {(leagueselect.keys())}")
+        return None
+    if purpose not in subdirs.keys():
         print(f"invalid selection for purpose: {purpose}")
         print(f"valid options are: {(subdirs.keys())}")
         return None
-    savepath = cwd / subdirs[purpose] / f"{leagueselect}.html"
+    if oddsformat not in OddsFormat.keys():
+        print(f"invalid selection for odds-format: {oddsformat}")
+        print(f"valid options are: {(OddsFormat.keys())}")
+        return None
+    savepath = cwd / subdirs[purpose] / leagueselect / f"{oddsformat}.html"
     return savepath
 
 
-def LoadPagesource(leagueselect):
-    filepath = GetSavePath(leagueselect, "source")
+def LoadPagesource(leagueselect, oddsformat="ALL"):
+    # TODO: incorporate this logic (copied from DownloadUB) to select multiple files
+    wantedsubpages = []
+    if oddsformat == "ALL":
+        wantedsubpages = [*OddsFormat.keys()]
+    elif oddsformat in OddsFormat.keys():
+        wantedsubpages.append(oddsformat)
+    elif oddsformat not in OddsFormat.keys():
+        print(f"invalid selection for odds-format: {oddsformat}")
+        print(f"valid options are: {(OddsFormat.keys())}")
+        return
+    filepath = GetSavePath(leagueselect, "source", oddsformat)
     if not filepath:
         print(f"LoadPagesource could not get filepath for: {leagueselect}")
         return None
@@ -103,10 +121,10 @@ def dan_html_extractor(soup):
                     overtime_str = lastchild[-1]
                     # -4 == 'Final'
                     finalscores = lastchild[-10], lastchild[-7]
-                    cell_data['value'] = f"Final ({overtime_str}) {finalscores[0]}, {finalscores[1]}"
+                    cell_data['value'] = f"Final ({overtime_str}) {finalscores[0]} - {finalscores[1]}"
                 elif 'Final' in cell_data['value']:
                     finalscores = lastchild[-7], lastchild[-4]
-                    cell_data['value'] = f"Final {finalscores[0]}, {finalscores[1]}"
+                    cell_data['value'] = f"Final {finalscores[0]} - {finalscores[1]}"
                 else:
                     time, date = lastchild[-1], lastchild[-3]  # -2 is the span containing the time
                     cell_data['value'] = f"{time}, {date}"
@@ -116,7 +134,8 @@ def dan_html_extractor(soup):
 
 def SplitNumbers(text):
     # we're splitting on 'P' because sometimes the odds lines have 'PK'; meaning "Pick'em"
-    splits = [*more_itertools.split_before(text, lambda c: (c == '+' or c == '-' or c == 'P'))]
+    # 'o' and 'u' are over/under; used in the 'Total' format (and 'Combined')
+    splits = [*more_itertools.split_before(text, lambda c: (c == '+' or c == '-' or c == 'P' or c == 'o' or c == 'u'))]
     if len(splits) == 2:
         firstline = str(''.join(splits[0]))
         secondline = str(''.join(splits[1]))
@@ -129,6 +148,7 @@ def SplitNumbers(text):
         print("unexpected length post-split")
         return []
     return [firstline, secondline]
+
 
 unrecognized_set = set()
 
@@ -166,11 +186,7 @@ def FormatColumnString(cell_data):
                 print(f"did not find two teams; \n\trecognized: {recognized}\n\t unrecognized: {unrecognized}\n")
                 unrecognized_set.add(unrecognized)
             return f"{team_names}"
-        # ordering the team names correctly
-        if cell_data['value'].startswith(team_names[0]):
-            return f"{team_names[0]} vs {team_names[1]}"
-        else:
-            return f"{team_names[1]} vs {team_names[0]}"
+        return f"{team_names[0]} vs {team_names[1]}"
 
     if cell_data['col-id'] == 'eventStart':
         if 'Final' in cell_data['value']:
@@ -184,6 +200,7 @@ def FormatColumnString(cell_data):
         else:   # TODO: more complex formatting for all possible layouts
             return f"eventStart: {cell_data['value']}"
 
+    # TODO: associate bestline odds with their sportsbook (logo is included in cell)
     if cell_data['col-id'] == "bestLine":
         bestodds = SplitNumbers(cell_data['value'])
         if len(bestodds) == 0:
@@ -196,6 +213,7 @@ def FormatColumnString(cell_data):
     return f"{cell_data['col-id']}: {cell_data['value']}"
 
 
+# TODO: parameterize this function with the Odds-Format type somehow
 def FormatCellData(all_cell_data):
     moneylinemap = {}  # storing the cells containing odds so we can lookup the sportsbook names and format by row
     formatted_strings = []
@@ -254,8 +272,9 @@ if __name__ == "__main__":
     TEAMLIST = leaguemap[args.leagueselect]
     # updating the default doesn't actually affect anything; default-parameters in functions will still use the original value
     DEFAULT_LEAGUE_SELECT = args.leagueselect
+    print(f"LEAGUE: {DEFAULT_LEAGUE_SELECT}\n")
 
-    soup = LoadPagesource(args.leagueselect)
+    soup = LoadPagesource(args.leagueselect, "Moneyline")
     table, header_row = ParseUB(soup)
     booknames = dan_parse_header(soup)
     #pprint.pprint(booknames)
@@ -278,9 +297,11 @@ if __name__ == "__main__":
         for odds in moneylines[magicnumbers['aria-rowindex']]:
             print(f"\t\t{odds}")
             #output_storage.append(moneylines[magicnumbers['aria-rowindex']])
+        print("\n")
 
     write_tickertape(output_storage)
     print("plsdontexit")
-    print("unrecognized names:\n")
-    for name in unrecognized_set:
-        print(f'\t"{name}",')
+    if len(unrecognized_set) > 0:
+        print("unrecognized names:")
+        for name in unrecognized_set:
+            print(f'\t"{name}",')
