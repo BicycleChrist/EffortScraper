@@ -20,6 +20,14 @@ OddsFormat = {
     },
 }
 
+default_format_map = {
+    "NHL": "Moneyline",
+    "NBA": "Spread",
+    "NFL": "Spread",
+    "MLB": "Moneyline",
+    "NCAAB": "Spread",
+}
+
 # we intend to use the NumberFormat like this:
 def ConvertTextToNumbers(listofstrings=['55', '1.3', '99', '2.2'], OddsFormatSelection="Moneyline"):
     actualnumbers = []

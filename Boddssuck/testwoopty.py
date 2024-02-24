@@ -265,16 +265,31 @@ def write_tickertape(inputtext):
             file.write(f"{ttstringd_string}\n")
 
 
+def capitalize(somestring):
+    return somestring.capitalize()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--leagueselect", default=DEFAULT_LEAGUE_SELECT, help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})")
+    parser.add_argument("leagueselect", default=DEFAULT_LEAGUE_SELECT,
+                        help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})",
+                        choices=leaguemap.keys())
+    parser.add_argument("odds", default=None,
+                        help=f"Select the oddsformat (default is league-dependent",
+                        choices=OddsFormat.keys(),
+                        type=capitalize
+                        )
     args = parser.parse_args()
     TEAMLIST = leaguemap[args.leagueselect]
     # updating the default doesn't actually affect anything; default-parameters in functions will still use the original value
     DEFAULT_LEAGUE_SELECT = args.leagueselect
-    print(f"LEAGUE: {DEFAULT_LEAGUE_SELECT}\n")
+    oddsformat = args.odds
+    if oddsformat is None:
+        oddsformat = default_format_map[DEFAULT_LEAGUE_SELECT]
+    print(f"LEAGUE: {DEFAULT_LEAGUE_SELECT}")
+    print(f"ODDS: {oddsformat}\n")
 
-    soup = LoadPagesource(args.leagueselect, "Moneyline")
+    soup = LoadPagesource(args.leagueselect, oddsformat)
     table, header_row = ParseUB(soup)
     booknames = dan_parse_header(soup)
     #pprint.pprint(booknames)

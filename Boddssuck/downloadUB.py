@@ -8,6 +8,7 @@ from selenium.webdriver.support.select import Select
 #from datetime import datetime
 from time import sleep
 import pathlib
+import argparse
 
 from LeagueMap import *
 TEAMLIST = leaguemap[DEFAULT_LEAGUE_SELECT]
@@ -66,6 +67,12 @@ def DownloadUBpage(leagueselect, oddsformat="ALL"):
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "Boddssuck" and "you're in the wrong directory")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("leagueselect", default=DEFAULT_LEAGUE_SELECT,
+                        help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})")
+    args = parser.parse_args()
+    DEFAULT_LEAGUE_SELECT = args.leagueselect
 
     # Set up the Firefox options and WebDriver
     service = FirefoxService()
