@@ -308,7 +308,7 @@ if __name__ == "__main__":
         print(formatted_output[magicnumbers['listindex']])
         output_storage.append(formatted_output[magicnumbers['listindex']])
         if len(moneylines) > 0:  # TODO: check if there's any odds listed. This doesn't work because all books have a default entry (an empty string)
-            print(f"\t--------MONEYLINES--------")
+            print(f"\t--------Market Odds--------")
         for odds in moneylines[magicnumbers['aria-rowindex']]:
             print(f"\t\t{odds}")
             #output_storage.append(moneylines[magicnumbers['aria-rowindex']])
