@@ -12,7 +12,11 @@ import pathlib
 from distutils import dir_util  # copying folders
 import pprint
 
-#TODO Literally all of it, if PaulC can do it so can we.
+#TODO Let Paul C know he should have tried harder.
+#TODO Upon taking a peak at the books here at around 3 A.M, Bovada is posting player prop odds before Pinnacle.
+# Pinnacle posts their odds for the first NBA game today (2/28) at ~2:55 AM
+# If this is a consistent occurance (appears it is), it can likely be exploited
+
 
 
 def DoTheThing(driver):
