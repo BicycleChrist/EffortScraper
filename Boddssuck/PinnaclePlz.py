@@ -10,7 +10,7 @@ from time import sleep
 from contextlib import contextmanager   # is this a part of selenium?
 import pathlib
 from distutils import dir_util  # copying folders
-
+import pprint
 
 #TODO Literally all of it, if PaulC can do it so can we.
 
@@ -28,10 +28,55 @@ def DoTheThing(driver):
             things = block.find_elements(By.XPATH, "//a[@class='']")
             links = [thing.get_attribute("href") for thing in things if thing.get_attribute("href")]
             gamelinks = [link for link in links if link.startswith('https://www.pinnacle.com/en/basketball/nba/')]
+
+            # removing trailing slash after NBA to properly create URL's for props.
+            gamelinks_for_props = [link[:-1] + '#player-props' for link in gamelinks if link.endswith('/')]
             print(rows)
             #print(links)
-            print(gamelinks)
-            return gamelinks
+            #print(gamelinks)
+            pprint.pprint(gamelinks_for_props)
+            return gamelinks_for_props
+
+
+# TODO: click the button to switch from decimal to american odds
+def VisitPage(url, driver: webdriver.Firefox):
+    #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})  # never works
+    driver.get(url)
+    sleep(3)  # need to give some time for the page to redirect
+    # if the game is live, the 'player-props' won't exist and it'll redirect us
+    if not driver.current_url.endswith('#player-props'):  # checking to see if we've been redirected
+        print(f"redirected: {driver.current_url}")
+        return {}
+    print(driver.get_cookie("UserPrefsCookie"))
+    showAllButton = driver.find_element(By.XPATH, "//div[@data-test-id='Collapse']//button")
+    if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
+        showAllButton.click()
+        sleep(1)
+
+    market_dict = {}
+    matchup_market_groups = driver.find_element(By.XPATH, "//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
+    market_groups = matchup_market_groups.find_elements(By.XPATH, '//div[@data-test-id="Collapse"][@data-collapsed="false"]')
+    group = market_groups[0]  # for some reason, these relative find methods return everything on the page???????
+    # so we don't do a for-loop becauase it'll repeat everything 100 times for no reason
+    titles = [element.text for element in group.find_elements(By.XPATH, "//div[contains(@class, 'collapse-title')]")]
+    contents = group.find_elements(By.XPATH, "//div[contains(@class, 'collapse-content')]")
+    #for content in contents:
+    #    market_buttons = content.find_elements(By.XPATH, "//button[contains(@class, 'market-btn')]")
+    # for some reason it finds every 'market-btn' on the page, not just the two sub-elements
+    content = contents[0]
+    market_buttons = content.find_elements(By.XPATH, "//button[contains(@class, 'market-btn')]")
+    for index, title in enumerate(titles):
+        if (index*2) >= len(market_buttons):
+            break
+        market_dict[title.rstrip('\nHide All')] = {}  # the first one contains the 'show-all' button as well
+        associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
+        print(title.rstrip('\nHide All'))
+        for btn in associated_content:
+            moneyline, value = btn.text.splitlines()
+            print(moneyline, value)
+            market_dict[title.rstrip('\nHide All')][moneyline] = value
+
+    return market_dict
 
 
 # we can jump to the 'player-props' page by editing the end of the URL:
@@ -100,10 +145,16 @@ if __name__ == "__main__":
     # the problem is that FirefoxProfile ALWAYS copies the folder into a new temp profile (which is normally desirable)
     driver = webdriver.Firefox(options=options)
     driver.implicitly_wait(6)
+    #driver.get("https://www.pinnacle.com")  # need to navigate to domain first to set cookie
+    #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})   # doesn't work
+    #driver.add_cookie({"name": "UserPrefsCookie", "value": "priceStyle=american"})  # setting odds-format to american   # doesn't work
+    #print(driver.get_cookie("UserPrefsCookie"))
 
     #InstallUblock()
-    with driver.context(driver.CONTEXT_CONTENT):  # not a typo
-        DoTheThing(driver)
+    with driver.context(driver.CONTEXT_CONTENT):
+        links = DoTheThing(driver)
+        for link in links:
+            VisitPage(link, driver)
 
     print("about to quit")
     driver.quit()
