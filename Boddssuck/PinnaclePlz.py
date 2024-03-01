@@ -76,9 +76,13 @@ def VisitPage(url, driver: webdriver.Firefox):
         associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
         print(title.rstrip('\nHide All'))
         for btn in associated_content:
-            moneyline, value = btn.text.splitlines()
-            print(moneyline, value)
-            market_dict[title.rstrip('\nHide All')][moneyline] = value
+            try:
+                moneyline, value = btn.text.splitlines()
+                print(moneyline, value)
+                market_dict[title.rstrip('\nHide All')][moneyline] = value
+            except ValueError:
+                print("Line not closed or not posted")
+                continue
 
     return market_dict
 
@@ -155,10 +159,16 @@ if __name__ == "__main__":
     #print(driver.get_cookie("UserPrefsCookie"))
 
     #InstallUblock()
+
+    # TODO Handle instances where lines are closed or not posted, as the script exits upon encountering either of these things
+    # This can happen despite other lines for the same player being correctly posted and accsessible, so our check for the URL redirect isnt going to work here
+
+
     with driver.context(driver.CONTEXT_CONTENT):
         links = DoTheThing(driver)
         for link in links:
             VisitPage(link, driver)
+
 
     print("about to quit")
     driver.quit()
