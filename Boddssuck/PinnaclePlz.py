@@ -18,7 +18,6 @@ import pprint
 # If this is a consistent occurance (appears it is), it can likely be exploited
 
 
-
 def DoTheThing(driver):
     driver.get("https://www.pinnacle.com/en/basketball/nba/matchups")
     contentBlocks = WebDriverWait(driver, 10).until(
@@ -52,37 +51,39 @@ def VisitPage(url, driver: webdriver.Firefox):
         print(f"redirected: {driver.current_url}")
         return {}
     print(driver.get_cookie("UserPrefsCookie"))
-    showAllButton = driver.find_element(By.XPATH, "//div[@data-test-id='Collapse']//button")
+    showAllButton = driver.find_element(By.XPATH, ".//div[@data-test-id='Collapse']//button")
     if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
         showAllButton.click()
         sleep(1)
+    #TODO: click the menu to change the odds format to american
 
     market_dict = {}
-    matchup_market_groups = driver.find_element(By.XPATH, "//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
-    market_groups = matchup_market_groups.find_elements(By.XPATH, '//div[@data-test-id="Collapse"][@data-collapsed="false"]')
-    group = market_groups[0]  # for some reason, these relative find methods return everything on the page???????
-    # so we don't do a for-loop becauase it'll repeat everything 100 times for no reason
-    titles = [element.text for element in group.find_elements(By.XPATH, "//div[contains(@class, 'collapse-title')]")]
-    contents = group.find_elements(By.XPATH, "//div[contains(@class, 'collapse-content')]")
-    #for content in contents:
-    #    market_buttons = content.find_elements(By.XPATH, "//button[contains(@class, 'market-btn')]")
-    # for some reason it finds every 'market-btn' on the page, not just the two sub-elements
-    content = contents[0]
-    market_buttons = content.find_elements(By.XPATH, "//button[contains(@class, 'market-btn')]")
-    for index, title in enumerate(titles):
-        if (index*2) >= len(market_buttons):
-            break
-        market_dict[title.rstrip('\nHide All')] = {}  # the first one contains the 'show-all' button as well
-        associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
-        print(title.rstrip('\nHide All'))
-        for btn in associated_content:
-            try:
-                moneyline, value = btn.text.splitlines()
-                print(moneyline, value)
-                market_dict[title.rstrip('\nHide All')][moneyline] = value
-            except ValueError:
-                print("Line not closed or not posted")
-                continue
+    matchup_market_groups = driver.find_element(By.XPATH, ".//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
+    market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')
+    for group in market_groups:
+        # so we don't do a for-loop becauase it'll repeat everything 100 times for no reason
+        titles = [element.text for element in group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-title')]")]
+        contents = group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-content')]")
+        for content in contents:
+            market_buttons = content.find_elements(By.XPATH, ".//button[contains(@class, 'market-btn')]")
+            for index, title in enumerate(titles):
+                if (index*2) >= len(market_buttons):
+                    print("oob index")
+                    break
+                stptitle = title.rstrip('\nHide All')
+                market_dict[stptitle] = {}  # the first one contains the 'show-all' button as well
+                associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
+                print(stptitle)
+                # you can check if the button is disabled (line closed) by checking this attribute: aria-label="Currently Offline"
+                for btn in associated_content:
+                    tmpvar = btn.text.splitlines()
+                    if len(tmpvar) == 2:
+                        moneyline, value = tmpvar
+                        print(moneyline, value)
+                        market_dict[stptitle][moneyline] = value
+                    else:  # less than two strings
+                        print("Line closed or not posted")
+                        continue
 
     return market_dict
 
@@ -163,12 +164,10 @@ if __name__ == "__main__":
     # TODO Handle instances where lines are closed or not posted, as the script exits upon encountering either of these things
     # This can happen despite other lines for the same player being correctly posted and accsessible, so our check for the URL redirect isnt going to work here
 
-
     with driver.context(driver.CONTEXT_CONTENT):
         links = DoTheThing(driver)
         for link in links:
             VisitPage(link, driver)
-
 
     print("about to quit")
     driver.quit()
