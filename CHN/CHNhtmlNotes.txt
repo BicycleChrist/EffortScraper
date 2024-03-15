@@ -25,7 +25,12 @@ class = "box"
 Skater Metrics table:
 div class ="widetablewrap"
 table class = sortable metrics
-Goalies
+
+Goalies:
+
+<table cellspacing="0" cellpadding="3" width="50%" class="metrics sortable">
+<thead>
+<tr>
 
 
 

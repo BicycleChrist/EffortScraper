@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import os
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor
 
 nhl_teams = [
     'ANA', 'ARI', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET', 'EDM',
@@ -14,16 +13,16 @@ nhl_teams = [
 ]
 
 site_directory_paths = [
-"/playerreport.php"
-"/gameflow.php"
-"/dl.php"
-"/hm.php"
-"/game.php"
-"/linestats.php?"
-"/graphs/"
-"/heatmaps/"
-"/images/"
-"/DataTables-1.10.3/"
+    "/playerreport.php",
+    "/gameflow.php",
+    "/dl.php",
+    "/hm.php",
+    "/game.php",
+    "/linestats.php?",
+    "/graphs/",
+    "/heatmaps/",
+    "/images/",
+    "/DataTables-1.10.3/"
 ]
 
 
@@ -52,13 +51,9 @@ def get_static_tables(team_abbr, date_folder):
         print(f"Error accessing the webpage: {e}")
 
 
-
 def allofit(date_folder):
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(get_static_tables, team, date_folder) for team in nhl_teams]
-        for future in futures:
-            future.result()
-
+    for team in nhl_teams:
+        get_static_tables(team, date_folder)
 
 
 def download_file(team_abbr, link, base_url, date_folder):
@@ -78,6 +73,7 @@ def download_file(team_abbr, link, base_url, date_folder):
                 f.write(chunk)
         print(f"Downloaded {link['href']} into {directory_path}/")
 
+
 def download_charts(base_url, date_folder):
     response = requests.get(base_url)
     response.raise_for_status()
@@ -85,14 +81,13 @@ def download_charts(base_url, date_folder):
     soup = BeautifulSoup(response.text, 'html.parser')
     links = [link for link in soup.find_all('a', href=True) if link['href'].endswith('.png')]
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for link in links:
-            parts = link['href'].split('-')
-            if len(parts) < 2 or not parts[1].isupper():
-                continue
+    for link in links:
+        parts = link['href'].split('-')
+        if len(parts) < 2 or not parts[1].isupper():
+            continue
 
-            team_abbr = parts[1]
-            executor.submit(download_file, team_abbr, link, base_url, date_folder)
+        team_abbr = parts[1]
+        download_file(team_abbr, link, base_url, date_folder)
 
     print("All files have been downloaded.")
 
@@ -127,13 +122,10 @@ def fetch_season_data(start_year, end_year):
             print(f"Failed to retrieve data for seasons {from_season}-{thru_season}")
 
 
-
-
-
 # Main execution logic
 if __name__ == "__main__":
     current_date = datetime.now().strftime('%Y-%m-%d')
-    #allofit(current_date)
-    #download_charts("https://www.naturalstattrick.com/teams/20232024/charts/pos_rolling/", current_date)
+    allofit(current_date)
+    download_charts("https://www.naturalstattrick.com/teams/20232024/charts/pos_rolling/", current_date)
     # Fetch data from 2007-2008 to 2023-2024 (presently for empty net goals)
     season_data = fetch_season_data(2007, 2024)

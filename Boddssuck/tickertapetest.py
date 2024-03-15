@@ -1,3 +1,4 @@
+import pathlib
 import random
 from tkinter import *
 
@@ -8,12 +9,14 @@ dimensions = [1915, 20]
 canvas = Canvas(window, bg="gray", width=dimensions[0], height=dimensions[1])
 canvas.pack(side="top")  # Position the canvas at the top of the window
 
-def read_text_file(file_path):
+def read_text_file(leagueselect):
+    cwd = pathlib.Path.cwd()
+    file_path = cwd / "tickertape_outputs" / f"{leagueselect}.txt"
     with open(file_path, 'r') as file:
         content = file.readlines()
     return content
 
-def move_text(text_object, lines, line_index, xdelta=2, framedelay=20):
+def move_text(text_object, lines, line_index, xdelta=2, framedelay=50):
     tcoords = canvas.coords(text_object)
     canvas.coords(text_object, tcoords[0] + xdelta, tcoords[1])  # Move from left to right
 
@@ -35,13 +38,13 @@ def move_text(text_object, lines, line_index, xdelta=2, framedelay=20):
     # callback
     window.after(adjusted_framedelay, move_text, text_object, lines, line_index, xdelta, framedelay)
 
+
 if __name__ == "__main__":
-    file_path = "/home/retupmoc/PycharmProjects/EffortScraper/Boddssuck/tickertapeformattedinfo.txt"
-    lines = read_text_file(file_path)
+    lines = read_text_file("NFL")
 
     initial_text = lines[0].strip() if lines and lines[0].strip() != "" else "Default Text"
     text_object = canvas.create_text(0, dimensions[1]/2, text=initial_text, font=("arial", 10), fill="white", anchor=W)
-    frame_rate = 25
+    frame_rate = 50
     xdelta = 2
 
     # Start the continuous animation

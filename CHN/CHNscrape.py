@@ -1,3 +1,4 @@
+from teamnames import CHN_TeamIDs
 import pprint
 import pathlib
 import requests
@@ -43,78 +44,6 @@ def ConstructMethod(category):
     attrs = CHN_table_categories[category]['htmlattrs']
     return lambda soupthing: method(soupthing, attrs)
 
-
-# TODO: move this into the other file
-CHN_TeamIDs = {
-    "Air-Force": 1,
-    #"American-International": 5,  # the site no longer uses this one, it redirects
-    "American-Intl": 5,  # use this one to avoid redirect
-    "Army": 6,
-    "Bentley": 8,
-    "Canisius": 13,
-    "Holy-Cross": 23,
-    "Mercyhurst": 28,
-    "Niagara": 39,
-    "RIT": 49,
-    "Robert-Morris": 50,
-    "Sacred-Heart": 51,
-    "Michigan": 31,
-    "Michigan-State": 32,
-    "Minnesota": 34,
-    "Notre-Dame": 43,
-    "Ohio-State": 44,
-    "Penn-State": 60,
-    "Wisconsin": 58,
-    "Augustana": 64,
-    "Bemidji-State": 7,
-    "Bowling-Green": 11,
-    "Ferris-State": 21,
-    "Lake-Superior": 24,
-    "Michigan-Tech": 33,
-    "Minnesota-State": 35,
-    "Northern-Michigan": 42,
-    "St-Thomas": 63,
-    "Brown": 12,
-    "Clarkson": 14,
-    "Colgate": 15,
-    "Cornell": 18,
-    "Dartmouth": 19,
-    "Harvard": 22,
-    "Princeton": 45,
-    "Quinnipiac": 47,
-    "Rensselaer": 48,
-    "St-Lawrence": 53,
-    "Union": 54,
-    "Yale": 59,
-    "Boston-College": 9,
-    "Boston-University": 10,
-    "Connecticut": 17,
-    "Maine": 25,
-    "Massachusetts": 27,
-    "UMass-Lowell": 26,
-    "Merrimack": 29,
-    "New-Hampshire": 38,
-    "Northeastern": 41,
-    "Providence": 46,
-    "Vermont": 55,
-    "Colorado-College": 16,
-    "Denver": 20,
-    "Miami": 30,
-    "Minnesota-Duluth": 36,
-    "Nebraska-Omaha": 37,
-    "North-Dakota": 40,
-    "St-Cloud-State": 52,
-    "Western-Michigan": 57,
-    "Alaska": 4,
-    "Alaska-Anchorage": 3,
-    "Arizona-State": 61,
-    "Lindenwood": 433,
-    "Long-Island": 62,
-    "Stonehill": 422,
-    # Note: both of these (still under Independent) were commented out in the HTML
-    #"Utica": 356,
-    #"Alabama-Huntsville": 2,
-}
 
 # TODO: map team-names to abbreviations (mostly used internally for hrefs)
 # you can potentially automate this by visiting each team's page and checking the url for their logo
@@ -185,13 +114,11 @@ def GetURLSuffix(teamname, prefix=None):
     return f"https://{prefix}/{suffix}"
 
 
-
-
 def ValidateSelections(categories:list):
     if len(categories) == 0:
         print("nothing selected")
         return False
-    isValid=True
+    isValid = True
     for arg in categories:
         if arg not in CHN_table_categories.keys():
             print(f"invalid category: {arg}")
