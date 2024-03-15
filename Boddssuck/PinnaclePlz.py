@@ -1,14 +1,13 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.firefox.service import Service as FirefoxService
+#from selenium.webdriver.support import expected_conditions as EC
+#from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
-from selenium.webdriver.support.select import Select
-from selenium.common.exceptions import *
+#from selenium.webdriver.support.select import Select
+#from selenium.common.exceptions import *
 from time import sleep
-from contextlib import contextmanager   # is this a part of selenium?
 import pathlib
 from distutils import dir_util  # copying folders
 import pprint
@@ -21,9 +20,28 @@ import pprint
 # Looks like the option for the odds-format is stored under the localstorage:
 # Local Storage > Main:Preferences (Object) > Odds:Object > format:"decimal"
 
+SELENIUMERRORS = [
+    'ElementClickInterceptedException', 'ElementNotInteractableException', 'ElementNotSelectableException', 'ElementNotVisibleException', 'ImeActivationFailedException', 'ImeNotAvailableException', 'InsecureCertificateException', 'InvalidArgumentException',
+    'InvalidCookieDomainException', 'InvalidCoordinatesException', 'InvalidElementStateException', 'InvalidSelectorException', 'InvalidSessionIdException', 'InvalidSwitchToTargetException', 'JavascriptException',
+    'MoveTargetOutOfBoundsException', 'NoAlertPresentException', 'NoSuchAttributeException', 'NoSuchCookieException', 'NoSuchDriverException', 'NoSuchElementException', 'NoSuchFrameException', 'NoSuchShadowRootException', 'NoSuchWindowException', 'Optional',
+    'ScreenshotException', 'Sequence', 'SessionNotCreatedException', 'StaleElementReferenceException', 'TimeoutException', 'UnableToSetCookieException', 'UnexpectedAlertPresentException', 'UnexpectedTagNameException', 'UnknownMethodException', 'WebDriverException',
+    #'SUPPORT_MSG', 'ERROR_URL',    # not sure if these are actual error types
+]
 
-def DoTheThing(driver):
-    driver.get("https://www.pinnacle.com/en/basketball/nba/matchups")
+
+# holds (URL-sub-segment, URL-suffix)
+URLbySport = {
+    "NBA": ("basketball/nba", "#player-props"),
+    "NHL": ("hockey/nhl",     "#game-props"),
+    "NFL": ("football/nfl",   ""),
+    "MLB": ("baseball/mlb",   ""),
+}
+
+
+def FindGameLinks(driver, sport):
+    urlseg, urlsuffix = URLbySport[sport]
+    baseurl = "https://www.pinnacle.com/en/" + urlseg
+    driver.get(str(baseurl+"/matchups"))
     contentBlocks = WebDriverWait(driver, 10).until (
         lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
                    if c.get_attribute("data-test-id") == 'LiveContainer']
@@ -32,12 +50,12 @@ def DoTheThing(driver):
         print(f"{block.get_attribute('class'), block.get_attribute('data-test-id')}")
         if block.get_attribute("data-test-id") == 'LiveContainer':  # redundant
             rows = block.find_elements(By.CLASS_NAME, 'event-row-participant')  # text for each team name
-            things = block.find_elements(By.XPATH, "//a[@class='']")
+            things = block.find_elements(By.XPATH, ".//a[@class='']")
             links = [thing.get_attribute("href") for thing in things if thing.get_attribute("href")]
-            gamelinks = [link for link in links if link.startswith('https://www.pinnacle.com/en/basketball/nba/')]
+            gamelinks = [link for link in links if link.startswith(baseurl)]
 
             # removing trailing slash after NBA to properly create URL's for props.
-            gamelinks_for_props = [link[:-1] + '#player-props' for link in gamelinks if link.endswith('/')]
+            gamelinks_for_props = [link[:-1] + urlsuffix for link in gamelinks if link.endswith('/')]
             print(rows)
             #print(links)
             #print(gamelinks)
@@ -46,14 +64,14 @@ def DoTheThing(driver):
 
 
 # TODO: test the handling of the 'Matchup not found' pages
-# TODO: click the button to switch from decimal to american odds
-def VisitPage(url, driver: webdriver.Firefox):
+def VisitPage(url, driver: webdriver.Firefox, sport):
+    _, urlsuffix = URLbySport[sport]
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})  # never works
     driver.get(url)
     sleep(3)  # need to give some time for the page to redirect
     # if the game is live, the 'player-props' won't exist and it'll redirect us
     # TODO: handle cases where the page lands on 'Matchup not found.'; this doesn't change the URL so it's not handled by the redirect logic
-    if not driver.current_url.endswith('#player-props'):  # checking to see if we've been redirected
+    if not driver.current_url.endswith(urlsuffix):  # checking to see if we've been redirected
         print(f"redirected: {driver.current_url}")
         return {}
     try:
@@ -80,13 +98,18 @@ def VisitPage(url, driver: webdriver.Firefox):
             return {}
         if oddsFormatDropdown.text != "American Odds":
             oddsFormatDropdown.click()  # open dropdown; might invalidate references
-            stylelist = oddsFormatDropdown.find_element(By.XPATH, '../div[contains(@class, "tooltip")]/ul[@data-test-id="OddsFormat"]')
-            styles = stylelist.find_elements(By.XPATH, "./li")
+            sleep(1)
+            stylelist = oddsFormatDropdown.find_element(By.XPATH, '../div/div[contains(@class, "tooltip")]/ul[@data-test-id="OddsFormat"]')
+            styles = stylelist.find_elements(By.XPATH, "./li/a")
+            styles[1].click()   # the 'not-selected style' always appears second
+            # note that changing the odds format doesn't close the dropdown menu, but it also doesn't invalidate any references (you can click the other style)
+            sleep(1)
             print(styles)
     except Exception as e:
         print(e)
 
     print("plsbreak")
+    # TODO: split this function in half
 
     market_dict = {}
     matchup_market_groups = driver.find_element(By.XPATH, ".//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
@@ -101,6 +124,8 @@ def VisitPage(url, driver: webdriver.Firefox):
                 if (index*2) >= len(market_buttons):
                     print("oob index")
                     break
+                # TODO: figure out why titles ending in 'e' have the last letter missing
+                # TODO: actually just rewrite this back to using nested loops instead of indecies (market_buttons are relative to contents)
                 stptitle = title.rstrip('\nHide All')
                 market_dict[stptitle] = {}  # the first one contains the 'show-all' button as well
                 associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
@@ -143,7 +168,7 @@ def ProfilePath():
         return str(selenium_profile_path)
     print("ignoring local profile folder! creating new profile")
     new_firefox_profile = FirefoxProfile()  # create a new temp one
-    temp_profile_path = new_firefox_profile.profile_dir  # these folders only have a 'user.js' in them????
+    temp_profile_path = new_firefox_profile.path  # these folders only have a 'user.js' in them????
     # maybe we have to actually run the browser to populate the folder?
     return temp_profile_path
 
@@ -169,6 +194,8 @@ def CopyProfile(forceOverwrite=False):
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "Boddssuck" and "you're in the wrong directory")
+    default_sport = "NHL"
+    # TOOD: sport as cmdline arg
 
     # Set up the Firefox options and WebDriver
     #service = FirefoxService()
@@ -197,9 +224,9 @@ if __name__ == "__main__":
     # This can happen despite other lines for the same player being correctly posted and accsessible, so our check for the URL redirect isnt going to work here
 
     with driver.context(driver.CONTEXT_CONTENT):
-        links = DoTheThing(driver)
+        links = FindGameLinks(driver, default_sport)
         for link in links:
-            VisitPage(link, driver)
+            VisitPage(link, driver, default_sport)
 
     print("about to quit")
     driver.quit()
