@@ -6,6 +6,7 @@ from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.support.select import Select
+from selenium.common.exceptions import *
 from time import sleep
 from contextlib import contextmanager   # is this a part of selenium?
 import pathlib
@@ -17,10 +18,13 @@ import pprint
 # Pinnacle posts their odds for the first NBA game today (2/28) at ~2:55 AM
 # If this is a consistent occurance (appears it is), it can likely be exploited
 
+# Looks like the option for the odds-format is stored under the localstorage:
+# Local Storage > Main:Preferences (Object) > Odds:Object > format:"decimal"
+
 
 def DoTheThing(driver):
     driver.get("https://www.pinnacle.com/en/basketball/nba/matchups")
-    contentBlocks = WebDriverWait(driver, 10).until(
+    contentBlocks = WebDriverWait(driver, 10).until (
         lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
                    if c.get_attribute("data-test-id") == 'LiveContainer']
     )
@@ -41,21 +45,48 @@ def DoTheThing(driver):
             return gamelinks_for_props
 
 
+# TODO: test the handling of the 'Matchup not found' pages
 # TODO: click the button to switch from decimal to american odds
 def VisitPage(url, driver: webdriver.Firefox):
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})  # never works
     driver.get(url)
     sleep(3)  # need to give some time for the page to redirect
     # if the game is live, the 'player-props' won't exist and it'll redirect us
+    # TODO: handle cases where the page lands on 'Matchup not found.'; this doesn't change the URL so it's not handled by the redirect logic
     if not driver.current_url.endswith('#player-props'):  # checking to see if we've been redirected
         print(f"redirected: {driver.current_url}")
         return {}
-    print(driver.get_cookie("UserPrefsCookie"))
-    showAllButton = driver.find_element(By.XPATH, ".//div[@data-test-id='Collapse']//button")
+    try:
+        print(driver.get_cookie("UserPrefsCookie"))
+        showAllButton = driver.find_element(By.XPATH, "//div[@data-test-id='Collapse']//button")
+    except Exception as E:
+        # assuming the exception is caused by not finding the 'showAllButton'
+        print(E)
+        # check if we're on a 'Matchup not found.' page (this might be a bad idea)
+        noEventsBlock = driver.find_element(By.XPATH, "//div[contains(@class, 'noEvents')][@data-test-id='NoEvents-Container']")
+        print(noEventsBlock.text)
+        print("Matchup not found")
+        return {}
+
     if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
         showAllButton.click()
         sleep(1)
-    #TODO: click the menu to change the odds format to american
+    # TODO: click the menu to change the odds format to american
+    try:
+        oddsFormatDropdown = driver.find_element(By.XPATH, "//div[i[contains(@class, 'icon-info')] and i[contains(@class, 'icon-down-arrow')]]")
+        if oddsFormatDropdown.text not in ["Decimal Odds", "American Odds"]:
+            print(f"wrong element found for oddsFormatDropdown; {driver.current_url}")
+            print("early exit")
+            return {}
+        if oddsFormatDropdown.text != "American Odds":
+            oddsFormatDropdown.click()  # open dropdown; might invalidate references
+            stylelist = oddsFormatDropdown.find_element(By.XPATH, '../div[contains(@class, "tooltip")]/ul[@data-test-id="OddsFormat"]')
+            styles = stylelist.find_elements(By.XPATH, "./li")
+            print(styles)
+    except Exception as e:
+        print(e)
+
+    print("plsbreak")
 
     market_dict = {}
     matchup_market_groups = driver.find_element(By.XPATH, ".//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
@@ -148,7 +179,8 @@ if __name__ == "__main__":
     options.profile = firefox_profile
     # firefox_profile.set_preference("javascript.enabled", False)
     print(firefox_profile)
-    print(options.profile.profile_dir)
+    #print(options.profile.profile_dir)  # in older versions of selenium
+    print(options.profile.path)
 
     # TODO: actually make it possible to persist changes to settings (especially ublock)
     # the problem is that FirefoxProfile ALWAYS copies the folder into a new temp profile (which is normally desirable)
