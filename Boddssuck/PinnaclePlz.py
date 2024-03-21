@@ -42,25 +42,25 @@ def FindGameLinks(driver, sport):
     urlseg, urlsuffix = URLbySport[sport]
     baseurl = "https://www.pinnacle.com/en/" + urlseg
     driver.get(str(baseurl+"/matchups"))
-    contentBlocks = WebDriverWait(driver, 10).until (
+    # not sure this wait condition is good enough (LiveContainer is not the one we really want)
+    contentBlocks = WebDriverWait(driver, 10).until(
         lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
                    if c.get_attribute("data-test-id") == 'LiveContainer']
     )
+    contentBlocks = list(driver.find_elements(By.XPATH, "//div[@id='root']//div[contains(@class, 'contentBlock')]"))
+    gamelinks = []
     for block in contentBlocks:
         print(f"{block.get_attribute('class'), block.get_attribute('data-test-id')}")
-        if block.get_attribute("data-test-id") == 'LiveContainer':  # redundant
-            rows = block.find_elements(By.CLASS_NAME, 'event-row-participant')  # text for each team name
-            things = block.find_elements(By.XPATH, ".//a[@class='']")
-            links = [thing.get_attribute("href") for thing in things if thing.get_attribute("href")]
-            gamelinks = [link for link in links if link.startswith(baseurl)]
-
-            # removing trailing slash after NBA to properly create URL's for props.
-            gamelinks_for_props = [link[:-1] + urlsuffix for link in gamelinks if link.endswith('/')]
-            print(rows)
-            #print(links)
-            #print(gamelinks)
-            pprint.pprint(gamelinks_for_props)
-            return gamelinks_for_props
+        rows = [row.text for row in block.find_elements(By.CLASS_NAME, 'event-row-participant')]  # text for each team name
+        hrefs = [link.get_attribute('href') for link in block.find_elements(By.XPATH, ".//a[@class=''][@href]")]
+        # removing trailing slash after NBA to properly create URL's for props.
+        gamelinks.extend([link[:-1] + urlsuffix for link in hrefs if (link.startswith(baseurl) and link.endswith('/'))])
+        
+        pprint.pprint(rows)
+        #pprint.pprint(hrefs)
+    
+    pprint.pprint(gamelinks)
+    return gamelinks
 
 
 # TODO: test the handling of the 'Matchup not found' pages
@@ -194,7 +194,7 @@ def CopyProfile(forceOverwrite=False):
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "Boddssuck" and "you're in the wrong directory")
-    default_sport = "NHL"
+    default_sport = "NBA"
     # TOOD: sport as cmdline arg
 
     # Set up the Firefox options and WebDriver
@@ -225,6 +225,7 @@ if __name__ == "__main__":
 
     with driver.context(driver.CONTEXT_CONTENT):
         links = FindGameLinks(driver, default_sport)
+        print("\n\n")
         for link in links:
             VisitPage(link, driver, default_sport)
 
