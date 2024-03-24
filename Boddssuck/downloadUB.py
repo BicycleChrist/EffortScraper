@@ -82,5 +82,5 @@ if __name__ == "__main__":
     driver = webdriver.Firefox(service=service, options=options, keep_alive=True)
     driver.implicitly_wait(6)
     driver.set_window_size(5760, 3240)  # forces the whole table to load (no horizontal scrolling)
-    DownloadUBpage(DEFAULT_LEAGUE_SELECT, "ALL")
+    DownloadUBpage(DEFAULT_LEAGUE_SELECT, "Spread")
     driver.quit()

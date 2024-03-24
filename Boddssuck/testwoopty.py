@@ -259,6 +259,7 @@ def FormatCellData(all_cell_data):
 
 def write_tickertape(inputtext):
     cwd = pathlib.Path.cwd()
+    # TODO: ensure tickertaper output dir exists
     output_file = cwd / "tickertape_outputs" / f"{DEFAULT_LEAGUE_SELECT}.txt"
     with open(output_file, 'w', encoding='utf-8') as file:
         for ttstringd_string in inputtext:
@@ -314,7 +315,7 @@ if __name__ == "__main__":
             #output_storage.append(moneylines[magicnumbers['aria-rowindex']])
         print("\n")
 
-    write_tickertape(output_storage)
+    #write_tickertape(output_storage)
     print("plsdontexit")
     if len(unrecognized_set) > 0:
         print("unrecognized names:")

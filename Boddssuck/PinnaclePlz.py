@@ -73,7 +73,7 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
     # TODO: handle cases where the page lands on 'Matchup not found.'; this doesn't change the URL so it's not handled by the redirect logic
     if not driver.current_url.endswith(urlsuffix):  # checking to see if we've been redirected
         print(f"redirected: {driver.current_url}")
-        return {}
+        return
     try:
         print(driver.get_cookie("UserPrefsCookie"))
         showAllButton = driver.find_element(By.XPATH, "//div[@data-test-id='Collapse']//button")
@@ -84,7 +84,7 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
         noEventsBlock = driver.find_element(By.XPATH, "//div[contains(@class, 'noEvents')][@data-test-id='NoEvents-Container']")
         print(noEventsBlock.text)
         print("Matchup not found")
-        return {}
+        return
 
     if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
         showAllButton.click()
@@ -95,7 +95,7 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
         if oddsFormatDropdown.text not in ["Decimal Odds", "American Odds"]:
             print(f"wrong element found for oddsFormatDropdown; {driver.current_url}")
             print("early exit")
-            return {}
+            return
         if oddsFormatDropdown.text != "American Odds":
             oddsFormatDropdown.click()  # open dropdown; might invalidate references
             sleep(1)
@@ -105,17 +105,22 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
             # note that changing the odds format doesn't close the dropdown menu, but it also doesn't invalidate any references (you can click the other style)
             sleep(1)
             print(styles)
-    except Exception as e:
+    except Exception as e:  # TODO: specifically catch selenium errors only
         print(e)
+    print(url)
+    return
 
-    print("plsbreak")
-    # TODO: split this function in half
 
+def ScrapePage(driver: webdriver.Firefox):
     market_dict = {}
-    matchup_market_groups = driver.find_element(By.XPATH, ".//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
+    try:
+        matchup_market_groups = driver.find_element(By.XPATH, ".//div[contains(@class, 'matchup-market-groups')]")  # container for all the elements of the stats
+    except Exception as E:
+        print("ScrapePage failed to find matchup-market-groups")
+        print(E)
+        return
     market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')
     for group in market_groups:
-        # so we don't do a for-loop becauase it'll repeat everything 100 times for no reason
         titles = [element.text for element in group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-title')]")]
         contents = group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-content')]")
         for content in contents:
@@ -124,9 +129,8 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
                 if (index*2) >= len(market_buttons):
                     print("oob index")
                     break
-                # TODO: figure out why titles ending in 'e' have the last letter missing
                 # TODO: actually just rewrite this back to using nested loops instead of indecies (market_buttons are relative to contents)
-                stptitle = title.rstrip('\nHide All')
+                stptitle = title.removesuffix('\nHide All')
                 market_dict[stptitle] = {}  # the first one contains the 'show-all' button as well
                 associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
                 print(stptitle)
@@ -135,12 +139,12 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
                     tmpvar = btn.text.splitlines()
                     if len(tmpvar) == 2:
                         moneyline, value = tmpvar
-                        print(moneyline, value)
+                        print('\t', moneyline, value)
                         market_dict[stptitle][moneyline] = value
                     else:  # less than two strings
                         print("Line closed or not posted")
                         continue
-
+                print("")  # implied newline
     return market_dict
 
 
@@ -228,6 +232,7 @@ if __name__ == "__main__":
         print("\n\n")
         for link in links:
             VisitPage(link, driver, default_sport)
+            ScrapePage(driver)
 
     print("about to quit")
     driver.quit()

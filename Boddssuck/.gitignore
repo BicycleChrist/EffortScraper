@@ -1,2 +1,5 @@
 bovadaPPsuck.py
 .seleniumstorage
+__pycache__
+pagesource/
+*.html

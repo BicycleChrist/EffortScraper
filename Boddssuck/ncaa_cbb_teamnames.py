@@ -188,7 +188,7 @@ ncaa_college_teams = [
     "San Diego State",
     "San Jose State",
     "Santa Clara",
-    "Seattle",
+    "Seattle U",
     "Seton Hall",
     "Siena College",
     "South Carolina State",
@@ -212,7 +212,7 @@ ncaa_college_teams = [
     "SUNY at Albany",
     "SUNY at Buffalo",
     "Syracuse",
-    "Tarleton State",
+    "Tarleton St",
     "Temple",
     "Tennessee State",
     "Texas A&M Corpus",
@@ -230,6 +230,7 @@ ncaa_college_teams = [
     "United States Air Force Academy",
     "United States Military Academy",
     "United States Naval Academy",
+    "UNLV",  # University of Las Vegas
     "Akron",
     "Alabama",
     "Alabama – Birmingham",
@@ -248,7 +249,8 @@ ncaa_college_teams = [
     "Central Florida",
     "Central Florida",
     "Cincinnati",
-    "Colorado – Boulder",
+    "Colorado",
+    "No. Colorado"  # north? Colorado
     "Connecticut",
     "Dayton",
     "Delaware",
@@ -263,6 +265,7 @@ ncaa_college_teams = [
     "Illinois",
     "Illinois at Chicago",
     "Iowa",
+    "IPFW"
     "Kansas",
     "Kentucky",
     "Louisiana",
@@ -295,6 +298,7 @@ ncaa_college_teams = [
     "North Carolina Asheville",
     "North Carolina at Chapel Hill",
     "North Carolina at Charlotte",
+    "NC State",  # "North Carolina State"
     "North Dakota",
     "North Florida",
     "North Texas",
@@ -408,4 +412,7 @@ ncaa_college_teams = [
     "Providence",
     "BYU",
     "Queens NC",
+    "Va Commonwealth",
+    "IPFW",
+    "Connecticut",
 ]
