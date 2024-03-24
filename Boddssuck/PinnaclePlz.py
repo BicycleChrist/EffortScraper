@@ -6,7 +6,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 #from selenium.webdriver.support.select import Select
-#from selenium.common.exceptions import *
+from selenium.common.exceptions import *
 from time import sleep
 import pathlib
 from distutils import dir_util  # copying folders
@@ -68,35 +68,40 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
     _, urlsuffix = URLbySport[sport]
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})  # never works
     driver.get(url)
+    print(url)
+    print(driver.get_cookie("UserPrefsCookie"))
     sleep(3)  # need to give some time for the page to redirect
     # if the game is live, the 'player-props' won't exist and it'll redirect us
     # TODO: handle cases where the page lands on 'Matchup not found.'; this doesn't change the URL so it's not handled by the redirect logic
     if not driver.current_url.endswith(urlsuffix):  # checking to see if we've been redirected
         print(f"redirected: {driver.current_url}")
-        return
+        #return driver
     try:
-        print(driver.get_cookie("UserPrefsCookie"))
+        print("finding showAllButton...")
         showAllButton = driver.find_element(By.XPATH, "//div[@data-test-id='Collapse']//button")
+        # TODO: figure out if this condition is actually acceptable
+        # (there's a glitch where switching from 'player-props' to 'All' sets the wrong text for this button
+        if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
+            print("click")
+            showAllButton.click()
+            sleep(1)
+            assert (showAllButton.text == "Hide All")
     except Exception as E:
-        # assuming the exception is caused by not finding the 'showAllButton'
         print(E)
         # check if we're on a 'Matchup not found.' page (this might be a bad idea)
         noEventsBlock = driver.find_element(By.XPATH, "//div[contains(@class, 'noEvents')][@data-test-id='NoEvents-Container']")
         print(noEventsBlock.text)
         print("Matchup not found")
-        return
-
-    if showAllButton.text == "Show All":  # if everything is already shown, this changes to 'Hide All'
-        showAllButton.click()
-        sleep(1)
-    # TODO: click the menu to change the odds format to american
+        return driver
     try:
+        print("finding oddsFormatDropdown...")
         oddsFormatDropdown = driver.find_element(By.XPATH, "//div[i[contains(@class, 'icon-info')] and i[contains(@class, 'icon-down-arrow')]]")
         if oddsFormatDropdown.text not in ["Decimal Odds", "American Odds"]:
             print(f"wrong element found for oddsFormatDropdown; {driver.current_url}")
             print("early exit")
-            return
+            return driver
         if oddsFormatDropdown.text != "American Odds":
+            print("click")
             oddsFormatDropdown.click()  # open dropdown; might invalidate references
             sleep(1)
             stylelist = oddsFormatDropdown.find_element(By.XPATH, '../div/div[contains(@class, "tooltip")]/ul[@data-test-id="OddsFormat"]')
@@ -107,8 +112,7 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
             print(styles)
     except Exception as e:  # TODO: specifically catch selenium errors only
         print(e)
-    print(url)
-    return
+    return driver
 
 
 def ScrapePage(driver: webdriver.Firefox):
@@ -119,32 +123,42 @@ def ScrapePage(driver: webdriver.Firefox):
         print("ScrapePage failed to find matchup-market-groups")
         print(E)
         return
-    market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')
+    #market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')
+    market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"]')
     for group in market_groups:
-        titles = [element.text for element in group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-title')]")]
-        contents = group.find_elements(By.XPATH, ".//div[contains(@class, 'collapse-content')]")
-        for content in contents:
-            market_buttons = content.find_elements(By.XPATH, ".//button[contains(@class, 'market-btn')]")
-            for index, title in enumerate(titles):
-                if (index*2) >= len(market_buttons):
-                    print("oob index")
-                    break
-                # TODO: actually just rewrite this back to using nested loops instead of indecies (market_buttons are relative to contents)
-                stptitle = title.removesuffix('\nHide All')
-                market_dict[stptitle] = {}  # the first one contains the 'show-all' button as well
-                associated_content = [market_buttons[index*2], market_buttons[(index*2)+1]]
-                print(stptitle)
-                # you can check if the button is disabled (line closed) by checking this attribute: aria-label="Currently Offline"
-                for btn in associated_content:
-                    tmpvar = btn.text.splitlines()
-                    if len(tmpvar) == 2:
-                        moneyline, value = tmpvar
-                        print('\t', moneyline, value)
-                        market_dict[stptitle][moneyline] = value
-                    else:  # less than two strings
-                        print("Line closed or not posted")
-                        continue
-                print("")  # implied newline
+        if group.get_attribute("data-collapsed") == "true":
+            print("unexpanded element!!!")
+            continue
+        # TODO: on some pages ('#All'), the market-group content blocks will have some of their content hidden, with a clickable 'See more' footer (even if you've hit 'Show All')
+        # Assuming there's only one title and content group per market-group
+        title = group.find_element(By.XPATH, ".//div[contains(@class, 'collapse-title')]").text.removesuffix('\nHide All')  # the 'Show/Hide All' button text will also be concatenated, if it exists
+        content = group.find_element(By.XPATH, ".//div[contains(@class, 'collapse-content')]")
+        try:
+            expandMarketBtn = content.find_element(By.XPATH, "./button")  # the expand button is the only one directly nested under the group div
+            print(f"Found expandMarketBtn: {expandMarketBtn.text}")
+            if expandMarketBtn.text == "See more":
+                expandMarketBtn.click()
+                assert(expandMarketBtn.text == "See less")
+        except NoSuchElementException:  # group doesn't have any hidden elements
+            pass
+        print(title)
+        try:  # find subHeading if it exists (only present on Live-Odds pages?)
+            subHeading = content.find_element(By.XPATH, "./ul[li and li]")  # ul with two child elements tagged li (which usually contain the team names)
+            print(subHeading.text)
+        except NoSuchElementException:
+            subHeading = None
+        market_dict[title] = {"subHeading": subHeading, "content": []}
+        market_buttons = content.find_elements(By.XPATH, ".//button[contains(@class, 'market-btn')]")
+        # you can check if the button is disabled (line closed) by checking this attribute: aria-label="Currently Offline"
+        for btn in market_buttons:
+            temptxt = btn.text
+            if len(temptxt) > 0:
+                market_dict[title]["content"].append(btn.text.splitlines())
+                print(temptxt)
+            else:  # assume "Line closed or not posted"
+                market_dict[title]["content"].append("Line Closed or Not Posted")
+                print("Line Closed or Not Posted")
+        print("")  # implied newline
     return market_dict
 
 
@@ -231,8 +245,8 @@ if __name__ == "__main__":
         links = FindGameLinks(driver, default_sport)
         print("\n\n")
         for link in links:
-            VisitPage(link, driver, default_sport)
-            ScrapePage(driver)
+            current_state = VisitPage(link, driver, default_sport)
+            ScrapePage(current_state)
 
     print("about to quit")
     driver.quit()
