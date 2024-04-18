@@ -4,3 +4,4 @@ pandas
 selenium
 matplotlib
 xgboost
+ttkthemes==3.2.2
