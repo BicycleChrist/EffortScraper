@@ -1,12 +1,21 @@
 import tkinter
 from tkinter import ttk
 
+# ttkthemes requires pip install
+USETTKTHEMES = True
+if USETTKTHEMES:
+    import ttkthemes
+
 
 class App(tkinter.Tk):
     def __init__(self):
         super().__init__()
         self.geometry("800x600")
-        self.style = ttk.Style()
+        if USETTKTHEMES:
+            self.style = ttkthemes.ThemedStyle()
+        else:
+            self.style = ttk.Style()
+        
         # ttk.Style().theme_names() lists available themes: ('clam', 'alt', 'default', 'classic')
         self.style.theme_use("default")
         self.title(self.style.theme_use())  # set title to current theme name
