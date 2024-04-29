@@ -2,6 +2,7 @@ import sqlite3
 import pathlib
 import logging
 
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -18,6 +19,39 @@ def remove_duplicates(dbname, tablename, field):
         logging.error(f"Error removing duplicates: {e}")
     finally:
         dbconnection.close()
+
+
+from pathlib import Path
+
+def import_logos_to_db(db_file, logos_dir):
+    try:
+        conn = sqlite3.connect(db_file)
+        c = conn.cursor()
+
+        c.execute('''CREATE TABLE IF NOT EXISTS TeamLogos
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     sport TEXT,
+                     team_name TEXT,
+                     logo_path TEXT)''')
+
+        logos_path = Path(logos_dir)
+        for sport_folder in logos_path.iterdir():
+            if sport_folder.is_dir():
+                sport = sport_folder.name
+                for logo_file in sport_folder.iterdir():
+                    if logo_file.suffix == '.png':
+                        team_name = logo_file.stem
+                        logo_path = str(logo_file)
+                        c.execute('''INSERT INTO TeamLogos (sport, team_name, logo_path)
+                                     VALUES (?, ?, ?)''', (sport, team_name, logo_path))
+
+        conn.commit()
+        logging.info("Logos imported successfully.")
+    except sqlite3.Error as e:
+        logging.error(f"Error importing logos: {e}")
+    finally:
+        conn.close()
+
 
 
 def create_table(tablename, filetype, category="placeholder"):
@@ -46,12 +80,17 @@ def create_table(tablename, filetype, category="placeholder"):
                         (team, date, category, str(filepath))
                     )
 
-        dbconnection.commit()
-        logging.info("Table created successfully.")
+        dbconnection.commit()  # Changed from conn to dbconnection
+
+        # Import logos to database after creating tables
+        import_logos_to_db('teamreports.db', '/home/retupmoc/Desktop/EffortScraper/TeamLogos')
+
+        logging.info("Tables created and logos imported successfully.")
     except sqlite3.Error as e:
-        logging.error(f"Error creating table: {e}")
+        logging.error(f"Error creating table or importing logos: {e}")
     finally:
         dbconnection.close()
+
 
 
 if __name__ == "__main__":
