@@ -1,61 +1,60 @@
 import sqlite3
 import pathlib
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 
-# TODO: actually prevent duplicates here
-def RemoveDuplicates(dbname, tablename, field):
-    dbconnection = sqlite3.connect(dbname)
-    cursor = dbconnection.cursor()
+def remove_duplicates(dbname, tablename, field):
+    try:
+        dbconnection = sqlite3.connect(dbname)
+        cursor = dbconnection.cursor()
 
-    cursor.execute("DROP TABLE IF EXISTS temptable")
-    cursor.execute(
-        '''CREATE TABLE temptable AS
-            SELECT DISTINCT * FROM graphs
-            WHERE file_path IN (
-                SELECT DISTINCT file_path FROM graphs
-           );'''
-    )
+        cursor.execute(f"DELETE FROM {tablename} WHERE ROWID NOT IN (SELECT MIN(ROWID) FROM {tablename} GROUP BY {field})")
 
-    #unduplicated = cursor.execute("SELECT * FROM temptable").fetchall()
-    #print(unduplicated)
-    dbconnection.commit()
-    dbconnection.close()
-    return
+        dbconnection.commit()
+        logging.info("Duplicates removed successfully.")
+    except sqlite3.Error as e:
+        logging.error(f"Error removing duplicates: {e}")
+    finally:
+        dbconnection.close()
 
 
-# TODO: actually do SQL syntax correctly instead of fstring
-def CreateTable(tablename, filetype, category="placeholder"):
-    cwd = pathlib.Path.cwd()
-    basedir = cwd / "NHLvacuum" / "nhlteamreports"
+def create_table(tablename, filetype, category="placeholder"):
+    try:
+        cwd = pathlib.Path.cwd()
+        basedir = cwd / "NHLvacuum" / "nhlteamreports"
 
-    # Connect to the SQLite database
-    dbconnection = sqlite3.connect('teamreports.db')
-    cursor = dbconnection.cursor()
+        dbconnection = sqlite3.connect('teamreports.db')
+        cursor = dbconnection.cursor()
 
-    cursor.execute(f"DROP TABLE IF EXISTS {tablename}")
-    cursor.execute(f'''CREATE TABLE IF NOT EXISTS {tablename}
-                   (id INTEGER PRIMARY KEY, team TEXT, date TEXT, category TEXT, filepath TEXT)''')
+        cursor.execute(f"DROP TABLE IF EXISTS {tablename}")
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS {tablename}
+                           (id INTEGER PRIMARY KEY, team TEXT, date TEXT, category TEXT, filepath TEXT)''')
 
-    team_subdirs = [subdir for subdir in basedir.glob("*")]
-    for team_subdir in team_subdirs:
-        team = team_subdir.name
-        team_subdir = team_subdir / "generalTRdata"
-        date_subdirs = [subdir for subdir in team_subdir.glob("*")]
-        for date_subdir in date_subdirs:
-            date = date_subdir.name
-            filepaths = date_subdir.rglob(f"*.{filetype}")
-            for filepath in filepaths:
-                # Insert the graph file path into the database
-                print(f"INSERT INTO {tablename} (team, date, category, filepath) VALUES ('{team}', '{date}', '{category}', '{filepath})'")
-                cursor.execute(
-                    f"INSERT INTO {tablename} (team, date, category, filepath) VALUES ('{team}', '{date}', '{category}', '{filepath}')"
-                )
+        team_subdirs = [subdir for subdir in basedir.glob("*")]
+        for team_subdir in team_subdirs:
+            team = team_subdir.name
+            team_subdir = team_subdir / "generalTRdata"
+            date_subdirs = [subdir for subdir in team_subdir.glob("*")]
+            for date_subdir in date_subdirs:
+                date = date_subdir.name
+                filepaths = date_subdir.rglob(f"*.{filetype}")
+                for filepath in filepaths:
+                    cursor.execute(
+                        "INSERT INTO {} (team, date, category, filepath) VALUES (?, ?, ?, ?)".format(tablename),
+                        (team, date, category, str(filepath))
+                    )
 
-    dbconnection.commit()
-    dbconnection.close()
-    return
+        dbconnection.commit()
+        logging.info("Table created successfully.")
+    except sqlite3.Error as e:
+        logging.error(f"Error creating table: {e}")
+    finally:
+        dbconnection.close()
 
 
 if __name__ == "__main__":
-    CreateTable("graphs", "png", "rollingavggraphs")
-    CreateTable("static", "csv", "static_data")
+    create_table("graphs", "png", "rollingavggraphs")
+    create_table("static", "csv", "static_data")
+    remove_duplicates("teamreports.db", "graphs", "filepath")
