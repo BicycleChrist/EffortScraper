@@ -1,7 +1,7 @@
 import tkinter as tk
 from moviepy.editor import VideoFileClip
 from PIL import Image, ImageTk
-
+import pathlib
 
 # Create Tkinter window
 root = tk.Tk()
@@ -22,9 +22,14 @@ root.geometry(f"{window_width}x{window_height}+{x}+{y}")
 # Remove window decorations
 root.overrideredirect(True)
 
+# Determine the directory of the current script
+cwd = pathlib.Path.cwd()
+
+# Construct the relative path to the video file
+video_path = cwd.parent / 'EffortScraper' / 'Heftyrender.mkv'
+
 # Load the video
-video_path = '/home/retupmoc/Desktop/EffortScraper/Heftyrender.mkv'
-video = VideoFileClip(video_path)
+video = VideoFileClip(str(video_path))  # Convert Path object to string
 
 # Create a Canvas to display the video
 canvas = tk.Canvas(root, width=window_width, height=window_height)
