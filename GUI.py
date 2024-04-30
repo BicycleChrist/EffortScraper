@@ -17,7 +17,7 @@ class App(tkinter.Tk):
             self.style = ttkthemes.ThemedStyle()
         else:
             self.style = ttk.Style()
-        
+
         # ttk.Style().theme_names() lists available themes: ('clam', 'alt', 'default', 'classic')
         self.style.theme_use("default")
         self.title(self.style.theme_use())  # set title to current theme name
@@ -66,22 +66,35 @@ def LoadImages(master, subpath):
     return loaded
 
 
+
 if __name__ == "__main__":
     app = App()
-    teamlogos = LoadImages(app, "CHN/teamlogos/")
-    print(f"loaded images: = {[img.name for img in teamlogos]}")
-    scaledlogos = [img.subsample(5, 5) for img in teamlogos]
-    # TODO: figure out how to keep the names for the scaled images
-    
-    for sport in ("NBA", "NHL", "NFL", "MLB"):
-        newframe = app.CreateTab(sport)
-        if sport == "NHL":
-            for image in scaledlogos:
-                tkinter.Label(master=newframe, image=image).pack(anchor="nw", side="left")
 
-    graphframe = app.CreateTab("graphs")
-    graphimages = LoadImages(graphframe, "NHLvacuum/nhlteamreports/COL/generalTRdata/2024-04-22/rollingavggraphs/")
-    for graph in graphimages:
-        tkinter.Label(master=graphframe, image=graph).pack(anchor="nw", side="top")
+    # Load NHL logos
+    nhl_logos = LoadImages(app, "TeamLogos/NHLlogos")
+    scaled_nhl_logos = [img.subsample(5, 5) for img in nhl_logos]
 
-    app.mainloop()
+    # Load MLB logos
+    mlb_logos = LoadImages(app, "TeamLogos/MLBlogos")
+    scaled_mlb_logos = [img.subsample(10, 10) for img in mlb_logos]
+
+    # Load NFL logos
+    nfl_logos = LoadImages(app, "TeamLogos/NFLlogos")
+    scaled_nfl_logos = [img.subsample(10, 10) for img in nfl_logos]
+
+    # Load NBA logos
+    nba_logos = LoadImages(app, "TeamLogos/NBAlogos")
+    scaled_nba_logos = [img.subsample(10, 10) for img in nba_logos]
+
+    for sport, logos in (("NHL", scaled_nhl_logos), ("MLB", scaled_mlb_logos), ("NFL", scaled_nfl_logos), ("NBA", scaled_nba_logos)):
+        new_frame = app.CreateTab(sport)
+        for image in logos:
+            tkinter.Label(master=new_frame, image=image).pack(anchor="nw", side="left")
+
+    graph_frame = app.CreateTab("graphs")
+    graph_images = LoadImages(graph_frame, "NHLvacuum/nhlteamreports/BOS/generalTRdata/2024-04-27/rollingavggraphs/")
+    for graph in graph_images:
+        tkinter.Label(master=graph_frame, image=graph).pack(anchor="nw", side="top")
+
+
+app.mainloop()
