@@ -1,6 +1,8 @@
 import tkinter
 from tkinter import ttk
 import pathlib
+#from SplashScreen import *
+# uncomment above for suspect Splash Screen render
 
 # ttkthemes requires pip install
 USETTKTHEMES = True
@@ -68,8 +70,8 @@ def LoadImages(master, subpath):
 
 
 if __name__ == "__main__":
-    app = App()
 
+    app = App()
     # Load NHL logos
     nhl_logos = LoadImages(app, "TeamLogos/NHLlogos")
     scaled_nhl_logos = [img.subsample(5, 5) for img in nhl_logos]
