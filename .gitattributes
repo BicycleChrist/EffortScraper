@@ -1,2 +1,7 @@
-Boddssuck/pagesource/*.html linguist-generated=true
-*.html linguist-generated=true
+*.html linguist-generated
+*.html linguist-vendored
+TeamLogos/** linguist-generated
+TeamLogos/** linguist-vendored
+*.png linguist-generated
+*.png linguist-vendored
+
