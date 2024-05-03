@@ -214,7 +214,7 @@ def FormatColumnString(cell_data):
 
 
 # TODO: parameterize this function with the Odds-Format type somehow
-def FormatCellData(all_cell_data):
+def FormatCellData(all_cell_data, booknames):
     moneylinemap = {}  # storing the cells containing odds so we can lookup the sportsbook names and format by row
     formatted_strings = []
     working_string = ''
@@ -259,49 +259,143 @@ def FormatCellData(all_cell_data):
 
 def write_tickertape(inputtext):
     cwd = pathlib.Path.cwd()
-    # TODO: ensure tickertaper output dir exists
-    output_file = cwd / "tickertape_outputs" / f"{DEFAULT_LEAGUE_SELECT}.txt"
+    output_dir = cwd / "tickertape_outputs"
+    output_dir.mkdir(exist_ok=True)  # ensure it exists
+    output_file = output_dir / f"{DEFAULT_LEAGUE_SELECT}.txt"
     with open(output_file, 'w', encoding='utf-8') as file:
         for ttstringd_string in inputtext:
             file.write(f"{ttstringd_string}\n")
+    return
 
 
-def capitalize(somestring):
+# used by argparser (allowing it to accept lowercase odds-format)
+def capitalize(somestring:str):
     return somestring.capitalize()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("leagueselect", default=DEFAULT_LEAGUE_SELECT,
-                        help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})",
-                        choices=leaguemap.keys())
-    parser.add_argument("odds", default=None,
-                        help=f"Select the oddsformat (default is league-dependent",
-                        choices=OddsFormat.keys(),
-                        type=capitalize
-                        )
-    args = parser.parse_args()
-    TEAMLIST = leaguemap[args.leagueselect]
-    # updating the default doesn't actually affect anything; default-parameters in functions will still use the original value
-    DEFAULT_LEAGUE_SELECT = args.leagueselect
-    oddsformat = args.odds
-    if oddsformat is None:
-        oddsformat = default_format_map[DEFAULT_LEAGUE_SELECT]
-    print(f"LEAGUE: {DEFAULT_LEAGUE_SELECT}")
-    print(f"ODDS: {oddsformat}\n")
+def InitializeParser(prevent_exit=False) -> argparse.ArgumentParser:
+    allow_exit = not prevent_exit  # lol
+    if prevent_exit:
+        print("\n Argparse 'exit_on_error' is DISABLED! \n")
+    
+    valid_leagues = f"{list(leaguemap.keys())}"
+    valid_formats = f"{list(OddsFormat.keys())}"
+    
+    parser = argparse.ArgumentParser(prog="testwoopty.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter, # prevents argparse from stripping whitespace (in description/epilog)
+        description=f"""\
+        leagueselect : {valid_leagues} 
+        odds-formats : {valid_formats}""",
+        epilog="""\t
+        this script parses and prints data from local HTML files (from Bovada).
+        it's actually a better and more complete implementation of 'parseUB'.
+        testwoopty expects files to be under subdirectories 'pagesource' and 'parsedpage'.
+        """,
+        exit_on_error=allow_exit,  # TODO: is it possible to set this outside of constructor?
+    )
+    
+    parser.add_argument("leagueselect", default=DEFAULT_LEAGUE_SELECT, 
+        choices=leaguemap.keys(),
+        nargs="?", # indicates that this (positional) argument isn't required (0 or 1 args accepted)
+        metavar="league", # "metavar" is the placeholder used in the --help strings
+        help=f"Select the league (default: {DEFAULT_LEAGUE_SELECT})",
+    )
+    parser.add_argument("format", default=None, 
+        choices=OddsFormat.keys(),
+        nargs="?",
+        type=capitalize, # dubious workaround(?) to maniuplate the input
+        metavar="format",
+        help=f"Select the odds-format (default is league-dependent)",
+    )
+    # argparse decides whether arguements are positional or keyword solely based on the leading "--".
+    # this will map to the same variable as the positional version given above (parser.format)
+    parser.add_argument("--format", default=argparse.SUPPRESS, dest="kw_formatarg",
+        choices=list(OddsFormat.keys()),
+        nargs=1, # unlike '?' and '*', specifying a number here causes it to store a list (of length one)
+        type=capitalize,
+        metavar="format",
+        help=f"Select the odds-format (keyword)",
+        required=False,  # 'required' is only valid for keyword-arguments (epic troll, I guess)
+    )
+    # you can't directly store it to "format" because it gets overwritten by "None" every time,
+    # (by the default value of the positional argument) so we store it in "kw_formatarg" instead.
+    # argparse.SUPPRESS can't be applied to positional args.
+    # we'll simply overwrite args.format with args.kwargs_format later
+    return parser
 
+
+def TestArgparsing():
+    print("\n Testing argparse: \n")
+    # prevent the parser from terminating the program during tests
+    parser = InitializeParser(prevent_exit=True)
+    
+    mock_cmdline_inputs = [
+        [],    #  no args - passes
+        #[""], #  empty string - fails
+        ["NHL", "Moneyline"],
+        ["MLB", "Spread"],
+        ["NBA"],
+        ["MLB", "--format", "Combined"],
+        ["--format", "Spread"],
+        ["--format=Total"], # alt format for keyword args
+        ["NFL", "--format=Moneyline"],
+        ["NHL", "Moneyline", "--format", "Combined"],  # redundant 'format' still works
+        ["NHL", "moneyline"],  # lowercase odds-format args
+        ["MLB", "combined"],
+        ["--format", "spread"],
+        ["--format=total"],
+    ]
+    
+    # the second and third methods return a tuple of (Namespace, list)
+    parsing_method_lambdas = {
+        "parse_args"                  : lambda args: (parser.parse_args(args), []),  # matching structure of the other two
+        "parse_known_args"            : lambda args: parser.parse_known_args(args),
+        "parse_known_intermixed_args" : lambda args: parser.parse_known_intermixed_args(args),
+    }
+    
+    for methodname, parsing_method in parsing_method_lambdas.items():
+        print(f"\n testing with parsing method:\t '{methodname}' ")
+        #print(f"{methodname}: type({result}), {result}")
+        try:
+            # results = {f"args= {mock_args}": vars(parsing_method(mock_args.copy())[0]) for mock_args in mock_cmdline_inputs}
+            results = {
+                "parsing_method": f"{methodname}",
+                "results": [
+                    {
+                        "cmdline": f"{mock_args.copy()}", 
+                        **vars(parsing_method(mock_args.copy())[0])
+                    } for mock_args in mock_cmdline_inputs
+                ],
+            }
+            pprint.pprint(results)
+            
+            # the second and third methods return a tuple of (Namespace, list)
+            #if type(result) == argparse.Namespace: print(vars(results))
+            #else: print(vars(results[0]))
+        except argparse.ArgumentError as ex:
+            print(f"FAILED: {ex}\n")
+        except BaseException as ex:  # argparse tries to exit when missing an arg
+            print(f"fuck off argparse {ex}\n")
+        print('\n')
+    
+    print(" finished testing argparse. ")
+    return
+
+
+def Main(args: argparse.Namespace):
+    oddsformat = args.format
     soup = LoadPagesource(args.leagueselect, oddsformat)
     table, header_row = ParseUB(soup)
     booknames = dan_parse_header(soup)
     #pprint.pprint(booknames)
     #pprint.pprint(header_row)
-
+    
     intermediate_output = dan_html_extractor(table)
-    formatted_output, moneylines, rowmapthing = FormatCellData(intermediate_output)
+    formatted_output, moneylines, rowmapthing = FormatCellData(intermediate_output, booknames)
     output_storage = []
     #write_to_text_file(formatted_output, output_file="tickertapeformattedinfo.txt")
     #print(intermediate_output)
-
+    
     #pprint.pprint(moneylines)
     #pprint.pprint(rowmapthing)
     for magicnumbers in rowmapthing.values():
@@ -314,10 +408,41 @@ if __name__ == "__main__":
             print(f"\t\t{odds}")
             #output_storage.append(moneylines[magicnumbers['aria-rowindex']])
         print("\n")
-
-    #write_tickertape(output_storage)
-    print("plsdontexit")
+    
     if len(unrecognized_set) > 0:
         print("unrecognized names:")
         for name in unrecognized_set:
             print(f'\t"{name}",')
+    
+    #write_tickertape(output_storage)
+    print("plsdontexit")
+    return
+
+
+if __name__ == "__main__":
+    RUN_ARGPARSE_TEST = True
+    if RUN_ARGPARSE_TEST:
+        TestArgparsing()
+        print("exiting. ('RUN_ARGPARSE_TEST' is True) \n")
+        exit()
+    # if "exit_on_error" could be set outside the constructor, we wouldn't have to exit
+    # exiting may not actually be necessary? kind of sketchy though
+        
+    argparser = InitializeParser()
+    parsed_args = argparser.parse_args()
+    
+    # intentionally global - these are referenced by 'FormatColumnString', among others
+    # TODO: refactor these out
+    TEAMLIST = leaguemap[parsed_args.leagueselect]
+    DEFAULT_LEAGUE_SELECT = parsed_args.leagueselect
+    # note that leagueselect defaults to 'DEFAULT_LEAGUE_SELECT' 
+    
+    if 'kw_formatarg' in parsed_args: # argparse.Namespace implements the '__contains__' method 
+        parsed_args.format = parsed_args.kw_formatarg[0]  # remember, the kwarg stores a list because 'nargs=1'
+    if parsed_args.format is None:
+        parsed_args.format = default_format_map[DEFAULT_LEAGUE_SELECT]
+    
+    print(f"LEAGUE: {parsed_args.leagueselect}")
+    print(f"ODDS-FORMAT: {parsed_args.format}\n")
+    
+    Main(parsed_args)
