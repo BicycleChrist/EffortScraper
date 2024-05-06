@@ -40,7 +40,7 @@ def move_text(text_object, lines, line_index, xdelta=2, framedelay=50):
 
 
 if __name__ == "__main__":
-    lines = read_text_file("NFL")
+    lines = read_text_file("OUT")
 
     initial_text = lines[0].strip() if lines and lines[0].strip() != "" else "Default Text"
     text_object = canvas.create_text(0, dimensions[1]/2, text=initial_text, font=("arial", 10), fill="white", anchor=W)

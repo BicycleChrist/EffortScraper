@@ -8,9 +8,11 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import time
 
-# ganked the selenium options/imports from boundFetch
 
+# ganked the selenium options/imports from boundFetch
+# every page but the stuff+ table is very inconsistent
 # Thought we could get away w/ just BS4 and req but no dice
+
 #TODO:save html files to own folder along with data files
 
 def download_html_selenium(url, filename):
@@ -64,9 +66,9 @@ def convert_to_csv(table_data, filename):
 
 
 def main():
-    url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'  # Replace 'your_url_here' with the URL of the webpage containing the table
+    url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
     html_file = 'FG.html'
-    csv_file = 'table_data.csv'
+    csv_file = 'stuffplustable_data.csv'
 
     # Download HTML file
     download_html_selenium(url, html_file)

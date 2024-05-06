@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 
 #TODO: extract headers from html, went on tilt and just hardcoded the shit
+#TODO: save output from this and other MLB scripts to folder within MLBanalytics
 
 def download_html_selenium(url, filename):
     service = FirefoxService()

@@ -212,7 +212,7 @@ def CopyProfile(forceOverwrite=False):
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "Boddssuck" and "you're in the wrong directory")
-    default_sport = "NBA"
+    default_sport = "MLB"
     # TOOD: sport as cmdline arg
 
     # Set up the Firefox options and WebDriver

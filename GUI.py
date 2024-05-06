@@ -4,7 +4,7 @@ import pathlib
 
 
 # ttkthemes requires pip install
-USETTKTHEMES = False
+USETTKTHEMES = True
 if USETTKTHEMES:
     import ttkthemes
 # https://ttkthemes.readthedocs.io/en/latest/themes.html
@@ -12,7 +12,7 @@ if USETTKTHEMES:
 
 class App(tkinter.Tk):
     def __init__(self):
-        super().__init__()
+        super().__init__(sync=False)
         if USETTKTHEMES:
             self.style = ttkthemes.ThemedStyle()
         else:
@@ -23,21 +23,25 @@ class App(tkinter.Tk):
         self.title(self.style.theme_use())  # set title to current theme name
 
         self._LOADED_IMAGES = {}
-        self._LOGOS_STORAGE = []  # required to keep images from unloading 
+        self._LOGOS_STORAGE = []  # required to keep images from unloading
         self._SCALED_LOGOS_STORAGE = []  # (specifically the logos in 'DrawLogos' function)
-        
+
         self.BUTTON_FRAMES_ENABLED = True
-        self.ButtonFrameToggle = tkinter.Checkbutton(master=self, text="Draw Button Frames", 
-                                                     command=self.ToggleButtonFrames, takefocus=False, 
+        self.ButtonFrameToggle = tkinter.Checkbutton(master=self, text="Draw Button Frames",
+                                                     command=self.ToggleButtonFrames, takefocus=False,
                                                      relief="raised", overrelief="sunken", borderwidth=3)
         self.ButtonFrameToggle.select()  # sets initial state to true
         self.ButtonFrameToggle.grid()
-        
+
         self.tab_control = ttk.Notebook(self, padding=(5,5,5,5))
+        #TODO: Was suppose to be two lines of code to get the icon to load but fuck me if its ever that easy
+        #icon = tk.PhotoImage(file="Eff0rt.png")
+        #self.iconphoto(True, icon)
         self.tab_control.grid()
+
         return
-    
-    
+
+
     def ToggleButtonFrames(self):
         self.BUTTON_FRAMES_ENABLED = not self.BUTTON_FRAMES_ENABLED
         tabnames = [self.tab_control.tab(tab, "text") for tab in self.tab_control.tabs()]
@@ -47,13 +51,13 @@ class App(tkinter.Tk):
             self.DrawLogos(tabname)
         self.tab_control.select(currentTab)  # re-selecting previous tab
         return
-    
-    
+
+
     def CreateThemeButtons(self, parent):
         themes = self.style.theme_names()
         button_frame = ttk.Frame(parent, padding=20)
         button_frame.grid()
-        
+
         for index, themename in enumerate(sorted(themes)):
             # setting default arguments is required for working around python jank
             def LambdaSetTheme(name=themename):
@@ -63,8 +67,7 @@ class App(tkinter.Tk):
             new_button = ttk.Button(button_frame, text=themename, command=LambdaSetTheme)
             new_button.grid(column=index, row=0)
         return
-    
-    
+
     def CreateTab(self, tabname):
         # for some reason names that start uppercase are illegal in Tcl/Tk so we have to prepend something
         new_frame = ttk.Frame(self.tab_control, name=f"tab_{tabname}")
@@ -72,8 +75,8 @@ class App(tkinter.Tk):
         self.tab_control.add(new_frame, text=tabname)
         self.CreateThemeButtons(new_frame)
         return new_frame
-    
-    
+
+
     # from TkExperiments
     # https://docs.python.org/3/library/tkinter.html#images
     def LoadImages(self, subpath: str):
@@ -86,7 +89,7 @@ class App(tkinter.Tk):
             return {}
         if subpath in self._LOADED_IMAGES and self._LOADED_IMAGES[subpath] is not None:
             return self._LOADED_IMAGES[subpath]  # already loaded
-        
+
         pngs = list(imagepath.glob('*.png'))
         # load and map all images under subpath. Make an entry for every subdirectory (mapped to None)
         # the idea is to defer the searching/loading of subdirectories
@@ -97,24 +100,31 @@ class App(tkinter.Tk):
         # you can assign a loaded image to a widget by using it's name in the 'image=' argument!
         print(f"\nloaded images: {[png.name for png in pngs]}\n")
         return self._LOADED_IMAGES[subpath]
-    
-    
+
+
     def DrawLogos(self, sportname):
         tabframe = self.CreateTab(sportname)
         logos = self.LoadImages(sportname)
         scaledlogos = {}
-        
+
         # relief can be: flat, groove, raised, ridge, solid, or sunken
         logoframe = ttk.Frame(master=tabframe, relief="flat", borderwidth=5)
         logoframe.grid()
         outer_subframe = ttk.Frame(master=logoframe, relief="ridge", border=5, borderwidth=10, padding=(0,0,0,0))
         lastCol = 0
         lastRow = 0
-        
+
         for name, logo in logos.items():
+            if logo is None:  # it's actually a subfolder that hasn't been loaded yet
+                sublogos = self.LoadImages(name)
+                self._LOGOS_STORAGE.append(sublogos)
+                self._LOADED_IMAGES[sportname] = sublogos
+                self.DrawLogos(sportname)
+                # TODO: make this load subfolders properly
+                return
             scaledlogos[name] = logo.subsample(10,10)
             def printlogoname(n=name): return lambda: print(n)
-            
+
             # the 'sticky' option basically controls the expansion of the element.
             # setting all directions causes all elements to basically become square
             outer_subframe.grid(sticky="NSEW")
@@ -127,24 +137,32 @@ class App(tkinter.Tk):
             newbutton = ttk.Button(master=subframe, image=scaledlogos[name], command=printlogoname(), text=name, compound="top", width=15, padding=(0,0,0,0))
             newbutton.grid(row=lastRow, column=lastCol, padx=2, pady=2, ipadx=0, ipady=0, sticky="SNEW")
             subframe.grid(row=lastRow, column=lastCol, padx=0, pady=0, ipadx=0, ipady=0, sticky="WE")
-            
+
             lastCol += 1
             if lastCol > 10:
                 lastCol = 0
                 lastRow += 1
-        
+
         # must store the images otherwise they'll unload
         self._LOGOS_STORAGE.append(logos)
         self._SCALED_LOGOS_STORAGE.append(scaledlogos)
         return
 
 
+from MLBAnalytics import BaseFrame
+BaseFrame.LAYOUTMETHOD = tkinter.Widget.grid
+
 if __name__ == "__main__":
     app = App()
     imagefolders = app.LoadImages("")  # loads all subdirectories under 'TeamLogos'
     print(imagefolders)
-    
+
     for sport in imagefolders.keys():
         app.DrawLogos(sport)
+    
+    BaseFrame.TOPLEVEL = app
+    newtab = app.CreateTab("newtab")
+    BaseFrame.InsertFrame(newtab, "MLB")
+    BaseFrame.InsertFrame()
     
     app.mainloop()
