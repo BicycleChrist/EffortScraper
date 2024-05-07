@@ -161,7 +161,7 @@ if __name__ == "__main__":
     BaseFrame.InsertFrame(newtab, "MLB")
     BaseFrame.InsertFrame()
     
-    app.icon = imagefolders["Efforticon"]
+    app.icon = imagefolders["Efforticoncolor"]
     app.iconphoto(True, app.icon)
 
     app.mainloop()
