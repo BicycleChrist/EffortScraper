@@ -2,6 +2,8 @@ import tkinter
 from tkinter import ttk
 import pathlib
 
+from MLBAnalytics import BaseFrame
+BaseFrame.LAYOUTMETHOD = tkinter.Widget.grid
 
 # ttkthemes requires pip install
 USETTKTHEMES = True
@@ -34,9 +36,6 @@ class App(tkinter.Tk):
         self.ButtonFrameToggle.grid()
 
         self.tab_control = ttk.Notebook(self, padding=(5,5,5,5))
-        #TODO: Was suppose to be two lines of code to get the icon to load but fuck me if its ever that easy
-        #icon = tk.PhotoImage(file="Eff0rt.png")
-        #self.iconphoto(True, icon)
         self.tab_control.grid()
 
         return
@@ -149,9 +148,6 @@ class App(tkinter.Tk):
         return
 
 
-from MLBAnalytics import BaseFrame
-BaseFrame.LAYOUTMETHOD = tkinter.Widget.grid
-
 if __name__ == "__main__":
     app = App()
     imagefolders = app.LoadImages("")  # loads all subdirectories under 'TeamLogos'
@@ -165,4 +161,7 @@ if __name__ == "__main__":
     BaseFrame.InsertFrame(newtab, "MLB")
     BaseFrame.InsertFrame()
     
+    app.icon = imagefolders["Efforticon"]
+    app.iconphoto(True, app.icon)
+
     app.mainloop()
