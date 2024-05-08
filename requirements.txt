@@ -5,4 +5,4 @@ selenium
 matplotlib
 xgboost
 #ttkthemes
-
+requests
