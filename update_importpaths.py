@@ -14,7 +14,9 @@ subdir_names = [
 ]
 
 # symlinks are dropped into these directories (allowing them to import this file as well)
-symlink_into = []
+symlink_into = [
+    "MLBAnalytics",
+]
 # note: paths listed here must also be in 'subdir_names'; they won't be used otherwise
 
 
@@ -44,7 +46,7 @@ def Update_ImportPaths(onlyGood=False):
             print(f"error: '{name}' does not exist or is not a directory")
         raise ImportError
     if onlyGood: return good_paths
-    return [ *good_paths, *sys.path]
+    return [ str(toplevel_path), *good_paths, *sys.path]
 
 
 # 'relative_to' doesn't accept 'walk_up' until 3.12
