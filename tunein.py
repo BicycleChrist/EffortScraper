@@ -1,5 +1,10 @@
 import requests
 from bs4 import BeautifulSoup
+import threading
+
+# TODO: Ignore links that don't lead to a stream, output is far greater than needed
+# I.E https://buffstreams.ai/soccer or https://the.streameast.app/team/anaheim-ducks
+
 
 def get_href_links(url):
     try:
@@ -12,13 +17,24 @@ def get_href_links(url):
         print(f"Error fetching links from {url}: {e}")
         return []
 
+
+def parse_url(url):
+    print(f"Links from {url}:")
+    href_links = get_href_links(url)
+    for link in href_links:
+        print(link)
+    print()
+
+
 def parse_urls(urls):
+    threads = []
     for url in urls:
-        print(f"Links from {url}:")
-        href_links = get_href_links(url)
-        for link in href_links:
-            print(link)
-        print()
+        thread = threading.Thread(target=parse_url, args=(url,))
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+
 
 if __name__ == "__main__":
     urls = [
@@ -31,4 +47,3 @@ if __name__ == "__main__":
         "https://buffstreams.ai/nhl"
     ]
     parse_urls(urls)
-
