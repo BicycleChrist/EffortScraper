@@ -13,7 +13,7 @@ LAYOUTMETHOD = tkinter.Widget.pack
 class MLBFrameT(DmFrameT):
     def __init__(self, master):
         super().__init__(master)
-        self.daily_lineups_data = None
+        self.daily_lineups_data = {}  # keys are the matchup titles
         self.DownloadButton = ttk.Button(master=self, text="download", command=self.DownloadButtonLambda)
         self.DownloadButton.pack()
         #self.MatchupSelectorText = tkinter.StringVar()
@@ -24,18 +24,33 @@ class MLBFrameT(DmFrameT):
         )
     
     def DownloadButtonLambda(self):
-        self.daily_lineups_data = daily_lineups.Main()
-        for matchupdict in self.daily_lineups_data:
+        data = daily_lineups.Main()
+        for matchupdict in data:
             matchup_title = matchupdict["Matchup"]
-            new_pane:ttk.PanedWindow = self.MatchupNB.AddTab(matchup_title, ttk.PanedWindow)
+            new_tab = self.MatchupNB.AddTab(matchup_title)
+            self.daily_lineups_data[matchup_title] = matchupdict
         
         # we add the callback here so it doesn't trigger when adding the tabs
         self.MatchupNB.AddCallback(self.Tabswitch_Callback)
-        # delete the button
-        self.DownloadButton.pack_forget()
+        # triggers anyway, lol
+        self.DownloadButton.pack_forget() # delete the button
     
     def Tabswitch_Callback(self, event):
-        print("hi")
+        current_tab = self.MatchupNB.current_tab
+        current_tab_name = current_tab["name"]
+        if current_tab_name not in self.daily_lineups_data.keys(): return
+        daily_lineup_data = self.daily_lineups_data[current_tab_name]
+        if daily_lineup_data is None: return
+        current_frame = self.MatchupNB.WidgetStorage[current_tab_name] 
+        CreateTabLayout(current_frame, daily_lineup_data)
+
+
+def CreateTabLayout(frame, data):
+    title_text = tkinter.Text(frame)
+    title_text.insert(tkinter.END, data["Matchup"])
+    title_text.pack(expand=1, fill="x")
+    team_text = tkinter.ScrolledText()
+
 
 
 if __name__ == "__main__":
