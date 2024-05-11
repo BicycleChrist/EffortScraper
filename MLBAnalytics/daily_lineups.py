@@ -51,8 +51,9 @@ def Main():
     matchups = []
     for teams, players_h, players_v, umpiretext, weathertext in teamlists_zipped:
         # looks like these actually give three things, seperated by newline?
-        home_team = teams[0].text.strip()
-        away_team = teams[1].text.strip()
+        # away teams are always listed first
+        away_team = teams[0].text.strip()
+        home_team = teams[1].text.strip()
         
         def FormatPlayerData(player):
             segments = player.text.strip().split('\n')
@@ -61,8 +62,9 @@ def Main():
         matchup = {
             "Matchup": "{} vs {}".format(away_team, home_team),
             "Team_Lineups": {
-                home_team: [FormatPlayerData(player) for player in players_h],
+                # away teams are always listed first
                 away_team: [FormatPlayerData(player) for player in players_v],
+                home_team: [FormatPlayerData(player) for player in players_h],
             },
             "Umpire": umpiretext.removeprefix("Umpire:"),
             "Weather": weathertext.removeprefix("Weather:"),
