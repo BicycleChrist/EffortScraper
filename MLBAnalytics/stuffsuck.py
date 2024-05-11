@@ -6,8 +6,6 @@ import pandas
 import time
 
 
-
-
 # Extract tableski data from HTML
 def extract_table_data(soup):
     toplevel = soup.find('div', class_="fg-data-grid table-type").extract()
@@ -27,9 +25,20 @@ def extract_table_data(soup):
     #return
 
 
-def LoadHTMLfile(file_name):
+def GetSaveDir():
     cwd = pathlib.Path().cwd()
-    html_file_path = cwd / file_name
+    save_dir = cwd / "MLBstats"
+    if not save_dir.exists():
+        save_dir.mkdir()
+    return save_dir
+
+
+def LoadHTMLfile(file_name):
+    save_dir = GetSaveDir()
+    html_file_path = save_dir / file_name
+    if not html_file_path.exists():
+        print(f"error: {file_name} not found!")
+        return None
     with open(html_file_path, encoding="utf-8", mode='r') as html_file:
         newsoup = BeautifulSoup(html_file.read(), 'lxml')
     return newsoup
@@ -45,10 +54,9 @@ def DownloadHTMLfile(url):
 
 
 def SaveDataframe(dataframe, file_name):
-    cwd = pathlib.Path().cwd()
-    save_dir = cwd / "MLBstats"
     current_time = time.localtime()
-    timestr = str(current_time.tm_hour) + str(current_time.tm_min) + str(current_time.tm_sec)
+    timestr = '_' + str(current_time.tm_hour) + str(current_time.tm_min) + str(current_time.tm_sec)
+    save_dir = GetSaveDir()
     file_name = file_name + timestr + '.csv'
     dump_path = save_dir / file_name
     dataframe.to_csv(dump_path, encoding="utf-8")
@@ -57,16 +65,14 @@ def SaveDataframe(dataframe, file_name):
 
 if __name__ == "__main__":
     # Minimum number of at bats can be changed via the "qual=" option at end of URL
-    url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
+    qual = 1
+    url = f'https://www.fangraphs.com/leaders/major-league?qual={qual}&pageitems=2000000000'
     #soup = LoadHTMLfile('FGhitter.html')
     newsoup = DownloadHTMLfile(url)
     dataframes = extract_table_data(newsoup)
-    SaveDataframe(dataframes[0], "stuffplustable_data_")
+    SaveDataframe(dataframes[0], "stuffplustable_data")
 
     print("pls dont exit")
 
-
-
-
-
-
+# full url
+#url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
