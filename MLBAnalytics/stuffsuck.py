@@ -8,6 +8,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import time
 
+#TODO: just reuse the code in batballsuck
 
 # ganked the selenium options/imports from boundFetch
 # every page but the stuff+ table is very inconsistent
@@ -29,7 +30,7 @@ def download_html_selenium(url, filename):
     html_content = driver.page_source
 
     # Write html to file
-    with open(filename, 'w') as file:
+    with open(filename, 'w', encoding="utf-8") as file:
         file.write(html_content)
 
     # Close WebDriver
@@ -61,20 +62,20 @@ def convert_to_csv(table_data, filename):
     df = pd.DataFrame(table_data)
     current_time = time.strftime("%Y-%m-%d %H-%M-%S")  # Get current date and time
     new_filename = f"{filename[:-4]}_{current_time}.csv"  # Append date and time to filename
-    df.to_csv(new_filename, index=False)
+    df.to_csv(new_filename, index=False, encoding="utf-8")
     print(f"Table data saved to '{new_filename}'.")
 
 
 def main():
     url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
-    html_file = 'FG.html'
-    csv_file = 'stuffplustable_data.csv'
+    html_file = 'MLBstats/FG.html'
+    csv_file = 'MLBstats/stuffplustable_data.csv'
 
     # Download HTML file
     download_html_selenium(url, html_file)
 
     # Extract table data
-    with open(html_file, 'r') as file:
+    with open(html_file, 'r', encoding="utf-8") as file:
         html_content = file.read()
         table_data = extract_table_data(html_content)
         convert_to_csv(table_data, csv_file)

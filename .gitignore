@@ -34,4 +34,4 @@ nflscripts/newdata/
 HeftyRender.mkv
 # ignoring any symlinks
 */update_importpaths.py
-
+MLBAnalytics/MLBstats/

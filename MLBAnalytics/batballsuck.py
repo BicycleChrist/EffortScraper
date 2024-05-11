@@ -12,7 +12,7 @@ import time
 def extract_table_data(soup):
     toplevel = soup.find('div', class_="fg-data-grid table-type").extract()
     bottomlevel = toplevel.find('div', class_='table-wrapper-inner').extract()
-    dataframes = pandas.read_html(bottomlevel.encode())  # list of two tables; 'table-scroll' and 'table-fixed'(hidden)
+    dataframes = pandas.read_html(bottomlevel.encode(), encoding="utf-8")  # list of two tables; 'table-scroll' and 'table-fixed'(hidden)
     # they should be the same table, probably
     return dataframes
 
@@ -51,7 +51,7 @@ def SaveDataframe(dataframe, file_name):
     timestr = str(current_time.tm_hour) + str(current_time.tm_min) + str(current_time.tm_sec)
     file_name = file_name + timestr + '.csv'
     dump_path = save_dir / file_name
-    dataframe.to_csv(dump_path)
+    dataframe.to_csv(dump_path, encoding="utf-8")
     return dump_path
 
 
