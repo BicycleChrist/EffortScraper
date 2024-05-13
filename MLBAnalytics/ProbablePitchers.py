@@ -5,7 +5,7 @@ import pprint
 from daily_lineups import GetPage
 
 
-def FindPitchers(soup):
+def ParseProbablePitchers(soup):
     main_content = soup.find('main').find('div', class_="container").extract()
     
     classPrefix = 'probable-pitchers__' # every HTML class starts with this
@@ -107,5 +107,5 @@ if __name__ == "__main__":
     url = 'https://www.mlb.com/probable-pitchers'
     soup = GetPage(url)
     if soup is None: exit(1)
-    pitcherData = FindPitchers(soup)
+    pitcherData = ParseProbablePitchers(soup)
     pprint.pprint(pitcherData, indent=2)
