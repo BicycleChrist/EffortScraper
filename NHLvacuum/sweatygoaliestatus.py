@@ -68,7 +68,7 @@ def scrape_website(soup):
 def main():
     # Define the number of retries
     max_retries = 5
-    url = "https://www.dailyfaceoff.com/starting-goalies/2024-05-12"
+    url = "https://www.dailyfaceoff.com/starting-goalies/"
     
     soup = None
     # Perform scraping with retries
