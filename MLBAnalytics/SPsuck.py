@@ -1,51 +1,112 @@
-from bs4 import BeautifulSoup
 import requests
+from bs4 import BeautifulSoup
+import pprint
+import pandas
 
-# Send a GET request to the URL
-url = 'https://www.mlb.com/probable-pitchers'
-response = requests.get(url)
+from daily_lineups import GetPage
 
-# Parse the HTML content
-soup = BeautifulSoup(response.text, 'html.parser')
 
-# Find all elements with the class 'probable-pitchers__matchup'
-matchups = soup.find_all(class_='probable-pitchers__matchup')
+def FindPitchers(soup):
+    main_content = soup.find('main').find('div', class_="container").extract()
+    
+    classPrefix = 'probable-pitchers__' # every HTML class starts with this
+    # convenience functions to make searching easier (to write)
+    def FIND(soupvar, html_tag, class_string='', **kwargs):
+        if len(class_string) > 0:
+            kwargs.update({"class_": f'{classPrefix + class_string}'})
+        return soupvar.find(html_tag, **kwargs)
+    
+    def FINDALL(soupvar, html_tag, class_string='', **kwargs):
+        if len(class_string) > 0:
+            kwargs.update({"class_": f'{classPrefix + class_string}'})
+        return soupvar.find_all(html_tag, **kwargs)
+    
+    # this one makes it easier to grab an attribute from an element. All attributes start with 'data-'
+    # returns a dict. If you pass a dict (into_dict), it'll be updated with the result
+    def GRABATTR(soupvar, attr_name:str, into_dict:dict|None=None):
+        newdict:dict = {attr_name: soupvar.attrs[f"data-{attr_name}"]}
+        if into_dict is not None: into_dict.update(newdict)
+        return newdict
+    
+    main_content = FIND(main_content, 'div', "container").extract()
+    del soup  # throw away the rest of the page
+    
+    all_data = {}
+    matchups = FINDALL(main_content, 'div', 'matchup')
+    date_button = FIND(main_content, 'div', "datepicker", id="probable-pitchers__datepicker")
+    page_date = GRABATTR(date_button, "date")
+    print(page_date)
+    
+    game_selector = FIND(main_content, 'div', "scores--game-selector")
+    # unfortunately, the gameslist is loaded via javascript, so we can't get this
+    #gameslist = game_selector.find('section').find('ul', class_="mlb-scores__list mlb-scores__list--games")
+    # note: all times Eastern (EST?)
+    
+    all_data["matchups"] = []
+    for matchup in matchups:
+        matchup_dict = {
+            "teams": {
+                "away": {},
+                "home": {},
+            }
+        }
+        GRABATTR(matchup, "gamepk", matchup_dict)
+        
+        # matchup has three subdivs: game, pitchers, and buttons (which doesn't matter)
+        #game = FIND(matchup, 'div', "game").extract()
+        #pitchers = FIND(matchup, 'div', "pitchers").extract()
+        
+        ### --- BEGIN: 'game' --- ###
+        game = FIND(matchup, 'div', "game").extract()
+        game_info = FIND(game, 'div', "game-info")
+        game_details = FIND(game_info, 'div', "game-details")
+        # TODO: game_details
+        
+        for teamside in ("away", "home"):
+            teamdict = matchup_dict["teams"][teamside]  # aliasing the dict; writes will affect matchup_dict
+            teamdict['side'] = teamside
+            # finding teamname and ids
+            GRABATTR(game, f"team-id-{teamside}", teamdict)
+            name = FIND(game, 'span', f"team-name--{teamside}")
+            teamdict["name"] = name.text.strip()
+            
+            # finding logo (which also has the record)
+            logodict = teamdict["logo"] = {}
+            logodiv = FIND(game_info, 'div', f"team-logo--{teamside}")
+            img = logodiv.find('img')
+            GRABATTR(img, "src", logodict)
+            record = FIND(logodiv, 'div', "team-record")  # this is literally under the logo
+            logodict['record'] = record.text.strip()
+            teamdict['record'] = record.text.strip()
+        
+        ### --- END OF 'game' DIV --- ###
+        ### --- BEGIN: 'pitchers' --- ###
+        pitchers = FIND(matchup, 'div', "pitchers").extract()
+        pitcher_summaries = FINDALL(pitchers, 'div', 'pitcher-summary')
+        pitcher_stats = FIND(pitchers, 'div', "stats")
+        # TODO: stats
+        # TODO: associate pitchers with teams (this info can ONLY be found under the hidden pitcher__stats-header??)
+        
+        pitcher_dict = {}
+        for summary in pitcher_summaries:
+            name = summary.find('a').text  # this happens to be the only '<a>' tag under the pitcher-summaries 
+            player_dict = pitcher_dict[name] = {}
+            spans = FINDALL(summary, 'span')
+            for span in spans:
+                # attrs always returns a list, but we only expect one class, so we immediately get [0]
+                span_key = span.attrs["class"][0].removeprefix(f"{classPrefix}pitcher-")
+                span_val = span.text.strip()
+                player_dict[span_key] = span_val
+        
+        matchup_dict["pitchers"] = pitcher_dict
+        all_data["matchups"].append(matchup_dict)
+    # END OF MATCHUP LOOP #
+    return all_data
 
-# Iterate over each matchup
-for matchup in matchups:
-    # Extract team names
-    team_names = matchup.find_all(class_='probable-pitchers__team-name')
-    away_team = team_names[0].text.strip()
-    home_team = team_names[2].text.strip()
 
-    # Find all elements with the class 'probable-pitchers__pitcher-summary'
-    pitcher_summaries = matchup.find_all(class_='probable-pitchers__pitcher-summary')
-
-    # Pair up the pitchers
-    paired_pitchers = [pitcher_summaries[i:i+2] for i in range(0, len(pitcher_summaries), 2)]
-
-    # Iterate over each pair of pitchers
-    for pair in paired_pitchers:
-        pitcher1 = pair[0]
-        pitcher2 = pair[1]
-
-        # Extract pitcher 1's information
-        pitcher1_name = pitcher1.find(class_='probable-pitchers__pitcher-name').text.strip()
-        pitcher1_hand = pitcher1.find(class_='probable-pitchers__pitcher-pitch-hand').text.strip()
-        pitcher1_stats = pitcher1.find(class_='probable-pitchers__pitcher-stats-summary').text.strip()
-
-        # Extract pitcher 2's information
-        pitcher2_name = pitcher2.find(class_='probable-pitchers__pitcher-name').text.strip()
-        pitcher2_hand = pitcher2.find(class_='probable-pitchers__pitcher-pitch-hand').text.strip()
-        pitcher2_stats = pitcher2.find(class_='probable-pitchers__pitcher-stats-summary').text.strip()
-
-        # Print the matchup
-        print(f"{away_team} vs {home_team}")
-        print("Name:", pitcher1_name)
-        print("Hand:", pitcher1_hand)
-        print("Stats:", pitcher1_stats)
-        print("VS.")
-        print("Name:", pitcher2_name)
-        print("Hand:", pitcher2_hand)
-        print("Stats:", pitcher2_stats)
-        print()
+if __name__ == "__main__":
+    url = 'https://www.mlb.com/probable-pitchers'
+    soup = GetPage(url)
+    if soup is None: exit(1)
+    pitcherData = FindPitchers(soup)
+    pprint.pprint(pitcherData, indent=2)

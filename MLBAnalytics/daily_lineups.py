@@ -5,7 +5,7 @@ import pprint
 
 # either returns 'soup' or 'None' (if bad response code)
 def GetPage(url) -> BeautifulSoup | None:
-    response = requests.get(url)
+    response = requests.get(url, timeout=5)
     if response.status_code != 200:
         print(f"not-good response code: {response.status_code}")
         return None
@@ -14,7 +14,7 @@ def GetPage(url) -> BeautifulSoup | None:
 
 def Main():
     soup = GetPage('https://www.rotowire.com/baseball/daily-lineups.php')
-    if soup is None: exit(0)
+    if soup is None: exit(1)
     
     # List of bottom level div classes, with game state determining name of div
     bottom_level_classes = [
