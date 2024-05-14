@@ -1,93 +1,86 @@
 import requests
 from bs4 import BeautifulSoup
-import random
-import time
+import pandas as pd
 
-#TODO: Despite the urls being consistent for all sports standings, different division/conference names mean different scraping logic for each standings page. This script also sucks
-url = 'https://www.espn.com/nba/standings'
-
-# Function to load the website with rotating user agents and proxies
-def load_website(url):
-    # List of user agents to rotate
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36",
-        # Add more user agents as needed
-    ]
-
-    # List of proxy servers to rotate
-    proxies = [
-        {"http": "http://162.223.94.166:80"},
-        {"http": "http://153.101.67.170:9002"},
-        # Add more proxy servers as needed
-    ]
-
-    max_retries = 5
-    for _ in range(max_retries):
-        user_agent = random.choice(user_agents)
-        proxy = random.choice(proxies)
-        headers = {'User-Agent': user_agent}
-
-        try:
-            # Make a GET request to the website using the selected proxy and headers
-            response = requests.get(url, headers=headers, proxies=proxy, timeout=5)
-            if response.status_code == 200:
-                # Parse the HTML content
-                soup = BeautifulSoup(response.content, 'lxml')
-                return soup
-            else:
-                print(f"Bad response: {response.status_code}")
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(2)  # Wait before retrying
-    raise Exception("Failed to retrieve the webpage after multiple attempts.")
+# ESPN commie JS users, NBC sports chad html table studs
+urls = {
+    'NFL': 'https://www.nbcsports.com/nfl/standings',
+    'NBA': 'https://www.nbcsports.com/nba/standings',
+    'MLB': 'https://www.nbcsports.com/mlb/standings',
+    'NHL': 'https://www.nbcsports.com/nhl/standings'
+}
 
 
-try:
-    soup = load_website(url)
+def extract_table_data(rows):
+    table_data = []
+    for row in rows:
+        cells = row.find_all(['th', 'td'])
+        row_data = [cell.get_text(strip=True) for cell in cells]
+        table_data.append(row_data)
+    return table_data
+
+# a dictionary of DataFrames, aka border line retardation
+def scrape_page(url, conference_titles):
+    response = requests.get(url)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    group_titles = soup.find_all('div', class_='TableGroup-title')
+
+    division_dataframes = {}
+
+    for group_title in group_titles:
+        group_name = group_title.get_text(strip=True)
+        if group_name not in conference_titles:
+            continue
+
+        group = group_title.find_next_sibling('div', class_='TableGroup-tables')
+        tables = group.find_all('bsp-table', class_='TableB')
+
+        for table in tables:
+            division_title = table.find('div', class_='Table-title').get_text(strip=True)
+            rows = table.find_all('tr')
+            data = extract_table_data(rows)
+            if data:
+                dataframe = pd.DataFrame(data[1:], columns=data[0])
+                division_name = f'{group_name} {division_title}'
+                division_dataframes[division_name] = dataframe
+
+    return division_dataframes
+
+# Dictionary to hold all DataFrames for NFL, NBA, MLB, and NHL
+all_dataframes = {}
+
+# Define conference titles
+#TODO: NHL and NBA conferences get printed one after the other
+# Need to overcome naming conflict
+
+nfl_conferences = ['NFC', 'AFC']
+nba_conferences = ['Eastern Conference', 'Western Conference']
+mlb_conferences = ['AL', 'NL']
+nhl_conferences = ['Eastern Conference', 'Western Conference']
 
 
-    def extract_standings(conference_title):
-        # Find the conference div by its title
-        conference_div = soup.find('div', class_='Table__Title', string=conference_title)
-        if conference_div:
-            conference_parent_div = conference_div.find_parent('div', class_='ResponsiveTable')
-            if conference_parent_div:
-                # Find the table body containing the standings
-                table_body = conference_parent_div.find('tbody', class_='Table__TBODY')
+nfl_data = scrape_page(urls['NFL'], nfl_conferences)
+all_dataframes.update(nfl_data)
 
 
-                rows = table_body.find_all('tr', class_='Table__TR Table__TR--sm')
-                standings = []
+nba_data = scrape_page(urls['NBA'], nba_conferences)
+all_dataframes.update(nba_data)
 
 
-                for row in rows:
-                    position = row.find('span', class_='team-position').text.strip()
-                    team_name = row.find('a', class_='AnchorLink').text.strip()
-                    standings.append((position, team_name))
-                return standings
-            else:
-                print(f"Parent div not found for conference: {conference_title}")
-        else:
-            print(f"Conference div not found for title: {conference_title}")
-        return []
+mlb_data = scrape_page(urls['MLB'], mlb_conferences)
+all_dataframes.update(mlb_data)
 
 
+nhl_data = scrape_page(urls['NHL'], nhl_conferences)
+all_dataframes.update(nhl_data)
 
-    east_standings = extract_standings('Eastern Conference')
-    west_standings = extract_standings('Western Conference')
-    print(east_standings)
-    print(west_standings)
+# Print the DataFrames for each division
+for division, df in all_dataframes.items():
+    print(f'{division} Table:')
+    print(df)
+    print('\n')
 
-    # Print the standings
-    print("Eastern Conference Standings:")
-    for position, team in east_standings:
-        print(f"{position}: {team}")
-
-    print("\nWestern Conference Standings:")
-    for position, team in west_standings:
-        print(f"{position}: {team}")
-
-except Exception as e:
-    print(e)
+    # Optionally, save each DataFrame to a CSV file
+    df.to_csv(f'{division.lower().replace(" ", "_")}_table.csv', index=False)
