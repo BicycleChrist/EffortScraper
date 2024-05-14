@@ -5,6 +5,12 @@ import pprint
 from daily_lineups import GetPage
 
 
+def FetchProbablePitchers()->BeautifulSoup|None:
+    url = 'https://www.mlb.com/probable-pitchers'
+    soup = GetPage(url)
+    return soup
+
+
 def ParseProbablePitchers(soup):
     main_content = soup.find('main').find('div', class_="container").extract()
     
@@ -44,10 +50,13 @@ def ParseProbablePitchers(soup):
     all_data["matchups"] = []
     for matchup in matchups:
         matchup_dict = {
+            "title": str,   # team1 vs team2
+            "gamepk": int,  # just an arbitrary number
             "teams": {
                 "away": {},
                 "home": {},
-            }
+            },
+            "pitchers": {},
         }
         GRABATTR(matchup, "gamepk", matchup_dict)
         
@@ -78,6 +87,9 @@ def ParseProbablePitchers(soup):
             logodict['record'] = record.text.strip()
             teamdict['record'] = record.text.strip()
         
+        matchup_dict["title"] = f"{matchup_dict['teams']['away']['name']} vs " \
+                                f"{matchup_dict['teams']['home']['name']}"
+        
         ### --- END OF 'game' DIV --- ###
         ### --- BEGIN: 'pitchers' --- ###
         pitchers = FIND(matchup, 'div', "pitchers").extract()
@@ -103,9 +115,9 @@ def ParseProbablePitchers(soup):
     return all_data
 
 
+# TODO: save as json
 if __name__ == "__main__":
-    url = 'https://www.mlb.com/probable-pitchers'
-    soup = GetPage(url)
-    if soup is None: exit(1)
+    soup = FetchProbablePitchers()
+    if not soup: exit(1)
     pitcherData = ParseProbablePitchers(soup)
     pprint.pprint(pitcherData, indent=2)
