@@ -24,7 +24,8 @@ class DmNotebookT(ttk.Notebook):
         new_widget.pack(expand=1, fill="both")
         self.WidgetStorage[name] = new_widget
         self.add(new_widget, text=name)
-        self.select(lastindex)  # selects newly-added tab
+        # doesn't seem necessary?
+        #self.select(lastindex)  # selects newly-added tab
         tab_metadata = { "name": name, "TCLname": self.select(), "index": lastindex }
         self.TabList.append(tab_metadata)
         return new_widget

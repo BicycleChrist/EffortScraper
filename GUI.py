@@ -2,11 +2,11 @@ import tkinter
 from tkinter import ttk
 import pathlib
 
-from MLBAnalytics import BaseFrame
-BaseFrame.LAYOUTMETHOD = tkinter.Widget.grid
+import DmFrame
+DmFrame.LAYOUTMETHOD = tkinter.Widget.grid
 
 # ttkthemes requires pip install
-USETTKTHEMES = True
+USETTKTHEMES = False
 if USETTKTHEMES:
     import ttkthemes
 # https://ttkthemes.readthedocs.io/en/latest/themes.html
@@ -156,10 +156,10 @@ if __name__ == "__main__":
     for sport in imagefolders.keys():
         app.DrawLogos(sport)
     
-    BaseFrame.TOPLEVEL = app
+    DmFrame.TOPLEVEL = app
     newtab = app.CreateTab("newtab")
-    BaseFrame.InsertFrame(newtab, "MLB")
-    BaseFrame.InsertFrame()
+    DmFrame.InsertFrame(newtab, "MLB")
+    DmFrame.InsertFrame()
     
     app.icon = imagefolders["Efforticoncolor"]
     app.iconphoto(True, app.icon)

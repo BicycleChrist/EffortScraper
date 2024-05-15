@@ -7,6 +7,7 @@ from tkinter.scrolledtext import ScrolledText
 from DmFrame import *
 from DmNotebook import *
 import daily_lineups
+from ProbablePitchersFrame import *
 
 
 LAYOUTMETHOD = tkinter.Widget.pack
@@ -44,9 +45,9 @@ def CreateTabLayout(frame, data):
         if home_team: label_team = "Home Team: "
         else: home_team = True
         labelframe = tkinter.LabelFrame(teamlist_frame, text=label_team + team_name)
-        labelframe.pack(expand=True, fill="y", side="left")
+        labelframe.pack(expand=True, fill="x", side="left")
         textbox = ScrolledText(labelframe)
-        textbox.pack(expand=True, fill="both")
+        textbox.pack(expand=True, fill="x")
         for playertext in playerdatalist:
             textbox.insert(tkinter.END, playertext)
             textbox.insert(tkinter.END, '\n')
@@ -59,8 +60,12 @@ def CreateTabLayout(frame, data):
 
 
 if __name__ == "__main__":
-    toplevel = tkinter.Tk(sync=True)
+    toplevel = tkinter.Tk()
+    toplevel.title("MLB_Frameski")
     MLB_frame = MLBFrameT(master=toplevel)
-    TOPLEVEL = MLB_frame
-    MLB_frame.pack()
+    TOPLEVEL = toplevel
+    MLB_frame.pack(side="left")
+    PPFrame = PPFrameT(master=toplevel)
+    TOPLEVEL = toplevel
+    PPFrame.pack(side="right")
     toplevel.mainloop()
