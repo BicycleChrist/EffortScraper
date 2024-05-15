@@ -35,3 +35,4 @@ HeftyRender.mkv
 # ignoring any symlinks
 */update_importpaths.py
 MLBAnalytics/MLBstats/
+Standings/http_proxies.txt
