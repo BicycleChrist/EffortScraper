@@ -13,10 +13,8 @@ def download_html_selenium(url, filename):
     options.add_argument("--window-size=1920x,1080")
     driver = webdriver.Firefox(service=service, options=options)
 
-
     driver.get(url)
     html = driver.page_source
-
 
     soup = BeautifulSoup(html, 'html.parser')
 
