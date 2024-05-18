@@ -36,3 +36,5 @@ HeftyRender.mkv
 */update_importpaths.py
 MLBAnalytics/MLBstats/
 Standings/http_proxies.txt
+MLBAnalytics/selenium_screenshots/
+MLBAnalytics/dataframes/

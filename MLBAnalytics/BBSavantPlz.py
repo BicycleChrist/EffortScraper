@@ -12,6 +12,8 @@ import pathlib
 import pprint
 import pandas
 from io import StringIO  # for pandas.read_html
+import shutil  # because rmdir only works if dir is empty, for some reason
+import selenium.webdriver.remote.webelement
 
 
 SELENIUMERRORS = [
@@ -34,6 +36,7 @@ def TryToFind(element, xpath_string):
     return element
 
 
+# TODO: "Open All button on top of page"
 # clicks on 'Click to Open' for each matchup under 'charts'
 def ExpandAll(contents):
     matchups = contents.find_elements(By.XPATH, './div')
@@ -80,28 +83,71 @@ def Find_Tables(container: webdriver.remote.webelement.WebElement):
         return None
     active_div = active_divs[0]
     tables = active_div.find_elements(By.XPATH, './/table')
+    # this is the right-side table
+    savant_table = active_div.find_element(By.CLASS_NAME, "table-savant").find_element(By.TAG_NAME, 'table')
+    tables.append(savant_table)
     return tables
 
 def GetMainContent(driver):
     main_content = TryToFind(driver, "/html/body/div[@class='article-template']/div[@id='games']")
     return main_content
 
+def GetScreenshotDir()->pathlib.Path:
+    cwd = pathlib.Path.cwd()
+    screenshot_dir = cwd / "selenium_screenshots"
+    if not screenshot_dir.exists(): screenshot_dir.mkdir()
+    return screenshot_dir
+
+# looks like screenshots will capture the parent element? for most tables
+def ScreenshotElement(element: selenium.webdriver.remote.webelement.WebElement, name):
+    screenshot_dir = GetScreenshotDir()
+    screenshot_filepath = screenshot_dir / f"{name}.png"
+    print(f"writing {screenshot_filepath.name}...")
+    screenshot_filepath.touch()
+    with open(screenshot_filepath, mode='wb') as screenshot_file:
+        screenshot_file.write(container.screenshot_as_png)
+    print(f"wrote {screenshot_filepath.name}")
+    return
+
+def DeleteScreenshotFolder():
+    screenshot_dir = GetScreenshotDir()
+    print(f"deleting {screenshot_dir}")
+    shutil.rmtree(screenshot_dir)
+    screenshot_dir.mkdir()
+    return
+
+def GetDataframeDir()->pathlib.Path:
+    cwd = pathlib.Path.cwd()
+    dataframe_dir = cwd / "dataframes"
+    if not dataframe_dir.exists(): dataframe_dir.mkdir()
+    return dataframe_dir
+
 
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "MLBAnalytics" and "you're in the wrong directory")
+
+    DeleteScreenshotFolder()
     
     # Set up the Firefox options and WebDriver
     #service = FirefoxService()
     options = FirefoxOptions()
-    options.add_argument('--headless')  # Uncomment if you run in headless mode
+    options.add_argument('--headless')
+    options.page_load_strategy = 'eager'
+    #options.page_load_strategy = 'none'  # maybe required for window.stop?
+    
     firefox_profile = FirefoxProfile()
     options.profile = firefox_profile
     print(firefox_profile)
     print(options.profile.path)
     
     driver = webdriver.Firefox(options=options)
-    driver.implicitly_wait(6)
+    driver.implicitly_wait(5)
+    
+    # Javascript that's supposed to freeze the page so that elements don't get invalidated by (JS) updates
+    script = driver.pin_script("window.stop();")
+    #script = driver.pin_script("return window.stop")
+    #driver.command_executor.execute()
     
     url = 'https://baseballsavant.mlb.com/gamefeed'
     driver.get(url)
@@ -111,23 +157,39 @@ if __name__ == "__main__":
     #charts = TryToFind(game_data, "./div[@id=charts]")
     charts = TryToFind(driver, "/html/body/div[@class='article-template']/div[@id='games']/div[@id='game-data']/div[@id='charts']")
     containers = ExpandAll(charts)
+    
+    # attempt to freeze the page here
+    driver.execute_script(script)
+    
     Tables = []
-    for container in containers:
+    for index, container in enumerate(containers):
         new_tables = Find_Tables(container)
         if new_tables is None: continue
         Tables.extend(new_tables)
+        ScreenshotElement(container, f"container_{index}")
     
     # converting tables to Pandas Dataframe
     dataframes = []
-    for table in Tables:
+    for index, table in enumerate(Tables):
         print(table.tag_name)
-        htmlski = table.get_attribute('innerHTML')
+        #ScreenshotElement(table, f"table_{index}")  # screenshots parent element?
+        htmlski = table.get_attribute('outerHTML')  # includes the <table> tags; innerHTML does not
         try:
-            new_dataframe = pandas.read_html(StringIO(htmlski))
-            dataframes.append(new_dataframe)
+            # read_html returns a list of dataframes
+            new_dataframes = pandas.read_html(StringIO(htmlski), encoding="utf-8")  # don't use 'links="all"'
+            dataframes.extend(new_dataframes)
         except Exception as bullshit:
             print(f"bullshit: {bullshit}")
-    print(len(dataframes))
-    print(dataframes)
+        print('\n')
+    
+    dataframe_dir = GetDataframeDir()
+    print(f"\nfound: {len(dataframes)} dataframes\n")
+    for index, dataframe in enumerate(dataframes):
+        pprint.pprint(dataframe.to_dict, indent=2)
+        df_filepath = dataframe_dir / f"dataframe_{index}.csv"
+        print(f"writing {df_filepath.name}")
+        dataframe.to_csv(df_filepath, mode='w', encoding="utf-8", index=True)
+        print('\n')
+    
     print("about to quit")
     driver.quit()
