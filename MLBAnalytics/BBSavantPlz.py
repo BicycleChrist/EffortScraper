@@ -1,21 +1,25 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-#from selenium.webdriver.support import expected_conditions as EC
-#from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
-#from selenium.webdriver.support.select import Select
-from selenium.common.exceptions import *
-from time import sleep
 import pathlib
-import pprint
+import shutil  # because pathlib.rmdir() only works on empty directories, for some reason
 import pandas
 from io import StringIO  # for pandas.read_html
-import shutil  # because rmdir only works if dir is empty, for some reason
-import selenium.webdriver.remote.webelement
+import pprint
+from time import sleep  # TODO: replace sleeps with selenium expected-conditions
+
+HAS_SELENIUM = True
+if HAS_SELENIUM:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    #from selenium.webdriver.support import expected_conditions as EC
+    #from selenium.webdriver.firefox.service import Service as FirefoxService
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+    #from selenium.webdriver.support.select import Select
+    from selenium.common.exceptions import *
+    import selenium.webdriver.remote.webelement
 
 
+# TODO: use these
 SELENIUMERRORS = [
     'ElementClickInterceptedException', 'ElementNotInteractableException', 'ElementNotSelectableException', 'ElementNotVisibleException', 'ImeActivationFailedException', 'ImeNotAvailableException', 'InsecureCertificateException', 'InvalidArgumentException',
     'InvalidCookieDomainException', 'InvalidCoordinatesException', 'InvalidElementStateException', 'InvalidSelectorException', 'InvalidSessionIdException', 'InvalidSwitchToTargetException', 'JavascriptException',
@@ -88,53 +92,139 @@ def Find_Tables(container: webdriver.remote.webelement.WebElement):
     tables.append(savant_table)
     return tables
 
+
 def GetMainContent(driver):
     main_content = TryToFind(driver, "/html/body/div[@class='article-template']/div[@id='games']")
     return main_content
 
-def GetScreenshotDir()->pathlib.Path:
-    cwd = pathlib.Path.cwd()
-    screenshot_dir = cwd / "selenium_screenshots"
-    if not screenshot_dir.exists(): screenshot_dir.mkdir()
-    return screenshot_dir
 
-# looks like screenshots will capture the parent element? for most tables
-def ScreenshotElement(element: selenium.webdriver.remote.webelement.WebElement, name):
-    screenshot_dir = GetScreenshotDir()
+def GetSaveDir(purpose: str) -> pathlib.Path | None:
+    accepted_types = [ "SCREENSHOT", "PNG", "HTML", "DATAFRAME", "CSV", ]
+    purpose = purpose.upper()
+    
+    # lenient fallback-matching; in case the user writes the plural form instead
+    if (purpose not in accepted_types) and purpose.endswith('S'):
+        purpose = purpose.removesuffix('S')
+    
+    match purpose:  # already uppercased
+        case "SCREENSHOT" | "PNG": bottom_folder_name = "selenium_screenshots"
+        case "DATAFRAME" | "CSV":  bottom_folder_name = "dataframes"
+        case "HTML":               bottom_folder_name = "html"
+        case _:
+            print(f"ERROR: no known save-directory for: {purpose}")
+            print(f"accepted types: {accepted_types}\n")
+            return None
+    
+    # TODO: ensure cwd is correct
+    cwd = pathlib.Path.cwd()
+    if cwd.name != "MLBAnalytics":
+        print("ERROR: you're running this script from the wrong directory!")
+        return None
+    
+    savedir = cwd / "savedfiles_BBSavant" / bottom_folder_name
+    if not savedir.exists(): savedir.mkdir(parents=True, exist_ok=True)
+    elif not savedir.is_dir():
+        print(f"ERROR: {savedir} exists but is not a directory!")
+        return None
+    
+    return savedir
+
+
+# TODO: add an option for 'ALL' to 'purposes'
+def ClearSaveFolders(*purposes:str, simulate=False):
+    cwd = pathlib.Path.cwd()  # basically only used for the deletion messages, and the cwd-check
+    # can't rely on cwd being defined in main; this function would then fail when imported elsewhere
+    # TODO: ensure cwd is really correct
+    if cwd.name != "MLBAnalytics":  # TODO: better / more resilient handling
+        print("ERROR: you're running this script from the wrong directory!")
+        return False
+    
+    if len(purposes) == 0:
+        print("WARNING: ClearSaveFolders() was called with zero targets (no effect)\n")
+        return True  # should be valid to call without targets
+    
+    announcement = f"Clearing save folders for: {purposes}"
+    if simulate: announcement = "[[SIMULATION]] " + announcement
+    print(f"\n\n {announcement} \n\n")
+    
+    # this gets set to false to indicate that at least one input was invalid
+    good_input_flag: bool = True
+    for purpose in purposes:
+        savedir = GetSaveDir(purpose)  # GetSaveDir() also (re-)creates the target dir when called
+        if savedir is None:
+            good_input_flag = False
+            continue
+        if simulate:
+            print(f"(simulating) wiping ./{savedir.relative_to(cwd)}/ ...")
+            # TODO: list files that would be deleted
+        elif simulate == False:
+            print(f"wiping ./{savedir.relative_to(cwd)}/ ...")
+            shutil.rmtree(savedir)  # savedir should always exist here because it's recreated by GetSaveDir()
+            savedir.mkdir()
+    
+    if not good_input_flag: print("input to ClearSaveFolders was bad.\n")
+    return good_input_flag
+
+
+def ScreenshotElement(element: selenium.webdriver.remote.webelement.WebElement, name:str):
+    screenshot_dir = GetSaveDir("SCREENSHOT")
     screenshot_filepath = screenshot_dir / f"{name}.png"
     print(f"writing {screenshot_filepath.name}...")
     screenshot_filepath.touch()
     with open(screenshot_filepath, mode='wb') as screenshot_file:
-        screenshot_file.write(container.screenshot_as_png)
+        screenshot_file.write(element.screenshot_as_png)
     print(f"wrote {screenshot_filepath.name}")
     return
 
-def DeleteScreenshotFolder():
-    screenshot_dir = GetScreenshotDir()
-    print(f"deleting {screenshot_dir}")
-    shutil.rmtree(screenshot_dir)
-    screenshot_dir.mkdir()
-    return
 
-def GetDataframeDir()->pathlib.Path:
-    cwd = pathlib.Path.cwd()
-    dataframe_dir = cwd / "dataframes"
-    if not dataframe_dir.exists(): dataframe_dir.mkdir()
-    return dataframe_dir
+def SaveElementHTML(element: selenium.webdriver.remote.webelement.WebElement, name:str):
+    html_savedir = GetSaveDir("HTML")
+    assert html_savedir is not None, "HTML save-directory should exist"
+    # 'outerHTML' includes the element div itself; 'innerHTML' does not
+    element_html = element.get_attribute('outerHTML')
+    filename = f"{name}.html"
+    save_filepath = html_savedir / filename
+    print(f"writing: {filename} ...")
+    return_code = save_filepath.write_text(element_html, encoding="utf-8")  # what does the 'newline' arg do?
+    #print(f"{filename} saved: return_code = {return_code}")
+    return
 
 
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
-    assert (cwd.name == "MLBAnalytics" and "you're in the wrong directory")
-
-    DeleteScreenshotFolder()
+    assert (cwd.name == "MLBAnalytics"), "you're in the wrong directory"  # TODO: refactor 'cwd' checks
+    
+    # enables saving for different elements / formats
+    ENABLED_FILE_SAVES = ("SCREENSHOTS", "DATAFRAMES", "HTML")
+    # valid options: "SCREENSHOTS", "DATAFRAMES", "HTML"
+    # Plural forms are optional ("SCREENSHOT" (instead of "SCREENSHOTS") will work fine)
+    # uppercase is also optional ("screenshot" is fine)
+    
+    # TODO: refactor this into the Save functions instead?
+    def isSaveEnabledFor(savetype:str)->bool:
+        savetype = savetype.upper()
+        UPPER_ENABLED = [S.upper() for S in ENABLED_FILE_SAVES]
+        PLURAL_ENABLED = [S+'S' for S in UPPER_ENABLED if not S.endswith('S')]
+        NONPLURAL_ENABLED = [S.removesuffix('S') for S in UPPER_ENABLED if S.endswith('S')]
+        return ( savetype in UPPER_ENABLED  or 
+                 savetype in PLURAL_ENABLED or
+                 savetype in NONPLURAL_ENABLED )
+    
+    # wipe (and recreate) any enabled save-folders on startup
+    return_flag = ClearSaveFolders(*ENABLED_FILE_SAVES)
+    if not return_flag: exit(3)  # ragequit if we passed an unrecognized string into 'purposes'
+    
+    if not HAS_SELENIUM:
+        print("early exit because you don't have selenium (HAS_SELENIUM = False)")
+        exit(0)
     
     # Set up the Firefox options and WebDriver
     #service = FirefoxService()
     options = FirefoxOptions()
     options.add_argument('--headless')
     options.page_load_strategy = 'eager'
-    #options.page_load_strategy = 'none'  # maybe required for window.stop?
+    #options.page_load_strategy = 'none'  # maybe required for window.stop? 
+    # the 'window.stop' script seems to work on 'eager' as well? hard to tell.
     
     firefox_profile = FirefoxProfile()
     options.profile = firefox_profile
@@ -161,20 +251,29 @@ if __name__ == "__main__":
     # attempt to freeze the page here
     driver.execute_script(script)
     
+    
+    # finding tables
     Tables = []
     for index, container in enumerate(containers):
         new_tables = Find_Tables(container)
         if new_tables is None: continue
         Tables.extend(new_tables)
-        ScreenshotElement(container, f"container_{index}")
+        container_name = f"container_{index}"
+        if isSaveEnabledFor("SCREENSHOTS"): ScreenshotElement(container, container_name)
+        if isSaveEnabledFor("HTML"): SaveElementHTML(container, container_name)
+        # print(index)
+    
     
     # converting tables to Pandas Dataframe
     dataframes = []
     for index, table in enumerate(Tables):
         print(table.tag_name)
-        #ScreenshotElement(table, f"table_{index}")  # screenshots parent element?
+        table_name = f"table_{index}"
+        if isSaveEnabledFor("SCREENSHOTS"): ScreenshotElement(table, table_name)
+        if isSaveEnabledFor("HTML"): SaveElementHTML(table, table_name)
+        # maybe SaveElementHTML should return the HTML?
         htmlski = table.get_attribute('outerHTML')  # includes the <table> tags; innerHTML does not
-        try:
+        try:  # TODO: this try-block can probably be removed; it was necessary only because pandas couldn't read (most of) the tables
             # read_html returns a list of dataframes
             new_dataframes = pandas.read_html(StringIO(htmlski), encoding="utf-8")  # don't use 'links="all"'
             dataframes.extend(new_dataframes)
@@ -182,14 +281,22 @@ if __name__ == "__main__":
             print(f"bullshit: {bullshit}")
         print('\n')
     
-    dataframe_dir = GetDataframeDir()
-    print(f"\nfound: {len(dataframes)} dataframes\n")
-    for index, dataframe in enumerate(dataframes):
-        pprint.pprint(dataframe.to_dict, indent=2)
-        df_filepath = dataframe_dir / f"dataframe_{index}.csv"
-        print(f"writing {df_filepath.name}")
-        dataframe.to_csv(df_filepath, mode='w', encoding="utf-8", index=True)
-        print('\n')
+    
+    if isSaveEnabledFor("DATAFRAMES"):
+        # TODO: save-function for dataframes? choice of output file-types?
+        dataframe_savedir = GetSaveDir("DATAFRAME")
+        if dataframe_savedir is None: exit(2)
+        
+        print(f"\nfound: {len(dataframes)} dataframes\n")
+        for index, dataframe in enumerate(dataframes):
+            pprint.pprint(dataframe.to_dict, indent=2)
+            df_filepath = dataframe_savedir / f"dataframe_{index}.csv"
+            print(f"writing {df_filepath.name}")
+            dataframe.to_csv(df_filepath, mode='w', encoding="utf-8", index=True)
+            print('\n')
+        
+    else:  # if saving dataframes is NOT enabled
+        pprint.pprint(dataframes, indent=2)
     
     print("about to quit")
     driver.quit()
