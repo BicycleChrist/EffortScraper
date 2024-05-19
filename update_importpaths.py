@@ -13,11 +13,12 @@ subdir_names = [
     "NHLvacuum",
 ]
 
-# symlinks are dropped into these directories (allowing them to import this file as well)
-symlink_into = [
-    "MLBAnalytics",
-]
-# note: paths listed here must also be in 'subdir_names'; they won't be used otherwise
+# symlinks are dropped into these directories (allowing them to import this file as well), if they exist
+# the key is the target name, the value is a list of parents (if empty, assume toplevel)
+# the values get evaluated/resolved to actual paths. If a value matches a previous key, that key's (resolved) paths will be substituted
+symlink_into = {
+    "MLBAnalytics": [],
+}
 
 
 def FindToplevelPath() -> pathlib.Path:
@@ -72,6 +73,38 @@ def CreateRelativePath(frompath: pathlib.PurePath, topath: pathlib.PurePath, tar
     return None
 
 
+# TODO: rewrite using match statement or something
+# resolves / rewrites the 'symlink_into' dict
+def ResolveSymlinkInto():
+    toplevel = FindToplevelPath()
+    targets = []
+    for targetname, parentlist in symlink_into.items():
+        if len(parentlist) == 0:  # then it's directly under toplevel
+            target = toplevel/targetname
+            if not target.exists(): f"could not locate toplevel-directory: '{target}'"; continue;
+            parentlist.append(target)
+        else:
+            resolved_parents = []
+            for parent in parentlist:
+                if parent in symlink_into.keys():
+                    resolved_parents.extend(symlink_into[parent])  # substituting
+                else:
+                    target_parent = toplevel/parent
+                    if not target_parent.exists(): f"could not locate toplevel-directory: '{target_parent}'"; continue;
+                    resolved_parents.append(target_parent)
+            resolved_targets = [rp/targetname for rp in resolved_parents]
+            valid_targets = [rt for rt in resolved_targets if rt.exists() and rt.is_dir()]  # targets are supposed to be dirs
+            invalid_targets = [rt for rt in resolved_targets if rt not in valid_targets]
+            print(f"{targetname}: {valid_targets}")
+            if len(invalid_targets) > 0: print(f"these targets resolved for '{targetname}' could not be located (or location is not a directory): '{invalid_targets}'")
+            parentlist.clear()
+            parentlist.extend(valid_targets)
+        
+        targets.extend(parentlist)
+    
+    return targets
+
+
 # returns a list of newly-written symlinks (symlink_location, relativePath)
 def CreateSymlinks(report_existing=True, overwrite=False) \
     -> list[tuple[pathlib.Path, pathlib.PurePath]]:
@@ -79,8 +112,7 @@ def CreateSymlinks(report_existing=True, overwrite=False) \
     thisfile = pathlib.Path(__file__)  # __file__ returns absolute path, by the way
     assert thisfile.exists(), "how are you running this??"
     # Update_ImportPaths returns a list of strings (for sys.path), so we convert back to pathlib.Path
-    good_paths = [pathlib.Path(path) for path in Update_ImportPaths(onlyGood=True)]
-    target_dirs = [path for path in good_paths if path.is_dir() and path.name in symlink_into]
+    target_dirs = ResolveSymlinkInto()
     
     # tuples are: (symlink_location, relativePath)
     written_symlinks: list[tuple[pathlib.Path, pathlib.PurePath]] = []
