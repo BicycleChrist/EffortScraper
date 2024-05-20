@@ -3,88 +3,101 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.support import expected_conditions as EC
-import time
-
-#TODO: Acquire live odds; pages are able to be parsed quite fast for bigly suck up
-#TODO : Figure out name of header element for odds containers
-service = FirefoxService()
-options = FirefoxOptions()
-options.add_argument('-headless')
-driver = webdriver.Firefox(service=service, options=options)
+from selenium.common.exceptions import *
+from time import sleep  # TODO: replace sleeps with selenium expected-conditions
 
 
-url = 'https://www.bovada.lv/sports/baseball/mlb'
-driver.get(url)
-
-
-wait = WebDriverWait(driver, 10)
-next_events_bucket = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'next-events-bucket')))
-
-
-grouped_events = next_events_bucket.find_elements(By.CLASS_NAME, 'grouped-events')
-
-
-game_links = []
-for event in grouped_events:
+def TryToFind(element, xpath_string):
     try:
-
-        coupons = event.find_elements(By.XPATH, ".//sp-coupon")
-
-        for coupon in coupons:
-            try:
-                # Find the href links to the game odds
-                links = coupon.find_elements(By.XPATH, ".//a[@class='game-view-cta']")
-                for link in links:
-                    game_links.append(link.get_attribute('href'))
-            except Exception as e:
-                print(f"Failed to extract href link: {e}")
-
-    except Exception as e:
-        print(f"Failed to process event: {e}")
-
-# Loop through each game link to extract data
-for game_link in game_links:
-    try:
-        driver.get(game_link)
-        time.sleep(1)
-
-        # Wait until the sp-main-area element is loaded
-        main_area = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'sp-main-area')))
+        x = element.find_element(By.XPATH, xpath_string)
+        return x
+    except Exception as SeleniumBullshit:
+        print(f"error trying to find: {xpath_string}")
+        print(f"from: {element}")
+        print(SeleniumBullshit)
+    return element
 
 
-        event_infos = main_area.find_elements(By.CLASS_NAME, 'event-info')
-
-        for event_info in event_infos:
-            try:
-                #  event-coupons within event-info incredible
-                event_coupons = event_info.find_elements(By.CLASS_NAME, 'event-coupons')
-
-                for coupon in event_coupons:
-                    # Extract coupon I guess fucking JS everytime
-                    game_date = coupon.find_element(By.CLASS_NAME, 'period').text.strip()
-                    game_time = coupon.find_element(By.CLASS_NAME, 'clock').text.strip()
-                    teams = coupon.find_elements(By.CLASS_NAME, 'competitor-name')
-                    team1 = teams[0].text.strip()
-                    team2 = teams[1].text.strip()
-
-                    # Extract odds data
-                    outcomes = coupon.find_elements(By.XPATH, ".//sp-outcome")
-                    for outcome in outcomes:
-                        try:
-                            bet_type_element = outcome.find_element(By.XPATH, ".//*[contains(@class, 'market-line') or contains(@class, 'bet-btn')]")
-                            #bet_type_header = outcome.find_element(By.CLASS_NAME, 'league-header full-width')
-                            bet_type = bet_type_element.text.strip()
-                            #bet_header = bet_type_header.text.strip()
-                            bet_price = outcome.find_element(By.CLASS_NAME, 'bet-price').text.strip()
-                            print(f"{game_date} {game_time} | {team1} vs {team2} | {bet_type}: {bet_price}")
-                        except Exception as e:
-                            print(f"Failed to extract bet information: {e}")
-                            print(f"Outcome element HTML: {outcome.get_attribute('innerHTML')}")
-            except Exception as e:
-                print(f"Failed to process event-info: {e}")
-    except Exception as e:
-        print(f"Failed to load game link {game_link}: {e}")
+def FindGameLinks(driver: webdriver.Firefox):
+    url = 'https://www.bovada.lv/sports/baseball/mlb'
+    driver.get(url)
+    sleep(3)
+    #wait = WebDriverWait(driver, 5)
+    #next_events_bucket = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'next-events-bucket')))
+    #grouped_events = next_events_bucket.find_elements(By.CLASS_NAME, 'grouped-events')
+    sp_path_event = driver.find_element(By.XPATH, "/html/body//div[@class='top-container']//main/div[@class='sp-main-area']//sp-path-event")
+    grouped_events = sp_path_event.find_elements(By.XPATH, ".//div[@class='grouped-events']")
+    
+    events = []
+    for group in grouped_events:
+        events.extend(group.find_elements(By.XPATH, ".//sp-coupon//a[@class='game-view-cta']"))
+    
+    game_links = [event.get_attribute('href') for event in events]
+    print(f"\n game_links: {game_links} \n")
+    return game_links
 
 
-driver.quit()
+def VisitGameLink(driver:webdriver.Firefox, game_link):
+    print(f"navigating to: {game_link}")
+    driver.get(game_link)
+    sleep(1)
+    print("got link")
+    # Wait until the sp-main-area element is loaded
+    #main_area = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'sp-main-area')))
+    main_area = driver.find_element(By.CLASS_NAME, 'sp-main-area')
+    print("found main area")
+    event = main_area.find_element(By.XPATH, './/sp-event')
+    print("found event")
+
+    #  event-coupons within event-info incredible
+    event_coupons = event.find_elements(By.TAG_NAME, 'sp-coupon')
+    print("found event coupons")
+    # this part is really slow for some reason; seems to be triggering the implicit wait a lot
+    article_lists = [coupon.find_elements(By.TAG_NAME, "article") for coupon in event_coupons]
+    intermediate = [a for a in article_lists if len(a) > 0]  # I think this is necessary
+    article_lists = intermediate
+    print(article_lists)
+    
+    results = []
+    for articlelist in article_lists:
+        for article in articlelist:
+            new_dict = {}
+            for thing in ('header', 'section'):
+                new_dict[thing] = article.find_element(By.TAG_NAME, thing).text.splitlines()
+            results.append(new_dict)
+            print(new_dict)
+    
+    print(results)
+    return results
+
+if __name__ == "__main__":
+    #TODO: Acquire live odds; pages are able to be parsed quite fast for bigly suck up
+    #TODO : Figure out name of header element for odds containers
+    options = FirefoxOptions()
+    #options.add_argument('--headless')
+    
+    options.page_load_strategy = 'eager'
+    firefox_profile = FirefoxProfile()
+    #firefox_profile.set_preference("permissions.default.image", 2)
+    options.profile = firefox_profile
+    print(firefox_profile)
+    print(options.profile.path)
+    
+    #options.add_argument('-headless')
+    driver = webdriver.Firefox(options=options)
+    driver.implicitly_wait(1)
+    print("finding game links")
+    game_links = FindGameLinks(driver)
+    # game_links = ["https://www.bovada.lv/sports/hockey/united-states/ahl/coachella-valley-firebirds-ontario-reign-202405192200"]
+    for game_link in game_links:
+        try:
+            VisitGameLink(driver, game_link)
+        except StaleElementReferenceException as stale_exception:
+            print(f"selenium is tarding out: {stale_exception}")
+            continue
+    
+    print("done")
+    driver.quit()
+    
