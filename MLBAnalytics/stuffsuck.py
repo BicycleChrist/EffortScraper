@@ -66,7 +66,7 @@ def SaveDataframe(dataframe, file_name):
 if __name__ == "__main__":
     # Minimum number of at bats can be changed via the "qual=" option at end of URL
     qual = 1
-    url = f'https://www.fangraphs.com/leaders/major-league?qual={qual}&pageitems=2000000000'
+    url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
     #soup = LoadHTMLfile('FGhitter.html')
     newsoup = DownloadHTMLfile(url)
     dataframes = extract_table_data(newsoup)
