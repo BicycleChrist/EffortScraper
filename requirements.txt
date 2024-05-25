@@ -6,3 +6,4 @@ matplotlib
 xgboost
 #ttkthemes
 requests
+more-itertools

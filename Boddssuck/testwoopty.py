@@ -287,7 +287,7 @@ def InitializeParser(prevent_exit=False) -> argparse.ArgumentParser:
         leagueselect : {valid_leagues} 
         odds-formats : {valid_formats}""",
         epilog="""\t
-        this script parses and prints data from local HTML files (from Bovada).
+        this script parses and prints data from local HTML files (from Unabated).
         it's actually a better and more complete implementation of 'parseUB'.
         testwoopty expects files to be under subdirectories 'pagesource' and 'parsedpage'.
         """,
@@ -420,7 +420,7 @@ def Main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    RUN_ARGPARSE_TEST = True
+    RUN_ARGPARSE_TEST = False
     if RUN_ARGPARSE_TEST:
         TestArgparsing()
         print("exiting. ('RUN_ARGPARSE_TEST' is True) \n")
