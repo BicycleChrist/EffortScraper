@@ -37,8 +37,4 @@ HeftyRender.mkv
 MLBAnalytics/MLBstats/
 Standings/http_proxies.txt
 MLBAnalytics/savedfiles_BBSavant/*/
-# INCLUDING the html subfolder only!
-!MLBAnalytics/savedfiles_BBSavant/html/
-# old output directories; remove these
-MLBAnalytics/selenium_screenshots/
-MLBAnalytics/dataframes/
+Boddssuck/profiling
