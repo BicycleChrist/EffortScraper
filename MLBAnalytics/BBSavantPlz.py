@@ -17,14 +17,18 @@ if HAS_SELENIUM:
     #from selenium.webdriver.support.select import Select
     from selenium.common.exceptions import *
     import selenium.webdriver.remote.webelement
+    # action-stuff for rotating Pitch3D canvases
+    from selenium.webdriver import ActionChains
+    from selenium.webdriver.common.actions.action_builder import ActionBuilder
+    from selenium.webdriver.common.actions.mouse_button import MouseButton
 
 
 # TODO: use these
 SELENIUMERRORS = [
-    'ElementClickInterceptedException', 'ElementNotInteractableException', 'ElementNotSelectableException', 'ElementNotVisibleException', 'ImeActivationFailedException', 'ImeNotAvailableException', 'InsecureCertificateException', 'InvalidArgumentException',
-    'InvalidCookieDomainException', 'InvalidCoordinatesException', 'InvalidElementStateException', 'InvalidSelectorException', 'InvalidSessionIdException', 'InvalidSwitchToTargetException', 'JavascriptException',
-    'MoveTargetOutOfBoundsException', 'NoAlertPresentException', 'NoSuchAttributeException', 'NoSuchCookieException', 'NoSuchDriverException', 'NoSuchElementException', 'NoSuchFrameException', 'NoSuchShadowRootException', 'NoSuchWindowException', 'Optional',
-    'ScreenshotException', 'Sequence', 'SessionNotCreatedException', 'StaleElementReferenceException', 'TimeoutException', 'UnableToSetCookieException', 'UnexpectedAlertPresentException', 'UnexpectedTagNameException', 'UnknownMethodException', 'WebDriverException',
+    ElementClickInterceptedException, ElementNotInteractableException, ElementNotSelectableException, ElementNotVisibleException, ImeActivationFailedException, ImeNotAvailableException, InsecureCertificateException, InvalidArgumentException,
+    InvalidCookieDomainException, InvalidCoordinatesException, InvalidElementStateException, InvalidSelectorException, InvalidSessionIdException, InvalidSwitchToTargetException, JavascriptException,
+    MoveTargetOutOfBoundsException, NoAlertPresentException, NoSuchAttributeException, NoSuchCookieException, NoSuchDriverException, NoSuchElementException, NoSuchFrameException, NoSuchShadowRootException, NoSuchWindowException, Optional,
+    ScreenshotException, Sequence, SessionNotCreatedException, StaleElementReferenceException, TimeoutException, UnableToSetCookieException, UnexpectedAlertPresentException, UnexpectedTagNameException, UnknownMethodException, WebDriverException,
     #'SUPPORT_MSG', 'ERROR_URL',    # not sure if these are actual error types
 ]
 
@@ -62,7 +66,7 @@ def ExpandAll(contents):
         if click_to_open.text == "Click to Open ↓":
             print("click")
             click_to_open.click()
-        sleep(1)
+        #sleep(1)
         # now that the thing is opened, we backtrack up the DOM to get the container for the info
         new_container = TryToFind(matchup, "./div[@class='game-view-container']")
         if new_container != matchup:  # if it failed to find the div, it would return matchup
@@ -99,7 +103,7 @@ def GetMainContent(driver):
 
 
 def GetSaveDir(purpose: str) -> pathlib.Path | None:
-    accepted_types = [ "SCREENSHOT", "PNG", "HTML", "DATAFRAME", "CSV", ]
+    accepted_types = [ "SCREENSHOT", "PNG", "HTML", "DATAFRAME", "CSV", "PITCH3D", ]
     purpose = purpose.upper()
     
     # lenient fallback-matching; in case the user writes the plural form instead
@@ -110,6 +114,7 @@ def GetSaveDir(purpose: str) -> pathlib.Path | None:
         case "SCREENSHOT" | "PNG": bottom_folder_name = "selenium_screenshots"
         case "DATAFRAME" | "CSV":  bottom_folder_name = "dataframes"
         case "HTML":               bottom_folder_name = "html"
+        case "PITCH3D":            bottom_folder_name = "pitch3d"
         case _:
             print(f"ERROR: no known save-directory for: {purpose}")
             print(f"accepted types: {accepted_types}\n")
@@ -166,10 +171,10 @@ def ClearSaveFolders(*purposes:str, simulate=False):
     return good_input_flag
 
 
-def ScreenshotElement(element: selenium.webdriver.remote.webelement.WebElement, name:str):
-    screenshot_dir = GetSaveDir("SCREENSHOT")
+def ScreenshotElement(element: selenium.webdriver.remote.webelement.WebElement, name:str, purpose="SCREENSHOT"):
+    screenshot_dir = GetSaveDir(purpose)
     screenshot_filepath = screenshot_dir / f"{name}.png"
-    print(f"writing {screenshot_filepath.name}...")
+    print(f"writing {screenshot_filepath.name}...", end=" ")
     screenshot_filepath.touch()
     with open(screenshot_filepath, mode='wb') as screenshot_file:
         screenshot_file.write(element.screenshot_as_png)
@@ -190,12 +195,40 @@ def SaveElementHTML(element: selenium.webdriver.remote.webelement.WebElement, na
     return
 
 
+def CollectPitch3D(driver: webdriver, container: selenium.webdriver.remote.webelement.WebElement):
+    nav_buttons = container.find_element(By.ID, "nav-buttons")
+    #real_buttons = nav_buttons.find_elements(By.XPATH, "./div")
+    pitch3d_button = nav_buttons.find_elements(By.XPATH, "./div")[6]
+    pitch3d_button.click()
+    canvas = container.find_element(By.XPATH, ".//div[@class='pitch3d']/div[@class='App']//canvas")
+    print(canvas.location_once_scrolled_into_view)
+    
+    iterations = 600
+    iteration = 0
+    while iteration < iterations:
+        # must redefine on every iteration; otherwise it simply will not work
+        RotateCanvas = ActionChains(driver, duration=0)\
+        .move_to_element_with_offset(canvas, 516, 150)\
+        .click_and_hold()\
+        .move_by_offset(-16, 0)\
+        .release()
+        
+        RotateCanvas.perform()
+        # number needs to be padded to ensure correct ordering of images when fed to ffmpeg
+        ScreenshotElement(canvas, f"canvas_{str(iteration).zfill(3)}", "PITCH3D")
+        iteration += 1
+    
+    print("Pitch3D done")
+    return
+
+
 if __name__ == "__main__":
     cwd = pathlib.Path.cwd()
     assert (cwd.name == "MLBAnalytics"), "you're in the wrong directory"  # TODO: refactor 'cwd' checks
     
     # enables saving for different elements / formats
-    ENABLED_FILE_SAVES = ("SCREENSHOTS", "DATAFRAMES", "HTML")
+    #ENABLED_FILE_SAVES = ("SCREENSHOTS", "DATAFRAMES", "HTML")
+    ENABLED_FILE_SAVES = ("PITCH3D",)
     # valid options: "SCREENSHOTS", "DATAFRAMES", "HTML"
     # Plural forms are optional ("SCREENSHOT" (instead of "SCREENSHOTS") will work fine)
     # uppercase is also optional ("screenshot" is fine)
@@ -222,6 +255,7 @@ if __name__ == "__main__":
     #service = FirefoxService()
     options = FirefoxOptions()
     options.add_argument('--headless')
+    options.add_argument("--window-size=1920x1080")
     options.page_load_strategy = 'eager'
     #options.page_load_strategy = 'none'  # maybe required for window.stop? 
     # the 'window.stop' script seems to work on 'eager' as well? hard to tell.
@@ -232,8 +266,10 @@ if __name__ == "__main__":
     print(options.profile.path)
     
     driver = webdriver.Firefox(options=options)
-    driver.implicitly_wait(5)
+    driver.implicitly_wait(3)
     
+    driver.set_window_size(1920, 1280)
+    driver.maximize_window()
     # Javascript that's supposed to freeze the page so that elements don't get invalidated by (JS) updates
     script = driver.pin_script("window.stop();")
     #script = driver.pin_script("return window.stop")
@@ -249,8 +285,21 @@ if __name__ == "__main__":
     containers = ExpandAll(charts)
     
     # attempt to freeze the page here
-    driver.execute_script(script)
+    #driver.execute_script(script)
     
+    try:
+        CollectPitch3D(driver, containers[0])
+    except NoSuchElementException:
+        print("Not real")
+    except Exception as E:
+        if E not in SELENIUMERRORS:
+            print(f"real exception: {E}; closing driver\n")
+            driver.quit()
+            raise E
+        print(f"SeleniumException: {E}\n")
+    
+    driver.quit()
+    exit(0)
     
     # finding tables
     Tables = []
