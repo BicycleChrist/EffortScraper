@@ -39,11 +39,16 @@ class PPFrameT(DmFrameT):
 def CreateTabLayout(matchupframe, matchup_dict):
     for pitcher_name, pitcher_dict in list(matchup_dict['pitchers'].items()):
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
-        pitcher_frame.pack(expand=True, fill="both", side="left", anchor="n")
+        pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
         for key, value in pitcher_dict.items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
-            textbox.pack(expand=True, fill="both", side="top")
-    
+            textbox.pack(expand=True, fill="both", side="top", anchor="nw")
+    for teamside, teamdict in list(matchup_dict['teams'].items()):
+        team_frame = ttk.LabelFrame(matchupframe, text=f"{teamdict['name']} - {teamside}")
+        team_frame.pack(expand=True, fill="both", side="top", anchor="sw")
+        for key, value in teamdict.items():
+            textbox = ttk.Label(master=team_frame, text=f"{key}: {value}")
+            textbox.pack(expand=True, fill="both", side="top", anchor="nw")
     return
 
 
