@@ -54,14 +54,21 @@ def DownloadHTMLfile(url):
 
 
 def SaveDataframe(dataframe, file_name):
-    current_time = time.localtime()
-    timestr = '_' + str(current_time.tm_hour) + str(current_time.tm_min) + str(current_time.tm_sec)
+    current_time = time.localtime()  # Get the current time
+    timestr = '_' + time.strftime('%d%m%Y', current_time)
     save_dir = GetSaveDir()
     file_name = file_name + timestr + '.csv'
     dump_path = save_dir / file_name
     dataframe.to_csv(dump_path, encoding="utf-8")
     return dump_path
 
+def get_pitching_data():
+    # Minimum number of at bats can be changed via the "qual=" option at end of URL
+    qual = 1
+    url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
+    newsoup = DownloadHTMLfile(url)
+    dataframes = extract_table_data(newsoup)
+    return dataframes[0]
 
 if __name__ == "__main__":
     # Minimum number of at bats can be changed via the "qual=" option at end of URL
