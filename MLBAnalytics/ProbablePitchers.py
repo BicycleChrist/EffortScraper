@@ -5,7 +5,7 @@ import pprint
 from daily_lineups import GetPage
 
 
-def FetchProbablePitchers()->BeautifulSoup|None:
+def FetchProbablePitchers() -> BeautifulSoup | None:
     url = 'https://www.mlb.com/probable-pitchers'
     soup = GetPage(url)
     return soup
@@ -13,44 +13,44 @@ def FetchProbablePitchers()->BeautifulSoup|None:
 
 def ParseProbablePitchers(soup):
     main_content = soup.find('main').find('div', class_="container").extract()
-    
-    classPrefix = 'probable-pitchers__' # every HTML class starts with this
+
+    classPrefix = 'probable-pitchers__'  # every HTML class starts with this
     # convenience functions to make searching easier (to write)
     def FIND(soupvar, html_tag, class_string='', **kwargs):
         if len(class_string) > 0:
             kwargs.update({"class_": f'{classPrefix + class_string}'})
         return soupvar.find(html_tag, **kwargs)
-    
+
     def FINDALL(soupvar, html_tag, class_string='', **kwargs):
         if len(class_string) > 0:
             kwargs.update({"class_": f'{classPrefix + class_string}'})
         return soupvar.find_all(html_tag, **kwargs)
-    
+
     # this one makes it easier to grab an attribute from an element. All attributes start with 'data-'
     # returns a dict. If you pass a dict (into_dict), it'll be updated with the result
-    def GRABATTR(soupvar, attr_name:str, into_dict:dict|None=None):
-        newdict:dict = {attr_name: soupvar.attrs[f"data-{attr_name}"]}
+    def GRABATTR(soupvar, attr_name: str, into_dict: dict | None = None):
+        newdict: dict = {attr_name: soupvar.attrs[f"data-{attr_name}"]}
         if into_dict is not None: into_dict.update(newdict)
         return newdict
-    
+
     main_content = FIND(main_content, 'div', "container").extract()
     del soup  # throw away the rest of the page
-    
+
     all_data = {}
     matchups = FINDALL(main_content, 'div', 'matchup')
     date_button = FIND(main_content, 'div', "datepicker", id="probable-pitchers__datepicker")
     page_date = GRABATTR(date_button, "date")
     print(page_date)
-    
+
     game_selector = FIND(main_content, 'div', "scores--game-selector")
     # unfortunately, the gameslist is loaded via javascript, so we can't get this
-    #gameslist = game_selector.find('section').find('ul', class_="mlb-scores__list mlb-scores__list--games")
+    # gameslist = game_selector.find('section').find('ul', class_="mlb-scores__list mlb-scores__list--games")
     # note: all times Eastern (EST?)
-    
+
     all_data["matchups"] = []
     for matchup in matchups:
         matchup_dict = {
-            "title": str,   # team1 vs team2
+            "title": str,  # team1 vs team2
             "gamepk": int,  # just an arbitrary number
             "teams": {
                 "away": {},
@@ -59,17 +59,17 @@ def ParseProbablePitchers(soup):
             "pitchers": {},
         }
         GRABATTR(matchup, "gamepk", matchup_dict)
-        
+
         # matchup has three subdivs: game, pitchers, and buttons (which doesn't matter)
-        #game = FIND(matchup, 'div', "game").extract()
-        #pitchers = FIND(matchup, 'div', "pitchers").extract()
-        
+        # game = FIND(matchup, 'div', "game").extract()
+        # pitchers = FIND(matchup, 'div', "pitchers").extract()
+
         ### --- BEGIN: 'game' --- ###
         game = FIND(matchup, 'div', "game").extract()
         game_info = FIND(game, 'div', "game-info")
         game_details = FIND(game_info, 'div', "game-details")
         # TODO: game_details
-        
+
         for teamside in ("away", "home"):
             teamdict = matchup_dict["teams"][teamside]  # aliasing the dict; writes will affect matchup_dict
             teamdict['side'] = teamside
@@ -77,7 +77,7 @@ def ParseProbablePitchers(soup):
             GRABATTR(game, f"team-id-{teamside}", teamdict)
             name = FIND(game, 'span', f"team-name--{teamside}")
             teamdict["name"] = name.text.strip()
-            
+
             # finding logo (which also has the record)
             logodict = teamdict["logo"] = {}
             logodiv = FIND(game_info, 'div', f"team-logo--{teamside}")
@@ -86,10 +86,10 @@ def ParseProbablePitchers(soup):
             record = FIND(logodiv, 'div', "team-record")  # this is literally under the logo
             logodict['record'] = record.text.strip()
             teamdict['record'] = record.text.strip()
-        
+
         matchup_dict["title"] = f"{matchup_dict['teams']['away']['name']} vs " \
                                 f"{matchup_dict['teams']['home']['name']}"
-        
+
         ### --- END OF 'game' DIV --- ###
         ### --- BEGIN: 'pitchers' --- ###
         pitchers = FIND(matchup, 'div', "pitchers").extract()
@@ -97,10 +97,16 @@ def ParseProbablePitchers(soup):
         pitcher_stats = FIND(pitchers, 'div', "stats")
         # TODO: stats
         # TODO: associate pitchers with teams (this info can ONLY be found under the hidden pitcher__stats-header??)
-        
+
         pitcher_dict = {}
         for summary in pitcher_summaries:
-            name = summary.find('a').text  # this happens to be the only '<a>' tag under the pitcher-summaries 
+            name_tag = summary.find('a')
+            if name_tag:
+                name = name_tag.text
+            else:
+                name_tag = FIND(summary, 'div', 'pitcher-name')
+                name = name_tag.text.strip() if name_tag and "TBD" in name_tag.text else "TBD"
+
             player_dict = pitcher_dict[name] = {}
             spans = FINDALL(summary, 'span')
             for span in spans:
@@ -108,7 +114,7 @@ def ParseProbablePitchers(soup):
                 span_key = span.attrs["class"][0].removeprefix(f"{classPrefix}pitcher-")
                 span_val = span.text.strip()
                 player_dict[span_key] = span_val
-        
+
         matchup_dict["pitchers"] = pitcher_dict
         all_data["matchups"].append(matchup_dict)
     # END OF MATCHUP LOOP #
