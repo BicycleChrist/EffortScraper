@@ -17,6 +17,7 @@ class PPFrameT(DmFrameT):
         self.probable_pitchers_data = []
         self.DownloadButton = ttk.Button(master=self, text="download", command=self.DownloadButtonLambda)
         self.DownloadButton.pack()
+        self.DownloadButtonHook = None  # define this to override the default 'CreateTabLayout' at the end of DownloadButtonLambda
         #self.MatchupSelectorText = tkinter.StringVar()
         #self.MatchupSelectorDropdown = ttk.OptionMenu(master=self, variable=self.MatchupSelectorText)
         self.MatchupDisplay, self.MatchupNB = InsertFrame(
@@ -32,7 +33,10 @@ class PPFrameT(DmFrameT):
             new_tab = self.MatchupNB.AddTab(matchup_dict['title'])
             matchup_frame = ttk.LabelFrame(new_tab, text=matchup_dict['title'])
             matchup_frame.pack(expand=True, fill="both", side="top", anchor="n")
-            CreateTabLayout(matchup_frame, matchup_dict)
+            if not self.DownloadButtonHook:
+                CreateTabLayout(matchup_frame, matchup_dict)
+            else:
+                self.DownloadButtonHook(matchup_frame, matchup_dict)
         self.DownloadButton.pack_forget() # delete the button
 
 
