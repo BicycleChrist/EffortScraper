@@ -6,6 +6,8 @@ from io import StringIO
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+#TODO: Organize the .csv files by team
+
 def extract_team_tables(soup):
     toplevel = soup.find('div', class_="row gx-1 gx-lg-2 gx-xl-4 gx-xxl-3 align-self-auto justify-content-center")
     if not toplevel:
@@ -75,7 +77,7 @@ if __name__ == "__main__":
         # Extract team tables
         team_tables = extract_team_tables(soup)
         if team_tables:
-            # Create the directory structure if it doesn't exist
+            # create directory structure if it doesn't exist
             output_dir = os.path.join("MLBstats", "BPdata")
             os.makedirs(output_dir, exist_ok=True)
 
@@ -83,13 +85,13 @@ if __name__ == "__main__":
                 # Format the current date as 'ddmmyyyy'
                 date_str = time.strftime("%d%m%Y")
                 filename = f"{team_name}_bullpen_stats_{date_str}.csv"
-                # Clean up the filename by replacing spaces with underscores
+                # Clean up the filename, need to do some more organization
                 filename = filename.replace(' ', '_')
                 file_path = os.path.join(output_dir, filename)
                 df.to_csv(file_path, index=False)
                 print(f"Data for {team_name} saved to {file_path}")
             
-            # Extract player links and scrape details using multithreading
+            # extract player links and scrape details with multithreading
             player_links = extract_player_links(soup)
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [executor.submit(scrape_player_details, base_url, player_name, href) for player_name, href in player_links]
