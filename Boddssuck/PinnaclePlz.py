@@ -9,7 +9,7 @@ from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.common.exceptions import *
 from time import sleep
 import pathlib
-from distutils import dir_util  # copying folders
+#from distutils import dir_util  # copying folders
 import pprint
 
 #TODO Let Paul C know he should have tried harder.
@@ -43,11 +43,13 @@ def FindGameLinks(driver, sport):
     baseurl = "https://www.pinnacle.com/en/" + urlseg
     driver.get(str(baseurl+"/matchups"))
     # not sure this wait condition is good enough (LiveContainer is not the one we really want)
-    contentBlocks = WebDriverWait(driver, 10).until(
-        lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
-                   if c.get_attribute("data-test-id") == 'LiveContainer']
-    )
+    #contentBlocks = WebDriverWait(driver, 10).until(
+    #    lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
+    #               if c.get_attribute("data-test-id") == 'LiveContainer']
+    #)
+    driver.implicitly_wait(0)
     contentBlocks = list(driver.find_elements(By.XPATH, "//div[@id='root']//div[contains(@class, 'contentBlock')]"))
+    driver.implicitly_wait(1)
     gamelinks = []
     for block in contentBlocks:
         print(f"{block.get_attribute('class'), block.get_attribute('data-test-id')}")
@@ -105,11 +107,13 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
             oddsFormatDropdown.click()  # open dropdown; might invalidate references
             sleep(1)
             stylelist = oddsFormatDropdown.find_element(By.XPATH, '../div/div[contains(@class, "tooltip")]/ul[@data-test-id="OddsFormat"]')
+            driver.implicitly_wait(0)
             styles = stylelist.find_elements(By.XPATH, "./li/a")
             styles[1].click()   # the 'not-selected style' always appears second
             # note that changing the odds format doesn't close the dropdown menu, but it also doesn't invalidate any references (you can click the other style)
             sleep(1)
             print(styles)
+            driver.implicitly_wait(1)
     except Exception as e:  # TODO: specifically catch selenium errors only
         print(e)
     return driver
@@ -123,6 +127,7 @@ def ScrapePage(driver: webdriver.Firefox):
         print("ScrapePage failed to find matchup-market-groups")
         print(E)
         return
+    driver.implicitly_wait(0)
     #market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')
     market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"]')
     for group in market_groups:
@@ -131,6 +136,7 @@ def ScrapePage(driver: webdriver.Firefox):
             continue
         # TODO: on some pages ('#All'), the market-group content blocks will have some of their content hidden, with a clickable 'See more' footer (even if you've hit 'Show All')
         # Assuming there's only one title and content group per market-group
+        driver.implicitly_wait(1)
         title = group.find_element(By.XPATH, ".//div[contains(@class, 'collapse-title')]").text.removesuffix('\nHide All')  # the 'Show/Hide All' button text will also be concatenated, if it exists
         content = group.find_element(By.XPATH, ".//div[contains(@class, 'collapse-content')]")
         try:
@@ -138,6 +144,7 @@ def ScrapePage(driver: webdriver.Firefox):
             print(f"Found expandMarketBtn: {expandMarketBtn.text}")
             if expandMarketBtn.text == "See more":
                 expandMarketBtn.click()
+                print("click")
                 assert(expandMarketBtn.text == "See less")
         except NoSuchElementException:  # group doesn't have any hidden elements
             pass
@@ -147,6 +154,7 @@ def ScrapePage(driver: webdriver.Firefox):
             print(subHeading.text)
         except NoSuchElementException:
             subHeading = None
+        driver.implicitly_wait(0)
         market_dict[title] = {"subHeading": subHeading, "content": []}
         market_buttons = content.find_elements(By.XPATH, ".//button[contains(@class, 'market-btn')]")
         # you can check if the button is disabled (line closed) by checking this attribute: aria-label="Currently Offline"
@@ -159,6 +167,7 @@ def ScrapePage(driver: webdriver.Firefox):
                 market_dict[title]["content"].append("Line Closed or Not Posted")
                 print("Line Closed or Not Posted")
         print("")  # implied newline
+        driver.implicitly_wait(1)
     return market_dict
 
 
@@ -230,7 +239,7 @@ if __name__ == "__main__":
     # TODO: actually make it possible to persist changes to settings (especially ublock)
     # the problem is that FirefoxProfile ALWAYS copies the folder into a new temp profile (which is normally desirable)
     driver = webdriver.Firefox(options=options)
-    driver.implicitly_wait(6)
+    driver.implicitly_wait(2)
     #driver.get("https://www.pinnacle.com")  # need to navigate to domain first to set cookie
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})   # doesn't work
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "priceStyle=american"})  # setting odds-format to american   # doesn't work
