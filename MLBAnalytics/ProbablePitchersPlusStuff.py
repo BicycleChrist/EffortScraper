@@ -4,23 +4,20 @@ import tkinter as tk
 from tkinter import ttk
 from ProbablePitchersFrame import PPFrameT
 from stuffsuck import get_pitching_data
-from BBSavant_statcast import scrape
+#from BBSavant_statcast import scrape
 from BBSplayer_ids import pitchers
+from penski import GetFilepath
 
 # Code is very jenk
 # The .csv file names of the team bullpen stats are not named correctly in order to be loaded by this GUI for some reason
 #TODO: Alter the file naming functionality for penski, or some other fix
 
 def load_bullpen_data(team_name):
-   
-    file_path = f'/home/retupmoc/Desktop/EffortScraper/MLBAnalytics/MLBstats/BPdata/{team_name}_Bullpen_Usage_bullpen_stats_30052024.csv'
-    
-    if os.path.exists(file_path):
-        # Read the CSV file into a DataFrame
-        return pd.read_csv(file_path)
-    else:
-        print(f"File not found: {file_path}")
+    filepath = GetFilepath('bullpen_stats', team_name)
+    if not filepath.exists():
+        print(f"File not found: {filepath}")
         return None
+    return pd.read_csv(filepath)
 
 def CreateTabLayout(matchupframe, matchup_dict, dataframe):
     print("tablayout")
@@ -52,10 +49,16 @@ def CreateTabLayout(matchupframe, matchup_dict, dataframe):
         'Stuff+', 'Location+', 'Pitching+'
     ]
 
+    bullpen_dir = GetFilepath('bullpen_stats', '').parent
+    bullpen_files = bullpen_dir.glob("*bullpen_stats*.csv")
     
-    for side in ['home', 'away']:
-        team_name = matchup_dict['teams'][side]['name']
-        bullpen_data = load_bullpen_data(team_name)
+    #for side in ['home', 'away']:
+    #    team_name = matchup_dict['teams'][side]['name']
+    #    bullpen_data = load_bullpen_data(team_name)
+    
+    for filepath in bullpen_files:
+        team_name = filepath.name.split("_Bullpen", maxsplit=1)[0]
+        bullpen_data = pd.read_csv(filepath)
         if bullpen_data is not None:
             bullpen_frame = ttk.LabelFrame(matchupframe, text=f"{team_name} Bullpen Usage")
             bullpen_frame.pack(expand=True, fill="both", side="bottom", anchor="sw")

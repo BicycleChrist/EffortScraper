@@ -3,7 +3,8 @@ import requests
 import pandas as pd
 import time
 from io import StringIO
-import os
+import pathlib
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
 #TODO: Organize the .csv files by team
@@ -67,56 +68,65 @@ def scrape_player_details(base_url, player_name, href):
         print(f"Failed to retrieve the player's page {href}. Status code: {response.status_code}")
         return player_name, None, None
 
+
+# 'purpose' is 'bullpen_stats' or' adv_traits'
+def GetFilepath(purpose:str, name:str, append_date=True) -> pathlib.Path:
+    purposes = ('bullpen_stats', 'adv_traits', 'splits_stats')
+    if purpose not in purposes:
+        print(f"Error: GetFilepath did not understand the purpose argument: '{purpose}'.\nExiting.")
+        exit(1)
+    cwd = pathlib.Path.cwd()
+    output_dir = cwd / "MLBstats" / "BPdata"
+    output_dir.mkdir(exist_ok=True, parents=True)
+    name = name.strip().replace(' ', '_')  # clean up the input
+    middle_segment = '_' + purpose + '_'
+    datestring = ''
+    if append_date: datestring = time.strftime("%d%m%Y")
+    else: middle_segment.removesuffix('_')
+    filename = f"{name}{middle_segment}{datestring}.csv"
+    print(f"filename: {filename}")
+    return output_dir / filename
+    
+
 if __name__ == "__main__":
     base_url = 'https://www.insidethepen.com'
     main_url = f'{base_url}/bullpen-usage.html'
     response = requests.get(main_url)
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.content, 'lxml')
-        
-        # Extract team tables
-        team_tables = extract_team_tables(soup)
-        if team_tables:
-            # create directory structure if it doesn't exist
-            output_dir = os.path.join("MLBstats", "BPdata")
-            os.makedirs(output_dir, exist_ok=True)
-
-            for team_name, df in team_tables:
-                # Format the current date as 'ddmmyyyy'
-                date_str = time.strftime("%d%m%Y")
-                filename = f"{team_name}_bullpen_stats_{date_str}.csv"
-                # Clean up the filename, need to do some more organization
-                filename = filename.replace(' ', '_')
-                file_path = os.path.join(output_dir, filename)
-                df.to_csv(file_path, index=False)
-                print(f"Data for {team_name} saved to {file_path}")
-            
-            # extract player links and scrape details with multithreading
-            player_links = extract_player_links(soup)
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = [executor.submit(scrape_player_details, base_url, player_name, href) for player_name, href in player_links]
-                
-                for future in futures:
-                    player_name, adv_traits, splits_stats_df = future.result()
-                    if adv_traits:
-                        adv_traits_filename = f"{player_name}_adv_traits_{date_str}.csv"
-                        adv_traits_filepath = os.path.join(output_dir, adv_traits_filename)
-                        adv_traits_df = pd.DataFrame(list(adv_traits.items()), columns=['Trait', 'Value'])
-                        adv_traits_df.to_csv(adv_traits_filepath, index=False)
-                        print(f"Advanced traits for {player_name} saved to {adv_traits_filepath}")
-                    
-                    if splits_stats_df is not None:
-                        splits_stats_filename = f"{player_name}_splits_stats_{date_str}.csv"
-                        splits_stats_filepath = os.path.join(output_dir, splits_stats_filename)
-                        splits_stats_df.to_csv(splits_stats_filepath, index=False)
-                        print(f"Splits stats for {player_name} saved to {splits_stats_filepath}")
-        else:
-            print("No tables extracted")
-    else:
+    if response.status_code != 200:
         print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
-
-
-
-
-
-
+        exit(1)
+    
+    print("soup")
+    soup = BeautifulSoup(response.content, 'lxml')
+    
+    # Extract team tables
+    team_tables = extract_team_tables(soup)
+    print("team tables extracted")
+    if not team_tables: 
+        print("No tables extracted")
+        exit(1)
+    
+    for team_name, df in team_tables:
+        filepath = GetFilepath('bullpen_stats', team_name)
+        df.to_csv(filepath, index=False)
+        print(f"Data for {team_name} saved to {filepath}")
+    
+    # extract player links and scrape details with multithreading
+    player_links = extract_player_links(soup)
+    print(f"extracted player links")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(scrape_player_details, base_url, player_name, href) for player_name, href in player_links]
+        #for future in futures:  # not really multithreading?
+        for future in concurrent.futures.as_completed(futures):
+            player_name, adv_traits, splits_stats_df = future.result()
+            if adv_traits:
+                filepath = GetFilepath('adv_traits', player_name)
+                adv_traits_df = pd.DataFrame(list(adv_traits.items()), columns=['Trait', 'Value'])
+                adv_traits_df.to_csv(filepath, index=False)
+                print(f"Advanced traits for {player_name} saved to {filepath}")
+            if splits_stats_df is not None:
+                filepath = GetFilepath('splits_stats', player_name)
+                splits_stats_df.to_csv(filepath, index=False)
+                print(f"Splits stats for {player_name} saved to {filepath}")
+    
+    print("Done")
