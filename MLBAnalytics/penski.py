@@ -116,7 +116,6 @@ if __name__ == "__main__":
     print(f"extracted player links")
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(scrape_player_details, base_url, player_name, href) for player_name, href in player_links]
-        #for future in futures:  # not really multithreading?
         for future in concurrent.futures.as_completed(futures):
             player_name, adv_traits, splits_stats_df = future.result()
             if adv_traits:

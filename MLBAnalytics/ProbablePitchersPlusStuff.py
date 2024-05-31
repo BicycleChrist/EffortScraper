@@ -1,4 +1,3 @@
-import os
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk
@@ -9,9 +8,6 @@ from BBSplayer_ids import pitchers
 from penski import GetFilepath
 import pathlib
 
-# Code is very jenk
-# The .csv file names of the team bullpen stats are not named correctly in order to be loaded by this GUI for some reason
-#TODO: Alter the file naming functionality for penski, or some other fix
 
 def load_bullpen_data(team_name):
     filepath = GetFilepath('bullpen_stats', team_name)
@@ -57,18 +53,20 @@ def CreateTabLayout(matchupframe, matchup_dict, dataframe):
         return filepath.name.split("_Bullpen", maxsplit=1)[0]
     
     bullpen_dict = { GetTeamname(bullpen_file):bullpen_file for bullpen_file in bullpen_files }
-    print(bullpen_dict.items())
+    #print(bullpen_dict.items())
+    #print(matchup_dict)
     for side in ['home', 'away']:
-        print(matchup_dict)
         team_name = matchup_dict['teams'][side]['name']
-        print(team_name)
-        
+        #print(team_name)
+        team_name = team_name.strip().replace(' ', '_')
+        if team_name == "D-backs":
+            team_name = "Diamondbacks"
         
         bullpen_data = None
         # the teamnames in the matchup_dict aren't the real names, so we have to search
         keys = list(bullpen_dict.keys())
         for real_name in keys:
-            if team_name in real_name:  # TODO: make more robust
+            if team_name in real_name:
                 filepath = bullpen_dict[real_name]
                 bullpen_data = pd.read_csv(filepath)
                 break
