@@ -7,6 +7,7 @@ from stuffsuck import get_pitching_data
 #from BBSavant_statcast import scrape
 from BBSplayer_ids import pitchers
 from penski import GetFilepath
+import pathlib
 
 # Code is very jenk
 # The .csv file names of the team bullpen stats are not named correctly in order to be loaded by this GUI for some reason
@@ -52,13 +53,26 @@ def CreateTabLayout(matchupframe, matchup_dict, dataframe):
     bullpen_dir = GetFilepath('bullpen_stats', '').parent
     bullpen_files = bullpen_dir.glob("*bullpen_stats*.csv")
     
-    #for side in ['home', 'away']:
-    #    team_name = matchup_dict['teams'][side]['name']
-    #    bullpen_data = load_bullpen_data(team_name)
+    def GetTeamname(filepath: pathlib.Path): 
+        return filepath.name.split("_Bullpen", maxsplit=1)[0]
     
-    for filepath in bullpen_files:
-        team_name = filepath.name.split("_Bullpen", maxsplit=1)[0]
-        bullpen_data = pd.read_csv(filepath)
+    bullpen_dict = { GetTeamname(bullpen_file):bullpen_file for bullpen_file in bullpen_files }
+    print(bullpen_dict.items())
+    for side in ['home', 'away']:
+        print(matchup_dict)
+        team_name = matchup_dict['teams'][side]['name']
+        print(team_name)
+        
+        
+        bullpen_data = None
+        # the teamnames in the matchup_dict aren't the real names, so we have to search
+        keys = list(bullpen_dict.keys())
+        for real_name in keys:
+            if team_name in real_name:  # TODO: make more robust
+                filepath = bullpen_dict[real_name]
+                bullpen_data = pd.read_csv(filepath)
+                break
+        
         if bullpen_data is not None:
             bullpen_frame = ttk.LabelFrame(matchupframe, text=f"{team_name} Bullpen Usage")
             bullpen_frame.pack(expand=True, fill="both", side="bottom", anchor="sw")
