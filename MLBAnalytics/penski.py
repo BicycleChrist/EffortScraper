@@ -70,7 +70,7 @@ def scrape_player_details(base_url, player_name, href):
 
 
 # 'purpose' is 'bullpen_stats' or' adv_traits'
-def GetFilepath(purpose:str, name:str, append_date=True) -> pathlib.Path:
+def GetFilepath(purpose:str, name:str, append_date=True) -> pathlib.Path | list[pathlib.Path]:
     purposes = ('bullpen_stats', 'adv_traits', 'splits_stats')
     if purpose not in purposes:
         print(f"Error: GetFilepath did not understand the purpose argument: '{purpose}'.\nExiting.")
@@ -80,10 +80,13 @@ def GetFilepath(purpose:str, name:str, append_date=True) -> pathlib.Path:
     output_dir.mkdir(exist_ok=True, parents=True)
     name = name.strip().replace(' ', '_')  # clean up the input
     middle_segment = '_' + purpose + '_'
-    datestring = ''
+    datestring = '*'
     if append_date: datestring = time.strftime("%d%m%Y")
     else: middle_segment.removesuffix('_')
     filename = f"{name}{middle_segment}{datestring}.csv"
+    if not append_date: # assume we're doing a lookup instead of save if we're not appending date
+        filenames = list(output_dir.glob(filename))
+        return filenames
     print(f"filename: {filename}")
     return output_dir / filename
     
@@ -114,7 +117,7 @@ if __name__ == "__main__":
     # extract player links and scrape details with multithreading
     player_links = extract_player_links(soup)
     print(f"extracted player links")
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=None) as executor:
         futures = [executor.submit(scrape_player_details, base_url, player_name, href) for player_name, href in player_links]
         for future in concurrent.futures.as_completed(futures):
             player_name, adv_traits, splits_stats_df = future.result()
