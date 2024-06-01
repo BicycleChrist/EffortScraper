@@ -31,7 +31,7 @@ class DmFrameT(ttk.Frame):
     
 
 # if specified, the new widget is created inside the frame and returned
-def InsertFrame(master=None, name=None, new_widget_class=None, new_toplevel=None, new_layoutmethod=None):
+def InsertFrame(master=None, name=None, new_widget_class=None, new_toplevel=None, new_layoutmethod=None, **kwargs):
     global TOPLEVEL
     global LAYOUTMETHOD
     if new_toplevel is None: new_toplevel = TOPLEVEL
@@ -47,7 +47,7 @@ def InsertFrame(master=None, name=None, new_widget_class=None, new_toplevel=None
     #    master = newframe.TOPLEVEL
     newframe.LAYOUTMETHOD(newframe)
     if new_widget_class is not None:
-        new_widget = new_widget_class(master=newframe)
+        new_widget = new_widget_class(master=newframe, **kwargs)
         newframe.LAYOUTMETHOD(new_widget)
         return newframe, new_widget
     return newframe
