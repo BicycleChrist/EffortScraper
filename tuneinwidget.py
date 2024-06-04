@@ -1,23 +1,24 @@
 import tkinter as tk
 from tkinter import ttk
-import threading
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import tunein 
+
 
 #  parse URLs and update the listbox
 def parse_urls(urls, listbox):
-    def run():
-        max_length = 0
-        for url in urls:
-            href_links = tunein.get_href_links(url)
+    max_length = 0
+    with ThreadPoolExecutor(max_workers=None) as executor:
+        futures = [executor.submit(tunein.get_href_links, url) for url in urls]
+        for future in concurrent.futures.as_completed(futures):
+            href_links = future.result()
             for link in href_links:
                 listbox.insert(tk.END, link)
                 if len(link) > max_length:
                     max_length = len(link)
-        
-        # change width based on the longest URL
-        listbox.config(width=max_length)
     
-    threading.Thread(target=run).start()
+    # change width based on the longest URL
+    listbox.config(width=max_length)
 
 
 root = tk.Tk()
