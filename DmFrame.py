@@ -25,7 +25,7 @@ class DmFrameT(ttk.Frame):
         if "LAYOUTMETHOD" in globals():
             self.LAYOUTMETHOD = LAYOUTMETHOD
         else:
-            self.LAYOUTMETHOD = tkinter.Widget.pack    
+            self.LAYOUTMETHOD = tkinter.Widget.grid
         if "TOPLEVEL" in globals():
             self.TOPLEVEL = TOPLEVEL
     
