@@ -132,8 +132,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
             bullpen_frame = InsertFrame(master=None, new_widget_class=None)
             bullpen_frame.pack(expand=True, fill="x", side="top", anchor="nw")
             bullpen_subframe = InsertFrame(bullpen_frame, new_toplevel=bullpen_frame, new_widget_class=None)
-            bullpen_subframe.pack(expand=True, fill="x", side="top", anchor="nw")
-
+            bullpen_subframe.pack(expand=True, fill="y", side="top", anchor="e")
             #bullpen_frame.pack(expand=True, fill="y", side="right", anchor="center")
             #bullpen_subframe = ttk.LabelFrame(matchupframe, text=f"{team_name} Adv bullpen stats")
             #bullpen_subframe.pack(expand=True, fill="y", side="left", anchor="")
@@ -157,6 +156,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 return
 
             dropdown = ttk.OptionMenu(bullpen_frame, default_text, "Adv BP stats", *pitcher_names, command=DropdownCallback)
+            
             dropdown.pack(expand=False, fill="none", anchor="center")
 
             # Create a Treeview

@@ -28,7 +28,9 @@ def extract_team_tables(soup):
         team_name = team_name_tag.text.strip()
         dataframes = pd.read_html(StringIO(str(bottomlevel)))
         if dataframes:
-            team_dataframes.append((team_name, dataframes[0]))
+            df = dataframes[0]
+            df.columns = df.columns.str.strip()  # Strip whitespace from column names
+            team_dataframes.append((team_name, df))
 
     return team_dataframes
 
@@ -62,6 +64,8 @@ def scrape_player_details(base_url, player_name, href):
         # Extract Splits Stats Table
         splits_stats_table = player_soup.find('table', class_='table table-bordered table-striped table-width sticky-table pb-0 mb-0')
         splits_stats_df = pd.read_html(StringIO(str(splits_stats_table)))[0] if splits_stats_table else None
+        if splits_stats_df is not None:
+            splits_stats_df.columns = splits_stats_df.columns.str.strip()
         
         return player_name, adv_traits, splits_stats_df
     else:
@@ -124,11 +128,12 @@ if __name__ == "__main__":
             if adv_traits:
                 filepath = GetFilepath('adv_traits', player_name)
                 adv_traits_df = pd.DataFrame(list(adv_traits.items()), columns=['Trait', 'Value'])
+                adv_traits_df['Trait'] = adv_traits_df['Trait'].str.strip()  # Strip whitespace from Trait column values
                 adv_traits_df.to_csv(filepath, index=False)
                 print(f"Advanced traits for {player_name} saved to {filepath}")
             if splits_stats_df is not None:
                 filepath = GetFilepath('splits_stats', player_name)
                 splits_stats_df.to_csv(filepath, index=False)
                 print(f"Splits stats for {player_name} saved to {filepath}")
-    
+
     print("Done")
