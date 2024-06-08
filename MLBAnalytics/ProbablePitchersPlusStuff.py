@@ -14,7 +14,8 @@ import pathlib
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
     formatted_pitcher_names = {}
-    pitcher_id_map = {}
+    pitcher_id_map = {} # This is being done in order to perform a lookup in the BBS dict to pass into the scrape function
+
 
     for name in starting_pitcher_names:
         last_first_name = ", ".join(name.split()[::-1])
@@ -55,6 +56,7 @@ def Fillout_BP_Frame(parent_frame, possible_files: dict):
     BP_dicts = []  # list of dicts; maps BPstat_type to a dataframe (loaded from csv)
     for BPstat_type, all_matching_files in possible_files.items():
         BPdata_dict = {BPstat_type: pd.read_csv(file) for file in all_matching_files}
+        # if file.exists(): #should already exist if we got it by glob
         BP_dicts.append(BPdata_dict)
 
     for BP_dict in BP_dicts:
@@ -99,6 +101,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
             team_name = "Diamondbacks"
 
         bullpen_data = None
+        # the teamnames in the matchup_dict aren't the real names, so we have to search
         keys = list(bullpen_dict.keys())
         for real_name in keys:
             if team_name in real_name:
@@ -134,7 +137,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
             bullpen_treeview = ttk.Treeview(matchupframe, columns=column_names, show='headings')
             for col in column_names:
                 bullpen_treeview.heading(col, text=col)
-                bullpen_treeview.column(col, anchor='center', width=75, stretch=NO)
+                bullpen_treeview.column(col, anchor='center', width=75, stretch=NO) # Stretch needs to used with width !!!
 
             bullpen_treeview.pack(expand=False, fill="both")
             bullpen_treeview.column("Player", width=130)
@@ -167,6 +170,7 @@ def Main():
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # Windows and MacOS bindings for the mouse wheel
+    # Only works when hovering over scroll bar
     toplevel.bind_all("<MouseWheel>", _on_mousewheel)  # Windows
     toplevel.bind_all("<Button-4>", _on_mousewheel)    # Linux
     toplevel.bind_all("<Button-5>", _on_mousewheel)    # Linux
@@ -174,7 +178,7 @@ def Main():
     PPFrame = PPFrameT(master=frame)
     PPFrame.pack(expand=False, side="left")
 
-    dataframe = get_pitching_data()
+    dataframe = get_pitching_data() # DON'T CALL THIS INLINE IN THE LAMBDA!!!!!! It will re-download EVERY ITERATION!
     def CreateTabLayoutLambda(matchupframe, matchupdict, dataframe):
         CreateTabLayoutCustom(matchupframe, matchupdict)
         FilloutStartingPitchers(matchupframe, matchupdict, dataframe)
