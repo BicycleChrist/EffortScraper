@@ -10,12 +10,15 @@ from stuffsuck import get_pitching_data
 from BBSplayer_ids import pitchers
 from penski import GetFilepath
 import pathlib
+from pathlib import Path
+from PIL import Image, ImageTk
+
+#TODO: Allow mouse wheel scrolling when not hovering over scrollbar
 
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
     formatted_pitcher_names = {}
-    pitcher_id_map = {} # This is being done in order to perform a lookup in the BBS dict to pass into the scrape function
-
+    pitcher_id_map = {}  # This is being done in order to perform a lookup in the BBS dict to pass into the scrape function
 
     for name in starting_pitcher_names:
         last_first_name = ", ".join(name.split()[::-1])
@@ -44,11 +47,45 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Stuff+ Stats")
             pitcher_stats_frame.pack(expand=True, fill="both", side="top", anchor="sw")
 
+            stats_frame = Frame(pitcher_stats_frame)
+            stats_frame.pack(side="top", fill="x")
             for header in column_headers_to_display:
                 if header in pitcher_data and not pd.isnull(pitcher_data[header]):
                     stat_value = pitcher_data[header]
-                    stat_label = ttk.Label(pitcher_stats_frame, text=f"{header}: {stat_value}")
-                    stat_label.pack(side="left", padx=2, pady=2)
+                    stat_label = ttk.Label(stats_frame, text=f"{header}: {stat_value}")
+                    stat_label.pack(side="left", padx=2, pady=2, anchor="w")
+
+            images_frame = Frame(pitcher_stats_frame)
+            images_frame.pack(side="top", fill="x", padx=2, pady=2)
+
+            try:
+                lastname, firstname = pitcher_name.split()
+                img1_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_trending_div.png"
+                img2_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_pitch_distribution_svg.png"
+
+                if not img1_path.exists():
+                    print(f"Image not found: {img1_path}")
+                    raise FileNotFoundError(f"Image not found: {img1_path}")
+                if not img2_path.exists():
+                    print(f"Image not found: {img2_path}")
+                    raise FileNotFoundError(f"Image not found: {img2_path}")
+
+                img1 = Image.open(img1_path)
+                img2 = Image.open(img2_path)
+
+                img1 = ImageTk.PhotoImage(img1)
+                img2 = ImageTk.PhotoImage(img2)
+
+                label1 = Label(images_frame, image=img1)
+                label2 = Label(images_frame, image=img2)
+
+                label1.image = img1
+                label2.image = img2
+
+                label1.pack(side="left", anchor="w", padx=1, pady=1)
+                label2.pack(side="left", anchor="w", padx=1, pady=1)
+            except Exception as e:
+                print(f"Error loading images: {e}")
 
     return
 
@@ -56,17 +93,20 @@ def Fillout_BP_Frame(parent_frame, possible_files: dict):
     BP_dicts = []  # list of dicts; maps BPstat_type to a dataframe (loaded from csv)
     for BPstat_type, all_matching_files in possible_files.items():
         BPdata_dict = {BPstat_type: pd.read_csv(file) for file in all_matching_files}
-        # if file.exists(): #should already exist if we got it by glob
         BP_dicts.append(BPdata_dict)
+
+    # Create a parent frame for the adv_traits and splits_stats frames
+    adv_splits_parent_frame = Frame(parent_frame)
+    adv_splits_parent_frame.pack(expand=True, fill="both", anchor="w", side="top")
 
     for BP_dict in BP_dicts:
         for BPstat_type, dataframe in BP_dict.items():
             dataframe.columns = dataframe.columns.str.strip()
-            BPstat_frame = ttk.LabelFrame(parent_frame, text=BPstat_type)
-            BPstat_frame.pack(expand=False, fill="none", anchor="w", side="top")
+            BPstat_frame = ttk.LabelFrame(adv_splits_parent_frame, text=BPstat_type)
+            BPstat_frame.pack(expand=True, fill="both", side="left")  # Pack side by side
 
             treeview = ttk.Treeview(BPstat_frame, columns=list(dataframe.columns), show='headings')
-            treeview.pack(expand=False, fill="x", side="bottom")
+            treeview.pack(expand=True, fill="both", side="left")
 
             for col in dataframe.columns:
                 treeview.heading(col, text=col)
@@ -84,6 +124,7 @@ def Fillout_BP_Frame(parent_frame, possible_files: dict):
                 treeview.insert("", "end", values=values)
 
     return
+
 
 def CreateTabLayoutCustom(matchupframe, matchup_dict):
     bullpen_dir = GetFilepath('bullpen_stats', '').parent
@@ -120,18 +161,24 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
             default_text = tkinter.StringVar()
             default_text.set("Default Text")
 
-            def DropdownCallback(stringvar=default_text, target_frame=bullpen_subframe):
-                stringvar = stringvar.strip().replace(' ', '_')
+            def DropdownCallback(selection, stringvar=default_text, target_frame=bullpen_subframe):
+                stringvar.set(selection)
+                formatted_name = selection.strip().replace(' ', '_')
                 possible_files = {
-                    BPstat_type: GetFilepath(BPstat_type, stringvar, append_date=False)
+                    BPstat_type: GetFilepath(BPstat_type, formatted_name, append_date=False)
                     for BPstat_type in ('adv_traits', 'splits_stats')
                 }
                 for widget in target_frame.winfo_children():
                     widget.pack_forget()
                 Fillout_BP_Frame(target_frame, possible_files)
+
+                # Load images
+                lastname, firstname = selection.split()
+                load_images(lastname, firstname, target_frame)
+
                 return
 
-            dropdown = ttk.OptionMenu(bullpen_frame, default_text, "Adv BP stats", *pitcher_names, command=DropdownCallback)
+            dropdown = ttk.OptionMenu(bullpen_frame, default_text, f"{team_name} Adv BP stats", *pitcher_names, command=DropdownCallback)
             dropdown.pack(expand=False, fill="none", anchor="center")
 
             bullpen_treeview = ttk.Treeview(matchupframe, columns=column_names, show='headings')
@@ -147,6 +194,35 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 bullpen_treeview.insert("", "end", values=values)
 
     return
+
+def load_images(lastname, firstname, frame):
+    try:
+        img1_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_trending_div.png"
+        img2_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_pitch_distribution_svg.png"
+
+        if not img1_path.exists():
+            print(f"Image not found: {img1_path}")
+            raise FileNotFoundError(f"Image not found: {img1_path}")
+        if not img2_path.exists():
+            print(f"Image not found: {img2_path}")
+            raise FileNotFoundError(f"Image not found: {img2_path}")
+
+        img1 = Image.open(img1_path)
+        img2 = Image.open(img2_path)
+
+        img1 = ImageTk.PhotoImage(img1)
+        img2 = ImageTk.PhotoImage(img2)
+
+        label1 = Label(frame, image=img1)
+        label2 = Label(frame, image=img2)
+
+        label1.image = img1
+        label2.image = img2
+
+        label1.pack(side="left", anchor="e", padx=3, pady=2)
+        label2.pack(side="right", anchor="w", padx=3, pady=2)
+    except Exception as e:
+        print(f"Error loading images: {e}")
 
 def Main():
     toplevel = tkinter.Tk()
@@ -168,12 +244,11 @@ def Main():
     frame.bind("<Configure>", on_frame_configure)
     def _on_mousewheel(event):
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
     # Windows and MacOS bindings for the mouse wheel
     # Only works when hovering over scroll bar
-    toplevel.bind_all("<MouseWheel>", _on_mousewheel)  # Windows
-    toplevel.bind_all("<Button-4>", _on_mousewheel)    # Linux
-    toplevel.bind_all("<Button-5>", _on_mousewheel)    # Linux
+    toplevel.bind_all("<MouseWheel>", _on_mousewheel)
+    toplevel.bind_all("<Button-4>", _on_mousewheel)
+    toplevel.bind_all("<Button-5>", _on_mousewheel)
 
     PPFrame = PPFrameT(master=frame)
     PPFrame.pack(expand=False, side="left")
@@ -191,3 +266,4 @@ def Main():
 
 if __name__ == "__main__":
     Main()
+
