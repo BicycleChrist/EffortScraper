@@ -16,6 +16,8 @@ from BBSavant_statcast import scrape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
+#TODO: Boost scraping speed
+#BBS scrape takes all damn day, must be miffing it via iterating through too much stuff or jenk threading implementation
 
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
@@ -25,22 +27,28 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     def fetch_pitcher_data(name, player_id):
         return (name, scrape(name, player_id))
 
+    # Pre-process names and construct URLs
     for name in starting_pitcher_names:
         last_first_name = ", ".join(name.split()[::-1])
         formatted_pitcher_names[name] = last_first_name
         player_id = pitchers.get(last_first_name)
         pitcher_id_map[last_first_name] = player_id
 
+    # Concurrently fetch all data
     with ThreadPoolExecutor() as executor:
         future_to_name = {
             executor.submit(fetch_pitcher_data, name, pitcher_id_map[name]): name
-            for name in pitcher_id_map
+            for name in pitcher_id_map if pitcher_id_map[name] is not None
         }
         pitcher_data_results = {}
         for future in as_completed(future_to_name):
-            name, pitcher_data = future.result()
-            pitcher_data_results[name] = pitcher_data
+            try:
+                name, pitcher_data = future.result()
+                pitcher_data_results[name] = pitcher_data
+            except Exception as e:
+                print(f"Error fetching data for {future_to_name[future]}: {e}")
 
+    # Filter the dataframe for starting pitchers
     filtered_df = dataframe[dataframe['Name'].isin(starting_pitcher_names)]
     pitcher_data_map = {row['Name']: row for index, row in filtered_df.iterrows()}
 
@@ -50,8 +58,18 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         'Stuff+', 'Location+', 'Pitching+'
     ]
 
+    def get_color(value):
+        value = int(value)  # Convert value to integer for comparison
+        if value >= 80:
+            return "#FF0000"  # Red
+        elif value <= 50:
+            return "#0000FF"  # Blue
+        elif 50 < value < 80:
+            return "#027C5E"  # Custom color for values between 50 and 80
+        else:
+            return "#000000"  # Black
+
     for pitcher_name, pitcher_dict in matchup_dict['pitchers'].items():
-        # Format the name as "LastName, FirstName"
         last_first_name = ", ".join(pitcher_name.split()[::-1])
         pitcher_data = pitcher_data_results.get(last_first_name, {})
 
@@ -105,17 +123,23 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         except Exception as e:
             print(f"Error loading images: {e}")
 
-        # Adding the listbox to display scraped data
-        listbox = Listbox(pitcher_stats_frame)
-        listbox.pack(expand=True, fill="both", side="right", padx=2, pady=2)
+        # scraped data with colored labels
+        scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Statcast Stats")
+        scraped_data_frame.pack(expand=True, fill="both", side="top", padx=5, pady=5)
 
         for key, value in pitcher_data.items():
-            listbox.insert(END, f"{key}:")
-            listbox.insert(END, f"  Value: {value['value']}")
-            listbox.insert(END, f"  Stat: {value['stat']}")
-            listbox.insert(END, "")
+            stat_label = ttk.Label(scraped_data_frame, text=f"{key}:", font=('Helvetica', 10, 'bold'))
+            stat_label.pack(anchor="w", padx=5, pady=2)
+
+            value_label = ttk.Label(scraped_data_frame, text=f"  % Ranking: {value['value']}", foreground=get_color(value['value']), font=('Helvetica', 10))
+            value_label.pack(anchor="w", padx=10, pady=2)
+
+            stat_value_label = ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10))
+            stat_value_label.pack(anchor="w", padx=10, pady=2)
 
     return
+
+
 
 
 
