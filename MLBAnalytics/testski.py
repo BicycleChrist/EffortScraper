@@ -22,27 +22,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
     print(starting_pitcher_names)
-    
+
     pitcher_id_map = {}
     for name in starting_pitcher_names:
-        newname, pitcherid = BBSplayer_ids.LookupPitcher(name, reverseOrder=True)
-        pitcher_id_map[newname] = pitcherid
-    
-    # newname = "_".join(inputname.split(", "))  # replaces commas with underscores
-    # reversedname = "_".join(inputname.split(", ")[::-1])
-    
+        try:
+            newname, pitcherid = BBSplayer_ids.LookupPitcher(name, reverseOrder=True)
+            pitcher_id_map[newname] = pitcherid
+        except KeyError as e:
+            print(f"KeyError: {e} - Pitcher name {name} not found in the dictionary. Skipping this pitcher.")
+            continue
+
     pitcher_data_results = {}
     with ThreadPoolExecutor() as executor:
         futures = {
             executor.submit(BBSavant_statcast.scrape, pitchername, player_id, True): pitchername
             for pitchername, player_id in pitcher_id_map.items()
         }
-        pitcher_data_results = { 
-            pitchername: future.result() 
-            for future, pitchername in futures.items() 
+        pitcher_data_results = {
+            pitchername: future.result()
+            for future, pitchername in futures.items()
         }
-    
-    # Filter the dataframe for starting pitchers
+
     filtered_df = dataframe[dataframe['Name'].isin(starting_pitcher_names)]
     pitcher_data_map = {row['Name']: row for index, row in filtered_df.iterrows()}
 
@@ -53,28 +53,27 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     ]
 
     def get_color(value):
-        value = int(value)  # Convert value to integer for comparison
-        if value >= 80:
-            return "#FF0000"  # Red
-        elif value <= 50:
-            return "#0000FF"  # Blue
-        elif 50 < value < 80:
-            return "#027C5E"  # Custom color for values between 50 and 80
-        else:
-            return "#000000"  # Black
-    
-    # TODO: figure out the name formatting in general
+        try:
+            value = int(value)
+            if value >= 80:
+                return "#FF0000"
+            elif value <= 50:
+                return "#0000FF"
+            elif 50 < value < 80:
+                return "#027C5E"
+        except ValueError:
+            return "#000000" 
+
     for reversed_pitcher_name, pitcher_data in pitcher_data_results.items():
         pitcher_name = "_".join(reversed_pitcher_name.split(", ")[::-1])
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
-        
-        # TODO: figure out how the pitcher names need to be looked up (reversed, using spaces or underscores? ascii or utf8?)
+
         spaced_pitcher_name = " ".join(reversed_pitcher_name.split(", ")[::-1])
         for key, value in matchup_dict['pitchers'].get(spaced_pitcher_name, {}).items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
-        
+
         pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Stuff+ Stats")
         pitcher_stats_frame.pack(expand=True, fill="both", side="top", anchor="sw")
 
@@ -88,11 +87,10 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
         images_frame = Frame(pitcher_stats_frame)
         images_frame.pack(side="top", fill="x", padx=2, pady=2)
-        
-        pitchername_reformatted = "_".join(pitcher_name.split(", "))  # name is already reversed
+
+        pitchername_reformatted = "_".join(pitcher_name.split(", ")) 
         load_images(pitchername_reformatted, images_frame)
 
-        # scraped data with colored labels
         scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Statcast Stats")
         scraped_data_frame.pack(expand=True, fill="both", side="top", padx=5, pady=5)
 
@@ -107,6 +105,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             stat_value_label.pack(anchor="w", padx=10, pady=2)
 
     return
+
 
 
 
@@ -220,9 +219,17 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
 
 def load_images(pitchername, frame):
     try:
-        img1_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_trending_div.png"
-        img2_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_pitch_distribution.png"
-        
+        # Correcting the reformatting of pitchername
+        # Split by underscore and reverse the order
+        reversed_name_parts = pitchername.split("_")
+        if len(reversed_name_parts) == 2:
+            corrected_pitchername = f"{reversed_name_parts[1]}_{reversed_name_parts[0]}"
+        else:
+            corrected_pitchername = pitchername
+
+        img1_path = pathlib.Path.cwd() / "MLBstats" / f"{corrected_pitchername}_trending_div.png"
+        img2_path = pathlib.Path.cwd() / "MLBstats" / f"{corrected_pitchername}_pitch_distribution.png"
+
         if not img1_path.exists():
             print(f"Image not found: {img1_path}")
             raise FileNotFoundError(f"Image not found: {img1_path}")
@@ -247,6 +254,7 @@ def load_images(pitchername, frame):
     except Exception as e:
         print(f"Error loading images: {e}")
     return
+
     
 
 def Main():

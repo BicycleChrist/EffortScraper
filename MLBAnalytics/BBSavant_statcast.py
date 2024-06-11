@@ -16,7 +16,7 @@ firefox_profile = FirefoxProfile()  # Not necessary
 options.profile = firefox_profile
 
 
-def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
+def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
     print(f"\nscraping {name}: {player_id}")
     if player_id is None:
         print("aborting scrape: you fucked up the player_id")
@@ -27,10 +27,9 @@ def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
     player_name_url_part = name.lower().replace(' ', '-').replace(',', '')
     url = f"{base_url}{player_name_url_part}-{player_id}?stats=statcast-r-pitching-mlb"
     driver.get(url)
-    
+
     scraped_data = {}
     try:
-        
         if take_screenshots:
             pitch_distribution = WebDriverWait(driver, 5).until(
                 EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
@@ -38,17 +37,17 @@ def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
             trending_div = WebDriverWait(driver, 5).until(
                 EC.visibility_of_element_located((By.ID, 'trending'))
             )
-            
+
             cwd = pathlib.Path.cwd()
             for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
                 filepath = cwd / "MLBstats" / f"{name.replace(', ', '_')}_{purpose}.png"
                 element.screenshot(str(filepath))
                 print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
-    except TimeoutException:
-        print(f"TimeoutException: Elements not found for player {name}.")
+
+        
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
         pitching_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitching')
-        
+
         for group in pitcher_value_groups + pitching_groups:
             metrics = group.find_elements(By.CSS_SELECTOR, 'g.metric')
             for metric in metrics:
@@ -57,16 +56,19 @@ def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
                 stat_text_element = metric.find_elements(By.CSS_SELECTOR, 'text.text-stat')
                 stat_text = stat_text_element[0].text if stat_text_element else 'N/A'
                 scraped_data[header] = {'value': value, 'stat': stat_text}
-        
+
         print(f"Scraped data for {name}: {scraped_data}")
+    except TimeoutException:
+        print(f"TimeoutException: Elements not found for player {name}.")
     finally:
         driver.quit()
-    
+
     return scraped_data
 
 
+
 def DDOS_the_site():
-    # Use ThreadPoolExecutor to manage threads
+    
     with ThreadPoolExecutor(max_workers=24) as executor:
         futures = {executor.submit(scrape, name, player_id, True): (name, player_id) for name, player_id in BBSplayer_ids.pitchers.items()}
     
