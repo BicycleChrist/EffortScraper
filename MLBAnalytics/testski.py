@@ -63,14 +63,15 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         else:
             return "#000000"  # Black
     
-    
+    # TODO: figure out the name formatting in general
     for reversed_pitcher_name, pitcher_data in pitcher_data_results.items():
         pitcher_name = "_".join(reversed_pitcher_name.split(", ")[::-1])
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
         
         # TODO: figure out how the pitcher names need to be looked up (reversed, using spaces or underscores? ascii or utf8?)
-        for key, value in matchup_dict['pitchers'].get(pitcher_name.replace('_', ' '), {}).items():
+        spaced_pitcher_name = " ".join(reversed_pitcher_name.split(", ")[::-1])
+        for key, value in matchup_dict['pitchers'].get(spaced_pitcher_name, {}).items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
         
@@ -80,8 +81,8 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         stats_frame = Frame(pitcher_stats_frame)
         stats_frame.pack(side="top", fill="x")
         for header in column_headers_to_display:
-            if header in pitcher_data_map.get(pitcher_name, {}) and not pd.isnull(pitcher_data_map[pitcher_name][header]):
-                stat_value = pitcher_data_map[pitcher_name][header]
+            if header in pitcher_data_map.get(spaced_pitcher_name, {}) and not pd.isnull(pitcher_data_map[spaced_pitcher_name][header]):
+                stat_value = pitcher_data_map[spaced_pitcher_name][header]
                 stat_label = ttk.Label(stats_frame, text=f"{header}: {stat_value}")
                 stat_label.pack(side="left", padx=2, pady=2, anchor="w")
 
@@ -221,7 +222,7 @@ def load_images(pitchername, frame):
     try:
         img1_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_trending_div.png"
         img2_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_pitch_distribution.png"
-
+        
         if not img1_path.exists():
             print(f"Image not found: {img1_path}")
             raise FileNotFoundError(f"Image not found: {img1_path}")
