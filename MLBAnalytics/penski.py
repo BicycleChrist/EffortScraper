@@ -95,7 +95,7 @@ def GetFilepath(purpose:str, name:str, append_date=True) -> pathlib.Path | list[
     return output_dir / filename
     
 
-if __name__ == "__main__":
+def Main():
     base_url = 'https://www.insidethepen.com'
     main_url = f'{base_url}/bullpen-usage.html'
     response = requests.get(main_url)
@@ -135,5 +135,10 @@ if __name__ == "__main__":
                 filepath = GetFilepath('splits_stats', player_name)
                 splits_stats_df.to_csv(filepath, index=False)
                 print(f"Splits stats for {player_name} saved to {filepath}")
+    
+    return
 
+
+if __name__ == "__main__":
+    Main()
     print("Done")

@@ -8,7 +8,7 @@ from ProbablePitchersFrame import PPFrameT
 from DmNotebook import DmNotebookT
 from stuffsuck import get_pitching_data
 import BBSplayer_ids
-from penski import GetFilepath
+import penski
 import pathlib
 from PIL import Image, ImageTk
 import BBSavant_statcast
@@ -34,7 +34,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     pitcher_data_results = {}
     with ThreadPoolExecutor() as executor:
         futures = {
-            executor.submit(BBSavant_statcast.scrape, pitchername, player_id, False): pitchername
+            executor.submit(BBSavant_statcast.scrape, pitchername, player_id, True): pitchername
             for pitchername, player_id in pitcher_id_map.items()
         }
         pitcher_data_results = { 
@@ -62,15 +62,18 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             return "#027C5E"  # Custom color for values between 50 and 80
         else:
             return "#000000"  # Black
-
-    for pitcher_name, pitcher_data in pitcher_data_results.items():
+    
+    
+    for reversed_pitcher_name, pitcher_data in pitcher_data_results.items():
+        pitcher_name = "_".join(reversed_pitcher_name.split(", ")[::-1])
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
-
-        for key, value in pitcher_data.items():
+        
+        # TODO: figure out how the pitcher names need to be looked up (reversed, using spaces or underscores? ascii or utf8?)
+        for key, value in matchup_dict['pitchers'].get(pitcher_name.replace('_', ' '), {}).items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
-
+        
         pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Stuff+ Stats")
         pitcher_stats_frame.pack(expand=True, fill="both", side="top", anchor="sw")
 
@@ -84,7 +87,8 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
         images_frame = Frame(pitcher_stats_frame)
         images_frame.pack(side="top", fill="x", padx=2, pady=2)
-        pitchername_reformatted = "_".join(pitcher_name.split(", ")[::-1])  # have to re-reverse the name
+        
+        pitchername_reformatted = "_".join(pitcher_name.split(", "))  # name is already reversed
         load_images(pitchername_reformatted, images_frame)
 
         # scraped data with colored labels
@@ -145,7 +149,7 @@ def Fillout_BP_Frame(parent_frame, possible_files: dict):
 
 
 def CreateTabLayoutCustom(matchupframe, matchup_dict):
-    bullpen_dir = GetFilepath('bullpen_stats', '').parent
+    bullpen_dir = penski.GetFilepath('bullpen_stats', '').parent
     bullpen_files = bullpen_dir.glob("*bullpen_stats*.csv")
 
     def GetTeamname(filepath: pathlib.Path):
@@ -183,7 +187,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 stringvar.set(selection)
                 formatted_name = selection.strip().replace(' ', '_')
                 possible_files = {
-                    BPstat_type: GetFilepath(BPstat_type, formatted_name, append_date=False)
+                    BPstat_type: penski.GetFilepath(BPstat_type, formatted_name, append_date=False)
                     for BPstat_type in ('adv_traits', 'splits_stats')
                 }
                 for widget in target_frame.winfo_children():
@@ -281,10 +285,11 @@ def Main():
     PPFrame.DownloadButtonHook = lambda a, b: (
         CreateTabLayoutLambda(a, b, dataframe)
     )
-
-
-
+    
     toplevel.mainloop()
+    return
+
 
 if __name__ == "__main__":
+    #penski.Main()  # acquire the CSVs for bullpen data (MLBstats/BPdata)
     Main()
