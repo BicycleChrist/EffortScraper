@@ -1,5 +1,4 @@
-import os
-import time
+import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -17,36 +16,41 @@ firefox_profile = FirefoxProfile()  # Not necessary
 options.profile = firefox_profile
 
 
-def scrape(name, player_id, take_screenshots=False):
+def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
+    print(f"\nscraping {name}: {player_id}")
+    if player_id is None:
+        print("aborting scrape: you fucked up the player_id")
+        return {}
     driver = webdriver.Firefox(options=options)
     base_url = "https://baseballsavant.mlb.com/savant-player/"
 
     player_name_url_part = name.lower().replace(' ', '-').replace(',', '')
     url = f"{base_url}{player_name_url_part}-{player_id}?stats=statcast-r-pitching-mlb"
+    driver.get(url)
     
     scraped_data = {}
-    
     try:
-        driver.get(url)
+        
         if take_screenshots:
-            pitch_distribution_svg = WebDriverWait(driver, 20).until(
+            pitch_distribution = WebDriverWait(driver, 5).until(
                 EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
             )
-            trending_div = WebDriverWait(driver, 20).until(
+            trending_div = WebDriverWait(driver, 5).until(
                 EC.visibility_of_element_located((By.ID, 'trending'))
             )
+            
+            cwd = pathlib.Path.cwd()
+            for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
+                filepath = cwd / "MLBstats" / f"{name.replace(', ', '_')}_{purpose}.png"
+                element.screenshot(filepath)
+                print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
+    except TimeoutException:
+        print(f"TimeoutException: Elements not found for player {name}.")
     
-            svg_filename = os.path.join('MLBstats', f"{name.replace(', ', '_')}_pitch_distribution_svg.png")
-            pitch_distribution_svg.screenshot(svg_filename)
-    
-            trending_filename = os.path.join('MLBstats', f"{name.replace(', ', '_')}_trending_div.png")
-            trending_div.screenshot(trending_filename)
-            print(f"Screenshots for {name} taken and saved as {svg_filename} and {trending_filename}.")
-        
-        
+    try:
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
         pitching_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitching')
-
+    
         for group in pitcher_value_groups + pitching_groups:
             metrics = group.find_elements(By.CSS_SELECTOR, 'g.metric')
             for metric in metrics:
@@ -57,9 +61,8 @@ def scrape(name, player_id, take_screenshots=False):
                 scraped_data[header] = {'value': value, 'stat': stat_text}
         
         print(f"Scraped data for {name}: {scraped_data}")
-    
-    except TimeoutException:
-        print(f"TimeoutException: Elements not found for player {name}.")
+    except Exception as E:
+        print(f"exception: {E}\n")
     finally:
         driver.quit()
     
@@ -85,3 +88,5 @@ if __name__ == "__main__":
     test_name, id = list(BBSplayer_ids.pitchers.items())[0]
     results = scrape(test_name, id, False)
     print(len(results))
+    DDOS_the_site()
+

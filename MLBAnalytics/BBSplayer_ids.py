@@ -1217,3 +1217,12 @@ pitchers = {
     "Hudson, Bryan": 663542,
     "McFarland, T.J.": 519008,
 }
+
+
+# convert names from other formats
+def LookupPitcher(namewithspaces, reverseOrder: bool = False):
+    sections = namewithspaces.split(" ")
+    if reverseOrder:
+        sections = sections[::-1]
+    newname = ", ".join(sections)  # replaces commas with underscores
+    return newname, pitchers[newname]

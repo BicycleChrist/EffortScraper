@@ -7,47 +7,41 @@ from tkinter import ttk
 from ProbablePitchersFrame import PPFrameT
 from DmNotebook import DmNotebookT
 from stuffsuck import get_pitching_data
-from BBSplayer_ids import pitchers
+import BBSplayer_ids
 from penski import GetFilepath
 import pathlib
-from pathlib import Path
 from PIL import Image, ImageTk
-from BBSavant_statcast import scrape
+import BBSavant_statcast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
 #TODO: Boost scraping speed
 #BBS scrape takes all damn day, must be miffing it via iterating through too much stuff or jenk threading implementation
 
+
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
-    formatted_pitcher_names = {}
+    print(starting_pitcher_names)
+    
     pitcher_id_map = {}
-
-    def fetch_pitcher_data(name, player_id):
-        return (name, scrape(name, player_id))
-
-    # Pre-process names and construct URLs
     for name in starting_pitcher_names:
-        last_first_name = ", ".join(name.split()[::-1])
-        formatted_pitcher_names[name] = last_first_name
-        player_id = pitchers.get(last_first_name)
-        pitcher_id_map[last_first_name] = player_id
-
-    # Concurrently fetch all data
+        newname, pitcherid = BBSplayer_ids.LookupPitcher(name, reverseOrder=True)
+        pitcher_id_map[newname] = pitcherid
+    
+    # newname = "_".join(inputname.split(", "))  # replaces commas with underscores
+    # reversedname = "_".join(inputname.split(", ")[::-1])
+    
+    pitcher_data_results = {}
     with ThreadPoolExecutor() as executor:
-        future_to_name = {
-            executor.submit(fetch_pitcher_data, name, pitcher_id_map[name]): name
-            for name in pitcher_id_map if pitcher_id_map[name] is not None
+        futures = {
+            executor.submit(BBSavant_statcast.scrape, pitchername, player_id, False): pitchername
+            for pitchername, player_id in pitcher_id_map.items()
         }
-        pitcher_data_results = {}
-        for future in as_completed(future_to_name):
-            try:
-                name, pitcher_data = future.result()
-                pitcher_data_results[name] = pitcher_data
-            except Exception as e:
-                print(f"Error fetching data for {future_to_name[future]}: {e}")
-
+        pitcher_data_results = { 
+            pitchername: future.result() 
+            for future, pitchername in futures.items() 
+        }
+    
     # Filter the dataframe for starting pitchers
     filtered_df = dataframe[dataframe['Name'].isin(starting_pitcher_names)]
     pitcher_data_map = {row['Name']: row for index, row in filtered_df.iterrows()}
@@ -69,14 +63,11 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         else:
             return "#000000"  # Black
 
-    for pitcher_name, pitcher_dict in matchup_dict['pitchers'].items():
-        last_first_name = ", ".join(pitcher_name.split()[::-1])
-        pitcher_data = pitcher_data_results.get(last_first_name, {})
-
+    for pitcher_name, pitcher_data in pitcher_data_results.items():
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
 
-        for key, value in pitcher_dict.items():
+        for key, value in pitcher_data.items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
 
@@ -93,35 +84,8 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
         images_frame = Frame(pitcher_stats_frame)
         images_frame.pack(side="top", fill="x", padx=2, pady=2)
-
-        try:
-            lastname, firstname = pitcher_name.split()
-            img1_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_trending_div.png"
-            img2_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_pitch_distribution_svg.png"
-
-            if not img1_path.exists():
-                print(f"Image not found: {img1_path}")
-                raise FileNotFoundError(f"Image not found: {img1_path}")
-            if not img2_path.exists():
-                print(f"Image not found: {img2_path}")
-                raise FileNotFoundError(f"Image not found: {img2_path}")
-
-            img1 = Image.open(img1_path)
-            img2 = Image.open(img2_path)
-
-            img1 = ImageTk.PhotoImage(img1)
-            img2 = ImageTk.PhotoImage(img2)
-
-            label1 = Label(images_frame, image=img1)
-            label2 = Label(images_frame, image=img2)
-
-            label1.image = img1
-            label2.image = img2
-
-            label1.pack(side="left", anchor="w", padx=1, pady=1)
-            label2.pack(side="left", anchor="w", padx=1, pady=1)
-        except Exception as e:
-            print(f"Error loading images: {e}")
+        pitchername_reformatted = "_".join(pitcher_name.split(", ")[::-1])  # have to re-reverse the name
+        load_images(pitchername_reformatted, images_frame)
 
         # scraped data with colored labels
         scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Statcast Stats")
@@ -227,9 +191,8 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 Fillout_BP_Frame(target_frame, possible_files)
 
                 # Load images
-                lastname, firstname = selection.split()
-                load_images(lastname, firstname, target_frame)
-
+                load_images(selection, target_frame)
+                
                 return
 
             dropdown = ttk.OptionMenu(bullpen_frame, default_text, f"{team_name} Adv BP stats", *pitcher_names, command=DropdownCallback)
@@ -249,10 +212,11 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
 
     return
 
-def load_images(lastname, firstname, frame):
+
+def load_images(pitchername, frame):
     try:
-        img1_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_trending_div.png"
-        img2_path = Path.cwd() / "MLBstats" / f"{firstname}_{lastname}_pitch_distribution_svg.png"
+        img1_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_trending_div.png"
+        img2_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_pitch_distribution.png"
 
         if not img1_path.exists():
             print(f"Image not found: {img1_path}")
@@ -277,6 +241,8 @@ def load_images(lastname, firstname, frame):
         label2.pack(side="right", anchor="w", padx=3, pady=2)
     except Exception as e:
         print(f"Error loading images: {e}")
+    return
+    
 
 def Main():
     toplevel = tkinter.Tk()
