@@ -25,6 +25,10 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
     pitcher_id_map = {}
     for name in starting_pitcher_names:
+        if name == 'TBD':
+            pitcher_id_map[name] = None
+            continue
+
         try:
             newname, pitcherid = BBSplayer_ids.LookupPitcher(name, reverseOrder=True)
             pitcher_id_map[newname] = pitcherid
@@ -36,7 +40,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
     with ThreadPoolExecutor() as executor:
         futures = {
             executor.submit(BBSavant_statcast.scrape, pitchername, player_id, True): pitchername
-            for pitchername, player_id in pitcher_id_map.items()
+            for pitchername, player_id in pitcher_id_map.items() if player_id is not None
         }
         pitcher_data_results = {
             pitchername: future.result()
@@ -62,7 +66,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             elif 50 < value < 80:
                 return "#027C5E"
         except ValueError:
-            return "#000000" 
+            return "#000000"
 
     for reversed_pitcher_name, pitcher_data in pitcher_data_results.items():
         pitcher_name = "_".join(reversed_pitcher_name.split(", ")[::-1])
@@ -88,7 +92,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         images_frame = Frame(pitcher_stats_frame)
         images_frame.pack(side="top", fill="x", padx=2, pady=2)
 
-        pitchername_reformatted = "_".join(pitcher_name.split(", ")) 
+        pitchername_reformatted = "_".join(pitcher_name.split(", "))
         load_images(pitchername_reformatted, images_frame)
 
         scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Statcast Stats")
@@ -104,7 +108,17 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             stat_value_label = ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10))
             stat_value_label.pack(anchor="w", padx=10, pady=2)
 
+    # Handle 'TBD' pitchers
+    for name in starting_pitcher_names:
+        if name == 'TBD':
+            pitcher_frame = ttk.LabelFrame(matchupframe, text='TBD')
+            pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
+
+            textbox = ttk.Label(master=pitcher_frame, text="The starter has not been decided yet.", font=('Helvetica', 25))
+            textbox.pack(expand=True, fill="both", side="top", anchor="nw")
+
     return
+
 
 
 
@@ -249,8 +263,8 @@ def load_images(pitchername, frame):
         label1.image = img1
         label2.image = img2
 
-        label1.pack(side="left", anchor="e", padx=3, pady=2)
-        label2.pack(side="right", anchor="w", padx=3, pady=2)
+        label1.pack(side="left", anchor="e", padx=1, pady=2)
+        label2.pack(side="right", anchor="w", padx=1, pady=2)
     except Exception as e:
         print(f"Error loading images: {e}")
     return
