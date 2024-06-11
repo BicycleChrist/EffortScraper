@@ -1,6 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
-import threading
+import concurrent.futures
 
 # TODO: Ignore links that don't lead to a stream, output is far greater than needed
 # I.E https://buffstreams.ai/soccer or https://the.streameast.app/team/anaheim-ducks
@@ -57,13 +57,10 @@ def parse_url(url):
 
 
 def parse_urls(urls):
-    threads = []
-    for url in urls:
-        thread = threading.Thread(target=parse_url, args=(url,))
-        thread.start()
-        threads.append(thread)
-    for thread in threads:
-        thread.join()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=None) as executor:
+        futures = [executor.submit(parse_url, url) for url in urls]
+        for future in concurrent.futures.as_completed(futures):
+            pass
 
 
 if __name__ == "__main__":

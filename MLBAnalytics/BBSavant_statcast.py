@@ -42,15 +42,13 @@ def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
             cwd = pathlib.Path.cwd()
             for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
                 filepath = cwd / "MLBstats" / f"{name.replace(', ', '_')}_{purpose}.png"
-                element.screenshot(filepath)
+                element.screenshot(str(filepath))
                 print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
     except TimeoutException:
         print(f"TimeoutException: Elements not found for player {name}.")
-    
-    try:
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
         pitching_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitching')
-    
+        
         for group in pitcher_value_groups + pitching_groups:
             metrics = group.find_elements(By.CSS_SELECTOR, 'g.metric')
             for metric in metrics:
@@ -61,8 +59,6 @@ def scrape(name: str, player_id, take_screenshots:bool=False) -> dict:
                 scraped_data[header] = {'value': value, 'stat': stat_text}
         
         print(f"Scraped data for {name}: {scraped_data}")
-    except Exception as E:
-        print(f"exception: {E}\n")
     finally:
         driver.quit()
     
@@ -88,5 +84,3 @@ if __name__ == "__main__":
     test_name, id = list(BBSplayer_ids.pitchers.items())[0]
     results = scrape(test_name, id, False)
     print(len(results))
-    DDOS_the_site()
-

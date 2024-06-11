@@ -12,6 +12,7 @@ from penski import GetFilepath
 import pathlib
 from pathlib import Path
 from PIL import Image, ImageTk
+from BBSavant_statcast import scrape
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
 
@@ -34,10 +35,11 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         'Stf+ SL', 'Stf+ CU', 'Stf+ CH', 'Stf+ KC', 'Stf+ FO',
         'Stuff+', 'Location+', 'Pitching+'
     ]
-
+    
     for pitcher_name, pitcher_dict in matchup_dict['pitchers'].items():
         pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
+        
         for key, value in pitcher_dict.items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
@@ -261,6 +263,8 @@ def Main():
     PPFrame.DownloadButtonHook = lambda a, b: (
         CreateTabLayoutLambda(a, b, dataframe)
     )
+
+
 
     toplevel.mainloop()
 
