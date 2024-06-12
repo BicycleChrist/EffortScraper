@@ -4,12 +4,25 @@ import pprint
 
 from daily_lineups import GetPage
 
-
 def FetchProbablePitchers() -> BeautifulSoup | None:
     url = 'https://www.mlb.com/probable-pitchers'
     soup = GetPage(url)
     return soup
 
+
+def ReformatPitcherNames(pitcher_names):
+    """
+    Reformat a list of pitcher names from "Firstname Lastname" to "Lastname, Firstname".
+    """
+    formatted_pitchers = []
+    for name in pitcher_names:
+        parts = name.split()
+        if len(parts) == 2:
+            formatted_name = f"{parts[1]}, {parts[0]}"
+        else:
+            formatted_name = name  # handle cases where the name doesn't split into two parts
+        formatted_pitchers.append(formatted_name)
+    return formatted_pitchers
 
 def ParseProbablePitchers(soup):
     main_content = soup.find('main').find('div', class_="container").extract()
@@ -59,10 +72,6 @@ def ParseProbablePitchers(soup):
             "pitchers": {},
         }
         GRABATTR(matchup, "gamepk", matchup_dict)
-
-        # matchup has three subdivs: game, pitchers, and buttons (which doesn't matter)
-        # game = FIND(matchup, 'div', "game").extract()
-        # pitchers = FIND(matchup, 'div', "pitchers").extract()
 
         ### --- BEGIN: 'game' --- ###
         game = FIND(matchup, 'div', "game").extract()
@@ -121,9 +130,21 @@ def ParseProbablePitchers(soup):
     return all_data
 
 
+
 # TODO: save as json
 if __name__ == "__main__":
     soup = FetchProbablePitchers()
     if not soup: exit(1)
     pitcherData = ParseProbablePitchers(soup)
     pprint.pprint(pitcherData, indent=2)
+    
+    # Collect all pitcher names for reformatting
+    all_pitcher_names = []
+    for matchup in pitcherData["matchups"]:
+        all_pitcher_names.extend(matchup["pitchers"].keys())
+
+    # Reformat pitcher names
+    formatted_pitchers = ReformatPitcherNames(all_pitcher_names)
+    print("\nFormatted Pitcher Names:")
+    pprint.pprint(formatted_pitchers, indent=2)
+
