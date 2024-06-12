@@ -5,6 +5,7 @@ import tkinter
 from tkinter import *
 from tkinter import ttk
 from ProbablePitchersFrame import PPFrameT
+from ProbablePitchers import ReformatPitcherNames
 from DmNotebook import DmNotebookT
 from stuffsuck import get_pitching_data
 import BBSplayer_ids
@@ -12,6 +13,7 @@ import penski
 import pathlib
 from PIL import Image, ImageTk
 import BBSavant_statcast
+from BBSavant_statcast import scrape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
@@ -209,8 +211,23 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 Fillout_BP_Frame(target_frame, possible_files)
 
                 # Load images
-                load_images(selection, target_frame)
-                
+                firstname, lastname = selection.split()
+                reformatted_name = f"{firstname}_{lastname}" # Firstname Lastname is secretly Lastname Firstname in this instance...Magic
+                try:
+                    load_images(reformatted_name, target_frame)
+                except FileNotFoundError:
+                    # Scrape images if not found
+                    print(f"Images for {reformatted_name} not found. Attempting to scrape...")
+                    try:
+                        # Lookup pitcher ID
+                        pitcher_key, pitcher_id = BBSplayer_ids.LookupPitcher(selection, reverseOrder=True)
+                        # Perform the scrape
+                        scrape(selection, pitcher_id, True)
+                        # Attempt to load images again
+                        load_images(reformatted_name, target_frame)
+                    except Exception as e:
+                        print(f"Error scraping images for {reformatted_name}: {e}")
+
                 return
 
             dropdown = ttk.OptionMenu(bullpen_frame, default_text, f"{team_name} Adv BP stats", *pitcher_names, command=DropdownCallback)
@@ -229,6 +246,8 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 bullpen_treeview.insert("", "end", values=values)
 
     return
+
+
 
 
 def load_images(pitchername, frame):
@@ -264,7 +283,7 @@ def load_images(pitchername, frame):
         label2.image = img2
 
         label1.pack(side="left", anchor="e", padx=1, pady=2)
-        label2.pack(side="right", anchor="w", padx=1, pady=2)
+        label2.pack(side="left", anchor="w", padx=1, pady=2)
     except Exception as e:
         print(f"Error loading images: {e}")
     return
