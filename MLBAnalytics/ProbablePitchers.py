@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import pprint
-
+from BBSavant_statcast import  scrape
 from daily_lineups import GetPage
 
 def FetchProbablePitchers() -> BeautifulSoup | None:
@@ -147,4 +147,4 @@ if __name__ == "__main__":
     formatted_pitchers = ReformatPitcherNames(all_pitcher_names)
     print("\nFormatted Pitcher Names:")
     pprint.pprint(formatted_pitchers, indent=2)
-
+    

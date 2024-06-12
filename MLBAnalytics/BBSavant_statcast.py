@@ -31,18 +31,30 @@ def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
     scraped_data = {}
     try:
         if take_screenshots:
-            pitch_distribution = WebDriverWait(driver, 5).until(
-                EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
-            )
-            trending_div = WebDriverWait(driver, 5).until(
-                EC.visibility_of_element_located((By.ID, 'trending'))
-            )
+            try:
+                pitch_distribution = WebDriverWait(driver, 5).until(
+                    EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
+                )
+            except TimeoutException:
+                print("Pitch distribution element not found within 5 seconds.")
+                pitch_distribution = None
+
+            try:
+                trending_div = WebDriverWait(driver, 5).until(
+                    EC.visibility_of_element_located((By.ID, 'trending'))
+                )
+            except TimeoutException:
+                print("Trending div element not found within 5 seconds.")
+                trending_div = None
 
             cwd = pathlib.Path.cwd()
             for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
-                filepath = cwd / "MLBstats" / f"{name.replace(', ', '_')}_{purpose}.png"
-                element.screenshot(str(filepath))
-                print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
+                if element is not None:
+                    filepath = cwd / "MLBstats" / f"{name.replace(', ', '_')}_{purpose}.png"
+                    element.screenshot(str(filepath))
+                    print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
+                else:
+                    print(f"No screenshot taken for {purpose} as element was not found.")
 
         
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
@@ -85,4 +97,6 @@ def DDOS_the_site():
 if __name__ == "__main__":
     test_name, id = list(BBSplayer_ids.pitchers.items())[0]
     results = scrape(test_name, id, False)
+    DDOS_the_site()
     print(len(results))
+

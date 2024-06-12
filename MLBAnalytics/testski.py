@@ -5,7 +5,7 @@ import tkinter
 from tkinter import *
 from tkinter import ttk
 from ProbablePitchersFrame import PPFrameT
-from ProbablePitchers import ReformatPitcherNames
+from ProbablePitchers import *
 from DmNotebook import DmNotebookT
 from stuffsuck import get_pitching_data
 import BBSplayer_ids
@@ -39,7 +39,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             continue
 
     pitcher_data_results = {}
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=None) as executor:
         futures = {
             executor.submit(BBSavant_statcast.scrape, pitchername, player_id, True): pitchername
             for pitchername, player_id in pitcher_id_map.items() if player_id is not None
@@ -109,6 +109,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
             stat_value_label = ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10))
             stat_value_label.pack(anchor="w", padx=10, pady=2)
+            
 
     # Handle 'TBD' pitchers
     for name in starting_pitcher_names:
@@ -308,6 +309,7 @@ def Main():
         canvas.configure(scrollregion=canvas.bbox("all"))
 
     frame.bind("<Configure>", on_frame_configure)
+
     def _on_mousewheel(event):
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     # Windows and MacOS bindings for the mouse wheel
@@ -319,7 +321,8 @@ def Main():
     PPFrame = PPFrameT(master=frame)
     PPFrame.pack(expand=False, side="left")
 
-    dataframe = get_pitching_data() # DON'T CALL THIS INLINE IN THE LAMBDA!!!!!! It will re-download EVERY ITERATION!
+    dataframe = get_pitching_data()  # DON'T CALL THIS INLINE IN THE LAMBDA!!!!!! It will re-download EVERY ITERATION!
+
     def CreateTabLayoutLambda(matchupframe, matchupdict, dataframe):
         CreateTabLayoutCustom(matchupframe, matchupdict)
         FilloutStartingPitchers(matchupframe, matchupdict, dataframe)
@@ -327,11 +330,12 @@ def Main():
     PPFrame.DownloadButtonHook = lambda a, b: (
         CreateTabLayoutLambda(a, b, dataframe)
     )
-    
+
     toplevel.mainloop()
     return
 
 
 if __name__ == "__main__":
-    #penski.Main()  # acquire the CSVs for bullpen data (MLBstats/BPdata)
     Main()
+    
+    
