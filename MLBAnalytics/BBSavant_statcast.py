@@ -8,7 +8,7 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-import BBSplayer_ids  # Assuming the file is in the same directory
+import BBSplayer_ids 
 
 options = FirefoxOptions()
 options.add_argument('--headless')

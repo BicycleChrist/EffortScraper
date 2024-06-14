@@ -17,8 +17,7 @@ from BBSavant_statcast import scrape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
-#TODO: Boost scraping speed
-#BBS scrape takes all damn day, must be miffing it via iterating through too much stuff or jenk threading implementation
+#TODO: Properly integrate data from parallel BBS scrape within ProbablePitchers into GUI
 
 
 def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
@@ -121,9 +120,6 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
 
     return
-
-
-
 
 
 
@@ -337,5 +333,5 @@ def Main():
 
 if __name__ == "__main__":
     Main()
-    
+    #scrape_pitcher_data() # Just gotta get this in there
     

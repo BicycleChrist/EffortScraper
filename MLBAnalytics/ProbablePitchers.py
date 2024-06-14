@@ -6,16 +6,15 @@ from BBSavant_statcast import scrape
 from daily_lineups import GetPage
 from BBSplayer_ids import pitchers  # Import the pitchers dictionary
 
+# global variable to store pitcher data results, probably a dumb idea 
+_pitcher_data_results = None
+
 def FetchProbablePitchers() -> BeautifulSoup | None:
     url = 'https://www.mlb.com/probable-pitchers'
     soup = GetPage(url)
     return soup
 
 def ReformatPitcherNames(pitcher_names):
-    """
-    Reformat a list of pitcher names from "Firstname Lastname" to "Lastname, Firstname",
-    and perform a lookup to get the respective player IDs.
-    """
     formatted_pitchers = {}
     for name in pitcher_names:
         parts = name.split()
@@ -48,15 +47,13 @@ def ParseProbablePitchers(soup):
             kwargs.update({"class_": f'{classPrefix + class_string}'})
         return soupvar.find_all(html_tag, **kwargs)
 
-    # this one makes it easier to grab an attribute from an element. All attributes start with 'data-'
-    # returns a dict. If you pass a dict (into_dict), it'll be updated with the result
     def GRABATTR(soupvar, attr_name: str, into_dict: dict | None = None):
         newdict: dict = {attr_name: soupvar.attrs[f"data-{attr_name}"]}
         if into_dict is not None: into_dict.update(newdict)
         return newdict
 
     main_content = FIND(main_content, 'div', "container").extract()
-    del soup  # throw away the rest of the page
+    del soup
 
     all_data = {}
     matchups = FINDALL(main_content, 'div', 'matchup')
@@ -108,13 +105,8 @@ def ParseProbablePitchers(soup):
         matchup_dict["title"] = f"{matchup_dict['teams']['away']['name']} vs " \
                                 f"{matchup_dict['teams']['home']['name']}"
 
-        ### --- END OF 'game' DIV --- ###
-        ### --- BEGIN: 'pitchers' --- ###
         pitchers = FIND(matchup, 'div', "pitchers").extract()
         pitcher_summaries = FINDALL(pitchers, 'div', 'pitcher-summary')
-        pitcher_stats = FIND(pitchers, 'div', "stats")
-        # TODO: stats
-        # TODO: associate pitchers with teams (this info can ONLY be found under the hidden pitcher__stats-header??)
 
         pitcher_dict = {}
         for summary in pitcher_summaries:
@@ -128,33 +120,32 @@ def ParseProbablePitchers(soup):
             player_dict = pitcher_dict[name] = {}
             spans = FINDALL(summary, 'span')
             for span in spans:
-                # attrs always returns a list, but we only expect one class, so we immediately get [0]
                 span_key = span.attrs["class"][0].removeprefix(f"{classPrefix}pitcher-")
                 span_val = span.text.strip()
                 player_dict[span_key] = span_val
 
         matchup_dict["pitchers"] = pitcher_dict
         all_data["matchups"].append(matchup_dict)
-    # END OF MATCHUP LOOP #
     return all_data
 
-# TODO: save as json
-if __name__ == "__main__":
+def scrape_pitcher_data():
+    global _pitcher_data_results
+    if _pitcher_data_results is not None:
+        return _pitcher_data_results
+    
     soup = FetchProbablePitchers()
-    if not soup: exit(1)
+    if not soup:
+        return None
     pitcherData = ParseProbablePitchers(soup)
-    print("\nParsed Pitcher Data:")
-    pprint.pprint(pitcherData, indent=2)
+    #print("\nParsed Pitcher Data:")
+    #pprint.pprint(pitcherData, indent=2)
 
-    # Collect all pitcher names for reformatting
     all_pitcher_names = []
     for matchup in pitcherData["matchups"]:
         all_pitcher_names.extend(matchup["pitchers"].keys())
 
-    # Reformat pitcher names and perform lookup
     formatted_pitcher_id_map = ReformatPitcherNames(all_pitcher_names)
 
-    # Parallel scraping
     pitcher_data_results = {}
     with ThreadPoolExecutor(max_workers=None) as executor:
         futures = {
@@ -168,7 +159,10 @@ if __name__ == "__main__":
 
     print("\nPitcher Data Results:")
     pprint.pprint(pitcher_data_results, indent=2)
+    _pitcher_data_results = pitcher_data_results
+    return _pitcher_data_results
 
-    # The rest of your logic to process and display the scraped data
+if __name__ == "__main__":
+    scrape_pitcher_data()
 
-    
+
