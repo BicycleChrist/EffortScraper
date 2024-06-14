@@ -1,27 +1,36 @@
 import requests
 from bs4 import BeautifulSoup
 import pprint
-from BBSavant_statcast import  scrape
+from concurrent.futures import ThreadPoolExecutor
+from BBSavant_statcast import scrape
 from daily_lineups import GetPage
+from BBSplayer_ids import pitchers  # Import the pitchers dictionary
 
 def FetchProbablePitchers() -> BeautifulSoup | None:
     url = 'https://www.mlb.com/probable-pitchers'
     soup = GetPage(url)
     return soup
 
-
 def ReformatPitcherNames(pitcher_names):
     """
-    Reformat a list of pitcher names from "Firstname Lastname" to "Lastname, Firstname".
+    Reformat a list of pitcher names from "Firstname Lastname" to "Lastname, Firstname",
+    and perform a lookup to get the respective player IDs.
     """
-    formatted_pitchers = []
+    formatted_pitchers = {}
     for name in pitcher_names:
         parts = name.split()
         if len(parts) == 2:
             formatted_name = f"{parts[1]}, {parts[0]}"
         else:
             formatted_name = name  # handle cases where the name doesn't split into two parts
-        formatted_pitchers.append(formatted_name)
+
+        # Perform lookup in the pitchers dictionary
+        player_id = pitchers.get(formatted_name)
+        if player_id:
+            formatted_pitchers[formatted_name] = player_id
+        else:
+            formatted_pitchers[formatted_name] = None  # handle cases where ID is not found
+
     return formatted_pitchers
 
 def ParseProbablePitchers(soup):
@@ -129,22 +138,37 @@ def ParseProbablePitchers(soup):
     # END OF MATCHUP LOOP #
     return all_data
 
-
-
 # TODO: save as json
 if __name__ == "__main__":
     soup = FetchProbablePitchers()
     if not soup: exit(1)
     pitcherData = ParseProbablePitchers(soup)
+    print("\nParsed Pitcher Data:")
     pprint.pprint(pitcherData, indent=2)
-    
+
     # Collect all pitcher names for reformatting
     all_pitcher_names = []
     for matchup in pitcherData["matchups"]:
         all_pitcher_names.extend(matchup["pitchers"].keys())
 
-    # Reformat pitcher names
-    formatted_pitchers = ReformatPitcherNames(all_pitcher_names)
-    print("\nFormatted Pitcher Names:")
-    pprint.pprint(formatted_pitchers, indent=2)
+    # Reformat pitcher names and perform lookup
+    formatted_pitcher_id_map = ReformatPitcherNames(all_pitcher_names)
+
+    # Parallel scraping
+    pitcher_data_results = {}
+    with ThreadPoolExecutor(max_workers=None) as executor:
+        futures = {
+            executor.submit(scrape, pitcher_name, player_id, True): pitcher_name
+            for pitcher_name, player_id in formatted_pitcher_id_map.items() if player_id is not None
+        }
+        pitcher_data_results = {
+            pitcher_name: future.result()
+            for future, pitcher_name in futures.items()
+        }
+
+    print("\nPitcher Data Results:")
+    pprint.pprint(pitcher_data_results, indent=2)
+
+    # The rest of your logic to process and display the scraped data
+
     
