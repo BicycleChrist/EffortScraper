@@ -4,7 +4,7 @@ import pprint
 from concurrent.futures import ThreadPoolExecutor
 from BBSavant_statcast import scrape
 from daily_lineups import GetPage
-from BBSplayer_ids import pitchers  # Import the pitchers dictionary
+from BBSplayer_ids import pitchers,Nonascii_Remap, LookupPitcher  # Import the pitchers dictionary
 
 # global variable to store pitcher data results, probably a dumb idea 
 _pitcher_data_results = None
@@ -25,10 +25,14 @@ def ReformatPitcherNames(pitcher_names):
 
         # Perform lookup in the pitchers dictionary
         player_id = pitchers.get(formatted_name)
-        if player_id:
-            formatted_pitchers[formatted_name] = player_id
-        else:
-            formatted_pitchers[formatted_name] = None  # handle cases where ID is not found
+        
+        if player_id is None:
+            # If not found, lookup in the Nonascii_Remap dictionary and then in the pitchers dictionary
+            remapped_name = Nonascii_Remap.get(formatted_name)
+            if remapped_name:
+                player_id = pitchers.get(remapped_name)
+        
+        formatted_pitchers[formatted_name] = player_id
 
     return formatted_pitchers
 
