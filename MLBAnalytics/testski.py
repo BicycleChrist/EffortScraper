@@ -12,15 +12,27 @@ import BBSplayer_ids
 import penski
 import pathlib
 from PIL import Image, ImageTk
-import BBSavant_statcast
 from BBSavant_statcast import scrape
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
-#TODO: Properly integrate data from parallel BBS scrape within ProbablePitchers into GUI
 
 
-def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
+def get_color(value: int) -> str:
+    try:
+        value = int(value)
+        if value >= 80:
+            return "#FF0000"
+        elif value <= 50:
+            return "#0000FF"
+        elif 50 < value < 80:
+            return "#027C5E"
+    except ValueError:
+        return "#000000"
+    return "#000000"
+
+
+def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe, statcast_bullshit):
     starting_pitcher_names = list(matchup_dict['pitchers'].keys())
     print(starting_pitcher_names)
 
@@ -37,17 +49,6 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
             print(f"KeyError: {e} - Pitcher name {name} not found in the dictionary. Skipping this pitcher.")
             continue
 
-    pitcher_data_results = {}
-    with ThreadPoolExecutor(max_workers=None) as executor:
-        futures = {
-            executor.submit(BBSavant_statcast.scrape, pitchername, player_id, True): pitchername
-            for pitchername, player_id in pitcher_id_map.items() if player_id is not None
-        }
-        pitcher_data_results = {
-            pitchername: future.result()
-            for future, pitchername in futures.items()
-        }
-
     filtered_df = dataframe[dataframe['Name'].isin(starting_pitcher_names)]
     pitcher_data_map = {row['Name']: row for index, row in filtered_df.iterrows()}
 
@@ -56,30 +57,18 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         'Stf+ SL', 'Stf+ CU', 'Stf+ CH', 'Stf+ KC', 'Stf+ FO',
         'Stuff+', 'Location+', 'Pitching+'
     ]
-
-    def get_color(value):
-        try:
-            value = int(value)
-            if value >= 80:
-                return "#FF0000"
-            elif value <= 50:
-                return "#0000FF"
-            elif 50 < value < 80:
-                return "#027C5E"
-        except ValueError:
-            return "#000000"
-
-    for reversed_pitcher_name, pitcher_data in pitcher_data_results.items():
-        pitcher_name = "_".join(reversed_pitcher_name.split(", ")[::-1])
-        pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
+    
+    for reversed_pitcher_name, pitcher_data in matchup_dict["pitchers"].items():
+        pitcher_frame = ttk.LabelFrame(matchupframe, text=reversed_pitcher_name)
         pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
-
+        
+        # unreversed
         spaced_pitcher_name = " ".join(reversed_pitcher_name.split(", ")[::-1])
         for key, value in matchup_dict['pitchers'].get(spaced_pitcher_name, {}).items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
             textbox.pack(expand=True, fill="both", side="top", anchor="nw")
-
-        pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Stuff+ Stats")
+        
+        pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{spaced_pitcher_name} Stuff+ Stats")
         pitcher_stats_frame.pack(expand=True, fill="both", side="top", anchor="sw")
 
         stats_frame = Frame(pitcher_stats_frame)
@@ -93,13 +82,21 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         images_frame = Frame(pitcher_stats_frame)
         images_frame.pack(side="top", fill="x", padx=2, pady=2)
 
-        pitchername_reformatted = "_".join(pitcher_name.split(", "))
+        pitchername_reformatted = "_".join(reversed(spaced_pitcher_name.split(" ")))
         load_images(pitchername_reformatted, images_frame)
 
-        scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Statcast Stats")
+        scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{spaced_pitcher_name} Statcast Stats")
         scraped_data_frame.pack(expand=True, fill="both", side="top", padx=5, pady=5)
-
-        for key, value in pitcher_data.items():
+        
+        unreversed_pitcher_name_with_comma = ", ".join(reversed(reversed_pitcher_name.split(" ")))
+        if not unreversed_pitcher_name_with_comma in statcast_bullshit.keys():
+            print(f"no statcast data for {unreversed_pitcher_name_with_comma}")
+            continue
+        
+        statcast_dict = statcast_bullshit[unreversed_pitcher_name_with_comma]
+        
+        # statcast stuff
+        for key, value in statcast_dict.items():
             stat_label = ttk.Label(scraped_data_frame, text=f"{key}:", font=('Helvetica', 10, 'bold'))
             stat_label.pack(anchor="w", padx=5, pady=2)
 
@@ -108,8 +105,7 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
 
             stat_value_label = ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10))
             stat_value_label.pack(anchor="w", padx=10, pady=2)
-            
-
+    
     # Handle 'TBD' pitchers
     for name in starting_pitcher_names:
         if name == 'TBD':
@@ -209,7 +205,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
 
                 # Load images
                 firstname, lastname = selection.split()
-                reformatted_name = f"{firstname}_{lastname}" # Firstname Lastname is secretly Lastname Firstname in this instance...Magic
+                reformatted_name = f"{lastname}_{firstname}"
                 try:
                     load_images(reformatted_name, target_frame)
                 except FileNotFoundError:
@@ -217,11 +213,9 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                     print(f"Images for {reformatted_name} not found. Attempting to scrape...")
                     try:
                         # Lookup pitcher ID
-                        pitcher_key, pitcher_id = BBSplayer_ids.LookupPitcher(selection, reverseOrder=True)
+                        pitcher_key, pitcher_id = BBSplayer_ids.LookupPitcher(selection, reverseOrder=False)
                         # Perform the scrape
                         scrape(selection, pitcher_id, True)
-                        # Attempt to load images again
-                        load_images(reformatted_name, target_frame)
                     except Exception as e:
                         print(f"Error scraping images for {reformatted_name}: {e}")
 
@@ -245,20 +239,10 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
     return
 
 
-
-
 def load_images(pitchername, frame):
     try:
-        # Correcting the reformatting of pitchername
-        # Split by underscore and reverse the order
-        reversed_name_parts = pitchername.split("_")
-        if len(reversed_name_parts) == 2:
-            corrected_pitchername = f"{reversed_name_parts[1]}_{reversed_name_parts[0]}"
-        else:
-            corrected_pitchername = pitchername
-
-        img1_path = pathlib.Path.cwd() / "MLBstats" / f"{corrected_pitchername}_trending_div.png"
-        img2_path = pathlib.Path.cwd() / "MLBstats" / f"{corrected_pitchername}_pitch_distribution.png"
+        img1_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_trending_div.png"
+        img2_path = pathlib.Path.cwd() / "MLBstats" / f"{pitchername}_pitch_distribution.png"
 
         if not img1_path.exists():
             print(f"Image not found: {img1_path}")
@@ -285,9 +269,10 @@ def load_images(pitchername, frame):
         print(f"Error loading images: {e}")
     return
 
-    
 
 def Main():
+    statcast_bullshit = scrape_pitcher_data()
+     
     toplevel = tkinter.Tk()
     toplevel.title("ProbablePitchers")
 
@@ -319,12 +304,12 @@ def Main():
 
     dataframe = get_pitching_data()  # DON'T CALL THIS INLINE IN THE LAMBDA!!!!!! It will re-download EVERY ITERATION!
 
-    def CreateTabLayoutLambda(matchupframe, matchupdict, dataframe):
+    def CreateTabLayoutLambda(matchupframe, matchupdict, dataframe, statcast_bullshit):
         CreateTabLayoutCustom(matchupframe, matchupdict)
-        FilloutStartingPitchers(matchupframe, matchupdict, dataframe)
+        FilloutStartingPitchers(matchupframe, matchupdict, dataframe, statcast_bullshit)
 
     PPFrame.DownloadButtonHook = lambda a, b: (
-        CreateTabLayoutLambda(a, b, dataframe)
+        CreateTabLayoutLambda(a, b, dataframe, statcast_bullshit)
     )
 
     toplevel.mainloop()
@@ -333,5 +318,3 @@ def Main():
 
 if __name__ == "__main__":
     Main()
-    #scrape_pitcher_data() # Just gotta get this in there
-    
