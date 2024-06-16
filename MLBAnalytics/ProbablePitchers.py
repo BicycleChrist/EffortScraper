@@ -1,40 +1,14 @@
-import requests
-from bs4 import BeautifulSoup
 import pprint
-from concurrent.futures import ThreadPoolExecutor
-from BBSavant_statcast import scrape
-from daily_lineups import GetPage
-from BBSplayer_ids import pitchers,Nonascii_Remap, LookupPitcher  # Import the pitchers dictionary
+from bs4 import BeautifulSoup
 
-# global variable to store pitcher data results, probably a dumb idea 
-_pitcher_data_results = None
+import daily_lineups # GetPage()
+
 
 def FetchProbablePitchers() -> BeautifulSoup | None:
     url = 'https://www.mlb.com/probable-pitchers'
-    soup = GetPage(url)
+    soup = daily_lineups.GetPage(url)
     return soup
 
-def ReformatPitcherNames(pitcher_names):
-    formatted_pitchers = {}
-    for name in pitcher_names:
-        parts = name.split()
-        if len(parts) == 2:
-            formatted_name = f"{parts[1]}, {parts[0]}"
-        else:
-            formatted_name = name  # handle cases where the name doesn't split into two parts
-
-        # Perform lookup in the pitchers dictionary
-        player_id = pitchers.get(formatted_name)
-        
-        if player_id is None:
-            # If not found, lookup in the Nonascii_Remap dictionary and then in the pitchers dictionary
-            remapped_name = Nonascii_Remap.get(formatted_name)
-            if remapped_name:
-                player_id = pitchers.get(remapped_name)
-        
-        formatted_pitchers[formatted_name] = player_id
-
-    return formatted_pitchers
 
 def ParseProbablePitchers(soup):
     main_content = soup.find('main').find('div', class_="container").extract()
@@ -132,41 +106,22 @@ def ParseProbablePitchers(soup):
         all_data["matchups"].append(matchup_dict)
     return all_data
 
-def scrape_pitcher_data():
-    global _pitcher_data_results
-    if _pitcher_data_results is not None:
-        return _pitcher_data_results
-    
+
+def ScrapeAllPitcherData(shouldPrint:bool = True) -> dict:
     soup = FetchProbablePitchers()
     if not soup:
-        return None
+        print("[ScrapePitcherData] WARNING: 'FetchProbablePitchers' appears to have failed.")
+        return {}
     pitcherData = ParseProbablePitchers(soup)
-    #print("\nParsed Pitcher Data:")
-    #pprint.pprint(pitcherData, indent=2)
+    
+    if shouldPrint: 
+        print("\nParsed Pitcher Data:")
+        pprint.pprint(pitcherData, indent=2)
+    
+    return pitcherData
 
-    all_pitcher_names = []
-    for matchup in pitcherData["matchups"]:
-        all_pitcher_names.extend(matchup["pitchers"].keys())
-
-    formatted_pitcher_id_map = ReformatPitcherNames(all_pitcher_names)
-
-    pitcher_data_results = {}
-    with ThreadPoolExecutor(max_workers=None) as executor:
-        futures = {
-            executor.submit(scrape, pitcher_name, player_id, True): pitcher_name
-            for pitcher_name, player_id in formatted_pitcher_id_map.items() if player_id is not None
-        }
-        pitcher_data_results = {
-            pitcher_name: future.result()
-            for future, pitcher_name in futures.items()
-        }
-
-    print("\nPitcher Data Results:")
-    pprint.pprint(pitcher_data_results, indent=2)
-    _pitcher_data_results = pitcher_data_results
-    return _pitcher_data_results
 
 if __name__ == "__main__":
-    scrape_pitcher_data()
-
-
+    print("ProbablePitchers")
+    results = ScrapeAllPitcherData(True)
+    pprint.pprint(results, indent=2)

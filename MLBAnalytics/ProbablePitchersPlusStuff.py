@@ -12,7 +12,7 @@ from penski import GetFilepath
 import pathlib
 from pathlib import Path
 from PIL import Image, ImageTk
-from BBSavant_statcast import scrape
+
 
 #TODO: Allow mouse wheel scrolling when not hovering over scrollbar
 

@@ -1,5 +1,6 @@
 import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -8,26 +9,39 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-import BBSplayer_ids 
 
-options = FirefoxOptions()
-options.add_argument('--headless')
-firefox_profile = FirefoxProfile()  # Not necessary
-options.profile = firefox_profile
+import BBSplayer_ids
 
 
-def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
-    print(f"\nscraping {name}: {player_id}")
-    if player_id is None:
-        print("aborting scrape: you fucked up the player_id")
-        return {}
-    driver = webdriver.Firefox(options=options)
+def ConstructURL(name: str, player_id:int) -> str:
     base_url = "https://baseballsavant.mlb.com/savant-player/"
-
+    
+    # TODO: make sure this is HTML safe (are periods safe? apostrophies could also be a problem)
     player_name_url_part = name.lower().replace(' ', '-').replace(',', '')
     url = f"{base_url}{player_name_url_part}-{player_id}?stats=statcast-r-pitching-mlb"
-    driver.get(url)
+    return url
 
+
+def StartDriver():
+    options = FirefoxOptions()
+    options.add_argument('--headless')
+    #firefox_profile = FirefoxProfile()  # Not necessary
+    #options.profile = firefox_profile
+    
+    driver = webdriver.Firefox(options=options)
+    return driver
+
+
+def Scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
+    print(f"\nscraping {name}: {player_id}")
+    #if player_id < 0:
+    if player_id < 100000: # seems like all players on the site have 6-digit IDs
+        print(f"aborting scrape: bad player_id: {player_id}")
+        return {}
+    
+    driver = StartDriver()
+    driver.get(ConstructURL(name, player_id))
+    
     scraped_data = {}
     try:
         if take_screenshots:
@@ -74,29 +88,28 @@ def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
         print(f"TimeoutException: Elements not found for player {name}.")
     finally:
         driver.quit()
-
+    
     return scraped_data
 
 
 
 def DDOS_the_site():
-    
-    with ThreadPoolExecutor(max_workers=24) as executor:
-        futures = {executor.submit(scrape, name, player_id, True): (name, player_id) for name, player_id in BBSplayer_ids.pitchers.items()}
-    
+    with ThreadPoolExecutor(max_workers=None) as executor:
+        futures = {executor.submit(Scrape, name, player_id, True): (name, player_id) for name, player_id in BBSplayer_ids.pitchers.items()}
         for future in as_completed(futures):
             name, player_id = futures[future]
             try:
-                future.result()
+                print(future.result())
             except Exception as exc:
                 print(f"An error occurred for player {name}: {exc}")
     
     print("All screenshots have been taken and data scraped.")
+    return
 
 
 if __name__ == "__main__":
-    test_name, id = list(BBSplayer_ids.pitchers.items())[0]
-    results = scrape(test_name, id, False)
-    DDOS_the_site()
+    test_name, player_id = list(BBSplayer_ids.pitchers.items())[0]
+    results = Scrape(test_name, player_id, False)
+    #DDOS_the_site()
     print(len(results))
-
+    print("plzdontexit")
