@@ -130,6 +130,7 @@ def ParseProbablePitchers(soup):
 
         matchup_dict["pitchers"] = pitcher_dict
         all_data["matchups"].append(matchup_dict)
+        print(matchup_dict)
     return all_data
 
 def scrape_pitcher_data():
@@ -168,5 +169,5 @@ def scrape_pitcher_data():
 
 if __name__ == "__main__":
     scrape_pitcher_data()
-
+    
 

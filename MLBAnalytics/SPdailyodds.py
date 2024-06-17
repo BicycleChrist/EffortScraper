@@ -2,6 +2,7 @@ import pprint
 from ProbablePitchers import FetchProbablePitchers, ParseProbablePitchers
 from bigBOVpoolskiMLB import Main as scrape_bigBOVpoolski_data
 #TODO: update import paths to just use bigBOVpoolski
+# Might be tough to format the output to be poperly used as it is now
 
 def get_pitcher_names_from_matchup_dict(matchup_dict):
     pitcher_names = []

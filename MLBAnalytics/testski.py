@@ -272,7 +272,8 @@ def load_images(pitchername, frame):
 
 def Main():
     statcast_bullshit = scrape_pitcher_data()
-     
+    print(f"\n\nfinished scrape with {len(statcast_bullshit)} entries\n\n")
+    
     toplevel = tkinter.Tk()
     toplevel.title("ProbablePitchers")
 
@@ -311,7 +312,9 @@ def Main():
     PPFrame.DownloadButtonHook = lambda a, b: (
         CreateTabLayoutLambda(a, b, dataframe, statcast_bullshit)
     )
-
+    
+    print("mainloop")
+    
     toplevel.mainloop()
     return
 

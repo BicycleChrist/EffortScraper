@@ -27,12 +27,14 @@ def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
     player_name_url_part = name.lower().replace(' ', '-').replace(',', '')
     url = f"{base_url}{player_name_url_part}-{player_id}?stats=statcast-r-pitching-mlb"
     driver.get(url)
-
+    
+    timeout = 5
     scraped_data = {}
     try:
         if take_screenshots:
+            print(f"screenshotting {name}\n")
             try:
-                pitch_distribution = WebDriverWait(driver, 5).until(
+                pitch_distribution = WebDriverWait(driver, timeout).until(
                     EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
                 )
             except TimeoutException:
@@ -40,7 +42,7 @@ def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
                 pitch_distribution = None
 
             try:
-                trending_div = WebDriverWait(driver, 5).until(
+                trending_div = WebDriverWait(driver, timeout).until(
                     EC.visibility_of_element_located((By.ID, 'trending'))
                 )
             except TimeoutException:
@@ -71,7 +73,7 @@ def scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
 
         print(f"Scraped data for {name}: {scraped_data}")
     except TimeoutException:
-        print(f"TimeoutException: Elements not found for player {name}.")
+        print(f"Scrape: TimeoutException: Elements not found for player {name}.")
     finally:
         driver.quit()
 
