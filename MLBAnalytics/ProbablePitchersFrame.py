@@ -22,7 +22,7 @@ class PPFrameT(DmFrameT):
         #self.MatchupSelectorDropdown = ttk.OptionMenu(master=self, variable=self.MatchupSelectorText)
         self.MatchupDisplay, self.MatchupNB = InsertFrame(
             self, "MatchupDisplay", 
-            DmNotebookT, self, tkinter.Widget.pack  
+            DmNotebookT, new_toplevel=self, new_layoutmethod=tkinter.Widget.pack  
         )
     
     def DownloadButtonLambda(self):

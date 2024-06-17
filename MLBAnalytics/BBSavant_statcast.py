@@ -32,35 +32,34 @@ def StartDriver():
     return driver
 
 
-def Scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
+# TODO: figure out why the screenshots crash occasionally
+def Scrape(name: str, player_id: int, take_screenshots: bool = False) -> dict:
     print(f"\nscraping {name}: {player_id}")
-    #if player_id < 0:
     if player_id < 100000: # seems like all players on the site have 6-digit IDs
         print(f"aborting scrape: bad player_id: {player_id}")
         return {}
     
+    url = ConstructURL(name, player_id)
     driver = StartDriver()
-    driver.get(ConstructURL(name, player_id))
+    driver.get(url)
     
+    wait_timeout = 5
     scraped_data = {}
     try:
         if take_screenshots:
-            try:
-                pitch_distribution = WebDriverWait(driver, 5).until(
-                    EC.visibility_of_element_located((By.ID, 'svg-pitch-distribution-mini'))
-                )
-            except TimeoutException:
-                print("Pitch distribution element not found within 5 seconds.")
-                pitch_distribution = None
-
-            try:
-                trending_div = WebDriverWait(driver, 5).until(
-                    EC.visibility_of_element_located((By.ID, 'trending'))
-                )
-            except TimeoutException:
-                print("Trending div element not found within 5 seconds.")
-                trending_div = None
-
+            #print(f"\n\n\n-------starting screenshots for: {name}-------\n\n\n")
+            driver.implicitly_wait(wait_timeout)
+            
+            # trying not to crash if the element doesn't exist
+            pitch_distribution_temp = driver.find_elements(By.ID, 'svg-pitch-distribution-mini')
+            trending_div_temp = driver.find_elements(By.ID, 'trending')
+            things = []
+            for temp in (pitch_distribution_temp, trending_div_temp):
+                if len(temp) == 0: things.append(None); continue
+                if len(temp) > 1: print("found more than one")
+                things.append(temp[0])
+            pitch_distribution, trending_div = things
+            
             cwd = pathlib.Path.cwd()
             for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
                 if element is not None:
@@ -69,11 +68,12 @@ def Scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
                     print(f"Screenshots for {purpose} taken and saved as {filepath.relative_to(cwd)}")
                 else:
                     print(f"No screenshot taken for {purpose} as element was not found.")
-
+            driver.implicitly_wait(0)  # resetting
+        # done taking screenshots
         
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
         pitching_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitching')
-
+        
         for group in pitcher_value_groups + pitching_groups:
             metrics = group.find_elements(By.CSS_SELECTOR, 'g.metric')
             for metric in metrics:
@@ -82,6 +82,7 @@ def Scrape(name: str, player_id, take_screenshots: bool = False) -> dict:
                 stat_text_element = metric.find_elements(By.CSS_SELECTOR, 'text.text-stat')
                 stat_text = stat_text_element[0].text if stat_text_element else 'N/A'
                 scraped_data[header] = {'value': value, 'stat': stat_text}
+                # TODO: rename 'value' to 'percentile', and 'stat' to 'value'
 
         print(f"Scraped data for {name}: {scraped_data}")
     except TimeoutException:

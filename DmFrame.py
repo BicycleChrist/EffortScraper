@@ -48,12 +48,12 @@ def InsertFrame(master=None, name=None,
     #newframe.UpdateGlobals()
     #if master is None:
     #    master = newframe.TOPLEVEL
-    newframe.LAYOUTMETHOD(newframe)
+    LAYOUTMETHOD(newframe)
     if new_widget_class is not None:
         if new_widget_name is not None:
             kwargs["name"] = new_widget_name
         new_widget = new_widget_class(master=newframe, **kwargs)
-        newframe.LAYOUTMETHOD(new_widget)
+        LAYOUTMETHOD(new_widget)
         return newframe, new_widget
     return newframe
 

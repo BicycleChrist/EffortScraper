@@ -6,6 +6,7 @@ import pandas
 import tkinter
 from tkinter import ttk
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import more_itertools  # flatten
 
 from DmFrame import InsertFrame
 from ProbablePitchersFrame import PPFrameT
@@ -22,6 +23,7 @@ import penski
 
 # used to color-code values in the GUI
 def GetTextColor(value: int) -> str:
+    if value == '': return "#000000"
     try: value = int(value)
     except ValueError: print(f"[GetTextColor] ERROR: Int conversion failed: {value}"); return "#000000"
     if value >= 80:       return "#FF0000"
@@ -29,6 +31,8 @@ def GetTextColor(value: int) -> str:
     elif 50 < value < 80: return "#027C5E"
     return "#000000"
 
+# need to store images here to keep them from unloading
+GLOBAL_IMAGE_STORAGE = []
 
 # TODO: create a subdirectory for these images
 def LoadPitcherImages(pitchername, parentframe, quiet:bool = False):
@@ -41,6 +45,11 @@ def LoadPitcherImages(pitchername, parentframe, quiet:bool = False):
     )
     loaded_images = []
     
+    # get rid of non-ascii before constructing filenames
+    unformatted_pitchername = pitchername.replace('_', ', ')
+    if unformatted_pitchername in BBSplayer_ids.Nonascii_Remap.keys():
+        new_unformatted_pitchername = BBSplayer_ids.Nonascii_Remap.get(unformatted_pitchername, pitchername)
+        pitchername = new_unformatted_pitchername.replace(', ', '_')
     for thing in ("trending_div", "pitch_distribution"):
         image_path = base_path / f"{pitchername}_{thing}.png"
         
@@ -54,6 +63,7 @@ def LoadPitcherImages(pitchername, parentframe, quiet:bool = False):
         image_label = ttk.Label(master=new_label, text=f"{pitchername}_{thing}", image=f"{image_path.stem}", compound="bottom")
         image_label.pack(expand=True, side="left")
     
+    GLOBAL_IMAGE_STORAGE.extend(loaded_images)
     return loaded_images
 
 
@@ -102,16 +112,16 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe, statcast_data
             if header in pitcher_data_map.get(spaced_pitcher_name, {}) and not pandas.isnull(pitcher_data_map[spaced_pitcher_name][header]):
                 stat_value = pitcher_data_map[spaced_pitcher_name][header]
                 stat_label = ttk.Label(stats_frame, text=f"{header}: {stat_value}")
-                stat_label.pack(side="left", padx=2, pady=2, anchor="w")
+                stat_label.pack(side="left", anchor="w")
 
         images_frame = tkinter.Frame(pitcher_stats_frame)
-        images_frame.pack(side="top", fill="x", padx=2, pady=2)
+        images_frame.pack(side="top", fill="x")
 
         pitchername_reformatted = "_".join(reversed(spaced_pitcher_name.split(" ")))
         LoadPitcherImages(pitchername_reformatted, images_frame)
 
         scraped_data_frame = ttk.LabelFrame(matchupframe, text=f"{spaced_pitcher_name} Statcast Stats")
-        scraped_data_frame.pack(expand=True, fill="both", side="top", padx=5, pady=5)
+        scraped_data_frame.pack(expand=True, fill="both", side="top")
         
         unreversed_pitcher_name_with_comma = ", ".join(reversed(reversed_pitcher_name.split(" ")))
         if not unreversed_pitcher_name_with_comma in statcast_data.keys():
@@ -122,14 +132,9 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe, statcast_data
         
         # statcast stuff
         for key, value in statcast_dict.items():
-            stat_label = ttk.Label(scraped_data_frame, text=f"{key}:", font=('Helvetica', 10, 'bold'))
-            stat_label.pack(anchor="w", padx=5, pady=2)
-            
-            value_label = ttk.Label(scraped_data_frame, text=f"  % Ranking: {value['value']}", foreground=GetTextColor(value['value']), font=('Helvetica', 10))
-            value_label.pack(anchor="w", padx=10, pady=2)
-            
-            stat_value_label = ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10))
-            stat_value_label.pack(anchor="w", padx=10, pady=2)
+            ttk.Label(scraped_data_frame, text=f"{key}:", font=('Helvetica', 10, 'bold')).pack(anchor="w", padx=5, pady=2)
+            ttk.Label(scraped_data_frame, text=f"  % Ranking: {value['value']}", foreground=GetTextColor(value['value']), font=('Helvetica', 10)).pack(anchor="w", padx=5, pady=2)
+            ttk.Label(scraped_data_frame, text=f"  Stat: {value['stat']}", font=('Helvetica', 10)).pack(anchor="w", padx=5, pady=2)
     
     # Handle 'TBD' pitchers
     for name in starting_pitcher_names:
@@ -164,14 +169,14 @@ def Fillout_BP_Frame(parent_frame, possible_files: dict):
 
             for col in dataframe.columns:
                 treeview.heading(col, text=col)
-                treeview.column(col, anchor='center', width=50, stretch=NO)
+                treeview.column(col, anchor='center', width=50, stretch=tkinter.NO)
 
             for column_name in ("Trait", "Season"):
                 if column_name in dataframe.columns:
                     if column_name == "Trait":
-                        treeview.column(column_name, anchor='center', width=175, stretch=NO)
+                        treeview.column(column_name, anchor='center', width=175, stretch=tkinter.NO)
                     elif column_name == "Season":
-                        treeview.column(column_name, anchor='center', width=75, stretch=NO)
+                        treeview.column(column_name, anchor='center', width=75, stretch=tkinter.NO)
 
             for index, row in dataframe.iterrows():
                 values = [row[col] for col in dataframe.columns]
@@ -249,7 +254,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
             bullpen_treeview = ttk.Treeview(matchupframe, columns=column_names, show='headings')
             for col in column_names:
                 bullpen_treeview.heading(col, text=col)
-                bullpen_treeview.column(col, anchor='center', width=75, stretch=NO) # Stretch needs to used with width !!!
+                bullpen_treeview.column(col, anchor='center', width=75, stretch=tkinter.NO) # Stretch needs to used with width !!!
             
             bullpen_treeview.pack(expand=False, fill="both")
             bullpen_treeview.column("Player", width=130)
@@ -263,28 +268,36 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
 
 # expects pitcherData from ProbablePitchers.ScrapePitcherData
 def GetStatcastPitcherData(pitcherData:dict) -> dict:
+    print("GetStatcastPitcherData")
     all_pitcher_names = [matchup["pitchers"].keys() for matchup in pitcherData["matchups"]]
+    all_pitcher_names = [*more_itertools.flatten(all_pitcher_names)]
+    # matchup-keys are pairs of names, so we need to flatten the list
     
     formatted_pitcher_id_map = {
-       newpitchername : playerID
-       for newpitchername, playerID in 
-       map(lambda pn: BBSplayer_ids.LookupPlayerID(pn, reverseOrder=True), all_pitcher_names)
+        newpitchername : playerID
+        for newpitchername, playerID in 
+        map(lambda pn: BBSplayer_ids.LookupPlayerID(pn, reverseOrder=True), all_pitcher_names)
+        if playerID is not None
     }
     
+    #single-threaded version
+    # pitcher_data_results = {
+    #     pitcher_name: BBSavant_statcast.Scrape(pitcher_name, player_id, take_screenshots=False)
+    #     for pitcher_name, player_id in formatted_pitcher_id_map.items() if player_id is not None
+    # }
+    
     # look into using 'add_done_callback()' for ThreadPoolExecutor
-    pitcher_data_results = {}
     with ThreadPoolExecutor(max_workers=None) as executor:
-       futures = {
-           pitcher_name: executor.submit(BBSavant_statcast.Scrape, pitcher_name, player_id, True)
-           for pitcher_name, player_id in formatted_pitcher_id_map.items() if player_id is not None
-       }
-       pitcher_data_results = {
-           pitcher_name: future.result() for future, pitcher_name in futures.keys()
-           #for future, pitcher_name in as_completed(futures.values())  # as_completed not necessary?
-       }
+        futures = {
+          pitcher_name: executor.submit(BBSavant_statcast.Scrape, pitcher_name, player_id, take_screenshots=False)
+          for pitcher_name, player_id in formatted_pitcher_id_map.items() if player_id is not None
+        }
+        pitcher_data_results = {
+          pitcher_name: future.result() for pitcher_name, future in futures.items()
+          #for future, pitcher_name in as_completed(futures.values())  # as_completed not necessary?
+        }
     
     return pitcher_data_results
-
 
 
 def Main():
@@ -294,44 +307,50 @@ def Main():
     toplevel = tkinter.Tk()
     toplevel.title("ProbablePitchers")
     
-    frame, canvas = InsertFrame(toplevel, new_widget_class=tkinter.Canvas, new_toplevel=toplevel, new_layoutmethod=tkinter.Pack)
-    scrollbar = ttk.Scrollbar(toplevel, orient=tkinter.VERTICAL, command=canvas.yview_scroll)
-    frame.pack(fill=tkinter.BOTH, expand=True)
-    canvas.pack(side=tkinter.TOP, fill=tkinter.BOTH, expand=True)
+    frame, canvas = InsertFrame(toplevel, new_widget_class=tkinter.Canvas, new_layoutmethod=tkinter.Widget.pack)
+    scrollbar = ttk.Scrollbar(toplevel, orient=tkinter.VERTICAL, command=canvas.yview)
+    frame.pack(fill=tkinter.BOTH, expand=True, side=tkinter.LEFT)
+    canvas.pack(fill=tkinter.BOTH, expand=True)
     scrollbar.pack(side=tkinter.RIGHT, fill=tkinter.Y)
-    
-    # first arg is a coordinate. 'window' must NOT be a toplevel window!
-    # https://tkinter-docs.readthedocs.io/en/latest/widgets/canvas.html
-    canvas.create_window((0, 0), window=frame, anchor="nw")
-    
-    def on_frame_configure(event):
-        canvas.configure(scrollregion=canvas.bbox("all"))
-    
-    frame.bind("<Configure>", on_frame_configure)
-    
-    def _on_mousewheel(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    # Windows and MacOS bindings for the mouse wheel
-    # Only works when hovering over scroll bar
-    toplevel.bind_all("<MouseWheel>", _on_mousewheel, add='+')
-    toplevel.bind_all("<Button-4>",   _on_mousewheel, add='+')
-    toplevel.bind_all("<Button-5>",   _on_mousewheel, add='+')
     
     PPFrame = PPFrameT(master=frame)
     PPFrame.pack(expand=False, side="left")
+    
+    # first arg is a coordinate. 'window' must NOT be a toplevel window!
+    # https://tkinter-docs.readthedocs.io/en/latest/widgets/canvas.html
+    
+    def scroll_event(event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    
+    canvas.configure(yscrollcommand=scrollbar.set)
+    toplevel.bind("<Configure>", scroll_event, add='+')
+    
+    #PPFrame.bind("<Configure>", scroll_event, add='+')
+    canvas.create_window((0, 0), window=PPFrame, anchor="nw")
+    
+    def mousewheel_callback(event):
+        scroll_delta = 5  # the (linux-specific) button-events always have a delta of 0, so we hardcode it
+        if event.delta != 0: scroll_delta = event.delta  # handling actual mousewheel event
+        if event.num == 4: scroll_delta *= -1  # button-4 == scroll-down
+        canvas.yview_scroll(scroll_delta, "units")
+    
+    toplevel.bind("<MouseWheel>", mousewheel_callback)
+    # Linux maps mouse-wheel scrollevents to these buttons, for some reason
+    toplevel.bind("<Button-4>",   mousewheel_callback)
+    toplevel.bind("<Button-5>",   mousewheel_callback)
     
     dataframe = get_pitching_data()  # DON'T CALL THIS INLINE IN THE LAMBDA!!!!!! It will re-download EVERY ITERATION!
     
     def CreateTabLayoutLambda(matchupframe, matchupdict, dataframe, statcast_data):
         CreateTabLayoutCustom(matchupframe, matchupdict)
         FilloutStartingPitchers(matchupframe, matchupdict, dataframe, statcast_data)
-    
+
     PPFrame.DownloadButtonHook = lambda a, b: (
         CreateTabLayoutLambda(a, b, dataframe, statcast_data)
     )
     
     toplevel.mainloop()
-    return pitcher_data, statcast_data, 
+    return pitcher_data, statcast_data, dataframe
 
 
 if __name__ == "__main__":

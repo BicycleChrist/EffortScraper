@@ -580,6 +580,7 @@ pitchers = {
     "Bukauskas, J.B.": 656266,
     "Espino, Paolo": 502179,
     "Alexander, Scott": 518397,
+    "Joyce, Ben": 690829,
     "Long, Sam": 669674,
     "Hicks, Aaron": 543305,
     "Englert, Mason": 669438,
@@ -1224,6 +1225,8 @@ pitchers = {
     "Jimenez, Joe": 641729,
     "Hudson, Bryan": 663542,
     "McFarland, T.J.": 519008,
+    "Waldrep, Hurston": 694462,
+    "Rodriguez, Carlos": 692230,
 }
 
 
@@ -1336,9 +1339,9 @@ def LookupPlayerID(pitchername, reverseOrder:bool=False, split_on:str=" ", join_
     
     if newname in Nonascii_Remap.keys():
         newname = Nonascii_Remap[newname]
-        for thedict in (hitters, pitchers):
-            if newname in thedict.keys(): return newname, thedict[newname]
-        # lookup failed
-        print(f"[LookupPlayerID] WARNING: new pitchername: '{newname}' not found!")
+    for thedict in (hitters, pitchers):
+        if newname in thedict.keys(): return newname, thedict[newname]
+    # lookup failed
+    print(f"[LookupPlayerID] WARNING: new pitchername: '{newname}' not found!")
     
     return newname, None
