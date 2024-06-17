@@ -12,6 +12,7 @@ import cProfile
 import pstats
 
 
+
 def TryToFind(element, xpath_string):
     try:
         x = element.find_element(By.XPATH, xpath_string)
@@ -27,6 +28,7 @@ def FindGameLinks(driver: webdriver.Firefox, url):
     all_game_links = []
     try:
         sp_path_event = driver.find_element(By.XPATH, "/html/body//div[@class='top-container']//main/div[@class='sp-main-area']//sp-path-event")
+        sp_next_events = driver.find_elements(By.XPATH, ".//div[@class='sp-next-events']")  
         grouped_events = sp_path_event.find_elements(By.XPATH, ".//div[@class='grouped-events']")
     except NoSuchElementException:
         print(f"No grouped events found on the page: {url}")
@@ -40,6 +42,7 @@ def FindGameLinks(driver: webdriver.Firefox, url):
     print(f"\n game_links for {url}: {game_links} \n")
     all_game_links.extend(game_links)
     return all_game_links
+
 
 
 def VisitGameLink(driver: webdriver.Firefox, game_link):
