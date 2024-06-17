@@ -1,10 +1,9 @@
 import update_importpaths
-from DmFrame import InsertFrame
+from Grid_DmFrame import InsertFrame
 import pandas
-import pandas as pd
 import tkinter
 from tkinter import ttk
-from ProbablePitchersFrame import PPFrameT
+from Grid_ProbablePitchersFrame import PPFrameT
 from stuffsuck import get_pitching_data
 #from BBSavant_statcast import scrape
 from BBSplayer_ids import pitchers
@@ -44,23 +43,33 @@ def FilloutStartingPitchers(matchupframe, matchup_dict, dataframe):
         'Stuff+', 'Location+', 'Pitching+'
     ]
     
+    column = 0
+    row = 4
+    bottomframe = ttk.Frame(master=matchupframe)
+    bottomframe.grid(row=row, column=column)
     for pitcher_name, pitcher_dict in matchup_dict['pitchers'].items():
-        pitcher_frame = ttk.LabelFrame(matchupframe, text=pitcher_name)
-        pitcher_frame.pack(expand=True, fill="both", side="top", anchor="nw")
+        pitcher_frame = ttk.LabelFrame(bottomframe, text=pitcher_name)
+        pitcher_frame.grid(column=column)
         for key, value in pitcher_dict.items():
             textbox = ttk.Label(master=pitcher_frame, text=f"{key}: {value}")
-            textbox.pack(expand=True, fill="both", side="top", anchor="nw")
+            textbox.grid(row=row, column=column)
 
         pitcher_data = pitcher_data_map.get(pitcher_name)
         if pitcher_data is not None:
-            pitcher_stats_frame = ttk.LabelFrame(matchupframe, text=f"{pitcher_name} Stuff+ Stats")
-            pitcher_stats_frame.pack(expand=True, fill="both", side="top", anchor="sw")
+            pitcher_stats_frame = ttk.LabelFrame(bottomframe, text=f"{pitcher_name} Stuff+ Stats")
+            pitcher_stats_frame.grid(row=row, column=column)
+            
+            row += 1
 
             for header in column_headers_to_display:
-                if header in pitcher_data and not pd.isnull(pitcher_data[header]):
+                if header in pitcher_data and not pandas.isnull(pitcher_data[header]):
                     stat_value = pitcher_data[header]
                     stat_label = ttk.Label(pitcher_stats_frame, text=f"{header}: {stat_value}")
-                    stat_label.pack(side="left", padx=5, pady=5)
+                    stat_label.grid(row=row, column=column)
+                    
+                    row += 1
+        column += 1
+        row = 4
     
     return
 
@@ -69,7 +78,7 @@ def Fillout_BP_Frame(parent_frame, possible_files:dict):
     # possible_files maps BPstat_type to a filepath
     BP_dicts: list[dict] = [] # list of dicts; maps BPstat_type to a dataframe (loaded from csv) 
     for BPstat_type, all_matching_files in possible_files.items():
-        BPdata_dict = { BPstat_type : pd.read_csv(file) for file in all_matching_files }
+        BPdata_dict = { BPstat_type : pandas.read_csv(file) for file in all_matching_files }
         #if file.exists(): #should already exist if we got it by glob
         BP_dicts.append(BPdata_dict)
     
@@ -84,7 +93,7 @@ def Fillout_BP_Frame(parent_frame, possible_files:dict):
                 columns=dataframe.columns, show='headings'
             )
             # 'show' can also take the value 'tree'
-            BPstat_frame.pack(expand=True, fill="none", anchor="w", side="left")
+            BPstat_frame.grid()
             # is this even necessary? what was the point of passing to treeview constructor?
             for col in dataframe.columns:
                 # Set column headings
@@ -97,7 +106,7 @@ def Fillout_BP_Frame(parent_frame, possible_files:dict):
                 values = [row[col] for col in dataframe.columns]
                 # Insert row into the Treeview
                 treeview.insert("", "end", values=values)
-            treeview.pack(expand=True, fill="x", side="left")
+            treeview.grid()
     print("BP_Frame done")
     return
 
@@ -127,14 +136,14 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
         for real_name in keys:
             if team_name in real_name:
                 filepath = bullpen_dict[real_name]
-                bullpen_data = pd.read_csv(filepath)
+                bullpen_data = pandas.read_csv(filepath)
                 break
         
         if bullpen_data is not None:
             bullpen_frame = ttk.LabelFrame(matchupframe, text=f"{team_name} Bullpen Usage")
-            bullpen_frame.pack(expand=True, fill="both", side="bottom", anchor="sw")
+            bullpen_frame.grid()
             bullpen_subframe = InsertFrame(bullpen_frame, new_toplevel=bullpen_frame, new_widget_class=None)
-            bullpen_subframe.pack(expand=True, fill="x", anchor="n", side="top")
+            bullpen_subframe.grid()
             
             # Extract column names 
             column_names = list(bullpen_data.columns)
@@ -152,7 +161,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 return
             
             dropdown = ttk.OptionMenu(bullpen_subframe, default_text, "Default Text", *pitcher_names, command=DropdownCallback)
-            dropdown.pack(expand=False, fill="none", anchor="center")
+            dropdown.grid()
             
             # Create a Treeview 
             bullpen_treeview = ttk.Treeview(bullpen_frame, columns=column_names, show='headings')
@@ -161,7 +170,7 @@ def CreateTabLayoutCustom(matchupframe, matchup_dict):
                 bullpen_treeview.heading(col, text=col)
                 # Set column widths
                 bullpen_treeview.column(col, width=100, anchor='center')
-            bullpen_treeview.pack(expand=True, fill="both", padx=2, pady=2)
+            bullpen_treeview.grid()
             
             # Iterate over DataFrame rows and insert  into the Treeview
             for index, row in bullpen_data.iterrows():
