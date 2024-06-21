@@ -563,7 +563,8 @@ pitchers = {
     "Allen, Logan": 663531,  # these two are actually different players with the same name
     "Allen, Logan": 671106,  # these two are actually different players with the same name
     "Suero, Wander": 593833,
-    "Peterson,David": 656849,
+    "Peterson, David": 656849,
+    "Herz, DJ": 687792,
     "McKinstry, Zach": 656716,
     "Hernández, Carlos": 672578,
     "Hernandez, Carlos": 672578,
@@ -574,9 +575,11 @@ pitchers = {
     "Diaz, Miguel": 622766,
     "Trevino, Jose": 624431,
     "Rutledge, Jackson": 671131,
+    "Mazur, Adam": 800049,
     "Pruitt, Austin": 643493,
     "Whitley, Forrest": 666215,
     "Koch, Matt": 571863,
+    "Bloss, Jake": 814005,
     "Bukauskas, J.B.": 656266,
     "Espino, Paolo": 502179,
     "Alexander, Scott": 518397,
@@ -1322,6 +1325,7 @@ Nonascii_Remap = {
     "Hernández, Daysbel": "Hernandez, Daysbel",
     "Zuñiga, Guillermo": "Zuniga, Guillermo",
     "Rodríguez, Manuel": "Rodriguez, Manuel",
+    "Richardson, Woods, Simeon": "Woods Richardson, Simeon",
     "Jiménez, Joe": "Jimenez, Joe",
 }
 

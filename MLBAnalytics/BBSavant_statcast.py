@@ -38,19 +38,17 @@ def Scrape(name: str, player_id: int, take_screenshots: bool = False) -> dict:
     if player_id < 100000: # seems like all players on the site have 6-digit IDs
         print(f"aborting scrape: bad player_id: {player_id}")
         return {}
-    
+
     url = ConstructURL(name, player_id)
     driver = StartDriver()
     driver.get(url)
-    
+
     wait_timeout = 5
     scraped_data = {}
     try:
         if take_screenshots:
-            #print(f"\n\n\n-------starting screenshots for: {name}-------\n\n\n")
             driver.implicitly_wait(wait_timeout)
-            
-            # trying not to crash if the element doesn't exist
+
             pitch_distribution_temp = driver.find_elements(By.ID, 'svg-pitch-distribution-mini')
             trending_div_temp = driver.find_elements(By.ID, 'trending')
             things = []
@@ -59,7 +57,7 @@ def Scrape(name: str, player_id: int, take_screenshots: bool = False) -> dict:
                 if len(temp) > 1: print("found more than one")
                 things.append(temp[0])
             pitch_distribution, trending_div = things
-            
+
             cwd = pathlib.Path.cwd()
             for purpose, element in (("pitch_distribution", pitch_distribution), ("trending_div", trending_div)):
                 if element is not None:
@@ -69,28 +67,33 @@ def Scrape(name: str, player_id: int, take_screenshots: bool = False) -> dict:
                 else:
                     print(f"No screenshot taken for {purpose} as element was not found.")
             driver.implicitly_wait(0)  # resetting
-        # done taking screenshots
-        
+
         pitcher_value_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitcherValue')
         pitching_groups = driver.find_elements(By.CSS_SELECTOR, 'g.group.pitching')
-        
+
         for group in pitcher_value_groups + pitching_groups:
             metrics = group.find_elements(By.CSS_SELECTOR, 'g.metric')
             for metric in metrics:
                 header = metric.find_element(By.CSS_SELECTOR, 'text').text
-                value = metric.find_element(By.CSS_SELECTOR, 'g.circle-bulb').text
-                stat_text_element = metric.find_elements(By.CSS_SELECTOR, 'text.text-stat')
-                stat_text = stat_text_element[0].text if stat_text_element else 'N/A'
+
+                # Try to find the value element, if it exists
+                value_elements = metric.find_elements(By.CSS_SELECTOR, 'g.circle-bulb')
+                value = value_elements[0].text if value_elements else 'N/A'
+
+                # Try to find the stat_text element, if it exists
+                stat_text_elements = metric.find_elements(By.CSS_SELECTOR, 'text.text-stat')
+                stat_text = stat_text_elements[0].text if stat_text_elements else 'N/A'
+
                 scraped_data[header] = {'value': value, 'stat': stat_text}
-                # TODO: rename 'value' to 'percentile', and 'stat' to 'value'
 
         print(f"Scraped data for {name}: {scraped_data}")
     except TimeoutException:
         print(f"TimeoutException: Elements not found for player {name}.")
     finally:
         driver.quit()
-    
+
     return scraped_data
+
 
 
 
