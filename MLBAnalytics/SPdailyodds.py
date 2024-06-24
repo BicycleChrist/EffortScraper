@@ -1,7 +1,11 @@
+import update_importpaths
+
 import pprint
 from ProbablePitchers import FetchProbablePitchers, ParseProbablePitchers
 from Boddssuck.bigBOVpoolski import Main as scrape_bigBOVpoolski_data
 import re
+
+print("imported SPdailyodds")
 
 # parse Over/Under betting odds from a given section
 def parse_over_under_odds(section):

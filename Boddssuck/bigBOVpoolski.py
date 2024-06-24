@@ -11,7 +11,11 @@ import pathlib
 import cProfile
 import pstats
 
+import update_importpaths
+import MLBAnalytics.SPdailyodds
 
+
+print("imported bigBOVpoolski")
 
 def TryToFind(element, xpath_string):
     try:

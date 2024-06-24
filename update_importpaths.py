@@ -13,11 +13,12 @@ subdir_names = [
     "NHLvacuum",
 ]
 
-# symlinks are dropped into these directories (allowing them to import this file as well), if they exist
-# the key is the target name, the value is a list of parents (if empty, assume toplevel)
-# the values get evaluated/resolved to actual paths. If a value matches a previous key, that key's (resolved) paths will be substituted
+# symlinks are dropped into these directories (allowing files there to import this file as well), if they exist
+# Each key is a target (directory) name, and the associated value is a list of parents (if empty, assume toplevel). All strings.
+# the values get evaluated/resolved to actual paths. If a value matches a previous key, that key's (resolved) paths will be substituted instead.
 symlink_into = {
     "MLBAnalytics": [],
+    "Imgui": [],
 }
 
 
