@@ -1,0 +1,45 @@
+Dear ImGui (immediate-mode GUI)
+
+# upstream C++ library
+https://github.com/ocornut/imgui
+
+# python bindings/port
+https://github.com/pyimgui/pyimgui
+https://pyimgui.readthedocs.io/en/latest/
+
+
+
+------------------------------------
+All commands written here are in bash
+
+To create a venv:
+    python3 -m venv .venv
+where '.venv' is the desired name
+
+WARNING: 'venv's are NOT PORTABLE!
+Tons of files inside them (including all the modules/libraries) require absolute paths,
+so you CANNOT copy/paste them anywhere else. In fact, even renaming parent folders will break them.
+
+then, to run inside of the venv, you have to:
+    source ./.venv/bin/activate
+you have to do this at the start of every session (persists until terminal exits)
+
+now that you have a venv, you can install imgui (and python-glfw/opengl):
+    python3 -m pip install imgui[glfw]
+imgui can be installed with support for several backends; glfw and sdl2 are the only relevant ones.
+to install everything (useless stuff), you can install imgui[full]
+When it runs, it also seems to complain that it wants numpy;
+    "Unable to import OpenGL.arrays.numpymodule.NumpyHandler: No numpy module present: No module named 'numpy'"
+but it actually seems to run fine without it?
+to make the error go away:
+    python3 -m pip install numpy
+
+
+Note that pip's search function (python3 -m pip search ___) is no longer supported.
+You have to search the website in a browser instead:
+    https://pypi.org/search
+
+now you should be able to import the libraries as long as you're running inside of venv
+
+------------------------
+just run ImguiTest.py to get the test GUI.
