@@ -74,6 +74,24 @@ if __name__ == "__main__":
     mlb_data = scrape_page(urls['MLB'], mlb_conferences)
     all_dataframes.update(mlb_data)
     mlb_combined_dataframe = pd.concat((mlb_data.values()))
+    mlb_combined_dataframe['RSRuns Scored'] = pd.to_numeric(mlb_combined_dataframe['RSRuns Scored'], errors='coerce')
+    mlb_combined_dataframe['RARuns Allowed'] = pd.to_numeric(mlb_combined_dataframe['RARuns Allowed'], errors='coerce')
+    mlb_combined_dataframe['WWins'] = pd.to_numeric(mlb_combined_dataframe['WWins'], errors='coerce')
+    mlb_combined_dataframe['LLosses'] = pd.to_numeric(mlb_combined_dataframe['LLosses'], errors='coerce')
+
+    mlb_combined_dataframe['Pythagorean Win %'] = round(mlb_combined_dataframe['RSRuns Scored']**2 / (mlb_combined_dataframe['RSRuns Scored']**2 + mlb_combined_dataframe['RARuns Allowed']**2), 3)
+    mlb_combined_dataframe['Total Games Played'] = mlb_combined_dataframe['WWins'] + mlb_combined_dataframe['LLosses']
+
+    # Calculate Adjusted Wins
+    mlb_combined_dataframe['Adjusted Wins'] = round(mlb_combined_dataframe['Total Games Played'] * mlb_combined_dataframe['Pythagorean Win %'], 2)
+
+    # Calculate Adjusted Losses
+    mlb_combined_dataframe['Adjusted Losses'] = round(mlb_combined_dataframe['Total Games Played'] - mlb_combined_dataframe['Adjusted Wins'], 2)
+
+    # Calculate Wins - Pythag wins
+    mlb_combined_dataframe['Wins - Pythagwins'] = round(mlb_combined_dataframe['WWins'] - mlb_combined_dataframe['Adjusted Wins'], 2)
+
+    mlb_combined_dataframe['']
     
     nhl_data = scrape_page(urls['NHL'], nhl_conferences)
     all_dataframes.update(nhl_data)
