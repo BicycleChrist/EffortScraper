@@ -564,6 +564,9 @@ pitchers = {
     "Allen, Logan": 671106,  # these two are actually different players with the same name
     "Suero, Wander": 593833,
     "Peterson, David": 656849,
+    "Williams, Gavin": 668909,
+    "Festa, David": 701581,
+    "Daniel, Davis": 669721,
     "Herz, DJ": 687792,
     "McKinstry, Zach": 656716,
     "Hernández, Carlos": 672578,
