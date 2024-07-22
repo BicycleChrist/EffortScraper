@@ -270,7 +270,7 @@ def ScrapePage(driver: webdriver.Firefox):
 # Initialize WebDriver for each thread
 def initialize_driver():
     options = FirefoxOptions()
-    #options.add_argument('--headless')
+    options.add_argument('--headless')
     #options.page_load_strategy = 'eager'  # breaks everything
     
     #firefox_profile = FirefoxProfile(profile_directory=ProfilePath())
