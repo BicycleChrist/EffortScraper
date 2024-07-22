@@ -291,7 +291,7 @@ def scrape_link(link, sport):
     return market_data
 
 
-def Main():
+def Main_Multithreaded():
     default_sport = "MLB"
     
     driver = initialize_driver()
@@ -304,9 +304,23 @@ def Main():
     
     with ThreadPoolExecutor(max_workers=None) as executor:
         futures = [executor.submit(ScrapeLinkLambda, link, gametitle, default_sport) for link, gametitle in mapped_gamelinks]
-        results = [future.result() for future in as_completed(futures)]
+    results = [future.result() for future in as_completed(futures)]
     return {gametitle: result for gametitle, result in results}
 
 
+def Main():
+    default_sport = "MLB"
+    driver = initialize_driver()
+    with driver.context(driver.CONTEXT_CONTENT):
+        mapped_gamelinks = FindGameLinks(driver, default_sport)
+    driver.quit()
+    
+    results = {}
+    for link, gametitle in mapped_gamelinks:
+        results[gametitle] = scrape_link(link, default_sport)
+    return results
+
+
 if __name__ == "__main__":
-    pprint.pprint(Main())
+    scraped_data = Main()
+    pprint.pprint(scraped_data)
