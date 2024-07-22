@@ -65,7 +65,7 @@ def FindGameLinks(driver, sport):
         if block.get_attribute('data-mode') == 'live': continue
         if block.get_attribute('data-test-id') == 'LiveContainer': continue
         rows = [row.text for row in block.find_elements(By.CLASS_NAME, 'event-row-participant')]  # text for each team name
-        gamelinks.extend(rows)
+        teamnames.extend(rows)
         hrefs = [link.get_attribute('href') for link in block.find_elements(By.XPATH, ".//a[@class=''][@href]")]
         # removing trailing slash after NBA to properly create URL's for props.
         gamelinks.extend([link[:-1] + urlsuffix for link in hrefs if (link.startswith(baseurl) and link.endswith('/'))])

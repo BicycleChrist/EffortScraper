@@ -98,18 +98,18 @@ def CursorExec(cursor, dbcommand, flatten_single=True):
 
 def TableFromDict(cursor, tablename: str, table_data: dict[any, dict]):
     # Get the column names from the keys of the first nested dictionary
-    columns = [ f"'{key}'" for key in next(iter(table_data.values())).keys() ]
+    columns = [ f"{key}" for key in next(iter(table_data.values())).keys() ]
     # surrounding each one with quotes because SQL will fail if any of the inputs contain spaces
     
     # Create the table
-    create_table_sql = f"CREATE TABLE IF NOT EXISTS '{tablename}' (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-    create_table_sql += ", ".join([f"'{col}' TEXT" for col in columns]) # should maybe be 'FLOAT' here instead?
+    create_table_sql = f"CREATE TABLE IF NOT EXISTS {tablename} (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    create_table_sql += ", ".join([f"{col} TEXT" for col in columns]) # should maybe be 'FLOAT' here instead?
     create_table_sql += ")"
     print("creating table SQL: \n\n")
     print(create_table_sql)
     
     cursor.execute(create_table_sql)
-    insert_sql = f"INSERT INTO '{tablename}' ({', '.join(columns)}) VALUES ({', '.join(['?' for _ in columns])})"
+    insert_sql = f"INSERT INTO {tablename} ({', '.join(columns)}) VALUES ({', '.join(['?' for _ in columns])})"
     
     for key, value in table_data.items():
         cursor.execute(insert_sql, [value.get(col, None) for col in columns])
@@ -128,7 +128,8 @@ def ClaudesExample():
        'person2': {'name': 'Alice', 'age': '25', 'city': 'Los Angeles'},
        'person3': {'name': 'Bob', 'age': '35', 'city': 'Chicago'}
     }
-    pprint(f"\ninput_data: {input_data}\n\n")
+    print("input_data:")
+    pprint(input_data)
     TableFromDict(dbcursor, table_name, input_data)
     dbconnection.commit()
     dbconnection.close()
