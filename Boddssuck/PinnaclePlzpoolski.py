@@ -316,7 +316,7 @@ def Main():
     driver.quit()
     
     results = {}
-    for link, gametitle in mapped_gamelinks:
+    for link, gametitle in mapped_gamelinks.items():
         results[gametitle] = scrape_link(link, default_sport)
     return results
 

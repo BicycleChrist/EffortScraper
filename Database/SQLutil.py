@@ -74,7 +74,7 @@ def GetDatabaseStructure(connection: sqlite3.Connection):
 
 
 # TODO: figure out how indecies work???
-def CreateIndex():
+def CreateIndex(dbconnection):
     dbconnection.execute(
         '''CREATE UNIQUE INDEX "indextest2" ON "static" (
             "team" ASC,
