@@ -5,555 +5,504 @@ python PinnaclePlzpoolski.py
 ('contentBlock square', None, None)
 ('contentBlock style_anonBlock__2DT-x style_sidebarAnonBlock__3fRjJ', None, None)
 scraping https://www.pinnacle.com/en/baseball/mlb/tampa-bay-rays-vs-new-york-yankees/1594016742#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/new-york-mets-vs-miami-marlins/1594029304#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/detroit-tigers-vs-cleveland-guardians/1594029302#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-pittsburgh-pirates/1594029303#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/cincinnati-reds-vs-atlanta-braves/1594029831#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/philadelphia-phillies-vs-minnesota-twins/1594030007#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/milwaukee-brewers-vs-chicago-cubs/1594030322#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/chicago-white-sox-vs-texas-rangers/1594030324#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/arizona-diamondbacks-vs-kansas-city-royals/1594030606#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/boston-red-sox-vs-colorado-rockies/1594031202#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/los-angeles-angels-vs-seattle-mariners/1594036263#player-props
-scraping https://www.pinnacle.com/en/baseball/mlb/houston-astros-vs-oakland-athletics/1594036262#player-props
-https://www.pinnacle.com/en/baseball/mlb/chicago-white-sox-vs-texas-rangers/1594030324#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/detroit-tigers-vs-cleveland-guardians/1594029302#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-pittsburgh-pirates/1594029303#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/arizona-diamondbacks-vs-kansas-city-royals/1594030606#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/boston-red-sox-vs-colorado-rockies/1594031202#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/houston-astros-vs-oakland-athletics/1594036262#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/milwaukee-brewers-vs-chicago-cubs/1594030322#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/new-york-mets-vs-miami-marlins/1594029304#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/cincinnati-reds-vs-atlanta-braves/1594029831#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-https://www.pinnacle.com/en/baseball/mlb/philadelphia-phillies-vs-minnesota-twins/1594030007#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
 https://www.pinnacle.com/en/baseball/mlb/tampa-bay-rays-vs-new-york-yankees/1594016742#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
-finding showAllButton...
-finding oddsFormatDropdown...
-finding showAllButton...
-click
-finding oddsFormatDropdown...
-click
-https://www.pinnacle.com/en/baseball/mlb/los-angeles-angels-vs-seattle-mariners/1594036263#player-props
-{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331177, 'sameSite': 'None'}
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331393, 'sameSite': 'None'}
 finding showAllButton...
 finding oddsFormatDropdown...
 click
+[<selenium.webdriver.remote.webelement.WebElement (session="ff21658e-ff33-4159-82a8-527319dd4de2", element="ec99f7dc-8c89-40d9-8524-9ad74f03582d")>, <selenium.webdriver.remote.webelement.WebElement (session="ff21658e-ff33-4159-82a8-527319dd4de2", element="bfab8432-1448-4c93-9ccc-f138af5b10b5")>]
+Aaron Judge (Home Runs)(must start)
+Aaron Judge (Total Bases)(must start)
+Alex Jackson (Home Runs)(must start)
+Alex Jackson (Total Bases)(must start)
+Alex Verdugo (Home Runs)(must start)
+Alex Verdugo (Total Bases)(must start)
+Amed Rosario (Home Runs)(must start)
+Amed Rosario (Total Bases)(must start)
+Anthony Volpe (Total Bases)(must start)
+Austin Wells (Home Runs)(must start)
+Austin Wells (Total Bases)(must start)
+Ben Rice (Home Runs)(must start)
+Ben Rice (Total Bases)(must start)
+Carlos Rodon (Earned Runs)(must start)
+Carlos Rodon (Hits Allowed)(must start)
+Carlos Rodon (Pitching Outs)(must start)
+Carlos Rodon (Total Strikeouts)(must start)
+Curtis Mead (Home Runs)(must start)
+Curtis Mead (Total Bases)(must start)
+DJ LeMahieu (Total Bases)(must start)
+Gleyber Torres (Home Runs)(must start)
+Gleyber Torres (Total Bases)(must start)
+Isaac Paredes (Home Runs)(must start)
+Isaac Paredes (Total Bases)(must start)
+Jonny DeLuca (Home Runs)(must start)
+Jonny DeLuca (Total Bases)(must start)
+José Caballero (Home Runs)(must start)
+José Caballero (Total Bases)(must start)
+Jose Siri (Home Runs)(must start)
+Jose Siri (Total Bases)(must start)
+Juan Soto (Home Runs)(must start)
+Juan Soto (Total Bases)(must start)
+Randy Arozarena (Home Runs)(must start)
+Randy Arozarena (Total Bases)(must start)
+Taylor Walls (Home Runs)(must start)
+Taylor Walls (Total Bases)(must start)
+Trent Grisham (Home Runs)(must start)
+Trent Grisham (Total Bases)(must start)
+Zack Littell (Earned Runs)(must start)
+Zack Littell (Hits Allowed)(must start)
+Zack Littell (Pitching Outs)(must start)
+Zack Littell (Total Strikeouts)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/new-york-mets-vs-miami-marlins/1594029304#player-props
+https://www.pinnacle.com/en/baseball/mlb/new-york-mets-vs-miami-marlins/1594029304#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331402, 'sameSite': 'None'}
 finding showAllButton...
 finding oddsFormatDropdown...
 click
+[<selenium.webdriver.remote.webelement.WebElement (session="ecefe66e-4b80-4fa4-9068-e7e99a457ce7", element="86c928c7-72ef-44f7-a1ae-0cd80635f92d")>, <selenium.webdriver.remote.webelement.WebElement (session="ecefe66e-4b80-4fa4-9068-e7e99a457ce7", element="bdcf435a-a62c-44ca-a9ff-b720adbd4e4f")>]
+Ali Sánchez (Total Bases)(must start)
+Brandon Nimmo (Home Runs)(must start)
+Brandon Nimmo (Total Bases)(must start)
+Bryan De La Cruz (Home Runs)(must start)
+Bryan De La Cruz (Total Bases)(must start)
+David Peterson (Earned Runs)(must start)
+David Peterson (Hits Allowed)(must start)
+David Peterson (Pitching Outs)(must start)
+David Peterson (Total Strikeouts)(must start)
+Emmanuel Rivera (Total Bases)(must start)
+Francisco Alvarez (Home Runs)(must start)
+Francisco Alvarez (Total Bases)(must start)
+Francisco Lindor (Home Runs)(must start)
+Francisco Lindor (Total Bases)(must start)
+Harrison Bader (Total Bases)(must start)
+J.D. Martinez (Home Runs)(must start)
+J.D. Martinez (Total Bases)(must start)
+Jake Burger (Home Runs)(must start)
+Jake Burger (Total Bases)(must start)
+Jazz Chisholm Jr. (Home Runs)(must start)
+Jazz Chisholm Jr. (Total Bases)(must start)
+Jeff McNeil (Home Runs)(must start)
+Jeff McNeil (Total Bases)(must start)
+Jesus Sanchez (Total Bases)(must start)
+Jose Iglesias (Total Bases)(must start)
+Josh Bell (Home Runs)(must start)
+Josh Bell (Total Bases)(must start)
+Mark Vientos (Home Runs)(must start)
+Mark Vientos (Total Bases)(must start)
+Otto Lopez (Total Bases)(must start)
+Pete Alonso (Home Runs)(must start)
+Pete Alonso (Total Bases)(must start)
+Xavier Edwards (Total Bases)(must start)
+Yonny Chirinos (Earned Runs)(must start)
+Yonny Chirinos (Hits Allowed)(must start)
+Yonny Chirinos (Pitching Outs)(must start)
+Yonny Chirinos (Total Strikeouts)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/detroit-tigers-vs-cleveland-guardians/1594029302#player-props
+https://www.pinnacle.com/en/baseball/mlb/detroit-tigers-vs-cleveland-guardians/1594029302#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331411, 'sameSite': 'None'}
 finding showAllButton...
 finding oddsFormatDropdown...
 click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-finding showAllButton...
-finding oddsFormatDropdown...
-click
-[<selenium.webdriver.remote.webelement.WebElement (session="2d5077ea-2f26-44aa-b9bd-a09b8f7fc26f", element="c8091350-18a9-41cd-8cd0-ef3f6fb06d00")>, <selenium.webdriver.remote.webelement.WebElement (session="2d5077ea-2f26-44aa-b9bd-a09b8f7fc26f", element="e4e27b90-1010-4c74-a36f-641160689528")>]
-[<selenium.webdriver.remote.webelement.WebElement (session="8d20fd09-3d95-4b65-86ed-9d7f2e6d88ee", element="fb58709f-90a7-4cf9-aa21-c9cb6768c657")>, <selenium.webdriver.remote.webelement.WebElement (session="8d20fd09-3d95-4b65-86ed-9d7f2e6d88ee", element="a32382e7-02ce-42aa-a0d3-a73fbcf76e52")>]
+[<selenium.webdriver.remote.webelement.WebElement (session="accf74e7-5abe-4bbb-bda9-f4aeaf0a3073", element="3a76a972-da20-442a-b2de-2e0cab6a5b53")>, <selenium.webdriver.remote.webelement.WebElement (session="accf74e7-5abe-4bbb-bda9-f4aeaf0a3073", element="c29ffa89-1d77-416c-8122-897b31948ebc")>]
 Andres Gimenez (Total Bases)(must start)
-Adolis Garcia (Home Runs)(must start)
 Angel Martínez (Total Bases)(must start)
-Adolis Garcia (Total Bases)(must start)
 Bo Naylor (Total Bases)(must start)
-Andrew Benintendi (Home Runs)(must start)
 Brayan Rocchio (Total Bases)(must start)
-Andrew Benintendi (Total Bases)(must start)
 Carlos Carrasco (Earned Runs)(must start)
+Carlos Carrasco (Hits Allowed)(must start)
+Carlos Carrasco (Pitching Outs)(must start)
+Carlos Carrasco (Total Strikeouts)(must start)
+Carson Kelly (Home Runs)(must start)
+Carson Kelly (Total Bases)(must start)
+Colt Keith (Home Runs)(must start)
+Colt Keith (Total Bases)(must start)
+David Fry (Home Runs)(must start)
+David Fry (Total Bases)(must start)
+Gio Urshela (Total Bases)(must start)
+Javier Báez (Home Runs)(must start)
+Javier Báez (Total Bases)(must start)
+Jhonkensy Noel (Home Runs)(must start)
+Jhonkensy Noel (Total Bases)(must start)
+Jose Ramirez (Home Runs)(must start)
+Jose Ramirez (Total Bases)(must start)
+Josh Naylor (Home Runs)(must start)
+Josh Naylor (Total Bases)(must start)
+Mark Canha (Home Runs)(must start)
+Mark Canha (Total Bases)(must start)
+Matt Vierling (Home Runs)(must start)
+Matt Vierling (Total Bases)(must start)
+Riley Greene (Home Runs)(must start)
+Riley Greene (Total Bases)(must start)
+Steven Kwan (Total Bases)(must start)
+Tarik Skubal (Earned Runs)(must start)
+Tarik Skubal (Hits Allowed)(must start)
+Tarik Skubal (Total Strikeouts)(must start)
+Wenceel Perez (Home Runs)(must start)
+Wenceel Perez (Total Bases)(must start)
+Zach McKinstry (Home Runs)(must start)
+Zach McKinstry (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-pittsburgh-pirates/1594029303#player-props
+https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-pittsburgh-pirates/1594029303#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331421, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="ddb627aa-cd73-4822-94e5-b3183f38c6c5", element="b9e49323-3181-4693-8a77-0cdf159a45b6")>, <selenium.webdriver.remote.webelement.WebElement (session="ddb627aa-cd73-4822-94e5-b3183f38c6c5", element="918c0751-8a4a-4c38-8afb-e668dfc72165")>]
+Alec Burleson (Home Runs)(must start)
+Alec Burleson (Total Bases)(must start)
+Andre Pallante (Earned Runs)(must start)
+Andre Pallante (Hits Allowed)(must start)
+Andre Pallante (Pitching Outs)(must start)
+Andre Pallante (Total Strikeouts)(must start)
+Andrew McCutchen (Home Runs)(must start)
+Andrew McCutchen (Total Bases)(must start)
+Bryan Reynolds (Home Runs)(must start)
+Bryan Reynolds (Total Bases)(must start)
+Joey Bart (Home Runs)(must start)
+Joey Bart (Total Bases)(must start)
+Joshua Palacios (Total Bases)(must start)
+Ke'Bryan Hayes (Total Bases)(must start)
+Lars Nootbaar (Total Bases)(must start)
+Masyn Winn (Total Bases)(must start)
+Mitch Keller (Earned Runs)(must start)
+Mitch Keller (Hits Allowed)(must start)
+Mitch Keller (Total Strikeouts)(must start)
+Nick Gonzales (Total Bases)(must start)
+Nolan Arenado (Total Bases)(must start)
+Nolan Gorman (Home Runs)(must start)
+Nolan Gorman (Total Bases)(must start)
+Oneil Cruz (Home Runs)(must start)
+Oneil Cruz (Total Bases)(must start)
+Paul Goldschmidt (Home Runs)(must start)
+Paul Goldschmidt (Total Bases)(must start)
+Rowdy Tellez (Total Bases)(must start)
+Willson Contreras (Home Runs)(must start)
+Willson Contreras (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/cincinnati-reds-vs-atlanta-braves/1594029831#player-props
+https://www.pinnacle.com/en/baseball/mlb/cincinnati-reds-vs-atlanta-braves/1594029831#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331430, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="88ad7c7a-3db8-45a7-99eb-f4c9074876b9", element="55cc63fb-a0d3-4b7c-822d-9db79d6a0dc8")>, <selenium.webdriver.remote.webelement.WebElement (session="88ad7c7a-3db8-45a7-99eb-f4c9074876b9", element="c78f434c-a9ee-459d-908e-8591c843f064")>]
+Adam Duvall (Home Runs)(must start)
+Adam Duvall (Total Bases)(must start)
+Austin Riley (Home Runs)(must start)
+Austin Riley (Total Bases)(must start)
+Eddie Rosario (Home Runs)(must start)
+Eddie Rosario (Total Bases)(must start)
+Elly De La Cruz (Home Runs)(must start)
+Elly De La Cruz (Total Bases)(must start)
+Hunter Greene (Earned Runs)(must start)
+Hunter Greene (Hits Allowed)(must start)
+Hunter Greene (Pitching Outs)(must start)
+Hunter Greene (Total Strikeouts)(must start)
+Jake Fraley (Total Bases)(must start)
+Jarred Kelenic (Home Runs)(must start)
+Jarred Kelenic (Total Bases)(must start)
+Jeimer Candelario (Home Runs)(must start)
+Jeimer Candelario (Total Bases)(must start)
+Jonathan India (Home Runs)(must start)
+Jonathan India (Total Bases)(must start)
+Marcell Ozuna (Home Runs)(must start)
+Marcell Ozuna (Total Bases)(must start)
+Matt Olson (Home Runs)(must start)
+Matt Olson (Total Bases)(must start)
+Nacho Alvarez Jr (Total Bases)(must start)
+Noelvi Marte (Home Runs)(must start)
+Noelvi Marte (Total Bases)(must start)
+Orlando Arcia (Home Runs)(must start)
+Orlando Arcia (Total Bases)(must start)
+Rece Hinds (Home Runs)(must start)
+Rece Hinds (Total Bases)(must start)
+Reynaldo Lopez (Earned Runs)(must start)
+Reynaldo Lopez (Hits Allowed)(must start)
+Reynaldo Lopez (Pitching Outs)(must start)
+Reynaldo Lopez (Total Strikeouts)(must start)
+Sean Murphy (Home Runs)(must start)
+Sean Murphy (Total Bases)(must start)
+Spencer Steer (Home Runs)(must start)
+Spencer Steer (Total Bases)(must start)
+Tyler Stephenson (Home Runs)(must start)
+Tyler Stephenson (Total Bases)(must start)
+Will Benson (Home Runs)(must start)
+Will Benson (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/philadelphia-phillies-vs-minnesota-twins/1594030007#player-props
+https://www.pinnacle.com/en/baseball/mlb/philadelphia-phillies-vs-minnesota-twins/1594030007#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331439, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="57748d90-da69-46c8-b87b-ade93af13377", element="3961835f-ddac-4948-b85c-5d27e261b271")>, <selenium.webdriver.remote.webelement.WebElement (session="57748d90-da69-46c8-b87b-ade93af13377", element="1e172299-bda5-406b-9912-6673a0676d48")>]
+Alec Bohm (Home Runs)(must start)
+Alec Bohm (Total Bases)(must start)
+Austin Martin (Total Bases)(must start)
+Bailey Ober (Earned Runs)(must start)
+Bailey Ober (Hits Allowed)(must start)
+Bailey Ober (Total Strikeouts)(must start)
+Brandon Marsh (Home Runs)(must start)
+Brandon Marsh (Total Bases)(must start)
+Brooks Lee (Home Runs)(must start)
+Brooks Lee (Total Bases)(must start)
+Bryce Harper (Home Runs)(must start)
+Bryce Harper (Total Bases)(must start)
+Bryson Stott (Home Runs)(must start)
+Bryson Stott (Total Bases)(must start)
+Byron Buxton (Home Runs)(must start)
+Byron Buxton (Total Bases)(must start)
+Carlos Santana (Home Runs)(must start)
+Carlos Santana (Total Bases)(must start)
+Diego A. Castillo (Home Runs)(must start)
+Diego A. Castillo (Total Bases)(must start)
+J.T. Realmuto (Home Runs)(must start)
+J.T. Realmuto (Total Bases)(must start)
+Johan Rojas (Home Runs)(must start)
+Johan Rojas (Total Bases)(must start)
+Kyle Schwarber (Home Runs)(must start)
+Kyle Schwarber (Total Bases)(must start)
+Manuel Margot (Home Runs)(must start)
+Manuel Margot (Total Bases)(must start)
+Max Kepler (Home Runs)(must start)
+Max Kepler (Total Bases)(must start)
+Nick Castellanos (Home Runs)(must start)
+Nick Castellanos (Total Bases)(must start)
+Ranger Suarez (Earned Runs)(must start)
+Ranger Suarez (Hits Allowed)(must start)
+Ranger Suarez (Total Strikeouts)(must start)
+Ryan Jeffers (Home Runs)(must start)
+Ryan Jeffers (Total Bases)(must start)
+Trea Turner (Home Runs)(must start)
+Trea Turner (Total Bases)(must start)
+Willi Castro (Home Runs)(must start)
+Willi Castro (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/milwaukee-brewers-vs-chicago-cubs/1594030322#player-props
+https://www.pinnacle.com/en/baseball/mlb/milwaukee-brewers-vs-chicago-cubs/1594030322#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331449, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="653aada4-b13e-4c31-9b6c-6e1b5bebe76a", element="76510ac4-27a7-4cb8-a41d-6f58a989d11f")>, <selenium.webdriver.remote.webelement.WebElement (session="653aada4-b13e-4c31-9b6c-6e1b5bebe76a", element="df86aa72-7c3c-4385-83fc-10a0426135e7")>]
+Brice Turang (Total Bases)(must start)
+Christian Yelich (Home Runs)(must start)
+Christian Yelich (Total Bases)(must start)
+Christopher Morel (Home Runs)(must start)
+Christopher Morel (Total Bases)(must start)
+Dansby Swanson (Home Runs)(must start)
+Dansby Swanson (Total Bases)(must start)
+Garrett Mitchell (Total Bases)(must start)
+Ian Happ (Home Runs)(must start)
+Ian Happ (Total Bases)(must start)
+Jackson Chourio (Home Runs)(must start)
+Jackson Chourio (Total Bases)(must start)
+Javier Assad (Earned Runs)(must start)
+Javier Assad (Hits Allowed)(must start)
+Javier Assad (Total Strikeouts)(must start)
+Joey Ortiz (Home Runs)(must start)
+Joey Ortiz (Total Bases)(must start)
+Michael Busch (Home Runs)(must start)
+Michael Busch (Total Bases)(must start)
+Miguel Amaya (Home Runs)(must start)
+Miguel Amaya (Total Bases)(must start)
+Mike Tauchman (Total Bases)(must start)
+Nico Hoerner (Total Bases)(must start)
+Pete Crow-Armstrong (Total Bases)(must start)
+Rhys Hoskins (Home Runs)(must start)
+Rhys Hoskins (Total Bases)(must start)
+Sal Frelick (Total Bases)(must start)
+Seiya Suzuki (Home Runs)(must start)
+Seiya Suzuki (Total Bases)(must start)
+Tobias Myers (Earned Runs)(must start)
+Tobias Myers (Hits Allowed)(must start)
+Tobias Myers (Pitching Outs)(must start)
+Tobias Myers (Total Strikeouts)(must start)
+William Contreras (Home Runs)(must start)
+William Contreras (Total Bases)(must start)
+Willy Adames (Home Runs)(must start)
+Willy Adames (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/chicago-white-sox-vs-texas-rangers/1594030324#player-props
+https://www.pinnacle.com/en/baseball/mlb/chicago-white-sox-vs-texas-rangers/1594030324#player-props
+None
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="c40e0b16-5531-4458-97d5-ed93b878065d", element="a3742473-9695-4a75-9766-915ed3b4a618")>, <selenium.webdriver.remote.webelement.WebElement (session="c40e0b16-5531-4458-97d5-ed93b878065d", element="eb156958-527c-46e0-bc2c-baf5cc997156")>]
+Adolis Garcia (Home Runs)(must start)
+Adolis Garcia (Total Bases)(must start)
+Andrew Benintendi (Home Runs)(must start)
+Andrew Benintendi (Total Bases)(must start)
 Andrew Vaughn (Home Runs)(must start)
 Andrew Vaughn (Total Bases)(must start)
 Brooks Baldwin (Home Runs)(must start)
-Carlos Carrasco (Hits Allowed)(must start)
 Brooks Baldwin (Total Bases)(must start)
-Carlos Carrasco (Pitching Outs)(must start)
 Corey Seager (Home Runs)(must start)
-Carlos Carrasco (Total Strikeouts)(must start)
 Corey Seager (Total Bases)(must start)
-Carson Kelly (Home Runs)(must start)
 Eloy Jiménez (Home Runs)(must start)
-Carson Kelly (Total Bases)(must start)
 Eloy Jiménez (Total Bases)(must start)
-Colt Keith (Home Runs)(must start)
 Erick Fedde (Earned Runs)(must start)
 Erick Fedde (Hits Allowed)(must start)
-Colt Keith (Total Bases)(must start)
 Erick Fedde (Pitching Outs)(must start)
-David Fry (Home Runs)(must start)
 Erick Fedde (Total Strikeouts)(must start)
-David Fry (Total Bases)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="6516f761-ad79-4a36-9347-c56f431dbff0", element="46b63fb5-ff32-46af-bfff-dcd2439e9c39")>, <selenium.webdriver.remote.webelement.WebElement (session="6516f761-ad79-4a36-9347-c56f431dbff0", element="aaccab29-1c81-4381-aa38-c5d6b6c65a6e")>]
 Jonah Heim (Home Runs)(must start)
 Jonah Heim (Total Bases)(must start)
-Gio Urshela (Total Bases)(must start)
 Josh H. Smith (Home Runs)(must start)
-Javier Báez (Home Runs)(must start)
 Josh H. Smith (Total Bases)(must start)
-Javier Báez (Total Bases)(must start)
-Jhonkensy Noel (Home Runs)(must start)
 Korey Lee (Home Runs)(must start)
-Jhonkensy Noel (Total Bases)(must start)
 Korey Lee (Total Bases)(must start)
-Jose Ramirez (Home Runs)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="9070dde9-d236-4649-8c40-e769995d78c4", element="2fdd0317-2752-4136-a27a-ff0eba2cbf6d")>, <selenium.webdriver.remote.webelement.WebElement (session="9070dde9-d236-4649-8c40-e769995d78c4", element="643cba49-c43a-4c26-a205-a877ac5941cb")>]
 Leody Taveras (Home Runs)(must start)
-Jose Ramirez (Total Bases)(must start)
 Leody Taveras (Total Bases)(must start)
-Josh Naylor (Home Runs)(must start)
 Luis Robert Jr. (Home Runs)(must start)
-Josh Naylor (Total Bases)(must start)
 Luis Robert Jr. (Total Bases)(must start)
-Mark Canha (Home Runs)(must start)
 Marcus Semien (Home Runs)(must start)
-Mark Canha (Total Bases)(must start)
 Marcus Semien (Total Bases)(must start)
-Matt Vierling (Home Runs)(must start)
 Michael Lorenzen (Earned Runs)(must start)
-Matt Vierling (Total Bases)(must start)
 Michael Lorenzen (Hits Allowed)(must start)
-Riley Greene (Home Runs)(must start)
 Michael Lorenzen (Pitching Outs)(must start)
-Riley Greene (Total Bases)(must start)
 Michael Lorenzen (Total Strikeouts)(must start)
-Steven Kwan (Total Bases)(must start)
 Nathaniel Lowe (Home Runs)(must start)
-Tarik Skubal (Earned Runs)(must start)
 Nathaniel Lowe (Total Bases)(must start)
-Tarik Skubal (Hits Allowed)(must start)
 Nick Senzel (Total Bases)(must start)
-Alec Burleson (Home Runs)(must start)
-Tarik Skubal (Total Strikeouts)(must start)
 Paul DeJong (Home Runs)(must start)
-Alec Burleson (Total Bases)(must start)
 Paul DeJong (Total Bases)(must start)
-Wenceel Perez (Home Runs)(must start)
-Andre Pallante (Earned Runs)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="37b8290b-5b2c-4304-8370-3fa01eadf47b", element="adb6b47d-ec62-4f8e-8d65-7bd6cdf7e1b1")>, <selenium.webdriver.remote.webelement.WebElement (session="37b8290b-5b2c-4304-8370-3fa01eadf47b", element="1e9a1c78-4204-4252-87b9-4eb8035b28aa")>]
 Tommy Pham (Home Runs)(must start)
-Wenceel Perez (Total Bases)(must start)
-Andre Pallante (Hits Allowed)(must start)
-Andre Pallante (Pitching Outs)(must start)
 Tommy Pham (Total Bases)(must start)
-Zach McKinstry (Home Runs)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="6c90a5a9-076d-44c5-80b2-96de0f9304ee", element="8a3900b9-5a9e-43b1-8468-f4496c7fa90e")>, <selenium.webdriver.remote.webelement.WebElement (session="6c90a5a9-076d-44c5-80b2-96de0f9304ee", element="592bb7ca-d3f9-4ab7-8b88-f32d153e904b")>]
 Travis Jankowski (Total Bases)(must start)
-Zach McKinstry (Total Bases)(must start)
-Andre Pallante (Total Strikeouts)(must start)
-Adam Frazier (Total Bases)(must start)
 Wyatt Langford (Home Runs)(must start)
 Wyatt Langford (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/arizona-diamondbacks-vs-kansas-city-royals/1594030606#player-props
+https://www.pinnacle.com/en/baseball/mlb/arizona-diamondbacks-vs-kansas-city-royals/1594030606#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331463, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="9502ad02-318b-453f-99f8-0e0769702edd", element="3720d568-d0f2-4749-8db6-43733df7954b")>, <selenium.webdriver.remote.webelement.WebElement (session="9502ad02-318b-453f-99f8-0e0769702edd", element="6a4a0b07-d44b-47e7-bbb1-a56cb4d49c4c")>]
+Adam Frazier (Total Bases)(must start)
 Alek Thomas (Total Bases)(must start)
-Andrew McCutchen (Home Runs)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="dc6c8ace-628f-4d80-85f6-3b007e71e6cd", element="a9daf6e8-28b7-4623-a93e-d7db4b77a8d2")>, <selenium.webdriver.remote.webelement.WebElement (session="dc6c8ace-628f-4d80-85f6-3b007e71e6cd", element="5ae0e022-87c6-4756-ac2e-7dae9d561ea2")>]
 Bobby Witt Jr. (Home Runs)(must start)
-Andrew McCutchen (Total Bases)(must start)
 Bobby Witt Jr. (Total Bases)(must start)
 Christian Walker (Home Runs)(must start)
-Brendan Donovan (Total Bases)(must start)
 Christian Walker (Total Bases)(must start)
-Bryan Reynolds (Home Runs)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="5928c9e2-9d90-4d2d-a124-3aea2dad0f57", element="ab08f7b3-b229-40f1-9f61-406b1108cf50")>, <selenium.webdriver.remote.webelement.WebElement (session="5928c9e2-9d90-4d2d-a124-3aea2dad0f57", element="03430864-1b89-4505-a408-71d11c7ddf7a")>]
 Cole Ragans (Earned Runs)(must start)
-Bryan Reynolds (Total Bases)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="a8370fd1-1b0e-450e-aa69-0b2a202c2584", element="459c74a7-4def-4de3-aace-d00f17da5dbb")>, <selenium.webdriver.remote.webelement.WebElement (session="a8370fd1-1b0e-450e-aa69-0b2a202c2584", element="e23ab8fc-6759-4b31-bb7b-42495950ff9f")>]
 Cole Ragans (Hits Allowed)(must start)
-Jack Suwinski (Total Bases)(must start)
 Cole Ragans (Pitching Outs)(must start)
-Joey Bart (Home Runs)(must start)
 Cole Ragans (Total Strikeouts)(must start)
-Joey Bart (Total Bases)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="6a6efa30-ed58-4c89-aed9-36d6b5c1144e", element="61cb6754-5eb0-4acc-a4d3-ca09e32a732f")>, <selenium.webdriver.remote.webelement.WebElement (session="6a6efa30-ed58-4c89-aed9-36d6b5c1144e", element="3271e465-8261-4987-868b-5bf22ac34329")>]
 Eugenio Suarez (Home Runs)(must start)
-Joshua Palacios (Total Bases)(must start)
 Eugenio Suarez (Total Bases)(must start)
-Ke'Bryan Hayes (Total Bases)(must start)
 Freddy Fermin (Home Runs)(must start)
-Lars Nootbaar (Total Bases)(must start)
 Freddy Fermin (Total Bases)(must start)
-Masyn Winn (Total Bases)(must start)
 Gabriel Moreno (Total Bases)(must start)
-Michael Siani (Total Bases)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="4c70e028-524c-4394-8db1-0d5214cc60ff", element="b02b67a3-8661-4477-b866-f2604285ada9")>, <selenium.webdriver.remote.webelement.WebElement (session="4c70e028-524c-4394-8db1-0d5214cc60ff", element="1e4b6c18-d4cb-406a-9036-4619e5045edc")>]
 Geraldo Perdomo (Total Bases)(must start)
-Mitch Keller (Earned Runs)(must start)
 Hunter Renfroe (Home Runs)(must start)
-Mitch Keller (Hits Allowed)(must start)
 Hunter Renfroe (Total Bases)(must start)
-Austin Gomber (Earned Runs)(must start)
-Brice Turang (Total Bases)(must start)
-Mitch Keller (Total Strikeouts)(must start)
-Abraham Toro (Home Runs)(must start)
 Jake McCarthy (Total Bases)(must start)
-Nick Gonzales (Total Bases)(must start)
-Austin Gomber (Hits Allowed)(must start)
-Abraham Toro (Total Bases)(must start)
-Christian Yelich (Home Runs)(must start)
 Ketel Marte (Home Runs)(must start)
-Austin Gomber (Pitching Outs)(must start)
-Nolan Arenado (Total Bases)(must start)
-Alex Bregman (Home Runs)(must start)
-Austin Gomber (Total Strikeouts)(must start)
-[<selenium.webdriver.remote.webelement.WebElement (session="dac6e9b8-95c9-4764-b559-b5e9a9d30dd8", element="b6d71701-ce99-4071-816b-5e04ad23f772")>, <selenium.webdriver.remote.webelement.WebElement (session="dac6e9b8-95c9-4764-b559-b5e9a9d30dd8", element="7ecc1d5c-97a7-4a0c-97a2-91e0f54a5d41")>]
-Nolan Gorman (Home Runs)(must start)
 Ketel Marte (Total Bases)(must start)
-Christian Yelich (Total Bases)(must start)
-Ali Sánchez (Total Bases)(must start)
-Alex Bregman (Total Bases)(must start)
-Brendan Rodgers (Home Runs)(must start)
-Nolan Gorman (Total Bases)(must start)
-Brandon Nimmo (Home Runs)(must start)
-Christopher Morel (Home Runs)(must start)
 Kyle Isbel (Total Bases)(must start)
-Brent Rooker (Home Runs)(must start)
-Brendan Rodgers (Total Bases)(must start)
-Oneil Cruz (Home Runs)(must start)
-Christopher Morel (Total Bases)(must start)
 Lourdes Gurriel Jr. (Home Runs)(must start)
-Brent Rooker (Total Bases)(must start)
-Brandon Nimmo (Total Bases)(must start)
-Oneil Cruz (Total Bases)(must start)
-Brenton Doyle (Home Runs)(must start)
-Adam Duvall (Home Runs)(must start)
-Dansby Swanson (Home Runs)(must start)
 Lourdes Gurriel Jr. (Total Bases)(must start)
-Bryan De La Cruz (Home Runs)(must start)
-Chas McCormick (Home Runs)(must start)
-Adam Duvall (Total Bases)(must start)
-Paul Goldschmidt (Home Runs)(must start)
-Brenton Doyle (Total Bases)(must start)
-Dansby Swanson (Total Bases)(must start)
 Maikel Garcia (Total Bases)(must start)
-Paul Goldschmidt (Total Bases)(must start)
-Chas McCormick (Total Bases)(must start)
-Austin Riley (Home Runs)(must start)
-Bryan De La Cruz (Total Bases)(must start)
-Ceddanne Rafaela (Home Runs)(must start)
-Garrett Mitchell (Total Bases)(must start)
 Michael Massey (Home Runs)(must start)
-Rowdy Tellez (Total Bases)(must start)
-Hogan Harris (Earned Runs)(must start)
-Ceddanne Rafaela (Total Bases)(must start)
-Austin Riley (Total Bases)(must start)
-David Peterson (Earned Runs)(must start)
 Michael Massey (Total Bases)(must start)
-Ian Happ (Home Runs)(must start)
-Willson Contreras (Home Runs)(must start)
-Hogan Harris (Hits Allowed)(must start)
-David Peterson (Hits Allowed)(must start)
-Eddie Rosario (Home Runs)(must start)
 Randal Grichuk (Home Runs)(must start)
-Ian Happ (Total Bases)(must start)
-Alec Bohm (Home Runs)(must start)
-Charlie Blackmon (Home Runs)(must start)
-Willson Contreras (Total Bases)(must start)
-David Peterson (Pitching Outs)(must start)
-Hogan Harris (Total Strikeouts)(must start)
-Eddie Rosario (Total Bases)(must start)
-Jackson Chourio (Home Runs)(must start)
 Randal Grichuk (Total Bases)(must start)
-Charlie Blackmon (Total Bases)(must start)
-Alec Bohm (Total Bases)(must start)
-David Peterson (Total Strikeouts)(must start)
-Jackson Chourio (Total Bases)(must start)
-Elly De La Cruz (Home Runs)(must start)
-Jake Meyers (Home Runs)(must start)
 Salvador Perez (Home Runs)(must start)
-Connor Wong (Home Runs)(must start)
-Javier Assad (Earned Runs)(must start)
-Emmanuel Rivera (Total Bases)(must start)
-Austin Martin (Total Bases)(must start)
-Elly De La Cruz (Total Bases)(must start)
-Jake Meyers (Total Bases)(must start)
-Connor Wong (Total Bases)(must start)
 Salvador Perez (Total Bases)(must start)
-Javier Assad (Hits Allowed)(must start)
-Francisco Alvarez (Home Runs)(must start)
-David Hamilton (Home Runs)(must start)
-Jeremy Pena (Home Runs)(must start)
-Bailey Ober (Earned Runs)(must start)
-Hunter Greene (Earned Runs)(must start)
-Aaron Judge (Home Runs)(must start)
 Vinnie Pasquantino (Home Runs)(must start)
-Javier Assad (Total Strikeouts)(must start)
-Jeremy Pena (Total Bases)(must start)
-David Hamilton (Total Bases)(must start)
-Hunter Greene (Hits Allowed)(must start)
-Francisco Alvarez (Total Bases)(must start)
 Vinnie Pasquantino (Total Bases)(must start)
-Aaron Judge (Total Bases)(must start)
-Bailey Ober (Hits Allowed)(must start)
-Joey Ortiz (Home Runs)(must start)
-Hunter Greene (Pitching Outs)(must start)
-JJ Bleday (Home Runs)(must start)
-Elias Díaz (Home Runs)(must start)
-Francisco Lindor (Home Runs)(must start)
-Alex Jackson (Home Runs)(must start)
 Yilber Diaz (Earned Runs)(must start)
-Bailey Ober (Total Strikeouts)(must start)
-Joey Ortiz (Total Bases)(must start)
-Hunter Greene (Total Strikeouts)(must start)
-Alex Jackson (Total Bases)(must start)
-JJ Bleday (Total Bases)(must start)
-Francisco Lindor (Total Bases)(must start)
 Yilber Diaz (Hits Allowed)(must start)
-Elias Díaz (Total Bases)(must start)
-Michael Busch (Home Runs)(must start)
-Brandon Marsh (Home Runs)(must start)
-Alex Verdugo (Home Runs)(must start)
-Jake Fraley (Total Bases)(must start)
-Joey Loperfido (Home Runs)(must start)
-Harrison Bader (Total Bases)(must start)
 Yilber Diaz (Pitching Outs)(must start)
-Ezequiel Tovar (Home Runs)(must start)
-Jarred Kelenic (Home Runs)(must start)
-Brandon Marsh (Total Bases)(must start)
-Alex Verdugo (Total Bases)(must start)
-Joey Loperfido (Total Bases)(must start)
-Michael Busch (Total Bases)(must start)
-Ezequiel Tovar (Total Bases)(must start)
 Yilber Diaz (Total Strikeouts)(must start)
-J.D. Martinez (Home Runs)(must start)
-Jarred Kelenic (Total Bases)(must start)
-Brooks Lee (Home Runs)(must start)
-Amed Rosario (Home Runs)(must start)
-Jose Altuve (Home Runs)(must start)
-J.D. Martinez (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/boston-red-sox-vs-colorado-rockies/1594031202#player-props
+https://www.pinnacle.com/en/baseball/mlb/boston-red-sox-vs-colorado-rockies/1594031202#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331472, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="d29c8ce5-9d72-4fe3-9fb4-b6cda07325ff", element="c8886297-1d8f-4535-9625-e3bced9233ed")>, <selenium.webdriver.remote.webelement.WebElement (session="d29c8ce5-9d72-4fe3-9fb4-b6cda07325ff", element="a98ae5e7-ee03-4c51-ad7b-fb010302bd1b")>]
+Austin Gomber (Earned Runs)(must start)
+Austin Gomber (Hits Allowed)(must start)
+Austin Gomber (Pitching Outs)(must start)
+Austin Gomber (Total Strikeouts)(must start)
+Brendan Rodgers (Home Runs)(must start)
+Brendan Rodgers (Total Bases)(must start)
+Brenton Doyle (Home Runs)(must start)
+Brenton Doyle (Total Bases)(must start)
+Ceddanne Rafaela (Home Runs)(must start)
+Ceddanne Rafaela (Total Bases)(must start)
+Charlie Blackmon (Home Runs)(must start)
+Charlie Blackmon (Total Bases)(must start)
+Connor Wong (Home Runs)(must start)
+Connor Wong (Total Bases)(must start)
+David Hamilton (Home Runs)(must start)
+David Hamilton (Total Bases)(must start)
+Elias Díaz (Home Runs)(must start)
+Elias Díaz (Total Bases)(must start)
+Ezequiel Tovar (Home Runs)(must start)
+Ezequiel Tovar (Total Bases)(must start)
 Jake Cave (Home Runs)(must start)
-Miguel Amaya (Home Runs)(must start)
-Jeimer Candelario (Home Runs)(must start)
-Brooks Lee (Total Bases)(must start)
-Amed Rosario (Total Bases)(must start)
-Jose Altuve (Total Bases)(must start)
-Anthony Rendon (Total Bases)(must start)
-Jake Burger (Home Runs)(must start)
 Jake Cave (Total Bases)(must start)
-Miguel Amaya (Total Bases)(must start)
-Jeimer Candelario (Total Bases)(must start)
-Bryce Harper (Home Runs)(must start)
-Anthony Volpe (Total Bases)(must start)
-Lawrence Butler (Home Runs)(must start)
-Jake Burger (Total Bases)(must start)
-Jonathan India (Home Runs)(must start)
-Mike Tauchman (Total Bases)(must start)
-Bryce Harper (Total Bases)(must start)
-Brandon Drury (Home Runs)(must start)
 Jamie Westbrook (Home Runs)(must start)
-Austin Wells (Home Runs)(must start)
-Lawrence Butler (Total Bases)(must start)
-Jazz Chisholm Jr. (Home Runs)(must start)
-Bryson Stott (Home Runs)(must start)
-Jonathan India (Total Bases)(must start)
-Nico Hoerner (Total Bases)(must start)
-Brandon Drury (Total Bases)(must start)
 Jamie Westbrook (Total Bases)(must start)
-Austin Wells (Total Bases)(must start)
-Bryson Stott (Total Bases)(must start)
-Jazz Chisholm Jr. (Total Bases)(must start)
-Mauricio Dubon (Home Runs)(must start)
-Bryce Miller (Earned Runs)(must start)
-Pete Crow-Armstrong (Total Bases)(must start)
 Jarren Duran (Home Runs)(must start)
-Marcell Ozuna (Home Runs)(must start)
-Ben Rice (Home Runs)(must start)
-Byron Buxton (Home Runs)(must start)
-Jeff McNeil (Home Runs)(must start)
-Mauricio Dubon (Total Bases)(must start)
-Rhys Hoskins (Home Runs)(must start)
 Jarren Duran (Total Bases)(must start)
-Bryce Miller (Hits Allowed)(must start)
-Ben Rice (Total Bases)(must start)
-Marcell Ozuna (Total Bases)(must start)
-Byron Buxton (Total Bases)(must start)
-Max Schuemann (Total Bases)(must start)
-Jeff McNeil (Total Bases)(must start)
-Rhys Hoskins (Total Bases)(must start)
 Masataka Yoshida (Home Runs)(must start)
-Bryce Miller (Pitching Outs)(must start)
-Matt Olson (Home Runs)(must start)
-Carlos Rodon (Earned Runs)(must start)
-Miguel Andujar (Total Bases)(must start)
-Jesus Sanchez (Total Bases)(must start)
-Carlos Santana (Home Runs)(must start)
-Sal Frelick (Total Bases)(must start)
-Matt Olson (Total Bases)(must start)
-Bryce Miller (Total Strikeouts)(must start)
 Masataka Yoshida (Total Bases)(must start)
-Seth Brown (Home Runs)(must start)
-Carlos Rodon (Hits Allowed)(must start)
-Jose Iglesias (Total Bases)(must start)
-Carlos Santana (Total Bases)(must start)
-Nacho Alvarez Jr (Total Bases)(must start)
-Cal Raleigh (Home Runs)(must start)
-Seiya Suzuki (Home Runs)(must start)
 Michael Toglia (Home Runs)(must start)
-Seth Brown (Total Bases)(must start)
-Carlos Rodon (Pitching Outs)(must start)
-Josh Bell (Home Runs)(must start)
-Diego A. Castillo (Home Runs)(must start)
-Noelvi Marte (Home Runs)(must start)
-Cal Raleigh (Total Bases)(must start)
 Michael Toglia (Total Bases)(must start)
-Shea Langeliers (Home Runs)(must start)
-Seiya Suzuki (Total Bases)(must start)
-Diego A. Castillo (Total Bases)(must start)
-Carlos Rodon (Total Strikeouts)(must start)
-Noelvi Marte (Total Bases)(must start)
-Josh Bell (Total Bases)(must start)
-Dylan Moore (Home Runs)(must start)
-Shea Langeliers (Total Bases)(must start)
-Tobias Myers (Earned Runs)(must start)
 Rafael Devers (Home Runs)(must start)
-J.T. Realmuto (Home Runs)(must start)
-Orlando Arcia (Home Runs)(must start)
-Curtis Mead (Home Runs)(must start)
-Mark Vientos (Home Runs)(must start)
-Spencer Arrighetti (Earned Runs)(must start)
-Tobias Myers (Hits Allowed)(must start)
-Dylan Moore (Total Bases)(must start)
-Curtis Mead (Total Bases)(must start)
-Orlando Arcia (Total Bases)(must start)
 Rafael Devers (Total Bases)(must start)
-Mark Vientos (Total Bases)(must start)
-J.T. Realmuto (Total Bases)(must start)
-Spencer Arrighetti (Hits Allowed)(must start)
-Tobias Myers (Pitching Outs)(must start)
-J.P. Crawford (Home Runs)(must start)
-DJ LeMahieu (Total Bases)(must start)
-Otto Lopez (Total Bases)(must start)
-Johan Rojas (Home Runs)(must start)
-Spencer Arrighetti (Pitching Outs)(must start)
 Romy Gonzalez (Home Runs)(must start)
-Rece Hinds (Home Runs)(must start)
-J.P. Crawford (Total Bases)(must start)
-Tobias Myers (Total Strikeouts)(must start)
-Pete Alonso (Home Runs)(must start)
-Spencer Arrighetti (Total Strikeouts)(must start)
-Gleyber Torres (Home Runs)(must start)
-Johan Rojas (Total Bases)(must start)
-Rece Hinds (Total Bases)(must start)
 Romy Gonzalez (Total Bases)(must start)
-Jo Adell (Home Runs)(must start)
-Kyle Schwarber (Home Runs)(must start)
-Gleyber Torres (Total Bases)(must start)
-Yainer Diaz (Home Runs)(must start)
-William Contreras (Home Runs)(must start)
 Ryan McMahon (Home Runs)(must start)
-Pete Alonso (Total Bases)(must start)
-Reynaldo Lopez (Earned Runs)(must start)
-Jo Adell (Total Bases)(must start)
-Isaac Paredes (Home Runs)(must start)
-Kyle Schwarber (Total Bases)(must start)
-Yainer Diaz (Total Bases)(must start)
-William Contreras (Total Bases)(must start)
 Ryan McMahon (Total Bases)(must start)
-Xavier Edwards (Total Bases)(must start)
-Reynaldo Lopez (Hits Allowed)(must start)
-Yordan Alvarez (Home Runs)(must start)
-Isaac Paredes (Total Bases)(must start)
-Jorge Polanco (Home Runs)(must start)
-Willy Adames (Home Runs)(must start)
-Manuel Margot (Home Runs)(must start)
 Sam Hilliard (Home Runs)(must start)
-Yonny Chirinos (Earned Runs)(must start)
-Reynaldo Lopez (Pitching Outs)(must start)
-Jonny DeLuca (Home Runs)(must start)
-Yordan Alvarez (Total Bases)(must start)
-Jorge Polanco (Total Bases)(must start)
-Willy Adames (Total Bases)(must start)
 Sam Hilliard (Total Bases)(must start)
-Manuel Margot (Total Bases)(must start)
-Yonny Chirinos (Hits Allowed)(must start)
-Reynaldo Lopez (Total Strikeouts)(must start)
-Zack Gelof (Home Runs)(must start)
-Josh Rojas (Home Runs)(must start)
-Jonny DeLuca (Total Bases)(must start)
-Max Kepler (Home Runs)(must start)
 Tanner Houck (Earned Runs)(must start)
-Yonny Chirinos (Pitching Outs)(must start)
-Josh Rojas (Total Bases)(must start)
-José Caballero (Home Runs)(must start)
-Zack Gelof (Total Bases)(must start)
-Sean Murphy (Home Runs)(must start)
 Tanner Houck (Hits Allowed)(must start)
-Max Kepler (Total Bases)(must start)
-Yonny Chirinos (Total Strikeouts)(must start)
-Logan O'Hoppe (Home Runs)(must start)
-José Caballero (Total Bases)(must start)
 Tanner Houck (Pitching Outs)(must start)
-Sean Murphy (Total Bases)(must start)
-Nick Castellanos (Home Runs)(must start)
-Jose Siri (Home Runs)(must start)
-Nick Castellanos (Total Bases)(must start)
-Logan O'Hoppe (Total Bases)(must start)
 Tanner Houck (Total Strikeouts)(must start)
-Spencer Steer (Home Runs)(must start)
-Mickey Moniak (Home Runs)(must start)
-Ranger Suarez (Earned Runs)(must start)
-Jose Siri (Total Bases)(must start)
-Spencer Steer (Total Bases)(must start)
 Tyler O'Neill (Home Runs)(must start)
-Mickey Moniak (Total Bases)(must start)
-Juan Soto (Home Runs)(must start)
-Tyler Stephenson (Home Runs)(must start)
-Ranger Suarez (Hits Allowed)(must start)
 Tyler O'Neill (Total Bases)(must start)
+scraping https://www.pinnacle.com/en/baseball/mlb/los-angeles-angels-vs-seattle-mariners/1594036263#player-props
+https://www.pinnacle.com/en/baseball/mlb/los-angeles-angels-vs-seattle-mariners/1594036263#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331481, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="c0c21738-0d89-483a-b73a-45d2a22f76c3", element="d4892e99-0697-4475-9e70-c93a4a9bcd53")>, <selenium.webdriver.remote.webelement.WebElement (session="c0c21738-0d89-483a-b73a-45d2a22f76c3", element="57abbd26-b403-4c19-9e2c-4c9637dd5ecc")>]
+Anthony Rendon (Total Bases)(must start)
+Brandon Drury (Home Runs)(must start)
+Brandon Drury (Total Bases)(must start)
+Bryce Miller (Earned Runs)(must start)
+Bryce Miller (Hits Allowed)(must start)
+Bryce Miller (Pitching Outs)(must start)
+Bryce Miller (Total Strikeouts)(must start)
+Cal Raleigh (Home Runs)(must start)
+Cal Raleigh (Total Bases)(must start)
+Dylan Moore (Home Runs)(must start)
+Dylan Moore (Total Bases)(must start)
+J.P. Crawford (Home Runs)(must start)
+J.P. Crawford (Total Bases)(must start)
+Jo Adell (Home Runs)(must start)
+Jo Adell (Total Bases)(must start)
+Jorge Polanco (Home Runs)(must start)
+Jorge Polanco (Total Bases)(must start)
+Josh Rojas (Home Runs)(must start)
+Josh Rojas (Total Bases)(must start)
+Logan O'Hoppe (Home Runs)(must start)
+Logan O'Hoppe (Total Bases)(must start)
+Mickey Moniak (Home Runs)(must start)
+Mickey Moniak (Total Bases)(must start)
 Mitch Garver (Home Runs)(must start)
-Juan Soto (Total Bases)(must start)
-Tyler Stephenson (Total Bases)(must start)
-Ranger Suarez (Total Strikeouts)(must start)
 Mitch Garver (Total Bases)(must start)
-Randy Arozarena (Home Runs)(must start)
-Ryan Jeffers (Home Runs)(must start)
-Will Benson (Home Runs)(must start)
 Mitch Haniger (Home Runs)(must start)
-Randy Arozarena (Total Bases)(must start)
-Ryan Jeffers (Total Bases)(must start)
-Will Benson (Total Bases)(must start)
 Mitch Haniger (Total Bases)(must start)
-Taylor Walls (Home Runs)(must start)
-Trea Turner (Home Runs)(must start)
 Nolan Schanuel (Home Runs)(must start)
-Taylor Walls (Total Bases)(must start)
-Trea Turner (Total Bases)(must start)
 Nolan Schanuel (Total Bases)(must start)
-Trent Grisham (Home Runs)(must start)
-Willi Castro (Home Runs)(must start)
 Taylor Ward (Home Runs)(must start)
-Trent Grisham (Total Bases)(must start)
-Willi Castro (Total Bases)(must start)
 Taylor Ward (Total Bases)(must start)
-Zack Littell (Earned Runs)(must start)
-Zack Littell (Hits Allowed)(must start)
 Tyler Anderson (Earned Runs)(must start)
 Tyler Anderson (Hits Allowed)(must start)
-Zack Littell (Pitching Outs)(must start)
-Zack Littell (Total Strikeouts)(must start)
 Tyler Anderson (Pitching Outs)(must start)
 Tyler Anderson (Total Strikeouts)(must start)
 Tyler Locklear (Home Runs)(must start)
@@ -564,11 +513,997 @@ Willie Calhoun (Home Runs)(must start)
 Willie Calhoun (Total Bases)(must start)
 Zach Neto (Home Runs)(must start)
 Zach Neto (Total Bases)(must start)
-Traceback (most recent call last):
-  File "/home/retupmoc/Desktop/EffortScraper/Boddssuck/PinnaclePlzpoolski.py", line 325, in <module>
-    scraped_data = Main_Multithreaded()
-                   ^^^^^^^^^^^^^^^^^^^^
-  File "/home/retupmoc/Desktop/EffortScraper/Boddssuck/PinnaclePlzpoolski.py", line 308, in Main_Multithreaded
-    return {gametitle: result for gametitle, result in results}
-                                  ^^^^^^^^^^^^^^^^^
-ValueError: not enough values to unpack (expected 2, got 1)
+scraping https://www.pinnacle.com/en/baseball/mlb/houston-astros-vs-oakland-athletics/1594036262#player-props
+https://www.pinnacle.com/en/baseball/mlb/houston-astros-vs-oakland-athletics/1594036262#player-props
+{'name': 'UserPrefsCookie', 'value': 'languageId=2&priceStyle=decimal&linesTypeView=a&device=d&languageGroup=all', 'path': '/', 'domain': '.pinnacle.com', 'secure': True, 'httpOnly': False, 'expiry': 1724331489, 'sameSite': 'None'}
+finding showAllButton...
+finding oddsFormatDropdown...
+click
+[<selenium.webdriver.remote.webelement.WebElement (session="1b13b163-bd64-493f-b21c-9ceace5da35e", element="3a3fa9b5-5114-4b6a-acb8-fd6274f76ebc")>, <selenium.webdriver.remote.webelement.WebElement (session="1b13b163-bd64-493f-b21c-9ceace5da35e", element="e9c74c82-d6dd-4a6e-a3b0-a1a9bd97c0b0")>]
+Abraham Toro (Home Runs)(must start)
+Abraham Toro (Total Bases)(must start)
+Alex Bregman (Home Runs)(must start)
+Alex Bregman (Total Bases)(must start)
+Brent Rooker (Home Runs)(must start)
+Brent Rooker (Total Bases)(must start)
+Chas McCormick (Home Runs)(must start)
+Chas McCormick (Total Bases)(must start)
+Hogan Harris (Earned Runs)(must start)
+Hogan Harris (Hits Allowed)(must start)
+Hogan Harris (Total Strikeouts)(must start)
+Jake Meyers (Home Runs)(must start)
+Jake Meyers (Total Bases)(must start)
+Jeremy Pena (Home Runs)(must start)
+Jeremy Pena (Total Bases)(must start)
+JJ Bleday (Home Runs)(must start)
+JJ Bleday (Total Bases)(must start)
+Joey Loperfido (Home Runs)(must start)
+Joey Loperfido (Total Bases)(must start)
+Jose Altuve (Home Runs)(must start)
+Jose Altuve (Total Bases)(must start)
+Lawrence Butler (Home Runs)(must start)
+Lawrence Butler (Total Bases)(must start)
+Mauricio Dubon (Home Runs)(must start)
+Mauricio Dubon (Total Bases)(must start)
+Max Schuemann (Total Bases)(must start)
+Miguel Andujar (Total Bases)(must start)
+Seth Brown (Home Runs)(must start)
+Seth Brown (Total Bases)(must start)
+Shea Langeliers (Home Runs)(must start)
+Shea Langeliers (Total Bases)(must start)
+Spencer Arrighetti (Earned Runs)(must start)
+Spencer Arrighetti (Hits Allowed)(must start)
+Spencer Arrighetti (Pitching Outs)(must start)
+Spencer Arrighetti (Total Strikeouts)(must start)
+Yainer Diaz (Home Runs)(must start)
+Yainer Diaz (Total Bases)(must start)
+Yordan Alvarez (Home Runs)(must start)
+Yordan Alvarez (Total Bases)(must start)
+Zack Gelof (Home Runs)(must start)
+Zack Gelof (Total Bases)(must start)
+{'Arizona Diamondbacks vs Kansas City Royals': {'Adam Frazier (Total Bases)(must start)': {'Over 1.5 TotalBases': 142,
+                                                                                           'Under 1.5 TotalBases': -196},
+                                                'Alek Thomas (Total Bases)(must start)': {'Over 0.5 TotalBases': -175,
+                                                                                          'Under 0.5 TotalBases': 129},
+                                                'Bobby Witt Jr. (Home Runs)(must start)': {'Over 0.5 HomeRuns': 489,
+                                                                                           'Under 0.5 HomeRuns': -855},
+                                                'Bobby Witt Jr. (Total Bases)(must start)': {'Over 1.5 TotalBases': -146,
+                                                                                             'Under 1.5 TotalBases': 110},
+                                                'Christian Walker (Home Runs)(must start)': {'Over 0.5 HomeRuns': 577,
+                                                                                             'Under 0.5 HomeRuns': -1098},
+                                                'Christian Walker (Total Bases)(must start)': {'Over 0.5 TotalBases': -182,
+                                                                                               'Under 0.5 TotalBases': 133},
+                                                'Cole Ragans (Earned Runs)(must start)': {'Over 1.5 EarnedRuns': -154,
+                                                                                          'Under 1.5 EarnedRuns': 115},
+                                                'Cole Ragans (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -184,
+                                                                                           'Under 4.5 HitsAllowed': 131},
+                                                'Cole Ragans (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -190,
+                                                                                            'Under 17.5 PitchingOuts': 131},
+                                                'Cole Ragans (Total Strikeouts)(must start)': {'Over 6.5 Strikeouts': 103,
+                                                                                               'Under 6.5 Strikeouts': -145},
+                                                'Eugenio Suarez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 741,
+                                                                                           'Under 0.5 HomeRuns': -1648},
+                                                'Eugenio Suarez (Total Bases)(must start)': {'Over 0.5 TotalBases': -115,
+                                                                                             'Under 0.5 TotalBases': -115},
+                                                'Freddy Fermin (Home Runs)(must start)': {'Over 0.5 HomeRuns': 882,
+                                                                                          'Under 0.5 HomeRuns': -2229},
+                                                'Freddy Fermin (Total Bases)(must start)': {'Over 0.5 TotalBases': -225,
+                                                                                            'Under 0.5 TotalBases': 160},
+                                                'Gabriel Moreno (Total Bases)(must start)': {'Over 1.5 TotalBases': 140,
+                                                                                             'Under 1.5 TotalBases': -192},
+                                                'Geraldo Perdomo (Total Bases)(must start)': {'Over 0.5 TotalBases': -155,
+                                                                                              'Under 0.5 TotalBases': 116},
+                                                'Hunter Renfroe (Home Runs)(must start)': {'Over 0.5 HomeRuns': 541,
+                                                                                           'Under 0.5 HomeRuns': -996},
+                                                'Hunter Renfroe (Total Bases)(must start)': {'Over 1.5 TotalBases': 141,
+                                                                                             'Under 1.5 TotalBases': -194},
+                                                'Jake McCarthy (Total Bases)(must start)': {'Over 0.5 TotalBases': -224,
+                                                                                            'Under 0.5 TotalBases': 159},
+                                                'Ketel Marte (Home Runs)(must start)': {'Over 0.5 HomeRuns': 531,
+                                                                                        'Under 0.5 HomeRuns': -966},
+                                                'Ketel Marte (Total Bases)(must start)': {'Over 1.5 TotalBases': 107,
+                                                                                          'Under 1.5 TotalBases': -143},
+                                                'Kyle Isbel (Total Bases)(must start)': {'Over 0.5 TotalBases': -163,
+                                                                                         'Under 0.5 TotalBases': 121},
+                                                'Lourdes Gurriel Jr. (Home Runs)(must start)': {'Over 0.5 HomeRuns': 718,
+                                                                                                'Under 0.5 HomeRuns': -1564},
+                                                'Lourdes Gurriel Jr. (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                                  'Under 1.5 TotalBases': -170},
+                                                'Maikel Garcia (Total Bases)(must start)': {'Over 1.5 TotalBases': 163,
+                                                                                            'Under 1.5 TotalBases': -231},
+                                                'Michael Massey (Home Runs)(must start)': {'Over 0.5 HomeRuns': 592,
+                                                                                           'Under 0.5 HomeRuns': -1144},
+                                                'Michael Massey (Total Bases)(must start)': {'Over 1.5 TotalBases': 124,
+                                                                                             'Under 1.5 TotalBases': -168},
+                                                'Randal Grichuk (Home Runs)(must start)': {'Over 0.5 HomeRuns': 720,
+                                                                                           'Under 0.5 HomeRuns': -1571},
+                                                'Randal Grichuk (Total Bases)(must start)': {'Over 0.5 TotalBases': -209,
+                                                                                             'Under 0.5 TotalBases': 150},
+                                                'Salvador Perez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 406,
+                                                                                           'Under 0.5 HomeRuns': -653},
+                                                'Salvador Perez (Total Bases)(must start)': {'Over 1.5 TotalBases': 111,
+                                                                                             'Under 1.5 TotalBases': -148},
+                                                'Vinnie Pasquantino (Home Runs)(must start)': {'Over 0.5 HomeRuns': 516,
+                                                                                               'Under 0.5 HomeRuns': -927},
+                                                'Vinnie Pasquantino (Total Bases)(must start)': {'Over 1.5 TotalBases': 111,
+                                                                                                 'Under 1.5 TotalBases': -148},
+                                                'Yilber Diaz (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -119,
+                                                                                          'Under 2.5 EarnedRuns': -112},
+                                                'Yilber Diaz (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 114,
+                                                                                           'Under 5.5 HitsAllowed': -165},
+                                                'Yilber Diaz (Pitching Outs)(must start)': {'Over 15.5 PitchingOuts': -115,
+                                                                                            'Under 15.5 PitchingOuts': -115},
+                                                'Yilber Diaz (Total Strikeouts)(must start)': {'Over 3.5 Strikeouts': -121,
+                                                                                               'Under 3.5 Strikeouts': -114}},
+ 'Boston Red Sox vs Colorado Rockies': {'Austin Gomber (Earned Runs)(must start)': {'Over 3.5 EarnedRuns': 103,
+                                                                                    'Under 3.5 EarnedRuns': -137},
+                                        'Austin Gomber (Hits Allowed)(must start)': {'Over 6.5 HitsAllowed': -101,
+                                                                                     'Under 6.5 HitsAllowed': -132},
+                                        'Austin Gomber (Pitching Outs)(must start)': {'Over 15.5 PitchingOuts': -104,
+                                                                                      'Under 15.5 PitchingOuts': -127},
+                                        'Austin Gomber (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': 120,
+                                                                                         'Under 4.5 Strikeouts': -159},
+                                        'Brendan Rodgers (Home Runs)(must start)': {'Over 0.5 HomeRuns': 782,
+                                                                                    'Under 0.5 HomeRuns': -1808},
+                                        'Brendan Rodgers (Total Bases)(must start)': {'Over 1.5 TotalBases': 112,
+                                                                                      'Under 1.5 TotalBases': -149},
+                                        'Brenton Doyle (Home Runs)(must start)': {'Over 0.5 HomeRuns': 637,
+                                                                                  'Under 0.5 HomeRuns': -1287},
+                                        'Brenton Doyle (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                    'Under 1.5 TotalBases': -171},
+                                        'Ceddanne Rafaela (Home Runs)(must start)': {'Over 0.5 HomeRuns': 552,
+                                                                                     'Under 0.5 HomeRuns': -1027},
+                                        'Ceddanne Rafaela (Total Bases)(must start)': {'Over 1.5 TotalBases': -106,
+                                                                                       'Under 1.5 TotalBases': -127},
+                                        'Charlie Blackmon (Home Runs)(must start)': {'Over 0.5 HomeRuns': 713,
+                                                                                     'Under 0.5 HomeRuns': -1547},
+                                        'Charlie Blackmon (Total Bases)(must start)': {'Over 1.5 TotalBases': 111,
+                                                                                       'Under 1.5 TotalBases': -148},
+                                        'Connor Wong (Home Runs)(must start)': {'Over 0.5 HomeRuns': 438,
+                                                                                'Under 0.5 HomeRuns': -727},
+                                        'Connor Wong (Total Bases)(must start)': {'Over 1.5 TotalBases': -120,
+                                                                                  'Under 1.5 TotalBases': -114},
+                                        'David Hamilton (Home Runs)(must start)': {'Over 0.5 HomeRuns': 739,
+                                                                                   'Under 0.5 HomeRuns': -1641},
+                                        'David Hamilton (Total Bases)(must start)': {'Over 1.5 TotalBases': 131,
+                                                                                     'Under 1.5 TotalBases': -178},
+                                        'Elias Díaz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 805,
+                                                                               'Under 0.5 HomeRuns': -1900},
+                                        'Elias Díaz (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                 'Under 1.5 TotalBases': -170},
+                                        'Ezequiel Tovar (Home Runs)(must start)': {'Over 0.5 HomeRuns': 594,
+                                                                                   'Under 0.5 HomeRuns': -1150},
+                                        'Ezequiel Tovar (Total Bases)(must start)': {'Over 1.5 TotalBases': -108,
+                                                                                     'Under 1.5 TotalBases': -123},
+                                        'Jake Cave (Home Runs)(must start)': {'Over 0.5 HomeRuns': 886,
+                                                                              'Under 0.5 HomeRuns': -2246},
+                                        'Jake Cave (Total Bases)(must start)': {'Over 1.5 TotalBases': 140,
+                                                                                'Under 1.5 TotalBases': -193},
+                                        'Jamie Westbrook (Home Runs)(must start)': {'Over 0.5 HomeRuns': 556,
+                                                                                    'Under 0.5 HomeRuns': -1037},
+                                        'Jamie Westbrook (Total Bases)(must start)': {'Over 1.5 TotalBases': 140,
+                                                                                      'Under 1.5 TotalBases': -188},
+                                        'Jarren Duran (Home Runs)(must start)': {'Over 0.5 HomeRuns': 557,
+                                                                                 'Under 0.5 HomeRuns': -1042},
+                                        'Jarren Duran (Total Bases)(must start)': {'Over 1.5 TotalBases': -151,
+                                                                                   'Under 1.5 TotalBases': 113},
+                                        'Masataka Yoshida (Home Runs)(must start)': {'Over 0.5 HomeRuns': 679,
+                                                                                     'Under 0.5 HomeRuns': -1425},
+                                        'Masataka Yoshida (Total Bases)(must start)': {'Over 1.5 TotalBases': 108,
+                                                                                       'Under 1.5 TotalBases': -144},
+                                        'Michael Toglia (Home Runs)(must start)': {'Over 0.5 HomeRuns': 574,
+                                                                                   'Under 0.5 HomeRuns': -1089},
+                                        'Michael Toglia (Total Bases)(must start)': {'Over 0.5 TotalBases': -185,
+                                                                                     'Under 0.5 TotalBases': 135},
+                                        'Rafael Devers (Home Runs)(must start)': {'Over 0.5 HomeRuns': 313,
+                                                                                  'Under 0.5 HomeRuns': -456},
+                                        'Rafael Devers (Total Bases)(must start)': {'Over 1.5 TotalBases': -124,
+                                                                                    'Under 1.5 TotalBases': -107},
+                                        'Romy Gonzalez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 440,
+                                                                                  'Under 0.5 HomeRuns': -731},
+                                        'Romy Gonzalez (Total Bases)(must start)': {'Over 1.5 TotalBases': -142,
+                                                                                    'Under 1.5 TotalBases': 105},
+                                        'Ryan McMahon (Home Runs)(must start)': {'Over 0.5 HomeRuns': 571,
+                                                                                 'Under 0.5 HomeRuns': -1081},
+                                        'Ryan McMahon (Total Bases)(must start)': {'Over 1.5 TotalBases': 122,
+                                                                                   'Under 1.5 TotalBases': -165},
+                                        'Sam Hilliard (Home Runs)(must start)': {'Over 0.5 HomeRuns': 607,
+                                                                                 'Under 0.5 HomeRuns': -1190},
+                                        'Sam Hilliard (Total Bases)(must start)': {'Over 0.5 TotalBases': -152,
+                                                                                   'Under 0.5 TotalBases': 113},
+                                        'Tanner Houck (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -110,
+                                                                                   'Under 2.5 EarnedRuns': -121},
+                                        'Tanner Houck (Hits Allowed)(must start)': {'Over 6.5 HitsAllowed': 124,
+                                                                                    'Under 6.5 HitsAllowed': -167},
+                                        'Tanner Houck (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -165,
+                                                                                     'Under 17.5 PitchingOuts': 113},
+                                        'Tanner Houck (Total Strikeouts)(must start)': {'Over 5.5 Strikeouts': -126,
+                                                                                        'Under 5.5 Strikeouts': -115},
+                                        "Tyler O'Neill (Home Runs)(must start)": {'Over 0.5 HomeRuns': 250,
+                                                                                  'Under 0.5 HomeRuns': -342},
+                                        "Tyler O'Neill (Total Bases)(must start)": {'Over 1.5 TotalBases': -148,
+                                                                                    'Under 1.5 TotalBases': 111}},
+ 'Chicago White Sox vs Texas Rangers': {'Adolis Garcia (Home Runs)(must start)': {'Over 0.5 HomeRuns': 363,
+                                                                                  'Under 0.5 HomeRuns': -557},
+                                        'Adolis Garcia (Total Bases)(must start)': {'Over 0.5 TotalBases': -193,
+                                                                                    'Under 0.5 TotalBases': 141},
+                                        'Andrew Benintendi (Home Runs)(must start)': {'Over 0.5 HomeRuns': 790,
+                                                                                      'Under 0.5 HomeRuns': -1839},
+                                        'Andrew Benintendi (Total Bases)(must start)': {'Over 1.5 TotalBases': 150,
+                                                                                        'Under 1.5 TotalBases': -208},
+                                        'Andrew Vaughn (Home Runs)(must start)': {'Over 0.5 HomeRuns': 570,
+                                                                                  'Under 0.5 HomeRuns': -1080},
+                                        'Andrew Vaughn (Total Bases)(must start)': {'Over 1.5 TotalBases': 139,
+                                                                                    'Under 1.5 TotalBases': -190},
+                                        'Brooks Baldwin (Home Runs)(must start)': {'Over 0.5 HomeRuns': 860,
+                                                                                   'Under 0.5 HomeRuns': -2129},
+                                        'Brooks Baldwin (Total Bases)(must start)': {'Over 0.5 TotalBases': -157,
+                                                                                     'Under 0.5 TotalBases': 117},
+                                        'Corey Seager (Home Runs)(must start)': {'Over 0.5 HomeRuns': 365,
+                                                                                 'Under 0.5 HomeRuns': -561},
+                                        'Corey Seager (Total Bases)(must start)': {'Over 1.5 TotalBases': 106,
+                                                                                   'Under 1.5 TotalBases': -141},
+                                        'Eloy Jiménez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 479,
+                                                                                 'Under 0.5 HomeRuns': -827},
+                                        'Eloy Jiménez (Total Bases)(must start)': {'Over 1.5 TotalBases': 141,
+                                                                                   'Under 1.5 TotalBases': -194},
+                                        'Erick Fedde (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -100,
+                                                                                  'Under 2.5 EarnedRuns': -140},
+                                        'Erick Fedde (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 114,
+                                                                                   'Under 5.5 HitsAllowed': -152},
+                                        'Erick Fedde (Pitching Outs)(must start)': {'Over 16.5 PitchingOuts': -113,
+                                                                                    'Under 16.5 PitchingOuts': -120},
+                                        'Erick Fedde (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': -104,
+                                                                                       'Under 4.5 Strikeouts': -131},
+                                        'Jonah Heim (Home Runs)(must start)': {'Over 0.5 HomeRuns': 611,
+                                                                               'Under 0.5 HomeRuns': -1202},
+                                        'Jonah Heim (Total Bases)(must start)': {'Over 0.5 TotalBases': -176,
+                                                                                 'Under 0.5 TotalBases': 129},
+                                        'Josh H. Smith (Home Runs)(must start)': {'Over 0.5 HomeRuns': 668,
+                                                                                  'Under 0.5 HomeRuns': -1388},
+                                        'Josh H. Smith (Total Bases)(must start)': {'Over 0.5 TotalBases': -176,
+                                                                                    'Under 0.5 TotalBases': 130},
+                                        'Korey Lee (Home Runs)(must start)': {'Over 0.5 HomeRuns': 823,
+                                                                              'Under 0.5 HomeRuns': -1972},
+                                        'Korey Lee (Total Bases)(must start)': {'Over 0.5 TotalBases': -131,
+                                                                                'Under 0.5 TotalBases': -101},
+                                        'Leody Taveras (Home Runs)(must start)': {'Over 0.5 HomeRuns': 792,
+                                                                                  'Under 0.5 HomeRuns': -1845},
+                                        'Leody Taveras (Total Bases)(must start)': {'Over 0.5 TotalBases': -180,
+                                                                                    'Under 0.5 TotalBases': 132},
+                                        'Luis Robert Jr. (Home Runs)(must start)': {'Over 0.5 HomeRuns': 355,
+                                                                                    'Under 0.5 HomeRuns': -541},
+                                        'Luis Robert Jr. (Total Bases)(must start)': {'Over 1.5 TotalBases': 124,
+                                                                                      'Under 1.5 TotalBases': -168},
+                                        'Marcus Semien (Home Runs)(must start)': {'Over 0.5 HomeRuns': 560,
+                                                                                  'Under 0.5 HomeRuns': -1050},
+                                        'Marcus Semien (Total Bases)(must start)': {'Over 1.5 TotalBases': 129,
+                                                                                    'Under 1.5 TotalBases': -174},
+                                        'Michael Lorenzen (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 103,
+                                                                                       'Under 2.5 EarnedRuns': -149},
+                                        'Michael Lorenzen (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 111,
+                                                                                        'Under 5.5 HitsAllowed': -148},
+                                        'Michael Lorenzen (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -108,
+                                                                                         'Under 17.5 PitchingOuts': -133},
+                                        'Michael Lorenzen (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': -116,
+                                                                                            'Under 4.5 Strikeouts': -114},
+                                        'Nathaniel Lowe (Home Runs)(must start)': {'Over 0.5 HomeRuns': 774,
+                                                                                   'Under 0.5 HomeRuns': -1775},
+                                        'Nathaniel Lowe (Total Bases)(must start)': {'Over 0.5 TotalBases': -188,
+                                                                                     'Under 0.5 TotalBases': 137},
+                                        'Nick Senzel (Total Bases)(must start)': {'Over 0.5 TotalBases': -137,
+                                                                                  'Under 0.5 TotalBases': 103},
+                                        'Paul DeJong (Home Runs)(must start)': {'Over 0.5 HomeRuns': 530,
+                                                                                'Under 0.5 HomeRuns': -964},
+                                        'Paul DeJong (Total Bases)(must start)': {'Over 0.5 TotalBases': -162,
+                                                                                  'Under 0.5 TotalBases': 116},
+                                        'Tommy Pham (Home Runs)(must start)': {'Over 0.5 HomeRuns': 693,
+                                                                               'Under 0.5 HomeRuns': -1473},
+                                        'Tommy Pham (Total Bases)(must start)': {'Over 1.5 TotalBases': 131,
+                                                                                 'Under 1.5 TotalBases': -177},
+                                        'Travis Jankowski (Total Bases)(must start)': {'Over 0.5 TotalBases': -147,
+                                                                                       'Under 0.5 TotalBases': 110},
+                                        'Wyatt Langford (Home Runs)(must start)': {'Over 0.5 HomeRuns': 517,
+                                                                                   'Under 0.5 HomeRuns': -929},
+                                        'Wyatt Langford (Total Bases)(must start)': {'Over 1.5 TotalBases': 138,
+                                                                                     'Under 1.5 TotalBases': -189}},
+ 'Cincinnati Reds vs Atlanta Braves': {'Adam Duvall (Home Runs)(must start)': {'Over 0.5 HomeRuns': 479,
+                                                                               'Under 0.5 HomeRuns': -829},
+                                       'Adam Duvall (Total Bases)(must start)': {'Over 0.5 TotalBases': -157,
+                                                                                 'Under 0.5 TotalBases': 117},
+                                       'Austin Riley (Home Runs)(must start)': {'Over 0.5 HomeRuns': 425,
+                                                                                'Under 0.5 HomeRuns': -696},
+                                       'Austin Riley (Total Bases)(must start)': {'Over 1.5 TotalBases': 117,
+                                                                                  'Under 1.5 TotalBases': -157},
+                                       'Eddie Rosario (Home Runs)(must start)': {'Over 0.5 HomeRuns': 582,
+                                                                                 'Under 0.5 HomeRuns': -1116},
+                                       'Eddie Rosario (Total Bases)(must start)': {'Over 0.5 TotalBases': -154,
+                                                                                   'Under 0.5 TotalBases': 115},
+                                       'Elly De La Cruz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 676,
+                                                                                   'Under 0.5 HomeRuns': -1415},
+                                       'Elly De La Cruz (Total Bases)(must start)': {'Over 0.5 TotalBases': -183,
+                                                                                     'Under 0.5 TotalBases': 134},
+                                       'Hunter Greene (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -102,
+                                                                                   'Under 2.5 EarnedRuns': -139},
+                                       'Hunter Greene (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -115,
+                                                                                    'Under 4.5 HitsAllowed': -125},
+                                       'Hunter Greene (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -121,
+                                                                                     'Under 17.5 PitchingOuts': -112},
+                                       'Hunter Greene (Total Strikeouts)(must start)': {'Over 6.5 Strikeouts': -113,
+                                                                                        'Under 6.5 Strikeouts': -127},
+                                       'Jake Fraley (Total Bases)(must start)': {'Over 0.5 TotalBases': -157,
+                                                                                 'Under 0.5 TotalBases': 117},
+                                       'Jarred Kelenic (Home Runs)(must start)': {'Over 0.5 HomeRuns': 464,
+                                                                                  'Under 0.5 HomeRuns': -791},
+                                       'Jarred Kelenic (Total Bases)(must start)': {'Over 0.5 TotalBases': -173,
+                                                                                    'Under 0.5 TotalBases': 128},
+                                       'Jeimer Candelario (Home Runs)(must start)': {'Over 0.5 HomeRuns': 563,
+                                                                                     'Under 0.5 HomeRuns': -1057},
+                                       'Jeimer Candelario (Total Bases)(must start)': {'Over 0.5 TotalBases': -196,
+                                                                                       'Under 0.5 TotalBases': 142},
+                                       'Jonathan India (Home Runs)(must start)': {'Over 0.5 HomeRuns': 711,
+                                                                                  'Under 0.5 HomeRuns': -1538},
+                                       'Jonathan India (Total Bases)(must start)': {'Over 1.5 TotalBases': 139,
+                                                                                    'Under 1.5 TotalBases': -190},
+                                       'Marcell Ozuna (Home Runs)(must start)': {'Over 0.5 HomeRuns': 288,
+                                                                                 'Under 0.5 HomeRuns': -409},
+                                       'Marcell Ozuna (Total Bases)(must start)': {'Over 1.5 TotalBases': 104,
+                                                                                   'Under 1.5 TotalBases': -138},
+                                       'Matt Olson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 367,
+                                                                              'Under 0.5 HomeRuns': -566},
+                                       'Matt Olson (Total Bases)(must start)': {'Over 0.5 TotalBases': -157,
+                                                                                'Under 0.5 TotalBases': 117},
+                                       'Nacho Alvarez Jr (Total Bases)(must start)': {'Over 0.5 TotalBases': -144,
+                                                                                      'Under 0.5 TotalBases': 108},
+                                       'Noelvi Marte (Home Runs)(must start)': {'Over 0.5 HomeRuns': 751,
+                                                                                'Under 0.5 HomeRuns': -1688},
+                                       'Noelvi Marte (Total Bases)(must start)': {'Over 0.5 TotalBases': -184,
+                                                                                  'Under 0.5 TotalBases': 135},
+                                       'Orlando Arcia (Home Runs)(must start)': {'Over 0.5 HomeRuns': 692,
+                                                                                 'Under 0.5 HomeRuns': -1471},
+                                       'Orlando Arcia (Total Bases)(must start)': {'Over 0.5 TotalBases': -165,
+                                                                                   'Under 0.5 TotalBases': 123},
+                                       'Rece Hinds (Home Runs)(must start)': {'Over 0.5 HomeRuns': 550,
+                                                                              'Under 0.5 HomeRuns': -1021},
+                                       'Rece Hinds (Total Bases)(must start)': {'Over 0.5 TotalBases': -162,
+                                                                                'Under 0.5 TotalBases': 120},
+                                       'Reynaldo Lopez (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 126,
+                                                                                    'Under 2.5 EarnedRuns': -170},
+                                       'Reynaldo Lopez (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -114,
+                                                                                     'Under 4.5 HitsAllowed': -119},
+                                       'Reynaldo Lopez (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -138,
+                                                                                      'Under 17.5 PitchingOuts': -101},
+                                       'Reynaldo Lopez (Total Strikeouts)(must start)': {'Over 6.5 Strikeouts': 124,
+                                                                                         'Under 6.5 Strikeouts': -167},
+                                       'Sean Murphy (Home Runs)(must start)': {'Over 0.5 HomeRuns': 563,
+                                                                               'Under 0.5 HomeRuns': -1057},
+                                       'Sean Murphy (Total Bases)(must start)': {'Over 0.5 TotalBases': -169,
+                                                                                 'Under 0.5 TotalBases': 125},
+                                       'Spencer Steer (Home Runs)(must start)': {'Over 0.5 HomeRuns': 538,
+                                                                                 'Under 0.5 HomeRuns': -987},
+                                       'Spencer Steer (Total Bases)(must start)': {'Over 1.5 TotalBases': 128,
+                                                                                   'Under 1.5 TotalBases': -173},
+                                       'Tyler Stephenson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 600,
+                                                                                    'Under 0.5 HomeRuns': -1170},
+                                       'Tyler Stephenson (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                      'Under 1.5 TotalBases': -171},
+                                       'Will Benson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 735,
+                                                                               'Under 0.5 HomeRuns': -1625},
+                                       'Will Benson (Total Bases)(must start)': {'Over 0.5 TotalBases': 133,
+                                                                                 'Under 0.5 TotalBases': -181}},
+ 'Detroit Tigers vs Cleveland Guardians': {'Andres Gimenez (Total Bases)(must start)': {'Over 0.5 TotalBases': -219,
+                                                                                        'Under 0.5 TotalBases': 156},
+                                           'Angel Martínez (Total Bases)(must start)': {'Over 0.5 TotalBases': -165,
+                                                                                        'Under 0.5 TotalBases': 122},
+                                           'Bo Naylor (Total Bases)(must start)': {'Over 0.5 TotalBases': -119,
+                                                                                   'Under 0.5 TotalBases': -111},
+                                           'Brayan Rocchio (Total Bases)(must start)': {'Over 0.5 TotalBases': -115,
+                                                                                        'Under 0.5 TotalBases': -115},
+                                           'Carlos Carrasco (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 116,
+                                                                                         'Under 2.5 EarnedRuns': -155},
+                                           'Carlos Carrasco (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -108,
+                                                                                          'Under 5.5 HitsAllowed': -129},
+                                           'Carlos Carrasco (Pitching Outs)(must start)': {'Over 15.5 PitchingOuts': 121,
+                                                                                           'Under 15.5 PitchingOuts': -179},
+                                           'Carlos Carrasco (Total Strikeouts)(must start)': {'Over 3.5 Strikeouts': -165,
+                                                                                              'Under 3.5 Strikeouts': 123},
+                                           'Carson Kelly (Home Runs)(must start)': {'Over 0.5 HomeRuns': 656,
+                                                                                    'Under 0.5 HomeRuns': -1348},
+                                           'Carson Kelly (Total Bases)(must start)': {'Over 0.5 TotalBases': -202,
+                                                                                      'Under 0.5 TotalBases': 146},
+                                           'Colt Keith (Home Runs)(must start)': {'Over 0.5 HomeRuns': 734,
+                                                                                  'Under 0.5 HomeRuns': -1623},
+                                           'Colt Keith (Total Bases)(must start)': {'Over 1.5 TotalBases': 109,
+                                                                                    'Under 1.5 TotalBases': -145},
+                                           'David Fry (Home Runs)(must start)': {'Over 0.5 HomeRuns': 726,
+                                                                                 'Under 0.5 HomeRuns': -1593},
+                                           'David Fry (Total Bases)(must start)': {'Over 0.5 TotalBases': -159,
+                                                                                   'Under 0.5 TotalBases': 118},
+                                           'Gio Urshela (Total Bases)(must start)': {'Over 1.5 TotalBases': 143,
+                                                                                     'Under 1.5 TotalBases': -198},
+                                           'Javier Báez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 774,
+                                                                                   'Under 0.5 HomeRuns': -1775},
+                                           'Javier Báez (Total Bases)(must start)': {'Over 0.5 TotalBases': -210,
+                                                                                     'Under 0.5 TotalBases': 151},
+                                           'Jhonkensy Noel (Home Runs)(must start)': {'Over 0.5 HomeRuns': 570,
+                                                                                      'Under 0.5 HomeRuns': -1080},
+                                           'Jhonkensy Noel (Total Bases)(must start)': {'Over 0.5 TotalBases': -130,
+                                                                                        'Under 0.5 TotalBases': -102},
+                                           'Jose Ramirez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 440,
+                                                                                    'Under 0.5 HomeRuns': -731},
+                                           'Jose Ramirez (Total Bases)(must start)': {'Over 1.5 TotalBases': 112,
+                                                                                      'Under 1.5 TotalBases': -150},
+                                           'Josh Naylor (Home Runs)(must start)': {'Over 0.5 HomeRuns': 674,
+                                                                                   'Under 0.5 HomeRuns': -1409},
+                                           'Josh Naylor (Total Bases)(must start)': {'Over 1.5 TotalBases': 154,
+                                                                                     'Under 1.5 TotalBases': -216},
+                                           'Mark Canha (Home Runs)(must start)': {'Over 0.5 HomeRuns': 815,
+                                                                                  'Under 0.5 HomeRuns': -1940},
+                                           'Mark Canha (Total Bases)(must start)': {'Over 0.5 TotalBases': -215,
+                                                                                    'Under 0.5 TotalBases': 154},
+                                           'Matt Vierling (Home Runs)(must start)': {'Over 0.5 HomeRuns': 556,
+                                                                                     'Under 0.5 HomeRuns': -1038},
+                                           'Matt Vierling (Total Bases)(must start)': {'Over 1.5 TotalBases': 115,
+                                                                                       'Under 1.5 TotalBases': -153},
+                                           'Riley Greene (Home Runs)(must start)': {'Over 0.5 HomeRuns': 545,
+                                                                                    'Under 0.5 HomeRuns': -1007},
+                                           'Riley Greene (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                      'Under 1.5 TotalBases': -170},
+                                           'Steven Kwan (Total Bases)(must start)': {'Over 1.5 TotalBases': 133,
+                                                                                     'Under 1.5 TotalBases': -182},
+                                           'Tarik Skubal (Earned Runs)(must start)': {'Over 1.5 EarnedRuns': -141,
+                                                                                      'Under 1.5 EarnedRuns': 106},
+                                           'Tarik Skubal (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -176,
+                                                                                       'Under 4.5 HitsAllowed': 125},
+                                           'Tarik Skubal (Total Strikeouts)(must start)': {'Over 6.5 Strikeouts': 106,
+                                                                                           'Under 6.5 Strikeouts': -150},
+                                           'Wenceel Perez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 893,
+                                                                                     'Under 0.5 HomeRuns': -2277},
+                                           'Wenceel Perez (Total Bases)(must start)': {'Over 1.5 TotalBases': 127,
+                                                                                       'Under 1.5 TotalBases': -172},
+                                           'Zach McKinstry (Home Runs)(must start)': {'Over 0.5 HomeRuns': 754,
+                                                                                      'Under 0.5 HomeRuns': -1696},
+                                           'Zach McKinstry (Total Bases)(must start)': {'Over 1.5 TotalBases': 138,
+                                                                                        'Under 1.5 TotalBases': -190}},
+ 'Houston Astros vs Oakland Athletics': {'Abraham Toro (Home Runs)(must start)': {'Over 0.5 HomeRuns': 890,
+                                                                                  'Under 0.5 HomeRuns': -2264},
+                                         'Abraham Toro (Total Bases)(must start)': {'Over 0.5 TotalBases': -174,
+                                                                                    'Under 0.5 TotalBases': 128},
+                                         'Alex Bregman (Home Runs)(must start)': {'Over 0.5 HomeRuns': 595,
+                                                                                  'Under 0.5 HomeRuns': -1154},
+                                         'Alex Bregman (Total Bases)(must start)': {'Over 1.5 TotalBases': 107,
+                                                                                    'Under 1.5 TotalBases': -142},
+                                         'Brent Rooker (Home Runs)(must start)': {'Over 0.5 HomeRuns': 413,
+                                                                                  'Under 0.5 HomeRuns': -667},
+                                         'Brent Rooker (Total Bases)(must start)': {'Over 0.5 TotalBases': -161,
+                                                                                    'Under 0.5 TotalBases': 120},
+                                         'Chas McCormick (Home Runs)(must start)': {'Over 0.5 HomeRuns': 686,
+                                                                                    'Under 0.5 HomeRuns': -1450},
+                                         'Chas McCormick (Total Bases)(must start)': {'Over 0.5 TotalBases': -166,
+                                                                                      'Under 0.5 TotalBases': 123},
+                                         'Hogan Harris (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -162,
+                                                                                    'Under 2.5 EarnedRuns': 111},
+                                         'Hogan Harris (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -104,
+                                                                                     'Under 5.5 HitsAllowed': -130},
+                                         'Hogan Harris (Total Strikeouts)(must start)': {'Over 3.5 Strikeouts': 106,
+                                                                                         'Under 3.5 Strikeouts': -141},
+                                         'JJ Bleday (Home Runs)(must start)': {'Over 0.5 HomeRuns': 577,
+                                                                               'Under 0.5 HomeRuns': -1100},
+                                         'JJ Bleday (Total Bases)(must start)': {'Over 0.5 TotalBases': -177,
+                                                                                 'Under 0.5 TotalBases': 130},
+                                         'Jake Meyers (Home Runs)(must start)': {'Over 0.5 HomeRuns': 554,
+                                                                                 'Under 0.5 HomeRuns': -1031},
+                                         'Jake Meyers (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                   'Under 1.5 TotalBases': -170},
+                                         'Jeremy Pena (Home Runs)(must start)': {'Over 0.5 HomeRuns': 751,
+                                                                                 'Under 0.5 HomeRuns': -1685},
+                                         'Jeremy Pena (Total Bases)(must start)': {'Over 1.5 TotalBases': 108,
+                                                                                   'Under 1.5 TotalBases': -143},
+                                         'Joey Loperfido (Home Runs)(must start)': {'Over 0.5 HomeRuns': 794,
+                                                                                    'Under 0.5 HomeRuns': -1855},
+                                         'Joey Loperfido (Total Bases)(must start)': {'Over 0.5 TotalBases': -127,
+                                                                                      'Under 0.5 TotalBases': -104},
+                                         'Jose Altuve (Home Runs)(must start)': {'Over 0.5 HomeRuns': 461,
+                                                                                 'Under 0.5 HomeRuns': -782},
+                                         'Jose Altuve (Total Bases)(must start)': {'Over 1.5 TotalBases': -109,
+                                                                                   'Under 1.5 TotalBases': -122},
+                                         'Lawrence Butler (Home Runs)(must start)': {'Over 0.5 HomeRuns': 521,
+                                                                                     'Under 0.5 HomeRuns': -940},
+                                         'Lawrence Butler (Total Bases)(must start)': {'Over 0.5 TotalBases': -174,
+                                                                                       'Under 0.5 TotalBases': 128},
+                                         'Mauricio Dubon (Home Runs)(must start)': {'Over 0.5 HomeRuns': 906,
+                                                                                    'Under 0.5 HomeRuns': -2337},
+                                         'Mauricio Dubon (Total Bases)(must start)': {'Over 1.5 TotalBases': 119,
+                                                                                      'Under 1.5 TotalBases': -160},
+                                         'Max Schuemann (Total Bases)(must start)': {'Over 0.5 TotalBases': -117,
+                                                                                     'Under 0.5 TotalBases': -113},
+                                         'Miguel Andujar (Total Bases)(must start)': {'Over 1.5 TotalBases': 151,
+                                                                                      'Under 1.5 TotalBases': -210},
+                                         'Seth Brown (Home Runs)(must start)': {'Over 0.5 HomeRuns': 663,
+                                                                                'Under 0.5 HomeRuns': -1370},
+                                         'Seth Brown (Total Bases)(must start)': {'Over 0.5 TotalBases': -118,
+                                                                                  'Under 0.5 TotalBases': -112},
+                                         'Shea Langeliers (Home Runs)(must start)': {'Over 0.5 HomeRuns': 453,
+                                                                                     'Under 0.5 HomeRuns': -764},
+                                         'Shea Langeliers (Total Bases)(must start)': {'Over 0.5 TotalBases': -163,
+                                                                                       'Under 0.5 TotalBases': 121},
+                                         'Spencer Arrighetti (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 130,
+                                                                                          'Under 2.5 EarnedRuns': -177},
+                                         'Spencer Arrighetti (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -108,
+                                                                                           'Under 4.5 HitsAllowed': -127},
+                                         'Spencer Arrighetti (Pitching Outs)(must start)': {'Over 16.5 PitchingOuts': -106,
+                                                                                            'Under 16.5 PitchingOuts': -125},
+                                         'Spencer Arrighetti (Total Strikeouts)(must start)': {'Over 5.5 Strikeouts': -142,
+                                                                                               'Under 5.5 Strikeouts': 104},
+                                         'Yainer Diaz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 551,
+                                                                                 'Under 0.5 HomeRuns': -1023},
+                                         'Yainer Diaz (Total Bases)(must start)': {'Over 1.5 TotalBases': -108,
+                                                                                   'Under 1.5 TotalBases': -123},
+                                         'Yordan Alvarez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 337,
+                                                                                    'Under 0.5 HomeRuns': -503},
+                                         'Yordan Alvarez (Total Bases)(must start)': {'Over 1.5 TotalBases': -100,
+                                                                                      'Under 1.5 TotalBases': -132},
+                                         'Zack Gelof (Home Runs)(must start)': {'Over 0.5 HomeRuns': 759,
+                                                                                'Under 0.5 HomeRuns': -1718},
+                                         'Zack Gelof (Total Bases)(must start)': {'Over 0.5 TotalBases': -117,
+                                                                                  'Under 0.5 TotalBases': -113}},
+ 'Los Angeles Angels vs Seattle Mariners': {'Anthony Rendon (Total Bases)(must start)': {'Over 0.5 TotalBases': -198,
+                                                                                         'Under 0.5 TotalBases': 143},
+                                            'Brandon Drury (Home Runs)(must start)': {'Over 0.5 HomeRuns': 777,
+                                                                                      'Under 0.5 HomeRuns': -1787},
+                                            'Brandon Drury (Total Bases)(must start)': {'Over 0.5 TotalBases': -169,
+                                                                                        'Under 0.5 TotalBases': 125},
+                                            'Bryce Miller (Earned Runs)(must start)': {'Over 1.5 EarnedRuns': -140,
+                                                                                       'Under 1.5 EarnedRuns': 102},
+                                            'Bryce Miller (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -125,
+                                                                                        'Under 4.5 HitsAllowed': -107},
+                                            'Bryce Miller (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -109,
+                                                                                         'Under 17.5 PitchingOuts': -134},
+                                            'Bryce Miller (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': -161,
+                                                                                            'Under 4.5 Strikeouts': 110},
+                                            'Cal Raleigh (Home Runs)(must start)': {'Over 0.5 HomeRuns': 219,
+                                                                                    'Under 0.5 HomeRuns': -314},
+                                            'Cal Raleigh (Total Bases)(must start)': {'Over 1.5 TotalBases': 114,
+                                                                                      'Under 1.5 TotalBases': -161},
+                                            'Dylan Moore (Home Runs)(must start)': {'Over 0.5 HomeRuns': 399,
+                                                                                    'Under 0.5 HomeRuns': -635},
+                                            'Dylan Moore (Total Bases)(must start)': {'Over 0.5 TotalBases': -147,
+                                                                                      'Under 0.5 TotalBases': 110},
+                                            'J.P. Crawford (Home Runs)(must start)': {'Over 0.5 HomeRuns': 577,
+                                                                                      'Under 0.5 HomeRuns': -1100},
+                                            'J.P. Crawford (Total Bases)(must start)': {'Over 1.5 TotalBases': 150,
+                                                                                        'Under 1.5 TotalBases': -209},
+                                            'Jo Adell (Home Runs)(must start)': {'Over 0.5 HomeRuns': 715,
+                                                                                 'Under 0.5 HomeRuns': -1554},
+                                            'Jo Adell (Total Bases)(must start)': {'Over 0.5 TotalBases': -106,
+                                                                                   'Under 0.5 TotalBases': -125},
+                                            'Jorge Polanco (Home Runs)(must start)': {'Over 0.5 HomeRuns': 428,
+                                                                                      'Under 0.5 HomeRuns': -702},
+                                            'Jorge Polanco (Total Bases)(must start)': {'Over 1.5 TotalBases': 131,
+                                                                                        'Under 1.5 TotalBases': -187},
+                                            'Josh Rojas (Home Runs)(must start)': {'Over 0.5 HomeRuns': 797,
+                                                                                   'Under 0.5 HomeRuns': -1864},
+                                            'Josh Rojas (Total Bases)(must start)': {'Over 0.5 TotalBases': -125,
+                                                                                     'Under 0.5 TotalBases': -106},
+                                            "Logan O'Hoppe (Home Runs)(must start)": {'Over 0.5 HomeRuns': 554,
+                                                                                      'Under 0.5 HomeRuns': -1032},
+                                            "Logan O'Hoppe (Total Bases)(must start)": {'Over 0.5 TotalBases': -181,
+                                                                                        'Under 0.5 TotalBases': 133},
+                                            'Mickey Moniak (Home Runs)(must start)': {'Over 0.5 HomeRuns': 274,
+                                                                                      'Under 0.5 HomeRuns': -588},
+                                            'Mickey Moniak (Total Bases)(must start)': {'Over 0.5 TotalBases': -167,
+                                                                                        'Under 0.5 TotalBases': 124},
+                                            'Mitch Garver (Home Runs)(must start)': {'Over 0.5 HomeRuns': 325,
+                                                                                     'Under 0.5 HomeRuns': -479},
+                                            'Mitch Garver (Total Bases)(must start)': {'Over 0.5 TotalBases': -179,
+                                                                                       'Under 0.5 TotalBases': 132},
+                                            'Mitch Haniger (Home Runs)(must start)': {'Over 0.5 HomeRuns': 453,
+                                                                                      'Under 0.5 HomeRuns': -763},
+                                            'Mitch Haniger (Total Bases)(must start)': {'Over 0.5 TotalBases': -166,
+                                                                                        'Under 0.5 TotalBases': 123},
+                                            'Nolan Schanuel (Home Runs)(must start)': {'Over 0.5 HomeRuns': 909,
+                                                                                       'Under 0.5 HomeRuns': -2351},
+                                            'Nolan Schanuel (Total Bases)(must start)': {'Over 1.5 TotalBases': 161,
+                                                                                         'Under 1.5 TotalBases': -227},
+                                            'Taylor Ward (Home Runs)(must start)': {'Over 0.5 HomeRuns': 615,
+                                                                                    'Under 0.5 HomeRuns': -1217},
+                                            'Taylor Ward (Total Bases)(must start)': {'Over 0.5 TotalBases': -168,
+                                                                                      'Under 0.5 TotalBases': 124},
+                                            'Tyler Anderson (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -130,
+                                                                                         'Under 2.5 EarnedRuns': -102},
+                                            'Tyler Anderson (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 128,
+                                                                                          'Under 5.5 HitsAllowed': -180},
+                                            'Tyler Anderson (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': -151,
+                                                                                           'Under 17.5 PitchingOuts': 104},
+                                            'Tyler Anderson (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': -151,
+                                                                                              'Under 4.5 Strikeouts': 107},
+                                            'Tyler Locklear (Home Runs)(must start)': {'Over 0.5 HomeRuns': 536,
+                                                                                       'Under 0.5 HomeRuns': -980},
+                                            'Tyler Locklear (Total Bases)(must start)': {'Over 0.5 TotalBases': -121,
+                                                                                         'Under 0.5 TotalBases': -110},
+                                            'Victor Robles (Home Runs)(must start)': {'Over 0.5 HomeRuns': 809,
+                                                                                      'Under 0.5 HomeRuns': -1917},
+                                            'Victor Robles (Total Bases)(must start)': {'Over 0.5 TotalBases': -210,
+                                                                                        'Under 0.5 TotalBases': 151},
+                                            'Willie Calhoun (Home Runs)(must start)': {'Over 0.5 HomeRuns': 553,
+                                                                                       'Under 0.5 HomeRuns': -1030},
+                                            'Willie Calhoun (Total Bases)(must start)': {'Over 0.5 TotalBases': -190,
+                                                                                         'Under 0.5 TotalBases': 139},
+                                            'Zach Neto (Home Runs)(must start)': {'Over 0.5 HomeRuns': 603,
+                                                                                  'Under 0.5 HomeRuns': -1178},
+                                            'Zach Neto (Total Bases)(must start)': {'Over 0.5 TotalBases': -132,
+                                                                                    'Under 0.5 TotalBases': -100}},
+ 'Milwaukee Brewers vs Chicago Cubs': {'Brice Turang (Total Bases)(must start)': {'Over 1.5 TotalBases': 112,
+                                                                                  'Under 1.5 TotalBases': -155},
+                                       'Christian Yelich (Home Runs)(must start)': {'Over 0.5 HomeRuns': 552,
+                                                                                    'Under 0.5 HomeRuns': -1026},
+                                       'Christian Yelich (Total Bases)(must start)': {'Over 1.5 TotalBases': 103,
+                                                                                      'Under 1.5 TotalBases': -137},
+                                       'Christopher Morel (Home Runs)(must start)': {'Over 0.5 HomeRuns': 417,
+                                                                                     'Under 0.5 HomeRuns': -677},
+                                       'Christopher Morel (Total Bases)(must start)': {'Over 0.5 TotalBases': -180,
+                                                                                       'Under 0.5 TotalBases': 132},
+                                       'Dansby Swanson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 540,
+                                                                                  'Under 0.5 HomeRuns': -993},
+                                       'Dansby Swanson (Total Bases)(must start)': {'Over 0.5 TotalBases': -201,
+                                                                                    'Under 0.5 TotalBases': 145},
+                                       'Garrett Mitchell (Total Bases)(must start)': {'Over 0.5 TotalBases': -160,
+                                                                                      'Under 0.5 TotalBases': 119},
+                                       'Ian Happ (Home Runs)(must start)': {'Over 0.5 HomeRuns': 632,
+                                                                            'Under 0.5 HomeRuns': -1270},
+                                       'Ian Happ (Total Bases)(must start)': {'Over 0.5 TotalBases': -178,
+                                                                              'Under 0.5 TotalBases': 131},
+                                       'Jackson Chourio (Home Runs)(must start)': {'Over 0.5 HomeRuns': 848,
+                                                                                   'Under 0.5 HomeRuns': -2078},
+                                       'Jackson Chourio (Total Bases)(must start)': {'Over 0.5 TotalBases': -214,
+                                                                                     'Under 0.5 TotalBases': 154},
+                                       'Javier Assad (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 117,
+                                                                                  'Under 2.5 EarnedRuns': -166},
+                                       'Javier Assad (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -102,
+                                                                                   'Under 4.5 HitsAllowed': -137},
+                                       'Javier Assad (Total Strikeouts)(must start)': {'Over 3.5 Strikeouts': -121,
+                                                                                       'Under 3.5 Strikeouts': -119},
+                                       'Joey Ortiz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 823,
+                                                                              'Under 0.5 HomeRuns': -1972},
+                                       'Joey Ortiz (Total Bases)(must start)': {'Over 1.5 TotalBases': 157,
+                                                                                'Under 1.5 TotalBases': -220},
+                                       'Michael Busch (Home Runs)(must start)': {'Over 0.5 HomeRuns': 698,
+                                                                                 'Under 0.5 HomeRuns': -1493},
+                                       'Michael Busch (Total Bases)(must start)': {'Over 0.5 TotalBases': -191,
+                                                                                   'Under 0.5 TotalBases': 139},
+                                       'Miguel Amaya (Home Runs)(must start)': {'Over 0.5 HomeRuns': 835,
+                                                                                'Under 0.5 HomeRuns': -2022},
+                                       'Miguel Amaya (Total Bases)(must start)': {'Over 0.5 TotalBases': -153,
+                                                                                  'Under 0.5 TotalBases': 114},
+                                       'Mike Tauchman (Total Bases)(must start)': {'Over 0.5 TotalBases': -206,
+                                                                                   'Under 0.5 TotalBases': 148},
+                                       'Nico Hoerner (Total Bases)(must start)': {'Over 1.5 TotalBases': 121,
+                                                                                  'Under 1.5 TotalBases': -163},
+                                       'Pete Crow-Armstrong (Total Bases)(must start)': {'Over 0.5 TotalBases': -158,
+                                                                                         'Under 0.5 TotalBases': 118},
+                                       'Rhys Hoskins (Home Runs)(must start)': {'Over 0.5 HomeRuns': 434,
+                                                                                'Under 0.5 HomeRuns': -718},
+                                       'Rhys Hoskins (Total Bases)(must start)': {'Over 0.5 TotalBases': -183,
+                                                                                  'Under 0.5 TotalBases': 134},
+                                       'Sal Frelick (Total Bases)(must start)': {'Over 1.5 TotalBases': 153,
+                                                                                 'Under 1.5 TotalBases': -213},
+                                       'Seiya Suzuki (Home Runs)(must start)': {'Over 0.5 HomeRuns': 408,
+                                                                                'Under 0.5 HomeRuns': -656},
+                                       'Seiya Suzuki (Total Bases)(must start)': {'Over 1.5 TotalBases': 108,
+                                                                                  'Under 1.5 TotalBases': -143},
+                                       'Tobias Myers (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -101,
+                                                                                  'Under 2.5 EarnedRuns': -131},
+                                       'Tobias Myers (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 119,
+                                                                                   'Under 5.5 HitsAllowed': -165},
+                                       'Tobias Myers (Pitching Outs)(must start)': {'Over 16.5 PitchingOuts': -122,
+                                                                                    'Under 16.5 PitchingOuts': -110},
+                                       'Tobias Myers (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': -179,
+                                                                                       'Under 4.5 Strikeouts': 122},
+                                       'William Contreras (Home Runs)(must start)': {'Over 0.5 HomeRuns': 458,
+                                                                                     'Under 0.5 HomeRuns': -774},
+                                       'William Contreras (Total Bases)(must start)': {'Over 1.5 TotalBases': 112,
+                                                                                       'Under 1.5 TotalBases': -149},
+                                       'Willy Adames (Home Runs)(must start)': {'Over 0.5 HomeRuns': 474,
+                                                                                'Under 0.5 HomeRuns': -816},
+                                       'Willy Adames (Total Bases)(must start)': {'Over 1.5 TotalBases': 123,
+                                                                                  'Under 1.5 TotalBases': -166}},
+ 'New York Mets vs Miami Marlins': {'Ali Sánchez (Total Bases)(must start)': {'Over 0.5 TotalBases': -130,
+                                                                              'Under 0.5 TotalBases': -102},
+                                    'Brandon Nimmo (Home Runs)(must start)': {'Over 0.5 HomeRuns': 487,
+                                                                              'Under 0.5 HomeRuns': -849},
+                                    'Brandon Nimmo (Total Bases)(must start)': {'Over 1.5 TotalBases': -106,
+                                                                                'Under 1.5 TotalBases': -125},
+                                    'Bryan De La Cruz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 709,
+                                                                                 'Under 0.5 HomeRuns': -1531},
+                                    'Bryan De La Cruz (Total Bases)(must start)': {'Over 1.5 TotalBases': 130,
+                                                                                   'Under 1.5 TotalBases': -177},
+                                    'David Peterson (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 134,
+                                                                                 'Under 2.5 EarnedRuns': -183},
+                                    'David Peterson (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -103,
+                                                                                  'Under 5.5 HitsAllowed': -132},
+                                    'David Peterson (Pitching Outs)(must start)': {'Over 17.5 PitchingOuts': 103,
+                                                                                   'Under 17.5 PitchingOuts': -141},
+                                    'David Peterson (Total Strikeouts)(must start)': {'Over 5.5 Strikeouts': 128,
+                                                                                      'Under 5.5 Strikeouts': -173},
+                                    'Emmanuel Rivera (Total Bases)(must start)': {'Over 0.5 TotalBases': -178,
+                                                                                  'Under 0.5 TotalBases': 131},
+                                    'Francisco Alvarez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 688,
+                                                                                  'Under 0.5 HomeRuns': -1459},
+                                    'Francisco Alvarez (Total Bases)(must start)': {'Over 1.5 TotalBases': 150,
+                                                                                    'Under 1.5 TotalBases': -209},
+                                    'Francisco Lindor (Home Runs)(must start)': {'Over 0.5 HomeRuns': 418,
+                                                                                 'Under 0.5 HomeRuns': -679},
+                                    'Francisco Lindor (Total Bases)(must start)': {'Over 1.5 TotalBases': -111,
+                                                                                   'Under 1.5 TotalBases': -119},
+                                    'Harrison Bader (Total Bases)(must start)': {'Over 0.5 TotalBases': -192,
+                                                                                 'Under 0.5 TotalBases': 140},
+                                    'J.D. Martinez (Home Runs)(must start)': {'Over 0.5 HomeRuns': 541,
+                                                                              'Under 0.5 HomeRuns': -994},
+                                    'J.D. Martinez (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                'Under 1.5 TotalBases': -171},
+                                    'Jake Burger (Home Runs)(must start)': {'Over 0.5 HomeRuns': 471,
+                                                                            'Under 0.5 HomeRuns': -808},
+                                    'Jake Burger (Total Bases)(must start)': {'Over 1.5 TotalBases': 120,
+                                                                              'Under 1.5 TotalBases': -161},
+                                    'Jazz Chisholm Jr. (Home Runs)(must start)': {'Over 0.5 HomeRuns': 879,
+                                                                                  'Under 0.5 HomeRuns': -2216},
+                                    'Jazz Chisholm Jr. (Total Bases)(must start)': {'Over 0.5 TotalBases': -170,
+                                                                                    'Under 0.5 TotalBases': 125},
+                                    'Jeff McNeil (Home Runs)(must start)': {'Over 0.5 HomeRuns': 876,
+                                                                            'Under 0.5 HomeRuns': -2199},
+                                    'Jeff McNeil (Total Bases)(must start)': {'Over 1.5 TotalBases': 147,
+                                                                              'Under 1.5 TotalBases': -204},
+                                    'Jesus Sanchez (Total Bases)(must start)': {'Over 0.5 TotalBases': -136,
+                                                                                'Under 0.5 TotalBases': 102},
+                                    'Jose Iglesias (Total Bases)(must start)': {'Over 1.5 TotalBases': 140,
+                                                                                'Under 1.5 TotalBases': -192},
+                                    'Josh Bell (Home Runs)(must start)': {'Over 0.5 HomeRuns': 802,
+                                                                          'Under 0.5 HomeRuns': -1887},
+                                    'Josh Bell (Total Bases)(must start)': {'Over 1.5 TotalBases': 154,
+                                                                            'Under 1.5 TotalBases': -215},
+                                    'Mark Vientos (Home Runs)(must start)': {'Over 0.5 HomeRuns': 608,
+                                                                             'Under 0.5 HomeRuns': -1194},
+                                    'Mark Vientos (Total Bases)(must start)': {'Over 0.5 TotalBases': -211,
+                                                                               'Under 0.5 TotalBases': 152},
+                                    'Otto Lopez (Total Bases)(must start)': {'Over 1.5 TotalBases': 143,
+                                                                             'Under 1.5 TotalBases': -198},
+                                    'Pete Alonso (Home Runs)(must start)': {'Over 0.5 HomeRuns': 481,
+                                                                            'Under 0.5 HomeRuns': -960},
+                                    'Pete Alonso (Total Bases)(must start)': {'Over 1.5 TotalBases': 146,
+                                                                              'Under 1.5 TotalBases': -174},
+                                    'Xavier Edwards (Total Bases)(must start)': {'Over 0.5 TotalBases': -212,
+                                                                                 'Under 0.5 TotalBases': 152},
+                                    'Yonny Chirinos (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -129,
+                                                                                 'Under 2.5 EarnedRuns': -108},
+                                    'Yonny Chirinos (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -113,
+                                                                                  'Under 5.5 HitsAllowed': -104},
+                                    'Yonny Chirinos (Pitching Outs)(must start)': {'Over 15.5 PitchingOuts': -115,
+                                                                                   'Under 15.5 PitchingOuts': -121},
+                                    'Yonny Chirinos (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': 141,
+                                                                                      'Under 4.5 Strikeouts': -190}},
+ 'Philadelphia Phillies vs Minnesota Twins': {'Alec Bohm (Home Runs)(must start)': {'Over 0.5 HomeRuns': 485,
+                                                                                    'Under 0.5 HomeRuns': -845},
+                                              'Alec Bohm (Total Bases)(must start)': {'Over 1.5 TotalBases': 101,
+                                                                                      'Under 1.5 TotalBases': -137},
+                                              'Austin Martin (Total Bases)(must start)': {'Over 0.5 TotalBases': -194,
+                                                                                          'Under 0.5 TotalBases': 141},
+                                              'Bailey Ober (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': -128,
+                                                                                        'Under 2.5 EarnedRuns': -107},
+                                              'Bailey Ober (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': 106,
+                                                                                         'Under 5.5 HitsAllowed': -154},
+                                              'Bailey Ober (Total Strikeouts)(must start)': {'Over 5.5 Strikeouts': -113,
+                                                                                             'Under 5.5 Strikeouts': -123},
+                                              'Brandon Marsh (Home Runs)(must start)': {'Over 0.5 HomeRuns': 707,
+                                                                                        'Under 0.5 HomeRuns': -1524},
+                                              'Brandon Marsh (Total Bases)(must start)': {'Over 0.5 TotalBases': -154,
+                                                                                          'Under 0.5 TotalBases': 115},
+                                              'Brooks Lee (Home Runs)(must start)': {'Over 0.5 HomeRuns': 831,
+                                                                                     'Under 0.5 HomeRuns': -2007},
+                                              'Brooks Lee (Total Bases)(must start)': {'Over 1.5 TotalBases': 137,
+                                                                                       'Under 1.5 TotalBases': -187},
+                                              'Bryce Harper (Home Runs)(must start)': {'Over 0.5 HomeRuns': 341,
+                                                                                       'Under 0.5 HomeRuns': -513},
+                                              'Bryce Harper (Total Bases)(must start)': {'Over 1.5 TotalBases': -108,
+                                                                                         'Under 1.5 TotalBases': -126},
+                                              'Bryson Stott (Home Runs)(must start)': {'Over 0.5 HomeRuns': 830,
+                                                                                       'Under 0.5 HomeRuns': -2000},
+                                              'Bryson Stott (Total Bases)(must start)': {'Over 1.5 TotalBases': 138,
+                                                                                         'Under 1.5 TotalBases': -189},
+                                              'Byron Buxton (Home Runs)(must start)': {'Over 0.5 HomeRuns': 379,
+                                                                                       'Under 0.5 HomeRuns': -591},
+                                              'Byron Buxton (Total Bases)(must start)': {'Over 1.5 TotalBases': 116,
+                                                                                         'Under 1.5 TotalBases': -155},
+                                              'Carlos Santana (Home Runs)(must start)': {'Over 0.5 HomeRuns': 694,
+                                                                                         'Under 0.5 HomeRuns': -1478},
+                                              'Carlos Santana (Total Bases)(must start)': {'Over 1.5 TotalBases': 144,
+                                                                                           'Under 1.5 TotalBases': -198},
+                                              'Diego A. Castillo (Home Runs)(must start)': {'Over 0.5 HomeRuns': 746,
+                                                                                            'Under 0.5 HomeRuns': -1667},
+                                              'Diego A. Castillo (Total Bases)(must start)': {'Over 0.5 TotalBases': -191,
+                                                                                              'Under 0.5 TotalBases': 140},
+                                              'J.T. Realmuto (Home Runs)(must start)': {'Over 0.5 HomeRuns': 382,
+                                                                                        'Under 0.5 HomeRuns': -599},
+                                              'J.T. Realmuto (Total Bases)(must start)': {'Over 1.5 TotalBases': 108,
+                                                                                          'Under 1.5 TotalBases': -143},
+                                              'Johan Rojas (Home Runs)(must start)': {'Over 0.5 HomeRuns': 905,
+                                                                                      'Under 0.5 HomeRuns': -2332},
+                                              'Johan Rojas (Total Bases)(must start)': {'Over 0.5 TotalBases': -185,
+                                                                                        'Under 0.5 TotalBases': 135},
+                                              'Kyle Schwarber (Home Runs)(must start)': {'Over 0.5 HomeRuns': 251,
+                                                                                         'Under 0.5 HomeRuns': -343},
+                                              'Kyle Schwarber (Total Bases)(must start)': {'Over 1.5 TotalBases': 103,
+                                                                                           'Under 1.5 TotalBases': -137},
+                                              'Manuel Margot (Home Runs)(must start)': {'Over 0.5 HomeRuns': 860,
+                                                                                        'Under 0.5 HomeRuns': -2129},
+                                              'Manuel Margot (Total Bases)(must start)': {'Over 1.5 TotalBases': 118,
+                                                                                          'Under 1.5 TotalBases': -158},
+                                              'Max Kepler (Home Runs)(must start)': {'Over 0.5 HomeRuns': 712,
+                                                                                     'Under 0.5 HomeRuns': -1543},
+                                              'Max Kepler (Total Bases)(must start)': {'Over 0.5 TotalBases': -216,
+                                                                                       'Under 0.5 TotalBases': 155},
+                                              'Nick Castellanos (Home Runs)(must start)': {'Over 0.5 HomeRuns': 450,
+                                                                                           'Under 0.5 HomeRuns': -756},
+                                              'Nick Castellanos (Total Bases)(must start)': {'Over 1.5 TotalBases': 123,
+                                                                                             'Under 1.5 TotalBases': -166},
+                                              'Ranger Suarez (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 103,
+                                                                                          'Under 2.5 EarnedRuns': -137},
+                                              'Ranger Suarez (Hits Allowed)(must start)': {'Over 6.5 HitsAllowed': 120,
+                                                                                           'Under 6.5 HitsAllowed': -161},
+                                              'Ranger Suarez (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': 102,
+                                                                                               'Under 4.5 Strikeouts': -139},
+                                              'Ryan Jeffers (Home Runs)(must start)': {'Over 0.5 HomeRuns': 585,
+                                                                                       'Under 0.5 HomeRuns': -1122},
+                                              'Ryan Jeffers (Total Bases)(must start)': {'Over 1.5 TotalBases': 151,
+                                                                                         'Under 1.5 TotalBases': -210},
+                                              'Trea Turner (Home Runs)(must start)': {'Over 0.5 HomeRuns': 327,
+                                                                                      'Under 0.5 HomeRuns': -484},
+                                              'Trea Turner (Total Bases)(must start)': {'Over 1.5 TotalBases': -113,
+                                                                                        'Under 1.5 TotalBases': -123},
+                                              'Willi Castro (Home Runs)(must start)': {'Over 0.5 HomeRuns': 833,
+                                                                                       'Under 0.5 HomeRuns': -2014},
+                                              'Willi Castro (Total Bases)(must start)': {'Over 1.5 TotalBases': 128,
+                                                                                         'Under 1.5 TotalBases': -174}},
+ 'St. Louis Cardinals vs Pittsburgh Pirates': {'Alec Burleson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 712,
+                                                                                         'Under 0.5 HomeRuns': -1543},
+                                               'Alec Burleson (Total Bases)(must start)': {'Over 1.5 TotalBases': 114,
+                                                                                           'Under 1.5 TotalBases': -153},
+                                               'Andre Pallante (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 124,
+                                                                                            'Under 2.5 EarnedRuns': -168},
+                                               'Andre Pallante (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -175,
+                                                                                             'Under 4.5 HitsAllowed': 129},
+                                               'Andre Pallante (Pitching Outs)(must start)': {'Over 16.5 PitchingOuts': -101,
+                                                                                              'Under 16.5 PitchingOuts': -134},
+                                               'Andre Pallante (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': 129,
+                                                                                                 'Under 4.5 Strikeouts': -175},
+                                               'Andrew McCutchen (Home Runs)(must start)': {'Over 0.5 HomeRuns': 705,
+                                                                                            'Under 0.5 HomeRuns': -1518},
+                                               'Andrew McCutchen (Total Bases)(must start)': {'Over 1.5 TotalBases': 144,
+                                                                                              'Under 1.5 TotalBases': -199},
+                                               'Bryan Reynolds (Home Runs)(must start)': {'Over 0.5 HomeRuns': 786,
+                                                                                          'Under 0.5 HomeRuns': -1820},
+                                               'Bryan Reynolds (Total Bases)(must start)': {'Over 1.5 TotalBases': 136,
+                                                                                            'Under 1.5 TotalBases': -186},
+                                               'Joey Bart (Home Runs)(must start)': {'Over 0.5 HomeRuns': 833,
+                                                                                     'Under 0.5 HomeRuns': -2014},
+                                               'Joey Bart (Total Bases)(must start)': {'Over 0.5 TotalBases': -140,
+                                                                                       'Under 0.5 TotalBases': 105},
+                                               'Joshua Palacios (Total Bases)(must start)': {'Over 0.5 TotalBases': -163,
+                                                                                             'Under 0.5 TotalBases': 121},
+                                               "Ke'Bryan Hayes (Total Bases)(must start)": {'Over 1.5 TotalBases': 142,
+                                                                                            'Under 1.5 TotalBases': -196},
+                                               'Lars Nootbaar (Total Bases)(must start)': {'Over 0.5 TotalBases': -168,
+                                                                                           'Under 0.5 TotalBases': 124},
+                                               'Masyn Winn (Total Bases)(must start)': {'Over 1.5 TotalBases': 120,
+                                                                                        'Under 1.5 TotalBases': -161},
+                                               'Mitch Keller (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 108,
+                                                                                          'Under 2.5 EarnedRuns': -158},
+                                               'Mitch Keller (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -107,
+                                                                                           'Under 5.5 HitsAllowed': -126},
+                                               'Mitch Keller (Total Strikeouts)(must start)': {'Over 5.5 Strikeouts': 101,
+                                                                                               'Under 5.5 Strikeouts': -134},
+                                               'Nick Gonzales (Total Bases)(must start)': {'Over 1.5 TotalBases': 129,
+                                                                                           'Under 1.5 TotalBases': -176},
+                                               'Nolan Arenado (Total Bases)(must start)': {'Over 1.5 TotalBases': 143,
+                                                                                           'Under 1.5 TotalBases': -198},
+                                               'Nolan Gorman (Home Runs)(must start)': {'Over 0.5 HomeRuns': 487,
+                                                                                        'Under 0.5 HomeRuns': -1210},
+                                               'Nolan Gorman (Total Bases)(must start)': {'Over 0.5 TotalBases': -102,
+                                                                                          'Under 0.5 TotalBases': -130},
+                                               'Oneil Cruz (Home Runs)(must start)': {'Over 0.5 HomeRuns': 708,
+                                                                                      'Under 0.5 HomeRuns': -1527},
+                                               'Oneil Cruz (Total Bases)(must start)': {'Over 0.5 TotalBases': -212,
+                                                                                        'Under 0.5 TotalBases': 152},
+                                               'Paul Goldschmidt (Home Runs)(must start)': {'Over 0.5 HomeRuns': 694,
+                                                                                            'Under 0.5 HomeRuns': -1480},
+                                               'Paul Goldschmidt (Total Bases)(must start)': {'Over 1.5 TotalBases': 148,
+                                                                                              'Under 1.5 TotalBases': -205},
+                                               'Rowdy Tellez (Total Bases)(must start)': {'Over 0.5 TotalBases': -154,
+                                                                                          'Under 0.5 TotalBases': 115},
+                                               'Willson Contreras (Home Runs)(must start)': {'Over 0.5 HomeRuns': 622,
+                                                                                             'Under 0.5 HomeRuns': -1238},
+                                               'Willson Contreras (Total Bases)(must start)': {'Over 1.5 TotalBases': 143,
+                                                                                               'Under 1.5 TotalBases': -198}},
+ 'Tampa Bay Rays vs New York Yankees': {'Aaron Judge (Home Runs)(must start)': {'Over 0.5 HomeRuns': 135,
+                                                                                'Under 0.5 HomeRuns': -192},
+                                        'Aaron Judge (Total Bases)(must start)': {'Over 2.5 TotalBases': 101,
+                                                                                  'Under 2.5 TotalBases': -136},
+                                        'Alex Jackson (Home Runs)(must start)': {'Over 0.5 HomeRuns': 560,
+                                                                                 'Under 0.5 HomeRuns': -1049},
+                                        'Alex Jackson (Total Bases)(must start)': {'Over 0.5 TotalBases': 113,
+                                                                                   'Under 0.5 TotalBases': -150},
+                                        'Alex Verdugo (Home Runs)(must start)': {'Over 0.5 HomeRuns': 569,
+                                                                                 'Under 0.5 HomeRuns': -1075},
+                                        'Alex Verdugo (Total Bases)(must start)': {'Over 1.5 TotalBases': 148,
+                                                                                   'Under 1.5 TotalBases': -206},
+                                        'Amed Rosario (Home Runs)(must start)': {'Over 0.5 HomeRuns': 646,
+                                                                                 'Under 0.5 HomeRuns': -1315},
+                                        'Amed Rosario (Total Bases)(must start)': {'Over 1.5 TotalBases': 102,
+                                                                                   'Under 1.5 TotalBases': -135},
+                                        'Anthony Volpe (Total Bases)(must start)': {'Over 1.5 TotalBases': 140,
+                                                                                    'Under 1.5 TotalBases': -192},
+                                        'Austin Wells (Home Runs)(must start)': {'Over 0.5 HomeRuns': 381,
+                                                                                 'Under 0.5 HomeRuns': -597},
+                                        'Austin Wells (Total Bases)(must start)': {'Over 1.5 TotalBases': 127,
+                                                                                   'Under 1.5 TotalBases': -172},
+                                        'Ben Rice (Home Runs)(must start)': {'Over 0.5 HomeRuns': 333,
+                                                                             'Under 0.5 HomeRuns': -602},
+                                        'Ben Rice (Total Bases)(must start)': {'Over 1.5 TotalBases': 118,
+                                                                               'Under 1.5 TotalBases': -158},
+                                        'Carlos Rodon (Earned Runs)(must start)': {'Over 2.5 EarnedRuns': 109,
+                                                                                   'Under 2.5 EarnedRuns': -145},
+                                        'Carlos Rodon (Hits Allowed)(must start)': {'Over 4.5 HitsAllowed': -130,
+                                                                                    'Under 4.5 HitsAllowed': -112},
+                                        'Carlos Rodon (Pitching Outs)(must start)': {'Over 16.5 PitchingOuts': -133,
+                                                                                     'Under 16.5 PitchingOuts': -102},
+                                        'Carlos Rodon (Total Strikeouts)(must start)': {'Over 6.5 Strikeouts': -165,
+                                                                                        'Under 6.5 Strikeouts': 114},
+                                        'Curtis Mead (Home Runs)(must start)': {'Over 0.5 HomeRuns': 604,
+                                                                                'Under 0.5 HomeRuns': -1182},
+                                        'Curtis Mead (Total Bases)(must start)': {'Over 1.5 TotalBases': 144,
+                                                                                  'Under 1.5 TotalBases': -198},
+                                        'DJ LeMahieu (Total Bases)(must start)': {'Over 0.5 TotalBases': -242,
+                                                                                  'Under 0.5 TotalBases': 159},
+                                        'Gleyber Torres (Home Runs)(must start)': {'Over 0.5 HomeRuns': 571,
+                                                                                   'Under 0.5 HomeRuns': -1677},
+                                        'Gleyber Torres (Total Bases)(must start)': {'Over 1.5 TotalBases': 138,
+                                                                                     'Under 1.5 TotalBases': -189},
+                                        'Isaac Paredes (Home Runs)(must start)': {'Over 0.5 HomeRuns': 486,
+                                                                                  'Under 0.5 HomeRuns': -846},
+                                        'Isaac Paredes (Total Bases)(must start)': {'Over 1.5 TotalBases': 144,
+                                                                                    'Under 1.5 TotalBases': -199},
+                                        'Jonny DeLuca (Home Runs)(must start)': {'Over 0.5 HomeRuns': 536,
+                                                                                 'Under 0.5 HomeRuns': -982},
+                                        'Jonny DeLuca (Total Bases)(must start)': {'Over 0.5 TotalBases': -210,
+                                                                                   'Under 0.5 TotalBases': 144},
+                                        'Jose Siri (Home Runs)(must start)': {'Over 0.5 HomeRuns': 433,
+                                                                              'Under 0.5 HomeRuns': -1014},
+                                        'Jose Siri (Total Bases)(must start)': {'Over 0.5 TotalBases': -124,
+                                                                                'Under 0.5 TotalBases': -107},
+                                        'José Caballero (Home Runs)(must start)': {'Over 0.5 HomeRuns': 713,
+                                                                                   'Under 0.5 HomeRuns': -1545},
+                                        'José Caballero (Total Bases)(must start)': {'Over 0.5 TotalBases': -125,
+                                                                                     'Under 0.5 TotalBases': -106},
+                                        'Juan Soto (Home Runs)(must start)': {'Over 0.5 HomeRuns': 230,
+                                                                              'Under 0.5 HomeRuns': -308},
+                                        'Juan Soto (Total Bases)(must start)': {'Over 1.5 TotalBases': -115,
+                                                                                'Under 1.5 TotalBases': -118},
+                                        'Randy Arozarena (Home Runs)(must start)': {'Over 0.5 HomeRuns': 340,
+                                                                                    'Under 0.5 HomeRuns': -509},
+                                        'Randy Arozarena (Total Bases)(must start)': {'Over 1.5 TotalBases': 126,
+                                                                                      'Under 1.5 TotalBases': -170},
+                                        'Taylor Walls (Home Runs)(must start)': {'Over 0.5 HomeRuns': 851,
+                                                                                 'Under 0.5 HomeRuns': -2094},
+                                        'Taylor Walls (Total Bases)(must start)': {'Over 0.5 TotalBases': -119,
+                                                                                   'Under 0.5 TotalBases': -111},
+                                        'Trent Grisham (Home Runs)(must start)': {'Over 0.5 HomeRuns': 491,
+                                                                                  'Under 0.5 HomeRuns': -861},
+                                        'Trent Grisham (Total Bases)(must start)': {'Over 0.5 TotalBases': -138,
+                                                                                    'Under 0.5 TotalBases': 104},
+                                        'Zack Littell (Earned Runs)(must start)': {'Over 3.5 EarnedRuns': 127,
+                                                                                   'Under 3.5 EarnedRuns': -179},
+                                        'Zack Littell (Hits Allowed)(must start)': {'Over 5.5 HitsAllowed': -130,
+                                                                                    'Under 5.5 HitsAllowed': -102},
+                                        'Zack Littell (Pitching Outs)(must start)': {'Over 15.5 PitchingOuts': 105,
+                                                                                     'Under 15.5 PitchingOuts': -143},
+                                        'Zack Littell (Total Strikeouts)(must start)': {'Over 4.5 Strikeouts': 124,
+                                                                                        'Under 4.5 Strikeouts': -167}}}
