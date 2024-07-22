@@ -1277,6 +1277,7 @@ pitchers = {
     "Bruihl, Justin": 677865,
     "Plesac, Zach": 668676,
     "Heller, Ben": 621294,
+    "Diaz, Yilber": 700270,
     "Rogers, Josh": 642028,
     "Young, Alex": 622065,
     "Chirinos, Yonny": 630023,
