@@ -8,6 +8,8 @@ from time import sleep
 import pathlib
 import pprint
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from database_manager import insert_player_prop
+
 
 #TODO Let Paul C know he should have tried harder.
 #TODO Scrape the page faster, threading isnt enough ):
@@ -59,15 +61,21 @@ def FindGameLinks(driver, sport):
     driver.implicitly_wait(1)
     gamelinks = []
     for block in contentBlocks:
-        print(f"{block.get_attribute('class'), block.get_attribute('data-test-id')}")
+        print(f"{block.get_attribute('class'), block.get_attribute('data-test-id'), block.get_attribute('data-mode')}")
+        if block.get_attribute('data-mode') == 'live': continue
+        if block.get_attribute('data-test-id') == 'LiveContainer': continue
         rows = [row.text for row in block.find_elements(By.CLASS_NAME, 'event-row-participant')]  # text for each team name
         hrefs = [link.get_attribute('href') for link in block.find_elements(By.XPATH, ".//a[@class=''][@href]")]
         # removing trailing slash after NBA to properly create URL's for props.
         gamelinks.extend([link[:-1] + urlsuffix for link in hrefs if (link.startswith(baseurl) and link.endswith('/'))])
-
+        
         pprint.pprint(rows)
         #pprint.pprint(hrefs)
-
+    
+    # TODO: figure out how to do this here?
+    #pairs = [f"{a} vs {b}" for a,b in zip(rows[0::2], rows[1::2])]
+    #mapped_gamelinks = {gametitle: link for gametitle, link in zip(pairs, gamelinks)}
+    
     pprint.pprint(gamelinks)
     return gamelinks
 
@@ -197,7 +205,7 @@ def ScrapePage(driver: webdriver.Firefox):
     driver.implicitly_wait(0)
     market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"][@data-collapsed="false"]')  # filtering out collapsed elements (maybe a bad idea)
     #market_groups = matchup_market_groups.find_elements(By.XPATH, './/div[@data-test-id="Collapse"]')
-    driver.implicitly_wait(1)
+    #driver.implicitly_wait(1)
     
     market_blocks = {
         # title : content (container for buttons and subheading, if any)
@@ -262,7 +270,7 @@ def ScrapePage(driver: webdriver.Firefox):
 # Initialize WebDriver for each thread
 def initialize_driver():
     options = FirefoxOptions()
-    options.add_argument('--headless')
+    #options.add_argument('--headless')
     #options.page_load_strategy = 'eager'  # breaks everything
     
     #firefox_profile = FirefoxProfile(profile_directory=ProfilePath())
@@ -281,10 +289,25 @@ def scrape_link(link, sport):
         driver.quit()
     return market_data
 
+def process_pinnacle_data(game_url, data):
+    for player_market, odds in data.items():
+        player_name, market = player_market.rsplit(' (', 1)
+        market = market.rstrip(')')
+        
+        line = None
+        over_odds = None
+        under_odds = None
+        
+        for line_type, line_odds in odds.items():
+            if line_type.startswith('Over'):
+                line = float(line_type.split()[1])
+                over_odds = line_odds
+            elif line_type.startswith('Under'):
+                under_odds = line_odds
+        
+        insert_player_prop(game_url, player_name, market, line, over_odds, under_odds)
 
-if __name__ == "__main__":
-    cwd = pathlib.Path.cwd()
-    assert (cwd.name == "Boddssuck" and "you're in the wrong directory")
+def Main():
     default_sport = "MLB"
     
     driver = initialize_driver()
@@ -292,11 +315,16 @@ if __name__ == "__main__":
         links = FindGameLinks(driver, default_sport)
     driver.quit()
     
-    links = links[0:3]
-    
     with ThreadPoolExecutor(max_workers=None) as executor:
         results = [executor.submit(scrape_link, link, default_sport) for link in links]
-        #results = list(executor.submit(lambda link: scrape_link(link, default_sport), links))
     
-    for future in results:
-        pprint.pprint(future.result())
+    for future, link in zip(as_completed(results), links):
+        game_data = future.result()
+        process_pinnacle_data(link, game_data)
+    
+    print("Data successfully inserted into the database.")
+    
+    return [future.result() for future in results]
+
+if __name__ == "__main__":
+    Main()

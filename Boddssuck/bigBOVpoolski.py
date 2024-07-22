@@ -10,6 +10,8 @@ import pprint
 import pathlib
 import cProfile
 import pstats
+import sqlite3
+import database_manager as db
 
 import update_importpaths
 import MLBAnalytics.SPdailyodds
@@ -129,8 +131,8 @@ def Main():
     
     urls = [
         'https://www.bovada.lv/sports/baseball/mlb',
-        'https://www.bovada.lv/sports/hockey/nhl',
-        'https://www.bovada.lv/sports/basketball/nba'
+        #'https://www.bovada.lv/sports/hockey/nhl',
+        #'https://www.bovada.lv/sports/basketball/nba'
     ]
     tab_handles = []
     for url in urls:
@@ -194,8 +196,34 @@ def PrintScrapedData(scraped_data):
     print(f"\n\n total_linecount number of lines scraped across all pages: {total_linecount}")
     
 
+def CommitScrapedData(scraped_data):
+    for url, data in scraped_data.items():
+        game_id = db.insert_game(url)
+        for data_dict in data:
+            header = data_dict['header'][0]
+            section = data_dict['section']
+            if header in section:
+                section.remove(header)
+            
+            market_id = db.insert_market(game_id, header)
+            
+            # remove "must start for action" text from results
+            #section = [item for item in section if item != "Must start for action. Game must go 8.5 innings unless the outcome has been determined."]
+            
+            if (len(section) % 2) == 0:
+                for selection, odds in zip(section[0::2], section[1::2]):
+                    db.insert_odds(market_id, selection, odds)
+            else:
+                # Handle odd number of lines (potential additional info)
+                for i in range(0, len(section) - 1, 2):
+                    selection, odds = section[i], section[i+1]
+                    additional_info = section[-1] if i == len(section) - 3 else None
+                    db.insert_odds(market_id, selection, odds, additional_info)
+
+    
+
 if __name__ == "__main__":
     results = Main()
     PrintScrapedData(results)
     print("exiting")
-    
+    CommitScrapedData(results)
