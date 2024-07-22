@@ -5,8 +5,13 @@ from pprint import pprint
 
 logging.basicConfig(level=logging.INFO)
 
-def CreateFolders():
+def CreateDBFolders():
     cwd = pathlib.Path.cwd()
+    if pathlib.Path.cwd().name != "Database":
+        print(f"""Your working directory is not correct;
+            you should be running this from the 'Database' directory.
+            \ncurrently: {pathlib.Path.cwd()}\n""")
+        raise PermissionError
     (cwd / 'Stable' ).mkdir(exist_ok=True)
     (cwd / 'Testing').mkdir(exist_ok=True)
     return
@@ -100,6 +105,8 @@ def TableFromDict(cursor, tablename: str, table_data: dict[any, dict]):
     create_table_sql = f"CREATE TABLE IF NOT EXISTS '{tablename}' (id INTEGER PRIMARY KEY AUTOINCREMENT, "
     create_table_sql += ", ".join([f"'{col}' TEXT" for col in columns]) # should maybe be 'FLOAT' here instead?
     create_table_sql += ")"
+    print("creating table SQL: \n\n")
+    print(create_table_sql)
     
     cursor.execute(create_table_sql)
     insert_sql = f"INSERT INTO '{tablename}' ({', '.join(columns)}) VALUES ({', '.join(['?' for _ in columns])})"
@@ -112,7 +119,8 @@ def TableFromDict(cursor, tablename: str, table_data: dict[any, dict]):
 # failing due to floating-point numbers in the data
 
 
-def Example():
+def ClaudesExample():
+    print("\nbuilding claude's DB...\n")
     dbconnection, dbcursor = OpenDatabase('claudes_database.db', create_ifmissing=True)
     table_name = 'people'
     input_data = {
@@ -120,19 +128,24 @@ def Example():
        'person2': {'name': 'Alice', 'age': '25', 'city': 'Los Angeles'},
        'person3': {'name': 'Bob', 'age': '35', 'city': 'Chicago'}
     }
+    pprint(f"\ninput_data: {input_data}\n\n")
     TableFromDict(dbcursor, table_name, input_data)
     dbconnection.commit()
     dbconnection.close()
 
 
-if __name__ == "__main__":
+def Example():
     dbname = 'teamreports.db'
     dbconnection, dbcursor = OpenDatabase(dbname)
-    
+
     db_structure = GetDatabaseStructure(dbconnection)
     pprint(db_structure)
-    
-    counts = CursorExec(dbcursor, 'SELECT COUNT(*) FROM "main"."graphs"')
-    Example()
-    
 
+    counts = CursorExec(dbcursor, 'SELECT COUNT(*) FROM "main"."graphs"')
+    print(counts)
+    return
+
+
+
+if __name__ == "__main__":
+    ClaudesExample()
