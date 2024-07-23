@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 #TODO Let Paul C know he should have tried harder.
-#TODO Scrape the page faster, threading isnt enough ):
+#TODO Fix multithreading, commit results to database
 
 # Looks like the option for the odds-format is stored under the localstorage:
 # Local Storage > Main:Preferences (Object) > Odds:Object > format:"decimal"
@@ -303,9 +303,12 @@ def Main_Multithreaded():
         return {gametitle: scrape_link(link, sport)}
     
     with ThreadPoolExecutor(max_workers=None) as executor:
-        futures = [executor.submit(ScrapeLinkLambda, link, gametitle, default_sport) for link, gametitle in mapped_gamelinks]
+        futures = [executor.submit(ScrapeLinkLambda, link, gametitle, default_sport) for link, gametitle in mapped_gamelinks.items()]
+    
     results = [future.result() for future in as_completed(futures)]
-    return {gametitle: result for gametitle, result in results}
+    
+    # Merge all dictionaries in the results list
+    return {k: v for result_dict in results for k, v in result_dict.items()}
 
 
 def Main():
@@ -322,5 +325,5 @@ def Main():
 
 
 if __name__ == "__main__":
-    scraped_data = Main()
+    scraped_data = Main_Multithreaded()
     pprint.pprint(scraped_data)
