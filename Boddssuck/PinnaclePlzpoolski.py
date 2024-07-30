@@ -8,10 +8,10 @@ from time import sleep
 import pathlib
 import pprint
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from localdatabase_manager import insert_player_prop
 
 #TODO Let Paul C know he should have tried harder.
-#TODO Fix multithreading, commit results to database
+# Needs some refactoring. Running main commits data to the DB
 
 # Looks like the option for the odds-format is stored under the localstorage:
 # Local Storage > Main:Preferences (Object) > Odds:Object > format:"decimal"
@@ -291,9 +291,30 @@ def scrape_link(link, sport):
     return market_data
 
 
+
+
+# This is the function that was lost, now refound to bring it all back together
+def process_pinnacle_data(game_url, data):
+    for player_market, odds in data.items():
+        player_name, market = player_market.rsplit(' (', 1)
+        market = market.rstrip(')')
+        
+        line = None
+        over_odds = None
+        under_odds = None
+        
+        for line_type, line_odds in odds.items():
+            if line_type.startswith('Over'):
+                line = float(line_type.split()[1])
+                over_odds = line_odds
+            elif line_type.startswith('Under'):
+                under_odds = line_odds
+        
+        insert_player_prop(game_url, player_name, market, line, over_odds, under_odds)
+
 def Main_Multithreaded():
     default_sport = "MLB"
-    
+                
     driver = initialize_driver()
     with driver.context(driver.CONTEXT_CONTENT):
         mapped_gamelinks = FindGameLinks(driver, default_sport)
@@ -310,20 +331,28 @@ def Main_Multithreaded():
     # Merge all dictionaries in the results list
     return {k: v for result_dict in results for k, v in result_dict.items()}
 
-
 def Main():
     default_sport = "MLB"
+    
     driver = initialize_driver()
     with driver.context(driver.CONTEXT_CONTENT):
-        mapped_gamelinks = FindGameLinks(driver, default_sport)
+        links = FindGameLinks(driver, default_sport)
     driver.quit()
     
-    results = {}
-    for link, gametitle in mapped_gamelinks.items():
-        results[gametitle] = scrape_link(link, default_sport)
-    return results
+    with ThreadPoolExecutor(max_workers=None) as executor:
+        results = [executor.submit(scrape_link, link, default_sport) for link in links]
+    
+    for future, link in zip(as_completed(results), links):
+        game_data = future.result()
+        process_pinnacle_data(link, game_data)
+    
+    print("Data successfully inserted into the database.")
+    
+    return [future.result() for future in results]
 
 
 if __name__ == "__main__":
-    scraped_data = Main_Multithreaded()
+    scraped_data = Main()
+    #scraped_data = Main_Multithreaded()
     pprint.pprint(scraped_data)
+    
