@@ -8,10 +8,8 @@ from time import sleep
 import pathlib
 import pprint
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from localdatabase_manager import insert_player_prop
 
 #TODO Let Paul C know he should have tried harder.
-# Needs some refactoring. Running main commits data to the DB
 
 # Looks like the option for the odds-format is stored under the localstorage:
 # Local Storage > Main:Preferences (Object) > Odds:Object > format:"decimal"
@@ -55,7 +53,8 @@ def FindGameLinks(driver, sport):
     #    lambda x: [c for c in x.find_elements(By.CLASS_NAME, "contentBlock")
     #               if c.get_attribute("data-test-id") == 'LiveContainer']
     #)
-    driver.implicitly_wait(0)
+    #driver.implicitly_wait(0) # broken
+    driver.implicitly_wait(3)
     contentBlocks = list(driver.find_elements(By.XPATH, "//div[@id='root']//div[contains(@class, 'contentBlock')]"))
     driver.implicitly_wait(1)
     gamelinks = []
@@ -157,7 +156,10 @@ def ParseMarketGroup(webelements: dict) -> dict:
             # TODO: figure out if clicking the expand button invalidates the buttoncolumns
     
     def ParseButton(button: WebElement) -> dict:
-        return {button.get_attribute("title"): int(button.get_attribute("aria-label").removeprefix("Money Line "))}
+        aria_value = button.get_attribute("aria-label")
+        if aria_value.startswith("Money Line "):
+            return {button.get_attribute("title"): int(aria_value.removeprefix("Money Line "))}
+        return {}
     
     index = 0
     def GetNextIndex():
@@ -291,30 +293,9 @@ def scrape_link(link, sport):
     return market_data
 
 
-
-
-# This is the function that was lost, now refound to bring it all back together
-def process_pinnacle_data(game_url, data):
-    for player_market, odds in data.items():
-        player_name, market = player_market.rsplit(' (', 1)
-        market = market.rstrip(')')
-        
-        line = None
-        over_odds = None
-        under_odds = None
-        
-        for line_type, line_odds in odds.items():
-            if line_type.startswith('Over'):
-                line = float(line_type.split()[1])
-                over_odds = line_odds
-            elif line_type.startswith('Under'):
-                under_odds = line_odds
-        
-        insert_player_prop(game_url, player_name, market, line, over_odds, under_odds)
-
 def Main_Multithreaded():
     default_sport = "MLB"
-                
+    
     driver = initialize_driver()
     with driver.context(driver.CONTEXT_CONTENT):
         mapped_gamelinks = FindGameLinks(driver, default_sport)
@@ -333,26 +314,23 @@ def Main_Multithreaded():
 
 def Main():
     default_sport = "MLB"
-    
     driver = initialize_driver()
     with driver.context(driver.CONTEXT_CONTENT):
-        links = FindGameLinks(driver, default_sport)
+        mapped_gamelinks = FindGameLinks(driver, default_sport)
     driver.quit()
     
-    with ThreadPoolExecutor(max_workers=None) as executor:
-        results = [executor.submit(scrape_link, link, default_sport) for link in links]
-    
-    for future, link in zip(as_completed(results), links):
-        game_data = future.result()
-        process_pinnacle_data(link, game_data)
-    
-    print("Data successfully inserted into the database.")
-    
-    return [future.result() for future in results]
+    results = {}
+    for link, gametitle in mapped_gamelinks.items():
+        # avoiding an overwrite / clobbering info across dates (games for today and tomorrow are both in the same container element)
+        # note that this completely breaks multithreading; the assumption is that today's games always come first
+        if gametitle in results.keys(): print(f"entry already exists for {gametitle}; skipping"); continue
+        results[gametitle] = scrape_link(link, default_sport)
+    return results
 
 
 if __name__ == "__main__":
     scraped_data = Main()
     #scraped_data = Main_Multithreaded()
     pprint.pprint(scraped_data)
+    
     

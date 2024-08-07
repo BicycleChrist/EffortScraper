@@ -96,9 +96,21 @@ def CursorExec(cursor, dbcommand, flatten_single=True):
 # builtin database names: "main" and "temp"
 
 
+def RecurseDictionaryTypes(table_data, recursion_lvl=0):
+    leading_indent = ''
+    for lvl in range(recursion_lvl):
+        leading_indent += '\t'
+    print(f"{leading_indent}key_types: {[type(key) for key in table_data.keys()]}")
+    print(f"{leading_indent}value_types: {[type(value) for value in table_data.values()]}")
+    for (value, value_type) in [(value, type(value)) for value in table_data.values()]:
+        if value_type == type(dict()):
+            RecurseDictionaryTypes(value, recursion_lvl+1)
+    return
+
+
 def TableFromDict(cursor, tablename: str, table_data: dict[any, dict]):
     # Get the column names from the keys of the first nested dictionary
-    columns = [ f"{key}" for key in next(iter(table_data.values())).keys() ]
+    columns = [ f"{key}".replace(' ', '_') for key in next(iter(table_data.values())).keys() ]
     # surrounding each one with quotes because SQL will fail if any of the inputs contain spaces
     
     # Create the table
@@ -124,13 +136,28 @@ def ClaudesExample():
     dbconnection, dbcursor = OpenDatabase('claudes_database.db', create_ifmissing=True)
     table_name = 'people'
     input_data = {
-       'person1': {'name': 'John', 'age': '30', 'city': 'New York'},
-       'person2': {'name': 'Alice', 'age': '25', 'city': 'Los Angeles'},
-       'person3': {'name': 'Bob', 'age': '35', 'city': 'Chicago'}
+       'somestring' : {
+       1: {'name': 'John' , 'age': 99, 'city': 'New York'   },
+       2: {'name': 'Alice', 'age': 25, 'city': 'Los Angeles'},
+       3: {'name': 'Bob'  , 'age': 567, 'city': 'Chicago'    },
+       },
+        44 : {
+        'person1': {'name': 'John' , 'age': 343, 'city': 'New York'   },
+        'person2': {'name': 'Alice', 'age': 25, 'city': 'Los Angeles'},
+        'person3': {'name': 'Bob'  , 'age': 55, 'city': 'Chicago'    },
+       },
+       12 : {
+       'person13': {'name': 'John' , 'age': 30, 'city': 'New York'   },
+       'person23': {'name': 'Alice', 'age': 25, 'city': 'Los Angeles'},
+       'person33': {'name': 'Bob'  , 'age': 35, 'city': 'Chicago'    },
+       },
     }
     print("input_data:")
     pprint(input_data)
-    TableFromDict(dbcursor, table_name, input_data)
+    print('\n\n')
+    RecurseDictionaryTypes(input_data)
+    print('\n\n')
+    #TableFromDict(dbcursor, table_name, input_data)
     dbconnection.commit()
     dbconnection.close()
 
