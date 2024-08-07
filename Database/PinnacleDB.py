@@ -1,20 +1,20 @@
 import update_importpaths
 import Boddssuck.PinnaclePlzpoolski as PinnaclePlz
 from SQLutil import *
-from database_manager import *
-
 from pprint import pprint
 
 
 def AttemptToBuildTable(PinncaleData):
-    dbname = 'new_pinnacle.db'
+    dbname = 'Pinnacle.db'
     dbconnection, dbcursor = OpenDatabase(dbname, create_ifmissing=True)
-    for (key, value) in PinncaleData.items():
-        TableFromDict(dbcursor, key, value)
+    #for (gametitle, entries) in PinncaleData.items():
+    #    TableFromDict(dbcursor, gametitle, entries)
+    TableFromDict(dbconnection, "PinnacleTable", PinncaleData)
     dbconnection.commit()
     dbconnection.close()
     return
 
+#from SampleData import *
 test_dict = {
     'Arizona Diamondbacks vs Kansas City Royals': {'Adam Frazier (Total Bases)(must start)': {'Over 1.5 TotalBases': 142,
                                                                                            'Under 1.5 TotalBases': -196},
@@ -103,7 +103,6 @@ if __name__ == "__main__":
     print("Asking Pinnacle Nicely...\n\n")
     PinnacleData = PinnaclePlz.Main()
     pprint(PinnacleData)
-    #AttemptToBuildTable(PinnacleData)
-    
-    process_pinnacle_data("www.pinnacle.com", PinnacleData)
-    #process_pinnacle_data("www.pinnacle.com", test_dict)
+    AttemptToBuildTable(PinnacleData)
+    #AttemptToBuildTable(SampleData)
+

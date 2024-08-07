@@ -108,27 +108,47 @@ def RecurseDictionaryTypes(table_data, recursion_lvl=0):
     return
 
 
-def TableFromDict(cursor, tablename: str, table_data: dict[any, dict]):
-    # Get the column names from the keys of the first nested dictionary
-    columns = [ f"{key}".replace(' ', '_') for key in next(iter(table_data.values())).keys() ]
-    # surrounding each one with quotes because SQL will fail if any of the inputs contain spaces
+# whitespace and parentheses are fine inside of quotes
+def EscapeString(inputstring: str):
+    return f"\"{inputstring}\""
+
+def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
+    # whitespace in tablenames / columns is illegal (SQL syntax splits on spaces)
+    #tablename_segments = tablename.split() # on whitespace
+    #tablename = '_'.join(tablename_segments)
+    # whitespace and parentheses are fine inside of quotes
+    tablename = EscapeString(tablename)
+    columns = [ 'game', 'market', 'line', 'value', ]
+    sql_column_defs = [ f'{column_name} TEXT' for column_name in columns]
+    sql_full_column_def = '(' + ', '.join(sql_column_defs) + ')'
+    sql_column_bullshit = '(' + ', '.join(columns) + ')'  # when inserting, you don't specify the types
     
-    # Create the table
-    create_table_sql = f"CREATE TABLE IF NOT EXISTS {tablename} (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-    create_table_sql += ", ".join([f"{col} TEXT" for col in columns]) # should maybe be 'FLOAT' here instead?
-    create_table_sql += ")"
-    print("creating table SQL: \n\n")
-    print(create_table_sql)
+    dbconnection.execute(f"CREATE TABLE {tablename} {sql_full_column_def}")
     
-    cursor.execute(create_table_sql)
-    insert_sql = f"INSERT INTO {tablename} ({', '.join(columns)}) VALUES ({', '.join(['?' for _ in columns])})"
+    current_state = {
+        'depth'  : 0,
+        'game'   : "placeholder",
+        'market' : "placeholder",
+        'line'   : "placeholder",
+        'value'  : "placeholder",
+    }
     
-    for key, value in table_data.items():
-        cursor.execute(insert_sql, [value.get(col, None) for col in columns])
-    
-    print(f"Table '{tablename}' created successfully with {len(table_data)} rows.")
+    def IterateLambda(data: dict):
+        current_depth = current_state['depth']
+        state_key = columns[current_depth]
+        for key, value in data.items():
+            current_state[state_key] = EscapeString(key)  
+            if type(value) == type(dict()):
+                current_state['depth'] += 1
+                IterateLambda(value)
+                current_state['depth'] -= 1
+            else: # reached the bottom dictionary (line and value)
+                current_state['line'] = EscapeString(key)
+                current_state['value'] = EscapeString(value)  # if you try insert a string without quotes, it'll error: 'no such column'
+                dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES {current_state["game"], current_state["market"], current_state["line"], current_state["value"]}')
+        return
+    IterateLambda(table_data)
     return
-# failing due to floating-point numbers in the data
 
 
 def ClaudesExample():
@@ -157,7 +177,7 @@ def ClaudesExample():
     print('\n\n')
     RecurseDictionaryTypes(input_data)
     print('\n\n')
-    #TableFromDict(dbcursor, table_name, input_data)
+    TableFromDict(dbcursor, table_name, input_data)
     dbconnection.commit()
     dbconnection.close()
 
