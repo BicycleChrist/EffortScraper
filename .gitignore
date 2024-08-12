@@ -42,3 +42,5 @@ MLBAnalytics/testski
 http_proxies.txt
 MLBAnalytics/savedfiles_BBSavant/*.mp4
 Imgui/imgui.ini
+Database/Stable
+Database/Testing
