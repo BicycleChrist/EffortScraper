@@ -10,11 +10,12 @@ import pprint
 import pathlib
 import cProfile
 import pstats
-import sqlite3
-import database_manager as db
+#import sqlite3
 
-import update_importpaths
-import MLBAnalytics.SPdailyodds
+# TODO: this file is broken.
+#import database_manager as db
+#import update_importpaths
+#import MLBAnalytics.SPdailyodds
 
 
 print("imported bigBOVpoolski")
