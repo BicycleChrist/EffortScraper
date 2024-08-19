@@ -2,6 +2,7 @@ import sqlite3
 import pathlib
 import logging
 from pprint import pprint
+import datetime
 
 logging.basicConfig(level=logging.INFO)
 
@@ -17,10 +18,27 @@ def CreateDBFolders():
     return
 
 
-def OpenDatabase(dbname: str, create_ifmissing=False) -> (sqlite3.Connection, sqlite3.Cursor):
+def BackupDB(dbpath: pathlib.Path):
+    if not dbpath.exists(): return
+    newlocation = dbpath
+    numbering = 0
+    while newlocation.exists():
+        numbering += 1
+        newname = dbpath.name + str(numbering)
+        newlocation = dbpath.parent / newname
+    # loop ended; found an untaken filename
+    newlocation.write_bytes(dbpath.read_bytes())
+    return
+
+
+def OpenDatabase(dbname: str, create_ifmissing=False, backup_existing=False) -> (sqlite3.Connection, sqlite3.Cursor):
     cwd = pathlib.Path.cwd()
     source = cwd / 'Stable' / dbname
     working_file = cwd / 'Testing' / dbname
+    
+    if backup_existing:
+        BackupDB(source)
+        BackupDB(working_file)
     
     if not working_file.exists():
         print(f"Copying {source.relative_to(cwd)} to {working_file.relative_to(cwd)}")
@@ -117,13 +135,16 @@ def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
     #tablename_segments = tablename.split() # on whitespace
     #tablename = '_'.join(tablename_segments)
     # whitespace and parentheses are fine inside of quotes
+    current_time = str(datetime.datetime.now().isoformat())
+    #tz=datetime.timezone.utc
+    
     tablename = EscapeString(tablename)
-    columns = [ 'game', 'market', 'line', 'value', ]
+    columns = [ 'game', 'market', 'line', 'value', 'time' ]
     sql_column_defs = [ f'{column_name} TEXT' for column_name in columns]
     sql_full_column_def = '(' + ', '.join(sql_column_defs) + ')'
     sql_column_bullshit = '(' + ', '.join(columns) + ')'  # when inserting, you don't specify the types
     
-    dbconnection.execute(f"CREATE TABLE {tablename} {sql_full_column_def}")
+    dbconnection.execute(f"CREATE TABLE IF NOT EXISTS {tablename} {sql_full_column_def}")
     
     current_state = {
         'depth'  : 0,
@@ -145,7 +166,7 @@ def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
             else: # reached the bottom dictionary (line and value)
                 current_state['line'] = EscapeString(key)
                 current_state['value'] = EscapeString(value)  # if you try insert a string without quotes, it'll error: 'no such column'
-                dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES {current_state["game"], current_state["market"], current_state["line"], current_state["value"]}')
+                dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES {current_state["game"], current_state["market"], current_state["line"], current_state["value"], current_time}')
         return
     IterateLambda(table_data)
     return
