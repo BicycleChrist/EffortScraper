@@ -6,5 +6,8 @@ source ~/Desktop/EffortScraper/venv/bin/activate
 cd ~/Desktop/EffortScraper/boundFetch/ || exit
 
 # logging scrape
-date >> ~/Desktop/EffortScraper/cronjob_success
+date >> ~/Desktop/EffortScraper/boundFetch/cronjob_success
 python3 ~/Desktop/EffortScraper/boundFetch/boundFetch.py >> ~/Desktop/EffortScraper/boundFetch/cronjob_success
+
+deactivate
+exit
