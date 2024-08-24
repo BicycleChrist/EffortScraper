@@ -106,8 +106,8 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
     except Exception as E:
         print(E)
         # check if we're on a 'Matchup not found.' page (this might be a bad idea)
-        noEventsBlock = driver.find_element(By.XPATH, "//div[contains(@class, 'noEvents')][@data-test-id='NoEvents-Container']")
-        print(noEventsBlock.text)
+        # noEventsBlock = driver.find_element(By.XPATH, "//div[contains(@class, 'noEvents')][@data-test-id='NoEvents-Container']")
+        # print(noEventsBlock.text)
         return driver
     try:
         print("finding oddsFormatDropdown...")
@@ -223,6 +223,7 @@ def ScrapePage(driver: webdriver.Firefox):
         result = ParseMarketGroup(group_contents)
         market_dict[title] = result
     
+    driver.implicitly_wait(1)
     return market_dict
 
 # 
@@ -274,11 +275,11 @@ def ScrapePage(driver: webdriver.Firefox):
 def initialize_driver():
     options = FirefoxOptions()
     options.add_argument('--headless')
-    #options.page_load_strategy = 'eager'  # breaks everything
+    # options.page_load_strategy = 'eager'  # breaks everything
     
     #firefox_profile = FirefoxProfile(profile_directory=ProfilePath())
     #options.profile = firefox_profile
-    driver = webdriver.Firefox(options=options)
+    driver = webdriver.Firefox(options=options, keep_alive=True)
     driver.implicitly_wait(1)
     return driver
 
@@ -312,19 +313,25 @@ def Main_Multithreaded():
     # Merge all dictionaries in the results list
     return {k: v for result_dict in results for k, v in result_dict.items()}
 
+
 def Main():
     default_sport = "MLB"
     driver = initialize_driver()
-    with driver.context(driver.CONTEXT_CONTENT):
-        mapped_gamelinks = FindGameLinks(driver, default_sport)
+    mapped_gamelinks = FindGameLinks(driver, default_sport)
     driver.quit()
+    driver = initialize_driver()
+    driver.implicitly_wait(1)
     
     results = {}
     for link, gametitle in mapped_gamelinks.items():
+        print(f"scraping {link}")
         # avoiding an overwrite / clobbering info across dates (games for today and tomorrow are both in the same container element)
         # note that this completely breaks multithreading; the assumption is that today's games always come first
         if gametitle in results.keys(): print(f"entry already exists for {gametitle}; skipping"); continue
-        results[gametitle] = scrape_link(link, default_sport)
+        VisitPage(link, driver, default_sport)
+        results[gametitle] = ScrapePage(driver)
+    
+    driver.quit()
     return results
 
 

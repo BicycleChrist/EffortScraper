@@ -566,6 +566,8 @@ pitchers = {
     "Peterson, David": 656849,
     "Williams, Gavin": 668909,
     "Festa, David": 701581,
+    "Birsong, Hayden": 806185,
+    "Kochanowicz, Jack": 686799,
     "Daniel, Davis": 669721,
     "Herz, DJ": 687792,
     "McKinstry, Zach": 656716,
