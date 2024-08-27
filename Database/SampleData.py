@@ -2,7 +2,10 @@
 
 # only one game entry
 simple_test_dict = {
-    'Arizona Diamondbacks vs Kansas City Royals': {'Adam Frazier (Total Bases)(must start)': {'Over 1.5 TotalBases': 142,
+    'Arizona Diamondbacks vs Kansas City Royals': {
+        "Tyler O'Neill (Home Runs)(must start)" : {'Over 1.5 TotalBases': 999,
+                                                                                           'Under 1.5 TotalBases': -999}, 
+        'Adam Frazier (Total Bases)(must start)': {'Over 1.5 TotalBases': 142,
                                                                                            'Under 1.5 TotalBases': -196},
                                                 'Alek Thomas (Total Bases)(must start)': {'Over 0.5 TotalBases': -175,
                                                                                           'Under 0.5 TotalBases': 129},

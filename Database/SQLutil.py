@@ -3,7 +3,6 @@ import pathlib
 import logging
 from pprint import pprint
 import datetime
-import unicodedata
 
 logging.basicConfig(level=logging.INFO)
 
@@ -127,27 +126,27 @@ def RecurseDictionaryTypes(table_data, recursion_lvl=0):
     return
 
 
-# whitespace and parentheses are fine inside of quotes
+# whitespace and parentheses are fine inside of quotes, and apostrophes need to be escaped
 def EscapeString(inputstring: str):
-    return f"\"{inputstring}\""
-
-
-
-def normalize_string(s):
-    return unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('ASCII')
+    return f"\"{inputstring}\"".replace("'", "`")
 
 
 def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
+    # whitespace in tablenames / columns is illegal (SQL syntax splits on spaces)
+    #tablename_segments = tablename.split() # on whitespace
+    #tablename = '_'.join(tablename_segments)
+    # whitespace and parentheses are fine inside of quotes
     current_time = str(datetime.datetime.now().isoformat())
-
-    tablename = EscapeString(normalize_string(tablename))
+    #tz=datetime.timezone.utc
+    
+    tablename = EscapeString(tablename)
     columns = [ 'game', 'market', 'line', 'value', 'time' ]
     sql_column_defs = [ f'{column_name} TEXT' for column_name in columns]
     sql_full_column_def = '(' + ', '.join(sql_column_defs) + ')'
-    sql_column_bullshit = '(' + ', '.join(columns) + ')'
-
+    sql_column_bullshit = '(' + ', '.join(columns) + ')'  # when inserting, you don't specify the types
+    
     dbconnection.execute(f"CREATE TABLE IF NOT EXISTS {tablename} {sql_full_column_def}")
-
+    
     current_state = {
         'depth'  : 0,
         'game'   : "placeholder",
@@ -155,21 +154,20 @@ def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
         'line'   : "placeholder",
         'value'  : "placeholder",
     }
-
+    
     def IterateLambda(data: dict):
         current_depth = current_state['depth']
         state_key = columns[current_depth]
         for key, value in data.items():
-            current_state[state_key] = EscapeString(normalize_string(str(key)))
+            current_state[state_key] = EscapeString(key)  
             if type(value) == type(dict()):
                 current_state['depth'] += 1
                 IterateLambda(value)
                 current_state['depth'] -= 1
-            else:
-                current_state['line'] = EscapeString(normalize_string(str(key)))
-                current_state['value'] = EscapeString(str(value))
-                dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES (?, ?, ?, ?, ?)',
-                                     (current_state["game"], current_state["market"], current_state["line"], current_state["value"], current_time))
+            else: # reached the bottom dictionary (line and value)
+                current_state['line'] = EscapeString(key)
+                current_state['value'] = EscapeString(value)  # if you try insert a string without quotes, it'll error: 'no such column'
+                dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES {current_state["game"], current_state["market"], current_state["line"], current_state["value"], current_time}')
         return
     IterateLambda(table_data)
     return

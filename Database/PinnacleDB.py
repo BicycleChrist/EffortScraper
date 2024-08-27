@@ -3,12 +3,12 @@ import Boddssuck.PinnaclePlzpoolski as PinnaclePlz
 from SQLutil import *
 from pprint import pprint
 
-# from SampleData import *
+#from SampleData import *
 
 # TODO: SQL won't let you call 'CREATE TABLE' an already-existing table (sqlite3.OperationalError: table "PinnacleTable" already exists)
 def AttemptToBuildTable(PinncaleData):
     dbname = 'Pinnacle.db'
-    dbconnection, dbcursor = OpenDatabase(dbname, create_ifmissing=True, backup_existing=False)
+    dbconnection, dbcursor = OpenDatabase(dbname, create_ifmissing=True, backup_existing=True)
     #for (gametitle, entries) in PinncaleData.items():
     #    TableFromDict(dbcursor, gametitle, entries)
     TableFromDict(dbconnection, "PinnacleTable", PinncaleData)
