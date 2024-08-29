@@ -23,12 +23,13 @@ SELENIUMERRORS = [
 ]
 
 
-# holds (URL-sub-segment, URL-suffix)
+# holds (URL-sub-segment, URL-suffix); sub-segment is just the part of the URL before 'matchups'
 URLbySport = {
     "NBA": ("basketball/nba", "#player-props"),
     "NHL": ("hockey/nhl",     "#game-props"),
     "NFL": ("football/nfl",   ""),
     "MLB": ("baseball/mlb",   "#player-props"),
+    "ESPORTS": ("esports",    ""),
 }
 
 
@@ -346,6 +347,6 @@ def TestPage(link:str, default_sport:str = "MLB"):
 if __name__ == "__main__":
     #test_link = "https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-new-york-yankees/1596118793#player-props"
     #scraped_data = TestPage(test_link)
-    scraped_data = Main()
+    scraped_data = Main("ESPORTS")
     #scraped_data = Main_Multithreaded()
     pprint.pprint(scraped_data)
