@@ -22,7 +22,7 @@ def parse_urls(urls, listbox):
 
 
 root = tk.Tk()
-root.title("Listbox with Scrollbar Example")
+root.title("Games list")
 
 
 frame = ttk.Frame(root)
