@@ -141,7 +141,7 @@ def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
     
     tablename = EscapeString(tablename)
     columns = [ 'game', 'market', 'line', 'value', 'time' ]
-    sql_column_defs = [ f'{column_name} TEXT' for column_name in columns]
+    sql_column_defs = [f'{column_name} INTEGER' if column_name == 'value' else f'{column_name} TEXT' for column_name in columns]
     sql_full_column_def = '(' + ', '.join(sql_column_defs) + ')'
     sql_column_bullshit = '(' + ', '.join(columns) + ')'  # when inserting, you don't specify the types
     
@@ -159,14 +159,14 @@ def TableFromDict(dbconnection, tablename: str, table_data: dict[any, dict]):
         current_depth = current_state['depth']
         state_key = columns[current_depth]
         for key, value in data.items():
-            current_state[state_key] = EscapeString(key)  
+            current_state[state_key] = EscapeString(key) 
             if type(value) == type(dict()):
                 current_state['depth'] += 1
                 IterateLambda(value)
                 current_state['depth'] -= 1
             else: # reached the bottom dictionary (line and value)
-                current_state['line'] = EscapeString(key)
-                current_state['value'] = EscapeString(value)  # if you try insert a string without quotes, it'll error: 'no such column'
+                current_state['line'] = EscapeString(key) # if you try insert a string without quotes, it'll error: 'no such column'
+                current_state['value'] = value  # assuming these are always integers for Pinnacle
                 dbconnection.execute(f'INSERT INTO {tablename} {sql_column_bullshit} VALUES {current_state["game"], current_state["market"], current_state["line"], current_state["value"], current_time}')
         return
     IterateLambda(table_data)

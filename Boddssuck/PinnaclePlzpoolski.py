@@ -85,10 +85,10 @@ def VisitPage(url, driver: webdriver.Firefox, sport):
     _, urlsuffix = URLbySport[sport]
     #driver.add_cookie({"name": "UserPrefsCookie", "value": "languageId=2&priceStyle=american&linesTypeView=a&device=d&languageGroup=all"})  # never works
     driver.get(url)
-    print(url)
     print(driver.get_cookie("UserPrefsCookie"))
     sleep(1)  # need to give some time for the page to redirect
     # if the game is live, the 'player-props' won't exist and it'll redirect us
+    print(driver.current_url)
     # TODO: handle cases where the page lands on 'Matchup not found.'; this doesn't change the URL so it's not handled by the redirect logic
     if not driver.current_url.endswith(urlsuffix):  # checking to see if we've been redirected
         print(f"redirected: {driver.current_url}")
@@ -314,8 +314,7 @@ def Main_Multithreaded():
     return {k: v for result_dict in results for k, v in result_dict.items()}
 
 
-def Main():
-    default_sport = "MLB"
+def Main(default_sport:str = "MLB"):
     driver = initialize_driver()
     mapped_gamelinks = FindGameLinks(driver, default_sport)
     driver.quit()
@@ -335,9 +334,18 @@ def Main():
     return results
 
 
+def TestPage(link:str, default_sport:str = "MLB"):
+    driver = initialize_driver()
+    driver.implicitly_wait(1)
+    print(f"scraping {link}")
+    VisitPage(link, driver, default_sport)
+    results = ScrapePage(driver)
+    return results
+
+
 if __name__ == "__main__":
+    #test_link = "https://www.pinnacle.com/en/baseball/mlb/st-louis-cardinals-vs-new-york-yankees/1596118793#player-props"
+    #scraped_data = TestPage(test_link)
     scraped_data = Main()
     #scraped_data = Main_Multithreaded()
     pprint.pprint(scraped_data)
-    
-    
