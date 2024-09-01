@@ -7,7 +7,8 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException
 import time
-import pprint
+
+from PolymarketParsing import ParseHrefs
 
 # Each market on the all markets page has its own small scroll bar which can interfere with the selenium action chain scrolling process.
 # Making the window huge has ameliorated this issue but we must remember that it exists
@@ -47,8 +48,7 @@ def ScrollPage(driver, directionDown=True):
     time.sleep(0.75)
     return
 
-#def ParseHrefs(market_links):
-    
+
 
 def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
     print("Scrolling the page...")
@@ -62,6 +62,7 @@ def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
 
     print(f"Reached maximum number of scrolls ({max_scrolls}) without finding 'End of results'.")
     return False
+
 
 def main():
     market_links = []
@@ -79,10 +80,12 @@ def main():
         market_links.extend([elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]") if not elem.get_attribute('href').endswith("#comments")])
         driver.quit()
     
-    print(f"\nScrape complete \nFound {len(market_links)} market links:")
-    pprint.pprint(market_links)
     return market_links
 
+
 if __name__ == "__main__":
-    main()
+    market_links = main()
+    print(f"\nScrape complete \nFound {len(market_links)} market links\n\n")
+    parsed = ParseHrefs(market_links)
+    pprint(parsed)
 
