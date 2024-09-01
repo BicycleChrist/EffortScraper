@@ -1,4 +1,5 @@
 from pprint import pprint
+from os import system
 
 def ParseHrefs(market_links: list[str]):
     mapping = {
@@ -12,6 +13,12 @@ def ParseHrefs(market_links: list[str]):
         mapping[section] = section_entries
         market_links = market_links[len(section_entries):]
     return mapping
+
+
+# calling bash script because Selenium sucks lmao
+def ZoomOutFirefox(increments=20):
+    exit_status = os.system(f"./zoom.bash - {increments}")
+    return exit_status
 
 
 if __name__ == "__main__":

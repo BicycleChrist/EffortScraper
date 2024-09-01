@@ -8,7 +8,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException
 import time
 
-from PolymarketParsing import ParseHrefs
+from PolymarketParsing import *
 
 # Each market on the all markets page has its own small scroll bar which can interfere with the selenium action chain scrolling process.
 # Making the window huge has ameliorated this issue but we must remember that it exists
@@ -69,7 +69,9 @@ def main():
     driver = initialize_driver()
     try:
         markets = GoToPage(driver, "https://polymarket.com/markets/all")
-        ZoomOut(driver, 0.75)  # Zoom out to 50%
+        time.sleep(1)  # Wait for the page to adjust after zooming out
+        #ZoomOut(driver, 0.75)  # Zoom out to 50%
+        ZoomOutFirefox()
         time.sleep(2)  # Wait for the page to adjust after zooming out
 
         # Use the new scroll function
