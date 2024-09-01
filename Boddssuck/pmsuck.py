@@ -7,6 +7,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException
 import time
+import pprint
 
 # Each market on the all markets page has its own small scroll bar which can interfere with the selenium action chain scrolling process.
 # Making the window huge has ameliorated this issue but we must remember that it exists
@@ -14,62 +15,74 @@ import time
 
 def initialize_driver():
     options = FirefoxOptions()
-    options.add_argument('--headless')
-    driver = webdriver.Firefox(options=options)
-    # center browser window
+    #options.add_argument('--headless')
+    driver = webdriver.Firefox(options=options, keep_alive=True)
     driver.set_window_position(0,0)
-    # Increase window size
-    driver.set_window_size(7500,5240)
-
-
-
+    driver.set_window_size(5000,7500)
+    driver.implicitly_wait(2)
     return driver
 
-def scroll_until_end_of_results(driver, max_scrolls=1000):
+def ZoomOut(driver, zoom_level=0.5):
+    print(f"Zooming out to {zoom_level * 100}%")
+    driver.execute_script(f"document.body.style.MozTransform = 'scale({zoom_level})';")
+    driver.execute_script(f"document.body.style.MozTransformOrigin = 'top left';")
+    time.sleep(0.5)
+    return
+
+def GoToPage(driver, url):
+    print(f"Getting page {url}")
+    driver.get(url)
+    #WebDriverWait(driver, 10).until(
+    #    EC.presence_of_element_located((By.ID, "markets-grid-container"))
+    #)
+    print("finding markets")
+    markets = driver.find_element(By.ID, 'markets-grid-container')
+    print("found markets")
+    return markets
+
+
+def ScrollPage(driver, directionDown=True):
+    scroll_key = Keys.PAGE_DOWN if directionDown else Keys.PAGE_UP
+    ActionChains(driver).send_keys(scroll_key).perform()
+    time.sleep(0.75)
+    return
+
+#def ParseHrefs(market_links):
+    
+
+def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
     print("Scrolling the page...")
-    body = driver.find_element(By.TAG_NAME, 'body')
-
-
     for _ in range(max_scrolls):
-        ActionChains(driver).send_keys_to_element(body, Keys.PAGE_DOWN).perform()
-        time.sleep(0.5)  # Short pause to allow content to load
+        ActionChains(driver).send_keys_to_element(markets, Keys.PAGE_DOWN).perform()
 
+        # Check if we've reached the end of results
         if driver.find_elements(By.XPATH, "//p[contains(text(),'End of results')]"):
             print("End of results found.")
             return True
-        else:
-            continue
 
     print(f"Reached maximum number of scrolls ({max_scrolls}) without finding 'End of results'.")
     return False
 
 def main():
+    market_links = []
     driver = initialize_driver()
     try:
-        driver.get("https://polymarket.com/markets/all")
+        markets = GoToPage(driver, "https://polymarket.com/markets/all")
+        ZoomOut(driver, 0.75)  # Zoom out to 50%
+        time.sleep(2)  # Wait for the page to adjust after zooming out
 
-        # wait for the market grid to be visible
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "markets-grid-container"))
-        )
-
-        # keep scrolling until end of results
-        all_loaded = scroll_until_end_of_results(driver)
-
-        # extract all href attributes for the markets after scrolling
-        market_links = [elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]")]
-
-        print(f"Found {len(market_links)} market links:")
-        for link in market_links:
-            print(link)
-
-        if not all_loaded:
-            print("Warning: Not all markets may have been loaded.")
+        # Use the new scroll function
+        scroll_until_end_of_results(driver, markets)
 
     finally:
-        # Wait a smidge before quit
-        time.sleep(2)
+        # Gather all market links
+        market_links.extend([elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]") if not elem.get_attribute('href').endswith("#comments")])
         driver.quit()
+    
+    print(f"\nScrape complete \nFound {len(market_links)} market links:")
+    pprint.pprint(market_links)
+    return market_links
 
 if __name__ == "__main__":
     main()
+
