@@ -11,6 +11,7 @@ import time
 from urllib.parse import unquote
 from tabulate import tabulate
 import logging
+import csv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ def scrape_single_url(url):
     driver = initialize_driver()
     try:
         result = scrape_market_data(driver, url)
-        time.sleep(0.1)
+        time.sleep(0.21)
         return url, result
     except Exception as e:
         logger.error(f"Error scraping {url}: {str(e)}")
@@ -85,6 +86,9 @@ def scrape_market_data(driver, url):
         return None
 
 def scrape_multi_outcome_market(driver, url):
+    WebDriverWait(driver, 2).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']"))
+        )
     market_items = driver.find_elements(By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']")
     market_data = []
 
@@ -109,6 +113,9 @@ def scrape_multi_outcome_market(driver, url):
 
 def scrape_single_outcome_market(driver):
     try:
+        WebDriverWait(driver, 2).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.c-dhzjXW-iqUfiq-css p.c-dqzIym"))
+        )
         outcome = {}
 
         # Extract the market question (name)
@@ -166,10 +173,10 @@ def main():
         market_links = [elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]") if not elem.get_attribute('href').endswith("#comments")]
         unique_market_links = filter_unique_urls(market_links)[:150]  # Limit to first 20 links for testing
 
-        logger.info(f"Found {len(unique_market_links)} unique market links (limited to 20 for testing)")
+        logger.info(f"Found {len(unique_market_links)} unique market links")
 
         results = []
-        with ThreadPoolExecutor(max_workers=23) as executor:  # Adjust max_workers as needed
+        with ThreadPoolExecutor(max_workers=12) as executor:  # Adjust max_workers as needed
             future_to_url = {executor.submit(scrape_single_url, url): url for url in unique_market_links}
             for future in as_completed(future_to_url):
                 url = future_to_url[future]
@@ -211,6 +218,16 @@ def main():
         headers = ["Name", "Bet Amount", "Probability", "Gain/Loss", "Yes Price", "No Price"]
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
+        # save output to .csv
+        with open("pm_results.csv", mode="w", newline='') as file:
+            writer = csv.writer(file)
+            # Write the header
+            writer.writerow(headers)
+            # Write the data rows
+            writer.writerows(table_data)
+
+        print("Final table saved to pm_results.csv")
+
     finally:
         driver.quit()
 
@@ -226,4 +243,3 @@ if __name__ == "__main__":
     main()
     #scrape_market_data()
     print("done")
-
