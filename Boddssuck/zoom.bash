@@ -11,7 +11,7 @@ zoom()
         shift 1
     fi
     
-    RESULTARR=($(xdotool search --maxdepth 2 --class firefox))
+    RESULTARR=($(xdotool search --class firefox))
     FIREFOX_WINDOW_ID=${RESULTARR[-1]}
     ITERATIONS=${1}
     while (( ${ITERATIONS} > 0 )); do

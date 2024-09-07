@@ -1,12 +1,9 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import NoSuchElementException
-import time
+import time # sleep
 
 from PolymarketParsing import *
 
@@ -14,21 +11,14 @@ from PolymarketParsing import *
 # Making the window huge has ameliorated this issue but we must remember that it exists
 #TODO: Decrease zoom level of window to 30-40% in initialize_driver function, allowing more content to load every scroll increasing scrape speed
 
-def initialize_driver():
+def initialize_driver(useHeadless=True):
     options = FirefoxOptions()
-    #options.add_argument('--headless')
+    if useHeadless: options.add_argument('--headless')
     driver = webdriver.Firefox(options=options, keep_alive=True)
     driver.set_window_position(0,0)
     driver.set_window_size(5000,7500)
     driver.implicitly_wait(2)
     return driver
-
-def ZoomOut(driver, zoom_level=0.5):
-    print(f"Zooming out to {zoom_level * 100}%")
-    driver.execute_script(f"document.body.style.MozTransform = 'scale({zoom_level})';")
-    driver.execute_script(f"document.body.style.MozTransformOrigin = 'top left';")
-    time.sleep(0.5)
-    return
 
 def GoToPage(driver, url):
     print(f"Getting page {url}")
@@ -41,14 +31,11 @@ def GoToPage(driver, url):
     print("found markets")
     return markets
 
-
 def ScrollPage(driver, directionDown=True):
     scroll_key = Keys.PAGE_DOWN if directionDown else Keys.PAGE_UP
     ActionChains(driver).send_keys(scroll_key).perform()
     time.sleep(0.75)
     return
-
-
 
 def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
     print("Scrolling the page...")
@@ -66,17 +53,13 @@ def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
 
 def main():
     market_links = []
-    driver = initialize_driver()
+    driver = initialize_driver(useHeadless=True)
+    
     try:
         markets = GoToPage(driver, "https://polymarket.com/markets/all")
-        time.sleep(1)  # Wait for the page to adjust after zooming out
-        #ZoomOut(driver, 0.75)  # Zoom out to 50%
         ZoomOutFirefox()
         time.sleep(2)  # Wait for the page to adjust after zooming out
-
-        # Use the new scroll function
         scroll_until_end_of_results(driver, markets)
-
     finally:
         # Gather all market links
         market_links.extend([elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]") if not elem.get_attribute('href').endswith("#comments")])
