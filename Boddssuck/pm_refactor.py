@@ -205,7 +205,7 @@ def main():
         "multi" : ([k for k in parsed_hrefs.keys() if k != ""][0:3], scrape_multi_outcome_market)
     }
     
-    driver = pmsuck.initialize_driver(useHeadless=False)
+    driver = pmsuck.initialize_driver()
     for outcome_type in "single", "multi":
         events, scrape_lambda = eventmap[outcome_type]
         for event in events:
