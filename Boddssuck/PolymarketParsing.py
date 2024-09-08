@@ -14,7 +14,6 @@ def ParseHrefs(market_links: list[str]):
         market_links = market_links[len(section_entries):]
     return mapping
 
-
 # calling bash script because Selenium sucks lmao
 def ZoomOutFirefox(increments=20):
     exit_status = system(f"./zoom.bash - {increments}")

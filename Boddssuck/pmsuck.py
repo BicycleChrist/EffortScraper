@@ -37,11 +37,13 @@ def ScrollPage(driver, directionDown=True):
     time.sleep(0.75)
     return
 
-def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
+def scroll_until_end_of_results(driver, markets, max_scrolls=100):
     print("Scrolling the page...")
     for _ in range(max_scrolls):
         ActionChains(driver).send_keys_to_element(markets, Keys.PAGE_DOWN).perform()
-
+        print("scroll")
+        time.sleep(0.5)  # Short pause to allow content to load
+        
         # Check if we've reached the end of results
         if driver.find_elements(By.XPATH, "//p[contains(text(),'End of results')]"):
             print("End of results found.")
@@ -53,7 +55,7 @@ def scroll_until_end_of_results(driver, markets, max_scrolls=1000):
 
 def main():
     market_links = []
-    driver = initialize_driver(useHeadless=True)
+    driver = initialize_driver(useHeadless=False)
     
     try:
         markets = GoToPage(driver, "https://polymarket.com/markets/all")
