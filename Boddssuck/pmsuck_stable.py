@@ -12,6 +12,11 @@ from urllib.parse import unquote
 from tabulate import tabulate
 import logging
 import csv
+import requests
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from pprint import pprint
+from PolymarketParsing import ParseHrefs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,22 +32,21 @@ def initialize_driver():
     return driver
 
 
-def scroll_until_end_of_results(driver, max_scrolls=1000):
-    print("Scrolling the page...")
-    body = driver.find_element(By.TAG_NAME, 'body')
-
-    for _ in range(max_scrolls):
-        ActionChains(driver).send_keys_to_element(body, Keys.PAGE_DOWN).perform()
-        time.sleep(0.5)  # Short pause to allow content to load
-
-        if driver.find_elements(By.XPATH, "//p[contains(text(),'End of results')]"):
-            print("End of results found.")
-            return True
-        else:
-            continue
-
-    print(f"Reached maximum number of scrolls ({max_scrolls}) without finding 'End of results'.")
-    return False
+def fetch_urls_from_sitemap(sitemap_url):
+    response = requests.get(sitemap_url)
+    response.raise_for_status()
+    
+    soup = BeautifulSoup(response.content, 'xml')
+    
+    urls = []
+    for url in soup.find_all('url'):
+        loc = url.find('loc')
+        changefreq = url.find('changefreq')
+        
+        if loc and changefreq and changefreq.text == 'always':
+            urls.append(loc.text)
+    
+    return urls
 
 def scrape_single_url(url):
     driver = initialize_driver()
@@ -56,13 +60,6 @@ def scrape_single_url(url):
         return url, None
     finally:
         driver.quit()
-
-def filter_unique_urls(urls):
-    base_urls = set()
-    for url in urls:
-        base_url = url.split('/event/')[0] + '/event/' + url.split('/event/')[1].split('/')[0]
-        base_urls.add(base_url)
-    return list(base_urls)
 
 def scrape_market_data(driver, url):
     try:
@@ -86,27 +83,72 @@ def scrape_market_data(driver, url):
         return None
 
 def scrape_multi_outcome_market(driver, url):
-    WebDriverWait(driver, 2).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']"))
-        )
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']"))
+    )
     market_items = driver.find_elements(By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']")
     market_data = []
 
     for index, item in enumerate(market_items):
-        outcome = {'url': url}  # Add the URL to each outcome
+        outcome = {'url': url}
 
         try:
-            outcome['name'] = item.find_element(By.CSS_SELECTOR, "p.c-cZBbTr").text
+            # Try multiple selectors for the outcome name
+            name_selectors = [
+                "p.c-cZBbTr",
+                "p.c-dqzIym",  # A more generic selector
+                "div[data-scroll-anchor^='event-detail-accordion-item'] > div > p"  # Even more generic
+            ]
+            
+            for selector in name_selectors:
+                try:
+                    outcome['name'] = item.find_element(By.CSS_SELECTOR, selector).text
+                    break
+                except NoSuchElementException:
+                    continue
+            
+            if 'name' not in outcome:
+                raise ValueError("Could not find outcome name")
+
             outcome['bet_amount'] = item.find_element(By.CSS_SELECTOR, "p.c-dqzIym-ihVLOVM-css").text
             outcome['probability'] = item.find_element(By.CSS_SELECTOR, "p.c-dqzIym-icEtPXM-css").text
 
-            yes_selector = "div.c-gBrBnR-ifgGdkS-css" if index == 0 else "div.c-gBrBnR-ibMWmgq-css"
-            outcome['yes_price'] = item.find_element(By.CSS_SELECTOR, yes_selector).text.split()[-1]
-            outcome['no_price'] = item.find_element(By.CSS_SELECTOR, "div.c-gBrBnR-ikGeufU-css").text.split()[-1]
+            # Try different selectors for Yes and No prices
+            yes_selectors = [
+                "div.c-gBrBnR-ifgGdkS-css",  # First outcome Yes
+                "div.c-gBrBnR-ibMWmgq-css",  # Other outcomes Yes
+                "button[data-testid='yes-button']"  # Generic Yes button
+            ]
+            no_selectors = [
+                "div.c-gBrBnR-ikGeufU-css",  # Common No selector
+                "button[data-testid='no-button']"  # Generic No button
+            ]
+
+            for yes_selector in yes_selectors:
+                try:
+                    yes_element = item.find_element(By.CSS_SELECTOR, yes_selector)
+                    outcome['yes_price'] = yes_element.text.split()[-1]
+                    break
+                except NoSuchElementException:
+                    continue
+
+            for no_selector in no_selectors:
+                try:
+                    no_element = item.find_element(By.CSS_SELECTOR, no_selector)
+                    outcome['no_price'] = no_element.text.split()[-1]
+                    break
+                except NoSuchElementException:
+                    continue
+
+            if 'yes_price' not in outcome or 'no_price' not in outcome:
+                raise ValueError("Could not find Yes or No price")
 
             market_data.append(outcome)
         except Exception as e:
             logger.warning(f"Error scraping outcome {index}: {str(e)}")
+            continue
+
+        time.sleep(0.1)  # Small delay between scraping each outcome
 
     logger.info(f"Successfully scraped {len(market_data)} outcomes from multi-outcome market")
     return market_data
@@ -159,25 +201,35 @@ def scrape_single_outcome_market(driver):
         logger.error(f"Error scraping single-outcome market: {str(e)}")
     return None
 
+def is_valid_market_url(url):
+    # Check if the URL is a valid Polymarket market URL
+    return url.startswith("https://polymarket.com/market/")
+
 def main():
-    base_url = "https://polymarket.com/markets/all"
+    sitemap_url = "https://polymarket.com/sitemap.xml"
     driver = initialize_driver()
     try:
-        driver.get(base_url)
+        market_links = fetch_urls_from_sitemap(sitemap_url)
+        parsed_links = ParseHrefs(market_links)
+        
+        # Flatten the parsed links dictionary into a list
+        unique_market_links = [k for k in parsed_links.keys() if k] + \
+                              [item for sublist in parsed_links.values() for item in sublist]
 
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "markets-grid-container"))
-        )
+        # Filter out invalid URLs
+        valid_market_links = [url for url in unique_market_links if is_valid_market_url(url)]
 
-        all_loaded = scroll_until_end_of_results(driver)
-        market_links = [elem.get_attribute('href') for elem in driver.find_elements(By.XPATH, "//a[contains(@href, '/event/')]") if not elem.get_attribute('href').endswith("#comments")]
-        unique_market_links = filter_unique_urls(market_links)[:-1]  #Set num of links to scrape
+        logger.info(f"Found {len(valid_market_links)} valid unique market links")
 
-        logger.info(f"Found {len(unique_market_links)} unique market links")
+        # Print the gathered URLs
+        print("\nGathered URLs:")
+        for url in valid_market_links:
+            print(url)
+        print("\nStarting scrape...\n")
 
         results = []
         with ThreadPoolExecutor(max_workers=6) as executor:  # Adjust max_workers as needed
-            future_to_url = {executor.submit(scrape_single_url, url): url for url in unique_market_links}
+            future_to_url = {executor.submit(scrape_single_url, url): url for url in valid_market_links}
             for future in as_completed(future_to_url):
                 url = future_to_url[future]
                 try:
