@@ -1,0 +1,143 @@
+<!--Need to feed in data semi-dynamically; then the arduous jounrey of creating the respectable tickertape can be put too rest  -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Improved Ticker Tape</title>
+    <style>
+        .ticker-wrap {
+            width: 100%;
+            overflow: hidden;
+            background-color: #a0a0a0;
+            padding: 10px 0;
+        }
+        .ticker {
+            display: inline-block;
+            white-space: nowrap;
+            padding-left: 100%;
+            animation: ticker 300s linear infinite;
+        }
+        .ticker__item {
+            display: inline-block;
+            padding: 0 2rem;
+        }
+        @keyframes ticker {
+            0% { transform: translate3d(0, 0, 0); }
+            100% { transform: translate3d(-100%, 0, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="ticker-wrap">
+        <div class="ticker" id="ticker">
+            <!-- Data will be inserted here dynamically -->
+        </div>
+    </div>
+
+    <script>
+        const tickerData = [
+            { title: 'This market will resolve to “Yes” if Ronald Dion de Santis wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Donald J. Trump wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 100, no: 0 },
+            { title: 'This market will resolve to “Yes” if Nimrata Nikki Haley wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Joe Biden wins the 2024 nomination of the Democratic Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Kamala Harris wins the 2024 nomination of the Democratic Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 100, no: 0 },
+            { title: 'This market will resolve to “Yes” if Pete Buttigieg wins the 2024 nomination of the Democratic Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Hillary Clinton wins the 2024 nomination of the Democratic Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'The 2024 United States presidential election will be held on Tuesday, November 5, 2024.', democratic: 46.5, republican: 53.5 },
+            { title: 'This market will resolve to “Yes” if Tucker Carlson wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Ben Shapiro wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Joe Rogan wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Kanye West', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Peter Thiel wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'This market will resolve to “Yes” if Donald Trump Jr. wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'In the upcoming MLB game scheduled for July 25, 7:05 PM ET:', braves: 64.0, phillies: 36.0 },
+            { title: 'In the upcoming MLB game scheduled for July 26, 7:10 PM ET:', yankees: 0, mets: 0 },
+            { title: 'In the upcoming MLB game scheduled for July 28, 9:45 PM ET:', cubs: 0, giants: 0 },
+            { title: 'In the upcoming MLB game scheduled for July 27, 7:10 PM ET:', guardians: 0, redsox: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 2, 7:10 PM ET:', bluejays: 0, rays: 0 },
+            { title: 'In the upcoming NFL preseason game scheduled for August 4, 8:00 PM ET:', jaguars: 0, raiders: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 9, 7:10 PM ET:', braves: 0, redsox: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 10, 10:10 PM ET:', twins: 0, dodgers: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 14, 7:08 PM ET:', yankees: 0, redsox: 0 },
+            { title: 'In the upcoming NFL preseason game scheduled for August 14, 4:25 PM ET:', vikings: 0, raiders: 0 },
+            { title: 'In the upcoming Premier League soccer game, scheduled for August 15:', crystalpalace: 0, liverpool: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 15, 6:40 PM ET:', padres: 0, marlins: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 16, 7:20 PM ET:', mets: 0, braves: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 17, 8:10 PM ET:', dodgers: 0, brewers: 0 },
+            { title: 'In the upcoming MLB game scheduled for August 21, 7:10 PM ET:', redsox: 0, orioles: 100 },
+            { title: 'In the upcoming MLB game scheduled for August 23, 9:40 PM ET:', guardians: 0, padres: 0 },
+            { title: 'This market will resolve to “Yes” if any Federal or State jurisdiction of the United States unseals or otherwise officially announces a criminal indictment of former President Donald Trump before the resolution time March 31, 2023, 11:59:59 PM ET. ', yes: 100, no: 0 },
+            { title: 'Miles Bridges is a National Basketball Association (NBA) player with the Charlotte Hornets. In July, 2022 he was arraigned on "one felony count of injuring a child’s parent and two felony counts of child abuse under circumstances or conditions likely to cause great bodily injury or death", throwing his status as an active player into question.', yes: 0, no: 100 },
+            { title: 'The Premier Leagues 2022-23 season started on August 6, 2022, and the final match round is scheduled for May 28, 2023. Erling Haaland has already scored 15 goals, and there is significant buzz that he may break the Premier Leagues record of 34 goals scored in a season, currently shared by Andy Cole (Newcastle 1993-94) and Alan Shearer (Blackburn 1994-95).', yes: 100, no: 0 },
+            { title: 'This market will resolve to “Yes” if former US vice president Michael Richard Pence wins the 2024 nomination of the Republican Party for U.S. president. Otherwise, this market will resolve to “No”.', yes: 0, no: 100 },
+            { title: 'In the upcoming IPL game, scheduled for May 9 at 10:00 AM ET:', mumbai: 100, bangalore: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 6:10 PM ET:', guardians: 100, tigers: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 6:35 PM ET:', pirates: 0, rockies: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 6:35 PM ET:', orioles: 100, rays: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 6:40 PM ET:', reds: 100, mets: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 6:40 PM ET:', phillies: 100, bluejays: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:05 PM ET:', yankees: 100, athletics: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:20 PM ET:', braves: 100, redsox: 0 },
+            { title: 'In the upcoming NBA game, scheduled for May 9 at 7:30 PM ET:', celtics: 0, ers: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:40 PM ET:', brewers: 0, dodgers: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:40 PM ET:', twins: 0, padres: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:40 PM ET:', royals: 0, whitesox: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 7:40 PM ET:', cubs: 0, cardinals: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 9:38 PM ET:', angels: 0, astros: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 9:40 PM ET:', mariners: 100, rangers: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 9:40 PM ET:', diamondbacks: 0, marlins: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 9 at 9:45 PM ET:', giants: 100, nationals: 0 },
+            { title: 'In the upcoming NBA game, scheduled for May 9 at 10:00 PM ET:', nuggets: 100, suns: 0 },
+            { title: 'In the upcoming IPL game, scheduled for May 10 at 10:00 AM ET:', chennai: 100, delhi: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 12:35 PM ET:', pirates: 0, rockies: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 12:35 PM ET:', yankees: 100, athletics: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 1:10 PM ET:', guardians: 0, tigers: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 1:40 PM ET:', brewers: 0, dodgers: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 3:40 PM ET:', diamondbacks: 0, marlins: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 3:40 PM ET:', mariners: 0, rangers: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 3:45 PM ET:', giants: 0, nationals: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 4:05 PM ET:', phillies: 100, bluejays: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 4:07 PM ET:', angels: 0, astros: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 6:35 PM ET:', orioles: 100, rays: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 6:40 PM ET:', reds: 0, mets: 100 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 7:20 PM ET:', braves: 0, redsox: 100 },
+            { title: 'In the upcoming NBA game, scheduled for May 10 at 7:30 PM ET:', knicks: 100, heat: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 7:40 PM ET:', cubs: 100, cardinals: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 7:40 PM ET:', royals: 100, whitesox: 0 },
+            { title: 'In the upcoming MLB game, scheduled for May 10 at 7:40 PM ET:', twins: 100, padres: 0 },
+            { title: 'In the upcoming NBA game, scheduled for May 10 at 10:00 PM ET:', warriors: 100, lakers: 0 },
+        ];
+
+        function populateTicker() {
+            const ticker = document.getElementById('ticker');
+            let tickerContent = '';
+
+            tickerData.forEach(item => {
+                if ('democratic' in item) {
+                    tickerContent += `<div class="ticker__item"><strong>${item.title}</strong>: Democratic: ${item.democratic}% Republican: ${item.republican}%</div>`;
+                } else {
+                    tickerContent += `<div class="ticker__item"><strong>${item.title}</strong>: Yes: ${item.yes}% No: ${item.no}%</div>`;
+                }
+            });
+
+            // Duplicate the content to ensure seamless looping
+            ticker.innerHTML = tickerContent + tickerContent;
+        }
+
+        function adjustAnimationDuration() {
+            const ticker = document.getElementById('ticker');
+            const contentWidth = ticker.scrollWidth / 2; // Divide by 2 because we duplicated the content
+            const duration = contentWidth / 150; // Adjust 50 to change scroll speed
+            ticker.style.animationDuration = `${duration}s`;
+        }
+
+        window.addEventListener('load', () => {
+            populateTicker();
+            adjustAnimationDuration();
+        });
+        window.addEventListener('resize', adjustAnimationDuration);
+    </script>
+</body>
+</html>
