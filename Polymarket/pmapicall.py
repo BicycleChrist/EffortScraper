@@ -128,7 +128,11 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-
+def fetch_and_process_markets():
+    markets_list = FetchMarkets()
+    filtered_data = FilterData(markets_list)
+    WriteJsonDump(filtered_data)
+    return filtered_data
 
 if __name__ == "__main__":
     # markets = LoadJsonDump()

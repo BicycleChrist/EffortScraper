@@ -5,12 +5,12 @@ import time
 from datetime import datetime
 import threading
 from typing import Optional, Dict, List
+from pmapicall import fetch_and_process_markets
 
 class MarketTicker:
     def __init__(self, root):
         self.root = root
         self.root.title("Market Predictions Ticker")
-        
         # Configuration
         self.config = {
             'update_interval': 30,  # seconds
@@ -48,7 +48,7 @@ class MarketTicker:
 
         # Initialize UI
         self.create_styles()
-        self.create_header()
+        self.create_header()  # Ensure this is called after main_frame is initialized
         self.create_ticker()
         self.create_status_bar()
         self.create_detail_view()
@@ -92,6 +92,10 @@ class MarketTicker:
                                text="PREDICTION MARKETS LIVE",
                                style='Header.TLabel')
         title_label.pack(side='left')
+
+        # Add a button to fetch and update data
+        update_button = ttk.Button(header_frame, text="Update Data", command=self.update_data)
+        update_button.pack(side='left', padx=5)
 
         # Controls
         controls_frame = ttk.Frame(header_frame)
@@ -354,6 +358,22 @@ class MarketTicker:
         if hasattr(self, 'update_thread'):
             self.update_thread.join(timeout=1.0)
         self.root.destroy()
+
+    def update_data(self):
+        """Fetch new market data in a separate thread and update the ticker"""
+        def fetch_data():
+            try:
+                fetch_and_process_markets()
+                # Schedule the UI update on the main thread
+                self.root.after(0, self.load_data)
+                self.root.after(0, lambda: messagebox.showinfo("Success", "Market data updated successfully."))
+            except Exception as e:
+                self.root.after(0, lambda: self.show_error(f"Failed to update data: {str(e)}"))
+        # Start the fetch_data function in a new thread
+        threading.Thread(target=fetch_data, daemon=True).start()
+        #self.last_scroll_time = time.time() + 10
+        #self.root.after(0, lambda: self.scroll_text)
+        #self.last_scroll_time = time.time()
 
 if __name__ == "__main__":
     root = tk.Tk()
