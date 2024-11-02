@@ -10,7 +10,7 @@ class MarketTicker:
     def __init__(self, root):
         self.root = root
         self.root.title("Market Predictions Ticker")
-
+        
         # Configuration
         self.config = {
             'update_interval': 30,  # seconds
@@ -18,9 +18,9 @@ class MarketTicker:
             'scroll_fps': 60,
             'default_speed': 1.0,
             'fonts': {
-                'header': ('Helvetica', 12, 'bold'),
-                'ticker': ('Helvetica', 16, 'bold'),
-                'status': ('Helvetica', 10)
+                'header': ('Noto Sans', 12, 'bold'),
+                'ticker': ('Noto Sans', 16, 'bold'),
+                'status': ('Noto Sans', 10)
             },
             'colors': {
                 'bg': 'black',
@@ -29,9 +29,8 @@ class MarketTicker:
                 'error': '#ff0000',
                 'hot_market': '#ff9900'  # Color for close races
             },
-            'spread_threshold': 20.0  # Highlight markets with spread below this
-        }
-
+            'spread_threshold': 35.0  # Highlight markets with spread below this
+        } 
         # State variables
         self.running = True
         self.ticker_text = ""
@@ -43,8 +42,8 @@ class MarketTicker:
         self.root.configure(bg=self.config['colors']['bg'])
         self.root.attributes('-topmost', True)
 
-        # Create main frame
-        self.main_frame = ttk.Frame(root)
+        # Create main frame with the new style
+        self.main_frame = ttk.Frame(root, style='Main.TFrame')
         self.main_frame.pack(fill='both', expand=True)
 
         # Initialize UI
@@ -58,10 +57,16 @@ class MarketTicker:
         self.setup_bindings()
 
         # Start background processes
+        self.load_data()
         self.start_background_tasks()
 
     def create_styles(self):
         style = ttk.Style()
+        # Add style for the main frame
+        style.configure('Main.TFrame', 
+                       background=self.config['colors']['bg'])
+        
+        # Keep existing styles
         style.configure('Header.TLabel',
                        background=self.config['colors']['bg'],
                        foreground=self.config['colors']['fg'],
@@ -99,10 +104,10 @@ class MarketTicker:
         self.speed_var = tk.DoubleVar(value=self.config['default_speed'])
         speed_scale = ttk.Scale(controls_frame,
                               from_=0.5,
-                              to=8.0,
+                              to=32.0,
                               variable=self.speed_var,
                               orient='horizontal',
-                              length=100,
+                              length=250,
                               command=self.on_speed_change)
         speed_scale.pack(side='left', padx=5)
 
@@ -144,16 +149,15 @@ class MarketTicker:
         self.detail_window = None
 
     def setup_bindings(self):
-        self.canvas.bind('<Enter>', self.pause_scrolling)
-        self.canvas.bind('<Leave>', self.resume_scrolling)
+        # self.canvas.bind('<Enter>', self.pause_scrolling)
+        # self.canvas.bind('<Leave>', self.resume_scrolling)
         self.canvas.bind('<Button-1>', self.on_click)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def start_background_tasks(self):
-        self.update_thread = threading.Thread(target=self.update_data_periodically,
-                                           daemon=True)
+        self.update_thread = threading.Thread(target=self.scroll_text, daemon=True)
         self.update_thread.start()
-        self.scroll_text()
+        # self.scroll_text()
 
     def calculate_spread(self, market: Dict) -> float:
         """Calculate the spread between Yes/No or highest/lowest options"""
@@ -200,8 +204,7 @@ class MarketTicker:
             lines = [f"{line}" for line in market['lines']]
             spread = market.get('spread', float('inf'))
 
-            # Add a hot market indicator for close races
-            prefix = "🔥 " if spread < self.config['spread_threshold'] else ""
+            prefix = "🔥" if spread < self.config['spread_threshold'] else ""
 
             return f"{prefix}{question} | {' • '.join(lines)} (Spread: {spread:.1f}%)"
         except KeyError as e:
@@ -268,14 +271,15 @@ class MarketTicker:
         self.status_label.config(text=f"Error: {message}", style='Error.TLabel')
         messagebox.showerror("Error", message)
 
-    def update_data_periodically(self) -> None:
-        """Periodically update market data"""
-        while self.running:
-            self.load_data()
-            time.sleep(self.config['update_interval'])
+    # def update_data_periodically(self) -> None:
+    #     """Periodically update market data"""
+    #     while self.running:
+    #         self.load_data()
+    #         time.sleep(self.config['update_interval'])
 
     def scroll_text(self) -> None:
         """Implement smooth scrolling with time-based movement"""
+        # print("scroll text")
         if not self.pause_scroll:
             current_time = time.time()
             delta_time = current_time - self.last_scroll_time
@@ -296,8 +300,8 @@ class MarketTicker:
 
             self.last_scroll_time = current_time
 
-        # Schedule next update based on desired FPS
-        self.root.after(int(1000 / self.config['scroll_fps']), self.scroll_text)
+            # Schedule next update based on desired FPS
+            self.root.after(int(1000 / self.config['scroll_fps']), self.scroll_text)
 
     def show_detail_view(self, text: str) -> None:
         """Show detailed view of clicked market"""
