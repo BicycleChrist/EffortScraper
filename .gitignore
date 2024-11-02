@@ -45,3 +45,5 @@ Imgui/imgui.ini
 Database/Stable
 Database/Testing
 boundFetch/cronjob_success
+mmKEY.py
+Polymarket/*.json
