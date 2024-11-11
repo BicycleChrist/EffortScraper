@@ -1,3 +1,4 @@
+import pathlib
 import tkinter as tk
 from tkinter import ttk, messagebox
 import json
@@ -17,6 +18,7 @@ class MarketTicker:
             'max_ticker_length': 10000,
             'scroll_fps': 60,
             'default_speed': 1.0,
+            'max_speed': 64.0,
             'fonts': {
                 'header': ('Noto Sans', 12, 'bold'),
                 'ticker': ('Noto Sans', 16, 'bold'),
@@ -107,8 +109,8 @@ class MarketTicker:
 
         self.speed_var = tk.DoubleVar(value=self.config['default_speed'])
         speed_scale = ttk.Scale(controls_frame,
-                              from_=0.5,
-                              to=32.0,
+                              from_=0.1,
+                              to=self.config['max_speed'],
                               variable=self.speed_var,
                               orient='horizontal',
                               length=250,
@@ -120,7 +122,7 @@ class MarketTicker:
                               height=50,
                               bg=self.config['colors']['bg'],
                               highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True)
+        self.canvas.pack(fill='x')
 
         self.text_id = self.canvas.create_text(
             0, 25,
@@ -156,6 +158,9 @@ class MarketTicker:
         # self.canvas.bind('<Enter>', self.pause_scrolling)
         # self.canvas.bind('<Leave>', self.resume_scrolling)
         self.canvas.bind('<Button-1>', self.on_click)
+        for N in range(4): # generate bindings for num-keys
+            self.root.bind(f'<Key-{N}>', self.speedcontrol_callback)
+            self.root.bind(f'<KP_{N}>', self.speedcontrol_callback)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def start_background_tasks(self):
@@ -176,7 +181,7 @@ class MarketTicker:
                     continue
 
             if len(percentages) < 2:
-                return float('inf')  # Return infinity for invalid/incomplete markets
+                return 0.0
 
             # Sort percentages in descending order
             percentages.sort(reverse=True)
@@ -185,11 +190,11 @@ class MarketTicker:
 
             # Filter out markets with a spread of less than 0.1%
             if spread < 0.1:
-                return float('inf')  # Treat markets with small spreads as invalid
+                return 0.0
 
             return spread
         except Exception:
-            return float('inf')
+            return 0.0
 
     def sort_markets_by_spread(self, markets: List[Dict]) -> List[Dict]:
         """Sort markets by their spread, from lowest to highest"""
@@ -198,7 +203,7 @@ class MarketTicker:
             market['spread'] = self.calculate_spread(market)
 
         # Sort by spread and filter out invalid markets
-        valid_markets = [m for m in markets if m['spread'] != float('inf')]
+        valid_markets = [m for m in markets if m['spread'] > 0.0]
         return sorted(valid_markets, key=lambda x: x['spread'])
 
     def format_market_text(self, market: Dict) -> str:
@@ -206,18 +211,21 @@ class MarketTicker:
         try:
             question = market['question']
             lines = [f"{line}" for line in market['lines']]
-            spread = market.get('spread', float('inf'))
+            spread = market.get('spread', 0.0)
 
             prefix = "🔥" if spread < self.config['spread_threshold'] else ""
 
-            return f"{prefix}{question} | {' • '.join(lines)} (Spread: {spread:.1f}%)"
+            return f"{prefix}{question} | {' • '.join(lines)} (Spread: {spread:.2f}%)"
         except KeyError as e:
             raise ValueError(f"Invalid market data format: missing {e}")
 
     def load_data(self) -> None:
         """Load and validate market data from file"""
         try:
-            with open('PMdump.json', 'r') as file:
+            print(f"current directory: {pathlib.Path.cwd()}")
+            filepath = pathlib.Path.cwd() / 'PMdump.json'
+            print(f"\nloading data from: {filepath}\n")
+            with open(filepath, 'r') as file:
                 data = json.load(file)
 
             if not data:
@@ -229,15 +237,19 @@ class MarketTicker:
                 raise ValueError("Invalid data format")
 
             # Sort markets by spread
+            print(f"#markets (before sort): {len(data)}")
             sorted_markets = self.sort_markets_by_spread(data)
+            print(f"#markets (after sort): {len(sorted_markets)}\n\n")
 
             # Format ticker text with character limit
             formatted_items = []
             current_length = 0
 
+            # for market in reversed(sorted_markets):
             for market in sorted_markets:
                 formatted_text = self.format_market_text(market)
                 if current_length + len(formatted_text) > self.config['max_ticker_length']:
+                    #print(f"skipping {market['question']}"); continue;
                     break
                 formatted_items.append(formatted_text)
                 current_length += len(formatted_text)
@@ -292,13 +304,18 @@ class MarketTicker:
             speed = self.speed_var.get() * delta_time * 60  # pixels per second
 
             # Get text position
+            # TODO: figure out why the hell bbox x2 is so large
             x1, y1, x2, y2 = self.canvas.bbox(self.text_id)
+            # x1 = self.canvas.winfo_x()
+            # x2 = self.canvas.winfo_width() - x1
+            #print(f"x1: {x1}, x2: {x2}")
 
+            # text runs out at around ~33k
             # Reset position if text has scrolled off screen
-            if x2 < 0:
-                self.canvas.move(self.text_id,
-                               self.canvas.winfo_width() - x1,
-                               0)
+            if x1 < -33000:
+                print("loop wow")
+                self.canvas.moveto(self.text_id, 0,0)
+                #self.pause_scroll = True
             else:
                 self.canvas.move(self.text_id, -speed, 0)
 
@@ -351,6 +368,22 @@ class MarketTicker:
         """Handle speed scale changes"""
         # Reset scroll timing on speed change to prevent jerky movement
         self.last_scroll_time = time.time()
+        self.pause_scroll = False
+    
+    def speedcontrol_callback(self, event):
+        # print(event)
+        current_speed = self.speed_var.get()
+        new_speed = current_speed
+        match(event.char):
+            case '0': new_speed = self.config['default_speed']
+            case '1': new_speed = current_speed - 1.0
+            case '2': new_speed = current_speed + 1.0
+            case '3':
+                print("maxing speed")
+                new_speed = self.config['max_speed']
+        
+        self.speed_var.set(new_speed)
+        return
 
     def on_closing(self) -> None:
         """Clean up resources before closing"""
@@ -366,7 +399,9 @@ class MarketTicker:
                 fetch_and_process_markets()
                 # Schedule the UI update on the main thread
                 self.root.after(0, self.load_data)
+                # TODO: display the message in the window, at the bottom
                 self.root.after(0, lambda: messagebox.showinfo("Success", "Market data updated successfully."))
+                self.canvas.moveto(self.text_id, 0, 0) # restart from beginning
             except Exception as e:
                 self.root.after(0, lambda: self.show_error(f"Failed to update data: {str(e)}"))
         # Start the fetch_data function in a new thread
