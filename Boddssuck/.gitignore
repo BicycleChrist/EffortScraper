@@ -3,3 +3,5 @@ bovadaPPsuck.py
 __pycache__
 pagesource/
 *.html
+pm_refactor_buildtable2.py
+PMdumpsample.json
