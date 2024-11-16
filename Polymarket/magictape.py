@@ -189,7 +189,7 @@ class MarketTicker:
             spread = abs(percentages[0] - percentages[1])
 
             # Filter out markets with a spread of less than 0.1%
-            if spread < 0.1:
+            if spread < 0.01:
                 return 0.0
 
             return spread
@@ -203,8 +203,9 @@ class MarketTicker:
             market['spread'] = self.calculate_spread(market)
 
         # Sort by spread and filter out invalid markets
-        valid_markets = [m for m in markets if m['spread'] > 0.0]
-        return sorted(valid_markets, key=lambda x: x['spread'])
+        valid_markets = [m for m in markets if ((m['spread'] > 0.0) and (m['spread'] < 95.0)) ]
+        return valid_markets
+        #return sorted(valid_markets, key=lambda x: x['spread'])
 
     def format_market_text(self, market: Dict) -> str:
         """Format individual market data with colors and styling"""
@@ -240,13 +241,13 @@ class MarketTicker:
             print(f"#markets (before sort): {len(data)}")
             sorted_markets = self.sort_markets_by_spread(data)
             print(f"#markets (after sort): {len(sorted_markets)}\n\n")
-
+            
             # Format ticker text with character limit
             formatted_items = []
             current_length = 0
 
-            # for market in reversed(sorted_markets):
-            for market in sorted_markets:
+            for market in reversed(sorted_markets):
+            # for market in sorted_markets:
                 formatted_text = self.format_market_text(market)
                 if current_length + len(formatted_text) > self.config['max_ticker_length']:
                     #print(f"skipping {market['question']}"); continue;

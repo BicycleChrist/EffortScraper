@@ -54,6 +54,8 @@ def FilterData(markets) -> list[dict]:
     # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
     # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
     # 'winner' will always be false for open markets
+    open_markets = [market for market in markets if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
+    markets = open_markets
     filtered_data = [
         { field: market[field] for field in wanted_fields }
         for market in markets
@@ -64,7 +66,7 @@ def FilterData(markets) -> list[dict]:
     return filtered_data
 
 def WriteJsonDump(data: list[dict]):
-    with open((pathlib.Path.cwd() / "PMdump.json"), "w") as json_file:
+    with open((pathlib.Path.cwd() / "PMdump_openmarkets.json"), "w") as json_file:
         json.dump(data, json_file, indent=2)
         print("wrote PMdump.json")
     return
