@@ -4,6 +4,11 @@ from pprint import pprint
 from py_clob_client.client import ClobClient
 from mmKEY import pmkey
 import pathlib
+import requests
+
+from datetime import datetime
+def GetCurrentTimestamp(): return datetime.now().timestamp()
+def DateFromTimestamp(timestamp: int) -> str: return datetime.fromtimestamp(timestamp).date().isoformat()
 
 # Polymarket CLOB API host
 host = "https://clob.polymarket.com"
@@ -15,6 +20,24 @@ client = ClobClient(
     key=pmkey,
     chain_id=chain_id
 )
+
+def ConstructTimeseries(history: json):
+    timeseries = [{ 
+          'price': point['p'], 
+          'timestamp': point['t'], 
+          'date': DateFromTimestamp(point['t'])
+        } for point in history]
+    return timeseries
+
+# default/min fidelity is 10 minutes. There's a cutoff at 12-hours where the timeseries will go back much further (~2-years further)
+def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1):
+    if fidelity_hours != -1: fidelity = fidelity_hours * 60
+    response = requests.get(f"{host}/prices-history", params={"market": token_id, "interval": "max", "fidelity": fidelity})
+    if not response.status_code == 200:
+        print(f"error fetching price history: response {response.status_code}"); return None
+    history = json.loads(response.content)['history']
+    timeseries = ConstructTimeseries(history)
+    return timeseries
 
 def FetchMarkets(next_cursor=None):
     # Initialize variables for pagination
@@ -49,7 +72,7 @@ def FetchMarkets(next_cursor=None):
 
 
 def FilterData(markets) -> list[dict]:
-    wanted_fields = ("question", "description", "tokens")
+    wanted_fields = ("question", "description", "tokens", "question_id", "condition_id")
     # there are always two tokens. https://docs.polymarket.com/#get-markets
     # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
     # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
@@ -66,7 +89,7 @@ def FilterData(markets) -> list[dict]:
     return filtered_data
 
 def WriteJsonDump(data: list[dict]):
-    with open((pathlib.Path.cwd() / "PMdump_openmarkets.json"), "w") as json_file:
+    with open((pathlib.Path.cwd() / "PMdump.json"), "w") as json_file:
         json.dump(data, json_file, indent=2)
         print("wrote PMdump.json")
     return
@@ -137,15 +160,16 @@ def fetch_and_process_markets():
     return filtered_data
 
 if __name__ == "__main__":
-    # markets = LoadJsonDump()
-    # print(markets)
-    markets_list = FetchMarkets()
-    filtered = FilterData(markets_list)
+    markets = LoadJsonDump()
+    print(markets)
+    # markets_list = FetchMarkets()
+    # filtered = FilterData(markets_list)
     
     # Debugging step: Print out the raw data
     #print("Raw Market Data:")
     #print(json.dumps(markets_list, indent=2))
-    WriteJsonDump(filtered)
+    # print(json.dumps(filtered, indent=2))
+    # WriteJsonDump(filtered)
     
     # market["active"] is always True?? Even when it's closed.
     # print(f"\n\n returned {len(markets_list)} markets \n")
