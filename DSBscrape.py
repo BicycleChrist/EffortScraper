@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 import csv
 import time
+import json
 
 def scrape_permits_page(url):
     headers = {
@@ -94,26 +95,85 @@ def scrape_vessels_page(url):
 
     return data
 
+def format_ifq_reference():
+    # Horrible to be including this as I am. Sue me
+    return """
+IFQ Area Reference:
+2C - Southeast Alaska
+3A - Central Gulf of Alaska
+3B - Western Gulf of Alaska
+4A - Eastern Aleutian Islands
+4B - Central/Western Aleutian Islands
+4C - Pribilof Islands
+4D - Northwestern Bering Sea
+4E - Bering Sea Flats
+
+Regulatory Areas for Halibut:
+2C - Southeast Outside District
+3A - Eastern Gulf of Alaska
+3B - Central Gulf of Alaska
+4A - Eastern Aleutians
+4B - Western Aleutians
+4C - Pribilof Islands
+4D - Northwestern Bering Sea
+4E - Bering Sea
+
+Regulatory Areas for Sablefish:
+AI - Aleutian Islands
+BS - Bering Sea
+CG - Central Gulf
+SE - Southeast Outside
+WG - Western Gulf
+WY - West Yakutat
+
+Vessel Categories:
+A - Vessels of any length
+B - Vessels less than or equal to 60 feet in length
+C - Vessels less than or equal to 35 feet in length
+D - Vessels less than or equal to 60 feet in length, not a catcher/processor
+
+Block Status:
+B - Blocked quota share
+U - Unblocked quota share
+"""
+
 def save_data(data, name):
     if not data:
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(data)
-
+    
     output_dir = 'PermitData'
     os.makedirs(output_dir, exist_ok=True)
-
+    
+    # add in reference information 
+    reference_info = format_ifq_reference()
+    
+    # save CSV with reference information as header comment, semi jenk
     csv_path = os.path.join(output_dir, f"{name}_{timestamp}.csv")
-    df.to_csv(csv_path,
-              index=False,
-              encoding='utf-8-sig',
-              quoting=csv.QUOTE_ALL,
-              quotechar='"',
-              escapechar='\\')
-
+    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+        if 'ifq' in name.lower():
+            f.write(f"# {reference_info.replace(chr(10), chr(10)+'# ')}\n")
+        writer = csv.writer(f, 
+                          quoting=csv.QUOTE_ALL,
+                          quotechar='"',
+                          escapechar='\\')
+        writer.writerow(df.columns)
+        writer.writerows(df.values)
+    
+    # save excel file with area/region key 
     excel_path = os.path.join(output_dir, f"{name}_{timestamp}.xlsx")
-    df.to_excel(excel_path, index=False)
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Data', index=False)
+        if 'ifq' in name.lower():
+            # Create reference sheet
+            ref_df = pd.DataFrame({'Reference Information': [line for line in reference_info.split('\n') if line.strip()]})
+            ref_df.to_excel(writer, sheet_name='IFQ Reference', index=False)
+            
+            # Adjust column width for reference sheet
+            worksheet = writer.sheets['IFQ Reference']
+            worksheet.column_dimensions['A'].width = 100
 
     print(f"Saved {len(data)} records for {name}")
     print(f"Files saved as {csv_path} and {excel_path}")
