@@ -1,71 +1,54 @@
-from selenium import webdriver
-from selenium.webdriver.firefox.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
-import os
 from datetime import datetime
+import os
+import csv  # Added missing import for csv.QUOTE_ALL
 
-def scrape_table(url):
-    options = webdriver.FirefoxOptions()
-    options.add_argument("--headless")
-    driver = webdriver.Firefox(options=options)
+def scrape_page(url):
+    # Use a more modern browser User-Agent
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/123.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+    }
 
-    try:
-        print(f"Accessing webpage...")
-        driver.get(url)
+    response = requests.get(url, headers=headers)
+    soup = BeautifulSoup(response.text, 'lxml')  # lxml is faster than html.parser
 
-        wait = WebDriverWait(driver, 10)
-        rows = wait.until(EC.presence_of_all_elements_located(
-            (By.CLASS_NAME, "resp-table-body__row")))
+    # Find all listing rows
+    rows = soup.find_all('tr', class_='resp-table-body__row')
 
-        print(f"Found {len(rows)} rows")
-        data = []
+    data = []
+    for row in rows:
+        listing = {}
 
-        for row in rows:
-            try:
-                row_data = {}
+        # Extract all labeled data at once
+        for item in row.find_all(class_=['resp-table-body__item--main', 'resp-table-body__item--inline']):
+            label = item.find(class_='resp-table-body__label')
+            if label:
+                key = label.text.strip().rstrip(':')
+                # Get text after the label
+                value = item.get_text(strip=True).replace(label.get_text(strip=True), '').strip()
+                listing[key] = value
 
-                id_cell = row.find_element(By.CLASS_NAME, "resp-table-body__item--main")
-                if id_cell:
-                    row_data['ID'] = id_cell.text.replace('ID:', '').strip()
+        # Extract notes/updated info
+        notes_div = row.find('div', id=lambda x: x and x.startswith('listing-notes-'))
+        if notes_div:
+            notes_label = notes_div.find(class_='resp-table-body__label')
+            if notes_label:
+                notes_text = notes_div.get_text(strip=True).replace(notes_label.get_text(strip=True), '').strip()
+                listing['Updated'] = notes_text
 
-                inline_cells = row.find_elements(By.CLASS_NAME, "resp-table-body__item--inline")
+        if listing:
+            data.append(listing)
 
-                for cell in inline_cells:
-                    try:
-                        label_span = cell.find_element(By.CLASS_NAME, "resp-table-body__label")
-                        if label_span:
-                            label = label_span.text.rstrip(':')
-                            full_text = cell.text
-                            value = full_text.replace(label_span.text, '').strip()
-                            row_data[label] = value
-                    except:
-                        continue
+    return data
 
-                notes_div = row.find_elements(By.CSS_SELECTOR, "[id^='listing-notes-']")
-                if notes_div:
-                    row_data['Updated'] = notes_div[0].text.replace('Updated/Notes:', '').strip()
-
-                data.append(row_data)
-
-            except Exception as e:
-                print(f"Error processing row: {e}")
-                continue
-
-        return data
-
-    except Exception as e:
-        print(f"Error during scraping: {e}")
-        return None
-
-    finally:
-        driver.quit()
-
-def save_data(data, base_filename):
+def save_data(data, name):
     if not data:
-        return False
+        return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(data)
@@ -73,20 +56,21 @@ def save_data(data, base_filename):
     output_dir = 'PermitData'
     os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        csv_filename = os.path.join(output_dir, f"{base_filename}_{timestamp}.csv")
-        df.to_csv(csv_filename, index=False)
-        print(f"Data saved to CSV: {csv_filename}")
+    # Fix for CSV: properly escape special characters and handle encoding
+    csv_path = os.path.join(output_dir, f"{name}_{timestamp}.csv")
+    df.to_csv(csv_path,
+              index=False,
+              encoding='utf-8-sig',  # Use UTF-8 with BOM for Excel compatibility
+              quoting=csv.QUOTE_ALL,  # Quote all fields
+              quotechar='"',         # Use double quotes
+              escapechar='\\')       # Use backslash as escape character
 
-        excel_filename = os.path.join(output_dir, f"{base_filename}_{timestamp}.xlsx")
-        df.to_excel(excel_filename, index=False)
-        print(f"Data saved to Excel: {excel_filename}")
+    # Excel saving remains the same
+    excel_path = os.path.join(output_dir, f"{name}_{timestamp}.xlsx")
+    df.to_excel(excel_path, index=False)
 
-        return True
-
-    except Exception as e:
-        print(f"Error saving files: {e}")
-        return False
+    print(f"Saved {len(data)} records for {name}")
+    print(f"Files saved as {csv_path} and {excel_path}")
 
 def main():
     urls = {
@@ -96,14 +80,15 @@ def main():
     }
 
     for name, url in urls.items():
-        print(f"\nStarting web scraping for {name}...")
-        data = scrape_table(url)
-
-        if data:
-            print(f"Successfully scraped {len(data)} rows")
-            save_data(data, name)
-        else:
-            print(f"No data was scraped")
+        print(f"\nScraping {name}...")
+        try:
+            data = scrape_page(url)
+            if data:
+                save_data(data, name)
+            else:
+                print(f"No data found for {name}")
+        except Exception as e:
+            print(f"Error scraping {name}: {e}")
 
 if __name__ == "__main__":
     main()
