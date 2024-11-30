@@ -47,40 +47,40 @@ def plot_price_history(timeseries, market_title="Market Price History"):
     
     # Add text box with price information
     info_text = f'Current: {current_price:.3f}\nMin: {min_price:.3f}\nMax: {max_price:.3f}'
-    plt.text(0.02, 0.98, info_text,
+    # plt.legend(bbox_to_anchor=(0, 1.02, 1, 0.2), 
+    #       loc="lower left",
+    #       mode="expand", 
+    #       borderaxespad=0,
+    #       ncol=3,
+    #       fancybox=True, 
+    #       shadow=True)
+    
+    # Or alternatively, you can create a text box instead of a legend:
+    props = dict(boxstyle='round', facecolor='white', alpha=0.8)
+    plt.text(0.02, 0.98, 
+             'Current: 0.505\nMin: 0.315\nMax: 0.675',
              transform=plt.gca().transAxes,
-             bbox=dict(facecolor='white', alpha=0.8),
+             fontsize=9,
              verticalalignment='top',
-             fontsize=10)
+             bbox=props)
+    
+    # To ensure there's enough room at the top:
+    plt.subplots_adjust(top=0.85)  # Adjust this value as needed
     
     # Adjust layout to prevent label cutoff
     plt.tight_layout()
-    
     return plt.gcf()
 
-# Example usage:
-def plot_market_history(token_id, market_title="Market Price History"):
-    """
-    Get price history for a market and plot it
-    
-    Parameters:
-    token_id (int): The market token ID
-    market_title (str): Title for the plot
-    """
-    
-    # Get the price history using your existing function
-    timeseries = GetPriceHistory(token_id)
-    
-    if timeseries:
-        # Create the plot
-        fig = plot_price_history(timeseries, market_title)
-        plt.show(block=True)
-    else:
-        print("Failed to fetch price history data")
+def PlotMarket(market:dict):
+    timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) for token_id in market['token_ids']]
+    for timeseries in timeseries_pair: plot_price_history(timeseries)
+    plt.show(block=True)
 
 if __name__ == "__main__":
     # these token_ids are for the presidential election
-    #token_ids = [11015470973684177829729219287262166995141465048508201953575582100565462316088, 65444287174436666395099524416802980027579283433860283898747701594488689243696]
-    #timeseries_pair = [GetPriceHistory(token_id, fidelity_hours=12) for token_id in token_ids]
-    #for timeseries in timeseries_pair: plot_price_history(timeseries)
+    market = "presidential_election_2024"
+    token_ids = [11015470973684177829729219287262166995141465048508201953575582100565462316088, 65444287174436666395099524416802980027579283433860283898747701594488689243696]
+    timeseries_pair = [GetPriceHistory(token_id, fidelity_hours=12) for token_id in token_ids]
+    for timeseries in timeseries_pair: plot_price_history(timeseries)
+    plt.show(block=True)
     print("done")

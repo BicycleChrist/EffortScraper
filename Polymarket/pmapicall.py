@@ -39,6 +39,10 @@ def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1):
     timeseries = ConstructTimeseries(history)
     return timeseries
 
+def GetMarketHistory(market_name): pass
+    # do something
+    #return GetPriceHistory(...)
+
 def FetchMarkets(next_cursor=None):
     # Initialize variables for pagination
     markets_list = []
@@ -85,13 +89,14 @@ def FilterData(markets) -> list[dict]:
     ]
     for market in filtered_data:
         market["lines"] = [ token['outcome'] + ': ' + str(token['price']*100) + '%' for token in market["tokens"] ]
+        market["token_ids"] = [token['token_id'] for token in market['tokens']]
         del market["tokens"]
     return filtered_data
 
-def WriteJsonDump(data: list[dict]):
-    with open((pathlib.Path.cwd() / "PMdump.json"), "w") as json_file:
+def WriteJsonDump(data: list[dict], filename="PMdump"):
+    with open((pathlib.Path.cwd() / f"{filename}.json"), "w") as json_file:
         json.dump(data, json_file, indent=2)
-        print("wrote PMdump.json")
+        print(f"wrote {filename}.json")
     return
 
 def LoadJsonDump():
@@ -157,14 +162,17 @@ def fetch_and_process_markets():
     markets_list = FetchMarkets()
     filtered_data = FilterData(markets_list)
     WriteJsonDump(filtered_data)
+    WriteJsonDump(markets_list, "PMdump_all")
     return filtered_data
 
 if __name__ == "__main__":
-    markets = LoadJsonDump()
-    print(markets)
+    # markets = LoadJsonDump()
+    # print(markets)
+    
+    fetch_and_process_markets()
+    
     # markets_list = FetchMarkets()
     # filtered = FilterData(markets_list)
-    
     # Debugging step: Print out the raw data
     #print("Raw Market Data:")
     #print(json.dumps(markets_list, indent=2))
