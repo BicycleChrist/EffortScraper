@@ -19,7 +19,7 @@ def scrape_permits_page(url):
     soup = BeautifulSoup(response.text, 'lxml')
 
     rows = soup.find_all('tr', class_='resp-table-body__row')
-    
+
     data = []
     for row in rows:
         listing = {}
@@ -52,20 +52,20 @@ def scrape_vessels_page(url):
     }
 
     response = requests.get(url, headers=headers)
-    
+
     if response.status_code != 200:
         return None
 
     soup = BeautifulSoup(response.text, 'lxml')
     vessels = soup.find_all('div', class_='card-vessel--flex')
-    
+
     if not vessels:
         return None
 
     data = []
     for vessel in vessels:
         vessel_data = {}
-        
+
         title = vessel.find('h3', class_='card-vessel__title')
         if title:
             vessel_data['ID'] = title.text.strip()
@@ -143,26 +143,26 @@ def save_data(data, name):
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(data)
-    
-    output_dir = 'PermitData'
+
+    output_dir = 'Archive'
     os.makedirs(output_dir, exist_ok=True)
-    
-    # add in reference information 
+
+    # add in reference information
     reference_info = format_ifq_reference()
-    
+
     # save CSV with reference information as header comment, semi jenk
     csv_path = os.path.join(output_dir, f"{name}_{timestamp}.csv")
     with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
         if 'ifq' in name.lower():
             f.write(f"# {reference_info.replace(chr(10), chr(10)+'# ')}\n")
-        writer = csv.writer(f, 
+        writer = csv.writer(f,
                           quoting=csv.QUOTE_ALL,
                           quotechar='"',
                           escapechar='\\')
         writer.writerow(df.columns)
         writer.writerows(df.values)
-    
-    # save excel file with area/region key 
+
+    # save excel file with area/region key
     excel_path = os.path.join(output_dir, f"{name}_{timestamp}.xlsx")
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Data', index=False)
@@ -170,7 +170,7 @@ def save_data(data, name):
             # Create reference sheet
             ref_df = pd.DataFrame({'Reference Information': [line for line in reference_info.split('\n') if line.strip()]})
             ref_df.to_excel(writer, sheet_name='IFQ Reference', index=False)
-            
+
             # Adjust column width for reference sheet
             worksheet = writer.sheets['IFQ Reference']
             worksheet.column_dimensions['A'].width = 100
@@ -185,7 +185,7 @@ def main():
         'Halibut_ifq': "https://dockstreetbrokers.com/longline-ifqs/halibut-ifqs",
         'Sablefish_ifq': "https://dockstreetbrokers.com/longline-ifqs/sablefish-ifqs"
     }
-    
+
     print("Starting permit scraping...")
     for name, url in permit_urls.items():
         print(f"\nScraping {name}...")
@@ -207,19 +207,19 @@ def main():
     while True:
         url = f"{base_url}{page}"
         print(f"Scraping vessel page {page}...")
-        
+
         page_data = scrape_vessels_page(url)
-        
+
         if page_data is None:
             print(f"No more vessel pages found after page {page-1}")
             break
-            
+
         all_vessel_data.extend(page_data)
         print(f"Found {len(page_data)} vessels on page {page}")
-        
+
         page += 1
-        time.sleep(1)  # Be nice to the server
-    
+        time.sleep(0.2)  # Be nice to the server
+
     if all_vessel_data:
         save_data(all_vessel_data, "vessels")
         print(f"\nTotal vessels scraped: {len(all_vessel_data)}")
