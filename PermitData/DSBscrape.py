@@ -6,6 +6,7 @@ import os
 import csv
 import time
 import json
+from DB_Setup import *
 
 def scrape_permits_page(url):
     headers = {
@@ -178,6 +179,43 @@ def save_data(data, name):
     print(f"Saved {len(data)} records for {name}")
     print(f"Files saved as {csv_path} and {excel_path}")
 
+
+
+def update_database():
+    """Import newly scraped data into the database"""
+    try:
+        # Import the database setup script
+        import DB_Setup
+
+        # Create database if it doesn't exist
+        if not os.path.exists('fisheries.db'):
+            DB_Setup.create_database()
+            print("Created new database.")
+
+        # Import only the most recent files (from current scrape)
+        current_date = datetime.now().strftime("%Y%m%d")
+        archive_dir = '/home/retupmoc/Desktop/EffortScraper/PermitData/Archive'
+
+        for filename in os.listdir(archive_dir):
+            if current_date in filename and filename.endswith('.csv'):
+                file_path = os.path.join(archive_dir, filename)
+                print(f"Importing {filename}...")
+
+                if filename.startswith('vessels_'):
+                    DB_Setup.import_vessels_data(file_path)
+                elif filename.startswith('Sablefish_ifq_') or filename.startswith('Halibut_ifq_'):
+                    DB_Setup.import_ifq_data(file_path)
+                elif filename.startswith('alaska_permits_'):
+                    DB_Setup.import_alaska_permits_data(file_path)
+
+        print("Database update complete.")
+
+    except Exception as e:
+        print(f"Error updating database: {str(e)}")
+
+
+
+
 def main():
     # Scrape permits
     permit_urls = {
@@ -228,3 +266,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    update_database()
