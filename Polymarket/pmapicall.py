@@ -39,10 +39,6 @@ def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1):
     timeseries = ConstructTimeseries(history)
     return timeseries
 
-def GetMarketHistory(market_name): pass
-    # do something
-    #return GetPriceHistory(...)
-
 def FetchMarkets(next_cursor=None):
     # Initialize variables for pagination
     markets_list = []

@@ -4,7 +4,7 @@ import matplotlib.dates as mdates
 from datetime import datetime
 import pandas as pd
 
-def plot_price_history(timeseries, market_title="Market Price History"):
+def plot_price_history(timeseries, label, market_title="Market Price History"):
     """
     Plot price history from a timeseries returned by ConstructTimeseries
     
@@ -23,7 +23,7 @@ def plot_price_history(timeseries, market_title="Market Price History"):
     
     # Plot the price history
     #plt.plot(df['datetime'], df['price'], linewidth=2, color=line_color)
-    plt.plot(df['datetime'], df['price'], linewidth=2)
+    plt.plot(df['datetime'], df['price'], linewidth=2, label=label)
     
     # Customize the plot
     plt.title(market_title, fontsize=14, pad=20)
@@ -66,21 +66,29 @@ def plot_price_history(timeseries, market_title="Market Price History"):
     
     # To ensure there's enough room at the top:
     plt.subplots_adjust(top=0.85)  # Adjust this value as needed
+    plt.legend(loc='upper right', bbox_to_anchor=(1, 1),
+              fancybox=True, shadow=True)
     
     # Adjust layout to prevent label cutoff
     plt.tight_layout()
     return plt.gcf()
 
-def PlotMarket(market:dict):
-    timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) for token_id in market['token_ids']]
-    for timeseries in timeseries_pair: plot_price_history(timeseries)
-    plt.show(block=True)
+
+# query is text that will be used to filter markets based on question
+def PlotMarkets(query, markets):
+    matching_markets = [market for market in markets if market['question'].startswith(query)]
+    print(f"found {len(matching_markets)} markets matching '{query}'")
+    for market in matching_markets:
+        timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) for token_id in market['token_ids']]
+        line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
+        for (label,timeseries) in zip(line_labels, timeseries_pair): 
+            plot_price_history(timeseries, label, market_title=market['question'])
+        plt.show(block=True)
+    print("done")
+    return
+
 
 if __name__ == "__main__":
-    # these token_ids are for the presidential election
-    market = "presidential_election_2024"
-    token_ids = [11015470973684177829729219287262166995141465048508201953575582100565462316088, 65444287174436666395099524416802980027579283433860283898747701594488689243696]
-    timeseries_pair = [GetPriceHistory(token_id, fidelity_hours=12) for token_id in token_ids]
-    for timeseries in timeseries_pair: plot_price_history(timeseries)
-    plt.show(block=True)
-    print("done")
+    markets = LoadJsonDump()
+    PlotMarkets('OpenSea', markets)
+    
