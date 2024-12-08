@@ -4,7 +4,8 @@ import matplotlib.dates as mdates
 from datetime import datetime
 import pandas as pd
 
-def plot_price_history(timeseries, label, market_title="Market Price History"):
+# label is the text to put in the legend
+def plot_price_history(index:int, label, timeseries, market_title="Market Price History"):
     """
     Plot price history from a timeseries returned by ConstructTimeseries
     
@@ -19,7 +20,7 @@ def plot_price_history(timeseries, label, market_title="Market Price History"):
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
     
     # Create the figure and axis
-    plt.figure(0, figsize=(12, 6))
+    plt.figure(index, figsize=(12, 6))
     
     # Plot the price history
     #plt.plot(df['datetime'], df['price'], linewidth=2, color=line_color)
@@ -58,7 +59,7 @@ def plot_price_history(timeseries, label, market_title="Market Price History"):
     # Or alternatively, you can create a text box instead of a legend:
     props = dict(boxstyle='round', facecolor='white', alpha=0.8)
     plt.text(0.02, 0.98, 
-             'Current: 0.505\nMin: 0.315\nMax: 0.675',
+             info_text,
              transform=plt.gca().transAxes,
              fontsize=9,
              verticalalignment='top',
@@ -75,20 +76,31 @@ def plot_price_history(timeseries, label, market_title="Market Price History"):
 
 
 # query is text that will be used to filter markets based on question
-def PlotMarkets(query, markets):
-    matching_markets = [market for market in markets if market['question'].startswith(query)]
+def PlotMarkets(query:str, markets, single_graph=False):
+    matching_markets = [market for market in markets if query in market['question']]
     print(f"found {len(matching_markets)} markets matching '{query}'")
-    for market in matching_markets:
+    userinput = input("continue? (Y/N, List): ")
+    if userinput.capitalize() == 'List':
+        for market in matching_markets: print(market['question']);
+        userinput = input("\ncontinue? (Y/N): ")
+    if userinput.capitalize() != 'Y': print("cancelling"); return;
+    for (index,market) in enumerate(matching_markets):
         timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) for token_id in market['token_ids']]
         line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
-        for (label,timeseries) in zip(line_labels, timeseries_pair): 
-            plot_price_history(timeseries, label, market_title=market['question'])
-        plt.show(block=True)
+        for (label,timeseries) in zip(line_labels, timeseries_pair):
+            title = market['question']
+            if single_graph: 
+                index = 0
+                label = title + ": " + label
+                title = query
+            plot_price_history(index, label, timeseries, title)
+        #plt.show(block=False)
+    plt.show(block=True)
     print("done")
     return
 
 
 if __name__ == "__main__":
     markets = LoadJsonDump()
-    PlotMarkets('OpenSea', markets)
-    
+    #PlotMarkets('OpenSea', markets)
+    PlotMarkets('NFL MVP', markets, False)
