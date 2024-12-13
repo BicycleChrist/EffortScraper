@@ -6,7 +6,7 @@ from sklearn.preprocessing import LabelEncoder
 import logging
 from openpyxl.styles import PatternFill
 
-# Set up logging
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Port coordinates
@@ -65,7 +65,7 @@ column_mapping = {
 }
 
 def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calculate the Haversine distance between two points in kilometers."""
+    # Been told this needs to happen, not exacly sure if
     R = 6371
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -75,7 +75,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 def calculate_port_distance_matrix(port_coordinates):
-    """Create a distance matrix between all ports."""
+    # distance matrix between ports
     ports = list(port_coordinates.keys())
     distances = pd.DataFrame(index=ports, columns=ports)
 
@@ -88,7 +88,7 @@ def calculate_port_distance_matrix(port_coordinates):
     return distances
 
 def calculate_price_correlations(df, ports):
-    """Calculate price correlations between all ports."""
+    # price correlations between all ports
     correlations = pd.DataFrame(index=ports, columns=ports)
 
     for p1 in ports:
@@ -102,7 +102,7 @@ def calculate_price_correlations(df, ports):
     return correlations
 
 def get_nearby_prices(df, port, date):
-    """Get prices from nearby months for a specific port."""
+    # +/- 3 month price reference
     nearby_prices = []
     for offset in range(-3, 4):  # -3 to +3 months
         try:
@@ -119,7 +119,7 @@ def get_nearby_prices(df, port, date):
     return nearby_prices
 
 def calculate_reasonable_bounds(prices, default_variation=0.3):
-    """Calculate reasonable min/max bounds from a list of prices."""
+    # price variation threshholds
     if not prices:
         return None, None
 
@@ -132,7 +132,7 @@ def calculate_reasonable_bounds(prices, default_variation=0.3):
     return median * (1 - variation), median * (1 + variation)
 
 def create_enhanced_features(df, target_port, port_distances, price_correlations):
-    """Create enhanced feature set for interpolation."""
+    # Claude attempting to pump out the feature set
     features = pd.DataFrame(index=df.index)
 
     # Temporal features
@@ -142,7 +142,7 @@ def create_enhanced_features(df, target_port, port_distances, price_correlations
     features['IsSummer'] = (features['Month'] >= 6) & (features['Month'] <= 8)
     features['IsWinter'] = (features['Month'] <= 2) | (features['Month'] == 12)
 
-    # Price history features
+    # price history features
     features['Prev_Month_Price'] = df[target_port].shift(1)
     features['Prev_Quarter_Avg'] = df[target_port].rolling(window=3, min_periods=1).mean()
 
@@ -161,7 +161,7 @@ def create_enhanced_features(df, target_port, port_distances, price_correlations
     return features
 
 def interpolate_with_model(df, port, features, model_params=None):
-    """Interpolate missing values using XGBoost with enhanced features."""
+    # interpolate with features
     if model_params is None:
         model_params = {
             'n_estimators': 200,
@@ -184,7 +184,7 @@ def interpolate_with_model(df, port, features, model_params=None):
 
     result = df[port].copy()
 
-    # Predict missing values
+    # Predict it
     for idx in df.index[pred_mask]:
         X_pred = features.loc[[idx]].fillna(-999)
         nearby_prices = get_nearby_prices(df, port, idx)
@@ -202,14 +202,14 @@ def interpolate_with_model(df, port, features, model_params=None):
 
 
 def extend_predictions(df, num_months, port_distances, price_correlations):
-    """Extend the dataset with predictions for future months"""
+    # try to make some big boy predictions
     # Create future dates
     last_date = df.index[-1]
     future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1),
                                periods=num_months,
                                freq='MS')
 
-    # Create extended DataFrame
+    # extend DataFrame
     extended_df = df.copy()
     for date in future_dates:
         extended_df.loc[date] = np.nan
@@ -229,7 +229,7 @@ def extend_predictions(df, num_months, port_distances, price_correlations):
 
 
 def preprocess_data(df, column_mapping):
-    """Preprocess data to handle multiple columns per port."""
+    # very jenk should remove
     df_processed = pd.DataFrame(index=df.index)
 
     port_columns = {}
