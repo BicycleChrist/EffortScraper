@@ -20,6 +20,8 @@ class PaginatedPlots:
         self.total_pages = 0
         self.fig = None
         self.axes = {}
+        # Store figure size as class attribute
+        self.figure_size = (15, 12)
 
     def add_market_data(self, market, timeseries_pair, line_labels):
         """Store market data for plotting"""
@@ -31,15 +33,16 @@ class PaginatedPlots:
         self.total_pages = (len(self.market_data) + self.plots_per_page - 1) // self.plots_per_page
 
     def plot_page(self):
-        """Plot current page of markets"""
-        plt.close('all')
+        if self.fig is None:
+            # Only create new figure on first call
+            self.fig = plt.figure(figsize=(15, 12))
+        else:
+            # Clear existing figure without closing window
+            self.fig.clear()
         
         # Calculate start and end indices for current page
         start_idx = self.current_page * self.plots_per_page
         end_idx = min(start_idx + self.plots_per_page, len(self.market_data))
-        
-        # Create figure with space for navigation buttons
-        self.fig = plt.figure(figsize=(15, 12))
         
         # Add navigation buttons
         next_btn = plt.axes([0.95, 0.02, 0.02, 0.04])
@@ -52,9 +55,9 @@ class PaginatedPlots:
                    ha='center')
         
         # Calculate grid layout
-        cols = min(3, self.plots_per_page)
+        cols = min(4, self.plots_per_page)
         rows = (self.plots_per_page + cols - 1) // cols
-
+    
         # Plot markets for current page
         for i, idx in enumerate(range(start_idx, end_idx)):
             data = self.market_data[idx]
@@ -92,14 +95,18 @@ class PaginatedPlots:
             
             ax.legend(loc='upper right', bbox_to_anchor=(1, 1),
                      fancybox=True, shadow=True, fontsize=6)
-
+    
         # Set up button callbacks
         self.next_button.on_clicked(self.next_page)
         self.prev_button.on_clicked(self.prev_page)
         
         plt.tight_layout()
         plt.subplots_adjust(bottom=0.1)  # Make room for navigation
-        plt.show(block=True)
+        
+        if self.fig not in plt.get_fignums():
+            plt.show(block=True)
+        else:
+            self.fig.canvas.draw()
 
     def next_page(self, event):
         """Handle next page button click"""
@@ -189,6 +196,6 @@ def PlotMarketsMultiThreaded(query:str, markets, single_graph=False, market_limi
 if __name__ == "__main__":
     markets = LoadJsonDump()
     #PlotMarkets('OpenSea', markets)
-    PlotMarkets('NFL', markets, False)
+    PlotMarkets('NBA', markets, False)
     # PlotMarketsMultiThreaded("Trump", markets, market_limit=1000, max_workers=16)
  
