@@ -10,6 +10,10 @@ from datetime import datetime
 def GetCurrentTimestamp(): return datetime.now().timestamp()
 def DateFromTimestamp(timestamp: int) -> str: return datetime.fromtimestamp(timestamp).date().isoformat()
 
+TIMESERIES_DIR = pathlib.Path.cwd() / "timeseries_cache"
+if not TIMESERIES_DIR.exists(): TIMESERIES_DIR.mkdir()
+TIMESERIES_CACHE = None
+
 # Polymarket CLOB API host
 host = "https://clob.polymarket.com"
 chain_id = 137  # Polygon Mainnet
@@ -29,14 +33,38 @@ def ConstructTimeseries(history: json):
         } for point in history]
     return timeseries
 
+def LoadTimeseriesData():
+    global TIMESERIES_CACHE
+    if TIMESERIES_CACHE is not None: return TIMESERIES_CACHE;
+    TIMESERIES_CACHE = {}
+    cache_files = TIMESERIES_DIR.glob('*')
+    for filepath in cache_files:
+        with open(filepath, mode='r', encoding='utf-8') as file_data:
+            TIMESERIES_CACHE[int(filepath.name)] = json.load(file_data)
+    return TIMESERIES_CACHE
+
+# TODO: record the fidelity of cached timeseries
+def SaveTimeseriesToCache(token_id:int, timeseries):
+    # print(f"caching {token_id}")
+    cache_file = TIMESERIES_DIR / str(token_id)
+    with open(cache_file, mode='w', encoding='utf-8') as new_cache_file:
+        json.dump(timeseries, new_cache_file, indent=2)
+    return
+
 # default/min fidelity is 10 minutes. There's a cutoff at 12-hours where the timeseries will go back much further (~2-years further)
-def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1):
+def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1, cache=True):
+    global TIMESERIES_CACHE
+    # TODO: do not ignore the fidelity of cached timeseries
+    LoadTimeseriesData()
+    if token_id in TIMESERIES_CACHE: return TIMESERIES_CACHE[token_id];
     if fidelity_hours != -1: fidelity = fidelity_hours * 60
     response = requests.get(f"{host}/prices-history", params={"market": token_id, "interval": "max", "fidelity": fidelity})
     if not response.status_code == 200:
         print(f"error fetching price history: response {response.status_code}"); return None
     history = json.loads(response.content)['history']
     timeseries = ConstructTimeseries(history)
+    # timeseries was not already cached; save it.
+    SaveTimeseriesToCache(token_id, timeseries)
     return timeseries
 
 def FetchMarkets(next_cursor=None):
