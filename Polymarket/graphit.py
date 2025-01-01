@@ -39,70 +39,73 @@ class PaginatedPlots:
         else:
             # Clear existing figure without closing window
             self.fig.clear()
-        
+
         # Calculate start and end indices for current page
         start_idx = self.current_page * self.plots_per_page
         end_idx = min(start_idx + self.plots_per_page, len(self.market_data))
-        
+
         # Add navigation buttons
         next_btn = plt.axes([0.95, 0.02, 0.02, 0.04])
         prev_btn = plt.axes([0.90, 0.02, 0.02, 0.04])
         self.next_button = Button(next_btn, '→')
         self.prev_button = Button(prev_btn, '←')
-        
+
         # Add page indicator
         plt.figtext(0.5, 0.02, f'Page {self.current_page + 1} of {self.total_pages}',
                    ha='center')
-        
+
         # Calculate grid layout
         cols = min(4, self.plots_per_page)
         rows = (self.plots_per_page + cols - 1) // cols
-    
+
         # Plot markets for current page
         for i, idx in enumerate(range(start_idx, end_idx)):
             data = self.market_data[idx]
             market = data['market']
             timeseries_pair = data['timeseries_pair']
             line_labels = data['line_labels']
-            
+
             ax = plt.subplot(rows, cols, i + 1)
-            
+
+            label_count = 0
             for label, timeseries in zip(line_labels, timeseries_pair):
                 df = pd.DataFrame(timeseries)
                 df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
-                
+
                 ax.plot(df['datetime'], df['price'], linewidth=2, label=label)
                 ax.set_title(market['question'], fontsize=10, pad=2)
                 ax.grid(True, linestyle='--', alpha=0.7)
-                
+
                 # Format x-axis
                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
                 ax.xaxis.set_major_locator(mdates.AutoDateLocator())
                 ax.tick_params(axis='x', labelsize=6)
-                
+
                 # Add price statistics
                 min_price = df['price'].min()
                 max_price = df['price'].max()
                 current_price = df['price'].iloc[-1]
-                
-                info_text = f'Current: {current_price:.3f}\nMin: {min_price:.3f}\nMax: {max_price:.3f}'
-                props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-                ax.text(0.02, 0.98, info_text,
+
+                info_text = f'[{label}]\nCurrent: {current_price:.3f}\nMin: {min_price:.3f}\nMax: {max_price:.3f}'
+                props = dict(boxstyle='round', facecolor='white', alpha=0.15)
+                ax.text(0.025, 0.98-(label_count*0.78), info_text,
                        transform=ax.transAxes,
                        fontsize=7,
+                       weight='bold',
                        verticalalignment='top',
                        bbox=props)
-            
+                label_count += 1
+
             ax.legend(loc='upper right', bbox_to_anchor=(1, 1),
                      fancybox=True, shadow=True, fontsize=6)
-    
+
         # Set up button callbacks
         self.next_button.on_clicked(self.next_page)
         self.prev_button.on_clicked(self.prev_page)
-        
+
         plt.tight_layout()
         plt.subplots_adjust(bottom=0.1)  # Make room for navigation
-        
+
         if self.fig not in plt.get_fignums():
             plt.show(block=True)
         else:
@@ -123,7 +126,7 @@ class PaginatedPlots:
 def PlotMarkets(query:str, markets, single_graph=False, confirm=False, plots_per_page=12):
     matching_markets = [market for market in markets if query in market['question']]
     print(f"found {len(matching_markets)} markets matching '{query}'")
-    
+
     if confirm:
         userinput = input("continue? (Y/N, List): ")
         if userinput.capitalize() == 'List':
@@ -133,18 +136,18 @@ def PlotMarkets(query:str, markets, single_graph=False, confirm=False, plots_per
 
     # Initialize paginated plots
     paginated = PaginatedPlots(plots_per_page)
-    
+
     # Collect all market data
     for market in matching_markets:
-        timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) 
+        timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12)
                           for token_id in market['token_ids']]
         line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
         paginated.add_market_data(market, timeseries_pair, line_labels)
-    
+
     # Display first page
     if paginated.market_data:
         paginated.plot_page()
-    
+
     print("done")
     return
 
@@ -157,12 +160,12 @@ def fetch_price_histories(market) -> tuple:
     line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
     return (market['question'], line_labels, timeseries_pair)
 
-# multithreaded version, presntly broken. Need to find request limit in docs. 
+# multithreaded version, presntly broken. Need to find request limit in docs.
 # consistent 429 resppnse code
 def PlotMarketsMultiThreaded(query:str, markets, single_graph=False, market_limit=500, max_workers=10):
     matching_markets = [market for market in markets if query in market['question']][:market_limit]
     print(f"Processing {len(matching_markets)} markets out of {len([m for m in markets if query in m['question']])} matches")
-    
+
     userinput = input("continue? (Y/N, List): ")
     if userinput.capitalize() == 'List':
         for market in matching_markets: print(market['question'])
@@ -176,7 +179,7 @@ def PlotMarketsMultiThreaded(query:str, markets, single_graph=False, market_limi
             timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12) for token_id in market['token_ids']]
             line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
             title = market['question']
-            
+
             for label, timeseries in zip(line_labels, timeseries_pair):
                 plot_title = title if not single_graph else query
                 plot_index = 0 if single_graph else index
@@ -188,14 +191,15 @@ def PlotMarketsMultiThreaded(query:str, markets, single_graph=False, market_limi
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(process_market, enumerate(matching_markets))
-    
+
     # plt.show(block=True)
     print("done")
 
 
 if __name__ == "__main__":
     markets = LoadJsonDump()
-    #PlotMarkets('OpenSea', markets)
-    PlotMarkets('NBA', markets, False)
-    # PlotMarketsMultiThreaded("Trump", markets, market_limit=1000, max_workers=16)
- 
+    PlotMarkets('NFL', markets)
+    # PlotMarkets('OpenSea', markets)
+    # PlotMarkets('AI', markets, False)
+    #PlotMarketsMultiThreaded("Trump", markets, market_limit=1000, max_workers=12 )
+
