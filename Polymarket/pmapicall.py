@@ -14,6 +14,9 @@ TIMESERIES_DIR = pathlib.Path.cwd() / "timeseries_cache"
 if not TIMESERIES_DIR.exists(): TIMESERIES_DIR.mkdir()
 TIMESERIES_CACHE = None
 
+# counting how many markets needed to be fetched
+CACHE_MISS_COUNT = 0
+
 # Polymarket CLOB API host
 host = "https://clob.polymarket.com"
 chain_id = 137  # Polygon Mainnet
@@ -37,26 +40,30 @@ def LoadTimeseriesData():
     global TIMESERIES_CACHE
     if TIMESERIES_CACHE is not None: return TIMESERIES_CACHE;
     TIMESERIES_CACHE = {}
+    print("loading timeseries cache...")
     cache_files = TIMESERIES_DIR.glob('*')
     for filepath in cache_files:
         with open(filepath, mode='r', encoding='utf-8') as file_data:
             TIMESERIES_CACHE[int(filepath.name)] = json.load(file_data)
+    print(f"loaded timeseries cache ({len(TIMESERIES_CACHE)} entries)")
     return TIMESERIES_CACHE
 
 # TODO: record the fidelity of cached timeseries
 def SaveTimeseriesToCache(token_id:int, timeseries):
     # print(f"caching {token_id}")
+    global CACHE_MISS_COUNT; CACHE_MISS_COUNT += 1
     cache_file = TIMESERIES_DIR / str(token_id)
     with open(cache_file, mode='w', encoding='utf-8') as new_cache_file:
         json.dump(timeseries, new_cache_file, indent=2)
     return
 
 # default/min fidelity is 10 minutes. There's a cutoff at 12-hours where the timeseries will go back much further (~2-years further)
-def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1, cache=True):
+def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1, load_cache=True):
     global TIMESERIES_CACHE
     # TODO: do not ignore the fidelity of cached timeseries
-    LoadTimeseriesData()
-    if token_id in TIMESERIES_CACHE: return TIMESERIES_CACHE[token_id];
+    if load_cache:
+        LoadTimeseriesData()
+        if token_id in TIMESERIES_CACHE: return TIMESERIES_CACHE[token_id];
     if fidelity_hours != -1: fidelity = fidelity_hours * 60
     response = requests.get(f"{host}/prices-history", params={"market": token_id, "interval": "max", "fidelity": fidelity})
     if not response.status_code == 200:
@@ -66,6 +73,17 @@ def GetPriceHistory(token_id:int, fidelity:int = 10, fidelity_hours:int = -1, ca
     # timeseries was not already cached; save it.
     SaveTimeseriesToCache(token_id, timeseries)
     return timeseries
+
+# Keep pumping
+def GetOrderbook(token_ids:list):
+    books = client.get_order_books(token_ids)
+    return books
+
+# regex for searching "tags" including "All" in open_markets(_nl).json
+# "tags"[ \t]*:[ \t]*\[[ \t\n\r]*(?:[^"\]]*"[^"]*"[ \t\n\r]*,[ \t\n\r]*)*"All"[ \t\n\r]*(?:,[ \t\n\r]*[^"\]]*"[^"]*")*[ \t\n\r]*\]
+# KDE's regex engine seems to be bugged and '\s' (whitespace) doesn't include newline, which is why '[ \t\n\r]' is used instead
+# not all markets have "All" tag? and occasionally "tags" is null (test markets)
+# TODO: load market tags
 
 def FetchMarkets(next_cursor=None):
     # Initialize variables for pagination

@@ -47,3 +47,4 @@ Database/Testing
 boundFetch/cronjob_success
 mmKEY.py
 Polymarket/*.json
+Polymarket/timeseries_cache/

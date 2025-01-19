@@ -1,3 +1,4 @@
+import pmapicall # global variables cannot be imported with 'from' syntax, so this is necessary (for CACHE_MISS_COUNT)
 from pmapicall import *
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -6,6 +7,7 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from matplotlib.widgets import Button
+import argparse
 
 # TODO: option for old multi-window display instead of subplot
 # TODO: Allow for faster navigation between the different graph pages
@@ -137,13 +139,15 @@ def PlotMarkets(query:str, markets, single_graph=False, confirm=False, plots_per
     # Initialize paginated plots
     paginated = PaginatedPlots(plots_per_page)
 
+    pmapicall.CACHE_MISS_COUNT = 0 # resetting cache stats
     # Collect all market data
     for market in matching_markets:
         timeseries_pair = [GetPriceHistory(int(token_id), fidelity_hours=12)
                           for token_id in market['token_ids']]
         line_labels = [line.split(':', maxsplit=1)[0] for line in market['lines']]
         paginated.add_market_data(market, timeseries_pair, line_labels)
-
+    print(f"{len(matching_markets) - pmapicall.CACHE_MISS_COUNT} markets loaded from cache. ({pmapicall.CACHE_MISS_COUNT} fetched)")
+    
     # Display first page
     if paginated.market_data:
         paginated.plot_page()
@@ -152,7 +156,8 @@ def PlotMarkets(query:str, markets, single_graph=False, confirm=False, plots_per
     return
 
 
-
+# TODO: check for 'Retry-After' header on 429 response
+# https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
 # for multithreaded version. Bugged; fails to fetch timeseries for most markets
 def fetch_price_histories(market) -> tuple:
     """Helper function to fetch price histories for a single market"""
@@ -195,10 +200,16 @@ def PlotMarketsMultiThreaded(query:str, markets, single_graph=False, market_limi
     # plt.show(block=True)
     print("done")
 
-
+# TODO: add option to filter by tags
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("market_query")
+    cmdline_args = parser.parse_args()
+    print(cmdline_args.market_query)
+    
     markets = LoadJsonDump()
-    PlotMarkets('NFL', markets)
+    PlotMarkets(cmdline_args.market_query, markets)
+    # PlotMarkets('Trump', markets)
     # PlotMarkets('OpenSea', markets)
     # PlotMarkets('AI', markets, False)
     #PlotMarketsMultiThreaded("Trump", markets, market_limit=1000, max_workers=12 )
