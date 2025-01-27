@@ -1,5 +1,6 @@
 import csv
 import json
+from collections import Counter
 from pprint import pprint
 from py_clob_client.client import ClobClient
 from mmKEY import pmkey
@@ -27,6 +28,9 @@ client = ClobClient(
     key=pmkey,
     chain_id=chain_id
 )
+
+# TODO: implement api-calls for 'gamma-market' api
+# https://docs.polymarket.com/#gamma-markets-api
 
 def ConstructTimeseries(history: json):
     timeseries = [{ 
@@ -83,7 +87,6 @@ def GetOrderbook(token_ids:list):
 # "tags"[ \t]*:[ \t]*\[[ \t\n\r]*(?:[^"\]]*"[^"]*"[ \t\n\r]*,[ \t\n\r]*)*"All"[ \t\n\r]*(?:,[ \t\n\r]*[^"\]]*"[^"]*")*[ \t\n\r]*\]
 # KDE's regex engine seems to be bugged and '\s' (whitespace) doesn't include newline, which is why '[ \t\n\r]' is used instead
 # not all markets have "All" tag? and occasionally "tags" is null (test markets)
-# TODO: load market tags
 
 def FetchMarkets(next_cursor=None):
     # Initialize variables for pagination
@@ -118,7 +121,7 @@ def FetchMarkets(next_cursor=None):
 
 
 def FilterData(markets) -> list[dict]:
-    wanted_fields = ("question", "description", "tokens", "question_id", "condition_id")
+    wanted_fields = ("question", "description", "tokens", "question_id", "condition_id", "tags")
     # there are always two tokens. https://docs.polymarket.com/#get-markets
     # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
     # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
@@ -132,6 +135,7 @@ def FilterData(markets) -> list[dict]:
     for market in filtered_data:
         market["lines"] = [ token['outcome'] + ': ' + str(token['price']*100) + '%' for token in market["tokens"] ]
         market["token_ids"] = [token['token_id'] for token in market['tokens']]
+        if market["tags"] is None: market["tags"] = []; # ensure 'tags' is always a list (handling case where it was null in JSON)
         del market["tokens"]
     return filtered_data
 
@@ -207,11 +211,60 @@ def fetch_and_process_markets():
     WriteJsonDump(markets_list, "PMdump_all")
     return filtered_data
 
-if __name__ == "__main__":
-    # markets = LoadJsonDump()
-    # print(markets)
+
+# TODO: figure out how to return/store all this info
+def GetAllTags(markets:list[dict]):
+    all_tags = [market['tags'] for market in markets] # list[list[str]]
+    tag_set = sorted({ tag
+        for taglist in all_tags
+        for tag in taglist
+    })
+    # relates all tags that appear together across all markets 
+    tag_relations = {
+        tag: { related
+            for taglist in all_tags if tag in taglist
+            for related in taglist if (tag != related)
+        } for tag in tag_set
+    }
     
-    fetch_and_process_markets()
+    # for each tag, counts occurrences of tags appearing alongside it across all markets 
+    tag_relations_counted = {
+        tag: Counter([
+            related
+            for taglist in all_tags if tag in taglist
+            for related in taglist if (tag != related) # you can remove this exclusion (allowing tag to count itself) to get a count of markets with this tag
+        ]) for tag in tag_set
+    }
+    
+    # manual count of markets including each tag (alternatively, remove the self-exclusion in 'tag_relations_counted' comprehension)
+    tag_occurrence_count = {
+        tag: len([taglist for taglist in all_tags if tag in taglist])
+        for tag in tag_set
+    }
+    # verifying equivalence between occurrence counting methods (when 'tag_relations_counted' does not exclude self-counts)
+    # self_count = { tag: tag_relations_counted[tag].get(tag) for tag in tag_set }
+    # mismatched = {
+    #     tag: [self_count[tag], tag_occurrence_count[tag]]
+    #     for tag in tag_set if (self_count[tag] != tag_occurrence_count[tag])
+    # }
+    
+    # sorted from most to least common
+    tags_ordered_by_frequency = {
+        tag:count for (tag,count) in reversed(sorted(tag_occurrence_count.items(), key=lambda item: item[1]))
+    }
+    # top-five most common related tags for top-five most common tags
+    top_five_relations = {
+        tag: [t for t in reversed(sorted(tag_relations_counted[tag].items(), key=lambda item: item[1]))][0:5]
+        for tag in [t for t in tags_ordered_by_frequency.keys()][0:5]
+    }
+    return tag_set
+
+
+if __name__ == "__main__":
+    markets = LoadJsonDump()
+    GetAllTags(markets)
+    # print(markets)
+    # fetch_and_process_markets()
     
     # markets_list = FetchMarkets()
     # filtered = FilterData(markets_list)
