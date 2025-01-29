@@ -1,43 +1,57 @@
 import requests
+from Creds import ODDS_API_KEY
+
+# credit info can be checked in 'response.headers' dict
+# 'x-requests-last':   The usage cost of the last API call
+# 'x-requests-used':    total usage credits used since the last quota reset
+# 'x-requests-remaining': total usage credits remaining until the quota resets
+
+# The usage quota cost = [number of markets specified] x [number of regions specified]
+# For historical-odds requests: 
+#   cost = 10 x [number of markets specified] x [number of regions specified]
+# Responses with empty data do not count towards the usage quota.
+# For examples of usage quota costs, see https://the-odds-api.com/liveapi/guides/v4/#usage-quota-costs
+# bookmaker lists per region: https://the-odds-api.com/sports-odds-data/bookmaker-apis.html
+
+# rate limit (status 429) is 30/s
+# https://the-odds-api.com/liveapi/guides/v4/api-error-codes.html#exceeded-freq-limit
+
+# TODO: get comprehensive list of available markets for event queries
+# https://the-odds-api.com/sports-odds-data/betting-markets.html
+
 
 # oddsAPI docs https://the-odds-api.com/liveapi/guides/v4/#endpoint-8
 #TODO:Implement historical odds, opportunity for some sneaky graph action
 def league_query():
-    API_KEY = "YOUR_API_KEY"
-
     response = requests.get(
         "https://api.the-odds-api.com/v4/sports",
-        params={"apiKey": API_KEY}
+        params={"apiKey": ODDS_API_KEY}
     )
-
     if response.status_code != 200:
         print(f"Failed to get sports: status_code {response.status_code}")
         print(response.text)
-    else:
-        sports = response.json()
-        # Group sports by category
-        sports_by_group = {}
-        for sport in sports:
-            group = sport['group']
-            if group not in sports_by_group:
-                sports_by_group[group] = []
-            sports_by_group[group].append(sport)
-
-        # Print formatted output
-        print("\nAvailable Sports and Leagues:")
-        print("=" * 50)
-        for group, sports_list in sorted(sports_by_group.items()):
-            print(f"\n{group}:")
-            print("-" * len(group))
-            for sport in sorted(sports_list, key=lambda x: x['title']):
-                print(f"• {sport['title']}")
-                print(f"  - Key: {sport['key']}")
-                print(f"  - Description: {sport['description']}")
-
+        return
+    
+    sports = response.json()
+    sports_by_group = {
+        group: [sport for sport in sports if (sport['group'] == group)]
+        for group in { sport['group'] for sport in sports }
+    }
+    
+    print("\nAvailable Sports and Leagues:")
+    print("=" * 50)
+    for group, sports_list in sorted(sports_by_group.items()):
+        print(f"\n{group}:")
+        print("-" * len(group))
+        for sport in sorted(sports_list, key=lambda x: x['title']):
+            print(f"• {sport['title']}")
+            print(f"  - Key: {sport['key']}")
+            print(f"  - Description: {sport['description']}")
+    
+    return sports_by_group
 
 
 def NHL_query():
-    API_KEY = "YOUR_API_KEY"
     SPORT = "icehockey_nhl"
     # BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
     REGIONS = "us,us2,eu"  # Ensure 'eu' is included for Pinnacle
@@ -48,7 +62,7 @@ def NHL_query():
     response = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds",
         params={
-            "apiKey": API_KEY,
+            "apiKey": ODDS_API_KEY,
             "regions": REGIONS,
             "markets": MARKETS,
             "oddsFormat": ODDS_FORMAT,
@@ -121,10 +135,7 @@ def NHL_query():
                     bm_price = outcome['price']
 
                     # Update best line for the team if this is better
-                    if best_lines[team]['price'] is None or (
-                        (bm_price > 0 and bm_price > best_lines[team]['price']) or
-                        (bm_price < 0 and bm_price < best_lines[team]['price'])
-                    ):
+                    if best_lines[team]['price'] is None or (bm_price > best_lines[team]['price']):
                         best_lines[team]['point'] = bm_point
                         best_lines[team]['price'] = bm_price
                         best_lines[team]['bookmaker'] = bookmaker['title']
@@ -171,7 +182,8 @@ def NHL_query():
             else:
                 print(f"  {team}: No lines available")
 
+
 if __name__ == "__main__":
     # Uncomment the function you want to run
-    #league_query()
-    NHL_query()
+    league_query()
+    #NHL_query()
