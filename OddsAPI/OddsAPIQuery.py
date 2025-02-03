@@ -54,7 +54,7 @@ def league_query():
 def NHL_query():
     SPORT = "icehockey_nhl"
     # BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
-    REGIONS = "us,us2,eu"  # Ensure 'eu' is included for Pinnacle
+    REGIONS = "us,eu"  # Ensure 'eu' is included for Pinnacle. Regions: us,us2,uk,au,eu
     MARKETS = "spreads"
     ODDS_FORMAT = "american"
     DATE_FORMAT = "iso"
