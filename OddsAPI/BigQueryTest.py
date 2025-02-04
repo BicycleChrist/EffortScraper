@@ -1,8 +1,8 @@
 import requests
 from Creds import ODDS_API_KEY
-import asyncio
-import aiohttp
 import time
+import pathlib
+import json
 
 # credit info can be checked in 'response.headers' dict
 # 'x-requests-last':   The usage cost of the last API call
@@ -18,7 +18,6 @@ import time
 
 # rate limit (status 429) is 30/s
 # https://the-odds-api.com/liveapi/guides/v4/api-error-codes.html#exceeded-freq-limit
-# TODO: YOU FUCKED UP EV CALC AGAIN FIX IT, AI doesnt understand probability
 # TODO: get comprehensive list of available markets for event queries
 # https://the-odds-api.com/sports-odds-data/betting-markets.html
 
@@ -28,7 +27,6 @@ import time
 # Cache for sports data to avoid repeated API calls
 SPORTS_CACHE = None
 CACHE_EXPIRY = 24 * 60 * 60
-
 
 def get_active_sports():
     global SPORTS_CACHE
@@ -48,7 +46,7 @@ def get_active_sports():
     SPORTS_CACHE = {'data': active_sports, 'timestamp': time.time()}
     return active_sports
 
-async def get_all_odds(session, sport_key, regions="us,us2,eu", markets="h2h,totals,spreads"):
+def get_all_odds(sport_key, regions="us,us2,eu", markets="h2h,totals,spreads"):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -56,11 +54,11 @@ async def get_all_odds(session, sport_key, regions="us,us2,eu", markets="h2h,tot
         "markets": markets,
         "oddsFormat": "american"
     }
-    async with session.get(url, params=params) as response:
-        if response.status != 200:
-            print(f"Error fetching odds for {sport_key}: {response.status}")
-            return None
-        return await response.json()
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        print(f"Error fetching odds for {sport_key}: {response.status_code}")
+        return None
+    return response.json()
 
 def outcomes_match(p_outcome, b_outcome):
     name_match = p_outcome['name'] == b_outcome['name']
@@ -124,25 +122,8 @@ def remove_vig(implied_probs:list[float]):
     return [p / total_implied_prob for p in implied_probs]
 
 
-def calculate_ev_for_pair(p_outcome, b_outcome):
-    pinnacle_decimal = american_to_decimal(p_outcome['price'])
-    bookmaker_decimal = american_to_decimal(b_outcome['price'])
-    
-    # Convert to implied probabilities
-    p_prob = 1 / pinnacle_decimal
-    b_prob = 1 / bookmaker_decimal
-    # TODO: why is b_prob unused
-    
-    # Remove vig properly
-    fair_probs = remove_vig([p_prob, 1 - p_prob])
-    fair_pinnacle_prob = fair_probs[0]
-    # TODO: why is 2nd number returned by 'remove_vig' ignored?
-    
-    ev = ((bookmaker_decimal - 1) * fair_pinnacle_prob) - (1 - fair_pinnacle_prob)
-    return ev
-
-
 def MoreCorrectEV(outcome_pair: list[int], keep_vig=True):
+    if len(outcome_pair) != 2: print(f"Error: cannot calc EV for {len(outcome_pair)}"); return 0.0;
     decimals = [american_to_decimal(outcome) for outcome in outcome_pair]
     probs = [(1/dec) for dec in decimals]
     novig = remove_vig(probs)
@@ -166,141 +147,105 @@ def ExpectedCalc(outcome_pair):
     return abs(probs[0] - probs[1])
 
 
-# TODO: preserve '"last_update":' field of each bookmakers' 'markets' data
-def calculate_ev_old(pinnacle_odds, bookmaker_odds):
-    if not pinnacle_odds:
-        return (None, None, None)
+# markets = [book['markets'] for book in bookmakers]
+    # outcomes = zip(market['outcomes'] for market in markets)
+    # prices = [[l['price'] for l in o] for o in outcomes]
+# bookmakers = [bookmakers_all[0], bookmakers_all[6]]
 
-    max_ev = -float('inf')
-    best_p = None
-    best_b = None
-    for p_outcome in pinnacle_odds:
-        for b_outcome in bookmaker_odds:
-            if outcomes_match(p_outcome, b_outcome):
-                current_ev = calculate_ev_for_pair(p_outcome, b_outcome)
-                if current_ev > max_ev:
-                    max_ev = current_ev
-                    best_p = p_outcome
-                    best_b = b_outcome
-    if max_ev == -float('inf'):
-        return None, None, None
-    return (max_ev, best_p, best_b)
-
-
-def calculate_ev(pinnacle_odds, bookmaker_odds):
-    if not pinnacle_odds:
-        return (None, None, None)
-
-    max_ev = -float('inf')
-    best_p = None
-    best_b = None
-    for p_outcome in pinnacle_odds:
-        for b_outcome in bookmaker_odds:
-            if outcomes_match(p_outcome, b_outcome):
-                current_ev = MoreCorrectEV(p_outcome, b_outcome)
-                if current_ev > max_ev:
-                    max_ev = current_ev
-                    best_p = p_outcome
-                    best_b = b_outcome
-    if max_ev == -float('inf'):
-        return None, None, None
-    return (max_ev, best_p, best_b)
-
-
-async def find_ev_opportunities(threshold=0.015):
-    sports = get_active_sports()
-    popular_sports = [sport for sport in sports if sport['key'] in [
-        'basketball_nba', 'americanfootball_nfl', 'soccer_epl', 'icehockey_nhl'
-        'baseball_mlb', 'aussierules_afl', 'tennis_atp', 'golf_pga',
-        'mma_mixed_martial_arts', 'boxing', 'soccer_uefa_champs_league',
-        'soccer_la_liga', 'soccer_ligue_1', 'soccer_bundesliga',
-        'soccer_serie_a', 'soccer_mls', 'cricket_ipl', 'rugbyleague_nrl',
-        #'rugby_union', 'soccer_fifa_world_cup', 'soccer_china_superleague', 'soccer_denmark_superliga',
-        #'cricket_big_bash', 'cricket_caribbean_premier_league', 'cricket_icc_world_cup',
-        #'basketball_euroleague', 'basketball_wnba', 'basketball_ncaab', 'basketball_nbl'
-    ]]
-
-#TODO: Create logic for establishing which leagues are in season, API hopefully can do this for us
-#popular_sports = [sport for sport in sports if sport['key'] in [
-#        'basketball_nba', 'americanfootball_nfl', 'soccer_epl', 'icehockey_nhl'
-#        'baseball_mlb', 'aussierules_afl', 'tennis_atp', 'golf_pga',
-#        'mma_mixed_martial_arts', 'boxing', 'soccer_uefa_champs_league',
-#        'soccer_la_liga', 'soccer_ligue_1', 'soccer_bundesliga',
-#        'soccer_serie_a', 'soccer_mls', 'cricket_ipl', 'rugbyleague_nrl',
-#        'rugby_union', 'soccer_fifa_world_cup', 'soccer_china_superleague', 'soccer_denmark_superliga',
-#        'cricket_big_bash', 'cricket_caribbean_premier_league', 'cricket_icc_world_cup',
-#        'basketball_euroleague', 'basketball_wnba', 'basketball_ncaab', 'basketball_nbl'
-#    ]]
-
-
-    opportunities = []
-    EV_results_old = []
-    EV_results = []
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [get_all_odds(session, sport['key']) for sport in popular_sports]
-        results = await asyncio.gather(*tasks)
-
-        for sport, odds_data in zip(popular_sports, results):
-            if not odds_data:
-                continue
-
-            for game in odds_data:
-                pinnacle = next((b for b in game['bookmakers'] if b['title'].lower() == 'pinnacle'), None)
-                if not pinnacle:
-                    continue
-
-                for bookmaker in game['bookmakers']:
-                    if bookmaker == pinnacle:
-                        continue
-
-                    for market in bookmaker['markets']:
-                        pinnacle_market = next((m for m in pinnacle['markets'] if m['key'] == market['key']), None)
-                        if not pinnacle_market:
-                            continue
-
-                        EV_results_old.append(calculate_ev_old(pinnacle_market['outcomes'], market['outcomes']))
-                        # TODO: figure out how to construct the parameters correctly here
-                        #new_EV_results = calculate_ev(pinnacle_market['outcomes'], market['outcomes'])
-                        #EV_results.append(new_EV_results)
-                        #ev, p_outcome, b_outcome = new_EV_results
-                        ev, p_outcome, b_outcome = EV_results_old[-1]
-                        if ev and ev >= threshold:
-                            opportunities.append({
-                                'sport': sport['key'],
-                                'teams': f"{game['home_team']} vs {game['away_team']}",
-                                'market': market['key'],
-                                'bookmaker': bookmaker['title'],
-                                'ev': f"{ev:.1%}",
-                                'pinnacle_odds': p_outcome['price'],
-                                'bookmaker_odds': b_outcome['price'],
-                                'pinnacle_line': p_outcome.get('point', 'N/A'),
-                                'bookmaker_line': b_outcome.get('point', 'N/A')
-                            })
+#TODO: refactor this so you're not passing two strings just to print them
+def CompareBooks(bookmakers, sportname:str, game_title:str):
+    market_map = [{
+    "bookmaker": bm['title'],
+    **bm['markets'][0] # 'markets' is always a list[dict] of length 1?
+    } for bm in bookmakers]
     
-    return sorted(opportunities, key=lambda x: x['ev'], reverse=True), EV_results, EV_results_old, results
+    market_map_byteam = [
+        {
+            'name': outcome['name'],
+            'market_type': market_dict['key'],
+            'bookmaker': market_dict['bookmaker'],
+            'price': outcome['price'],
+        }
+        for market_dict in market_map
+        for outcome in market_dict['outcomes']
+    ]
+    
+    outcome_map = {
+        entry['name']: {
+            key: [d2[key] for d2 in market_map_byteam if d2['name'] == entry['name']]
+            for key in entry.keys()
+        }
+        for entry in market_map_byteam
+        for key in entry.keys()
+    }
+    
+    calculated_EVs = {
+        outcome: MoreCorrectEV(game['price'])
+        for (outcome, game) in outcome_map.items()
+        if len(game['price']) == 2
+    }
+    
+    print(sportname)
+    print(game_title)
+    print(" | ".join([book['title'] for book in bookmakers]))
+    for (side, entry) in outcome_map.items():
+        print(f"market_type: {entry['market_type'][0]}")
+        print(f"  {side}: ")
+        for (bm, price) in zip(entry['bookmaker'], entry['price']):
+            print(f"    {bm}: {price}")
+    print("  EV:")
+    for (line, ev) in calculated_EVs.items():
+        print(f"    {line}: {ev:.2f}%")
+    print("")
+    
+    return {
+        "books": [book['title'] for book in bookmakers],
+        "EV": calculated_EVs,
+    }
 
-if __name__ == "__main__":
+
+def DoEverything(sport):
+    savedir = pathlib.Path.cwd() / "savedata"
     start_time = time.time()
-    loop = asyncio.get_event_loop()
-    opportunities, EV_results, EV_results_old, results = loop.run_until_complete(find_ev_opportunities())
-
-    print("\n+EV Opportunities:")
-    print("=" * 50)
-    for opp in opportunities:
-        print(f"\nSport: {opp['sport']}")
-        print(f"Teams: {opp['teams']}")
-        print(f"Market: {opp['market']}")
-        print(f"Bookmaker: {opp['bookmaker']}")
-        print(f"Pinnacle Line: {opp['pinnacle_line']}  Odds: {opp['pinnacle_odds']}")
-        print(f"Bookmaker Line: {opp['bookmaker_line']}  Odds: {opp['bookmaker_odds']}")
-        print(f"EV: {opp['ev']}")
+    games = get_all_odds(sport)
+    
+    dumpfile = savedir / f"{sport}_{int(start_time)}.json"
+    json.dump(games, dumpfile.open('w'), indent=2)
+    
+    results = []
+    for game in games:
+        print(f"Sport: {sport}")
+        game_title = f"{game['home_team']} vs {game['away_team']}"
+        print(game_title)
+        bookmakers_all = game['bookmakers']
+         
+        # TODO: do something even if pinnacle isn't in there
+        ###########################################
+        has_pinnacle = ('pinnacle' in [book['key'] for book in bookmakers_all])
+        if not has_pinnacle:
+            print("Ignoring game because pinnacle line isn't available")
+            continue
+        
+        pinnacle_entry = [book for book in bookmakers_all if book['key'] == 'pinnacle'][0]
+        other_books = [book for book in bookmakers_all if book['key'] != 'pinnacle']
+        
+        comparisons = [
+            CompareBooks([pinnacle_entry, other_book], sport, game_title)
+            for other_book in other_books
+        ]
+        results.append(comparisons)
+    
+    json.dumps(results, indent=2)
+    
+    savefile = savedir / f"pinnacle_comparisons_{sport}_{int(start_time)}.json"
+    json.dump(results, savefile.open('w'), indent=2)
     
     print(f"\nProcessing time: {time.time() - start_time:.2f} seconds")
-    print("\n\nEV results: ")
-    print(EV_results)
-    print("\n\nEV results (old): ")
-    print(EV_results_old)
-    print("\n\nresults: ")
-    print(results)
 
+
+if __name__ == "__main__":
+    # sports = ['icehockey_nhl', 'tennis_atp']
+    # for sport in sports:
+    #     DoEverything(sport)
+    DoEverything('icehockey_nhl')
+    print("\n\n done \n\n")

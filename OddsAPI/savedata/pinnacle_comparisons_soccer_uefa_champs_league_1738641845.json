@@ -1,0 +1,1954 @@
+[
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": 0.0014930387070283824,
+        "Draw": -0.0019036740909955663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Unibet"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": 0.021638083026125965,
+        "Draw": 0.0036985668053629572
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": 0.0014930387070283824,
+        "Draw": -0.0019036740909955663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": 0.0014930387070283824,
+        "Draw": -0.0019036740909955663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Brest": -0.01155746851586159,
+        "Paris Saint Germain": -0.007929299482433039,
+        "Draw": -0.0019036740909955663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": 0.013234721681588069,
+        "Draw": -0.005825242718446533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Brest": -0.018344798832603537,
+        "Paris Saint Germain": 0.00529821374508016,
+        "Draw": -0.005825242718446533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Brest": 0.001632546445946459,
+        "Paris Saint Germain": 0.016537777007764876,
+        "Draw": -0.006226044321653079
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Brest": 0.006469096949034081,
+        "Paris Saint Germain": 0.01991809678601586,
+        "Draw": 0.009672912263103184
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Brest": -0.007355787843592698,
+        "Paris Saint Germain": 0.013234721681588069,
+        "Draw": -0.005825242718446533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Brest": 0.008919076532537429,
+        "Paris Saint Germain": 0.0030025296312142236,
+        "Draw": 0.007258869431086112
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Brest": 0.008919076532537429,
+        "Paris Saint Germain": 0.0030025296312142236,
+        "Draw": 0.007258869431086112
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Brest": 0.010501355013550207,
+        "Paris Saint Germain": -0.005812897366030856,
+        "Draw": -0.005825242718446533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Brest": 0.0021680216802169028,
+        "Paris Saint Germain": -0.0022092937624273445,
+        "Draw": -0.0019036740909955663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Brest": -0.0024296794692084678,
+        "Paris Saint Germain": -0.007929299482433039,
+        "Draw": -0.005825242718446533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Brest": -0.007355787843592698,
+        "Paris Saint Germain": 0.0014930387070283824,
+        "Draw": 0.008989572096368303
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Brest": 0.008919076532537429,
+        "Paris Saint Germain": 0.013234721681588069,
+        "Draw": 0.012356575463371655
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Brest": 0.010501355013550207,
+        "Paris Saint Germain": 0.013234721681588069,
+        "Draw": 0.0018670649738611322
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Brest": -0.007355787843592698,
+        "Paris Saint Germain": -0.0022092937624273445,
+        "Draw": 0.0036985668053629572
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Brest": 0.003922407645129078,
+        "Paris Saint Germain": 0.0030025296312142236,
+        "Draw": 0.005495511998534597
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Brest": 0.00036621987841500836,
+        "Paris Saint Germain": 0.0037635298899543757,
+        "Draw": 0.0018670649738611322
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Brest": 0.00036621987841500836,
+        "Paris Saint Germain": 0.0037635298899543757,
+        "Draw": 0.0018670649738611322
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Brest": -0.06057707635899878,
+        "Paris Saint Germain": 0.013234721681588069,
+        "Draw": 0.0018670649738611322
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Brest": 0.00036621987841500836,
+        "Paris Saint Germain": 0.0037635298899543757,
+        "Draw": 0.0018670649738611322
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.011114198388441188,
+        "Sporting Lisbon": 0.006006006006006093,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Unibet"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.0,
+        "Sporting Lisbon": 0.015667841754798295,
+        "Draw": 0.007844815290258156
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.011114198388441188,
+        "Sporting Lisbon": 0.006006006006006093,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.011114198388441188,
+        "Sporting Lisbon": 0.006006006006006093,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.0021641508413137167,
+        "Sporting Lisbon": -0.014665828619316978,
+        "Draw": -0.014711575687185507
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": -0.004095004095003962,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": -0.014665828619316978,
+        "Draw": -0.01068743081797019
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.01040853499869887,
+        "Sporting Lisbon": 0.00992181608921705,
+        "Draw": 0.007150467283037032
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.005464480874316946,
+        "Sporting Lisbon": 0.006006006006006093,
+        "Draw": -0.014711575687185507
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": -0.004095004095003962,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": 0.0,
+        "Draw": 0.007844815290258156
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": 0.0,
+        "Draw": 0.007844815290258156
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": 0.006006006006006093,
+        "Draw": -0.014711575687185507
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Borussia Dortmund": -0.005464480874316946,
+        "Sporting Lisbon": -0.004095004095003962,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.005288207297726166,
+        "Sporting Lisbon": -0.004095004095003962,
+        "Draw": -0.0029698927126258212
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.00939751487939855,
+        "Sporting Lisbon": 0.011853959222380417,
+        "Draw": 0.008535518426050492
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.0,
+        "Sporting Lisbon": -0.014665828619316978,
+        "Draw": -0.0029698927126258212
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.01922687715037452,
+        "Sporting Lisbon": 0.0,
+        "Draw": -0.0007364204076822922
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.003193527783691752,
+        "Sporting Lisbon": 0.0,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.002135953436215088,
+        "Sporting Lisbon": -0.002038237332354975,
+        "Draw": -0.0007364204076822922
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.002135953436215088,
+        "Sporting Lisbon": -0.002038237332354975,
+        "Draw": -0.0007364204076822922
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Borussia Dortmund": 0.002135953436215088,
+        "Sporting Lisbon": -0.002038237332354975,
+        "Draw": -0.0007364204076822922
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Juventus": -0.014665828619316978,
+        "PSV Eindhoven": 0.002735978112175075,
+        "Draw": 0.013015848709899691
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Unibet"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": 0.008021390374331694,
+        "Draw": 0.02012822424332783
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Juventus": -0.014665828619316978,
+        "PSV Eindhoven": 0.002735978112175075,
+        "Draw": 0.013015848709899691
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Juventus": -0.014665828619316978,
+        "PSV Eindhoven": 0.002735978112175075,
+        "Draw": 0.013015848709899691
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Juventus": -0.00849527450355736,
+        "PSV Eindhoven": -0.010406128053186858,
+        "Draw": -0.0065689534835980945
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Juventus": -0.030333670374115218,
+        "PSV Eindhoven": -0.01161946259985469,
+        "Draw": -0.0065689534835980945
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": -0.0028011204481792618,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": -0.014705882352941124,
+        "Draw": -0.0065689534835980945
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Juventus": -0.018687707641195928,
+        "PSV Eindhoven": -0.0039403321137067016,
+        "Draw": -0.001614165920114985
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Juventus": 0.006581834137779741,
+        "PSV Eindhoven": 0.008021390374331694,
+        "Draw": 0.017328672171659232
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Juventus": -0.010570824524312794,
+        "PSV Eindhoven": -0.0028011204481792618,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Juventus": 0.0021734405564008408,
+        "PSV Eindhoven": 0.0,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Juventus": 0.0021734405564008408,
+        "PSV Eindhoven": 0.0,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Juventus": 0.011074197120708895,
+        "PSV Eindhoven": -0.014705882352941124,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": -0.0028011204481792618,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": -0.0028011204481792618,
+        "Draw": -0.0065689534835980945
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": -0.008608321377331363,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Juventus": 0.01335262045176372,
+        "PSV Eindhoven": 0.008021390374331694,
+        "Draw": 0.010806554947472513
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": -0.008608321377331363,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Juventus": 0.0021734405564008408,
+        "PSV Eindhoven": 0.008021390374331694,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Juventus": 0.015652951699463402,
+        "PSV Eindhoven": 0.002735978112175075,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": 0.002735978112175075,
+        "Draw": 0.011546988545387382
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Juventus": 5.551115123125783e-17,
+        "PSV Eindhoven": -0.008608321377331363,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": 0.004879371103280072,
+        "Draw": 0.0047345869467437796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": 0.004879371103280072,
+        "Draw": 0.0047345869467437796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Juventus": -0.006400682739492181,
+        "PSV Eindhoven": 0.004879371103280072,
+        "Draw": 0.0047345869467437796
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.018808777429467072,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.018808777429467072,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Unibet"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": 0.030303030303030276,
+        "Draw": -1.1102230246251565e-16
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.018808777429467072,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": -0.00811084825954711,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Manchester City": -0.024276377217553602,
+        "Real Madrid": -0.013722126929674117,
+        "Draw": -0.011111111111111072
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.0,
+        "Draw": 0.0035087719298244613
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": -0.006734006734006703,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Manchester City": -0.01651315548053267,
+        "Real Madrid": 0.00649350649350644,
+        "Draw": 0.0007092198581558629
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Manchester City": 0.005230307890791264,
+        "Real Madrid": 0.00649350649350644,
+        "Draw": 0.019141914191419085
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Manchester City": 0.0035014005602241882,
+        "Real Madrid": 0.0,
+        "Draw": -0.011111111111111072
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.00649350649350644,
+        "Draw": -1.1102230246251565e-16
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Manchester City": 0.0035014005602241882,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": 0.006926406926406781
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Manchester City": 0.0035014005602241882,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": 0.006926406926406781
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": 0.00649350649350644,
+        "Draw": -0.011111111111111072
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": -0.006734006734006703,
+        "Draw": -0.007305936073059516
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Manchester City": -0.0146145414687614,
+        "Real Madrid": 0.00649350649350644,
+        "Draw": 0.006926406926406781
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Manchester City": 0.010332001653120315,
+        "Real Madrid": 0.010279473176999732,
+        "Draw": 0.009597257926306724
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Manchester City": 0.008645433482034837,
+        "Real Madrid": 0.012759170653907526,
+        "Draw": -0.003603603603603678
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": 0.0,
+        "Draw": -0.003603603603603678
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Manchester City": 0.01366400218624042,
+        "Real Madrid": 0.018808777429467072,
+        "Draw": 0.006926406926406781
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Manchester City": -0.005363847666726151,
+        "Real Madrid": -0.002664002664002685,
+        "Draw": 0.012859560067681741
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Manchester City": 0.0,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": -0.003603603603603678
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Manchester City": 0.0,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": -0.003603603603603678
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Manchester City": 0.0,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": -0.003603603603603678
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Manchester City": 0.0,
+        "Real Madrid": 0.003924133420536324,
+        "Draw": -0.003603603603603678
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -0.0035087719298246833,
+        "Draw": -0.0030525030525030417
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Atalanta": 0.0,
+        "Club Brugge": -0.0013923698134225004,
+        "Draw": 0.008767827916763893
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -0.00711237553342825,
+        "Draw": -0.010989010989011172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Atalanta": -0.009246417013407227,
+        "Club Brugge": -0.010814708002884088,
+        "Draw": -0.0030525030525030417
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Atalanta": -0.011503243914783912,
+        "Club Brugge": -0.004938620008466232,
+        "Draw": -0.012631047113805915
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -1.1102230246251565e-16,
+        "Draw": 0.0007526719855485142
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Atalanta": 0.014563106796116498,
+        "Club Brugge": 0.008055853920515554,
+        "Draw": 0.009473285335354298
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Atalanta": 0.012075544607061839,
+        "Club Brugge": 0.005425935973955465,
+        "Draw": 0.01498501498501481
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -1.1102230246251565e-16,
+        "Draw": -0.010989010989011172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": 0.006747638326585648,
+        "Draw": -0.010989010989011172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Atalanta": 0.014563106796116498,
+        "Club Brugge": 0.006747638326585648,
+        "Draw": 0.0007526719855485142
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": 0.013157894736842035,
+        "Draw": -0.010989010989011172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Atalanta": 0.009612611746611599,
+        "Club Brugge": -0.00711237553342825,
+        "Draw": 0.008058608058607919
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Atalanta": 0.009612611746611599,
+        "Club Brugge": -0.00711237553342825,
+        "Draw": 0.008058608058607919
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Atalanta": 0.029126213592232997,
+        "Club Brugge": -0.00711237553342825,
+        "Draw": 0.004455004455004352
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -0.00711237553342825,
+        "Draw": -0.0030525030525030417
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -1.1102230246251565e-16,
+        "Draw": -0.0007568189386372159
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -1.1102230246251565e-16,
+        "Draw": -0.0007568189386372159
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Atalanta": 0.0023679848448969754,
+        "Club Brugge": -1.1102230246251565e-16,
+        "Draw": 0.0007526719855485142
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "AC Milan": -0.01284168042561007,
+        "Feyenoord": -0.001184974523047777,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "AC Milan": -0.02250351617440227,
+        "Feyenoord": -0.001184974523047777,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "AC Milan": -0.003590986623574821,
+        "Feyenoord": -0.007234581298607323,
+        "Draw": -0.0065689534835980945
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "AC Milan": -0.026489565003500415,
+        "Feyenoord": -0.002378149561826026,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "AC Milan": -0.01284168042561007,
+        "Feyenoord": 0.004659560836391186,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "AC Milan": 0.010418294525186167,
+        "Feyenoord": 0.009194451148731853,
+        "Draw": 0.008560844254895228
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "AC Milan": -0.007243621086180929,
+        "Feyenoord": 0.004659560836391186,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "AC Milan": -0.007243621086180929,
+        "Feyenoord": 0.004659560836391186,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "AC Milan": -0.01284168042561007,
+        "Feyenoord": 0.010309278350515427,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "AC Milan": -0.01284168042561007,
+        "Feyenoord": 0.010309278350515427,
+        "Draw": -0.002428166734115833
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "AC Milan": -1.1102230246251565e-16,
+        "Feyenoord": 0.015773759224832373,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "AC Milan": -0.009093554488578404,
+        "Feyenoord": -0.27756950952827236,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "AC Milan": -0.007243621086180929,
+        "Feyenoord": 0.004659560836391186,
+        "Draw": 0.001595978135099485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "AC Milan": -0.01284168042561007,
+        "Feyenoord": -0.001184974523047777,
+        "Draw": 0.005508341202392297
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "AC Milan": 0.0017728610431513303,
+        "Feyenoord": 0.0011768582591912269,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "AC Milan": 0.0017728610431513303,
+        "Feyenoord": 0.0011768582591912269,
+        "Draw": 0.009313516240443853
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "AC Milan": -0.007243621086180929,
+        "Feyenoord": 0.004659560836391186,
+        "Draw": 0.001595978135099485
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.00488656195462478,
+        "Celtic": -0.008988334289539157,
+        "Draw": -0.014471243042671555
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.013701988951869859,
+        "Celtic": -0.0012663265675314506,
+        "Draw": 0.0003435717721432807
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.015997673065735796,
+        "Celtic": -0.026131191432396284,
+        "Draw": -0.0049474335188620655
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": -0.013641146895664785,
+        "Celtic": -0.004062225915154927,
+        "Draw": -0.0049474335188620655
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.0027701598382225967,
+        "Celtic": -0.018802947157587124,
+        "Draw": -0.0049474335188620655
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.012192498027684018,
+        "Celtic": -0.014279339580544392,
+        "Draw": 0.006957328385899797
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.013701988951869859,
+        "Celtic": 0.008868808567603748,
+        "Draw": 0.013114963853880113
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.030617556106671495,
+        "Celtic": 0.0014184774417759227,
+        "Draw": 0.004696930555881829
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.0013777900248002073,
+        "Celtic": 0.005991570715941474,
+        "Draw": 0.0003435717721432807
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.0013777900248002073,
+        "Celtic": 0.005991570715941474,
+        "Draw": 0.0003435717721432807
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.007761674263699225,
+        "Celtic": -0.006187213841359895,
+        "Draw": -0.0038651824366109366
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": -0.017877665687651728,
+        "Celtic": -0.007975163063601909,
+        "Draw": -0.010549674415220589
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": -0.011780104712041994,
+        "Celtic": 0.008868808567603748,
+        "Draw": 0.0037105751391466324
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": -0.005369848301785496,
+        "Celtic": 0.0005354752342704439,
+        "Draw": 0.0003435717721432807
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": -0.0027127471990885943,
+        "Celtic": 0.019583094281889424,
+        "Draw": 0.01009016046610034
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.01754950422650553,
+        "Celtic": -0.019977345278549996,
+        "Draw": -0.003150488325690426
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.013701988951869859,
+        "Celtic": 0.0005354752342704439,
+        "Draw": 0.008537606514850582
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.013701988951869859,
+        "Celtic": 0.0005354752342704439,
+        "Draw": 0.008537606514850582
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.00488656195462478,
+        "Celtic": 0.0005354752342704439,
+        "Draw": 0.0037105751391466324
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.013701988951869859,
+        "Celtic": -0.02742151401304138,
+        "Draw": -0.03186254739049765
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Bayern M\u00fcnchen": 0.0013777900248002073,
+        "Celtic": 0.005991570715941474,
+        "Draw": 0.0003435717721432807
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Benfica": 0.0072850898494414285,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Benfica": 0.004890453834115682,
+        "Monaco": -0.0018341220057956908,
+        "Draw": 0.00218550572602505
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Benfica": 0.0072850898494414285,
+        "Monaco": -0.017094017094017033,
+        "Draw": -0.01885236243666777
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Benfica": -0.005030181086519203,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Benfica": 0.0072850898494414285,
+        "Monaco": -0.01907814407814401,
+        "Draw": -0.017181728013245468
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Benfica": 0.013129625208880391,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Benfica": 0.01081574772869287,
+        "Monaco": 0.010683760683760757,
+        "Draw": 0.009222605315058363
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Benfica": 0.013129625208880391,
+        "Monaco": 0.00894038550942311,
+        "Draw": 0.008535518426050492
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Benfica": 0.011976621634569251,
+        "Monaco": -0.013178207010806076,
+        "Draw": -0.008326898911447222
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Benfica": -0.005030181086519203,
+        "Monaco": -0.02719502719502709,
+        "Draw": -0.01885236243666777
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Benfica": 0.018779342723004633,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.014711575687185507
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Benfica": 0.013129625208880391,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Benfica": 0.018779342723004633,
+        "Monaco": 0.007182360123536569,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betfair"
+      ],
+      "EV": {
+        "Benfica": -0.04788732394366191,
+        "Monaco": -0.01907814407814401,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Benfica": 0.013129625208880391,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Benfica": 0.006091914810663179,
+        "Monaco": -0.00555000555000551,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Benfica": 0.006091914810663179,
+        "Monaco": -0.00555000555000551,
+        "Draw": 0.0007324397568300167
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Benfica": 0.004890453834115682,
+        "Monaco": -0.007432181345224831,
+        "Draw": -0.006775067750677377
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Benfica": 0.004890453834115682,
+        "Monaco": 0.0018185124568104172,
+        "Draw": 0.0043360433604335835
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Benfica": 0.004890453834115682,
+        "Monaco": 0.0018185124568104172,
+        "Draw": 0.0043360433604335835
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Benfica": 0.006091914810663179,
+        "Monaco": -0.00555000555000551,
+        "Draw": 0.0007324397568300167
+      }
+    }
+  ]
+]

@@ -1,0 +1,3589 @@
++EV Opportunities:
+==================================================
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 180
+EV: 98.6%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 338
+EV: 9.8%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 750
+EV: 9.7%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 750
+EV: 9.7%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 750
+EV: 9.7%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 750
+EV: 9.7%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 310
+EV: 9.6%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 724
+Bookmaker Line: N/A  Odds: 800
+EV: 9.2%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: MyBookie.ag
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 170
+EV: 8.9%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 170
+EV: 8.9%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 850
+EV: 8.9%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 850
+EV: 8.9%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 850
+EV: 8.9%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 850
+EV: 8.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 700
+EV: 8.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 700
+EV: 8.8%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: GTbets
+Pinnacle Line: N/A  Odds: -182
+Bookmaker Line: N/A  Odds: -146
+EV: 8.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 115
+EV: 8.6%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 115
+EV: 8.6%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 115
+EV: 8.6%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 115
+EV: 8.6%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 228
+Bookmaker Line: N/A  Odds: 256
+EV: 8.5%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 740
+EV: 8.4%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 740
+EV: 8.4%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 306
+Bookmaker Line: N/A  Odds: 340
+EV: 8.4%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1250
+EV: 8.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1250
+EV: 8.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 293
+EV: 8.0%
+
+Sport: soccer_denmark_superliga
+Teams: Silkeborg IF vs Vejle Boldklub
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 271
+Bookmaker Line: N/A  Odds: 300
+EV: 7.8%
+
+Sport: soccer_denmark_superliga
+Teams: Silkeborg IF vs Vejle Boldklub
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 271
+Bookmaker Line: N/A  Odds: 300
+EV: 7.8%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 330
+EV: 7.8%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 660
+EV: 7.8%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 660
+EV: 7.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 439
+Bookmaker Line: N/A  Odds: 480
+EV: 7.6%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 690
+EV: 7.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 690
+EV: 7.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 690
+EV: 7.5%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -196
+EV: 7.4%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -196
+EV: 7.4%
+
+Sport: soccer_denmark_superliga
+Teams: AaB vs FC Nordsjaelland
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 385
+Bookmaker Line: N/A  Odds: 420
+EV: 7.2%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 306
+Bookmaker Line: N/A  Odds: 335
+EV: 7.1%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 306
+Bookmaker Line: N/A  Odds: 335
+EV: 7.1%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 306
+Bookmaker Line: N/A  Odds: 335
+EV: 7.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 647
+Bookmaker Line: N/A  Odds: 700
+EV: 7.1%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: -182
+Bookmaker Line: N/A  Odds: -152
+EV: 7.0%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: ESPN BET
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 135
+EV: 66.7%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 135
+EV: 66.7%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: DraftKings
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 130
+EV: 63.1%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: Hard Rock Bet
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 130
+EV: 63.1%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 130
+EV: 63.1%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 1700
+EV: 625.8%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 260
+EV: 6.8%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 228
+Bookmaker Line: N/A  Odds: 250
+EV: 6.7%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 650
+EV: 6.4%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 650
+EV: 6.4%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 650
+EV: 6.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 440
+EV: 6.3%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 440
+EV: 6.3%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 440
+EV: 6.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Fliff
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1225
+EV: 6.3%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 205
+Bookmaker Line: N/A  Odds: 224
+EV: 6.2%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 278
+EV: 6.2%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 130
+EV: 6.0%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 110
+EV: 6.0%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 110
+EV: 6.0%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 125
+EV: 59.6%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 116
+EV: 53.2%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 306
+Bookmaker Line: N/A  Odds: 330
+EV: 5.9%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 720
+EV: 5.8%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 720
+EV: 5.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 263
+Bookmaker Line: N/A  Odds: 284
+EV: 5.8%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: Wind Creek
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 625
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 700
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 700
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 700
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 700
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 250
+EV: 5.7%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 295
+EV: 5.6%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 295
+EV: 5.6%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 295
+EV: 5.6%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 820
+EV: 5.5%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 360
+EV: 5.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 207
+Bookmaker Line: N/A  Odds: 224
+EV: 5.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 284
+EV: 5.5%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 272
+Bookmaker Line: N/A  Odds: 292
+EV: 5.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 675
+EV: 5.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 275
+EV: 5.3%
+
+Sport: basketball_ncaab
+Teams: East Tennessee St Buccaneers vs Furman Paladins
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 3.5  Odds: -118
+Bookmaker Line: 3.5  Odds: -106
+EV: 5.2%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 190
+Bookmaker Line: N/A  Odds: 205
+EV: 5.2%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 228
+Bookmaker Line: N/A  Odds: 245
+EV: 5.2%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 620
+EV: 5.0%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 640
+EV: 5.0%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 358
+EV: 5.0%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 280
+EV: 5.0%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: GTbets
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 110
+EV: 49.0%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: Fliff
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 105
+EV: 45.4%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 105
+EV: 45.4%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: DraftKings
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 1200
+EV: 424.2%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: Fliff
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 160
+EV: 4.8%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 160
+EV: 4.8%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -106
+EV: 4.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 647
+Bookmaker Line: N/A  Odds: 682
+EV: 4.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 647
+Bookmaker Line: N/A  Odds: 682
+EV: 4.7%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 197
+Bookmaker Line: N/A  Odds: 210
+EV: 4.4%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 355
+EV: 4.4%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 355
+EV: 4.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 417
+Bookmaker Line: N/A  Odds: 440
+EV: 4.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 280
+EV: 4.4%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 341
+Bookmaker Line: N/A  Odds: 360
+EV: 4.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Hard Rock Bet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1200
+EV: 4.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1200
+EV: 4.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1200
+EV: 4.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1200
+EV: 4.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: -282
+Bookmaker Line: N/A  Odds: -242
+EV: 4.3%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 380
+Bookmaker Line: N/A  Odds: 400
+EV: 4.2%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 136
+Bookmaker Line: N/A  Odds: 146
+EV: 4.2%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 245
+EV: 4.2%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: -182
+Bookmaker Line: N/A  Odds: -163
+EV: 4.1%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 294
+Bookmaker Line: N/A  Odds: 310
+EV: 4.1%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 294
+Bookmaker Line: N/A  Odds: 310
+EV: 4.1%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Matchbook
+Pinnacle Line: N/A  Odds: 294
+Bookmaker Line: N/A  Odds: 310
+EV: 4.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 121
+Bookmaker Line: N/A  Odds: 130
+EV: 4.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -200
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 340
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 340
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Matchbook
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 340
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 453
+Bookmaker Line: N/A  Odds: 475
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 100
+Bookmaker Line: N/A  Odds: 108
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 100
+Bookmaker Line: N/A  Odds: 108
+EV: 4.0%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 705
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: DraftKings
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 237
+Bookmaker Line: N/A  Odds: 250
+EV: 3.9%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 353
+EV: 3.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 270
+EV: 3.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 263
+Bookmaker Line: N/A  Odds: 277
+EV: 3.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 439
+Bookmaker Line: N/A  Odds: 460
+EV: 3.9%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: ESPN BET
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: 100
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -118
+Bookmaker Line: N/A  Odds: -109
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 200
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 200
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 200
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 200
+EV: 3.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: BetUS
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 200
+EV: 3.8%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: ESPN BET
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 125
+EV: 3.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 125
+EV: 3.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 125
+EV: 3.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 125
+EV: 3.7%
+
+Sport: soccer_epl
+Teams: Crystal Palace vs Everton
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 228
+Bookmaker Line: N/A  Odds: 240
+EV: 3.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: -267
+Bookmaker Line: N/A  Odds: -235
+EV: 3.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 334
+Bookmaker Line: N/A  Odds: 350
+EV: 3.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Feyenoord vs AC Milan
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 254
+Bookmaker Line: N/A  Odds: 267
+EV: 3.7%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: ESPN BET
+Pinnacle Line: 6.5  Odds: -113
+Bookmaker Line: 6.5  Odds: -105
+EV: 3.6%
+
+Sport: mma_mixed_martial_arts
+Teams: Wang Cong vs Bruna Brasil
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: -462
+Bookmaker Line: N/A  Odds: -385
+EV: 3.6%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 275
+EV: 3.6%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 275
+EV: 3.6%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: -6.5  Odds: -103
+Bookmaker Line: -6.5  Odds: 104
+EV: 3.5%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 105
+EV: 3.5%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 105
+EV: 3.5%
+
+Sport: soccer_denmark_superliga
+Teams: Brondby IF vs Viborg FF
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 475
+Bookmaker Line: N/A  Odds: 495
+EV: 3.5%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 610
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 272
+Bookmaker Line: N/A  Odds: 285
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 186
+Bookmaker Line: N/A  Odds: 196
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Unibet
+Pinnacle Line: 3.5  Odds: -105
+Bookmaker Line: 3.5  Odds: 102
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: betPARX
+Pinnacle Line: 3.5  Odds: -105
+Bookmaker Line: 3.5  Odds: 102
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: BetRivers
+Pinnacle Line: 3.5  Odds: -105
+Bookmaker Line: 3.5  Odds: 102
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Bally Bet
+Pinnacle Line: 3.5  Odds: -105
+Bookmaker Line: 3.5  Odds: 102
+EV: 3.5%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 287
+EV: 3.5%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: GTbets
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -109
+EV: 3.4%
+
+Sport: soccer_denmark_superliga
+Teams: SonderjyskE vs AGF Aarhus
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 335
+Bookmaker Line: N/A  Odds: 350
+EV: 3.4%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 105
+Bookmaker Line: N/A  Odds: 112
+EV: 3.4%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Matchbook
+Pinnacle Line: N/A  Odds: 105
+Bookmaker Line: N/A  Odds: 112
+EV: 3.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 660
+EV: 3.4%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -119
+Bookmaker Line: N/A  Odds: -111
+EV: 3.3%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: h2h
+Bookmaker: Matchbook
+Pinnacle Line: N/A  Odds: -119
+Bookmaker Line: N/A  Odds: -111
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: East Tennessee St Buccaneers vs Furman Paladins
+Market: spreads
+Bookmaker: BetOnline.ag
+Pinnacle Line: 3.5  Odds: -118
+Bookmaker Line: 3.5  Odds: -110
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: East Tennessee St Buccaneers vs Furman Paladins
+Market: spreads
+Bookmaker: BetUS
+Pinnacle Line: 3.5  Odds: -118
+Bookmaker Line: 3.5  Odds: -110
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: -2.5  Odds: -108
+Bookmaker Line: -2.5  Odds: -101
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: Belmont Bruins vs Evansville Purple Aces
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: -11.0  Odds: -108
+Bookmaker Line: -11.0  Odds: -101
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: -101
+EV: 3.3%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 425
+EV: 3.3%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 242
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 207
+Bookmaker Line: N/A  Odds: 217
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 268
+Bookmaker Line: N/A  Odds: 280
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 268
+Bookmaker Line: N/A  Odds: 280
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 207
+Bookmaker Line: N/A  Odds: 217
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: -118
+Bookmaker Line: N/A  Odds: -110
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 276
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 263
+Bookmaker Line: N/A  Odds: 275
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 263
+Bookmaker Line: N/A  Odds: 275
+EV: 3.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 263
+Bookmaker Line: N/A  Odds: 275
+EV: 3.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -103
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 239
+Bookmaker Line: N/A  Odds: 250
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Wind Creek
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 800
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 675
+Bookmaker Line: N/A  Odds: 700
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 350
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 350
+EV: 3.2%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 350
+EV: 3.2%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 278
+Bookmaker Line: N/A  Odds: 290
+EV: 3.2%
+
+Sport: soccer_uefa_champs_league
+Teams: Club Brugge vs Atalanta
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 278
+Bookmaker Line: N/A  Odds: 290
+EV: 3.2%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 270
+Bookmaker Line: N/A  Odds: 282
+EV: 3.2%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -205
+EV: 3.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -205
+EV: 3.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -205
+EV: 3.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -205
+EV: 3.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -222
+EV: 3.1%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 254
+Bookmaker Line: N/A  Odds: 265
+EV: 3.1%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 186
+Bookmaker Line: N/A  Odds: 195
+EV: 3.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 128
+Bookmaker Line: N/A  Odds: 135
+EV: 3.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Feyenoord vs AC Milan
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 254
+Bookmaker Line: N/A  Odds: 265
+EV: 3.1%
+
+Sport: mma_mixed_martial_arts
+Teams: Weili Zhang vs Tatiana Suarez
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 104
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 680
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 680
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 405
+Bookmaker Line: N/A  Odds: 420
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 405
+Bookmaker Line: N/A  Odds: 420
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -271
+Bookmaker Line: N/A  Odds: -244
+EV: 3.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 275
+EV: 3.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Feyenoord vs AC Milan
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 196
+Bookmaker Line: N/A  Odds: 205
+EV: 3.0%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1500
+EV: 28.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1500
+EV: 28.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1500
+EV: 28.3%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: ESPN BET
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 200
+EV: 21.0%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1400
+EV: 20.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1400
+EV: 20.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1400
+EV: 20.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1400
+EV: 20.3%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1400
+EV: 20.3%
+
+Sport: basketball_ncaab
+Teams: East Tennessee St Buccaneers vs Furman Paladins
+Market: spreads
+Bookmaker: 888sport
+Pinnacle Line: 3.5  Odds: -118
+Bookmaker Line: 3.5  Odds: -111
+EV: 2.9%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: BetOnline.ag
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -110
+EV: 2.9%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: BetUS
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -110
+EV: 2.9%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: MyBookie.ag
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -110
+EV: 2.9%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 285
+EV: 2.9%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 285
+EV: 2.9%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 285
+EV: 2.9%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 139
+Bookmaker Line: N/A  Odds: 146
+EV: 2.9%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: FanDuel
+Pinnacle Line: 2.5  Odds: -108
+Bookmaker Line: 2.5  Odds: -102
+EV: 2.8%
+
+Sport: basketball_ncaab
+Teams: Tulane Green Wave vs Tulsa Golden Hurricane
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 143.0  Odds: -109
+Bookmaker Line: 143.0  Odds: -103
+EV: 2.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: FanDuel
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: -102
+EV: 2.8%
+
+Sport: mma_mixed_martial_arts
+Teams: Wang Cong vs Bruna Brasil
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -462
+Bookmaker Line: N/A  Odds: -400
+EV: 2.8%
+
+Sport: mma_mixed_martial_arts
+Teams: Wang Cong vs Bruna Brasil
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -462
+Bookmaker Line: N/A  Odds: -400
+EV: 2.8%
+
+Sport: mma_mixed_martial_arts
+Teams: Wang Cong vs Bruna Brasil
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -462
+Bookmaker Line: N/A  Odds: -400
+EV: 2.8%
+
+Sport: mma_mixed_martial_arts
+Teams: Wang Cong vs Bruna Brasil
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -462
+Bookmaker Line: N/A  Odds: -400
+EV: 2.8%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 310
+EV: 2.8%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 310
+EV: 2.8%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 310
+EV: 2.8%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 310
+EV: 2.8%
+
+Sport: basketball_ncaab
+Teams: Siena Saints vs Quinnipiac Bobcats
+Market: totals
+Bookmaker: ESPN BET
+Pinnacle Line: 142.5  Odds: -111
+Bookmaker Line: 142.5  Odds: -105
+EV: 2.7%
+
+Sport: basketball_ncaab
+Teams: Milwaukee Panthers vs Fort Wayne Mastodons
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 4.0  Odds: -112
+Bookmaker Line: 4.0  Odds: -106
+EV: 2.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -225
+EV: 2.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Jim Crute vs Rodolfo Bellato
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 120
+Bookmaker Line: N/A  Odds: 126
+EV: 2.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -200
+Bookmaker Line: N/A  Odds: -185
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 197
+Bookmaker Line: N/A  Odds: 205
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 197
+Bookmaker Line: N/A  Odds: 205
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 197
+Bookmaker Line: N/A  Odds: 205
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 197
+Bookmaker Line: N/A  Odds: 205
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 240
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 240
+EV: 2.7%
+
+Sport: soccer_epl
+Teams: Fulham vs Nottingham Forest
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 231
+Bookmaker Line: N/A  Odds: 240
+EV: 2.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: totals
+Bookmaker: 1xBet
+Pinnacle Line: 2.5  Odds: -124
+Bookmaker Line: 2.5  Odds: -117
+EV: 2.7%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 136.0  Odds: -114
+Bookmaker Line: 136.0  Odds: -108
+EV: 2.6%
+
+Sport: soccer_denmark_superliga
+Teams: Brondby IF vs Viborg FF
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 475
+Bookmaker Line: N/A  Odds: 490
+EV: 2.6%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 128
+Bookmaker Line: N/A  Odds: 134
+EV: 2.6%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: spreads
+Bookmaker: Matchbook
+Pinnacle Line: -0.5  Odds: -101
+Bookmaker Line: -0.5  Odds: 104
+EV: 2.5%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: totals
+Bookmaker: Bovada
+Pinnacle Line: 3.0  Odds: -116
+Bookmaker Line: 3.0  Odds: -110
+EV: 2.5%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: 1xBet
+Pinnacle Line: 3.5  Odds: -116
+Bookmaker Line: 3.5  Odds: -110
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 256
+Bookmaker Line: N/A  Odds: 265
+EV: 2.5%
+
+Sport: basketball_ncaab
+Teams: Saint Peter's Peacocks vs Mt. St. Mary's Mountaineers
+Market: spreads
+Bookmaker: FanDuel
+Pinnacle Line: 3.5  Odds: -107
+Bookmaker Line: 3.5  Odds: -102
+EV: 2.4%
+
+Sport: basketball_ncaab
+Teams: Oregon Ducks vs Nebraska Cornhuskers
+Market: spreads
+Bookmaker: FanDuel
+Pinnacle Line: 6.5  Odds: -107
+Bookmaker Line: 6.5  Odds: -102
+EV: 2.4%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -227
+EV: 2.4%
+
+Sport: soccer_denmark_superliga
+Teams: AaB vs FC Nordsjaelland
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 320
+Bookmaker Line: N/A  Odds: 330
+EV: 2.4%
+
+Sport: soccer_denmark_superliga
+Teams: AaB vs FC Nordsjaelland
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 320
+Bookmaker Line: N/A  Odds: 330
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -107
+Bookmaker Line: N/A  Odds: -102
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -107
+Bookmaker Line: N/A  Odds: -102
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: totals
+Bookmaker: Matchbook
+Pinnacle Line: 2.5  Odds: -106
+Bookmaker Line: 2.5  Odds: -101
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 2.75  Odds: -106
+Bookmaker Line: 2.75  Odds: -101
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: totals
+Bookmaker: BetOnline.ag
+Pinnacle Line: 2.75  Odds: -106
+Bookmaker Line: 2.75  Odds: -101
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 675
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 675
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: spreads
+Bookmaker: Matchbook
+Pinnacle Line: 1.5  Odds: -105
+Bookmaker Line: 1.5  Odds: 100
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 420
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 420
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 420
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: LowVig.ag
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 420
+EV: 2.4%
+
+Sport: soccer_epl
+Teams: Southampton vs Bournemouth
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 408
+Bookmaker Line: N/A  Odds: 420
+EV: 2.4%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: DraftKings
+Pinnacle Line: N/A  Odds: -267
+Bookmaker Line: N/A  Odds: -245
+EV: 2.4%
+
+Sport: basketball_ncaab
+Teams: Iona Gaels vs Fairfield Stags
+Market: totals
+Bookmaker: FanDuel
+Pinnacle Line: 140.5  Odds: -110
+Bookmaker Line: 140.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Iona Gaels vs Fairfield Stags
+Market: totals
+Bookmaker: ESPN BET
+Pinnacle Line: 140.5  Odds: -110
+Bookmaker Line: 140.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Iona Gaels vs Fairfield Stags
+Market: totals
+Bookmaker: BetMGM
+Pinnacle Line: 140.5  Odds: -110
+Bookmaker Line: 140.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Sacred Heart Pioneers vs Manhattan Jaspers
+Market: totals
+Bookmaker: ESPN BET
+Pinnacle Line: 155.5  Odds: -110
+Bookmaker Line: 155.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Sacred Heart Pioneers vs Manhattan Jaspers
+Market: totals
+Bookmaker: BetMGM
+Pinnacle Line: 155.5  Odds: -110
+Bookmaker Line: 155.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Milwaukee Panthers vs Fort Wayne Mastodons
+Market: totals
+Bookmaker: BetMGM
+Pinnacle Line: 158.5  Odds: -110
+Bookmaker Line: 158.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: BetOnline.ag
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: FanDuel
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: BetUS
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -105
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: BetMGM
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -105
+EV: 2.3%
+
+Sport: mma_mixed_martial_arts
+Teams: Tom Nolan vs Viacheslav Borshchev
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 117
+Bookmaker Line: N/A  Odds: 122
+EV: 2.3%
+
+Sport: mma_mixed_martial_arts
+Teams: Jim Crute vs Rodolfo Bellato
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 120
+Bookmaker Line: N/A  Odds: 125
+EV: 2.3%
+
+Sport: soccer_denmark_superliga
+Teams: Brondby IF vs Viborg FF
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 340
+Bookmaker Line: N/A  Odds: 350
+EV: 2.3%
+
+Sport: soccer_epl
+Teams: Brentford vs Tottenham Hotspur
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 299
+Bookmaker Line: N/A  Odds: 308
+EV: 2.3%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: -271
+Bookmaker Line: N/A  Odds: -250
+EV: 2.3%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -271
+Bookmaker Line: N/A  Odds: -250
+EV: 2.3%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -149
+Bookmaker Line: N/A  Odds: -141
+EV: 2.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: GTbets
+Pinnacle Line: N/A  Odds: -267
+Bookmaker Line: N/A  Odds: -246
+EV: 2.3%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: totals
+Bookmaker: William Hill
+Pinnacle Line: 2.5  Odds: -124
+Bookmaker Line: 2.5  Odds: -118
+EV: 2.3%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: BetRivers
+Pinnacle Line: 6.5  Odds: -113
+Bookmaker Line: 6.5  Odds: -108
+EV: 2.2%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: Bally Bet
+Pinnacle Line: 6.5  Odds: -113
+Bookmaker Line: 6.5  Odds: -108
+EV: 2.2%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: betPARX
+Pinnacle Line: 6.5  Odds: -113
+Bookmaker Line: 6.5  Odds: -108
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 125
+Bookmaker Line: N/A  Odds: 130
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 125
+Bookmaker Line: N/A  Odds: 130
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: Brighton and Hove Albion vs Chelsea
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 272
+Bookmaker Line: N/A  Odds: 280
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 270
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 270
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 262
+Bookmaker Line: N/A  Odds: 270
+EV: 2.2%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: -606
+Bookmaker Line: N/A  Odds: -526
+EV: 2.2%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: ESPN BET
+Pinnacle Line: N/A  Odds: -282
+Bookmaker Line: N/A  Odds: -260
+EV: 2.2%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: spreads
+Bookmaker: DraftKings
+Pinnacle Line: 7.0  Odds: -117
+Bookmaker Line: 7.0  Odds: -112
+EV: 2.1%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: -241
+Bookmaker Line: N/A  Odds: -225
+EV: 2.1%
+
+Sport: soccer_epl
+Teams: West Ham United vs Brentford
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 186
+Bookmaker Line: N/A  Odds: 192
+EV: 2.1%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 336
+Bookmaker Line: N/A  Odds: 345
+EV: 2.1%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Wind Creek
+Pinnacle Line: 3.5  Odds: -116
+Bookmaker Line: 3.5  Odds: -111
+EV: 2.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: spreads
+Bookmaker: Bovada
+Pinnacle Line: -0.5  Odds: -117
+Bookmaker Line: -0.5  Odds: -112
+EV: 2.1%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 195
+EV: 2.1%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 600
+EV: 2.0%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: Tipico
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 600
+EV: 2.0%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: Suprabets
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 600
+EV: 2.0%
+
+Sport: soccer_denmark_superliga
+Teams: FC Midtjylland vs Lyngby
+Market: h2h
+Bookmaker: Bovada
+Pinnacle Line: N/A  Odds: 586
+Bookmaker Line: N/A  Odds: 600
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: spreads
+Bookmaker: Matchbook
+Pinnacle Line: 0.5  Odds: -104
+Bookmaker Line: 0.5  Odds: 100
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 102
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 102
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: -102
+Bookmaker Line: N/A  Odds: 102
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 405
+Bookmaker Line: N/A  Odds: 415
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 341
+Bookmaker Line: N/A  Odds: 350
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 341
+Bookmaker Line: N/A  Odds: 350
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 341
+Bookmaker Line: N/A  Odds: 350
+EV: 2.0%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 341
+Bookmaker Line: N/A  Odds: 350
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 650
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 650
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 650
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 650
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: spreads
+Bookmaker: 1xBet
+Pinnacle Line: -1.5  Odds: 105
+Bookmaker Line: -1.5  Odds: 109
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 635
+Bookmaker Line: N/A  Odds: 650
+EV: 2.0%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: spreads
+Bookmaker: 1xBet
+Pinnacle Line: -1.5  Odds: -101
+Bookmaker Line: -1.5  Odds: 103
+EV: 2.0%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 148
+Bookmaker Line: N/A  Odds: 196
+EV: 19.4%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Matchbook
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 800
+EV: 18.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 647
+Bookmaker Line: N/A  Odds: 775
+EV: 17.1%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 1147
+Bookmaker Line: N/A  Odds: 1350
+EV: 16.3%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 780
+EV: 16.2%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 900
+EV: 14.7%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 900
+EV: 14.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 765
+EV: 14.3%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Betfair
+Pinnacle Line: N/A  Odds: 605
+Bookmaker Line: N/A  Odds: 700
+EV: 13.5%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 885
+EV: 13.0%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 880
+EV: 12.4%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 772
+Bookmaker Line: N/A  Odds: 880
+EV: 12.4%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 750
+EV: 12.3%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 200
+EV: 112.8%
+
+Sport: basketball_ncaab
+Teams: Saint Mary's Gaels vs Gonzaga Bulldogs
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: -244
+Bookmaker Line: N/A  Odds: 200
+EV: 112.8%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: -182
+Bookmaker Line: N/A  Odds: -137
+EV: 11.6%
+
+Sport: basketball_ncaab
+Teams: Nevada Wolf Pack vs UNLV Rebels
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: -182
+Bookmaker Line: N/A  Odds: -137
+EV: 11.6%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 740
+EV: 11.0%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 740
+EV: 11.0%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: h2h
+Bookmaker: DraftKings
+Pinnacle Line: N/A  Odds: 106
+Bookmaker Line: N/A  Odds: 110
+EV: 1.9%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: 106
+Bookmaker Line: N/A  Odds: 110
+EV: 1.9%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: h2h
+Bookmaker: Hard Rock Bet
+Pinnacle Line: N/A  Odds: 106
+Bookmaker Line: N/A  Odds: 110
+EV: 1.9%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 156.0  Odds: -107
+Bookmaker Line: 156.0  Odds: -103
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -213
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Jack Jenkins vs Gabriel Santos
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: -226
+Bookmaker Line: N/A  Odds: -213
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: BetOnline.ag
+Pinnacle Line: N/A  Odds: 170
+Bookmaker Line: N/A  Odds: 175
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 170
+Bookmaker Line: N/A  Odds: 175
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 170
+Bookmaker Line: N/A  Odds: 175
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 170
+Bookmaker Line: N/A  Odds: 175
+EV: 1.9%
+
+Sport: mma_mixed_martial_arts
+Teams: Dricus Du Plessis vs Sean Strickland
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 170
+Bookmaker Line: N/A  Odds: 175
+EV: 1.9%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: 1xBet
+Pinnacle Line: N/A  Odds: -107
+Bookmaker Line: N/A  Odds: -103
+EV: 1.9%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: spreads
+Bookmaker: 1xBet
+Pinnacle Line: 0.0  Odds: -125
+Bookmaker Line: 0.0  Odds: -120
+EV: 1.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Brest vs Paris Saint Germain
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -267
+Bookmaker Line: N/A  Odds: -250
+EV: 1.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Juventus vs PSV Eindhoven
+Market: totals
+Bookmaker: GTbets
+Pinnacle Line: 2.5  Odds: -124
+Bookmaker Line: 2.5  Odds: -119
+EV: 1.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: -282
+Bookmaker Line: N/A  Odds: -263
+EV: 1.9%
+
+Sport: soccer_uefa_champs_league
+Teams: Celtic vs Bayern München
+Market: h2h
+Bookmaker: BetUS
+Pinnacle Line: N/A  Odds: -282
+Bookmaker Line: N/A  Odds: -263
+EV: 1.9%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 1.5  Odds: -109
+Bookmaker Line: 1.5  Odds: -105
+EV: 1.8%
+
+Sport: americanfootball_nfl
+Teams: Philadelphia Eagles vs Kansas City Chiefs
+Market: spreads
+Bookmaker: BetMGM
+Pinnacle Line: 1.5  Odds: -109
+Bookmaker Line: 1.5  Odds: -105
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Siena Saints vs Quinnipiac Bobcats
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: -6.0  Odds: -110
+Bookmaker Line: -6.0  Odds: -106
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Siena Saints vs Quinnipiac Bobcats
+Market: totals
+Bookmaker: betPARX
+Pinnacle Line: 142.5  Odds: -111
+Bookmaker Line: 142.5  Odds: -107
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Siena Saints vs Quinnipiac Bobcats
+Market: totals
+Bookmaker: BetRivers
+Pinnacle Line: 142.5  Odds: -111
+Bookmaker Line: 142.5  Odds: -107
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Siena Saints vs Quinnipiac Bobcats
+Market: totals
+Bookmaker: Bally Bet
+Pinnacle Line: 142.5  Odds: -111
+Bookmaker Line: 142.5  Odds: -107
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: GTbets
+Pinnacle Line: -2.5  Odds: -108
+Bookmaker Line: -2.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: betPARX
+Pinnacle Line: -2.5  Odds: -108
+Bookmaker Line: -2.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: BetRivers
+Pinnacle Line: -2.5  Odds: -108
+Bookmaker Line: -2.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Wright St Raiders vs Robert Morris Colonials
+Market: spreads
+Bookmaker: Bally Bet
+Pinnacle Line: -2.5  Odds: -108
+Bookmaker Line: -2.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Tulane Green Wave vs Tulsa Golden Hurricane
+Market: totals
+Bookmaker: BetOnline.ag
+Pinnacle Line: 143.0  Odds: -109
+Bookmaker Line: 143.0  Odds: -105
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Tulane Green Wave vs Tulsa Golden Hurricane
+Market: spreads
+Bookmaker: LowVig.ag
+Pinnacle Line: 10.0  Odds: -110
+Bookmaker Line: 10.0  Odds: -106
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Tulane Green Wave vs Tulsa Golden Hurricane
+Market: totals
+Bookmaker: BetUS
+Pinnacle Line: 143.0  Odds: -109
+Bookmaker Line: 143.0  Odds: -105
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: betPARX
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: betPARX
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -106
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: BetRivers
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: BetRivers
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -106
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: spreads
+Bookmaker: Bally Bet
+Pinnacle Line: 4.5  Odds: -108
+Bookmaker Line: 4.5  Odds: -104
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: DePaul Blue Demons vs Seton Hall Pirates
+Market: totals
+Bookmaker: Bally Bet
+Pinnacle Line: 135.5  Odds: -110
+Bookmaker Line: 135.5  Odds: -106
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Oregon Ducks vs Nebraska Cornhuskers
+Market: spreads
+Bookmaker: betPARX
+Pinnacle Line: -6.5  Odds: -109
+Bookmaker Line: -6.5  Odds: -105
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Oregon Ducks vs Nebraska Cornhuskers
+Market: spreads
+Bookmaker: Bally Bet
+Pinnacle Line: -6.5  Odds: -109
+Bookmaker Line: -6.5  Odds: -105
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Oregon Ducks vs Nebraska Cornhuskers
+Market: spreads
+Bookmaker: BetRivers
+Pinnacle Line: -6.5  Odds: -109
+Bookmaker Line: -6.5  Odds: -105
+EV: 1.8%
+
+Sport: soccer_epl
+Teams: Everton vs Liverpool
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: -241
+Bookmaker Line: N/A  Odds: -227
+EV: 1.8%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 3.0  Odds: -111
+Bookmaker Line: 3.0  Odds: -107
+EV: 1.8%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: totals
+Bookmaker: BetOnline.ag
+Pinnacle Line: 3.0  Odds: -111
+Bookmaker Line: 3.0  Odds: -107
+EV: 1.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: 888sport
+Pinnacle Line: N/A  Odds: 121
+Bookmaker Line: N/A  Odds: 125
+EV: 1.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Sporting Lisbon vs Borussia Dortmund
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 121
+Bookmaker Line: N/A  Odds: 125
+EV: 1.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Nordic Bet
+Pinnacle Line: N/A  Odds: 128
+Bookmaker Line: N/A  Odds: 132
+EV: 1.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: Betsson
+Pinnacle Line: N/A  Odds: 128
+Bookmaker Line: N/A  Odds: 132
+EV: 1.8%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: totals
+Bookmaker: Coolbet
+Pinnacle Line: 3.0  Odds: -111
+Bookmaker Line: 3.0  Odds: -107
+EV: 1.8%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: spreads
+Bookmaker: GTbets
+Pinnacle Line: 6.5  Odds: -113
+Bookmaker Line: 6.5  Odds: -109
+EV: 1.7%
+
+Sport: basketball_ncaab
+Teams: Illinois Fighting Illini vs Ohio State Buckeyes
+Market: totals
+Bookmaker: GTbets
+Pinnacle Line: 156.0  Odds: -113
+Bookmaker Line: 156.0  Odds: -109
+EV: 1.7%
+
+Sport: basketball_ncaab
+Teams: Florida Atlantic Owls vs South Florida Bulls
+Market: totals
+Bookmaker: LowVig.ag
+Pinnacle Line: 152.0  Odds: -112
+Bookmaker Line: 152.0  Odds: -108
+EV: 1.7%
+
+Sport: basketball_ncaab
+Teams: Sacred Heart Pioneers vs Manhattan Jaspers
+Market: spreads
+Bookmaker: GTbets
+Pinnacle Line: 2.5  Odds: -113
+Bookmaker Line: 2.5  Odds: -109
+EV: 1.7%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: totals
+Bookmaker: BetOnline.ag
+Pinnacle Line: 136.0  Odds: -114
+Bookmaker Line: 136.0  Odds: -110
+EV: 1.7%
+
+Sport: basketball_ncaab
+Teams: TCU Horned Frogs vs Colorado Buffaloes
+Market: totals
+Bookmaker: BetUS
+Pinnacle Line: 136.0  Odds: -114
+Bookmaker Line: 136.0  Odds: -110
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: betPARX
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 330
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Bally Bet
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 330
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: BetRivers
+Pinnacle Line: N/A  Odds: 323
+Bookmaker Line: N/A  Odds: 330
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Manchester United vs Crystal Palace
+Market: h2h
+Bookmaker: Coolbet
+Pinnacle Line: N/A  Odds: 254
+Bookmaker Line: N/A  Odds: 260
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 657
+Bookmaker Line: N/A  Odds: 670
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Chelsea vs West Ham United
+Market: h2h
+Bookmaker: GTbets
+Pinnacle Line: N/A  Odds: -280
+Bookmaker Line: N/A  Odds: -263
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Aston Villa vs Ipswich Town
+Market: h2h
+Bookmaker: ESPN BET
+Pinnacle Line: N/A  Odds: -271
+Bookmaker Line: N/A  Odds: -255
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Manchester City vs Newcastle United
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: -149
+Bookmaker Line: N/A  Odds: -143
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Bovada
+Pinnacle Line: 3.5  Odds: -116
+Bookmaker Line: 3.5  Odds: -112
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Betsson
+Pinnacle Line: 3.5  Odds: -116
+Bookmaker Line: 3.5  Odds: -112
+EV: 1.7%
+
+Sport: soccer_epl
+Teams: Liverpool vs Wolverhampton Wanderers
+Market: totals
+Bookmaker: Nordic Bet
+Pinnacle Line: 3.5  Odds: -116
+Bookmaker Line: 3.5  Odds: -112
+EV: 1.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Feyenoord vs AC Milan
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 254
+Bookmaker Line: N/A  Odds: 260
+EV: 1.7%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: h2h
+Bookmaker: GTbets
+Pinnacle Line: N/A  Odds: 189
+Bookmaker Line: N/A  Odds: 194
+EV: 1.7%
+
+Sport: mma_mixed_martial_arts
+Teams: Kevin Jousset vs Jonathan Micallef
+Market: h2h
+Bookmaker: Wind Creek
+Pinnacle Line: N/A  Odds: -246
+Bookmaker Line: N/A  Odds: -233
+EV: 1.6%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: BetUS
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 270
+EV: 1.6%
+
+Sport: soccer_epl
+Teams: Leicester City vs Arsenal
+Market: h2h
+Bookmaker: BetMGM
+Pinnacle Line: N/A  Odds: -320
+Bookmaker Line: N/A  Odds: -300
+EV: 1.6%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: FanDuel
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 280
+EV: 1.6%
+
+Sport: soccer_epl
+Teams: Tottenham Hotspur vs Manchester United
+Market: h2h
+Bookmaker: Marathon Bet
+Pinnacle Line: N/A  Odds: 274
+Bookmaker Line: N/A  Odds: 280
+EV: 1.6%
+
+Sport: soccer_uefa_champs_league
+Teams: Manchester City vs Real Madrid
+Market: h2h
+Bookmaker: William Hill
+Pinnacle Line: N/A  Odds: 264
+Bookmaker Line: N/A  Odds: 270
+EV: 1.6%
+
+Sport: soccer_epl
+Teams: Arsenal vs Manchester City
+Market: h2h
+Bookmaker: Unibet
+Pinnacle Line: N/A  Odds: 294
+Bookmaker Line: N/A  Odds: 300
+EV: 1.5%
+
+Sport: soccer_uefa_champs_league
+Teams: Monaco vs Benfica
+Market: totals
+Bookmaker: Bovada
+Pinnacle Line: 2.75  Odds: -122
+Bookmaker Line: 2.75  Odds: -118
+EV: 1.5%
+
+Processing time: 0.87 seconds
+

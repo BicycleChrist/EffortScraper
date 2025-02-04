@@ -1,0 +1,3376 @@
+[
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Boston Bruins": 0.10510510510510507,
+        "Minnesota Wild": 0.0979937996650394
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Boston Bruins": 0.11695906432748548,
+        "Minnesota Wild": 0.1076332829887332
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Boston Bruins": -0.017094017094017033,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Boston Bruins": -0.027777777777777735,
+        "Minnesota Wild": -0.026066350710900466
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Boston Bruins": -0.017094017094017033,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Boston Bruins": -0.017094017094017033,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Boston Bruins": 5.551115123125783e-17,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Boston Bruins": 0.09043927648578809,
+        "Minnesota Wild": 0.09657515872306177
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Boston Bruins": -0.003915810083210958,
+        "Minnesota Wild": 0.00445008121398216
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Boston Bruins": -0.003915810083210958,
+        "Minnesota Wild": 0.00445008121398216
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.006835581480131192
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Boston Bruins": 5.551115123125783e-17,
+        "Minnesota Wild": -0.013871228759680942
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Boston Bruins": 5.551115123125783e-17,
+        "Minnesota Wild": -0.013871228759680942
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Boston Bruins": 0.07936507936507942,
+        "Minnesota Wild": 0.11029728565273589
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Boston Bruins": -0.005847953216374269,
+        "Minnesota Wild": -0.009158138150513917
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Boston Bruins": -0.015259895088221287,
+        "Minnesota Wild": -0.013871228759680942
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Boston Bruins": 0.010101010101010166,
+        "Minnesota Wild": 0.006643929662931258
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Boston Bruins": -0.015259895088221287,
+        "Minnesota Wild": -0.013871228759680942
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Boston Bruins": 0.11307767944936087,
+        "Minnesota Wild": 0.11679079214624233
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Boston Bruins": -0.009661835748792258,
+        "Minnesota Wild": -0.0022568269013766296
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.12086362554251295,
+        "Columbus Blue Jackets": 0.07265905728175859
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.1332032831535942,
+        "Columbus Blue Jackets": 0.08109360518999065
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.008110848259547165,
+        "Columbus Blue Jackets": -0.00991620804204485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.014604354753053606,
+        "Columbus Blue Jackets": -0.023925489190805838
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.008110848259547165,
+        "Columbus Blue Jackets": -0.00991620804204485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.008110848259547165,
+        "Columbus Blue Jackets": -0.00991620804204485
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.004100153072381263,
+        "Columbus Blue Jackets": -0.006556839603311326
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.004100153072381263,
+        "Columbus Blue Jackets": -0.006556839603311326
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.001376841525540351,
+        "Columbus Blue Jackets": -0.011616714793056704
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.10218643739318883,
+        "Columbus Blue Jackets": 0.07373757324379471
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.0032518738923306145
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.015060240963855498
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.01286817271947388,
+        "Columbus Blue Jackets": -0.015060240963855498
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.0032518738923306145
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.009428371316200557,
+        "Columbus Blue Jackets": -0.004897639337839266
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.01286817271947388,
+        "Columbus Blue Jackets": -0.023925489190805838
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.011616714793056704
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.015060240963855498
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.008110848259547165,
+        "Columbus Blue Jackets": -0.0016193807488017464
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.08696838443436444,
+        "Columbus Blue Jackets": 0.08910642570281113
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.004100153072381263,
+        "Columbus Blue Jackets": -0.0032518738923306145
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.001376841525540351,
+        "Columbus Blue Jackets": -0.015060240963855498
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.024524989673688546,
+        "Columbus Blue Jackets": -0.006556839603311326
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.01435317420447535,
+        "Columbus Blue Jackets": -0.0016193807488017464
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Buffalo Sabres": -0.01713728281789656,
+        "Columbus Blue Jackets": -0.006556839603311326
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.015060240963855498
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.12086362554251295,
+        "Columbus Blue Jackets": 0.09391411801050342
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Buffalo Sabres": 0.005611278670126951,
+        "Columbus Blue Jackets": -0.006556839603311326
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Florida Panthers": 0.10600255427841654,
+        "Washington Capitals": 0.10045397469332562
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Florida Panthers": 0.11686896981014627,
+        "Washington Capitals": 0.10946907498631642
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": -0.017193084130203817
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": -0.017193084130203817
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": -0.017193084130203817
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Florida Panthers": 5.551115123125783e-17,
+        "Washington Capitals": -0.00987672475063106
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Florida Panthers": 5.551115123125783e-17,
+        "Washington Capitals": -0.00987672475063106
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Florida Panthers": -0.018518518518518434,
+        "Washington Capitals": -0.031198686371100126
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Florida Panthers": 0.002153316106804526,
+        "Washington Capitals": 0.0
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Florida Panthers": 0.002153316106804526,
+        "Washington Capitals": -0.019584284512795924
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Florida Panthers": 0.098440545808967,
+        "Washington Capitals": 0.08444757213230114
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": 0.002414759007051015
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": 0.002414759007051015
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Florida Panthers": 0.002153316106804526,
+        "Washington Capitals": -0.019584284512795924
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Florida Panthers": -0.00424736663268771,
+        "Washington Capitals": -0.0123396576110813
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Florida Panthers": -0.0021334698754052472,
+        "Washington Capitals": -0.014778325123152691
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Florida Panthers": 0.11150512214342012,
+        "Washington Capitals": 0.07594417077175697
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Florida Panthers": 0.002153316106804526,
+        "Washington Capitals": -0.019584284512795924
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Florida Panthers": -0.00424736663268771,
+        "Washington Capitals": -0.019584284512795924
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Florida Panthers": 0.01097068632613668,
+        "Washington Capitals": 0.002414759007051015
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Florida Panthers": -0.00424736663268771,
+        "Washington Capitals": -0.019584284512795924
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Florida Panthers": 0.12381389654116925,
+        "Washington Capitals": 0.10799545282303902
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Florida Panthers": -0.008417508417508324,
+        "Washington Capitals": -0.007389162561576401
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.10416335610996352,
+        "Pittsburgh Penguins": 0.09391738205297528
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.1160049627791564,
+        "Pittsburgh Penguins": 0.10177460508586345
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.008296827293243048,
+        "Pittsburgh Penguins": -0.021645021645021578
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.008296827293243048,
+        "Pittsburgh Penguins": -0.021645021645021578
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.008296827293243048,
+        "Pittsburgh Penguins": -0.021645021645021578
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.006400409626216019,
+        "Pittsburgh Penguins": -0.005696058327637199
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.006400409626216019,
+        "Pittsburgh Penguins": -0.005696058327637199
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.02586731588557517,
+        "Pittsburgh Penguins": -0.021645021645021578
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0110689437065149,
+        "Pittsburgh Penguins": -0.0018821757952193208
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.10172468859789208,
+        "Pittsburgh Penguins": 0.07829050382241876
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.006400409626216019,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.01861042183622824,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.01861042183622824,
+        "Pittsburgh Penguins": 0.016233766233766267
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.006400409626216019,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.012600806451612934,
+        "Pittsburgh Penguins": -0.0018821757952193208
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.01861042183622824,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0032258064516129115,
+        "Pittsburgh Penguins": -0.003780789806990592
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0110689437065149,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.001619380748801691,
+        "Pittsburgh Penguins": -0.0018821757952193208
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.08938503098681083,
+        "Pittsburgh Penguins": 0.09391738205297528
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0032258064516129115,
+        "Pittsburgh Penguins": -0.0018821757952193208
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.00493745885450958,
+        "Pittsburgh Penguins": -0.011544011544011523
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.00493745885450958,
+        "Pittsburgh Penguins": 0.009171619341110882
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.009525019050038053,
+        "Pittsburgh Penguins": -0.011544011544011523
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.009525019050038053,
+        "Pittsburgh Penguins": -0.011544011544011523
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0032258064516129115,
+        "Pittsburgh Penguins": -0.0018821757952193208
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "New Jersey Devils": 0.1160049627791564,
+        "Pittsburgh Penguins": 0.09956709956709953
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "New Jersey Devils": -0.0110689437065149,
+        "Pittsburgh Penguins": 0.007368518006815927
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "New York Islanders": 0.09688602267738466,
+        "Vegas Golden Knights": 0.104727041222346
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "New York Islanders": 0.10495816456257578,
+        "Vegas Golden Knights": 0.11623028513713007
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "New York Islanders": 0.0019321431331633665,
+        "Vegas Golden Knights": -0.017679202828672524
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "New York Islanders": 0.0019321431331633665,
+        "Vegas Golden Knights": -0.017679202828672524
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "New York Islanders": 0.0019321431331633665,
+        "Vegas Golden Knights": -0.017679202828672524
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.004977765978628812
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.004977765978628812
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "New York Islanders": -0.02458764470853403,
+        "Vegas Golden Knights": -0.025220680958385866
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "New York Islanders": -0.005899937067337935,
+        "Vegas Golden Knights": -0.006610259122157569
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "New York Islanders": 0.07288157553770402,
+        "Vegas Golden Knights": 0.10707214698661605
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "New York Islanders": 0.0,
+        "Vegas Golden Knights": 0.001686568171085423
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "New York Islanders": 0.0,
+        "Vegas Golden Knights": 0.001686568171085423
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "New York Islanders": -0.00992181608921705,
+        "Vegas Golden Knights": -0.0033320005331200497
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "New York Islanders": -0.007901858912309101,
+        "Vegas Golden Knights": 0.001686568171085423
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": 0.001686568171085423
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "New York Islanders": 0.08338577721837626,
+        "Vegas Golden Knights": 0.10235905637744902
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "New York Islanders": -0.014016820184221013,
+        "Vegas Golden Knights": 0.0068306010928961824
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.016135278172195677
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "New York Islanders": 0.005746025665581245,
+        "Vegas Golden Knights": 0.008573976267233663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.016135278172195677
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "New York Islanders": 0.10154558351377585,
+        "Vegas Golden Knights": 0.11623028513713007
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "New York Islanders": -0.003915810083210958,
+        "Vegas Golden Knights": -0.0016728002676480447
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.006581834137779741,
+        "Winnipeg Jets": -0.002462932860450129
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.002235536081552414,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.10276997189883585,
+        "Winnipeg Jets": 0.10408118768706276
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.11336412745635327,
+        "Winnipeg Jets": 0.11338250382329607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.010868620119989514,
+        "Winnipeg Jets": -0.007316359379572646
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.010868620119989514,
+        "Winnipeg Jets": -0.007316359379572646
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.006581834137779741,
+        "Winnipeg Jets": -0.002462932860450129
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.010868620119989514,
+        "Winnipeg Jets": -0.007316359379572646
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.0272536687631027,
+        "Winnipeg Jets": -0.021321961620468954
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.021247662757096775,
+        "Winnipeg Jets": 0.0074380572385597254
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.0935192780968006,
+        "Winnipeg Jets": 0.09432429688293231
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.012982516877271977,
+        "Winnipeg Jets": 0.014682684140274294
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.012982516877271977,
+        "Winnipeg Jets": 0.014682684140274294
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.012982516877271977,
+        "Winnipeg Jets": -0.002462932860450129
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.1116352201257862,
+        "Winnipeg Jets": 0.08582089552238814
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.006581834137779741,
+        "Winnipeg Jets": -0.009707559762164752
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.006581834137779741,
+        "Winnipeg Jets": -0.009707559762164752
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.012982516877271977,
+        "Winnipeg Jets": -0.009707559762164752
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.009071117561683606,
+        "Winnipeg Jets": 0.012291483757682187
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.012982516877271977,
+        "Winnipeg Jets": -0.009707559762164752
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Carolina Hurricanes": 0.11507874629658499,
+        "Winnipeg Jets": 0.11338250382329607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Carolina Hurricanes": -0.01715265866209259,
+        "Winnipeg Jets": 0.0024875621890547706
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0051023011378131256,
+        "St Louis Blues": -0.006200396825396859
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0051023011378131256,
+        "St Louis Blues": -0.006200396825396859
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.11422141907327227,
+        "St Louis Blues": 0.08006599378881984
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.12572466298805618,
+        "St Louis Blues": 0.0875946969696969
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.02072917936836971,
+        "St Louis Blues": 0.006009615384615419
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.02072917936836971,
+        "St Louis Blues": 0.006009615384615419
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0051023011378131256,
+        "St Louis Blues": -0.006200396825396859
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.02072917936836971,
+        "St Louis Blues": 0.006009615384615419
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.02072917936836971,
+        "St Louis Blues": -0.02604166666666663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.008835037233371146,
+        "St Louis Blues": -0.003075787401574881
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.1075774894103409,
+        "St Louis Blues": 0.06804435483870974
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.003924133420536269,
+        "St Louis Blues": 0.0
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0025693730729701714,
+        "St Louis Blues": -0.009374999999999911
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.003924133420536269,
+        "St Louis Blues": -0.0015318627450979783
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.003924133420536269,
+        "St Louis Blues": 0.0
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Edmonton Oilers": 5.551115123125783e-17,
+        "St Louis Blues": -0.015879065040650397
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.003924133420536269,
+        "St Louis Blues": -0.009374999999999911
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.008835037233371146,
+        "St Louis Blues": -0.009374999999999911
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.008835037233371146,
+        "St Louis Blues": -0.0015318627450979783
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.09900336611444788,
+        "St Louis Blues": 0.078125
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0025693730729701714,
+        "St Louis Blues": -0.0015318627450979783
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.010658140154543083,
+        "St Louis Blues": -0.02604166666666663
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.012490007993605112,
+        "St Louis Blues": -0.017538265306122458
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.014819604990165158,
+        "St Louis Blues": 0.003028100775193776
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0051023011378131256,
+        "St Louis Blues": -0.017538265306122458
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0025693730729701714,
+        "St Louis Blues": -0.0015318627450979783
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Edmonton Oilers": 0.12572466298805618,
+        "St Louis Blues": 0.0875946969696969
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Edmonton Oilers": -0.0025693730729701714,
+        "St Louis Blues": 0.006009615384615419
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Calgary Flames": 0.09205143191116305,
+        "Toronto Maple Leafs": 0.10819749586581617
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Calgary Flames": -0.027681113571654592,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Calgary Flames": -0.03408179631114683,
+        "Toronto Maple Leafs": -0.016991041087426606
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Calgary Flames": -0.027681113571654592,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Calgary Flames": -0.007562008469449433,
+        "Toronto Maple Leafs": -0.004781028877414384
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Calgary Flames": -0.027681113571654592,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Calgary Flames": 0.09990865494405121,
+        "Toronto Maple Leafs": 0.1199246747756576
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Calgary Flames": -0.007562008469449433,
+        "Toronto Maple Leafs": -0.004781028877414384
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Calgary Flames": -0.0037481259370315545,
+        "Toronto Maple Leafs": -5.551115123125783e-17
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Calgary Flames": -0.015394088669950734,
+        "Toronto Maple Leafs": 0.001619380748801691
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Calgary Flames": 0.07389162561576346,
+        "Toronto Maple Leafs": 0.11058869624840828
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Calgary Flames": -0.0094941516026128,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": 0.006556839603311215
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Calgary Flames": -0.0094941516026128,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": 0.006556839603311215
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Calgary Flames": -0.011443393347574049,
+        "Toronto Maple Leafs": -0.004781028877414384
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Calgary Flames": -0.0173960105149219,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": -0.001606425702811276
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Calgary Flames": -0.0037481259370315545,
+        "Toronto Maple Leafs": -0.001606425702811276
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Calgary Flames": 0.09205143191116305,
+        "Toronto Maple Leafs": 0.09100441173561247
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": 0.006556839603311215
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Calgary Flames": -0.023510971786833812,
+        "Toronto Maple Leafs": 0.015060240963855442
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Calgary Flames": 0.007305669199298648,
+        "Toronto Maple Leafs": 0.009916208042044683
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": -0.007905638301236417
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": -0.007905638301236417
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": 0.006556839603311215
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Calgary Flames": 0.09770114942528729,
+        "Toronto Maple Leafs": 0.12445992500808933
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Calgary Flames": -0.013409961685823757,
+        "Toronto Maple Leafs": 0.006556839603311215
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.09534583063994817,
+        "Utah Hockey Club": 0.10898146681450971
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": -0.0053187717183178496
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.0353161902659751,
+        "Utah Hockey Club": -0.02372881355932205
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": -0.0053187717183178496
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.006226908547469878,
+        "Utah Hockey Club": -0.0053187717183178496
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": -0.0053187717183178496
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.10405663203367643,
+        "Utah Hockey Club": 0.11965018187446796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.006226908547469878,
+        "Utah Hockey Club": -0.0053187717183178496
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.0148010318433629,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.09277645756697805,
+        "Utah Hockey Club": 0.09317939900106453
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.006226908547469878,
+        "Utah Hockey Club": 0.005455735796901118
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.002038237332354864,
+        "Utah Hockey Club": 0.011053795136330147
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.006226908547469878,
+        "Utah Hockey Club": 0.005455735796901118
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.0192094254247418,
+        "Utah Hockey Club": 0.0036216137911053714
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.002056766762649098,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.09534583063994817,
+        "Utah Hockey Club": 0.08846630839189751
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.002056766762649098,
+        "Utah Hockey Club": -0.00706214689265533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.002056766762649098,
+        "Utah Hockey Club": -0.00706214689265533
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": -0.01220617981446609
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": -0.01220617981446609
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Philadelphia Flyers": 0.1076611015759088,
+        "Utah Hockey Club": 0.12172573189522351
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Philadelphia Flyers": -0.012627591286962114,
+        "Utah Hockey Club": 0.0018031013342950097
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.109375,
+        "Seattle Kraken": 0.10678761836556061
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.012195121951219523,
+        "Seattle Kraken": -0.008654074987559712
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.023809523809523725,
+        "Seattle Kraken": -0.0250391236306729
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.012195121951219523,
+        "Seattle Kraken": -0.008654074987559712
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.010767971744842175
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.012195121951219523,
+        "Seattle Kraken": -0.008654074987559712
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.11832061068702293,
+        "Seattle Kraken": 0.11729329142901479
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.010767971744842175
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0024875621890546595,
+        "Seattle Kraken": 0.002214545132429746
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.10317460317460314,
+        "Seattle Kraken": 0.08006598147443211
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.014563106796116498,
+        "Seattle Kraken": -0.012862563508907354
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.014563106796116498,
+        "Seattle Kraken": -0.012862563508907354
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.004950495049504899,
+        "Seattle Kraken": -0.010767971744842175
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.012195121951219523,
+        "Seattle Kraken": -0.0250391236306729
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.09183673469387754,
+        "Seattle Kraken": 0.09573382322923041
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.00738916256157629,
+        "Seattle Kraken": -0.008654074987559712
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.014563106796116498,
+        "Seattle Kraken": 0.002214545132429746
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.012195121951219523,
+        "Seattle Kraken": -0.010767971744842175
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Detroit Red Wings": -0.012195121951219523,
+        "Seattle Kraken": -0.010767971744842175
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.11538461538461542,
+        "Seattle Kraken": 0.10498451703126566
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Detroit Red Wings": 0.0,
+        "Seattle Kraken": -0.014938113529662789
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.07219548315438729,
+        "Dallas Stars": 0.11862554314504298
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0786135106805943,
+        "Dallas Stars": 0.1319188698950145
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.021170610211706076,
+        "Dallas Stars": -0.02070393374741203
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.014677103718199636,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.014677103718199636,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.014677103718199636,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.002361832782239004,
+        "Dallas Stars": -0.004748608657663411
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.002361832782239004,
+        "Dallas Stars": -0.004748608657663411
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.002361832782239004,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betclic"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.06077561257958708,
+        "Dallas Stars": 0.10096362753367577
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.008017592889540626,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0034827025771999587,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.008017592889540626,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.002361832782239004,
+        "Dallas Stars": -0.012051543524613018
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.00475646879756475,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0034827025771999587,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0034827025771999587,
+        "Dallas Stars": -0.012051543524613018
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0034827025771999587,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.00841143955779855,
+        "Dallas Stars": -0.004748608657663411
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.06468797564687989,
+        "Dallas Stars": 0.10096362753367577
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.00841143955779855,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.02790461694571278,
+        "Dallas Stars": 0.0019409937888198447
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.002361832782239004,
+        "Dallas Stars": -0.007528703180877172
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.08272549368439774,
+        "Dallas Stars": 0.124223602484472
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.021170610211706076,
+        "Dallas Stars": 0.0
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.021170610211706076,
+        "Dallas Stars": 0.0
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Anaheim Ducks": 0.0091324200913242,
+        "Dallas Stars": 0.014116318464144573
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Anaheim Ducks": -0.00841143955779855,
+        "Dallas Stars": -0.0028666985188725014
+      }
+    }
+  ],
+  [
+    {
+      "books": [
+        "Pinnacle",
+        "Marathon Bet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.12119238839447222,
+        "San Jose Sharks": 0.07741935483870976
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "1xBet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.1334838721521543,
+        "San Jose Sharks": 0.08553459119496865
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Fliff"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": -0.011860832894043216,
+        "San Jose Sharks": -0.0444444444444444
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetRivers"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0055281451690921135,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "betPARX"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0055281451690921135,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bally Bet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0055281451690921135,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Betsson"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.009784188750978473,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Suprabets"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": -0.0013566312133708736,
+        "San Jose Sharks": -0.008163265306122436
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Nordic Bet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.009784188750978473,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "DraftKings"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0013666803334700384,
+        "San Jose Sharks": -0.013223140495867813
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetOnline.ag"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.009784188750978473,
+        "San Jose Sharks": -0.006504065040650375
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "GTbets"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0013666803334700384,
+        "San Jose Sharks": -0.008163265306122436
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "LowVig.ag"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.009784188750978473,
+        "San Jose Sharks": -0.006504065040650375
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "William Hill"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.01561169457848427,
+        "San Jose Sharks": -0.016666666666666607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "FanDuel"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.021621309963099578,
+        "San Jose Sharks": -0.034782608695652195
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetUS"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.01561169457848427,
+        "San Jose Sharks": -0.020168067226890796
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetMGM"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.00835480052913734,
+        "San Jose Sharks": -0.016666666666666607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "ESPN BET"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.00835480052913734,
+        "San Jose Sharks": -0.016666666666666607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Tipico"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.10492995925219922,
+        "San Jose Sharks": 0.07741935483870976
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Bovada"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": -0.0013566312133708736,
+        "San Jose Sharks": -0.004858299595141724
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Hard Rock Bet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.01561169457848427,
+        "San Jose Sharks": -0.025531914893616947
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "BetAnySports"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.01561169457848427,
+        "San Jose Sharks": -0.016666666666666607
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Coolbet"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.12850874777404497,
+        "San Jose Sharks": 0.08944099378881987
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "888sport"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0055281451690921135,
+        "San Jose Sharks": -0.025531914893616947
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Matchbook"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.01709669606348574,
+        "San Jose Sharks": 1.1102230246251565e-16
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Wind Creek"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.0055281451690921135,
+        "San Jose Sharks": -0.025531914893616947
+      }
+    },
+    {
+      "books": [
+        "Pinnacle",
+        "Everygame"
+      ],
+      "EV": {
+        "Montr\u00e9al Canadiens": 0.00835480052913734,
+        "San Jose Sharks": -0.008163265306122436
+      }
+    }
+  ]
+]
