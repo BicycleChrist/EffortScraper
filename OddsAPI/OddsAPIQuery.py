@@ -51,14 +51,7 @@ def league_query():
     return sports_by_group
 
 
-def NHL_query():
-    SPORT = "icehockey_nhl"
-    # BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
-    REGIONS = "us,eu"  # Ensure 'eu' is included for Pinnacle. Regions: us,us2,uk,au,eu
-    MARKETS = "spreads"
-    ODDS_FORMAT = "american"
-    DATE_FORMAT = "iso"
-
+def odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT):
     response = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds",
         params={
@@ -72,19 +65,25 @@ def NHL_query():
 
     if response.status_code != 200:
         print(f"Error: {response.status_code}\n{response.text}")
-        return
-
-    odds = response.json()
-
+        return None
+    
     # Optional: Filter bookmakers if BOOKMAKERS is uncommented
-    if 'BOOKMAKERS' in globals():
-        queried_books = [b.strip().lower() for b in BOOKMAKERS.split(',')]
-    else:
-        queried_books = None  # No filter, show all bookmakers
+    # if 'BOOKMAKERS' in globals():
+    #     queried_books = [b.strip().lower() for b in BOOKMAKERS.split(',')]
+    # else:
+    #     queried_books = None  # No filter, show all bookmakers
+    return response.json()
 
+
+def ParseOdds(odds):
+    results = {}
     for game in odds:
-        print(f"\nGame: {game['home_team']} vs {game['away_team']}")
+        game_title = f"{game['home_team']} vs {game['away_team']}"
+        print(f"\nGame: {game_title}")
         print(f"Start Time: {game['commence_time']}")
+        results[game_title] = {
+            "start_time": {game['commence_time']}
+        }
 
         # Extract Pinnacle's odds first (for +EV calculation)
         pinnacle_odds = None
@@ -108,7 +107,10 @@ def NHL_query():
                             'price': outcome['price']
                         }
                     break
-
+        
+        results[game_title]['pinnacle_spreads'] = pinnacle_spreads 
+        results[game_title]['pinnacle_odds'] = pinnacle_odds 
+        
         # Track the best lines for each team
         best_lines = {
             game['home_team']: {'point': None, 'price': None, 'bookmaker': None},
@@ -121,12 +123,12 @@ def NHL_query():
             bm_title = bookmaker['title'].lower()
 
             # Skip if BOOKMAKERS is defined and this bookmaker isn't in the list
-            if queried_books and bm_title not in queried_books:
-                continue
+            # if queried_books and bm_title not in queried_books:
+            #     continue
 
             print(f"\n\033[1mBookmaker: {bookmaker['title']}\033[0m")
             for market in bookmaker['markets']:
-                if market['key'] != 'spreads':
+                if market['key'] != 'spreads': # TODO: don't limit parsing to only spreads
                     continue
 
                 for outcome in market['outcomes']:
@@ -181,9 +183,22 @@ def NHL_query():
                 print(f"  {team} Spread: {line['point']} ({line['price']}) at {line['bookmaker']}")
             else:
                 print(f"  {team}: No lines available")
+    # end of game for-loop
+    return results
 
 
 if __name__ == "__main__":
-    # Uncomment the function you want to run
     league_query()
-    #NHL_query()
+    
+    # SPORT = "soccer_uefa_champs_league"
+    # BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
+    # REGIONS = "us,eu"  # Ensure 'eu' is included for Pinnacle. Regions: us,us2,uk,au,eu
+    # MARKETS = "spreads"
+    # ODDS_FORMAT = "american"
+    # DATE_FORMAT = "iso"
+    # 
+    # response = odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT)
+    # if response is None: exit(1);
+    # odds = response.json()
+    # parsed_results = ParseOdds(odds)
+    
