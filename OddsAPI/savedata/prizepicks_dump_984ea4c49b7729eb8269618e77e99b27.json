@@ -1,0 +1,444 @@
+{
+  "player_points": {
+    "id": "984ea4c49b7729eb8269618e77e99b27",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2025-02-08T03:10:00Z",
+    "home_team": "Phoenix Suns",
+    "away_team": "Utah Jazz",
+    "bookmakers": [
+      {
+        "key": "prizepicks",
+        "title": "PrizePicks",
+        "markets": [
+          {
+            "key": "player_points",
+            "last_update": "2025-02-08T02:34:32Z",
+            "outcomes": [
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Under",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Over",
+                "description": "John Collins",
+                "price": -137,
+                "point": 18.0
+              },
+              {
+                "name": "Under",
+                "description": "John Collins",
+                "price": -137,
+                "point": 18.0
+              },
+              {
+                "name": "Over",
+                "description": "Devin Booker",
+                "price": -137,
+                "point": 32.5
+              },
+              {
+                "name": "Under",
+                "description": "Devin Booker",
+                "price": -137,
+                "point": 32.5
+              },
+              {
+                "name": "Over",
+                "description": "Keyonte George",
+                "price": -137,
+                "point": 17.0
+              },
+              {
+                "name": "Under",
+                "description": "Keyonte George",
+                "price": -137,
+                "point": 17.0
+              },
+              {
+                "name": "Over",
+                "description": "Lauri Markkanen",
+                "price": -137,
+                "point": 19.5
+              },
+              {
+                "name": "Under",
+                "description": "Lauri Markkanen",
+                "price": -137,
+                "point": 19.5
+              },
+              {
+                "name": "Over",
+                "description": "Nick Richards",
+                "price": -137,
+                "point": 10.5
+              },
+              {
+                "name": "Under",
+                "description": "Nick Richards",
+                "price": -137,
+                "point": 10.5
+              },
+              {
+                "name": "Over",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Under",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Over",
+                "description": "Grayson Allen",
+                "price": -137,
+                "point": 15.5
+              },
+              {
+                "name": "Under",
+                "description": "Grayson Allen",
+                "price": -137,
+                "point": 15.5
+              },
+              {
+                "name": "Over",
+                "description": "Brice Sensabaugh",
+                "price": -137,
+                "point": 8.5
+              },
+              {
+                "name": "Under",
+                "description": "Brice Sensabaugh",
+                "price": -137,
+                "point": 8.5
+              },
+              {
+                "name": "Over",
+                "description": "Tyus Jones",
+                "price": -137,
+                "point": 13.5
+              },
+              {
+                "name": "Under",
+                "description": "Tyus Jones",
+                "price": -137,
+                "point": 13.5
+              },
+              {
+                "name": "Over",
+                "description": "Royce O'Neale",
+                "price": -137,
+                "point": 14.0
+              },
+              {
+                "name": "Under",
+                "description": "Royce O'Neale",
+                "price": -137,
+                "point": 14.0
+              },
+              {
+                "name": "Over",
+                "description": "Mason Plumlee",
+                "price": -137,
+                "point": 6.5
+              },
+              {
+                "name": "Under",
+                "description": "Mason Plumlee",
+                "price": -137,
+                "point": 6.5
+              },
+              {
+                "name": "Over",
+                "description": "Monte Morris",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Under",
+                "description": "Monte Morris",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Over",
+                "description": "Ryan Dunn",
+                "price": -137,
+                "point": 8.5
+              },
+              {
+                "name": "Under",
+                "description": "Ryan Dunn",
+                "price": -137,
+                "point": 8.5
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "player_rebounds": {
+    "id": "984ea4c49b7729eb8269618e77e99b27",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2025-02-08T03:10:00Z",
+    "home_team": "Phoenix Suns",
+    "away_team": "Utah Jazz",
+    "bookmakers": [
+      {
+        "key": "prizepicks",
+        "title": "PrizePicks",
+        "markets": [
+          {
+            "key": "player_rebounds",
+            "last_update": "2025-02-08T02:34:32Z",
+            "outcomes": [
+              {
+                "name": "Over",
+                "description": "John Collins",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Under",
+                "description": "John Collins",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Over",
+                "description": "Nick Richards",
+                "price": -137,
+                "point": 8.5
+              },
+              {
+                "name": "Under",
+                "description": "Nick Richards",
+                "price": -137,
+                "point": 8.5
+              },
+              {
+                "name": "Over",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Under",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 11.5
+              },
+              {
+                "name": "Over",
+                "description": "Mason Plumlee",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Under",
+                "description": "Mason Plumlee",
+                "price": -137,
+                "point": 7.5
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "player_assists": {
+    "id": "984ea4c49b7729eb8269618e77e99b27",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2025-02-08T03:10:00Z",
+    "home_team": "Phoenix Suns",
+    "away_team": "Utah Jazz",
+    "bookmakers": [
+      {
+        "key": "prizepicks",
+        "title": "PrizePicks",
+        "markets": [
+          {
+            "key": "player_assists",
+            "last_update": "2025-02-08T02:34:32Z",
+            "outcomes": [
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 8.0
+              },
+              {
+                "name": "Under",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 8.0
+              },
+              {
+                "name": "Over",
+                "description": "Keyonte George",
+                "price": -137,
+                "point": 5.5
+              },
+              {
+                "name": "Under",
+                "description": "Keyonte George",
+                "price": -137,
+                "point": 5.5
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "player_points_alternate": {
+    "id": "984ea4c49b7729eb8269618e77e99b27",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2025-02-08T03:10:00Z",
+    "home_team": "Phoenix Suns",
+    "away_team": "Utah Jazz",
+    "bookmakers": [
+      {
+        "key": "prizepicks",
+        "title": "PrizePicks",
+        "markets": [
+          {
+            "key": "player_points_alternate",
+            "last_update": "2025-02-08T02:28:10Z",
+            "outcomes": [
+              {
+                "name": "Over",
+                "description": "Devin Booker",
+                "price": -137,
+                "point": 24.5
+              },
+              {
+                "name": "Over",
+                "description": "Devin Booker",
+                "price": 100,
+                "point": 39.5
+              },
+              {
+                "name": "Over",
+                "description": "Nick Richards",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Over",
+                "description": "Nick Richards",
+                "price": 100,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 9.5
+              },
+              {
+                "name": "Over",
+                "description": "Lauri Markkanen",
+                "price": 100,
+                "point": 27.5
+              },
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": 100,
+                "point": 17.5
+              },
+              {
+                "name": "Over",
+                "description": "Lauri Markkanen",
+                "price": -137,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "John Collins",
+                "price": 100,
+                "point": 24.5
+              },
+              {
+                "name": "Over",
+                "description": "John Collins",
+                "price": -137,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "Walker Kessler",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 7.5
+              },
+              {
+                "name": "Over",
+                "description": "Lauri Markkanen",
+                "price": 100,
+                "point": 24.5
+              },
+              {
+                "name": "Over",
+                "description": "Keyonte George",
+                "price": -137,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": 100,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "Isaiah Collier",
+                "price": -137,
+                "point": 9.5
+              },
+              {
+                "name": "Over",
+                "description": "Walker Kessler",
+                "price": 100,
+                "point": 14.5
+              },
+              {
+                "name": "Over",
+                "description": "Keyonte George",
+                "price": 100,
+                "point": 24.5
+              },
+              {
+                "name": "Over",
+                "description": "Lauri Markkanen",
+                "price": -137,
+                "point": 17.5
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

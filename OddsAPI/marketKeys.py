@@ -4,7 +4,7 @@ def get_sport_key(sport_name: str, league_name: str) -> str:
     Get the API key for a given sport and league combination.
     Returns None if not found.
     """
-    return SPORTS.get(sport_name, {}).get(league_name)
+    return SPORTS_MARKETS.get(sport_name, {}).get(league_name)
 
 
 

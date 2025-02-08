@@ -58,47 +58,48 @@ class NBAPropsClient:
                 print(f"\nError decoding JSON response: {e}")
                 return None
 
-    def format_props_by_player(self, props_data: Dict, sport: str = "basketball_nba") -> Dict[str, Dict[str, List[Dict]]]:
-        """Reorganize props data by player for each bookmaker."""
-        props_by_player = {}
-        sport_markets = SPORTS_MARKETS.get(sport, {})
+
+def format_props_by_player(props_data: Dict, sport: str = "basketball_nba") -> Dict[str, Dict[str, List[Dict]]]:
+    """Reorganize props data by player for each bookmaker."""
+    props_by_player = {}
+    sport_markets = SPORTS_MARKETS.get(sport, {})
+    
+    for bookmaker in props_data.get("bookmakers", []):
+        book_name = bookmaker["title"]
         
-        for bookmaker in props_data.get("bookmakers", []):
-            book_name = bookmaker["title"]
+        for market in bookmaker.get("markets", []):
+            market_name = sport_markets.get(market["key"], market["key"])
+            market_key = market["key"]
             
-            for market in bookmaker.get("markets", []):
-                market_name = sport_markets.get(market["key"], market["key"])
-                market_key = market["key"]
+            for outcome in market["outcomes"]:
+                player_name = outcome.get("description", outcome.get("name"))
+                if not player_name or player_name in ["Over", "Under", "Yes", "No"]:
+                    continue
                 
-                for outcome in market["outcomes"]:
-                    player_name = outcome.get("description", outcome.get("name"))
-                    if not player_name or player_name in ["Over", "Under", "Yes", "No"]:
-                        continue
-                    
-                    if player_name not in props_by_player:
-                        props_by_player[player_name] = {}
-                    
-                    if book_name not in props_by_player[player_name]:
-                        props_by_player[player_name][book_name] = []
-                    
-                    # Handle different market types
-                    prop_data = {
-                        "market": market_name,
-                        "type": outcome["name"],
-                        "odds": outcome["price"]
-                    }
-                    
-                    # Add line only for Over/Under markets
-                    if "point" in outcome and outcome["name"] in ["Over", "Under"]:
-                        prop_data["line"] = outcome["point"]
-                    
-                    # For Yes/No markets, use the type as the line
-                    if outcome["name"] in ["Yes", "No"]:
-                        prop_data["line"] = outcome["name"]
-                    
-                    props_by_player[player_name][book_name].append(prop_data)
-        
-        return props_by_player
+                if player_name not in props_by_player:
+                    props_by_player[player_name] = {}
+                
+                if book_name not in props_by_player[player_name]:
+                    props_by_player[player_name][book_name] = []
+                
+                # Handle different market types
+                prop_data = {
+                    "market": market_name,
+                    "type": outcome["name"],
+                    "odds": outcome["price"]
+                }
+                
+                # Add line only for Over/Under markets
+                if "point" in outcome and outcome["name"] in ["Over", "Under"]:
+                    prop_data["line"] = outcome["point"]
+                
+                # For Yes/No markets, use the type as the line
+                if outcome["name"] in ["Yes", "No"]:
+                    prop_data["line"] = outcome["name"]
+                
+                props_by_player[player_name][book_name].append(prop_data)
+    
+    return props_by_player
 
 
 async def select_markets() -> Set[str]:
@@ -193,7 +194,7 @@ async def main():
                 continue
             
             # Process and display props organized by player
-            props_by_player = client.format_props_by_player(props_data)
+            props_by_player = format_props_by_player(props_data)
             
             # Display props for each player
             for player_name, bookmaker_props in sorted(props_by_player.items()):

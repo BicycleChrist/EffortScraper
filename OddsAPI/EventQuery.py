@@ -45,3 +45,66 @@ cost = response.headers['x-requests-last']; print(cost)
 remaining = response.headers['x-requests-remaining']
 results = event_odds['bookmakers'] # all other returned data is identical to the info in 'event'; this field is the only new data
 # results is a list[dict]
+
+#############################################################################
+# Querying Prizepicks
+
+import json
+import pathlib
+import requests
+from Creds import ODDS_API_KEY
+
+base_url = "https://api.the-odds-api.com/v4/sports"
+# "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+credits_spent = 0
+
+def MakeRequest(url, params):
+    print(f"sending request to {url}")
+    response = requests.get(url, params)
+    headers = response.headers
+    print(f"request cost: {headers['x-requests-last']} credits [{headers['x-requests-remaining']} remaining]")
+    global credits_spent; credits_spent += int(headers['x-requests-last'])
+    if response.status_code != 200:
+        print(f"Request Failed: {response.status_code}")
+        return None
+    return response.json()
+
+
+# doesn't cost any credits
+def GetGameList(sport_key:str):
+    url = f"{base_url}/{sport_key}/events"
+    params = { "apiKey": ODDS_API_KEY }
+
+def PrizepicksQuery(event_id, markets):
+    url = f"{base_url}/basketball_nba/events/{event_id}/odds"
+    params = {"apiKey": ODDS_API_KEY, "oddsFormat": "american", "regions": "us_dfs"} 
+    global credits_spent; credits_spent = 0
+    results = {}
+    
+    for market in markets:
+        params['markets'] = market
+        results[market] = MakeRequest(url, params)
+    
+    print(f"\n\ntotal credits spent: {credits_spent}")
+    return results
+
+
+def SavePrizepicks(event_id, data):
+    savedir = pathlib.Path.cwd() / "savedata"
+    dumpfile = savedir / f"prizepicks_dump_{event_id}.json"
+    json.dump(data, dumpfile.open('w', encoding="utf-8"), indent=2)
+
+
+# 'Demons and goblins are included under "_alternate" markets'
+# The 'price' field is used to differentiate: 
+#   'Demons have default odds, goblins have been assigned even odds (+100)' 
+
+if __name__ == "__main__":
+    playerprop_markets = [
+        "player_points",
+        "player_rebounds",
+        "player_assists",
+        "player_points_alternate",
+    ]
+    event_id = "5c962a5ad947d385ee524f36970a8ce4"
+    results = PrizepicksQuery(event_id,playerprop_markets)
