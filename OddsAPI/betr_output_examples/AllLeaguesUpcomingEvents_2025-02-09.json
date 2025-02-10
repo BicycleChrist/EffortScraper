@@ -1,0 +1,51 @@
+{
+  "data": {
+    "getUpcomingEventsV2": [
+      {
+        "id": "67a44201e77d112988fec0c7",
+        "league": "CBB",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01b",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01d",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01c",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01f",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f020",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f022",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f023",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      },
+      {
+        "id": "678f2a01ebb68b700d67f024",
+        "league": "NBA",
+        "__typename": "TeamVersusEvent"
+      }
+    ]
+  }
+}

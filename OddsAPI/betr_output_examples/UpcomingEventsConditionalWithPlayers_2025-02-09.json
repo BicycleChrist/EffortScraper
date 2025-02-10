@@ -1,0 +1,542 @@
+{
+  "data": {
+    "getUpcomingEventsV2": [
+      {
+        "id": "678f2a01ebb68b700d67f01b",
+        "date": "2025-02-11T00:00Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021716",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352082",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100368604",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52630047",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Rocket Mortgage FieldHouse",
+          "city": "Cleveland",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "MIN@CLE",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba36e",
+            "name": "MIN",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/MIN.png",
+            "color": "#0C2340",
+            "secondaryColor": "#78BE20",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/MIN.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba36a",
+            "name": "CLE",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/CLE.png",
+            "color": "#860038",
+            "secondaryColor": "#B48B52",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/CLE.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01d",
+        "date": "2025-02-11T00:00Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021718",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352084",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100368804",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52631149",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Capital One Arena",
+          "city": "Washington",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "SA@WAS",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba376",
+            "name": "SA",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/SA.png",
+            "color": "#101114",
+            "secondaryColor": "#C4CED4",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/SA.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba35f",
+            "name": "WAS",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/WAS.png",
+            "color": "#002b5c",
+            "secondaryColor": "#E31837",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/WAS.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01c",
+        "date": "2025-02-11T00:00Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021717",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352083",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100369103",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52631219",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Kia Center",
+          "city": "Orlando",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "ATL@ORL",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba361",
+            "name": "ATL",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/ATL.png",
+            "color": "#C8102E",
+            "secondaryColor": "#FDB927",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/ATL.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba363",
+            "name": "ORL",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/ORL.png",
+            "color": "#101114",
+            "secondaryColor": "#0077C0",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/ORL.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f01f",
+        "date": "2025-02-11T00:30Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021720",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352086",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100368809",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52631815",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Kaseya Center",
+          "city": "Miami",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "BOS@MIA",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba367",
+            "name": "BOS",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/BOS.png",
+            "color": "#008348",
+            "secondaryColor": "#BA9653",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/BOS.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba362",
+            "name": "MIA",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/MIA.png",
+            "color": "#101114",
+            "secondaryColor": "#98002E",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/MIA.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f020",
+        "date": "2025-02-11T01:00Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021721",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352087",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100368609",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52630579",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Fiserv Forum",
+          "city": "Milwaukee",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "GS@MIL",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba378",
+            "name": "GS",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/GS.png",
+            "color": "#1d428A",
+            "secondaryColor": "#FFC72C",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/GS.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba36d",
+            "name": "MIL",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/MIL.png",
+            "color": "#00471C",
+            "secondaryColor": "#EEE1C6",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/MIL.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f022",
+        "date": "2025-02-11T01:30Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021723",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352089",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100369108",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52631981",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "American Airlines Center",
+          "city": "Dallas",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "SAC@DAL",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba37c",
+            "name": "SAC",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/SAC.png",
+            "color": "#101114",
+            "secondaryColor": "#5A2D81",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/SAC.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba377",
+            "name": "DAL",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/DAL.png",
+            "color": "#002B5E",
+            "secondaryColor": "#B8C4CA",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/DAL.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f023",
+        "date": "2025-02-11T02:00Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20021724",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352090",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100369107",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52630107",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Ball Arena",
+          "city": "Denver",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "POR@DEN",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba371",
+            "name": "POR",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/POR.png",
+            "color": "#101114",
+            "secondaryColor": "#C8102E",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/POR.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba372",
+            "name": "DEN",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/DEN.png",
+            "color": "#0E2240",
+            "secondaryColor": "#FEC524",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/DEN.png",
+            "__typename": "Team"
+          }
+        ]
+      },
+      {
+        "id": "678f2a01ebb68b700d67f024",
+        "date": "2025-02-11T03:30Z",
+        "status": "SCHEDULED",
+        "sport": "BASKETBALL",
+        "league": "NBA",
+        "competitionType": "VERSUS",
+        "dataFeedSourceIds": [
+          {
+            "id": "20022270",
+            "source": "SPORTS_DATA",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "11352095",
+            "source": "BET_GENIUS",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "1032501156100369008",
+            "source": "PAM",
+            "__typename": "DataFeedSourceId"
+          },
+          {
+            "id": "52631901",
+            "source": "BET_RADAR",
+            "__typename": "DataFeedSourceId"
+          }
+        ],
+        "playerStructure": "TEAM",
+        "venueDetails": {
+          "name": "Crypto.com Arena",
+          "city": "Los Angeles",
+          "country": "USA",
+          "__typename": "VenueDetails"
+        },
+        "headerImage": null,
+        "attributes": null,
+        "name": "UTA@LAL",
+        "icon": null,
+        "dedicated": false,
+        "__typename": "TeamVersusEvent",
+        "teams": [
+          {
+            "id": "648a048be70ced3cb8eba36f",
+            "name": "UTA",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/UTA.png",
+            "color": "#101114",
+            "secondaryColor": "#F9A01B",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/UTA.png",
+            "__typename": "Team"
+          },
+          {
+            "id": "648a048be70ced3cb8eba379",
+            "name": "LAL",
+            "league": "NBA",
+            "sport": "BASKETBALL",
+            "icon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/small-icons/LAL.png",
+            "color": "#552583",
+            "secondaryColor": "#FDB927",
+            "largeIcon": "https://prod-betr-teams-icons.s3.amazonaws.com/NBA/large-icons/LAL.png",
+            "__typename": "Team"
+          }
+        ]
+      }
+    ]
+  }
+}
