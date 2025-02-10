@@ -74,16 +74,19 @@ def MakeRequest(url, params):
 def GetGameList(sport_key:str):
     url = f"{base_url}/{sport_key}/events"
     params = { "apiKey": ODDS_API_KEY }
+    return MakeRequest(url, params)
 
-def PrizepicksQuery(event_id, markets):
+def PrizepicksQuery(event_id, markets, regions:list[str]):
     url = f"{base_url}/basketball_nba/events/{event_id}/odds"
-    params = {"apiKey": ODDS_API_KEY, "oddsFormat": "american", "regions": "us_dfs"} 
     global credits_spent; credits_spent = 0
     results = {}
     
-    for market in markets:
-        params['markets'] = market
-        results[market] = MakeRequest(url, params)
+    for region in regions:
+        results[region] = {}
+        params = {"apiKey": ODDS_API_KEY, "oddsFormat": "american", "regions": {region}}
+        for market in markets:
+            params['markets'] = market
+            results[region][market] = MakeRequest(url, params)
     
     print(f"\n\ntotal credits spent: {credits_spent}")
     return results
@@ -101,10 +104,17 @@ def SavePrizepicks(event_id, data):
 
 if __name__ == "__main__":
     playerprop_markets = [
-        "player_points",
+        #"player_points",
         "player_rebounds",
         "player_assists",
-        "player_points_alternate",
+        #"player_points_alternate",
     ]
-    event_id = "5c962a5ad947d385ee524f36970a8ce4"
-    results = PrizepicksQuery(event_id,playerprop_markets)
+    # regions = ["us_dfs"]
+    regions = ["us_dfs","eu"]
+    
+    gamelist = GetGameList('basketball_nba')
+    # get event_id from the gamelist
+    event_id = "de674935dc38d314dc4b4b0ac5c024c4"
+    results = PrizepicksQuery(event_id,playerprop_markets, regions)
+
+# interesting repo: https://github.com/acandrewchow/bet-genius/blob/main/src/client.py

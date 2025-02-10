@@ -51,3 +51,4 @@ Polymarket/timeseries_cache/
 OddsAPI/Creds.py
 OddsAPI/BetrNotes.txt
 OddsAPI/RefernceDocsForApi.txt
+OddsAPI/betr_dumps/
