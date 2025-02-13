@@ -1,0 +1,1711 @@
+[
+  {
+    "Austin Reaves": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 19.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 19.0
+          }
+        ]
+      }
+    },
+    "Dalton Knecht": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.0
+          }
+        ]
+      }
+    },
+    "Brice Sensabaugh": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 6.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 6.5
+          }
+        ]
+      }
+    },
+    "Keyonte George": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.5
+          }
+        ]
+      }
+    },
+    "Jarred Vanderbilt": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 4.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 4.5
+          }
+        ]
+      }
+    },
+    "Walker Kessler": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.0
+          }
+        ]
+      }
+    },
+    "Jordan Clarkson": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 18.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 18.0
+          }
+        ]
+      }
+    },
+    "Rui Hachimura": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 14.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 14.5
+          }
+        ]
+      }
+    },
+    "Isaiah Collier": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 10.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 10.5
+          }
+        ]
+      }
+    },
+    "LeBron James": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 24.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 24.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 24.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 24.5
+          }
+        ]
+      }
+    },
+    "Luka Doncic": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 23.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 23.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 24.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 24.0
+          }
+        ]
+      }
+    },
+    "Lauri Markkanen": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 18.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 18.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 18.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 18.5
+          }
+        ]
+      }
+    },
+    "John Collins": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 18.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 18.0
+          }
+        ]
+      }
+    },
+    "Jaxson Hayes": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ]
+      }
+    },
+    "Johnny Juzang": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.0
+          }
+        ]
+      }
+    }
+  },
+  {
+    "Dalano Banton": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 11.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 11.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.0
+          }
+        ]
+      }
+    },
+    "Nikola Jokic": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -146,
+            "line": 28.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": 110,
+            "line": 28.5
+          }
+        ]
+      },
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 29.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 29.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 30.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 30.0
+          }
+        ]
+      }
+    },
+    "Kris Murray": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ]
+      }
+    },
+    "Jamal Murray": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -130,
+            "line": 20.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -102,
+            "line": 20.5
+          }
+        ]
+      },
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.0
+          }
+        ]
+      }
+    },
+    "Aaron Gordon": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -109,
+            "line": 11.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -121,
+            "line": 11.5
+          }
+        ]
+      },
+      "dfs": {}
+    },
+    "Zeke Nnaji": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 10.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 10.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 10.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 10.5
+          }
+        ]
+      }
+    },
+    "Jalen Pickett": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ]
+      }
+    },
+    "Michael Porter Jr": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -112,
+            "line": 17.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -118,
+            "line": 17.5
+          }
+        ]
+      },
+      "dfs": {}
+    },
+    "Shaedon Sharpe": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.0
+          }
+        ]
+      }
+    },
+    "Julian Strawther": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 15.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 15.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 15.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 15.5
+          }
+        ]
+      }
+    },
+    "Anfernee Simons": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -105,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -126,
+            "line": 21.5
+          }
+        ]
+      },
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ]
+      }
+    },
+    "Donovan Clingan": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ]
+      }
+    },
+    "Toumani Camara": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -127,
+            "line": 10.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -104,
+            "line": 10.5
+          }
+        ]
+      },
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 10.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 10.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 11.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 11.0
+          }
+        ]
+      }
+    },
+    "Jerami Grant": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -107,
+            "line": 14.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -123,
+            "line": 14.5
+          }
+        ]
+      },
+      "dfs": {}
+    },
+    "Jabari Walker": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 5.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 5.5
+          }
+        ]
+      }
+    },
+    "Deni Avdija": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -107,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -124,
+            "line": 16.5
+          }
+        ]
+      },
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 16.5
+          }
+        ]
+      }
+    },
+    "Christian Braun": {
+      "pinnacle": {
+        "Pinnacle": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -142,
+            "line": 16.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": 107,
+            "line": 16.5
+          }
+        ]
+      },
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 17.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 17.0
+          }
+        ]
+      }
+    }
+  },
+  {
+    "Jimmy Butler": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.5
+          }
+        ]
+      }
+    },
+    "Kyrie Irving": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 27.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 27.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 27.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 27.5
+          }
+        ]
+      }
+    },
+    "Spencer Dinwiddie": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ]
+      }
+    },
+    "Moses Moody": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 11.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 11.5
+          }
+        ]
+      }
+    },
+    "Max Christie": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 13.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 13.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ]
+      }
+    },
+    "Brandin Podziemski": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.0
+          }
+        ]
+      }
+    },
+    "Stephen Curry": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 27.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 27.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 27.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 27.5
+          }
+        ]
+      }
+    },
+    "Draymond Green": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 9.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 9.0
+          }
+        ]
+      }
+    },
+    "Naji Marshall": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 12.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 12.5
+          }
+        ]
+      }
+    },
+    "Quinten Post": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 9.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 9.5
+          }
+        ]
+      }
+    },
+    "Olivier-Maxence Prosper": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 11.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 11.5
+          }
+        ]
+      }
+    },
+    "Klay Thompson": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 15.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 15.5
+          }
+        ]
+      }
+    },
+    "Jaden Hardy": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ]
+      }
+    },
+    "Kessler Edwards": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 5.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 5.5
+          }
+        ]
+      }
+    },
+    "Buddy Hield": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 14.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 14.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 14.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 14.5
+          }
+        ]
+      }
+    }
+  },
+  {
+    "Jaren Jackson Jr": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 22.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 22.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 23.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 23.0
+          }
+        ]
+      }
+    },
+    "Amir Coffey": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ]
+      }
+    },
+    "Jaylen Wells": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ]
+      }
+    },
+    "Norman Powell": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 23.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 23.5
+          }
+        ]
+      }
+    },
+    "Ja Morant": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.0
+          }
+        ]
+      }
+    },
+    "Ivica Zubac": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 15.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 15.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 15.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 15.5
+          }
+        ]
+      }
+    },
+    "Bogdan Bogdanovic": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 8.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 8.5
+          }
+        ]
+      }
+    },
+    "James Harden": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 21.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 21.5
+          }
+        ]
+      }
+    },
+    "Desmond Bane": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.0
+          }
+        ]
+      }
+    },
+    "Zach Edey": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 7.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 7.5
+          }
+        ]
+      }
+    },
+    "Derrick Jones": {
+      "pinnacle": {},
+      "dfs": {
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 9.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 9.0
+          }
+        ]
+      }
+    },
+    "Kawhi Leonard": {
+      "pinnacle": {},
+      "dfs": {
+        "Underdog": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.5
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.5
+          }
+        ],
+        "PrizePicks": [
+          {
+            "market": "player_points",
+            "type": "Over",
+            "odds": -137,
+            "line": 20.0
+          },
+          {
+            "market": "player_points",
+            "type": "Under",
+            "odds": -137,
+            "line": 20.0
+          }
+        ]
+      }
+    }
+  }
+]
