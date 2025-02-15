@@ -21,12 +21,12 @@ def find_best_parlays(comparison_results: Dict, dfs_site: str = 'PrizePicks') ->
     """
     Analyze comparison results to find the best 2-leg and 3-leg parlay opportunities.
     """
-    print("I'll launch computer out in culdesac once this works")
+    #print("I'll launch computer out in culdesac once this works")
     opportunities = []
     
     print(f"Processing parlays for {dfs_site}...")
-    print("DEBUG - Players in comparison results:", list(comparison_results.keys()))
-    print("Comparison Results:", json.dumps(comparison_results, indent=2))  # Debugging print
+    
+    
     
     for player, sources in comparison_results.items():
         print(f"\nDEBUG - {player} data: {json.dumps(sources, indent=2)}")
