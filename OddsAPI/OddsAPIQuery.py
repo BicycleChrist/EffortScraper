@@ -51,6 +51,10 @@ def league_query():
     return sports_by_group
 
 
+
+
+
+
 def odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT):
     response = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds",
@@ -62,17 +66,28 @@ def odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT):
             "dateFormat": DATE_FORMAT
         }
     )
-
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}\n{response.text}")
-        return None
-    
     # Optional: Filter bookmakers if BOOKMAKERS is uncommented
     # if 'BOOKMAKERS' in globals():
     #     queried_books = [b.strip().lower() for b in BOOKMAKERS.split(',')]
     # else:
     #     queried_books = None  # No filter, show all bookmakers
-    return response.json()
+    if response.status_code != 200:
+        print(f"Error: {response.status_code}\n{response.text}")
+        return None
+    
+    # Process the odds data to ensure 3-way moneylines are handled
+    odds_data = response.json()
+    for game in odds_data:
+        for bookmaker in game['bookmakers']:
+            for market in bookmaker['markets']:
+                if market['key'] == 'h2h':
+                    # Check if this is a 3-way moneyline (i.e., has a "Draw" outcome)
+                    is_three_way = any(outcome['name'].lower() == 'draw' for outcome in market['outcomes'])
+                    if is_three_way:
+                        # Ensure the market is labeled as a 3-way moneyline
+                        market['key'] = 'h2h_3way'
+    
+    return odds_data
 
 
 def ParseOdds(odds):
