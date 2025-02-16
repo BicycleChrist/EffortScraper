@@ -28,6 +28,46 @@ NBA_MARKETS = {
     "player_triple_double": "Triple Double (Yes/No)",
 }
 
+
+NFL_MARKETS = {
+    "player_assists": "Assists (Over/Under)",
+    "player_defensive_interceptions": "Defensive Interceptions (Over/Under)",
+    "player_field_goals": "Field Goals (Over/Under)",
+    "player_kicking_points": "Kicking Points (Over/Under)",
+    "player_pass_attempts": "Pass Attempts (Over/Under)",
+    "player_pass_completions": "Pass Completions (Over/Under)",
+    "player_pass_interceptions": "Pass Intercepts (Over/Under)",
+    "player_pass_longest_completion": "Longest Pass Completion (Over/Under)",
+    "player_pass_rush_reception_tds": "Pass + Rush + Reception Touchdowns (Over/Under)",
+    "player_pass_rush_reception_yds": "Pass + Rush + Reception Yards (Over/Under)",
+    "player_pass_tds": "Pass Touchdowns (Over/Under)",
+    "player_pass_yds": "Pass Yards (Over/Under)",
+    "player_pass_yds_q1": "1st Quarter Pass Yards (Over/Under)",
+    "player_pats": "Points After Touchdown (Over/Under)",
+    "player_receptions": "Receptions (Over/Under)",
+    "player_reception_longest": "Longest Reception (Over/Under)",
+    "player_reception_tds": "Reception Touchdowns (Over/Under)",
+    "player_reception_yds": "Reception Yards (Over/Under)",
+    "player_rush_attempts": "Rush Attempts (Over/Under)",
+    "player_rush_longest": "Longest Rush (Over/Under)",
+    "player_rush_reception_tds": "Rush + Reception Touchdowns (Over/Under)",
+    "player_rush_reception_yds": "Rush + Reception Yards (Over/Under)",
+    "player_rush_tds": "Rush Touchdowns (Over/Under)",
+    "player_rush_yds": "Rush Yards (Over/Under)",
+    "player_sacks": "Sacks (Over/Under)",
+    "player_solo_tackles": "Solo Tackles (Over/Under)",
+    "player_tackles_assists": "Tackles + Assists (Over/Under)",
+    "player_tds_over": "Touchdowns (Over only)",
+    "player_1st_td": "1st Touchdown Scorer (Yes/No)",
+    "player_anytime_td": "Anytime Touchdown Scorer (Yes/No)",
+    "player_last_td": "Last Touchdown Scorer (Yes/No)"
+}
+
+
+
+
+
+
 MLB_MARKETS = {
     "batter_home_runs": "Batter home runs (Over/Under)",
     "batter_first_home_run": "Batter first home run (Yes/No)",

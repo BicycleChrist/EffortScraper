@@ -19,7 +19,7 @@ class PropClient:
         self.base_url = "https://api.the-odds-api.com/v4"
         self.request_count = 0
 
-    async def fetch_json(self, session: aiohttp.ClientSession, url: str, params: Dict) -> Optional[Dict]:
+    async def fetch_json(self, session: aiohttp.ClientSession, url: str, params: dict) -> dict|None:
         """Helper function to make GET requests and return JSON response."""
         print(f"Fetching data from: {url}")
         async with session.get(url, params=params) as response:
@@ -30,7 +30,7 @@ class PropClient:
                 print(f"Error fetching {url}: {response.status}\nResponse: {response_text}")
                 return None
             try:
-                return json.loads(response_text)
+                return await response.json()
             except json.JSONDecodeError as e:
                 print(f"Error decoding JSON response: {e}")
                 return None
@@ -41,7 +41,7 @@ class PropClient:
         params = {"apiKey": self.api_key}
         return await self.fetch_json(session, url, params)
 
-    async def get_event_odds(self, session: aiohttp.ClientSession, event_id: str, markets: Set[str], region: str = "us") -> Optional[Dict]:
+    async def get_event_odds(self, session: aiohttp.ClientSession, event_id: str, markets: set[str], region: str = "us") -> dict:
         """Fetch event odds for a specific event and markets."""
         url = f"{self.base_url}/sports/{self.sport_key}/events/{event_id}/odds"
         params = {
@@ -77,7 +77,7 @@ def format_props_by_player(props_data: Dict) -> Dict[str, Dict[str, List[Dict]]]
     return props_by_player
 
 
-def save_data(event_id: str, data: Dict, filename_prefix: str):
+def save_data(event_id: str, data: dict, filename_prefix: str):
     """Save data to JSON file in the specified directory."""
     file_path = SAVE_DIR / f"{filename_prefix}_{event_id}.json"
     with file_path.open('w', encoding="utf-8") as f:
@@ -107,24 +107,13 @@ async def main():
         "baseball_mlb": MLB_MARKETS,
         "icehockey_nhl": NHL_MARKETS,
         "aussierules_afl": AFL_MARKETS,
-        "soccer_usa_mls": SOCCER_MARKETS
+        "soccer_mexico_ligamx": SOCCER_MARKETS
     }
     
     available_markets = market_map.get(sport_key, {})
     if not available_markets:
-        print(f"Invalid sport key: {sport_key}")
+        print(f"No available markets for: {sport_key}")
         return
-        print(f"Invalid sport key: {sport_key}")
-        return
-
-    market_map = {
-        "basketball_nba": NBA_MARKETS,
-        "baseball_mlb": MLB_MARKETS,
-        "icehockey_nhl": NHL_MARKETS,
-        "aussierules_afl": AFL_MARKETS,
-        "soccer": SOCCER_MARKETS
-    }
-    available_markets = market_map.get(sport_key, {})
 
     client = PropClient(sport_key)
     async with aiohttp.ClientSession() as session:
@@ -133,7 +122,8 @@ async def main():
         if not games:
             print("No games found")
             return
-
+        save_data(sport_key, games, "raw_gameslist")
+        
         print("Available games:")
         for i, game in enumerate(games):
             print(f"{i + 1}. {game['away_team']} @ {game['home_team']}")
@@ -151,13 +141,14 @@ async def main():
             selected_markets = set(available_markets.keys())
         else:
             selected_markets = {list(available_markets.keys())[int(i) - 1] for i in selected_props.split(',')}
-        selected_markets = {list(available_markets.keys())[int(i) - 1] for i in selected_props.split(',')}
         
         for event_id in game_ids:
-            props_data = await client.get_event_odds(session, event_id, selected_markets, region="us_dfs")
+            print(event_id)
+            props_data = await client.get_event_odds(session, event_id, selected_markets)
             if not props_data:
                 print(f"No props data available for game ID {event_id}.")
                 continue
+            save_data(event_id, props_data, "raw_props_data")
             props_by_player = format_props_by_player(props_data)
             save_data(event_id, props_by_player, "player_props")
 
@@ -168,24 +159,9 @@ async def main():
             print(json.dumps(prizepicks_parlays, indent=2))
             print("Underdog Best Parlays:")
             print(json.dumps(underdog_parlays, indent=2))
-            save_data("prizepicks", prizepicks_parlays, "parlay_results")
-            save_data("underdog", underdog_parlays, "parlay_results")
-        if not props_data:
-            print("No props data available for this game.")
-            return
-        props_by_player = format_props_by_player(props_data)
-        save_data(event_id, props_by_player, "player_props")
-
-        print("Finding best parlays...")
-        prizepicks_parlays = find_best_parlays({event_id: props_by_player}, "PrizePicks")
-        underdog_parlays = find_best_parlays({event_id: props_by_player}, "Underdog")
-        print("PrizePicks Best Parlays:")
-        print(json.dumps(prizepicks_parlays, indent=2))
-        print("Underdog Best Parlays:")
-        print(json.dumps(underdog_parlays, indent=2))
-        save_data("prizepicks", prizepicks_parlays, "parlay_results")
-        save_data("underdog", underdog_parlays, "parlay_results")
-
+            save_data(event_id, prizepicks_parlays, "prizepicks_parlay_results")
+            save_data(event_id, underdog_parlays, "underdog_parlay_results")
+        
         print(f"Total API requests made: {client.request_count}")
 
 

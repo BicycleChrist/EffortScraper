@@ -189,7 +189,7 @@ def CompareBooks(bookmakers, sportname:str, game_title:str):
     print(game_title)
     print(" | ".join([book['title'] for book in bookmakers]))
     for (side, entry) in outcome_map.items():
-        print(f"market_type: {entry['market_type'][0]}")
+        # print(f"market_type: {entry['market_type'][0]}")
         print(f"  {side}: ")
         for (bm, price) in zip(entry['bookmaker'], entry['price']):
             print(f"    {bm}: {price}")
@@ -204,6 +204,7 @@ def CompareBooks(bookmakers, sportname:str, game_title:str):
     }
 
 
+#TODO: Fix "market_type" being printed several times per game displayed. 
 def DoEverything(sport):
     savedir = pathlib.Path.cwd() / "savedata"
     start_time = time.time()
@@ -213,27 +214,67 @@ def DoEverything(sport):
     json.dump(games, dumpfile.open('w'), indent=2)
     
     results = []
+    best_lines = []
+    
+    priority_books = ["pinnacle", "circa", "betcris", "betonline"]
+    
     for game in games:
         print(f"Sport: {sport}")
         game_title = f"{game['home_team']} vs {game['away_team']}"
         print(game_title)
         bookmakers_all = game['bookmakers']
-         
-        # TODO: do something even if pinnacle isn't in there
-        ###########################################
-        has_pinnacle = ('pinnacle' in [book['key'] for book in bookmakers_all])
-        if not has_pinnacle:
-            print("Ignoring game because pinnacle line isn't available")
-            continue
         
-        pinnacle_entry = [book for book in bookmakers_all if book['key'] == 'pinnacle'][0]
-        other_books = [book for book in bookmakers_all if book['key'] != 'pinnacle']
+        available_books = {book['key']: book for book in bookmakers_all}
+        selected_book = next((available_books[key] for key in priority_books if key in available_books), None)
         
-        comparisons = [
-            CompareBooks([pinnacle_entry, other_book], sport, game_title)
-            for other_book in other_books
-        ]
+        best_traditional = {}
+        best_three_way = {}
+        
+        comparisons = []
+        for other_book in bookmakers_all:
+            for market in other_book.get('markets', []):
+                if market['key'] == 'h2h':
+                    outcomes = market.get('outcomes', [])
+                    is_three_way = any(outcome['name'].lower() == 'draw' for outcome in outcomes)
+                    market_type = "3-way moneyline" if is_three_way else "traditional moneyline"
+                    print(f"h2h Market Type: {market_type}")
+                    
+                    for outcome in outcomes:
+                        team = outcome['name']
+                        price = outcome['price']
+                        bookmaker = other_book['title']
+                        
+                        if is_three_way:
+                            if team not in best_three_way or price > best_three_way[team]['price']:
+                                best_three_way[team] = {'price': price, 'bookmaker': bookmaker}
+                        else:
+                            if team not in best_traditional or price > best_traditional[team]['price']:
+                                best_traditional[team] = {'price': price, 'bookmaker': bookmaker}
+                    
+            if selected_book:
+                comparisons.append(CompareBooks([selected_book, other_book], sport, game_title))
+            else:
+                comparisons.append(CompareBooks([other_book], sport, game_title))
+                
+        best_lines.append({
+            'game': game_title,
+            'best_traditional': best_traditional,
+            'best_three_way': best_three_way
+        })
+        
         results.append(comparisons)
+    
+    print("-----------------------------Best Lines-----------------------------")
+    for game_info in best_lines:
+        print(f"\n{game_info['game']}")
+        if game_info['best_traditional']:
+            print("Market Type: Traditional Moneyline")
+            for team, data in game_info['best_traditional'].items():
+                print(f"  {team}: {data['bookmaker']} {data['price']}")
+        if game_info['best_three_way']:
+            print("Market Type: 3-way Moneyline")
+            for team, data in game_info['best_three_way'].items():
+                print(f"  {team}: {data['bookmaker']} {data['price']}")
     
     json.dumps(results, indent=2)
     
@@ -243,9 +284,14 @@ def DoEverything(sport):
     print(f"\nProcessing time: {time.time() - start_time:.2f} seconds")
 
 
+
+
+
+
+
 if __name__ == "__main__":
     # sports = ['icehockey_nhl', 'tennis_atp']
     # for sport in sports:
     #     DoEverything(sport)
-    DoEverything('icehockey_nhl')
+    DoEverything('icehockey_ahl')
     print("\n\n done \n\n")
