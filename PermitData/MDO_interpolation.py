@@ -10,6 +10,10 @@ from openpyxl.styles import PatternFill
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Port coordinates
+# Reccent St Paul Island MDO prices can be obtained via the master rate schedule document
+# Price of Marine Diesel = $6.18 per gallon plus taxes in July 2024; $7.19 in July 2022
+# https://stpaulak.com/wp-content/uploads/2024/07CSP_2024MasterRateSchedule_UPDATED_22Jul24.pdf
+# Due to the remoteness of both St paul and King cove, we can assume that prices in the less remote King cove will be at a slight discount to St paul
 port_coordinates = {
     'Dillingham': (59.03865636911631, -158.4774533325954),
     'Yakutat': (59.56478746108611, -139.7412206054035),
@@ -27,7 +31,8 @@ port_coordinates = {
     'Juneau': (58.38428553582909, -134.6458802501777),
     'Sitka': (57.05376183638209, -135.34949780572398),
     'Ketchikan': (55.343012147350635, -131.64854512244167),
-    'St Paul Island': (57.78689854451251, -152.41106925000147)
+    'St Paul Island': (57.78689854451251, -152.41106925000147),
+    'King Cove': (55.05711552698481, -162.31944444367755)
 }
 
 # Column mapping
@@ -62,6 +67,7 @@ column_mapping = {
     'St Paul Island_Avg': 'St Paul Island',
     'St Paul Island_Min': 'St Paul Island',
     'St Paul Island_Max': 'St Paul Island',
+    'King Cove_Max': 'King Cove'
 }
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -132,41 +138,64 @@ def calculate_reasonable_bounds(prices, default_variation=0.3):
     return median * (1 - variation), median * (1 + variation)
 
 def create_enhanced_features(df, target_port, port_distances, price_correlations):
-    # Claude attempting to pump out the feature set
     features = pd.DataFrame(index=df.index)
 
-    # Temporal features
+    # Base features
     features['Year'] = df.index.year
     features['Month'] = df.index.month
     features['Quarter'] = df.index.quarter
     features['IsSummer'] = (features['Month'] >= 6) & (features['Month'] <= 8)
     features['IsWinter'] = (features['Month'] <= 2) | (features['Month'] == 12)
+    features['Month_Sin'] = np.sin(2 * np.pi * features['Month']/12)
+    features['Month_Cos'] = np.cos(2 * np.pi * features['Month']/12)
 
-    # price history features
+    # Price history features
     features['Prev_Month_Price'] = df[target_port].shift(1)
     features['Prev_Quarter_Avg'] = df[target_port].rolling(window=3, min_periods=1).mean()
 
-    # Nearby port features
-    closest_ports = port_distances[target_port].sort_values()
-    closest_ports = closest_ports[closest_ports.index != target_port][:5]
+    # Special handling for remote ports
+    if target_port in ['St Paul Island', 'King Cove']:
+        if 'Dutch Harbor' in df.columns:
+            features['Dutch_Harbor_Price'] = df['Dutch Harbor']
+            features['Dutch_Harbor_Weight'] = 0.4
 
-    for i, (other_port, distance) in enumerate(closest_ports.items(), 1):
-        if other_port in df.columns:
-            corr = price_correlations.loc[target_port, other_port]
-            weight = 1 / (distance + 1) * max(0.1, corr)
+        if 'Sand Point' in df.columns:
+            features['Sand_Point_Price'] = df['Sand Point']
+            features['Sand_Point_Weight'] = 0.3
 
-            features[f'Port_{i}_Price'] = df[other_port]
-            features[f'Port_{i}_Weight'] = weight
+        if 'Dillingham' in df.columns:
+            features['Dillingham_Price'] = df['Dillingham']
+            features['Dillingham_Weight'] = 0.2
+    else:
+        # Regular port features
+        closest_ports = port_distances[target_port].sort_values()
+        closest_ports = closest_ports[closest_ports.index != target_port][:5]
+
+        for i, (other_port, distance) in enumerate(closest_ports.items(), 1):
+            if other_port in df.columns:
+                corr = price_correlations.loc[target_port, other_port]
+                weight = 1 / (distance + 1) * max(0.1, corr)
+                features[f'Port_{i}_Price'] = df[other_port]
+                features[f'Port_{i}_Weight'] = weight
 
     return features
 
+
+def calculate_remote_port_premium(row, reference_port, min_premium, max_premium):
+    """Calculate premium price based on reference port price"""
+    if pd.isna(row[reference_port]):
+        return None
+
+    # Use random premium within range to add slight variation
+    premium = np.random.uniform(min_premium, max_premium)
+    return row[reference_port] * (1 + premium)
+
 def interpolate_with_model(df, port, features, model_params=None):
-    # interpolate with features
     if model_params is None:
         model_params = {
             'n_estimators': 200,
             'learning_rate': 0.05,
-            'max_depth': 4,
+            'max_depth': 8,
             'random_state': 42
         }
 
@@ -176,26 +205,102 @@ def interpolate_with_model(df, port, features, model_params=None):
     if not train_mask.any() or not pred_mask.any():
         return df[port].copy()
 
-    X_train = features[train_mask].fillna(-999)
-    y_train = df.loc[train_mask, port]
-
-    model = xgb.XGBRegressor(**model_params)
-    model.fit(X_train, y_train)
-
     result = df[port].copy()
 
-    # Predict it
-    for idx in df.index[pred_mask]:
-        X_pred = features.loc[[idx]].fillna(-999)
-        nearby_prices = get_nearby_prices(df, port, idx)
-        min_bound, max_bound = calculate_reasonable_bounds(nearby_prices)
+    # Handle St Paul Island first
+    if port == 'St Paul Island':
+        temp_df = pd.DataFrame(index=df.index)
 
-        pred = model.predict(X_pred)[0]
+        if 'Dillingham' in df.columns:
+            temp_df['dill_price'] = df.apply(
+                lambda x: calculate_remote_port_premium(x, 'Dillingham', 0.01, 0.04),
+                axis=1
+            )
 
-        if min_bound is not None and max_bound is not None:
-            pred = np.clip(pred, min_bound, max_bound)
+        if 'Dutch Harbor' in df.columns:
+            temp_df['dutch_price'] = df.apply(
+                lambda x: calculate_remote_port_premium(x, 'Dutch Harbor', 0.05, 0.08),
+                axis=1
+            )
 
-        result.loc[idx] = pred
+        # Process each missing value
+        for idx in df.index[pred_mask]:
+            # Apply known fixed prices first
+            known_prices = {
+                pd.Timestamp('2024-07-01'): 6.18,
+                pd.Timestamp('2022-07-01'): 7.19
+            }
+
+            if idx in known_prices:
+                result.loc[idx] = known_prices[idx]
+                continue
+
+            premium_prices = temp_df.loc[idx].dropna()
+            if not premium_prices.empty:
+                result.loc[idx] = premium_prices.mean()
+            else:
+                X_pred = features.loc[[idx]].fillna(-999)
+                if not X_pred.empty:
+                    X_train = features[train_mask].fillna(-999)
+                    y_train = df.loc[train_mask, port]
+                    if not X_train.empty and not y_train.empty:
+                        model = xgb.XGBRegressor(**model_params)
+                        model.fit(X_train, y_train)
+                        result.loc[idx] = model.predict(X_pred)[0]
+
+    # Handle King Cove separately, after St Paul Island is complete
+    elif port == 'King Cove':
+        # Get St Paul Island prices - they should all be populated now
+        st_paul_prices = df['St Paul Island']
+
+        for idx in df.index[pred_mask]:
+            st_paul_price = st_paul_prices.loc[idx]
+            if pd.notna(st_paul_price):
+                # Calculate King Cove as 2-5% discount from St Paul
+                discount = np.random.uniform(0.02, 0.05)
+                result.loc[idx] = st_paul_price * (1 - discount)
+            else:
+                # Fallback to Dillingham/Dutch Harbor reference if needed
+                temp_prices = []
+
+                if 'Dillingham' in df.columns and pd.notna(df.loc[idx, 'Dillingham']):
+                    temp_prices.append(df.loc[idx, 'Dillingham'] * 1.20)  # 20% premium
+
+                if 'Dutch Harbor' in df.columns and pd.notna(df.loc[idx, 'Dutch Harbor']):
+                    temp_prices.append(df.loc[idx, 'Dutch Harbor'] * 1.15)  # 15% premium
+
+                if temp_prices:
+                    result.loc[idx] = np.mean(temp_prices)
+                else:
+                    # Model-based fallback as last resort
+                    X_pred = features.loc[[idx]].fillna(-999)
+                    if not X_pred.empty:
+                        X_train = features[train_mask].fillna(-999)
+                        y_train = df.loc[train_mask, port]
+                        if not X_train.empty and not y_train.empty:
+                            model = xgb.XGBRegressor(**model_params)
+                            model.fit(X_train, y_train)
+                            result.loc[idx] = model.predict(X_pred)[0]
+
+    else:
+        # Original model-based interpolation for non-remote ports remains unchanged
+        X_train = features[train_mask].fillna(-999)
+        y_train = df.loc[train_mask, port]
+
+        model = xgb.XGBRegressor(**model_params)
+        model.fit(X_train, y_train)
+
+        for idx in df.index[pred_mask]:
+            X_pred = features.loc[[idx]].fillna(-999)
+            nearby_prices = get_nearby_prices(df, port, idx)
+            min_bound, max_bound = calculate_reasonable_bounds(nearby_prices)
+
+            pred = model.predict(X_pred)[0]
+
+            if min_bound is not None and max_bound is not None:
+                pred = np.clip(pred, min_bound, max_bound)
+
+            result.loc[idx] = pred
 
     return result
 
@@ -247,7 +352,7 @@ def preprocess_data(df, column_mapping):
             best_col = valid_counts.idxmax()
             df_processed[port] = df[best_col]
 
-            # Fill gaps with other columns if available
+
             for col in cols:
                 mask = df_processed[port].isna() & df[col].notna()
                 df_processed.loc[mask, port] = df.loc[mask, col]
@@ -277,6 +382,42 @@ def extend_predictions(df, num_months, port_distances, price_correlations):
             continue
 
     return extended_df
+
+
+def adjust_premium_port_prices(df):
+    """
+    Adjusts prices for St Paul Island and King Cove based on remoteness premium
+    """
+    df_adjusted = df.copy()
+
+    # Known recent prices for St Paul Island
+    st_paul_reference = {
+        pd.Timestamp('2024-07-01'): 6.18,  # From rate schedule
+        pd.Timestamp('2022-07-01'): 7.19   # Historical reference
+    }
+
+    # Process each date
+    for date in df_adjusted.index:
+        # Find the highest non-premium port price for this date
+        other_ports = df_adjusted.loc[date].drop(['St Paul Island', 'King Cove'])
+        base_price = other_ports.max()
+
+        if pd.notna(base_price):
+            # St Paul Island adjustment
+            if pd.isna(df_adjusted.loc[date, 'St Paul Island']):
+                if date in st_paul_reference:
+                    df_adjusted.loc[date, 'St Paul Island'] = st_paul_reference[date]
+                else:
+                    df_adjusted.loc[date, 'St Paul Island'] = base_price * 1.35
+
+            # King Cove adjustment
+            if pd.isna(df_adjusted.loc[date, 'King Cove']):
+                df_adjusted.loc[date, 'King Cove'] = base_price * 1.25
+
+    return df_adjusted
+
+
+
 
 
 def main():

@@ -17,6 +17,8 @@ from requests.exceptions import ConnectionError, HTTPError
 from pprint import pprint
 from PolymarketParsing import ParseHrefs
 import pmsuck
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

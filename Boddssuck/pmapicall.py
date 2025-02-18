@@ -16,56 +16,44 @@ client = ClobClient(
     chain_id=chain_id
 )
 
-# Initialize variables for pagination
-markets_list = []
-next_cursor = None
-
-limit = 10
-i = 0
-
-# Fetch all available markets using pagination
-#while i < limit:
-while True:
-    try:
-        print(f"Fetching markets with next_cursor: {next_cursor}")
-        response = client.get_markets(next_cursor=next_cursor) if next_cursor else client.get_markets()
-        
-        #print(f"API Response: {json.dumps(response, indent=2)}")
-        
-        if 'data' not in response:
-            print("No data found in response.")
+def FetchMarkets(next_cursor=None):
+    # Initialize variables for pagination
+    markets_list = []
+    limit = 10
+    i = 0
+    # Fetch all available markets using pagination
+    #while i < limit:
+    while True:
+        try:
+            print(f"Fetching markets with next_cursor: {next_cursor}")
+            response = client.get_markets(next_cursor=next_cursor) if next_cursor else client.get_markets()
+            
+            #print(f"API Response: {json.dumps(response, indent=2)}")
+            
+            if 'data' not in response:
+                print("No data found in response.")
+                break
+            
+            markets_list.extend(response['data'])
+            next_cursor = response.get("next_cursor")
+            
+            if not next_cursor:
+                break
+        except Exception as e:
+            print(f"Exception occurred: {e}")
+            print(f"Exception details: {e.__class__.__name__}")
+            print(f"Error message: {e.args}")
             break
-        
-        markets_list.extend(response['data'])
-        next_cursor = response.get("next_cursor")
-        
-        if not next_cursor:
-            break
-    except Exception as e:
-        print(f"Exception occurred: {e}")
-        print(f"Exception details: {e.__class__.__name__}")
-        print(f"Error message: {e.args}")
-        break
-    i += 1
+        i += 1
+    return markets_list
 
-# Debugging step: Print out the raw data
-#print("Raw Market Data:")
-#print(json.dumps(markets_list, indent=2))
-
-# market["active"] is always True?? Even when it's closed.
-print(f"\n\n returned {len(markets_list)} markets \n")
-open_markets = [market for market in markets_list if ((market["active"] is True) and (not market["closed"]))]
-print(f"#open_markets: {len(open_markets)}")
-print("\n\n")
-pprint([market["market_slug"] for market in open_markets])
-
-wanted_fields = ("question", "description", "tokens")
-# there are always two tokens. https://docs.polymarket.com/#get-markets
-# "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
-# (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
-# 'winner' will always be false for open markets
 
 def FilterData(markets) -> list[dict]:
+    wanted_fields = ("question", "description", "tokens")
+    # there are always two tokens. https://docs.polymarket.com/#get-markets
+    # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
+    # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
+    # 'winner' will always be false for open markets
     filtered_data = [
         { field: market[field] for field in wanted_fields }
         for market in markets
@@ -75,11 +63,17 @@ def FilterData(markets) -> list[dict]:
         del market["tokens"]
     return filtered_data
 
-filtered = FilterData(markets_list)
+def WriteJsonDump(data: list[dict]):
+    with open((pathlib.Path.cwd() / "PMdump.json"), "w") as json_file:
+        json.dump(data, json_file, indent=2)
+        print("wrote PMdump.json")
+    return
 
-with open((pathlib.Path.cwd() / "PMdump.json"), "w") as json_file:
-    json.dump(filtered, json_file, indent=2)
-    print("wrote PMdump.json")
+def LoadJsonDump():
+    loaded_data = {}
+    with open((pathlib.Path.cwd() / "PMdump.json"), "r") as json_file:
+        json.load(json_file, indent=2)
+    return loaded_data
 
 
 def GenerateHTML(markets_list: list[dict]):
@@ -107,7 +101,6 @@ def GenerateHTML(markets_list: list[dict]):
     print(f"wrote to {html_file}")
     return
 
-GenerateHTML(filtered)
 
 def SaveToCSV(marketsdata, filename):
     cwd = pathlib.Path.cwd() 
@@ -136,7 +129,26 @@ def SaveToCSV(marketsdata, filename):
         print(f"Error writing to CSV: {e}")
 
 
-SaveToCSV(filtered, "all")
+
+if __name__ == "__main__":
+    markets_list = LoadJsonDump()
+    # markets_list = FetchMarkets()
+    # filtered = FilterData(markets_list)
+    
+    # Debugging step: Print out the raw data
+    #print("Raw Market Data:")
+    #print(json.dumps(markets_list, indent=2))
+    # WriteJsonDump(filtered)
+    
+    # market["active"] is always True?? Even when it's closed.
+    print(f"\n\n returned {len(markets_list)} markets \n")
+    open_markets = [market for market in markets_list if ((market["active"] is True) and (not market["closed"]))]
+    print(f"#open_markets: {len(open_markets)}")
+    print("\n\n")
+    pprint([market["market_slug"] for market in open_markets])
+    
+    # GenerateHTML(filtered)
+    # SaveToCSV(filtered, "all")
 
 
 

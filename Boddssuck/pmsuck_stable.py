@@ -8,7 +8,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, urlunsplit
 from tabulate import tabulate
 import logging
 import csv
@@ -89,6 +89,8 @@ def scrape_multi_outcome_market(driver, url):
     market_items = driver.find_elements(By.CSS_SELECTOR, "div[data-scroll-anchor^='event-detail-accordion-item']")
     market_data = []
 
+    bet_amount_present = True  # Flag to check if bet amount is present
+
     for index, item in enumerate(market_items):
         outcome = {'url': url}
 
@@ -110,7 +112,15 @@ def scrape_multi_outcome_market(driver, url):
             if 'name' not in outcome:
                 raise ValueError("Could not find outcome name")
 
-            outcome['bet_amount'] = item.find_element(By.CSS_SELECTOR, "p.c-dqzIym-ihVLOVM-css").text
+            if bet_amount_present:
+                try:
+                    outcome['bet_amount'] = item.find_element(By.CSS_SELECTOR, "p.c-dqzIym-ihVLOVM-css").text
+                except NoSuchElementException:
+                    bet_amount_present = False
+                    outcome['bet_amount'] = 'N/A'
+            else:
+                outcome['bet_amount'] = 'N/A'
+
             outcome['probability'] = item.find_element(By.CSS_SELECTOR, "p.c-dqzIym-icEtPXM-css").text
 
             # Try different selectors for Yes and No prices
@@ -203,7 +213,22 @@ def scrape_single_outcome_market(driver):
 
 def is_valid_market_url(url):
     # Check if the URL is a valid Polymarket market URL
-    return url.startswith("https://polymarket.com/market/")
+    return url.startswith("https://polymarket.com/market/") or url.startswith("https://polymarket.com/events/")
+
+def normalize_polymarket_url(url):
+    parsed = urlparse(url)
+    path_parts = parsed.path.rstrip('/').split('/')
+    
+    # Keep only the parts up to 'event' and the next segment (event name)
+    if 'event' in path_parts:
+        event_index = path_parts.index('event')
+        normalized_path = '/'.join(path_parts[:event_index + 2])
+    else:
+        normalized_path = parsed.path
+    
+    # Reconstruct the URL without query parameters
+    normalized_url = urlunsplit((parsed.scheme, parsed.netloc, normalized_path, '', ''))
+    return normalized_url
 
 def main():
     sitemap_url = "https://polymarket.com/sitemap.xml"
@@ -213,23 +238,23 @@ def main():
         parsed_links = ParseHrefs(market_links)
         
         # Flatten the parsed links dictionary into a list
-        unique_market_links = [k for k in parsed_links.keys() if k] + \
-                              [item for sublist in parsed_links.values() for item in sublist]
+        all_links = [k for k in parsed_links.keys() if k] + \
+                    [item for sublist in parsed_links.values() for item in sublist]
 
-        # Filter out invalid URLs
-        valid_market_links = [url for url in unique_market_links if is_valid_market_url(url)]
+        # Normalize and deduplicate URLs
+        unique_market_links = list(set(normalize_polymarket_url(url) for url in all_links if is_valid_market_url(url)))
 
-        logger.info(f"Found {len(valid_market_links)} valid unique market links")
+        logger.info(f"Found {len(unique_market_links)} valid unique market links")
 
         # Print the gathered URLs
         print("\nGathered URLs:")
-        for url in valid_market_links:
+        for url in unique_market_links:
             print(url)
         print("\nStarting scrape...\n")
 
         results = []
-        with ThreadPoolExecutor(max_workers=6) as executor:  # Adjust max_workers as needed
-            future_to_url = {executor.submit(scrape_single_url, url): url for url in valid_market_links}
+        with ThreadPoolExecutor(max_workers=6) as executor:  
+            future_to_url = {executor.submit(scrape_single_url, url): url for url in unique_market_links}
             for future in as_completed(future_to_url):
                 url = future_to_url[future]
                 try:
@@ -254,7 +279,7 @@ def main():
         # Combine single-outcome and multi-outcome results
         all_results = single_outcome_results + [outcome for market in multi_outcome_results for outcome in market]
 
-        # Print all results in a single table
+        
         print("Market Outcomes:")
         table_data = [
             [

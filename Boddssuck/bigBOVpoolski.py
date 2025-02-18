@@ -10,6 +10,8 @@ import pprint
 import pathlib
 import cProfile
 import pstats
+import json
+import pathlib
 #import sqlite3
 
 # TODO: this file is broken.
@@ -131,9 +133,9 @@ def Main():
     driver.implicitly_wait(1)
     
     urls = [
-        'https://www.bovada.lv/sports/baseball/mlb',
-        #'https://www.bovada.lv/sports/hockey/nhl',
-        #'https://www.bovada.lv/sports/basketball/nba'
+        #'https://www.bovada.lv/sports/baseball/mlb',
+        'https://www.bovada.lv/sports/hockey/nhl',
+        'https://www.bovada.lv/sports/basketball/nba'
     ]
     tab_handles = []
     for url in urls:
@@ -197,6 +199,14 @@ def PrintScrapedData(scraped_data):
     print(f"\n\n total_linecount number of lines scraped across all pages: {total_linecount}")
     
 
+def SaveScrapedData(data):
+    save_path = pathlib.Path(__file__).parent.parent / "bovada_scraped_data.json"
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    print(f"Scraped data saved to {save_path}")
+
+
+
 #def CommitScrapedData(scraped_data):
 #    for url, data in scraped_data.items():
 #        game_id = db.insert_game(url)
@@ -228,3 +238,4 @@ if __name__ == "__main__":
     PrintScrapedData(results)
     print("exiting")
     # CommitScrapedData(results)
+    SaveScrapedData(results)
