@@ -5,11 +5,11 @@ from datetime import datetime
 import aiohttp
 from math import pi # No clue wtf is going on here but im going with it
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon
+from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QHBoxLayout, QFrame, QSizePolicy
+    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, 
 )
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
@@ -18,7 +18,6 @@ from marketKeys import *
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
-#TODO: 
 # League market configurations
 MAJOR_PROP_LEAGUES = {
     "basketball_nba": NBA_MARKETS,
@@ -51,6 +50,8 @@ class LeagueTabData:
         self.table_data = {}
         self.game_colors = {}
         self.current_color_index = 0
+        self.bookmakers = []
+        self.previous_data = {}
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -156,6 +157,27 @@ class DataManager(QObject):
 
 class ModernOddsWindow(QMainWindow):
     """Main window for displaying and managing odds data"""
+    BUTTON_STYLE = """
+        QPushButton {
+            background-color: #007bff;  /* Blue */
+            color: white;
+            border: 1px solid #0056b3;
+            padding: 5px 10px;
+            margin-right: 5px;
+            border-radius: 4px;
+        }
+        QPushButton:checked {
+            background-color: #28a745;  /* Green */
+            color: white;
+            border: 1px solid #218838;
+        }
+        QPushButton:disabled {
+            background-color: #e9ecef;
+            color: #6c757d;
+            border-color: #dee2e6;
+        }
+    """
+
     def __init__(self):
         super().__init__()
         self.timer = QTimer()
@@ -163,6 +185,7 @@ class ModernOddsWindow(QMainWindow):
         self.leagues_loaded = False
         self.league_tabs = {}  # {league_name: LeagueTabData}
         self.current_league = None
+        self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
         self.connect_signals()
 
@@ -170,7 +193,6 @@ class ModernOddsWindow(QMainWindow):
         """Initialize the user interface components"""
         self.setWindowTitle("Effort Odds")
         self.setGeometry(100, 100, 800, 600)
-        #TODO: Change this path for the icon
         self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png")) 
         
         main_widget = QWidget()
@@ -182,9 +204,60 @@ class ModernOddsWindow(QMainWindow):
         layout.addWidget(QLabel("Select League:"))
         layout.addWidget(self.league_selector)
         
-        # Refresh button
+        # Market selection and refresh controls
+        controls_container = QWidget()
+        controls_layout = QHBoxLayout(controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Left side container for regular markets
+        left_container = QWidget()
+        left_layout = QHBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Create regular market buttons
+        self.market_buttons = {}
+        for market in ["h2h", "spreads", "totals"]:
+            btn = QPushButton(market.capitalize())
+            btn.setCheckable(True)
+            btn.setChecked(market in self.selected_markets)
+            btn.setObjectName(f"market_{market}")
+            self.market_buttons[market] = btn
+            btn.setStyleSheet(self.BUTTON_STYLE)  # Apply style
+            left_layout.addWidget(btn)
+
+        # Add fetch button
         self.refresh_btn = QPushButton("Fetch Odds")
-        layout.addWidget(self.refresh_btn)
+        self.refresh_btn.setFixedWidth(120)
+        self.refresh_btn.setStyleSheet(self.BUTTON_STYLE)  # Apply style
+        left_layout.addWidget(self.refresh_btn)
+
+        # Right side container for props
+        right_container = QWidget()
+        right_layout = QHBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Add props button
+        self.props_button = QPushButton("Props")
+        self.props_button.setCheckable(True)
+        self.props_button.setObjectName("market_props")
+        self.props_button.setEnabled(False)
+        self.props_button.setStyleSheet(self.BUTTON_STYLE)  # Apply style
+        self.market_buttons["props"] = self.props_button
+        right_layout.addWidget(self.props_button)
+
+        # Add props availability label
+        self.props_availability_label = QLabel("No Props available for this league")
+        self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
+        self.props_availability_label.setVisible(False)
+        right_layout.addWidget(self.props_availability_label)
+        right_layout.addStretch()
+
+        # Add both containers to main controls layout
+        controls_layout.addWidget(left_container)
+        controls_layout.addWidget(right_container)
+
+        # Add controls container to main layout
+        layout.addWidget(controls_container)
         
         # Progress bar
         self.progress = QProgressBar()
@@ -196,7 +269,7 @@ class ModernOddsWindow(QMainWindow):
         layout.addWidget(self.tab_widget)
         
         # Auto-update controls
-        update_controls_layout = QHBoxLayout()  # Create horizontal layout for controls
+        update_controls_layout = QHBoxLayout()
         
         self.auto_update_check = QCheckBox("Auto-Update Odds")
         update_controls_layout.addWidget(self.auto_update_check)
@@ -209,16 +282,13 @@ class ModernOddsWindow(QMainWindow):
         update_controls_layout.addWidget(QLabel("Update Interval:"))
         update_controls_layout.addWidget(self.update_interval)
         
-        # Create a frame for the status indicators
         self.status_frame = QFrame()
         self.status_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
         self.status_frame_layout = QHBoxLayout(self.status_frame)
         
-        # Last update time
         self.last_update_label = QLabel("Last Update: Never")
         self.last_update_label.setStyleSheet("color: #6c757d;")
         
-        # Status label
         self.update_status = QLabel("")
         self.update_status.setStyleSheet("""
             QLabel {
@@ -228,28 +298,71 @@ class ModernOddsWindow(QMainWindow):
             }
         """)
         
-        # Add widgets to the status frame
+        # Progress indicator
+        self.progress_indicator = UpdateProgressIndicator()
+        self.status_frame_layout.addWidget(self.progress_indicator)
         self.status_frame_layout.addWidget(self.last_update_label)
         self.status_frame_layout.addWidget(self.update_status)
         update_controls_layout.addWidget(self.status_frame)
-        
-        update_controls_layout.addStretch()  # Add stretch to keep controls left-aligned
+        update_controls_layout.addStretch()
         
         layout.addLayout(update_controls_layout)
 
-    def RestartTimer(self):
-        interval_ms = self.update_interval.value() * 60 * 1000
-        self.timer.start(interval_ms)
-        return interval_ms
+    def update_market_selection(self):
+        """Update selected markets based on button states"""
+        self.selected_markets = {market for market, btn in self.market_buttons.items() 
+                               if btn.isChecked() and btn.isEnabled()}
+        print("Selected markets:", self.selected_markets)
+
+    def handle_league_change(self):
+        """Handle league selection changes"""
+        selected_league = self.league_selector.currentText()
+        sport_key = self.data_manager.league_map.get(selected_league)
+        
+        # Enable/disable props button based on league
+        has_props = sport_key in MAJOR_PROP_LEAGUES
+        self.props_button.setEnabled(has_props)
+        self.props_availability_label.setVisible(not has_props)
+        
+        # Uncheck props button if league doesn't support it
+        if not has_props and self.props_button.isChecked():
+            self.props_button.setChecked(False)
+            self.update_market_selection()
+
+    def get_valid_markets(self, sport_key):
+        """Get valid markets for the selected sport"""
+        valid_markets = REGULAR_MARKETS.copy()
+        if sport_key in MAJOR_PROP_LEAGUES:
+            valid_markets.update(MAJOR_PROP_LEAGUES[sport_key].keys())
+        return valid_markets
 
     def connect_signals(self):
         """Connect UI signals to their respective slots"""
+        self.league_selector.currentTextChanged.connect(self.handle_league_change)
+        for btn in self.market_buttons.values():
+            btn.toggled.connect(self.update_market_selection)
+        self.refresh_btn.setStyleSheet(self.BUTTON_STYLE)
         self.refresh_btn.clicked.connect(self.refresh_data)
         self.auto_update_check.stateChanged.connect(self.toggle_auto_update)
         self.update_interval.valueChanged.connect(self.update_timer_interval)
         self.data_manager.odds_updated.connect(self.display_odds)
         self.tab_widget.currentChanged.connect(self.handle_tab_change)
         self.timer.timeout.connect(self.refresh_data)
+
+            
+        
+
+    # Rest of the class methods remain unchanged...
+    # (RestartTimer, update_status_text, initialize, populate_leagues, 
+    # handle_tab_change, create_league_tab, format_market_label, 
+    # format_price, display_odds, update_table_display, 
+    # toggle_auto_update, update_timer_interval, refresh_data)
+
+    def RestartTimer(self):
+        interval_ms = self.update_interval.value() * 60 * 1000
+        self.timer.start(interval_ms)
+        return interval_ms
+
     
     def update_status_text(self):
         """Update the status text showing time until next update"""
@@ -290,11 +403,15 @@ class ModernOddsWindow(QMainWindow):
         print("Fetched leagues:", leagues)
         self.league_selector.clear()
         self.data_manager.league_map.clear()
-
+    
         for sport_category, league_list in leagues.items():
             for league in league_list:
                 self.league_selector.addItem(league['title'])
                 self.data_manager.league_map[league['title']] = league['key']
+        
+        # Call handle_league_change after populating
+        if self.league_selector.count() > 0:
+            self.handle_league_change()
 
     def handle_tab_change(self, index):
         """Handle tab switching events"""
@@ -335,6 +452,7 @@ class ModernOddsWindow(QMainWindow):
         return price
 
     def display_odds(self, odds: dict, league_name: str):
+        """Update odds display efficiently by only processing changed data"""
         if not odds or 'bookmakers' not in odds:
             return
         
@@ -347,86 +465,144 @@ class ModernOddsWindow(QMainWindow):
         away_team = odds.get('away_team', 'Unknown')
         
         # Collect bookmaker names
-        bookmakers = []
         for bm in odds['bookmakers']:
-            if bm['title'] not in bookmakers:
-                bookmakers.append(bm['title'])
-        tab_data.num_cols = len(bookmakers)
+            bm_title = bm['title']
+            if bm_title not in tab_data.bookmakers:
+                tab_data.bookmakers.append(bm_title)
         
-        # Add a header row for the game
+        # Add a header row for the game if it doesn't exist
         game_header = f"Game: {home_team} vs {away_team}"
         if game_header not in tab_data.table_rows:
             tab_data.table_rows.append(game_header)
             tab_data.table_data[game_header] = {'is_header': True, 'game_id': game_id}
             tab_data.num_rows += 1
         
-        # Process markets
+        # Process markets and track changes
         for bm in odds['bookmakers']:
             bm_title = bm['title']
             for market in bm['markets']:
                 market_key = market['key']
                 for outcome in market['outcomes']:
-                    # Make the row label unique by including game_id or teams
                     unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
                     
+                    # Add new row if needed
                     if unique_label not in tab_data.table_rows:
                         tab_data.table_rows.append(unique_label)
                         tab_data.table_data[unique_label] = {'game_id': game_id}
                         tab_data.num_rows += 1
                     
+                    # Update price only if changed
                     price = self.format_price(outcome)
+                    if unique_label not in tab_data.table_data:
+                        tab_data.table_data[unique_label] = {'game_id': game_id}
                     tab_data.table_data[unique_label][bm_title] = price
         
-        self.update_table_display(tab_data, bookmakers)
+        self.update_table_display(tab_data)
 
 
 
-    def update_table_display(self, tab_data: LeagueTabData, bookmakers):
-        """Update the table display with formatted odds data"""
+
+    def update_table_display(self, tab_data: LeagueTabData):
+        """Update table display with improved price change highlighting"""
         table = tab_data.table_widget
-        table.setRowCount(tab_data.num_rows)
-        table.setColumnCount(len(bookmakers) + 1)
+        current_rows = table.rowCount()
+        current_cols = table.columnCount()
         
-        headers = ["Market/Outcome"] + bookmakers
-        table.setHorizontalHeaderLabels(headers)
+        # Update table structure if needed
+        expected_cols = len(tab_data.bookmakers) + 1
+        if current_cols != expected_cols:
+            table.setColumnCount(expected_cols)
+            table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
+        
+        expected_rows = len(tab_data.table_rows)
+        if current_rows != expected_rows:
+            table.setRowCount(expected_rows)
+        
+        needs_resize = False
         
         for row_idx, row_label in enumerate(tab_data.table_rows):
             row_data = tab_data.table_data[row_label]
-            game_id = row_data.get('game_id')
-            
-            # Create and style the row
-            item = ColoredTableItem(row_label, game_id)
-            if row_data.get('is_header'):
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-            
-            # Set background color and ensure text is black
+            game_id = row_data['game_id']
             color = tab_data.get_game_color(game_id)
-            item.setBackground(QBrush(color))
-            item.setForeground(QBrush(QColor('black')))
-            table.setItem(row_idx, 0, item)
             
-            # Populate odds data
-            if not row_data.get('is_header'):
-                for col_idx, bm_title in enumerate(bookmakers, 1):
-                    price = row_data.get(bm_title, "")
-                    odds_item = ColoredTableItem(price, game_id)
-                    odds_item.setBackground(QBrush(color))
-                    odds_item.setForeground(QBrush(QColor('black')))
-                    table.setItem(row_idx, col_idx, odds_item)
-
-        # Optimize column widths
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        for i in range(1, len(bookmakers) + 1):
-            table.setColumnWidth(i, 120)
+            # Create or update row header if needed
+            header_item = table.item(row_idx, 0)
+            if not header_item:
+                header_item = ColoredTableItem(row_label, game_id)
+                table.setItem(row_idx, 0, header_item)
+                needs_resize = True
+            
+            # Apply header styling with black text
+            if row_data.get('is_header'):
+                font = QFont()
+                font.setBold(True)
+                header_item.setFont(font)
+                header_item.setBackground(color)
+                header_item.setForeground(QColor('black'))
+            else:
+                market_color = QColor(color)
+                market_color.setAlpha(230)
+                header_item.setBackground(market_color)
+                header_item.setForeground(QColor('black'))
+            
+            # Update bookmaker columns
+            for col_idx, bm in enumerate(tab_data.bookmakers, 1):
+                current_value = row_data.get(bm, "")
+                previous_value = tab_data.previous_data.get((row_label, bm))
+                
+                item = table.item(row_idx, col_idx)
+                if not item:
+                    item = ColoredTableItem(current_value, game_id)
+                    table.setItem(row_idx, col_idx, item)
+                    needs_resize = True
+                
+                # Only update if value has changed
+                if current_value != previous_value and previous_value is not None:
+                    item.setText(current_value)
+                    
+                    # Parse the odds values for comparison
+                    try:
+                        current_odds = float(current_value.split()[0])
+                        previous_odds = float(previous_value.split()[0])
+                        
+                        # Better odds (higher value) = green, worse odds = red
+                        if current_odds > previous_odds:
+                            highlight_color = QColor(0, 200, 0, 180)  # Semi-transparent green
+                        else:
+                            highlight_color = QColor(200, 0, 0, 180)  # Semi-transparent red
+                        
+                        item.setBackground(highlight_color)
+                        item.setForeground(QColor('black'))  # Keep text black for readability
+                        
+                        # Reset background after 5 seconds
+                        market_color = QColor(color)
+                        market_color.setAlpha(230)
+                        QTimer.singleShot(5000, lambda i=item, c=market_color: (
+                            i.setBackground(c),
+                            i.setForeground(QColor('black'))
+                        ))
+                    except (ValueError, IndexError):
+                        # If we can't parse the odds, just update without highlighting
+                        item.setText(current_value)
+                    
+                    tab_data.previous_data[(row_label, bm)] = current_value
+                    needs_resize = True
+                elif current_value != previous_value:
+                    # First time seeing this value
+                    item.setText(current_value)
+                    tab_data.previous_data[(row_label, bm)] = current_value
+                
+                # Maintain consistent background and text color when not highlighted
+                if not row_data.get('is_header') and item.background().color().alpha() != 180:  # Don't override highlight
+                    market_color = QColor(color)
+                    market_color.setAlpha(230)
+                    item.setBackground(market_color)
+                    item.setForeground(QColor('black'))
         
-        table.resizeRowsToContents()
-        table.resizeColumnsToContents()
-        table.updateGeometry()
-        table.update()
-        print(f"num_rows: {tab_data.num_rows}")
-        print(f"length of table_rows: {len(tab_data.table_rows)}")
+        # Only resize if needed
+        if needs_resize:
+            table.resizeColumnsToContents()
+            table.resizeRowsToContents()
     
     
     def toggle_auto_update(self):
@@ -465,7 +641,7 @@ class ModernOddsWindow(QMainWindow):
         self.last_update_label.setText(f"Last Update: {current_time}")
         
         # Update status during refresh
-        self.update_status.setStyleSheet("background-color: #007bff; color: white;")
+        self.update_status.setStyleSheet("background-color: #007bff; color: black;")
         self.update_status.setText("Updating odds...")
         
         try:
@@ -473,7 +649,7 @@ class ModernOddsWindow(QMainWindow):
             sport_key = self.data_manager.league_map.get(selected_league)
             if not sport_key:
                 print(f"No valid sport key found for the selected league: {selected_league}")
-                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
+                self.update_status.setStyleSheet("background-color: #dc3545; color: black;")
                 self.update_status.setText("Error: Invalid league selection")
                 return
     
@@ -496,7 +672,7 @@ class ModernOddsWindow(QMainWindow):
     
             if not isinstance(games, list):
                 print(f"Unexpected response from get_games(): {games}")
-                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
+                self.update_status.setStyleSheet("background-color: #dc3545; color: black;")
                 self.update_status.setText("Error: Invalid response format")
                 return
     
@@ -512,9 +688,7 @@ class ModernOddsWindow(QMainWindow):
                 self.progress.setValue(progress_value)
     
                 async with aiohttp.ClientSession() as session:
-                    available_markets = REGULAR_MARKETS.copy()
-                    if sport_key in MAJOR_PROP_LEAGUES:
-                        available_markets |= set(MAJOR_PROP_LEAGUES[sport_key].keys())
+                    available_markets = self.selected_markets.copy()
                     odds = await self.data_manager.prop_client.get_event_odds(
                         session, game_id, available_markets, region="us" # us,us2,eu,au,uk
                     )
