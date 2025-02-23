@@ -7,12 +7,12 @@ from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, 
+    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout
 )
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
 from marketKeys import *
-
+from EffortOddsPropsWindow import PropsWindow
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -186,6 +186,7 @@ class ModernOddsWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        self.region_selector = None
         self.timer = QTimer()
         self.data_manager = DataManager()
         self.leagues_loaded = False
@@ -194,6 +195,7 @@ class ModernOddsWindow(QMainWindow):
         self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
         self.connect_signals()
+        self.selected_region = {"us"}
 
     def init_ui(self):
         """Initialize the user interface components"""
@@ -210,6 +212,30 @@ class ModernOddsWindow(QMainWindow):
         self.layout.addWidget(QLabel("Select League:"))
         self.layout.addWidget(self.league_selector)
         
+        # Bunch of BS for the region checkboxes
+        region_label = QLabel("Select Region:")
+        self.layout.addWidget(region_label)
+        
+        region_container = QWidget()
+        region_layout = QGridLayout(region_container)
+        region_layout.setSpacing(10)
+        
+        self.region_checkboxes = {}
+        regions = ['us', 'us2', 'eu', 'au', 'uk', 'global']
+        
+        # Create checkboxes in a 3x2 grid (3 columns, 2 rows)
+        for i, region in enumerate(regions):
+            checkbox = QCheckBox(region)
+            if region == 'us':
+                checkbox.setChecked(True)
+            checkbox.stateChanged.connect(lambda state, r=region: self.handle_region_change(r))
+            self.region_checkboxes[region] = checkbox
+            region_layout.addWidget(checkbox, i // 3, i % 3)  # Changed to 3 columns
+        
+        region_container.setFixedHeight(58) # exactly 58 or the bottom of the g gets cut off in global put me on tilt
+        region_container.setFixedWidth(200)
+        self.layout.addWidget(region_container)
+        
         # Market selection and refresh controls
         controls_container = QWidget()
         controls_layout = QHBoxLayout(controls_container)
@@ -219,7 +245,7 @@ class ModernOddsWindow(QMainWindow):
         left_container = QWidget()
         left_layout = QHBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
-
+        
         # Create regular market buttons
         self.market_buttons = {}
         for market in ["h2h", "spreads", "totals"]:
@@ -230,7 +256,6 @@ class ModernOddsWindow(QMainWindow):
             self.market_buttons[market] = btn
             btn.setStyleSheet(self.BUTTON_STYLE)  # Apply style
             left_layout.addWidget(btn)
-        
         
         # Add fetch button
         self.fetch_odds_button = QPushButton("Fetch Odds")
@@ -323,25 +348,71 @@ class ModernOddsWindow(QMainWindow):
 
     def handle_league_change(self):
         """Handle league selection changes"""
+        
+        # Ensure self.props_button exists before proceeding
+        if not hasattr(self, "props_button"):
+            print("Warning: props_button does not exist yet. Skipping handle_league_change.")
+            return
+        
         selected_league = self.league_selector.currentText()
         sport_key = self.data_manager.league_map.get(selected_league)
-        
-        # Enable/disable props button based on league
-        has_props = sport_key in MAJOR_PROP_LEAGUES
+    
+        has_props = sport_key in MAJOR_PROP_MARKETS  # Check if this league has props
         self.props_button.setEnabled(has_props)
         self.props_availability_label.setVisible(not has_props)
-        
-        # Uncheck props button if league doesn't support it
+    
         if not has_props and self.props_button.isChecked():
             self.props_button.setChecked(False)
             self.update_market_selection()
 
+    
+    
+    def handle_region_change(self, region):
+        """Handle region selection changes"""
+        if region == 'global' and self.region_checkboxes['global'].isChecked():
+            # Check all other regions when global is selected
+            for r, cb in self.region_checkboxes.items():
+                if r != 'global':
+                    cb.setChecked(True)
+            self.selected_region = "us,us2,eu,au,uk"
+        else:
+            # If global is unchecked, uncheck it when selecting individual regions
+            if region != 'global':
+                self.region_checkboxes['global'].setChecked(False)
+            
+            # Get all selected regions except 'global'
+            selected = [r for r, cb in self.region_checkboxes.items() 
+                       if cb.isChecked() and r != 'global']
+            
+            # Join selected regions with commas or default to "us"
+            self.selected_region = ",".join(selected) if selected else "us"
+        
+        print(f"Selected regions: {self.selected_region}")
+    
     def get_valid_markets(self, sport_key):
         """Get valid markets for the selected sport"""
         valid_markets = REGULAR_MARKETS.copy()
         if sport_key in MAJOR_PROP_LEAGUES:
             valid_markets.update(MAJOR_PROP_LEAGUES[sport_key].keys())
         return valid_markets
+    
+    def handle_props_button(self):
+        """Handle Props button click to open PropsWindow."""
+        selected_league = self.league_selector.currentText()
+        sport_key = self.data_manager.league_map.get(selected_league)
+        
+        print(f"Props button clicked. League: {selected_league}, Sport Key: {sport_key}")  # Debug print
+        
+        if sport_key in MAJOR_PROP_MARKETS:  # Ensure props exist for this league
+            print("Props are available for this league. Creating PropsWindow...")  # Debug print
+            if not hasattr(self, "props_window") or self.props_window is None:
+                self.props_window = PropsWindow(sport_key, selected_league)
+            self.props_window.show()
+            self.props_window.activateWindow()  # Brings the window to the front if it already exists
+        else:
+            print("No props available for this league.")  # Debug print
+
+
 
     def connect_signals(self):
         """Connect UI signals to their respective slots"""
@@ -354,6 +425,7 @@ class ModernOddsWindow(QMainWindow):
         self.data_manager.odds_updated.connect(self.display_odds)
         self.tab_widget.currentChanged.connect(self.handle_tab_change)
         self.timer.timeout.connect(self.refresh_data)
+        self.props_button.clicked.connect(self.handle_props_button)
 
     # Rest of the class methods remain unchanged...
     # (RestartTimer, update_status_text, initialize, populate_leagues, 
@@ -365,8 +437,12 @@ class ModernOddsWindow(QMainWindow):
         interval_ms = self.update_interval.value() * 60 * 1000
         self.timer.start(interval_ms)
         return interval_ms
+        
+    def update_region(self):
+        selected_region = self.region_selector.currentText()
+        print(f"Selected bookmaker region: {selected_region}")
+        # Modify your odds fetching logic based on selected region here
 
-    
     def update_status_text(self):
         """Update the status text showing time until next update"""
         if not self.auto_update_check.isChecked():
@@ -692,8 +768,12 @@ class ModernOddsWindow(QMainWindow):
     
                 async with aiohttp.ClientSession() as session:
                     available_markets = self.selected_markets.copy()
+                    selected_region = self.selected_region  # Use the selected region
                     odds = await self.data_manager.prop_client.get_event_odds(
-                        session, game_id, available_markets, region="us" # us,us2,eu,au,uk
+                        session, 
+                        game_id, 
+                        available_markets, 
+                        region=selected_region  # Use the selected region here
                     )
                 
                 print(selected_league)

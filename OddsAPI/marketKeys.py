@@ -300,4 +300,12 @@ SPORTS_MARKETS = {
     }
 }
 
-
+# Redundant mightt delete later
+MAJOR_PROP_MARKETS = {
+    "basketball_nba": NBA_MARKETS,
+    "football_nfl": NFL_MARKETS,
+    "baseball_mlb": MLB_MARKETS,
+    "icehockey_nhl": NHL_MARKETS,
+    "aussierules_afl": AFL_MARKETS,
+    "soccer_usa_mls": SOCCER_MARKETS,
+}
