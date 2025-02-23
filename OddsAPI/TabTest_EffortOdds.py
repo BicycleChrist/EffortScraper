@@ -209,6 +209,8 @@ class ModernOddsWindow(QMainWindow):
         self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
         self.connect_signals(nofetch=True)
+        self.tab_widget.tabDetached.connect(self.handle_tab_detached)
+        
 
     def init_ui(self):
         """Initialize the user interface components"""
@@ -329,7 +331,7 @@ class ModernOddsWindow(QMainWindow):
         update_controls_layout.addStretch()
         
         self.layout.addLayout(update_controls_layout)
-
+    
     def update_market_selection(self):
         """Update selected markets based on button states"""
         self.selected_markets = {market for market, btn in self.market_buttons.items() 
@@ -357,7 +359,13 @@ class ModernOddsWindow(QMainWindow):
         if sport_key in MAJOR_PROP_LEAGUES:
             valid_markets.update(MAJOR_PROP_LEAGUES[sport_key].keys())
         return valid_markets
-
+    
+    def handle_tab_detached(self, league_name):
+        """Remove the league's data from tracking when its tab is detached"""
+        if league_name in self.league_tabs:
+            del self.league_tabs[league_name]
+    
+    
     def connect_signals(self, nofetch:bool = False):
         """
         Connect UI signals to their respective slots
