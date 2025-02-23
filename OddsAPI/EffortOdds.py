@@ -195,7 +195,7 @@ class ModernOddsWindow(QMainWindow):
         self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
         self.connect_signals()
-        self.selected_region = {"us"}
+        self.selected_region = "us" # default region should always be a string
 
     def init_ui(self):
         """Initialize the user interface components"""
@@ -374,7 +374,7 @@ class ModernOddsWindow(QMainWindow):
             for r, cb in self.region_checkboxes.items():
                 if r != 'global':
                     cb.setChecked(True)
-            self.selected_region = "us,us2,eu,au,uk"
+            self.selected_region = "us,us2,eu,au,uk"  # Ensure it's a string, not a set
         else:
             # If global is unchecked, uncheck it when selecting individual regions
             if region != 'global':
@@ -385,7 +385,7 @@ class ModernOddsWindow(QMainWindow):
                        if cb.isChecked() and r != 'global']
             
             # Join selected regions with commas or default to "us"
-            self.selected_region = ",".join(selected) if selected else "us"
+            self.selected_region = ",".join(selected) if selected else "us"  # Ensure string format
         
         print(f"Selected regions: {self.selected_region}")
     

@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Set
 from Creds import ODDS_API_KEY
 from marketKeys import SPORTS_MARKETS, NBA_MARKETS, MLB_MARKETS, NHL_MARKETS, AFL_MARKETS, SOCCER_MARKETS
 from parlay_analyzer import find_best_parlays
+import requests
 
 # Define save directory
 SAVE_DIR = pathlib.Path.cwd() / "savedata"
@@ -35,6 +36,8 @@ class PropClient:
                 print(f"Error decoding JSON response: {e}")
                 return None
 
+    
+
     async def get_games(self, session: aiohttp.ClientSession) -> Optional[List[Dict]]:
         """Fetch active games for the selected sport."""
         url = f"{self.base_url}/sports/{self.sport_key}/events"
@@ -51,6 +54,30 @@ class PropClient:
             "oddsFormat": "american"
         }
         return await self.fetch_json(session, url, params)
+    
+    
+    def fetch_json_no_async(self, url: str, params: dict) -> dict|None:
+        """Helper function to make GET requests and return JSON response."""
+        print(f"Fetching data from: {url}")
+        response = requests.get(url, params)
+        self.request_count += 1
+        response_text = response.text
+        print(f"Response Status: {response.status_code}")
+        if response.status_code != 200:
+            print(f"Error fetching {url}: {response.status_code}\nResponse: {response_text}")
+            return None
+        return response.json()
+    
+    def get_event_odds_no_async(self, event_id: str, markets: set[str], region: str = "us") -> dict:
+        """Fetch event odds for a specific event and markets."""
+        url = f"{self.base_url}/sports/{self.sport_key}/events/{event_id}/odds"
+        params = {
+            "apiKey": self.api_key,
+            "regions": region,
+            "markets": ",".join(markets),
+            "oddsFormat": "american"
+        }
+        return self.fetch_json_no_async(url, params)
 
 
 def format_props_by_player(props_data: Dict) -> Dict[str, Dict[str, List[Dict]]]:

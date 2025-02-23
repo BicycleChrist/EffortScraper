@@ -134,8 +134,9 @@ def Main():
     
     urls = [
         #'https://www.bovada.lv/sports/baseball/mlb',
-        'https://www.bovada.lv/sports/hockey/nhl',
-        'https://www.bovada.lv/sports/basketball/nba'
+        #'https://www.bovada.lv/sports/hockey/nhl',
+        #'https://www.bovada.lv/sports/basketball/nba',
+        'https://www.bovada.lv/sports/basketball/college-basketball'
     ]
     tab_handles = []
     for url in urls:
