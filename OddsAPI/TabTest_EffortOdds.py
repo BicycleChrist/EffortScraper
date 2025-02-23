@@ -1,7 +1,12 @@
+# This version of the file does not fetch any data; instead it constructs tabs from saved data
+# it exists for rapidly testing tab-detachment functionality
+
 import qasync
 import asyncio
+import json
 from datetime import datetime
 import aiohttp
+from math import pi # No clue wtf is going on here but im going with it
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
 from PyQt6.QtWidgets import (
@@ -12,6 +17,9 @@ from PyQt6.QtWidgets import (
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
 from marketKeys import *
+from TabTest_EOdetachableTabs import DetachableTabWidget
+
+import pathlib
 
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
@@ -105,28 +113,34 @@ class LeagueTabData:
 
 
 #TODO: Make this work, spinbox not allowing for interval selection for update interval 
-class UpdateProgressIndicator(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(20, 20)
-        self.progress = 0
-        
-    def setProgress(self, value):
-        self.progress = value
-        self.update()
-        
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Draw background circle
-        painter.setPen(QPen(QColor("#e9ecef"), 2))
-        painter.drawEllipse(2, 2, 16, 16)
-        
-        # Draw progress arc
-        painter.setPen(QPen(QColor("#007bff"), 2))
-        angle = int(-self.progress * 360)
-        painter.drawArc(2, 2, 16, 16, 90 * 16, angle * 16)
+# class UpdateProgressIndicator(QWidget):
+#     def __init__(self, parent=None):
+#         print("EffortOdds UpdateProgressIndicator constructed")
+#         super().__init__(parent)
+#         self.setFixedSize(20, 20)
+#         self.progress = 0
+#         
+#         
+#     def setProgress(self, value):
+#         print("EffortOdds UpdateProgressIndicator setProgress")
+#         self.progress = value
+#         self.update()
+#         
+#         
+#     def paintEvent(self, event):
+#         print("EffortOdds UpdateProgressIndicator paintevent")
+#         painter = QPainter(self)
+#         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+#         
+#         # Draw background circle
+#         painter.setPen(QPen(QColor("#e9ecef"), 2))
+#         painter.drawEllipse(2, 2, 16, 16)
+#         
+#         # Draw progress arc
+#         painter.setPen(QPen(QColor("#007bff"), 2))
+#         angle = int(-self.progress * 360)
+#         painter.drawArc(2, 2, 16, 16, 90 * 16, angle * 16)
+#         
 
 
 
@@ -187,13 +201,14 @@ class ModernOddsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.timer = QTimer()
+        self.unique_tab_suffix = 0
         self.data_manager = DataManager()
         self.leagues_loaded = False
         self.league_tabs = {}  # {league_name: LeagueTabData}
         self.current_league = None
         self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
-        self.connect_signals()
+        self.connect_signals(nofetch=True)
 
     def init_ui(self):
         """Initialize the user interface components"""
@@ -271,7 +286,7 @@ class ModernOddsWindow(QMainWindow):
         self.layout.addWidget(self.progress)
         
         # Tab widget for different leagues
-        self.tab_widget = QTabWidget()
+        self.tab_widget = DetachableTabWidget(self.data_manager)  # Use DetachableTabWidget
         self.layout.addWidget(QLabel("Odds:"))
         self.layout.addWidget(self.tab_widget)
         
@@ -306,11 +321,11 @@ class ModernOddsWindow(QMainWindow):
         """)
         
         # Progress indicator
-        self.progress_indicator = UpdateProgressIndicator()
-        self.status_frame_layout.addWidget(self.progress_indicator)
-        self.status_frame_layout.addWidget(self.last_update_label)
-        self.status_frame_layout.addWidget(self.update_status)
-        update_controls_layout.addWidget(self.status_frame)
+        # self.progress_indicator = UpdateProgressIndicator()
+        # self.status_frame_layout.addWidget(self.progress_indicator)
+        # self.status_frame_layout.addWidget(self.last_update_label)
+        # self.status_frame_layout.addWidget(self.update_status)
+        # update_controls_layout.addWidget(self.status_frame)
         update_controls_layout.addStretch()
         
         self.layout.addLayout(update_controls_layout)
@@ -343,12 +358,16 @@ class ModernOddsWindow(QMainWindow):
             valid_markets.update(MAJOR_PROP_LEAGUES[sport_key].keys())
         return valid_markets
 
-    def connect_signals(self):
-        """Connect UI signals to their respective slots"""
+    def connect_signals(self, nofetch:bool = False):
+        """
+        Connect UI signals to their respective slots
+        :param nofetch: forces 'fetch odds' button to load data from a dumpfile instead
+        """
         self.league_selector.currentTextChanged.connect(self.handle_league_change)
         for btn in self.market_buttons.values():
             btn.toggled.connect(self.update_market_selection)
-        self.fetch_odds_button.clicked.connect(self.refresh_data)
+        if nofetch: self.fetch_odds_button.clicked.connect(self.ConstructTabFromDump)
+        else: self.fetch_odds_button.clicked.connect(self.refresh_data)
         self.auto_update_check.stateChanged.connect(self.toggle_auto_update)
         self.update_interval.valueChanged.connect(self.update_timer_interval)
         self.data_manager.odds_updated.connect(self.display_odds)
@@ -371,7 +390,7 @@ class ModernOddsWindow(QMainWindow):
         """Update the status text showing time until next update"""
         if not self.auto_update_check.isChecked():
             self.update_status.setText("")
-            self.progress_indicator.setProgress(0)
+            # self.progress_indicator.setProgress(0)
             return
     
         remaining_time = self.timer.remainingTime() // 1000  # Convert to milliseconds to seconds
@@ -390,7 +409,7 @@ class ModernOddsWindow(QMainWindow):
             self.update_status.setStyleSheet("background-color: #28a745; color: white;")
         
         self.update_status.setText(f"Next update in: {minutes}m {seconds}s")
-        self.progress_indicator.setProgress(progress)
+        # self.progress_indicator.setProgress(progress)
     
     
     
@@ -402,7 +421,18 @@ class ModernOddsWindow(QMainWindow):
 
     async def populate_leagues(self):
         """Fetch and populate leagues in the dropdown"""
-        leagues = await self.data_manager.fetch_leagues()
+        # leagues = await self.data_manager.fetch_leagues()
+        leagues_dump_path = pathlib.Path.cwd() / "savedata" / "league_dump.json"
+        # save
+        # with leagues_dump_path.open(mode='w', encoding="utf-8") as league_dump_file:
+        #     json.dump(leagues, league_dump_file, indent=2)
+        # print(f"saved fetched leagues to: {leagues_dump_path}")
+        
+        # load
+        with leagues_dump_path.open(mode='r', encoding="utf-8") as league_dump_file:
+            leagues = json.load(league_dump_file)
+        print(f"loaded leagues from: {leagues_dump_path}")
+        
         print("Fetched leagues:", leagues)
         self.league_selector.clear()
         self.data_manager.league_map.clear()
@@ -424,6 +454,7 @@ class ModernOddsWindow(QMainWindow):
     def create_league_tab(self, league_name, sport_key):
         """Create a new tab for a league"""
         if league_name not in self.league_tabs:
+            print(f"creating tab for league: {league_name}, sport: {sport_key}")
             tab_data = LeagueTabData(league_name, sport_key)
             table_widget = tab_data.create_table_widget()
             self.tab_widget.addTab(table_widget, league_name)
@@ -627,6 +658,50 @@ class ModernOddsWindow(QMainWindow):
             self.timer.start(interval_ms)
             print(f"timer interval updated: {interval_ms}")
         # self.update_status_text() # crashes
+
+    def ConstructTabFromDump(self, tab_name:str = "NBA"):
+        tab_name = "NBA"
+        print(f"loading dumpfile for: {tab_name}")
+        dumpfile_path = (pathlib.Path.cwd() / "tabdata_dumps" / f"{tab_name}.json")
+        loaded_tab_data = {}
+        with dumpfile_path.open(mode='r', encoding="utf-8") as dumpfile:
+            loaded_tab_data = json.load(dumpfile)
+        print(f"loaded tab data from: {dumpfile_path}")
+        
+        league_name = loaded_tab_data["league_name"]
+        sports_key = loaded_tab_data["sports_key"]
+        if (self.unique_tab_suffix > 0):
+            league_name = league_name + str(self.unique_tab_suffix)
+            sports_key = sports_key + str(self.unique_tab_suffix)
+        self.unique_tab_suffix += 1
+        print(f"manually constructing Tab: {league_name} {sports_key}")
+        
+        self.data_manager.sport_key = sports_key
+        self.data_manager.league_map[league_name] = sports_key
+        self.data_manager.prop_client = PropClient(sports_key)
+        tab_data = self.create_league_tab(league_name, sports_key)
+        # already handled by 'create_league_tab'
+        # self.league_tabs[league_name] = tab_data
+        
+        print("tab created; inserting data")
+        # Reset tab data for fresh query
+        tab_data.num_rows = 0
+        tab_data.table_rows.clear()
+        tab_data.table_data.clear()
+        tab_data.game_colors.clear()
+        tab_data.current_color_index = 0
+        
+        games = loaded_tab_data["games"]
+        tab_data.num_rows = len(loaded_tab_data["table_rows"])
+        tab_data.table_rows = loaded_tab_data["table_rows"]
+        tab_data.table_data = loaded_tab_data["table_data"]
+        tab_data.bookmakers = loaded_tab_data["bookmakers"]
+        
+        print("updating table display")
+        #self.data_manager.odds_updated.emit(odds, selected_league)
+        self.update_table_display(tab_data)
+        print("constructed new tab!\n\n")
+        return
 
     @qasync.asyncSlot() 
     # This function might just be too fucking much
