@@ -55,6 +55,32 @@ class PropClient:
         }
         return await self.fetch_json(session, url, params)
     
+    async def get_dfs_props(self, session: aiohttp.ClientSession, event_id: str) -> dict:
+        """Fetch DFS props for a specific event."""
+        # This method would query DFS props from your data source
+        # Since the original code doesn't show a specific DFS endpoint, we'll need to adapt
+        # based on your specific API requirements
+        
+        url = f"{self.base_url}/sports/{self.sport_key}/events/{event_id}/dfs/props"
+        params = {
+            "apiKey": self.api_key,
+            "regions": "us",
+            "oddsFormat": "american"
+        }
+        return await self.fetch_json(session, url, params)
+
+    def get_dfs_props_no_async(self, event_id: str) -> dict:
+        """Non-async version of get_dfs_props."""
+        url = f"{self.base_url}/sports/{self.sport_key}/events/{event_id}/dfs/props"
+        params = {
+            "apiKey": self.api_key,
+            "regions": "us",
+            "oddsFormat": "american"
+        }
+        return self.fetch_json_no_async(url, params)
+    
+    
+    
     
     def fetch_json_no_async(self, url: str, params: dict) -> dict|None:
         """Helper function to make GET requests and return JSON response."""
