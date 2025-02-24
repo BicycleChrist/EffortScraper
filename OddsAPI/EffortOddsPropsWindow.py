@@ -4,17 +4,23 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QIcon, QFont, QPen, QPainter
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QLabel, QProgressBar, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton, 
+    QHBoxLayout, QGridLayout, QCheckBox
 )
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
-# --- Begin code from EffortOdds that is needed to avoid circular imports ---
+
+
+# Cant Believe this file works at all
+#TODO: Right now the table only displays overs, need to get unders in there for player_props
+# Ideally we have a structure "-142 O (15.5) +106 U" for each cell 
 
 class ColoredTableItem(QTableWidgetItem):
     """Custom table item that stores game ID for color coordination"""
     def __init__(self, text, game_id):
         super().__init__(text)
         self.game_id = game_id
+
 
 class LeagueTabData:
     """Manages data and display state for each league tab"""
@@ -96,7 +102,7 @@ class LeagueTabData:
         if current_rows != expected_rows:
             table.setRowCount(expected_rows)
         
-        needs_resize = False
+        needs_resize = True
         
         for row_idx, row_label in enumerate(self.table_rows):
             row_data = self.table_data[row_label]
@@ -175,9 +181,6 @@ class LeagueTabData:
             table.resizeColumnsToContents()
             table.resizeRowsToContents()
 
-# --- End code from EffortOdds ---
-
-# --- Begin combined BaseTableWindow and PropsWindow code ---
 
 class BaseTableWindow(QMainWindow):
     def __init__(self, title, sport_key, league_name):
@@ -193,6 +196,7 @@ class BaseTableWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         self.layout = QVBoxLayout(main_widget)
+        grid_layout = QGridLayout()
         # Progress bar
         self.progress = QProgressBar()
         self.layout.addWidget(self.progress)
@@ -204,46 +208,185 @@ class BaseTableWindow(QMainWindow):
     def add_control(self, widget):
         self.layout.insertWidget(0, widget)
 
+
+from PyQt6.QtWidgets import QScrollArea, QGroupBox
+
 class PropsWindow(BaseTableWindow):
     def __init__(self, sport_key, league_name):
         super().__init__(f"{league_name} Player Props", sport_key, league_name)
+        # Define button style
+        self.fetch_button_style = """
+            QPushButton {
+                background-color: #dc9437;
+                color: white;
+                border: 1px solid #0056b3;
+                padding: 5px 10px;
+                margin-right: 5px;
+                border-radius: 4px;
+            }
+        """
         self.prop_client = PropClient(sport_key)
         self.prop_types = []
-        self.init_prop_ui()
+        self.game_checkboxes = {}  # Store game checkboxes for easy access
 
-    def init_prop_ui(self):
+        # Use a QTimer to schedule the async initialization
+        self.timer = QTimer()
+        self.timer.setSingleShot(True)  # Ensure the timer only fires once
+        self.timer.timeout.connect(self.start_async_init)
+        self.timer.start(0)  # Start the timer immediately after the constructor
+
+    def start_async_init(self):
+        """Start the asynchronous initialization of the UI."""
+        import asyncio
+        asyncio.create_task(self.init_prop_ui())
+
+    async def init_prop_ui(self):
+        # Create controls container
+        controls_widget = QWidget()
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+    
+        # Prop type label
+        controls_layout.addWidget(QLabel("Select Prop Type:"))
+    
         # Prop type selector
         self.prop_selector = QComboBox()
-        self.add_control(self.prop_selector)
-        self.add_control(QLabel("Select Prop Type:"))
+        controls_layout.addWidget(self.prop_selector)
+    
+        # Fetch button
+        self.fetch_button = QPushButton("Fetch Props")
+        self.fetch_button.setStyleSheet(self.fetch_button_style)
+        self.fetch_button.clicked.connect(self.on_fetch_props_clicked)  # Connect to the method
+        controls_layout.addWidget(self.fetch_button)
+    
+        # Add controls to the main layout
+        self.layout.addWidget(controls_widget)
+    
+        # Create a collapsible group box for game selection
+        game_group = QGroupBox("Select Games")
+        game_group.setCheckable(True)  # Make the group box collapsible
+        game_group.setChecked(True)  # Default to expanded
+        game_group_layout = QVBoxLayout(game_group)
+    
+        # Add "Select All" and "Deselect All" buttons
+        select_all_button = QPushButton("Select All")
+        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+        deselect_all_button = QPushButton("Deselect All")
+        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
+        game_group_layout.addWidget(select_all_button)
+        game_group_layout.addWidget(deselect_all_button)
+    
+        # Create a scrollable area for game selection
+        self.game_selection_area = QScrollArea()
+        self.game_selection_area.setWidgetResizable(True)
+        self.game_selection_widget = QWidget()
+        self.game_selection_layout = QGridLayout(self.game_selection_widget)
+        self.game_selection_area.setWidget(self.game_selection_widget)
+    
+        # Add the scrollable area to the group box
+        game_group_layout.addWidget(self.game_selection_area)
+    
+        # Add the collapsible group box to the main layout
+        self.layout.addWidget(game_group)
+    
         # Create table
         self.create_table()
+    
         # Load prop markets
         self.load_prop_markets()
+        
+        
+        # Fetch and populate games
+        async with aiohttp.ClientSession() as session:
+            games = await self.prop_client.get_games(session)
+            self.populate_game_selection(games)
+
+
 
     def load_prop_markets(self):
+        """Load available prop markets into the dropdown"""
         from marketKeys import MAJOR_PROP_MARKETS
         prop_markets = MAJOR_PROP_MARKETS.get(self.sport_key, {})
         self.prop_types = list(prop_markets.keys())
         self.prop_selector.addItems([prop_markets[key] for key in self.prop_types])
-        self.prop_selector.currentIndexChanged.connect(self.prop_type_changed)
+
+    def populate_game_selection(self, games):
+        """Populate the game selection area with checkboxes for each game."""
+        # Clear existing checkboxes
+        for i in reversed(range(self.game_selection_layout.count())):
+            self.game_selection_layout.itemAt(i).widget().setParent(None)
+        self.game_checkboxes.clear()
+    
+        # Add a checkbox for each game
+        for game in games:
+            game_id = game.get('id', '')
+            home_team = game.get('home_team', 'Unknown')
+            away_team = game.get('away_team', 'Unknown')
+            game_label = f"{home_team} vs {away_team}"
+            checkbox = QCheckBox(game_label)
+            checkbox.setChecked(True)  # Default to selected
+            self.game_checkboxes[game_id] = checkbox
+            self.game_selection_layout.addWidget(checkbox)
+    
+    
+    def set_all_game_checkboxes(self, checked: bool):
+        """Set all game checkboxes to checked or unchecked state."""
+        for checkbox in self.game_checkboxes.values():
+            checkbox.setChecked(checked)
+    
+    
+    def process_dfs_props_data(self, dfs_props):
+        """Process DFS props data for display in the table"""
+        if not dfs_props or 'bookmakers' not in dfs_props:
+            return
+        
+        game_id = dfs_props.get('id', 'unknown')
+        
+        for bm in dfs_props['bookmakers']:
+            bm_title = bm['title']
+            if bm_title not in self.tab_data.bookmakers:
+                self.tab_data.bookmakers.append(bm_title)
+            
+            for market in bm['markets']:
+                for outcome in market['outcomes']:
+                    player_name = outcome.get('description', outcome.get('name'))
+                    label = f"{player_name} - DFS {market['key']}"
+                    
+                    if label not in self.tab_data.table_rows:
+                        self.tab_data.table_rows.append(label)
+                        self.tab_data.table_data[label] = {'game_id': game_id}
+                    
+                    price = f"{outcome.get('price', '')} ({outcome.get('point', '')})"
+                    self.tab_data.table_data[label][bm_title] = price
 
     @qasync.asyncSlot()
-    async def prop_type_changed(self, index):
-        selected_prop = self.prop_types[index]
-        await self.refresh_data({selected_prop})
+    async def on_fetch_props_clicked(self):
+        """Handle fetch button click"""
+        selected_index = self.prop_selector.currentIndex()
+        if selected_index >= 0:
+            selected_prop = self.prop_types[selected_index]
+            await self.refresh_data({selected_prop})
 
     @qasync.asyncSlot()
     async def refresh_data(self, markets):
+        """Fetch props only for selected games"""
         self.progress.setValue(0)
         try:
             async with aiohttp.ClientSession() as session:
                 games = await self.prop_client.get_games(session)
-                total_games = len(games)
-                for idx, game in enumerate(games):
-                    game_id = game.get('id', '')
+                # Populate game selection checkboxes
+                self.populate_game_selection(games)
+    
+                # Filter games based on selected checkboxes
+                selected_games = [
+                    game_id for game_id, checkbox in self.game_checkboxes.items()
+                    if checkbox.isChecked()
+                ]
+    
+                total_games = len(selected_games)
+                for idx, game_id in enumerate(selected_games):
                     odds = await self.prop_client.get_event_odds(
-                        session, game_id, markets, region="us"
+                        session, game_id, markets, region="us,eu,us_dfs"
                     )
                     self.process_odds_data(odds)
                     self.progress.setValue(int((idx + 1) / total_games * 100))
@@ -271,3 +414,4 @@ class PropsWindow(BaseTableWindow):
                     price = f"{outcome.get('price', '')} ({outcome.get('point', '')})"
                     self.tab_data.table_data[label][bm_title] = price
         self.tab_data.update_table_display()
+
