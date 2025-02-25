@@ -397,21 +397,55 @@ class PropsWindow(BaseTableWindow):
     def process_odds_data(self, odds):
         if not odds or 'bookmakers' not in odds:
             return
+        
         game_id = odds.get('id', 'unknown')
         home_team = odds.get('home_team', 'Unknown')
         away_team = odds.get('away_team', 'Unknown')
+        
         for bm in odds['bookmakers']:
             bm_title = bm['title']
             if bm_title not in self.tab_data.bookmakers:
                 self.tab_data.bookmakers.append(bm_title)
+            
+            # group markets by player name and market key
+            grouped_markets = {}
             for market in bm['markets']:
+                market_key = market['key']
                 for outcome in market['outcomes']:
                     player_name = outcome.get('description', outcome.get('name'))
-                    label = f"{player_name} - {market['key']}"
-                    if label not in self.tab_data.table_rows:
-                        self.tab_data.table_rows.append(label)
-                        self.tab_data.table_data[label] = {'game_id': game_id}
-                    price = f"{outcome.get('price', '')} ({outcome.get('point', '')})"
-                    self.tab_data.table_data[label][bm_title] = price
+                    # Create a unique key for grouping
+                    group_key = f"{player_name} - {market_key}"
+                    
+                    if group_key not in grouped_markets:
+                        grouped_markets[group_key] = {'over': None, 'under': None, 'point': outcome.get('point', '')}
+                    
+                    # Store over/under odds
+                    if outcome.get('name', '').lower() == 'over':
+                        grouped_markets[group_key]['over'] = outcome.get('price', '')
+                    elif outcome.get('name', '').lower() == 'under':
+                        grouped_markets[group_key]['under'] = outcome.get('price', '')
+            
+            # Process the grouped markets
+            for label, data in grouped_markets.items():
+                if label not in self.tab_data.table_rows:
+                    self.tab_data.table_rows.append(label)
+                    self.tab_data.table_data[label] = {'game_id': game_id}
+                
+                
+                over_price = data['over']
+                under_price = data['under']
+                point = data['point']
+                
+                if over_price is not None and under_price is not None:
+                    price = f"{over_price} O ({point}) {under_price} U"
+                elif over_price is not None:
+                    price = f"{over_price} O ({point})"
+                elif under_price is not None:
+                    price = f"{under_price} U ({point})"
+                else:
+                    price = f"({point})"
+                    
+                self.tab_data.table_data[label][bm_title] = price
+        
         self.tab_data.update_table_display()
 
