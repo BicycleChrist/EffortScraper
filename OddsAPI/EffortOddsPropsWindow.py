@@ -87,7 +87,7 @@ class LeagueTabData:
         return self.game_colors[game_id]
 
     def update_table_display(self):
-        """Update table display with improved price change highlighting"""
+        # Create different color scheme for DFS site headers
         table = self.table_widget
         current_rows = table.rowCount()
         current_cols = table.columnCount()
@@ -97,6 +97,7 @@ class LeagueTabData:
         if current_cols != expected_cols:
             table.setColumnCount(expected_cols)
             table.setHorizontalHeaderLabels(["Market/Outcome"] + self.bookmakers)
+            
         
         expected_rows = len(self.table_rows)
         if current_rows != expected_rows:
@@ -228,6 +229,8 @@ class PropsWindow(BaseTableWindow):
         self.prop_client = PropClient(sport_key)
         self.prop_types = []
         self.game_checkboxes = {}  # Store game checkboxes for easy access
+        self.market_groups = {}  # Store markets grouped by player and type
+        self.best_lines = {}  # Store the best lines for each market group
 
         # Use a QTimer to schedule the async initialization
         self.timer = QTimer()
@@ -295,13 +298,10 @@ class PropsWindow(BaseTableWindow):
         # Load prop markets
         self.load_prop_markets()
         
-        
         # Fetch and populate games
         async with aiohttp.ClientSession() as session:
             games = await self.prop_client.get_games(session)
             self.populate_game_selection(games)
-
-
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
@@ -328,12 +328,10 @@ class PropsWindow(BaseTableWindow):
             self.game_checkboxes[game_id] = checkbox
             self.game_selection_layout.addWidget(checkbox)
     
-    
     def set_all_game_checkboxes(self, checked: bool):
         """Set all game checkboxes to checked or unchecked state."""
         for checkbox in self.game_checkboxes.values():
             checkbox.setChecked(checked)
-    
     
     def process_dfs_props_data(self, dfs_props):
         """Process DFS props data for display in the table"""
@@ -372,6 +370,10 @@ class PropsWindow(BaseTableWindow):
         """Fetch props only for selected games"""
         self.progress.setValue(0)
         try:
+            # Reset market groups and best lines
+            self.market_groups = {}
+            self.best_lines = {}
+            
             async with aiohttp.ClientSession() as session:
                 games = await self.prop_client.get_games(session)
                 # Populate game selection checkboxes
@@ -390,10 +392,225 @@ class PropsWindow(BaseTableWindow):
                     )
                     self.process_odds_data(odds)
                     self.progress.setValue(int((idx + 1) / total_games * 100))
+                
+                # Find best lines for each market group
+                self.find_best_lines()
+                
+                # Update table display with best lines highlighted
                 self.tab_data.update_table_display()
+                self.highlight_best_lines()
         except Exception as e:
             print(f"Error fetching props: {e}")
 
+    def find_best_lines(self):
+        """Find the best lines for each market group"""
+        # Group table rows by player and market type
+        market_groups = {}
+        
+        for row_label in self.tab_data.table_rows:
+            # Parse player name and market type from row label
+            parts = row_label.split(' - ')
+            if len(parts) >= 2:
+                player_name = parts[0]
+                market_type = parts[1]
+                
+                # Create a unique key for this market group
+                market_key = f"{player_name}:{market_type}"
+                
+                if market_key not in market_groups:
+                    market_groups[market_key] = []
+                
+                market_groups[market_key].append(row_label)
+        
+        self.market_groups = market_groups
+        
+        # Find best lines for each market group
+        for market_key, rows in market_groups.items():
+            best_over, best_under = self.find_best_market_lines(rows)
+            self.best_lines[market_key] = {
+                'over': best_over,
+                'under': best_under
+            }
+    
+    def find_best_market_lines(self, market_rows):
+        """Find best over and under lines for a specific market"""
+        best_over = {'odds': -999999, 'point': 999999, 'bookmaker': None}
+        best_under = {'odds': -999999, 'point': -999999, 'bookmaker': None}
+        
+        for row_label in market_rows:
+            row_data = self.tab_data.table_data[row_label]
+            
+            for bm in self.tab_data.bookmakers:
+                if bm not in row_data:
+                    continue
+                    
+                value = row_data[bm]
+                if not value:
+                    continue
+                    
+                # Try to parse the value (e.g., "-142 O (15.5) +106 U")
+                try:
+                    parts = value.split()
+                    # Check for over odds
+                    if 'O' in parts:
+                        over_idx = parts.index('O')
+                        if over_idx > 0:  # Ensure there's an odds value before 'O'
+                            over_odds = float(parts[over_idx-1])
+                            # Find the point value (in parentheses)
+                            for i in range(over_idx, len(parts)):
+                                if '(' in parts[i]:
+                                    point_str = parts[i].strip('()')
+                                    if ')' not in point_str:  # Handle case where closing paren is separate
+                                        for j in range(i+1, len(parts)):
+                                            if ')' in parts[j]:
+                                                point_str = point_str + parts[j].strip(')')
+                                                break
+                                    try:
+                                        point = float(point_str)
+                                        # For overs: lower point and higher odds is better
+                                        if (point < best_over['point'] or 
+                                            (point == best_over['point'] and over_odds > best_over['odds'])):
+                                            best_over = {'odds': over_odds, 'point': point, 'bookmaker': bm}
+                                        break
+                                    except ValueError:
+                                        continue
+                    
+                    # Check for under odds
+                    if 'U' in parts:
+                        under_idx = parts.index('U')
+                        if under_idx > 0:  # Ensure there's an odds value before 'U'
+                            under_odds = float(parts[under_idx-1])
+                            # The point value should be the same as for overs
+                            for i in range(0, len(parts)):
+                                if '(' in parts[i]:
+                                    point_str = parts[i].strip('()')
+                                    if ')' not in point_str:  # Handle case where closing paren is separate
+                                        for j in range(i+1, len(parts)):
+                                            if ')' in parts[j]:
+                                                point_str = point_str + parts[j].strip(')')
+                                                break
+                                    try:
+                                        point = float(point_str)
+                                        # For unders: higher point and higher odds is better
+                                        if (point > best_under['point'] or 
+                                            (point == best_under['point'] and under_odds > best_under['odds'])):
+                                            best_under = {'odds': under_odds, 'point': point, 'bookmaker': bm}
+                                        break
+                                    except ValueError:
+                                        continue
+                except (ValueError, IndexError) as e:
+                    print(f"Error parsing value '{value}': {e}")
+                    continue
+        
+        return best_over, best_under
+
+    def highlight_best_lines(self):
+        """Highlight cells with the best lines"""
+        table = self.tab_data.table_widget
+        
+        # Define highlight colors
+        best_over_color = QColor(0, 200, 0, 150)  # Green with some transparency
+        best_under_color = QColor(0, 93, 167, 211)  # Blue with some transparency
+        
+        # First reset all highlights to normal
+        for row_idx, row_label in enumerate(self.tab_data.table_rows):
+            row_data = self.tab_data.table_data[row_label]
+            game_id = row_data.get('game_id')
+            normal_color = self.tab_data.get_game_color(game_id)
+            normal_color.setAlpha(230)
+            
+            # Skip header rows
+            if row_data.get('is_header'):
+                continue
+                
+            # Identify the market group this row belongs to
+            parts = row_label.split(' - ')
+            if len(parts) < 2:
+                continue
+                
+            player_name = parts[0]
+            market_type = parts[1]
+            market_key = f"{player_name}:{market_type}"
+            
+            # Skip if we don't have best lines for this market
+            if market_key not in self.best_lines:
+                continue
+                
+            best_over = self.best_lines[market_key]['over']
+            best_under = self.best_lines[market_key]['under']
+            
+            # Check each bookmaker column
+            for col_idx, bm in enumerate(self.tab_data.bookmakers, 1):
+                if bm not in row_data:
+                    continue
+                    
+                item = table.item(row_idx, col_idx)
+                if not item:
+                    continue
+                    
+                value = row_data[bm]
+                
+                # Check if this cell has the best over odds
+                if best_over['bookmaker'] == bm:
+                    try:
+                        parts = value.split()
+                        if 'O' in parts:
+                            over_idx = parts.index('O')
+                            if over_idx > 0:
+                                over_odds = float(parts[over_idx-1])
+                                
+                                # Find the point value
+                                for i in range(over_idx, len(parts)):
+                                    if '(' in parts[i]:
+                                        point_str = parts[i].strip('()')
+                                        if ')' not in point_str:  # Handle case where closing paren is separate
+                                            for j in range(i+1, len(parts)):
+                                                if ')' in parts[j]:
+                                                    point_str = point_str + parts[j].strip(')')
+                                                    break
+                                        try:
+                                            point = float(point_str)
+                                            if point == best_over['point'] and over_odds == best_over['odds']:
+                                                # This cell has the best over line - highlight it
+                                                item.setBackground(best_over_color)
+                                                item.setForeground(QColor('black'))
+                                            break
+                                        except ValueError:
+                                            continue
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Check if this cell has the best under odds
+                if best_under['bookmaker'] == bm:
+                    try:
+                        parts = value.split()
+                        if 'U' in parts:
+                            under_idx = parts.index('U')
+                            if under_idx > 0:
+                                under_odds = float(parts[under_idx-1])
+                                
+                                # Find the point value
+                                for i in range(0, len(parts)):
+                                    if '(' in parts[i]:
+                                        point_str = parts[i].strip('()')
+                                        if ')' not in point_str:  # Handle case where closing paren is separate
+                                            for j in range(i+1, len(parts)):
+                                                if ')' in parts[j]:
+                                                    point_str = point_str + parts[j].strip(')')
+                                                    break
+                                        try:
+                                            point = float(point_str)
+                                            if point == best_under['point'] and under_odds == best_under['odds']:
+                                                # This cell has the best under line - highlight it
+                                                item.setBackground(best_under_color)
+                                                item.setForeground(QColor('black'))
+                                            break
+                                        except ValueError:
+                                            continue
+                    except (ValueError, IndexError):
+                        pass
+    
+    # This is semi-jenk, can likley be half as long and twice as efficient
     def process_odds_data(self, odds):
         if not odds or 'bookmakers' not in odds:
             return
@@ -407,7 +624,7 @@ class PropsWindow(BaseTableWindow):
             if bm_title not in self.tab_data.bookmakers:
                 self.tab_data.bookmakers.append(bm_title)
             
-            # group markets by player name and market key
+            # Group markets by player name and market key
             grouped_markets = {}
             for market in bm['markets']:
                 market_key = market['key']
@@ -431,7 +648,7 @@ class PropsWindow(BaseTableWindow):
                     self.tab_data.table_rows.append(label)
                     self.tab_data.table_data[label] = {'game_id': game_id}
                 
-                
+                # Format as "-142 O (15.5) +106 U"
                 over_price = data['over']
                 under_price = data['under']
                 point = data['point']
