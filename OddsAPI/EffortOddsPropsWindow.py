@@ -248,7 +248,7 @@ class PropsWindow(BaseTableWindow):
         controls_widget = QWidget()
         controls_layout = QHBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 0, 0, 0)
-    
+        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
         # Prop type label
         controls_layout.addWidget(QLabel("Select Prop Type:"))
     
