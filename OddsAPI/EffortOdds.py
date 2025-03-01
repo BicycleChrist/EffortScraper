@@ -79,7 +79,6 @@ class LeagueTabData:
         """Create and configure a new table widget for this league"""
         self.table_widget = QTableWidget()
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table_widget.setMinimumSize(1000, 800)
         self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table_widget.updateGeometry()
         # Style the header
@@ -299,6 +298,7 @@ class ModernOddsWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.layout.addWidget(QLabel("Odds:"))
         self.layout.addWidget(self.tab_widget)
+        self.layout.addWidget(self.tab_widget, 1)
         
         # Auto-update controls
         update_controls_layout = QHBoxLayout()
