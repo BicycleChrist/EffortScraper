@@ -5,7 +5,7 @@ from PyQt6.QtGui import QColor, QIcon, QFont, QPen, QPainter
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QLabel, QProgressBar, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton, 
-    QHBoxLayout, QGridLayout, QCheckBox
+    QHBoxLayout, QGridLayout, QCheckBox, QScrollBar
 )
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
@@ -221,7 +221,7 @@ class PropsWindow(BaseTableWindow):
                 background-color: #dc9437;
                 color: white;
                 border: 1px solid #0056b3;
-                padding: 5px 10px;
+                padding: 5px 10px; 
                 margin-right: 5px;
                 border-radius: 4px;
             }
@@ -249,55 +249,71 @@ class PropsWindow(BaseTableWindow):
         controls_layout = QHBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
+
         # Prop type label
         controls_layout.addWidget(QLabel("Select Prop Type:"))
-    
+
         # Prop type selector
         self.prop_selector = QComboBox()
         controls_layout.addWidget(self.prop_selector)
-    
+
         # Fetch button
         self.fetch_button = QPushButton("Fetch Props")
         self.fetch_button.setStyleSheet(self.fetch_button_style)
-        self.fetch_button.clicked.connect(self.on_fetch_props_clicked)  # Connect to the method
+        self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
         controls_layout.addWidget(self.fetch_button)
-    
+
+        # Add "Select All" and "Deselect All" buttons to the right of the fetch button
+        button_container = QWidget()
+        button_layout = QVBoxLayout(button_container)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(5)  # Reduce spacing between buttons
+
+        select_all_button = QPushButton("Select All")
+        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+        deselect_all_button = QPushButton("Deselect All")
+        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
+
+        # Make buttons smaller
+        select_all_button.setFixedSize(80, 25)
+        deselect_all_button.setFixedSize(80, 25)
+
+        button_layout.addWidget(select_all_button)
+        button_layout.addWidget(deselect_all_button)
+        controls_layout.addWidget(button_container)
+
         # Add controls to the main layout
         self.layout.addWidget(controls_widget)
-    
+
         # Create a collapsible group box for game selection
         game_group = QGroupBox("Select Games")
         game_group.setCheckable(True)  # Make the group box collapsible
         game_group.setChecked(True)  # Default to expanded
         game_group_layout = QVBoxLayout(game_group)
-    
-        # Add "Select All" and "Deselect All" buttons
-        select_all_button = QPushButton("Select All")
-        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
-        deselect_all_button = QPushButton("Deselect All")
-        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-        game_group_layout.addWidget(select_all_button)
-        game_group_layout.addWidget(deselect_all_button)
-    
+        game_group_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding inside the group box
+
         # Create a scrollable area for game selection
         self.game_selection_area = QScrollArea()
         self.game_selection_area.setWidgetResizable(True)
         self.game_selection_widget = QWidget()
         self.game_selection_layout = QGridLayout(self.game_selection_widget)
+        self.game_selection_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding around checkboxes
+        self.game_selection_layout.setVerticalSpacing(5)  # Reduce vertical spacing between checkboxes
+        self.game_selection_layout.setHorizontalSpacing(10)  # Reduce horizontal spacing between checkboxes
         self.game_selection_area.setWidget(self.game_selection_widget)
-    
+
         # Add the scrollable area to the group box
         game_group_layout.addWidget(self.game_selection_area)
-    
+
         # Add the collapsible group box to the main layout
         self.layout.addWidget(game_group)
-    
+
         # Create table
         self.create_table()
-    
+
         # Load prop markets
         self.load_prop_markets()
-        
+
         # Fetch and populate games
         async with aiohttp.ClientSession() as session:
             games = await self.prop_client.get_games(session)
@@ -316,9 +332,9 @@ class PropsWindow(BaseTableWindow):
         for i in reversed(range(self.game_selection_layout.count())):
             self.game_selection_layout.itemAt(i).widget().setParent(None)
         self.game_checkboxes.clear()
-    
+
         # Add a checkbox for each game
-        for game in games:
+        for idx, game in enumerate(games):
             game_id = game.get('id', '')
             home_team = game.get('home_team', 'Unknown')
             away_team = game.get('away_team', 'Unknown')
@@ -326,7 +342,14 @@ class PropsWindow(BaseTableWindow):
             checkbox = QCheckBox(game_label)
             checkbox.setChecked(True)  # Default to selected
             self.game_checkboxes[game_id] = checkbox
-            self.game_selection_layout.addWidget(checkbox)
+
+            # Calculate row and column positions
+            row = idx // 2  # 2 columns
+            col = idx % 2
+            self.game_selection_layout.addWidget(checkbox, row, col)
+
+        # Adjust the layout to fit the content
+        self.game_selection_widget.adjustSize()
     
     def set_all_game_checkboxes(self, checked: bool):
         """Set all game checkboxes to checked or unchecked state."""
@@ -388,7 +411,7 @@ class PropsWindow(BaseTableWindow):
                 total_games = len(selected_games)
                 for idx, game_id in enumerate(selected_games):
                     odds = await self.prop_client.get_event_odds(
-                        session, game_id, markets, region="us,eu,us_dfs"
+                        session, game_id, markets, region="us,us2,us_dfs,uk,au,eu"
                     )
                     self.process_odds_data(odds)
                     self.progress.setValue(int((idx + 1) / total_games * 100))
