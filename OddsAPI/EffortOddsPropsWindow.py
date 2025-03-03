@@ -1,29 +1,57 @@
 import qasync
 import aiohttp
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QIcon, QFont, QPen, QPainter
+from PyQt6.QtGui import QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QLabel, QProgressBar, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton, 
-    QHBoxLayout, QGridLayout, QCheckBox, QScrollBar
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton,
+    QHBoxLayout, QGridLayout, QCheckBox, QScrollArea, QGroupBox
 )
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
+from LineCalculator import *
 
+# -----------------------------------------------------------------------------
+# Helper function to extract odds and point from a given value string.
+def extract_odds_point(value: str, indicator: str):
+    """
+    Parse a price string (e.g. "-142 O (15.5)") and extract the odds and point
+    corresponding to the given indicator ('O' for over, 'U' for under).
+    
+    Returns:
+        Tuple (odds, point) if successfully parsed, else None.
+    """
+    try:
+        parts = value.split()
+        if indicator in parts:
+            idx = parts.index(indicator)
+            if idx > 0:
+                odds = float(parts[idx - 1])
+                # Look for the first token (from idx onward) containing '('
+                for i in range(idx, len(parts)):
+                    if '(' in parts[i]:
+                        point_str = parts[i].strip('()')
+                        # Handle case where closing paren may be separate
+                        if ')' not in parts[i]:
+                            for j in range(i + 1, len(parts)):
+                                if ')' in parts[j]:
+                                    point_str += parts[j].strip(')')
+                                    break
+                        return odds, float(point_str)
+    except Exception:
+        pass
+    return None
 
-# Cant Believe this file works at all
-#TODO: Right now the table only displays overs, need to get unders in there for player_props
-# Ideally we have a structure "-142 O (15.5) +106 U" for each cell 
-
+# -----------------------------------------------------------------------------
+# Custom table item that stores game ID for color coordination
 class ColoredTableItem(QTableWidgetItem):
-    """Custom table item that stores game ID for color coordination"""
     def __init__(self, text, game_id):
         super().__init__(text)
         self.game_id = game_id
 
-
+# -----------------------------------------------------------------------------
+# Manages data and display state for each league tab
 class LeagueTabData:
-    """Manages data and display state for each league tab"""
     def __init__(self, league_name, sport_key):
         self.league_name = league_name
         self.sport_key = sport_key
@@ -98,12 +126,11 @@ class LeagueTabData:
             table.setColumnCount(expected_cols)
             table.setHorizontalHeaderLabels(["Market/Outcome"] + self.bookmakers)
             
-        
         expected_rows = len(self.table_rows)
         if current_rows != expected_rows:
             table.setRowCount(expected_rows)
         
-        needs_resize = True
+        needs_resize = False
         
         for row_idx, row_label in enumerate(self.table_rows):
             row_data = self.table_data[row_label]
@@ -144,28 +171,21 @@ class LeagueTabData:
                 # Only update if value has changed
                 if current_value != previous_value and previous_value is not None:
                     item.setText(current_value)
-                    try:
-                        current_odds = float(current_value.split()[0])
-                        previous_odds = float(previous_value.split()[0])
-                        
+                    parsed = extract_odds_point(current_value, 'O')  # Try parsing as over odds
+                    parsed_prev = extract_odds_point(previous_value, 'O')
+                    if parsed and parsed_prev:
+                        current_odds, _ = parsed
+                        previous_odds, _ = parsed_prev
                         # Better odds (higher value) = green, worse odds = red
-                        if current_odds > previous_odds:
-                            highlight_color = QColor(0, 200, 0, 180)
-                        else:
-                            highlight_color = QColor(200, 0, 0, 180)
-                        
+                        highlight_color = QColor(0, 200, 0, 180) if current_odds > previous_odds else QColor(200, 0, 0, 180)
                         item.setBackground(highlight_color)
                         item.setForeground(QColor('black'))
-                        
                         market_color = QColor(color)
                         market_color.setAlpha(230)
                         QTimer.singleShot(5000, lambda i=item, c=market_color: (
                             i.setBackground(c),
                             i.setForeground(QColor('black'))
                         ))
-                    except (ValueError, IndexError):
-                        item.setText(current_value)
-                    
                     self.previous_data[(row_label, bm)] = current_value
                     needs_resize = True
                 elif current_value != previous_value:
@@ -182,7 +202,8 @@ class LeagueTabData:
             table.resizeColumnsToContents()
             table.resizeRowsToContents()
 
-
+# -----------------------------------------------------------------------------
+# Base window class that provides a table and basic controls
 class BaseTableWindow(QMainWindow):
     def __init__(self, title, sport_key, league_name):
         super().__init__()
@@ -199,19 +220,24 @@ class BaseTableWindow(QMainWindow):
         self.layout = QVBoxLayout(main_widget)
         grid_layout = QGridLayout()
         # Progress bar
+        self.layout.addSpacing(20)
         self.progress = QProgressBar()
+        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.layout.addWidget(self.progress)
 
     def create_table(self):
         self.table_widget = self.tab_data.create_table_widget()
+        self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.layout.insertWidget(0, self.table_widget)
 
     def add_control(self, widget):
         self.layout.insertWidget(0, widget)
 
-
-from PyQt6.QtWidgets import QScrollArea, QGroupBox
-
+# -----------------------------------------------------------------------------
+# PropsWindow: Displays player props and associated best lines
+# Cant Believe this file works at all
+#TODO: Right now the table only displays overs, need to get unders in there for player_props
+# Ideally we have a structure "-142 O (15.5) +106 U" for each cell 
 class PropsWindow(BaseTableWindow):
     def __init__(self, sport_key, league_name):
         super().__init__(f"{league_name} Player Props", sport_key, league_name)
@@ -231,6 +257,7 @@ class PropsWindow(BaseTableWindow):
         self.game_checkboxes = {}  # Store game checkboxes for easy access
         self.market_groups = {}  # Store markets grouped by player and type
         self.best_lines = {}  # Store the best lines for each market group
+        self.best_lines_widget = None
 
         # Use a QTimer to schedule the async initialization
         self.timer = QTimer()
@@ -247,73 +274,75 @@ class PropsWindow(BaseTableWindow):
         # Create controls container
         controls_widget = QWidget()
         controls_layout = QHBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
+        controls_layout.setSpacing(5)  # Reduce spacing between widgets
         self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
-
         # Prop type label
         controls_layout.addWidget(QLabel("Select Prop Type:"))
-
+    
         # Prop type selector
         self.prop_selector = QComboBox()
         controls_layout.addWidget(self.prop_selector)
-
+    
         # Fetch button
         self.fetch_button = QPushButton("Fetch Props")
         self.fetch_button.setStyleSheet(self.fetch_button_style)
         self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
         controls_layout.addWidget(self.fetch_button)
-
-        # Add "Select All" and "Deselect All" buttons to the right of the fetch button
-        button_container = QWidget()
-        button_layout = QVBoxLayout(button_container)
-        button_layout.setContentsMargins(0, 0, 0, 0)
-        button_layout.setSpacing(5)  # Reduce spacing between buttons
-
+    
+        # Progress bar (moved to the right of the controls)
+        self.progress = QProgressBar()
+        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls_layout.addWidget(self.progress)
+    
+        # Add controls to the main layout
+        self.layout.addWidget(controls_widget)
+    
+        # Create a container for the bottom area (game selection and best lines)
+        bottom_container = QWidget()
+        bottom_layout = QHBoxLayout(bottom_container)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
+    
+        # Add the game selection box to the left
+        game_group = QGroupBox("Select Games")
+        game_group.setCheckable(True)
+        game_group.setChecked(True)
+        game_group_layout = QVBoxLayout(game_group)
+        game_group_layout.setContentsMargins(5, 5, 5, 5)
+    
+        # Add "Select All" and "Deselect All" buttons
         select_all_button = QPushButton("Select All")
         select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
         deselect_all_button = QPushButton("Deselect All")
         deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-
-        # Make buttons smaller
-        select_all_button.setFixedSize(80, 25)
-        deselect_all_button.setFixedSize(80, 25)
-
-        button_layout.addWidget(select_all_button)
-        button_layout.addWidget(deselect_all_button)
-        controls_layout.addWidget(button_container)
-
-        # Add controls to the main layout
-        self.layout.addWidget(controls_widget)
-
-        # Create a collapsible group box for game selection
-        game_group = QGroupBox("Select Games")
-        game_group.setCheckable(True)  # Make the group box collapsible
-        game_group.setChecked(True)  # Default to expanded
-        game_group_layout = QVBoxLayout(game_group)
-        game_group_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding inside the group box
-
-        # Create a scrollable area for game selection
+        game_group_layout.addWidget(select_all_button)
+        game_group_layout.addWidget(deselect_all_button)
+    
+        # Add the game selection scroll area
         self.game_selection_area = QScrollArea()
         self.game_selection_area.setWidgetResizable(True)
         self.game_selection_widget = QWidget()
         self.game_selection_layout = QGridLayout(self.game_selection_widget)
-        self.game_selection_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding around checkboxes
-        self.game_selection_layout.setVerticalSpacing(5)  # Reduce vertical spacing between checkboxes
-        self.game_selection_layout.setHorizontalSpacing(10)  # Reduce horizontal spacing between checkboxes
+        self.game_selection_layout.setContentsMargins(5, 5, 5, 5)
         self.game_selection_area.setWidget(self.game_selection_widget)
-
-        # Add the scrollable area to the group box
         game_group_layout.addWidget(self.game_selection_area)
-
-        # Add the collapsible group box to the main layout
-        self.layout.addWidget(game_group)
-
+    
+        # Add the game selection box to the left side of the bottom container
+        bottom_layout.addWidget(game_group)
+    
+        # Add the best lines widget to the right side of the bottom container
+        self.create_best_lines_widget()
+        bottom_layout.addWidget(self.best_lines_widget)
+    
+        # Add the bottom container to the main layout
+        self.layout.addWidget(bottom_container)
+    
         # Create table
         self.create_table()
-
+    
         # Load prop markets
         self.load_prop_markets()
-
+    
         # Fetch and populate games
         async with aiohttp.ClientSession() as session:
             games = await self.prop_client.get_games(session)
@@ -321,7 +350,6 @@ class PropsWindow(BaseTableWindow):
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
-        from marketKeys import MAJOR_PROP_MARKETS
         prop_markets = MAJOR_PROP_MARKETS.get(self.sport_key, {})
         self.prop_types = list(prop_markets.keys())
         self.prop_selector.addItems([prop_markets[key] for key in self.prop_types])
@@ -390,13 +418,12 @@ class PropsWindow(BaseTableWindow):
 
     @qasync.asyncSlot()
     async def refresh_data(self, markets):
-        """Fetch props only for selected games"""
         self.progress.setValue(0)
         try:
             # Reset market groups and best lines
             self.market_groups = {}
             self.best_lines = {}
-            
+    
             async with aiohttp.ClientSession() as session:
                 games = await self.prop_client.get_games(session)
                 # Populate game selection checkboxes
@@ -415,13 +442,16 @@ class PropsWindow(BaseTableWindow):
                     )
                     self.process_odds_data(odds)
                     self.progress.setValue(int((idx + 1) / total_games * 100))
-                
+    
                 # Find best lines for each market group
                 self.find_best_lines()
-                
+    
                 # Update table display with best lines highlighted
                 self.tab_data.update_table_display()
                 self.highlight_best_lines()
+    
+                # Update the best lines widget
+                self.update_best_lines_display()  # Add this line
         except Exception as e:
             print(f"Error fetching props: {e}")
 
@@ -429,32 +459,22 @@ class PropsWindow(BaseTableWindow):
         """Find the best lines for each market group"""
         # Group table rows by player and market type
         market_groups = {}
-        
         for row_label in self.tab_data.table_rows:
             # Parse player name and market type from row label
             parts = row_label.split(' - ')
             if len(parts) >= 2:
                 player_name = parts[0]
                 market_type = parts[1]
-                
                 # Create a unique key for this market group
                 market_key = f"{player_name}:{market_type}"
-                
-                if market_key not in market_groups:
-                    market_groups[market_key] = []
-                
-                market_groups[market_key].append(row_label)
-        
+                market_groups.setdefault(market_key, []).append(row_label)
         self.market_groups = market_groups
         
-        # Find best lines for each market group
+        # Find best lines for each market group using the helper function
         for market_key, rows in market_groups.items():
             best_over, best_under = self.find_best_market_lines(rows)
-            self.best_lines[market_key] = {
-                'over': best_over,
-                'under': best_under
-            }
-    
+            self.best_lines[market_key] = {'over': best_over, 'under': best_under}
+
     def find_best_market_lines(self, market_rows):
         """Find best over and under lines for a specific market"""
         best_over = {'odds': -999999, 'point': 999999, 'bookmaker': None}
@@ -462,69 +482,29 @@ class PropsWindow(BaseTableWindow):
         
         for row_label in market_rows:
             row_data = self.tab_data.table_data[row_label]
-            
             for bm in self.tab_data.bookmakers:
                 if bm not in row_data:
                     continue
-                    
                 value = row_data[bm]
                 if not value:
                     continue
                     
-                # Try to parse the value (e.g., "-142 O (15.5) +106 U")
-                try:
-                    parts = value.split()
-                    # Check for over odds
-                    if 'O' in parts:
-                        over_idx = parts.index('O')
-                        if over_idx > 0:  # Ensure there's an odds value before 'O'
-                            over_odds = float(parts[over_idx-1])
-                            # Find the point value (in parentheses)
-                            for i in range(over_idx, len(parts)):
-                                if '(' in parts[i]:
-                                    point_str = parts[i].strip('()')
-                                    if ')' not in point_str:  # Handle case where closing paren is separate
-                                        for j in range(i+1, len(parts)):
-                                            if ')' in parts[j]:
-                                                point_str = point_str + parts[j].strip(')')
-                                                break
-                                    try:
-                                        point = float(point_str)
-                                        # For overs: lower point and higher odds is better
-                                        if (point < best_over['point'] or 
-                                            (point == best_over['point'] and over_odds > best_over['odds'])):
-                                            best_over = {'odds': over_odds, 'point': point, 'bookmaker': bm}
-                                        break
-                                    except ValueError:
-                                        continue
-                    
-                    # Check for under odds
-                    if 'U' in parts:
-                        under_idx = parts.index('U')
-                        if under_idx > 0:  # Ensure there's an odds value before 'U'
-                            under_odds = float(parts[under_idx-1])
-                            # The point value should be the same as for overs
-                            for i in range(0, len(parts)):
-                                if '(' in parts[i]:
-                                    point_str = parts[i].strip('()')
-                                    if ')' not in point_str:  # Handle case where closing paren is separate
-                                        for j in range(i+1, len(parts)):
-                                            if ')' in parts[j]:
-                                                point_str = point_str + parts[j].strip(')')
-                                                break
-                                    try:
-                                        point = float(point_str)
-                                        # For unders: higher point and higher odds is better
-                                        if (point > best_under['point'] or 
-                                            (point == best_under['point'] and under_odds > best_under['odds'])):
-                                            best_under = {'odds': under_odds, 'point': point, 'bookmaker': bm}
-                                        break
-                                    except ValueError:
-                                        continue
-                except (ValueError, IndexError) as e:
-                    print(f"Error parsing value '{value}': {e}")
-                    continue
-        
+                # Parse over odds/point using helper function
+                result = extract_odds_point(value, 'O')
+                if result is not None:
+                    over_odds, point = result
+                    if (point < best_over['point'] or 
+                        (point == best_over['point'] and over_odds > best_over['odds'])):
+                        best_over = {'odds': over_odds, 'point': point, 'bookmaker': bm}
+                
+                # Parse under odds/point using helper function
+                result = extract_odds_point(value, 'U')
+                if result is not None:
+                    under_odds, point = result
+                    if (point > best_under['point'] or 
+                        (point == best_under['point'] and under_odds > best_under['odds'])):
+                        best_under = {'odds': under_odds, 'point': point, 'bookmaker': bm}
+                        
         return best_over, best_under
 
     def highlight_best_lines(self):
@@ -575,63 +555,21 @@ class PropsWindow(BaseTableWindow):
                 
                 # Check if this cell has the best over odds
                 if best_over['bookmaker'] == bm:
-                    try:
-                        parts = value.split()
-                        if 'O' in parts:
-                            over_idx = parts.index('O')
-                            if over_idx > 0:
-                                over_odds = float(parts[over_idx-1])
-                                
-                                # Find the point value
-                                for i in range(over_idx, len(parts)):
-                                    if '(' in parts[i]:
-                                        point_str = parts[i].strip('()')
-                                        if ')' not in point_str:  # Handle case where closing paren is separate
-                                            for j in range(i+1, len(parts)):
-                                                if ')' in parts[j]:
-                                                    point_str = point_str + parts[j].strip(')')
-                                                    break
-                                        try:
-                                            point = float(point_str)
-                                            if point == best_over['point'] and over_odds == best_over['odds']:
-                                                # This cell has the best over line - highlight it
-                                                item.setBackground(best_over_color)
-                                                item.setForeground(QColor('black'))
-                                            break
-                                        except ValueError:
-                                            continue
-                    except (ValueError, IndexError):
-                        pass
+                    result = extract_odds_point(value, 'O')
+                    if result is not None:
+                        over_odds, point = result
+                        if point == best_over['point'] and over_odds == best_over['odds']:
+                            item.setBackground(best_over_color)
+                            item.setForeground(QColor('black'))
                 
                 # Check if this cell has the best under odds
                 if best_under['bookmaker'] == bm:
-                    try:
-                        parts = value.split()
-                        if 'U' in parts:
-                            under_idx = parts.index('U')
-                            if under_idx > 0:
-                                under_odds = float(parts[under_idx-1])
-                                
-                                # Find the point value
-                                for i in range(0, len(parts)):
-                                    if '(' in parts[i]:
-                                        point_str = parts[i].strip('()')
-                                        if ')' not in point_str:  # Handle case where closing paren is separate
-                                            for j in range(i+1, len(parts)):
-                                                if ')' in parts[j]:
-                                                    point_str = point_str + parts[j].strip(')')
-                                                    break
-                                        try:
-                                            point = float(point_str)
-                                            if point == best_under['point'] and under_odds == best_under['odds']:
-                                                # This cell has the best under line - highlight it
-                                                item.setBackground(best_under_color)
-                                                item.setForeground(QColor('black'))
-                                            break
-                                        except ValueError:
-                                            continue
-                    except (ValueError, IndexError):
-                        pass
+                    result = extract_odds_point(value, 'U')
+                    if result is not None:
+                        under_odds, point = result
+                        if point == best_under['point'] and under_odds == best_under['odds']:
+                            item.setBackground(best_under_color)
+                            item.setForeground(QColor('black'))
     
     # This is semi-jenk, can likley be half as long and twice as efficient
     def process_odds_data(self, odds):
@@ -655,14 +593,14 @@ class PropsWindow(BaseTableWindow):
                     player_name = outcome.get('description', outcome.get('name'))
                     # Create a unique key for grouping
                     group_key = f"{player_name} - {market_key}"
-                    
                     if group_key not in grouped_markets:
                         grouped_markets[group_key] = {'over': None, 'under': None, 'point': outcome.get('point', '')}
                     
                     # Store over/under odds
-                    if outcome.get('name', '').lower() == 'over':
+                    outcome_name = outcome.get('name', '').lower()
+                    if outcome_name == 'over':
                         grouped_markets[group_key]['over'] = outcome.get('price', '')
-                    elif outcome.get('name', '').lower() == 'under':
+                    elif outcome_name == 'under':
                         grouped_markets[group_key]['under'] = outcome.get('price', '')
             
             # Process the grouped markets
@@ -688,4 +626,55 @@ class PropsWindow(BaseTableWindow):
                 self.tab_data.table_data[label][bm_title] = price
         
         self.tab_data.update_table_display()
+        
+    # Widget to try and calculate best lines for entire query based on deviation
+    def create_best_lines_widget(self):
+        """Create a widget to display the best lines and their deviations."""
+        self.best_lines_widget = QTableWidget()
+        self.best_lines_widget.setColumnCount(5)
+        self.best_lines_widget.setHorizontalHeaderLabels(["Player", "Market", "Best Line", "Avg Odds", "Deviation"])
+        self.best_lines_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.layout.addWidget(self.best_lines_widget)
 
+    def update_best_lines_display(self):
+        """Update the best lines widget with the latest data."""
+        if not self.best_lines_widget:
+            print("Best lines widget not initialized. Skipping update.")
+            return
+    
+        # Clear existing data
+        self.best_lines_widget.setRowCount(0)
+    
+        # Calculate best lines
+        calculator = BestLinesCalculator(self.tab_data.table_data, self.tab_data.bookmakers)
+        best_lines = calculator.calculate_best_lines()
+    
+        # Populate the widget
+        for market_key, data in best_lines.items():
+            player_name, market_type = market_key.split(':')
+            row_position = self.best_lines_widget.rowCount()
+            self.best_lines_widget.insertRow(row_position)
+    
+            # Add player and market type
+            self.best_lines_widget.setItem(row_position, 0, QTableWidgetItem(player_name))
+            self.best_lines_widget.setItem(row_position, 1, QTableWidgetItem(market_type))
+    
+            if data['over']:
+                # Add best over line
+                over = data['over']
+                over_text = f"{over['odds']} O ({over['point']}) @ {over['bookmaker']}"
+                self.best_lines_widget.setItem(row_position, 2, QTableWidgetItem(over_text))
+    
+                # Add average odds and deviation only when there are multiple lines for this point
+                if over['count'] > 1:
+                    self.best_lines_widget.setItem(row_position, 3, QTableWidgetItem(f"{over['avg_odds']:.2f}"))
+                    self.best_lines_widget.setItem(row_position, 4, QTableWidgetItem(f"+{over['deviation']:.2f}"))
+                else:
+                    # Only one line at this point value
+                    self.best_lines_widget.setItem(row_position, 3, QTableWidgetItem("Solo Line"))
+                    self.best_lines_widget.setItem(row_position, 4, QTableWidgetItem("N/A"))
+            else:
+                # No over lines
+                self.best_lines_widget.setItem(row_position, 2, QTableWidgetItem("No Line"))
+                self.best_lines_widget.setItem(row_position, 3, QTableWidgetItem("N/A"))
+                self.best_lines_widget.setItem(row_position, 4, QTableWidgetItem("N/A"))
