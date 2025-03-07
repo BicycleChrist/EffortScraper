@@ -11,6 +11,10 @@ from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
 from LineCalculator import *
 
+
+#TODO: This file is massive need refactor soon or eventloop woopty is imminent 
+#TODO: Fix game selection checkboxes, still just queries all games every time
+
 # -----------------------------------------------------------------------------
 # Helper function to extract odds and point from a given value string.
 def extract_odds_point(value: str, indicator: str):
