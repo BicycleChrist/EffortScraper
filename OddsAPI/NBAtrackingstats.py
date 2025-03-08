@@ -7,6 +7,8 @@ class SimpleNBAStatsClient:
     """
     A simplified client for accessing NBA.com's advanced stats API
     """
+    # Big ups to chitown88 from SOF, thanks boss
+    
     
     # Base URLs
     BASE_URL = "https://stats.nba.com/stats/"

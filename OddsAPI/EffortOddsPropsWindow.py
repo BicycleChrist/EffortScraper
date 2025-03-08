@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
 from LineCalculator import *
-
+from TrackingStatsWidget import integrate_stats_with_props_window
 
 #TODO: This file is massive need refactor soon or eventloop woopty is imminent 
 #TODO: Fix game selection checkboxes, still just queries all games every time
@@ -223,12 +223,7 @@ class BaseTableWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         self.layout = QVBoxLayout(main_widget)
         grid_layout = QGridLayout()
-        # Progress bar
-        self.layout.addSpacing(20)
-        self.progress = QProgressBar()
-        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.layout.addWidget(self.progress)
-
+        
     def create_table(self):
         self.table_widget = self.tab_data.create_table_widget()
         self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -314,13 +309,21 @@ class PropsWindow(BaseTableWindow):
         game_group_layout = QVBoxLayout(game_group)
         game_group_layout.setContentsMargins(5, 5, 5, 5)
     
-        # Add "Select All" and "Deselect All" buttons
         select_all_button = QPushButton("Select All")
         select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+        select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
+        select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
         deselect_all_button = QPushButton("Deselect All")
         deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-        game_group_layout.addWidget(select_all_button)
-        game_group_layout.addWidget(deselect_all_button)
+        deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
+        deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+        
+        # Create a horizontal layout for the buttons to place them side by side
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(select_all_button)
+        buttons_layout.addWidget(deselect_all_button)
+        buttons_layout.addStretch()  # Add stretch to push buttons to the left
+        game_group_layout.addLayout(buttons_layout)
     
         # Add the game selection scroll area
         self.game_selection_area = QScrollArea()
@@ -343,6 +346,7 @@ class PropsWindow(BaseTableWindow):
     
         # Create table
         self.create_table()
+        
     
         # Load prop markets
         self.load_prop_markets()
@@ -351,6 +355,7 @@ class PropsWindow(BaseTableWindow):
         async with aiohttp.ClientSession() as session:
             games = await self.prop_client.get_games(session)
             self.populate_game_selection(games)
+        integrate_stats_with_props_window(self)
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
