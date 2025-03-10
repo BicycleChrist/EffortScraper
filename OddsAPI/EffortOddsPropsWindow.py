@@ -13,7 +13,6 @@ from LineCalculator import *
 from TrackingStatsWidget import integrate_stats_with_props_window
 
 #TODO: This file is massive need refactor soon or eventloop woopty is imminent 
-#TODO: Fix game selection checkboxes, still just queries all games every time
 
 # -----------------------------------------------------------------------------
 # Helper function to extract odds and point from a given value string.
@@ -343,6 +342,7 @@ class PropsWindow(BaseTableWindow):
     
         # Add the bottom container to the main layout
         self.layout.addWidget(bottom_container)
+        
     
         # Create table
         self.create_table()
@@ -355,7 +355,7 @@ class PropsWindow(BaseTableWindow):
         async with aiohttp.ClientSession() as session:
             games = await self.prop_client.get_games(session)
             self.populate_game_selection(games)
-        integrate_stats_with_props_window(self)
+            integrate_stats_with_props_window(self)
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
@@ -421,11 +421,11 @@ class PropsWindow(BaseTableWindow):
     async def on_fetch_props_clicked(self):
         """Handle fetch button click"""
         selected_index = self.prop_selector.currentIndex()
+        integrate_stats_with_props_window(self)
         if selected_index >= 0:
             selected_prop = self.prop_types[selected_index]
             await self.refresh_data({selected_prop})
 
-    @qasync.asyncSlot()
     @qasync.asyncSlot()
     async def refresh_data(self, markets):
         self.progress.setValue(0)
@@ -435,11 +435,10 @@ class PropsWindow(BaseTableWindow):
             self.best_lines = {}
             self.raw_odds_data_by_game = {}  # Store raw odds data for each game
             
+            self.tab_data.table_rows = []
+            self.tab_data.table_data = {}
+            
             async with aiohttp.ClientSession() as session:
-                games = await self.prop_client.get_games(session)
-                # Populate game selection checkboxes
-                self.populate_game_selection(games)
-                
                 # Filter games based on selected checkboxes
                 selected_games = [
                     game_id for game_id, checkbox in self.game_checkboxes.items()
@@ -447,6 +446,14 @@ class PropsWindow(BaseTableWindow):
                 ]
                 
                 total_games = len(selected_games)
+                
+                # Debug logging
+                selected_game_names = [
+                    (checkbox.text(), checkbox.isChecked()) for game_id, checkbox in self.game_checkboxes.items()
+                ]
+                print(f"{len(selected_games)}/{len(selected_game_names)} selected")
+                for (text, isChecked) in selected_game_names:
+                    print(f"{text}: {isChecked}")
                 
                 # Create a consolidated odds data structure to combine data from all games
                 consolidated_odds_data = {
@@ -491,7 +498,7 @@ class PropsWindow(BaseTableWindow):
                 # Now store the consolidated data for the best lines calculator
                 self.consolidated_odds_data = consolidated_odds_data
                 
-                # Update table display
+                # Update table display AFTER all data is processed
                 self.tab_data.update_table_display()
                 
                 # Update the best lines widget using the consolidated raw data
@@ -720,9 +727,8 @@ class PropsWindow(BaseTableWindow):
                     price = f"({point})"
                     
                 self.tab_data.table_data[label][bm_title] = price
-        
-        self.tab_data.update_table_display()
-        
+    
+    
     # Widget to try and calculate best lines for entire query based on deviation
     def create_best_lines_widget(self):
         """Create a widget to display the best lines and their deviations."""

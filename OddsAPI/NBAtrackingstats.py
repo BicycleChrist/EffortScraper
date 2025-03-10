@@ -21,7 +21,7 @@ class SimpleNBAStatsClient:
         'Accept-Language': 'en-US,en;q=0.9',
     }
     
-    def __init__(self, season="2023-24", season_type="Regular Season"):
+    def __init__(self, season="2024-25", season_type="Regular Season"):
         """Initialize the NBA Stats client"""
         self.season = season
         self.season_type = season_type
