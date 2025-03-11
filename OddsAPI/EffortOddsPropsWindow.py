@@ -95,7 +95,7 @@ class LeagueTabData:
         """Create and configure a new table widget for this league"""
         self.table_widget = QTableWidget()
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table_widget.setMinimumSize(1000, 800)
+        self.table_widget.setMinimumSize(1280, 360)
         self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table_widget.updateGeometry()
         # Style the header
@@ -302,23 +302,25 @@ class PropsWindow(BaseTableWindow):
         bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
     
         # Add the game selection box to the left
-        game_group = QGroupBox("Select Games")
-        game_group.setCheckable(True)
-        game_group.setChecked(True)
+        game_group = QGroupBox()
         game_group_layout = QVBoxLayout(game_group)
-        game_group_layout.setContentsMargins(5, 5, 5, 5)
+        game_group_layout.setContentsMargins(3, 3, 3, 3)  # Tighter margins
+        game_group_layout.setSpacing(0)  # Remove spacing between elements
     
+        # Create horizontal layout for buttons
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(2)  # Reduce spacing between buttons
+        
         select_all_button = QPushButton("Select All")
         select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
         select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
         select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+        
         deselect_all_button = QPushButton("Deselect All")
         deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
         deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
         deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
         
-        # Create a horizontal layout for the buttons to place them side by side
-        buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(select_all_button)
         buttons_layout.addWidget(deselect_all_button)
         buttons_layout.addStretch()  # Add stretch to push buttons to the left
@@ -327,13 +329,17 @@ class PropsWindow(BaseTableWindow):
         # Add the game selection scroll area
         self.game_selection_area = QScrollArea()
         self.game_selection_area.setWidgetResizable(True)
+        # self.game_selection_area.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # Fixed size in both dimensions
+        # self.game_selection_area.setFixedHeight(80)  # Fixed height that's sufficient but compact
         self.game_selection_widget = QWidget()
         self.game_selection_layout = QGridLayout(self.game_selection_widget)
-        self.game_selection_layout.setContentsMargins(5, 5, 5, 5)
+        self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
+        self.game_selection_layout.setSpacing(0)  # Remove spacing between checkboxes completely
         self.game_selection_area.setWidget(self.game_selection_widget)
         game_group_layout.addWidget(self.game_selection_area)
     
         # Add the game selection box to the left side of the bottom container
+        game_group.setFixedHeight(300)
         bottom_layout.addWidget(game_group)
     
         # Add the best lines widget to the right side of the bottom container
@@ -342,11 +348,9 @@ class PropsWindow(BaseTableWindow):
     
         # Add the bottom container to the main layout
         self.layout.addWidget(bottom_container)
-        
     
         # Create table
         self.create_table()
-        
     
         # Load prop markets
         self.load_prop_markets()
@@ -367,24 +371,46 @@ class PropsWindow(BaseTableWindow):
         """Populate the game selection area with checkboxes for each game."""
         # Clear existing checkboxes
         for i in reversed(range(self.game_selection_layout.count())):
-            self.game_selection_layout.itemAt(i).widget().setParent(None)
+            widget = self.game_selection_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
         self.game_checkboxes.clear()
-
+    
+        # Use just 2 columns to match the screenshot layout
+        num_columns = 2
+    
         # Add a checkbox for each game
         for idx, game in enumerate(games):
             game_id = game.get('id', '')
             home_team = game.get('home_team', 'Unknown')
             away_team = game.get('away_team', 'Unknown')
             game_label = f"{home_team} vs {away_team}"
+            
             checkbox = QCheckBox(game_label)
             checkbox.setChecked(True)  # Default to selected
+            
+            # Keep font size reasonable for readability
+            # Font size is now handled in the stylesheet
+            
+            # Make checkboxes reasonably sized but still compact
+            checkbox.setStyleSheet("""
+                QCheckBox { 
+                    padding: 1px; 
+                    margin: 0px; 
+                    min-height: 20px; 
+                    max-height: 20px; 
+                    height: 20px;
+                    font-size: 9pt;
+                }
+            """)
+            
             self.game_checkboxes[game_id] = checkbox
-
+    
             # Calculate row and column positions
-            row = idx // 2  # 2 columns
-            col = idx % 2
+            row = idx // num_columns
+            col = idx % num_columns
             self.game_selection_layout.addWidget(checkbox, row, col)
-
+    
         # Adjust the layout to fit the content
         self.game_selection_widget.adjustSize()
     

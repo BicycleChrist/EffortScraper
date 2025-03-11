@@ -181,7 +181,24 @@ class ModernOddsWindow(QMainWindow):
         padding: 5px 10px;
         margin-right: 5px;
         border-radius: 4px;
+        width: 200px;
+        font-size: 24px;
     }"""
+    
+    props_button_style = """
+        QPushButton {
+            background-color: #007bff;  /* Blue */
+            color: white;
+            border: 3px solid #0056b3;
+            border-radius: 4px;
+            width: 72px;
+            height: 36px;
+            font-size: 12px;
+        }
+        QPushButton:disabled {
+            background-color: #909090;
+        }
+    """
     
     def __init__(self):
         super().__init__()
@@ -200,7 +217,7 @@ class ModernOddsWindow(QMainWindow):
         """Initialize the user interface components"""
         self.setWindowTitle("Effort Odds")
         self.setGeometry(100, 100, 800, 600)
-        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png")) 
+        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png")) # Change to relative path
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -257,8 +274,7 @@ class ModernOddsWindow(QMainWindow):
             left_layout.addWidget(btn)
         
         # Add fetch button
-        self.fetch_odds_button = QPushButton("Fetch Odds")
-        self.fetch_odds_button.setFixedWidth(120)
+        self.fetch_odds_button = QPushButton("Fetch Odds 🎰") # slot machine
         self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)  # Apply style
         left_layout.addWidget(self.fetch_odds_button)
 
@@ -268,11 +284,10 @@ class ModernOddsWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
 
         # Add props button
-        self.props_button = QPushButton("Props")
-        self.props_button.setCheckable(True)
+        self.props_button = QPushButton("Props ➣➣")
         self.props_button.setObjectName("market_props")
         self.props_button.setEnabled(False)
-        self.props_button.setStyleSheet(self.BUTTON_STYLE)  # Apply style
+        self.props_button.setStyleSheet(self.props_button_style)  # Apply style
         self.market_buttons["props"] = self.props_button
         right_layout.addWidget(self.props_button)
 
@@ -360,10 +375,7 @@ class ModernOddsWindow(QMainWindow):
         has_props = sport_key in MAJOR_PROP_MARKETS  # Check if this league has props
         self.props_button.setEnabled(has_props)
         self.props_availability_label.setVisible(not has_props)
-    
-        if not has_props and self.props_button.isChecked():
-            self.props_button.setChecked(False)
-            self.update_market_selection()
+        # self.update_market_selection() # not necessary?
 
     
     
@@ -412,7 +424,16 @@ class ModernOddsWindow(QMainWindow):
         else:
             print("No props available for this league.")  # Debug print
 
-
+    # overriding inherited method for custom keybinds
+    def keyPressEvent(self, a0):
+        self.clearFocus()
+        print(f"Keypress: {a0.key()}")
+        if (a0.key() == Qt.Key.Key_1):
+            if not self.props_button.isEnabled(): return;
+            self.handle_props_button()
+            return
+        super().keyPressEvent(a0) # delegate back to base keybind handling
+        return
 
     def connect_signals(self):
         """Connect UI signals to their respective slots"""
@@ -476,7 +497,7 @@ class ModernOddsWindow(QMainWindow):
         await self.populate_leagues()
         self.leagues_loaded = True
 
-    async def populate_leagues(self):
+    async def populate_leagues(self, default_league="NBA"):
         """Fetch and populate leagues in the dropdown"""
         leagues = await self.data_manager.fetch_leagues()
         print("Fetched leagues:", leagues)
@@ -487,6 +508,8 @@ class ModernOddsWindow(QMainWindow):
             for league in league_list:
                 self.league_selector.addItem(league['title'])
                 self.data_manager.league_map[league['title']] = league['key']
+        
+        self.league_selector.setCurrentText(default_league)
         
         # Call handle_league_change after populating
         if self.league_selector.count() > 0:
