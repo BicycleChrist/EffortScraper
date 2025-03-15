@@ -13,6 +13,7 @@ from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
 from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
+import pandas as pd
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -99,6 +100,52 @@ class LeagueTabData:
             self.game_colors[game_id] = self.color_palette[self.current_color_index]
             self.current_color_index = (self.current_color_index + 1) % len(self.color_palette)
         return self.game_colors[game_id]
+    
+    def to_dataframe(self):
+        """Convert the current table data to a pandas DataFrame"""
+        # Create a DataFrame with rows as indices and bookmakers as columns
+        df = pd.DataFrame(index=self.table_rows, columns=self.bookmakers)
+        
+        # Fill the DataFrame with current odds values
+        for row_label in self.table_rows:
+            row_data = self.table_data.get(row_label, {})
+            for bm in self.bookmakers:
+                df.at[row_label, bm] = row_data.get(bm, "")
+        
+        # Add game_id and is_header columns for reference
+        df['game_id'] = [self.table_data.get(row, {}).get('game_id', '') for row in self.table_rows]
+        df['is_header'] = [self.table_data.get(row, {}).get('is_header', False) for row in self.table_rows]
+        
+        return df
+    
+    def update_from_dataframe(self, df):
+        """Update table data from a pandas DataFrame"""
+        # Update bookmakers list if needed
+        bm_columns = [col for col in df.columns if col not in ['game_id', 'is_header']]
+        for bm in bm_columns:
+            if bm not in self.bookmakers:
+                self.bookmakers.append(bm)
+        
+        # Update rows
+        self.table_rows = df.index.tolist()
+        
+        # Update table data
+        for row_label in self.table_rows:
+            if row_label not in self.table_data:
+                self.table_data[row_label] = {}
+            
+            # Set game_id and is_header
+            self.table_data[row_label]['game_id'] = df.at[row_label, 'game_id']
+            self.table_data[row_label]['is_header'] = df.at[row_label, 'is_header']
+            
+            # Set bookmaker data
+            for bm in bm_columns:
+                if pd.notna(df.at[row_label, bm]) and df.at[row_label, bm] != "":
+                    self.table_data[row_label][bm] = df.at[row_label, bm]
+
+    
+    
+    
         
 
 
@@ -730,7 +777,7 @@ class ModernOddsWindow(QMainWindow):
     @qasync.asyncSlot() 
     # This function might just be too fucking much
     async def refresh_data(self):
-        """Fetch and update odds data asynchronously"""
+        """Fetch and update odds data asynchronously using pandas for comparison"""
         if not self.leagues_loaded:
             print("Leagues not loaded yet. Please wait.")
             return
@@ -743,7 +790,7 @@ class ModernOddsWindow(QMainWindow):
         self.last_update_label.setText(f"Last Update: {current_time}")
         
         # Update status during refresh
-        self.update_status.setStyleSheet("background-color: #007bff; color: black;")
+        self.update_status.setStyleSheet("background-color: #007bff; color: white;")
         self.update_status.setText("Updating odds...")
         
         try:
@@ -751,34 +798,40 @@ class ModernOddsWindow(QMainWindow):
             sport_key = self.data_manager.league_map.get(selected_league)
             if not sport_key:
                 print(f"No valid sport key found for the selected league: {selected_league}")
-                self.update_status.setStyleSheet("background-color: #dc3545; color: black;")
+                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
                 self.update_status.setText("Error: Invalid league selection")
                 return
     
             # Create or get existing tab
             tab_data = self.create_league_tab(selected_league, sport_key)
             
+            # Store current table state in a DataFrame before updating
+            current_df = None
+            if tab_data.table_rows:
+                current_df = tab_data.to_dataframe()
+            
             self.data_manager.sport_key = sport_key
             self.data_manager.prop_client = PropClient(sport_key)
     
-            # Reset tab data for fresh query
-            tab_data.num_rows = 0
-            tab_data.table_rows.clear()
-            tab_data.table_data.clear()
-            tab_data.game_colors.clear()
-            tab_data.current_color_index = 0
-    
+            # Create a new DataFrame for the updated data
+            new_table_rows = []
+            new_table_data = {}
+            
             async with aiohttp.ClientSession() as session:
                 games = await self.data_manager.prop_client.get_games(session)
             print(f"Fetched games response: {games}")
     
             if not isinstance(games, list):
                 print(f"Unexpected response from get_games(): {games}")
-                self.update_status.setStyleSheet("background-color: #dc3545; color: black;")
+                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
                 self.update_status.setText("Error: Invalid response format")
                 return
     
+            # Process odds data for each game
             total_games = len(games)
+            bookmakers_seen = set()
+            game_odds_data = {}
+            
             for index, game in enumerate(games):
                 game_id = game.get('id', '')
                 if not game_id:
@@ -791,19 +844,81 @@ class ModernOddsWindow(QMainWindow):
     
                 async with aiohttp.ClientSession() as session:
                     available_markets = self.selected_markets.copy()
-                    selected_region = self.selected_region  # Use the selected region
+                    selected_region = self.selected_region
                     odds = await self.data_manager.prop_client.get_event_odds(
                         session, 
                         game_id, 
                         available_markets, 
-                        region=selected_region  # Use the selected region here
+                        region=selected_region
                     )
+                    
+                game_odds_data[game_id] = odds
                 
-                print(selected_league)
-                print(game_id)
-                print(odds)
-                self.data_manager.odds_updated.emit(odds, selected_league)
-    
+                # Extract key info from this game
+                home_team = odds.get('home_team', 'Unknown')
+                away_team = odds.get('away_team', 'Unknown')
+                
+                # Add header row for the game
+                game_header = f"Game: {home_team} vs {away_team}"
+                new_table_rows.append(game_header)
+                new_table_data[game_header] = {'is_header': True, 'game_id': game_id}
+                
+                # Process all bookmakers and markets
+                for bm in odds.get('bookmakers', []):
+                    bm_title = bm['title']
+                    bookmakers_seen.add(bm_title)
+                    
+                    for market in bm.get('markets', []):
+                        market_key = market['key']
+                        for outcome in market.get('outcomes', []):
+                            # Create the row label
+                            unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
+                            
+                            # Add row if not already present
+                            if unique_label not in new_table_rows:
+                                new_table_rows.append(unique_label)
+                                new_table_data[unique_label] = {'game_id': game_id}
+                                
+                            # Update price
+                            price = self.format_price(outcome)
+                            new_table_data[unique_label][bm_title] = price
+            
+            # Create a new DataFrame from the collected data
+            new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
+            
+            # Fill the new DataFrame
+            for row_label in new_table_rows:
+                row_data = new_table_data.get(row_label, {})
+                for bm in bookmakers_seen:
+                    new_df.at[row_label, bm] = row_data.get(bm, "")
+                    
+            # Add game_id and is_header columns
+            new_df['game_id'] = [new_table_data.get(row, {}).get('game_id', '') for row in new_table_rows]
+            new_df['is_header'] = [new_table_data.get(row, {}).get('is_header', False) for row in new_table_rows]
+            
+            # Identify changes between current and new data
+            changes = {}
+            if current_df is not None:
+                # Look for changed odds
+                for row in new_df.index:
+                    if row in current_df.index:
+                        for bm in bookmakers_seen:
+                            if bm in current_df.columns:
+                                old_val = current_df.at[row, bm]
+                                new_val = new_df.at[row, bm]
+                                if old_val != new_val and old_val != "" and new_val != "":
+                                    if row not in changes:
+                                        changes[row] = {}
+                                    changes[row][bm] = (old_val, new_val)
+            
+            # Update tab_data with the new data
+            tab_data.bookmakers = list(bookmakers_seen)
+            tab_data.table_rows = new_table_rows
+            tab_data.table_data = new_table_data
+            
+            # Update the table display with highlighting changes
+            self.update_table_with_changes(tab_data, changes)
+            
             self.progress.setValue(100)
             
             # Reset status text if auto-update is enabled
@@ -813,6 +928,11 @@ class ModernOddsWindow(QMainWindow):
             else:
                 self.update_status.setStyleSheet("background-color: #28a745; color: white;")
                 self.update_status.setText("Update complete")
+                
+            # Log the number of changed lines
+            if changes:
+                total_changes = sum(len(changes_dict) for changes_dict in changes.values())
+                print(f"Total lines changed: {total_changes}")
                 
         except aiohttp.ClientError as e:
             print(f"Network error: {e}")
@@ -829,6 +949,115 @@ class ModernOddsWindow(QMainWindow):
             # Reset error messages after a delay
             if not self.auto_update_check.isChecked():
                 QTimer.singleShot(5000, lambda: self.update_status.setText(""))
+
+
+# Update Odds table with changes after auto-update, likely needs to be refactored or moved to different file
+    def update_table_with_changes(self, tab_data, changes):
+        """Update the table with efficient display of odds changes"""
+        table = tab_data.table_widget
+        
+        # Count the total number of changed cells
+        total_changes = sum(len(changes_dict) for changes_dict in changes.values())
+        
+        # Update the changes counter label
+        if hasattr(self, 'changes_counter_label'):
+            if total_changes > 0:
+                self.changes_counter_label.setText(f"Lines Changed: {total_changes}")
+                self.changes_counter_label.setStyleSheet("color: #dc3545; font-weight: bold;")
+                
+                # Reset the color after 5 seconds
+                QTimer.singleShot(5000, lambda: self.changes_counter_label.setStyleSheet("color: #6c757d;"))
+            else:
+                self.changes_counter_label.setText("No Changes")
+        
+        # Update table structure if needed
+        expected_cols = len(tab_data.bookmakers) + 1
+        if table.columnCount() != expected_cols:
+            table.setColumnCount(expected_cols)
+            table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
+        
+        expected_rows = len(tab_data.table_rows)
+        if table.rowCount() != expected_rows:
+            table.setRowCount(expected_rows)
+        
+        # Update all rows
+        for row_idx, row_label in enumerate(tab_data.table_rows):
+            row_data = tab_data.table_data[row_label]
+            game_id = row_data['game_id']
+            color = tab_data.get_game_color(game_id)
+            
+            # Create or update row header
+            header_item = table.item(row_idx, 0)
+            if not header_item:
+                header_item = ColoredTableItem(row_label, game_id)
+                table.setItem(row_idx, 0, header_item)
+            else:
+                header_item.setText(row_label)
+            
+            # Apply header styling
+            if row_data.get('is_header'):
+                font = QFont()
+                font.setBold(True)
+                header_item.setFont(font)
+                header_item.setBackground(color)
+                header_item.setForeground(QColor('black'))
+            else:
+                market_color = QColor(color)
+                market_color.setAlpha(230)
+                header_item.setBackground(market_color)
+                header_item.setForeground(QColor('black'))
+            
+            # Update bookmaker columns
+            for col_idx, bm in enumerate(tab_data.bookmakers, 1):
+                current_value = row_data.get(bm, "")
+                
+                item = table.item(row_idx, col_idx)
+                if not item:
+                    item = ColoredTableItem(current_value, game_id)
+                    table.setItem(row_idx, col_idx, item)
+                else:
+                    item.setText(current_value)
+                
+                # Check if this cell has changed
+                if row_label in changes and bm in changes[row_label]:
+                    old_value, new_value = changes[row_label][bm]
+                    
+                    # Parse the odds values for comparison
+                    try:
+                        current_odds = float(new_value.split()[0])
+                        previous_odds = float(old_value.split()[0])
+                        
+                        # Better odds (higher value) = green, worse odds = red
+                        if current_odds > previous_odds:
+                            highlight_color = QColor(0, 200, 0, 180)  # Semi-transparent green
+                        else:
+                            highlight_color = QColor(200, 0, 0, 180)  # Semi-transparent red
+                        
+                        item.setBackground(highlight_color)
+                        item.setForeground(QColor('black'))  # Keep text black for readability
+                        
+                        # Reset background after 5 seconds
+                        market_color = QColor(color)
+                        market_color.setAlpha(230)
+                        QTimer.singleShot(5000, lambda i=item, c=market_color: (
+                            i.setBackground(c),
+                            i.setForeground(QColor('black'))
+                        ))
+                    except (ValueError, IndexError):
+                        # If we can't parse the odds, just update without highlighting
+                        pass
+                else:
+                    # No change, maintain consistent background and text color
+                    if not row_data.get('is_header'):
+                        market_color = QColor(color)
+                        market_color.setAlpha(230)
+                        item.setBackground(market_color)
+                        item.setForeground(QColor('black'))
+        
+        # Resize the table
+        table.resizeColumnsToContents()
+        table.resizeRowsToContents()
+
 
 
 async def main():
