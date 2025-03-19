@@ -9,6 +9,8 @@ from PyQt6.QtWidgets import (
 )
 import traceback
 
+# TODO: the two tables don't have filtering synced
+# TODO: the player table can't be sorted by column
 
 class FrozenTableWidget(QTableWidget):
     """Widget for displaying frozen columns"""
@@ -245,7 +247,8 @@ class AdvancedStatsWidget(QWidget):
                 df = df.sort_values(by='MIN', ascending=False)
             
             # Take top players (to avoid overwhelming the table)
-            df_display = df.head(50)
+            # df_display = df.head(50)
+            df_display = df
             
             # Prepare for row data insertion
             self.frozen_table.setSortingEnabled(False)
@@ -392,7 +395,7 @@ class AdvancedStatsWidget(QWidget):
             stat_cols = ['MIN', 'PASSES_MADE', 'PASSES_RECEIVED', 'AST', 'POTENTIAL_AST', 'SECONDARY_AST',
                        'AST_POINTS_CREATED', 'AST_ADJ', 'AST_TO_PASS_PCT']
         elif 'REB_CHANCES' in df.columns:  # Rebounding stats
-            stat_cols = ['MIN', 'OREB', 'OREB_CONTEST', 'OREB_UNCONTEST', 'OREB_CONTEST_PCT', 
+            stat_cols = ['MIN','REB', 'OREB', 'OREB_CONTEST', 'OREB_UNCONTEST', 'OREB_CONTEST_PCT', 
                          'OREB_CHANCES', 'OREB_CHANCE_PCT', 'OREB_CHANCE_DEFER', 'OREB_CHANCE_PCT_ADJ', 
                          'AVG_OREB_DIST', 'DREB', 'DREB_CONTEST', 'DREB_UNCONTEST', 'DREB_CONTEST_PCT',
                          'DREB_CHANCES', 'DREB_CHANCE_PCT', 'DREB_CHANCE_DEFER', 'DREB_CHANCE_PCT_ADJ',

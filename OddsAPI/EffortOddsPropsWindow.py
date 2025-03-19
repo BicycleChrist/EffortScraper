@@ -313,13 +313,19 @@ class PropsWindow(BaseTableWindow):
         bottom_container = QWidget()
         bottom_layout = QHBoxLayout(bottom_container)
         bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
-    
+        
+        # 'game_group' and checkbox-buttons need to match width
+        game_selection_width = 600
+        game_selection_height = 250
+        
         # Add the game selection box to the left
         game_group = QGroupBox()
         game_group_layout = QVBoxLayout(game_group)
         game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
         game_group_layout.setSpacing(0)  # Remove spacing between elements
-    
+        game_group.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
+        game_group.setFixedHeight(game_selection_height) # not necessary?
+        
         # Create horizontal layout for buttons
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(2)  # Reduce spacing between buttons
@@ -346,7 +352,7 @@ class PropsWindow(BaseTableWindow):
         self.game_selection_area.setContentsMargins(0, 0, 0, 0)
         
         # Set a fixed width that's narrower to reduce the spacing
-        self.game_selection_area.setFixedWidth(600)  # Adjust this value based on your needs
+        self.game_selection_area.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
         
         self.game_selection_widget = QWidget()
         self.game_selection_layout = QGridLayout(self.game_selection_widget)
@@ -358,7 +364,7 @@ class PropsWindow(BaseTableWindow):
         game_group_layout.addWidget(self.game_selection_area)
     
         # Add the game selection box to the left side of the bottom container
-        game_group.setFixedHeight(250)  # Reduced from 300 to make more compact
+        game_group.setFixedHeight(game_selection_height)  # Reduced from 300 to make more compact
         bottom_layout.addWidget(game_group)
     
         # Add the best lines widget to the right side of the bottom container

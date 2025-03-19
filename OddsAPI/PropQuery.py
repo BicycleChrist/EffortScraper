@@ -5,7 +5,6 @@ import pathlib
 from typing import Optional, Dict, List, Set
 from Creds import ODDS_API_KEY
 from marketKeys import SPORTS_MARKETS, NBA_MARKETS, MLB_MARKETS, NHL_MARKETS, AFL_MARKETS, SOCCER_MARKETS
-from parlay_analyzer import find_best_parlays
 import requests
 
 # Define save directory
@@ -205,15 +204,15 @@ async def main():
             props_by_player = format_props_by_player(props_data)
             save_data(event_id, props_by_player, "player_props")
 
-            print("Finding best parlays...")
-            prizepicks_parlays = find_best_parlays({event_id: props_by_player}, "PrizePicks")
-            underdog_parlays = find_best_parlays({event_id: props_by_player}, "Underdog")
-            print("PrizePicks Best Parlays:")
-            print(json.dumps(prizepicks_parlays, indent=2))
-            print("Underdog Best Parlays:")
-            print(json.dumps(underdog_parlays, indent=2))
-            save_data(event_id, prizepicks_parlays, "prizepicks_parlay_results")
-            save_data(event_id, underdog_parlays, "underdog_parlay_results")
+            #print("Finding best parlays...")
+            #prizepicks_parlays = find_best_parlays({event_id: props_by_player}, "PrizePicks")
+            #underdog_parlays = find_best_parlays({event_id: props_by_player}, "Underdog")
+            #print("PrizePicks Best Parlays:")
+            #print(json.dumps(prizepicks_parlays, indent=2))
+            #print("Underdog Best Parlays:")
+            #print(json.dumps(underdog_parlays, indent=2))
+            #save_data(event_id, prizepicks_parlays, "prizepicks_parlay_results")
+            #save_data(event_id, underdog_parlays, "underdog_parlay_results")
         
         print(f"Total API requests made: {client.request_count}")
 
