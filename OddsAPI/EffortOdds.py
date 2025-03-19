@@ -259,7 +259,20 @@ class ModernOddsWindow(QMainWindow):
         self.init_ui()
         self.connect_signals()
         self.selected_region = "us" # default region should always be a string
-
+        
+        self.icon_frame = 0
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(16)
+    
+    def UpdateIcon(self):
+        framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
+        next_icon = f"{framesdir}/frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(next_icon))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
+        #print(next_icon)
+    
     def init_ui(self):
         """Initialize the user interface components"""
         self.setWindowTitle("Effort Odds")
@@ -951,7 +964,7 @@ class ModernOddsWindow(QMainWindow):
                 QTimer.singleShot(5000, lambda: self.update_status.setText(""))
 
 
-# Update Odds table with changes after auto-update, likely needs to be refactored or moved to different file
+# Update Odds table with changes
     def update_table_with_changes(self, tab_data, changes):
         """Update the table with efficient display of odds changes"""
         table = tab_data.table_widget

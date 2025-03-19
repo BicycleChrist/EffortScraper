@@ -262,7 +262,20 @@ class PropsWindow(BaseTableWindow):
         self.timer.setSingleShot(True)  # Ensure the timer only fires once
         self.timer.timeout.connect(self.start_async_init)
         self.timer.start(0)  # Start the timer immediately after the constructor
-
+        
+        self.icon_frame = 0
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(16)
+    
+    def UpdateIcon(self):
+        framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
+        next_icon = f"{framesdir}/frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(next_icon))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
+        #print(next_icon)
+    
     def start_async_init(self):
         """Start the asynchronous initialization of the UI."""
         import asyncio
@@ -304,7 +317,7 @@ class PropsWindow(BaseTableWindow):
         # Add the game selection box to the left
         game_group = QGroupBox()
         game_group_layout = QVBoxLayout(game_group)
-        game_group_layout.setContentsMargins(3, 3, 3, 3)  # Tighter margins
+        game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
         game_group_layout.setSpacing(0)  # Remove spacing between elements
     
         # Create horizontal layout for buttons
@@ -326,20 +339,26 @@ class PropsWindow(BaseTableWindow):
         buttons_layout.addStretch()  # Add stretch to push buttons to the left
         game_group_layout.addLayout(buttons_layout)
     
-        # Add the game selection scroll area
+        # Add the game selection scroll area with improved spacing
         self.game_selection_area = QScrollArea()
         self.game_selection_area.setWidgetResizable(True)
-        # self.game_selection_area.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # Fixed size in both dimensions
-        # self.game_selection_area.setFixedHeight(80)  # Fixed height that's sufficient but compact
+        self.game_selection_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.game_selection_area.setContentsMargins(0, 0, 0, 0)
+        
+        # Set a fixed width that's narrower to reduce the spacing
+        self.game_selection_area.setFixedWidth(600)  # Adjust this value based on your needs
+        
         self.game_selection_widget = QWidget()
         self.game_selection_layout = QGridLayout(self.game_selection_widget)
         self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
-        self.game_selection_layout.setSpacing(0)  # Remove spacing between checkboxes completely
+        self.game_selection_layout.setHorizontalSpacing(0)  # Set horizontal spacing to 0
+        self.game_selection_layout.setVerticalSpacing(0)    # Set vertical spacing to 0
+        
         self.game_selection_area.setWidget(self.game_selection_widget)
         game_group_layout.addWidget(self.game_selection_area)
     
         # Add the game selection box to the left side of the bottom container
-        game_group.setFixedHeight(300)
+        game_group.setFixedHeight(250)  # Reduced from 300 to make more compact
         bottom_layout.addWidget(game_group)
     
         # Add the best lines widget to the right side of the bottom container
@@ -378,6 +397,12 @@ class PropsWindow(BaseTableWindow):
     
         # Use just 2 columns to match the screenshot layout
         num_columns = 2
+        
+        # Set zero spacing for the grid layout and remove margins
+        self.game_selection_layout.setSpacing(0)
+        self.game_selection_layout.setContentsMargins(0, 0, 0, 0)
+        self.game_selection_layout.setHorizontalSpacing(0) # Explicitly set horizontal spacing to 0
+        self.game_selection_layout.setVerticalSpacing(0)   # Explicitly set vertical spacing to 0
     
         # Add a checkbox for each game
         for idx, game in enumerate(games):
@@ -389,18 +414,16 @@ class PropsWindow(BaseTableWindow):
             checkbox = QCheckBox(game_label)
             checkbox.setChecked(True)  # Default to selected
             
-            # Keep font size reasonable for readability
-            # Font size is now handled in the stylesheet
-            
-            # Make checkboxes reasonably sized but still compact
+            # Tighter styling with reduced height and zero vertical margins
             checkbox.setStyleSheet("""
                 QCheckBox { 
-                    padding: 1px; 
+                    padding: 0px; 
                     margin: 0px; 
-                    min-height: 20px; 
-                    max-height: 20px; 
-                    height: 20px;
+                    min-height: 14px; 
+                    max-height: 14px; 
+                    height: 14px;
                     font-size: 9pt;
+                    spacing: 2px; /* Reduce space between checkbox and text */
                 }
             """)
             
@@ -413,6 +436,11 @@ class PropsWindow(BaseTableWindow):
     
         # Adjust the layout to fit the content
         self.game_selection_widget.adjustSize()
+
+    # Update the game selection area configuration in init_prop_ui method
+    # Replace the game_selection_area related code with this
+
+    # Update the portion of init_prop_ui where you create the game selection area
     
     def set_all_game_checkboxes(self, checked: bool):
         """Set all game checkboxes to checked or unchecked state."""
