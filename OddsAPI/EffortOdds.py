@@ -14,6 +14,9 @@ from OddsAPIQuery import league_query, odds_query
 from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
 import pandas as pd
+from GUItuneinwidget import TuneInWidget
+
+
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -273,22 +276,50 @@ class ModernOddsWindow(QMainWindow):
         self.icon_frame = ((self.icon_frame + 1) % 200)
         #print(next_icon)
     
+
     def init_ui(self):
         """Initialize the user interface components"""
         self.setWindowTitle("Effort Odds")
         self.setGeometry(100, 100, 800, 600)
-        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png")) # Change to relative path
+        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        self.layout = QVBoxLayout(main_widget)  # Define self.layout here
+        self.layout = QVBoxLayout(main_widget)
         
+        # --------- TOP SECTION ---------
         # League selection dropdown
+        league_layout = QHBoxLayout()
+        league_layout.addWidget(QLabel("Select League:"))
         self.league_selector = QComboBox()
-        self.layout.addWidget(QLabel("Select League:"))
-        self.layout.addWidget(self.league_selector)
+        league_layout.addWidget(self.league_selector)
         
-        # Bunch of BS for the region checkboxes
+        # Add streaming toggle button to the right of league selector
+        league_layout.addStretch(1)  # Push the button to the right
+        self.stream_toggle_button = QPushButton("Show Streaming Links ▼")
+        self.stream_toggle_button.setCheckable(True)
+        self.stream_toggle_button.setChecked(False)
+        self.stream_toggle_button.clicked.connect(self.toggle_streaming_links)
+        self.stream_toggle_button.setFixedWidth(150)
+        self.stream_toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: none;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 9pt;
+            }
+            QPushButton:checked {
+                background-color: #34495E;
+            }
+        """)
+        league_layout.addWidget(self.stream_toggle_button)
+        
+        self.layout.addLayout(league_layout)
+        
+        # --------- REGION SECTION ---------
+        # Region selection checkboxes
         region_label = QLabel("Select Region:")
         self.layout.addWidget(region_label)
         
@@ -306,17 +337,18 @@ class ModernOddsWindow(QMainWindow):
                 checkbox.setChecked(True)
             checkbox.stateChanged.connect(lambda state, r=region: self.handle_region_change(r))
             self.region_checkboxes[region] = checkbox
-            region_layout.addWidget(checkbox, i // 3, i % 3)  # Changed to 3 columns
+            region_layout.addWidget(checkbox, i // 3, i % 3)
         
-        region_container.setFixedHeight(58) # exactly 58 or the bottom of the g gets cut off in global put me on tilt
+        region_container.setFixedHeight(58)
         region_container.setFixedWidth(200)
         self.layout.addWidget(region_container)
         
-        # Market selection and refresh controls
-        controls_container = QWidget()
-        controls_layout = QHBoxLayout(controls_container)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-
+        # --------- MARKET AND STREAMING SECTION ---------
+        # This is where the key change happens - we put the streaming widget in the same row as the market buttons
+        
+        # Create a horizontal layout for markets and streaming
+        market_streaming_layout = QHBoxLayout()
+        
         # Left side container for regular markets
         left_container = QWidget()
         left_layout = QHBoxLayout(left_container)
@@ -330,51 +362,56 @@ class ModernOddsWindow(QMainWindow):
             btn.setChecked(market in self.selected_markets)
             btn.setObjectName(f"market_{market}")
             self.market_buttons[market] = btn
-            btn.setStyleSheet(self.BUTTON_STYLE)  # Apply style
+            btn.setStyleSheet(self.BUTTON_STYLE)
             left_layout.addWidget(btn)
         
         # Add fetch button
-        self.fetch_odds_button = QPushButton("Fetch Odds 🎰") # slot machine
-        self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)  # Apply style
+        self.fetch_odds_button = QPushButton("Fetch Odds 🎰")
+        self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)
         left_layout.addWidget(self.fetch_odds_button)
-
-        # Right side container for props
-        right_container = QWidget()
-        right_layout = QHBoxLayout(right_container)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
+        
         # Add props button
         self.props_button = QPushButton("Props ➣➣")
         self.props_button.setObjectName("market_props")
         self.props_button.setEnabled(False)
-        self.props_button.setStyleSheet(self.props_button_style)  # Apply style
+        self.props_button.setStyleSheet(self.props_button_style)
         self.market_buttons["props"] = self.props_button
-        right_layout.addWidget(self.props_button)
-
+        left_layout.addWidget(self.props_button)
+        
         # Add props availability label
         self.props_availability_label = QLabel("No Props available for this league")
         self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
         self.props_availability_label.setVisible(False)
-        right_layout.addWidget(self.props_availability_label)
-        right_layout.addStretch()
-
-        # Add both containers to main controls layout
-        controls_layout.addWidget(left_container)
-        controls_layout.addWidget(right_container)
-
-        # Add controls container to main layout
-        self.layout.addWidget(controls_container)
+        left_layout.addWidget(self.props_availability_label)
         
+        # Add the left container to the market_streaming_layout
+        market_streaming_layout.addWidget(left_container)
+        
+        # Add a stretch to push everything to the left and right
+        market_streaming_layout.addStretch(1)
+        
+        # Add the TuneInWidget to the right side of market_streaming_layout
+        self.tune_in_widget = TuneInWidget()
+        self.tune_in_widget.setVisible(False)  # Hidden by default
+        self.tune_in_widget.setFixedWidth(650)  # Fixed width to make it compact
+        market_streaming_layout.addWidget(self.tune_in_widget)
+        
+        # Add the market_streaming_layout to the main layout
+        self.layout.addLayout(market_streaming_layout)
+        
+        # --------- PROGRESS BAR ---------
         # Progress bar
         self.progress = QProgressBar()
         self.layout.addWidget(self.progress)
         
+        # --------- ODDS SECTION ---------
         # Tab widget for different leagues
         self.tab_widget = QTabWidget()
         self.layout.addWidget(QLabel("Odds:"))
         self.layout.addWidget(self.tab_widget)
         self.layout.addWidget(self.tab_widget, 1)
         
+        # --------- AUTO-UPDATE CONTROLS ---------
         # Auto-update controls
         update_controls_layout = QHBoxLayout()
         
@@ -414,6 +451,20 @@ class ModernOddsWindow(QMainWindow):
         update_controls_layout.addStretch()
         
         self.layout.addLayout(update_controls_layout)
+
+
+
+# Add this method to your ModernOddsWindow class if you don't have it already
+    def toggle_streaming_links(self):
+        """Toggle visibility of the streaming links widget"""
+        visible = self.stream_toggle_button.isChecked()
+        self.tune_in_widget.setVisible(visible)
+        
+        # Update button text
+        if visible:
+            self.stream_toggle_button.setText("Hide Streaming Links ▲")
+        else:
+            self.stream_toggle_button.setText("Show Streaming Links ▼")
 
     def update_market_selection(self):
         """Update selected markets based on button states"""
@@ -786,6 +837,19 @@ class ModernOddsWindow(QMainWindow):
             self.timer.start(interval_ms)
             print(f"timer interval updated: {interval_ms}")
         # self.update_status_text() # crashes
+    
+    def toggle_streaming_links(self):
+        """Toggle visibility of the streaming links widget"""
+        visible = self.stream_toggle_button.isChecked()
+        self.tune_in_widget.setVisible(visible)
+        
+        # Update button text
+        if visible:
+            self.stream_toggle_button.setText("Hide Streaming Links ▲")
+        else:
+            self.stream_toggle_button.setText("Show Streaming Links ▼")
+
+
 
     @qasync.asyncSlot() 
     # This function might just be too fucking much
