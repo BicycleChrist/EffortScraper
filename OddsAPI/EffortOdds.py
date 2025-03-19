@@ -15,7 +15,7 @@ from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
 import pandas as pd
 from GUItuneinwidget import TuneInWidget
-
+from GUIteamnewswidget import TeamNewsWidget
 
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
@@ -296,6 +296,8 @@ class ModernOddsWindow(QMainWindow):
         
         # Add streaming toggle button to the right of league selector
         league_layout.addStretch(1)  # Push the button to the right
+        
+        # Create toggle buttons
         self.stream_toggle_button = QPushButton("Show Streaming Links ▼")
         self.stream_toggle_button.setCheckable(True)
         self.stream_toggle_button.setChecked(False)
@@ -314,7 +316,44 @@ class ModernOddsWindow(QMainWindow):
                 background-color: #34495E;
             }
         """)
-        league_layout.addWidget(self.stream_toggle_button)
+        
+        # Create news toggle button
+        self.news_toggle_button = QPushButton("Show Injury News ▼")
+        self.news_toggle_button.setCheckable(True)
+        self.news_toggle_button.setChecked(False)
+        self.news_toggle_button.clicked.connect(self.toggle_news_feed)
+        self.news_toggle_button.setFixedWidth(150)
+        self.news_toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: none;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 9pt;
+            }
+            QPushButton:checked {
+                background-color: #34495E;
+            }
+        """)
+        
+        # Create a dedicated container for the right side elements
+        right_side_container = QWidget()
+        right_side_layout = QVBoxLayout(right_side_container)
+        right_side_layout.setContentsMargins(0, 0, 0, 0)  # No margins
+        right_side_layout.setSpacing(2)  # Minimal spacing between buttons and widget
+        
+        # Create a horizontal layout for the buttons
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.stream_toggle_button)
+        buttons_layout.addWidget(self.news_toggle_button)
+        buttons_layout.setSpacing(4)  # Small spacing between buttons
+        
+        # Add the buttons layout to the right side layout
+        right_side_layout.addLayout(buttons_layout)
+        
+        # Add the right side container to the league layout
+        league_layout.addWidget(right_side_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         
         self.layout.addLayout(league_layout)
         
@@ -395,6 +434,27 @@ class ModernOddsWindow(QMainWindow):
         self.tune_in_widget.setVisible(False)  # Hidden by default
         self.tune_in_widget.setFixedWidth(650)  # Fixed width to make it compact
         market_streaming_layout.addWidget(self.tune_in_widget)
+        
+        # Create the team news widget
+        self.team_news_widget = TeamNewsWidget()
+        self.team_news_widget.setVisible(False)  # Hidden by default
+        self.team_news_widget.setFixedWidth(650)  # Fixed width to match tune_in_widget
+        
+        # Create news container and add to right side layout
+        self.news_container = QWidget()
+        self.news_container.setFixedWidth(650)  # Match the width of the widget
+        news_container_layout = QVBoxLayout(self.news_container)
+        news_container_layout.setContentsMargins(0, 0, 0, 0)  # Zero margins
+        news_container_layout.setSpacing(0)  # Zero spacing
+        news_container_layout.addWidget(self.team_news_widget)
+        
+        # Set initial state for the news container
+        self.news_container.setVisible(False)  # Hide container initially
+        self.news_container.setMaximumHeight(0)  # No height initially
+        
+        # Add news container to right side layout
+        right_side_layout.addWidget(self.news_container)
+        right_side_layout.addStretch(1)  # Push everything to the top
         
         # Add the market_streaming_layout to the main layout
         self.layout.addLayout(market_streaming_layout)
@@ -487,6 +547,8 @@ class ModernOddsWindow(QMainWindow):
         self.props_button.setEnabled(has_props)
         self.props_availability_label.setVisible(not has_props)
         # self.update_market_selection() # not necessary?
+        if hasattr(self, 'team_news_widget'):
+            self.team_news_widget.handle_league_change(sport_key)
 
     
     
@@ -558,6 +620,7 @@ class ModernOddsWindow(QMainWindow):
         self.tab_widget.currentChanged.connect(self.handle_tab_change)
         self.timer.timeout.connect(self.refresh_data)
         self.props_button.clicked.connect(self.handle_props_button)
+        self.news_toggle_button.clicked.connect(self.toggle_news_feed)
 
     # Rest of the class methods remain unchanged...
     # (RestartTimer, update_status_text, initialize, populate_leagues, 
@@ -848,6 +911,76 @@ class ModernOddsWindow(QMainWindow):
             self.stream_toggle_button.setText("Hide Streaming Links ▲")
         else:
             self.stream_toggle_button.setText("Show Streaming Links ▼")
+    
+    
+    def toggle_news_feed(self):
+        """Toggle visibility of the news feed widget with optimized spacing"""
+        visible = self.news_toggle_button.isChecked()
+        
+        # Hide the streaming widget if showing news
+        if visible:
+            self.stream_toggle_button.setChecked(False)
+            self.tune_in_widget.setVisible(False)
+            self.stream_toggle_button.setText("Show Streaming Links ▼")
+        
+        # Make the widget visible first (needed for proper layout calculations)
+        self.news_container.setVisible(visible)
+        self.team_news_widget.setVisible(visible)
+        
+        # Update button text and adjust container size
+        if visible:
+            self.news_toggle_button.setText("Hide Injury News ▲")
+            
+            # Calculate exact height for 3 articles
+            article_height = 85
+            container_height = (article_height * 3)
+            
+            # Set exact fixed height instead of min/max
+            self.news_container.setFixedHeight(container_height)
+            
+            # KEY FIX: Set negative top margin on progress bar to pull it upward
+            prog_margins = self.progress.contentsMargins()
+            prog_margins.setTop(-100)  # Adjust this value as needed
+            self.progress.setContentsMargins(prog_margins)
+            
+            # Set minimal spacing in main layout
+            self.layout.setSpacing(0)
+        else:
+            self.news_toggle_button.setText("Show Injury News ▼")
+            
+            # Collapse container completely
+            self.news_container.setFixedHeight(0)
+            
+            # Reset progress bar margins to normal
+            prog_margins = self.progress.contentsMargins()
+            prog_margins.setTop(0)
+            self.progress.setContentsMargins(prog_margins)
+            
+            # Reset layout spacing
+            self.layout.setSpacing(0)
+        
+        # Force update to apply changes
+        QTimer.singleShot(10, self.update)
+
+
+
+
+    def set_visible_article_count(self, count):
+        """Set the number of visible articles in the news feed"""
+        if not hasattr(self, 'article_count'):
+            self.article_count = 3  # Default
+        
+        self.article_count = max(1, min(count, 10))  # Keep between 1-10
+        
+        # If news feed is currently visible, update its height
+        if self.news_toggle_button.isChecked():
+            article_height = 85  # Approximate height of one article
+            margins = 10
+            container_height = (article_height * self.article_count) + margins
+            
+            self.news_container.setMinimumHeight(container_height)
+            self.news_container.setMaximumHeight(container_height)
+            QTimer.singleShot(0, self.news_container.updateGeometry)
 
 
 
