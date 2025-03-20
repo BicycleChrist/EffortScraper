@@ -5,13 +5,16 @@ from datetime import datetime, timedelta
 import re
 from bs4 import BeautifulSoup
 import time
-
+import sys
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QColor, QIcon, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton
 )
+
+#TODO: Inline team names into NBA.com URL's
+
 
 class NewsWorker(QObject):
     """Background worker to fetch news without blocking the UI"""
@@ -28,66 +31,48 @@ class NewsWorker(QObject):
             # NBA
             "basketball_nba": {
                 "general": [
-                    "https://www.nba.com/rss/nba_rss.xml",
+                    "https://www.nba.com/rss/nba",
+                    "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
-                    "https://www.fantasypros.com/nba/news/injury.php?format=rss",
+                    "https://www.fantasypros.com/nba/player-news.php",
                     "https://www.rotoballer.com/feed/nba-player-news",
-                    "https://www.cbssports.com/rss/headlines/nba/injuries"
+                    "https://www.insidehoops.com/blog/?feed=rss2",
+                    "https://sports.yahoo.com/nba/rss.xml"
                 ],
-                "teams": {
-                    "Lakers": ["https://www.lakersnation.com/feed/"],
-                    "Celtics": ["https://www.celticsblog.com/rss/"],
-                    # Add more team-specific feeds as needed
-                }
+        
             },
             # NFL
             "football_nfl": {
                 "general": [
                     "https://www.nfl.com/rss/rsslanding?searchString=home",
+                    "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
                     "https://www.fantasypros.com/nfl/news/injury.php?format=rss",
                     "https://www.rotoballer.com/feed/nfl-player-news",
                     "https://www.cbssports.com/rss/headlines/nfl/injuries"
-                ],
-                "teams": {
-                    # Team specific feeds
-                }
+                ]
             },
             # MLB
             "baseball_mlb": {
                 "general": [
                     "https://www.mlb.com/feeds/news/rss.xml",
+                    "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
                     "https://www.fantasypros.com/mlb/news/injury.php?format=rss",
                     "https://www.rotoballer.com/feed/mlb-player-news",
                     "https://www.cbssports.com/rss/headlines/mlb/injuries"
-                ],
-                "teams": {
-                    # Team specific feeds
-                }
+                ]
             },
             # NHL
             "icehockey_nhl": {
                 "general": [
-                    "https://www.nhl.com/feeds/news/rss.xml",
+                    "http://www.nhl.com/rss/news.xml",
+                    "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
                     "https://www.fantasypros.com/nhl/news/injury.php?format=rss",
                     "https://www.rotoballer.com/feed/nhl-player-news",
                     "https://www.cbssports.com/rss/headlines/nhl/injuries"
-                ],
-                "teams": {
-                    # Team specific feeds
-                }
-            },
-            # MLS
-            "soccer_usa_mls": {
-                "general": [
-                    "https://www.mlssoccer.com/feed/news",
-                    "https://www.espn.com/espn/rss/soccer/news"
-                ],
-                "teams": {
-                    # Team specific feeds
-                }
+                ]
             }
         }
 
@@ -446,7 +431,7 @@ class TeamNewsWidget(QWidget):
         header_layout.setContentsMargins(5, 0, 5, 0)  # Small horizontal margins only
         
         title_label = QLabel("Team News & Injury Updates")
-        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #212529;")
+        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e55717;")
         header_layout.addWidget(title_label)
         
         header_layout.addStretch()
@@ -648,7 +633,6 @@ class TeamNewsWidget(QWidget):
 # For testing the widget standalone
 if __name__ == "__main__":
     from PyQt6.QtWidgets import QApplication
-    import sys
 
     app = QApplication(sys.argv)
 

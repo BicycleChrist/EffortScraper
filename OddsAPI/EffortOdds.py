@@ -7,7 +7,7 @@ from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout
+    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter
 )
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
@@ -21,6 +21,8 @@ from GUIteamnewswidget import TeamNewsWidget
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
+#TODO: Layout becomes semi-jenk  once news widget is toggeled on, needs fix
+
 MAJOR_PROP_LEAGUES = {
     "basketball_nba": NBA_MARKETS,
     "baseball_mlb": MLB_MARKETS,
@@ -469,7 +471,16 @@ class ModernOddsWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.layout.addWidget(QLabel("Odds:"))
         self.layout.addWidget(self.tab_widget)
+        # Create a QSplitter
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.addWidget(self.tab_widget)
+        self.splitter.addWidget(self.news_container)  # Add news container to splitter
+        
+        # Set initial splitter sizes
+        self.splitter.setSizes([400, 100])
+
         self.layout.addWidget(self.tab_widget, 1)
+        self.layout.addWidget(self.splitter)
         
         # --------- AUTO-UPDATE CONTROLS ---------
         # Auto-update controls
