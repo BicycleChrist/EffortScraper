@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton
 )
 
-#TODO: Inline team names into NBA.com URL's
+#TODO: Add in a news refresh timer...
 
 
 class NewsWorker(QObject):
@@ -35,9 +35,9 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
                     "https://www.fantasypros.com/nba/player-news.php",
-                    "https://www.rotoballer.com/feed/nba-player-news",
                     "https://www.insidehoops.com/blog/?feed=rss2",
-                    "https://sports.yahoo.com/nba/rss.xml"
+                    "https://sports.yahoo.com/nba/rss.xml",
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],
         
             },
@@ -47,9 +47,10 @@ class NewsWorker(QObject):
                     "https://www.nfl.com/rss/rsslanding?searchString=home",
                     "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
-                    "https://www.fantasypros.com/nfl/news/injury.php?format=rss",
-                    "https://www.rotoballer.com/feed/nfl-player-news",
-                    "https://www.cbssports.com/rss/headlines/nfl/injuries"
+                    "https://www.fantasypros.com/nfl/news/injury.php?format=rss",                    
+                    "https://www.cbssports.com/rss/headlines/nfl/injuries",
+                    "https://sports.yahoo.com/nfl/rss.xml",
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl"
                 ]
             },
             # MLB
@@ -59,8 +60,9 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
                     "https://www.fantasypros.com/mlb/news/injury.php?format=rss",
-                    "https://www.rotoballer.com/feed/mlb-player-news",
-                    "https://www.cbssports.com/rss/headlines/mlb/injuries"
+                    "https://www.cbssports.com/rss/headlines/mlb/injuries",
+                    "https://sports.yahoo.com/mlb/rss.xml",
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb"
                 ]
             },
             # NHL
@@ -70,20 +72,13 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
                     "https://www.fantasypros.com/nhl/news/injury.php?format=rss",
-                    "https://www.rotoballer.com/feed/nhl-player-news",
-                    "https://www.cbssports.com/rss/headlines/nhl/injuries"
+                    "https://www.cbssports.com/rss/headlines/nhl/injuries",
+                    "https://sports.yahoo.com/nhl/rss.xml",
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ]
             }
         }
 
-        # Bleacher Report team streams (can be accessed without API)
-        self.bleacher_report_urls = {
-            "basketball_nba": "https://bleacherreport.com/nba",
-            "football_nfl": "https://bleacherreport.com/nfl",
-            "baseball_mlb": "https://bleacherreport.com/mlb",
-            "icehockey_nhl": "https://bleacherreport.com/nhl",
-            "soccer_usa_mls": "https://bleacherreport.com/soccer",
-        }
 
     def set_league(self, league_key):
         """Set the current league to fetch news for"""
@@ -179,63 +174,6 @@ class NewsWorker(QObject):
             print(f"Error fetching RSS feed {url}: {str(e)}")
             return []
 
-    async def fetch_bleacher_report(self, league_key):
-        """Fetch news from Bleacher Report without API"""
-        url = self.bleacher_report_urls.get(league_key)
-        if not url:
-            return []
-
-        news_items = []
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-
-                        # Find news articles (adjust selectors based on BR's actual structure)
-                        articles = soup.select('article.articleContent')
-
-                        for article in articles[:15]:  # Limit to 15 items
-                            title_elem = article.select_one('.atom.articleTitle')
-                            title = title_elem.text.strip() if title_elem else "No Title"
-
-                            link_elem = article.select_one('a')
-                            link = link_elem['href'] if link_elem and 'href' in link_elem.attrs else ""
-                            if link and not link.startswith('http'):
-                                link = f"https://bleacherreport.com{link}"
-
-                            img_elem = article.select_one('img')
-                            image_url = img_elem['src'] if img_elem and 'src' in img_elem.attrs else None
-
-                            # Try to extract date
-                            date_elem = article.select_one('.date')
-                            date = datetime.now()  # Default to now
-                            if date_elem:
-                                try:
-                                    date_text = date_elem.text.strip()
-                                    date = datetime.strptime(date_text, '%B %d, %Y')
-                                except:
-                                    pass  # Keep default date
-
-                            description = ""
-                            desc_elem = article.select_one('.atom.articleDescription')
-                            if desc_elem:
-                                description = desc_elem.text.strip()
-
-                            news_items.append({
-                                'title': title,
-                                'description': description,
-                                'link': link,
-                                'date': date,
-                                'source': 'Bleacher Report',
-                                'image_url': image_url
-                            })
-
-        except Exception as e:
-            print(f"Error fetching Bleacher Report: {str(e)}")
-
-        return news_items
 
     async def fetch_news(self):
         """Fetch news from all configured sources"""
@@ -258,8 +196,6 @@ class NewsWorker(QObject):
         # Fetch from all RSS sources in parallel
         tasks = [self.fetch_rss_feed(url) for url in sources]
 
-        # Add Bleacher Report task
-        tasks.append(self.fetch_bleacher_report(self.league_key))
 
         # Execute all tasks
         results = await asyncio.gather(*tasks)
