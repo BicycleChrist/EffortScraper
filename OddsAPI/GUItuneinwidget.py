@@ -2,12 +2,12 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import GUItunein
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QScrollBar,
     QComboBox, QLabel, QPushButton, QLineEdit, QFrame, QListWidgetItem
 )
-import re
+import webbrowser
+
 
 class TuneInWidget(QWidget):
     """PyQt6 implementation of TuneIn widget for displaying streaming links"""
@@ -24,7 +24,6 @@ class TuneInWidget(QWidget):
             "https://the.streameast.app/mlbstreams17",
             "https://the.streameast.app/nbastreams64",
             "https://the.streameast.app/nflstreams3",
-            "https://methstreams.com/mlb-streams/live1/"
         ]
         
         # League names for filtering
@@ -137,7 +136,7 @@ class TuneInWidget(QWidget):
         self.links_list = QListWidget()
         self.links_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.links_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.links_list.itemDoubleClicked.connect(self.open_link)
+        self.links_list.itemDoubleClicked.connect(lambda item: webbrowser.open(item.text()))
         self.links_list.setFixedHeight(110)
         
         # Build the layout
@@ -184,36 +183,15 @@ class TuneInWidget(QWidget):
         selected_league = self.league_filter.currentText()
         search_text = self.search_box.text().lower()
         
-        self.filtered_links = []
-        self.links_list.clear()
-        
-        for link in self.all_links:
-            link_lower = link.lower()
-            
-            # Apply league filter
-            if selected_league != "All Leagues":
-                keywords = self.league_keywords.get(selected_league, [])
-                if not any(keyword in link_lower for keyword in keywords):
-                    continue
-            
-            # Apply search filter
-            if search_text and search_text not in link_lower:
-                continue
-                
-            self.filtered_links.append(link)
-            self.links_list.addItem(link)
-    
-    @pyqtSlot(QListWidgetItem)
-    def open_link(self, item):
-        """Handle double-click on a link item"""
-        import webbrowser
-        link = item.text()
-        
-        # Only attempt to open if it looks like a URL
-        if link.startswith("http"):
-            webbrowser.open(link)
+        if selected_league == "All Leagues":
+            base_links = self.all_links
         else:
-            # Extract URL from text if it contains a URL
-            url_match = re.search(r'https?://[^\s]+', link)
-            if url_match:
-                webbrowser.open(url_match.group(0))
+            keywords = self.league_keywords.get(selected_league, [])
+            base_links = [link for link in self.all_links if (any(keyword in link for keyword in keywords))]
+        
+        if search_text == "": self.filtered_links = base_links
+        else: self.filtered_links = [link for link in base_links if (search_text in link)]
+        
+        self.links_list.clear()
+        self.links_list.addItems(self.filtered_links)
+        

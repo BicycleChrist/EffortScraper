@@ -524,19 +524,6 @@ class ModernOddsWindow(QMainWindow):
         self.layout.addLayout(update_controls_layout)
 
 
-
-# Add this method to your ModernOddsWindow class if you don't have it already
-    def toggle_streaming_links(self):
-        """Toggle visibility of the streaming links widget"""
-        visible = self.stream_toggle_button.isChecked()
-        self.tune_in_widget.setVisible(visible)
-        
-        # Update button text
-        if visible:
-            self.stream_toggle_button.setText("Hide Streaming Links ▲")
-        else:
-            self.stream_toggle_button.setText("Show Streaming Links ▼")
-
     def update_market_selection(self):
         """Update selected markets based on button states"""
         self.selected_markets = {market for market, btn in self.market_buttons.items() 
@@ -972,28 +959,6 @@ class ModernOddsWindow(QMainWindow):
         
         # Force update to apply changes
         QTimer.singleShot(10, self.update)
-
-
-
-
-    def set_visible_article_count(self, count):
-        """Set the number of visible articles in the news feed"""
-        if not hasattr(self, 'article_count'):
-            self.article_count = 3  # Default
-        
-        self.article_count = max(1, min(count, 10))  # Keep between 1-10
-        
-        # If news feed is currently visible, update its height
-        if self.news_toggle_button.isChecked():
-            article_height = 85  # Approximate height of one article
-            margins = 10
-            container_height = (article_height * self.article_count) + margins
-            
-            self.news_container.setMinimumHeight(container_height)
-            self.news_container.setMaximumHeight(container_height)
-            QTimer.singleShot(0, self.news_container.updateGeometry)
-
-
 
     @qasync.asyncSlot() 
     # This function might just be too fucking much

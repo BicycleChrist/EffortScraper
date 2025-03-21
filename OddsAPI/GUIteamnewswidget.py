@@ -1,13 +1,10 @@
 import asyncio
-import aiohttp
 import feedparser
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
-from bs4 import BeautifulSoup
-import time
 import sys
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
-from PyQt6.QtGui import QColor, QIcon, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton
@@ -27,6 +24,9 @@ class NewsWorker(QObject):
         self.league_key = None
         self.team_name = None
         self.running = False
+        self.news_items = None
+        # TODO: prevent news_items from automatically being re-fetched
+        
         self.rss_urls = {
             # NBA
             "basketball_nba": {
@@ -39,7 +39,6 @@ class NewsWorker(QObject):
                     "https://sports.yahoo.com/nba/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],
-        
             },
             # NFL
             "football_nfl": {
@@ -88,13 +87,14 @@ class NewsWorker(QObject):
         """Set a specific team to filter news for"""
         self.team_name = team_name
 
-    def prioritize_injury_news(self, news_items):
+    def prioritize_injury_news(self, news_items, threshold=2):
         """Prioritize news items about injuries"""
         injury_keywords = [
             'injury', 'injured', 'injuries', 'hurt', 'questionable', 'doubtful',
             'out', 'expected to miss', 'ruled out', 'status', 'return', 'recovering',
             'rehabilitation', 'surgery', 'health', 'hamstring', 'ankle', 'knee',
-            'IL', 'injured list', 'disabled list', 'DNP', 'game-time decision'
+            'IL', 'injured list', 'disabled list', 'DNP', 'game-time decision',
+            'hospital', 'recover', 'active', 'inactive'
         ]
 
         # Score each item based on injury relevance
@@ -111,26 +111,26 @@ class NewsWorker(QObject):
                     injury_score += 1
 
             item['injury_score'] = injury_score
-
-        # Sort by injury score first, then by date
-        news_items.sort(key=lambda x: (-x['injury_score'], x['date']), reverse=True)
-
-        # Tag items with high injury relevance
-        for item in news_items:
-            if item['injury_score'] > 2:
+            
+            # Tag items with high injury relevance
+            if item['injury_score'] >= threshold:
                 item['is_injury_news'] = True
             else:
                 item['is_injury_news'] = False
-
+        
+         # Sort by injury score first, then by date
+        news_items.sort(key=lambda x: (-x['injury_score'], x['date']), reverse=True)
         return news_items
 
     async def fetch_rss_feed(self, url):
         """Fetch and parse an RSS feed"""
+        print(f"fetching rss feed: {url}")
         try:
             feed = feedparser.parse(url)
-            news_items = []
-
-            for entry in feed.entries[:10]:  # Limit to 10 items per feed
+            fetched_news_items = []
+            print(f"parsing {len(feed.entries)} entries")
+            
+            for entry in feed.entries:  # Limit to 10 items per feed
                 # Extract date (handling various formats)
                 pub_date = entry.get('published_parsed', None)
                 if pub_date:
@@ -160,7 +160,7 @@ class NewsWorker(QObject):
                 description = re.sub(r'<[^>]+>', '', description)
                 description = description[:200] + '...' if len(description) > 200 else description
 
-                news_items.append({
+                fetched_news_items.append({
                     'title': title,
                     'description': description,
                     'link': entry.link,
@@ -168,8 +168,8 @@ class NewsWorker(QObject):
                     'source': feed.feed.title if hasattr(feed, 'feed') and hasattr(feed.feed, 'title') else url.split('/')[2],
                     'image_url': image_url
                 })
-
-            return news_items
+            print(f"items parsed: {len(fetched_news_items)}")
+            return fetched_news_items
         except Exception as e:
             print(f"Error fetching RSS feed {url}: {str(e)}")
             return []
@@ -224,15 +224,15 @@ class NewsWorker(QObject):
 
         # Apply injury news prioritization
         all_news = self.prioritize_injury_news(all_news)
-
-        # Limit to most recent 20 items
-        all_news = all_news[:20]
-
+        self.news_items = all_news
+        
         # Emit the signal with results
         self.news_fetched.emit(all_news)
 
     def run_fetch(self):
         """Start the fetch operation in a separate thread"""
+        if self.news_items is not None: print("skipping fetch (already loaded)"); return;
+        if self.running: print(f"fetch already in progress!"); return;
         self.running = True
         asyncio.run(self.fetch_news())
 
@@ -568,8 +568,6 @@ class TeamNewsWidget(QWidget):
 
 # For testing the widget standalone
 if __name__ == "__main__":
-    from PyQt6.QtWidgets import QApplication
-
     app = QApplication(sys.argv)
 
     widget = TeamNewsWidget()
