@@ -7,10 +7,8 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton
+    QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton, QSpinBox
 )
-
-#TODO: Add in a news refresh timer...
 
 
 class NewsWorker(QObject):
@@ -25,7 +23,6 @@ class NewsWorker(QObject):
         self.team_name = None
         self.running = False
         self.news_items = None
-        # TODO: prevent news_items from automatically being re-fetched
         
         self.rss_urls = {
             # NBA
@@ -127,6 +124,11 @@ class NewsWorker(QObject):
         print(f"fetching rss feed: {url}")
         try:
             feed = feedparser.parse(url)
+            
+            # Check if feed parsed correctly
+            if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
+                print(f"Warning parsing RSS feed {url}: {feed.bozo_exception}")
+            
             fetched_news_items = []
             print(f"parsing {len(feed.entries)} entries")
             
@@ -177,62 +179,73 @@ class NewsWorker(QObject):
 
     async def fetch_news(self):
         """Fetch news from all configured sources"""
-        if not self.league_key:
-            self.error_occurred.emit("No league selected")
-            return
+        try:
+            if not self.league_key:
+                self.error_occurred.emit("No league selected")
+                return
 
-        sources = []
+            sources = []
 
-        # Add RSS feeds for the current league
-        league_feeds = self.rss_urls.get(self.league_key, {})
-        if league_feeds:
-            # Add general feeds for the league
-            sources.extend(league_feeds.get('general', []))
+            # Add RSS feeds for the current league
+            league_feeds = self.rss_urls.get(self.league_key, {})
+            if league_feeds:
+                # Add general feeds for the league
+                sources.extend(league_feeds.get('general', []))
 
-            # Add team-specific feeds if a team is selected
-            if self.team_name and self.team_name in league_feeds.get('teams', {}):
-                sources.extend(league_feeds['teams'][self.team_name])
+                # Add team-specific feeds if a team is selected
+                if self.team_name and self.team_name in league_feeds.get('teams', {}):
+                    sources.extend(league_feeds['teams'][self.team_name])
 
-        # Fetch from all RSS sources in parallel
-        tasks = [self.fetch_rss_feed(url) for url in sources]
+            # Fetch from all RSS sources in parallel
+            tasks = [self.fetch_rss_feed(url) for url in sources]
 
 
-        # Execute all tasks
-        results = await asyncio.gather(*tasks)
+            # Execute all tasks
+            results = await asyncio.gather(*tasks)
 
-        # Combine and sort all news items
-        all_news = []
-        for result in results:
-            all_news.extend(result)
+            # Combine and sort all news items
+            all_news = []
+            for result in results:
+                all_news.extend(result)
 
-        # Filter by team name if specified
-        if self.team_name:
-            team_keywords = [self.team_name.lower()]
-            # Add common variations/abbreviations
-            if len(self.team_name) > 3:
-                team_keywords.append(self.team_name[-3:].lower())  # Last 3 chars as possible abbreviation
+            # Filter by team name if specified
+            if self.team_name:
+                team_keywords = [self.team_name.lower()]
+                # Add common variations/abbreviations
+                if len(self.team_name) > 3:
+                    team_keywords.append(self.team_name[-3:].lower())  # Last 3 chars as possible abbreviation
 
-            # Filter news items containing team name in title or description
-            filtered_news = []
-            for item in all_news:
-                title_lower = item['title'].lower()
-                desc_lower = item['description'].lower()
-                if any(keyword in title_lower or keyword in desc_lower for keyword in team_keywords):
-                    filtered_news.append(item)
+                # Filter news items containing team name in title or description
+                filtered_news = []
+                for item in all_news:
+                    title_lower = item['title'].lower()
+                    desc_lower = item['description'].lower()
+                    if any(keyword in title_lower or keyword in desc_lower for keyword in team_keywords):
+                        filtered_news.append(item)
 
-            all_news = filtered_news
+                all_news = filtered_news
 
-        # Apply injury news prioritization
-        all_news = self.prioritize_injury_news(all_news)
-        self.news_items = all_news
-        
-        # Emit the signal with results
-        self.news_fetched.emit(all_news)
+            # Apply injury news prioritization
+            all_news = self.prioritize_injury_news(all_news)
+            self.news_items = all_news
+            
+            # Emit the signal with results
+            self.news_fetched.emit(all_news)
+        finally:
+            # Make sure to reset the running flag when done
+            self.running = False
 
     def run_fetch(self):
         """Start the fetch operation in a separate thread"""
-        if self.news_items is not None: print("skipping fetch (already loaded)"); return;
-        if self.running: print(f"fetch already in progress!"); return;
+        # Remove the condition that prevents refetching
+        # if self.news_items is not None: print("skipping fetch (already loaded)"); return;
+        
+        if self.running: 
+            print(f"fetch already in progress!")
+            return
+            
+        # Reset news_items to None to allow fresh fetching
+        self.news_items = None
         self.running = True
         asyncio.run(self.fetch_news())
 
@@ -354,6 +367,12 @@ class TeamNewsWidget(QWidget):
         self.current_team = None
         self.setup_ui()
         self.setup_worker()
+        
+        # Add auto-refresh timer (5 minutes by default)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_news)
+        self.refresh_timer.start(5 * 60 * 1000)  # 5 minutes in milliseconds
+        self.current_refresh_interval = 5  # Store current interval in minutes
 
     def setup_ui(self):
         """Set up the UI components"""
@@ -369,6 +388,23 @@ class TeamNewsWidget(QWidget):
         title_label = QLabel("Team News & Injury Updates")
         title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e55717;")
         header_layout.addWidget(title_label)
+        
+        # Add padding space between title and refresh controls
+        header_layout.addSpacing(20)
+        
+        # Add refresh interval spinner
+        refresh_layout = QHBoxLayout()
+        refresh_layout.setSpacing(2)
+        refresh_layout.addWidget(QLabel("Refresh Freq"))
+        self.refresh_interval = QSpinBox()
+        self.refresh_interval.setRange(1, 30)
+        self.refresh_interval.setValue(5)
+        self.refresh_interval.setSuffix(" min")
+        self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
+        self.refresh_interval.setFixedWidth(70)
+        self.refresh_interval.setStyleSheet("font-size: 10px;")
+        refresh_layout.addWidget(self.refresh_interval)
+        header_layout.addLayout(refresh_layout)
         
         header_layout.addStretch()
         
@@ -523,6 +559,13 @@ class TeamNewsWidget(QWidget):
 
         # Clear current news items
         self.clear_news_items()
+        
+        # Force the worker to reset its cached news_items
+        if hasattr(self.worker, 'news_items'):
+            self.worker.news_items = None
+        
+        # Make sure the running flag is reset (in case it got stuck)
+        self.worker.running = False
 
         # Start the worker in its thread
         QTimer.singleShot(0, self.worker.run_fetch)
@@ -558,6 +601,16 @@ class TeamNewsWidget(QWidget):
         """Display an error message"""
         self.status_label.setText(f"Error: {error_message}")
         self.status_label.setVisible(True)
+        
+    def update_refresh_interval(self):
+        """Update the timer interval when spinbox value changes"""
+        new_interval = self.refresh_interval.value()
+        if new_interval != self.current_refresh_interval:
+            self.current_refresh_interval = new_interval
+            interval_ms = new_interval * 60 * 1000  # Convert minutes to milliseconds
+            self.refresh_timer.stop()
+            self.refresh_timer.start(interval_ms)
+            print(f"News refresh interval updated to {new_interval} minutes")
 
     def handle_league_change(self, league_key):
         """Public method to update when the main app changes leagues"""
