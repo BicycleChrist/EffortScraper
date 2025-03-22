@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton, QSpinBox
+    QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox
 )
 
 
@@ -115,8 +115,8 @@ class NewsWorker(QObject):
             else:
                 item['is_injury_news'] = False
         
-         # Sort by injury score first, then by date
-        news_items.sort(key=lambda x: (-x['injury_score'], x['date']), reverse=True)
+        # Sort primarily by date (newest first), not injury score
+        news_items.sort(key=lambda x: x['date'], reverse=True)
         return news_items
 
     async def fetch_rss_feed(self, url):
@@ -225,7 +225,7 @@ class NewsWorker(QObject):
 
                 all_news = filtered_news
 
-            # Apply injury news prioritization
+            # Apply injury news prioritization (but keep date sorting)
             all_news = self.prioritize_injury_news(all_news)
             self.news_items = all_news
             
@@ -237,9 +237,6 @@ class NewsWorker(QObject):
 
     def run_fetch(self):
         """Start the fetch operation in a separate thread"""
-        # Remove the condition that prevents refetching
-        # if self.news_items is not None: print("skipping fetch (already loaded)"); return;
-        
         if self.running: 
             print(f"fetch already in progress!")
             return
@@ -365,6 +362,8 @@ class TeamNewsWidget(QWidget):
         super().__init__(parent)
         self.current_league = None
         self.current_team = None
+        self.show_injuries_only = False
+        self.all_news_items = []  # Store all news items for filtering
         self.setup_ui()
         self.setup_worker()
         
@@ -405,6 +404,19 @@ class TeamNewsWidget(QWidget):
         self.refresh_interval.setStyleSheet("font-size: 10px;")
         refresh_layout.addWidget(self.refresh_interval)
         header_layout.addLayout(refresh_layout)
+        
+        # Add injury filter checkbox
+        self.injury_filter = QCheckBox("Injuries Only")
+        self.injury_filter.setStyleSheet("""
+            QCheckBox {
+                font-size: 10px;
+                color: #d9534f;
+                padding: 4px
+                font-weight: bold;
+            }
+        """)
+        self.injury_filter.toggled.connect(self.toggle_injury_filter)
+        header_layout.addWidget(self.injury_filter)
         
         header_layout.addStretch()
         
@@ -458,8 +470,6 @@ class TeamNewsWidget(QWidget):
         self.scroll_area.setWidget(self.scroll_content)
         self.layout.addWidget(self.scroll_area)
 
-
-
     def setup_worker(self):
         """Set up the background worker for fetching news"""
         self.worker = NewsWorker()
@@ -467,7 +477,7 @@ class TeamNewsWidget(QWidget):
         self.worker.moveToThread(self.worker_thread)
 
         # Connect signals
-        self.worker.news_fetched.connect(self.update_news_items)
+        self.worker.news_fetched.connect(self.on_news_fetched)
         self.worker.error_occurred.connect(self.show_error)
 
         # Start the thread
@@ -552,6 +562,19 @@ class TeamNewsWidget(QWidget):
         # Refresh news with the new team filter
         self.refresh_news()
 
+    def toggle_injury_filter(self, checked):
+        """Toggle showing only injury news"""
+        self.show_injuries_only = checked
+        
+        # Apply filter to existing news items
+        if self.all_news_items:
+            self.update_news_items(self.all_news_items)
+            
+        # Update status to reflect filter status
+        if checked and not self.all_news_items:
+            self.status_label.setText("No injury news found")
+            self.status_label.setVisible(True)
+
     def refresh_news(self):
         """Refresh news data"""
         self.status_label.setText("Loading news...")
@@ -578,19 +601,35 @@ class TeamNewsWidget(QWidget):
             if widget:
                 widget.deleteLater()
 
-    def update_news_items(self, news_items):
-        """Update the display with new news items"""
-        self.clear_news_items()
+    def on_news_fetched(self, news_items):
+        """Handle when news is fetched - store all items first"""
+        # Store all news items before filtering
+        self.all_news_items = news_items
+        self.update_news_items(news_items)
 
-        if not news_items:
-            self.status_label.setText("No news items found")
+    def update_news_items(self, news_items):
+        """Update the display with news items, applying filters as needed"""
+        self.clear_news_items()
+        
+        # Apply injury filter if enabled
+        filtered_items = news_items
+        if self.show_injuries_only:
+            filtered_items = [item for item in news_items if item.get('is_injury_news', False)]
+        
+        # Sort by date (newest first) - this is now redundant as we sort in prioritize_injury_news
+        # But keeping it here as a safeguard
+        filtered_items.sort(key=lambda x: x['date'], reverse=True)
+
+        if not filtered_items:
+            message = "No injury news found" if self.show_injuries_only else "No news items found"
+            self.status_label.setText(message)
             self.status_label.setVisible(True)
             return
 
         self.status_label.setVisible(False)
 
         # Add news items to the scroll area
-        for item in news_items:
+        for item in filtered_items:
             news_widget = NewsArticleWidget(item)
             self.scroll_layout.addWidget(news_widget)
 
