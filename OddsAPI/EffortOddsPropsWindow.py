@@ -234,8 +234,7 @@ class BaseTableWindow(QMainWindow):
 # -----------------------------------------------------------------------------
 # PropsWindow: Displays player props and associated best lines
 # Cant Believe this file works at all
-#TODO: Right now the table only displays overs, need to get unders in there for player_props
-# Ideally we have a structure "-142 O (15.5) +106 U" for each cell 
+
 class PropsWindow(BaseTableWindow):
     def __init__(self, sport_key, league_name):
         super().__init__(f"{league_name} Player Props", sport_key, league_name)

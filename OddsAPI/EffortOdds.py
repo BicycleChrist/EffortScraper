@@ -16,12 +16,14 @@ from EffortOddsPropsWindow import PropsWindow
 import pandas as pd
 from GUItuneinwidget import TuneInWidget
 from GUIteamnewswidget import TeamNewsWidget
-
+from GUIbestlineswidget import *
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
-#TODO: Layout becomes semi-jenk  once news widget is toggeled on, needs fix
+#TODO: 
+
+
 
 MAJOR_PROP_LEAGUES = {
     "basketball_nba": NBA_MARKETS,
@@ -452,7 +454,6 @@ class ModernOddsWindow(QMainWindow):
         
         # Set initial state for the news container
         self.news_container.setVisible(False)  # Hide container initially
-        self.news_container.setMaximumHeight(0)  # No height initially
         
         # Add news container to right side layout
         right_side_layout.addWidget(self.news_container)
@@ -470,17 +471,47 @@ class ModernOddsWindow(QMainWindow):
         # Tab widget for different leagues
         self.tab_widget = QTabWidget()
         self.layout.addWidget(QLabel("Odds:"))
-        self.layout.addWidget(self.tab_widget)
-        # Create a QSplitter
-        self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.addWidget(self.tab_widget)
-        self.splitter.addWidget(self.news_container)  # Add news container to splitter
         
-        # Set initial splitter sizes
-        self.splitter.setSizes([400, 100])
-
-        self.layout.addWidget(self.tab_widget, 1)
-        self.layout.addWidget(self.splitter)
+        # Create the best lines container
+        self.best_lines_container = QWidget()
+        best_lines_layout = QVBoxLayout(self.best_lines_container)
+        best_lines_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Add a header
+        best_lines_header = QLabel("Best Lines")
+        best_lines_header.setStyleSheet("font-weight: bold; font-size: 14px;")
+        best_lines_layout.addWidget(best_lines_header)
+        
+        # Create the best lines widget
+        self.best_lines_widget = BestLinesWidget()
+        best_lines_layout.addWidget(self.best_lines_widget)
+        
+        # First, create a horizontal splitter for the bottom section
+        self.horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Add the news container to the left side of horizontal splitter
+        self.horizontal_splitter.addWidget(self.news_container)
+        
+        # Add the best lines container to the right side of horizontal splitter  
+        self.horizontal_splitter.addWidget(self.best_lines_container)
+        
+        # Set initial sizes for horizontal splitter
+        self.horizontal_splitter.setSizes([325, 325])  # Equal width initially
+        
+        # Now create the vertical splitter with tab widget on top and horizontal splitter on bottom
+        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.vertical_splitter.addWidget(self.tab_widget)
+        self.vertical_splitter.addWidget(self.horizontal_splitter)
+        
+        # Set initial sizes for vertical splitter to show more of the tab widget
+        self.vertical_splitter.setSizes([400, 200])
+        
+        # Add the vertical splitter to the main layout
+        self.layout.addWidget(self.vertical_splitter, 1)  # The 1 gives it stretch
+        
+        # Set initial visibility
+        self.news_container.setVisible(False)
+        self.best_lines_container.setVisible(True)
         
         # --------- AUTO-UPDATE CONTROLS ---------
         # Auto-update controls
@@ -959,9 +990,27 @@ class ModernOddsWindow(QMainWindow):
         
         # Force update to apply changes
         QTimer.singleShot(10, self.update)
+    
+    
+    def update_best_lines_display(self):
+        """Update the best lines widget with the latest consolidated raw API data."""
+        if not self.best_lines_widget:
+            print("Best lines widget not initialized. Skipping update.")
+            return
+        
+        # Use the consolidated raw data if available
+        if hasattr(self, 'consolidated_odds_data') and self.consolidated_odds_data:
+            self.best_lines = self.best_lines_widget.update_display(self.consolidated_odds_data)
+        else:
+            print("No consolidated odds data available for best lines calculation.")
+
+
+
+
+
 
     @qasync.asyncSlot() 
-    # This function might just be too fucking much
+    # This function might just be too fucking much 
     async def refresh_data(self):
         """Fetch and update odds data asynchronously using pandas for comparison"""
         if not self.leagues_loaded:
@@ -1018,6 +1067,12 @@ class ModernOddsWindow(QMainWindow):
             bookmakers_seen = set()
             game_odds_data = {}
             
+            # Create a consolidated odds data structure for the best lines widget
+            consolidated_odds_data = {
+                'bookmakers': []
+            }
+            bookmakers_map = {}  # To track and merge bookmakers across games
+            
             for index, game in enumerate(games):
                 game_id = game.get('id', '')
                 if not game_id:
@@ -1054,8 +1109,24 @@ class ModernOddsWindow(QMainWindow):
                     bm_title = bm['title']
                     bookmakers_seen.add(bm_title)
                     
+                    # Add to consolidated data for best lines widget
+                    if bm_title not in bookmakers_map:
+                        bookmakers_map[bm_title] = {
+                            'title': bm_title,
+                            'markets': []
+                        }
+                        consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
+                    
                     for market in bm.get('markets', []):
                         market_key = market['key']
+                        
+                        # Add game_id to each outcome for reference (needed for best lines)
+                        for outcome in market.get('outcomes', []):
+                            outcome['game_id'] = game_id
+                        
+                        # Add to consolidated data
+                        bookmakers_map[bm_title]['markets'].append(market)
+                        
                         for outcome in market.get('outcomes', []):
                             # Create the row label
                             unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
@@ -1068,6 +1139,9 @@ class ModernOddsWindow(QMainWindow):
                             # Update price
                             price = self.format_price(outcome)
                             new_table_data[unique_label][bm_title] = price
+            
+            # Store the consolidated data for the best lines widget
+            self.consolidated_odds_data = consolidated_odds_data
             
             # Create a new DataFrame from the collected data
             new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
@@ -1105,6 +1179,23 @@ class ModernOddsWindow(QMainWindow):
             # Update the table display with highlighting changes
             self.update_table_with_changes(tab_data, changes)
             
+            # Print a debug message before updating best lines widget
+            print("About to update best lines widget with consolidated data")
+            print(f"Number of bookmakers in consolidated data: {len(consolidated_odds_data['bookmakers'])}")
+            
+            # Update best lines widget with the consolidated data
+            if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
+                print("Updating best lines widget...")
+                try:
+                    self.best_lines = self.best_lines_widget.update_display(consolidated_odds_data)
+                    print("Best lines widget updated successfully")
+                except Exception as e:
+                    print(f"Error updating best lines widget: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print("Best lines widget not available")
+            
             self.progress.setValue(100)
             
             # Reset status text if auto-update is enabled
@@ -1128,6 +1219,8 @@ class ModernOddsWindow(QMainWindow):
             print(f"Error: {e}")
             self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
             self.update_status.setText("An error occurred")
+            import traceback
+            traceback.print_exc()
         finally:
             self.fetch_odds_button.setEnabled(True)
             # Reset progress bar
@@ -1135,114 +1228,115 @@ class ModernOddsWindow(QMainWindow):
             # Reset error messages after a delay
             if not self.auto_update_check.isChecked():
                 QTimer.singleShot(5000, lambda: self.update_status.setText(""))
-
-
-# Update Odds table with changes
+    
+    
+    # Update Odds table with changes
+    
     def update_table_with_changes(self, tab_data, changes):
-        """Update the table with efficient display of odds changes"""
-        table = tab_data.table_widget
-        
-        # Count the total number of changed cells
-        total_changes = sum(len(changes_dict) for changes_dict in changes.values())
-        
-        # Update the changes counter label
-        if hasattr(self, 'changes_counter_label'):
-            if total_changes > 0:
-                self.changes_counter_label.setText(f"Lines Changed: {total_changes}")
-                self.changes_counter_label.setStyleSheet("color: #dc3545; font-weight: bold;")
-                
-                # Reset the color after 5 seconds
-                QTimer.singleShot(5000, lambda: self.changes_counter_label.setStyleSheet("color: #6c757d;"))
-            else:
-                self.changes_counter_label.setText("No Changes")
-        
-        # Update table structure if needed
-        expected_cols = len(tab_data.bookmakers) + 1
-        if table.columnCount() != expected_cols:
-            table.setColumnCount(expected_cols)
-            table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
-        
-        expected_rows = len(tab_data.table_rows)
-        if table.rowCount() != expected_rows:
-            table.setRowCount(expected_rows)
-        
-        # Update all rows
-        for row_idx, row_label in enumerate(tab_data.table_rows):
-            row_data = tab_data.table_data[row_label]
-            game_id = row_data['game_id']
-            color = tab_data.get_game_color(game_id)
-            
-            # Create or update row header
-            header_item = table.item(row_idx, 0)
-            if not header_item:
-                header_item = ColoredTableItem(row_label, game_id)
-                table.setItem(row_idx, 0, header_item)
-            else:
-                header_item.setText(row_label)
-            
-            # Apply header styling
-            if row_data.get('is_header'):
-                font = QFont()
-                font.setBold(True)
-                header_item.setFont(font)
-                header_item.setBackground(color)
-                header_item.setForeground(QColor('black'))
-            else:
-                market_color = QColor(color)
-                market_color.setAlpha(230)
-                header_item.setBackground(market_color)
-                header_item.setForeground(QColor('black'))
-            
-            # Update bookmaker columns
-            for col_idx, bm in enumerate(tab_data.bookmakers, 1):
-                current_value = row_data.get(bm, "")
-                
-                item = table.item(row_idx, col_idx)
-                if not item:
-                    item = ColoredTableItem(current_value, game_id)
-                    table.setItem(row_idx, col_idx, item)
-                else:
-                    item.setText(current_value)
-                
-                # Check if this cell has changed
-                if row_label in changes and bm in changes[row_label]:
-                    old_value, new_value = changes[row_label][bm]
-                    
-                    # Parse the odds values for comparison
-                    try:
-                        current_odds = float(new_value.split()[0])
-                        previous_odds = float(old_value.split()[0])
-                        
-                        # Better odds (higher value) = green, worse odds = red
-                        if current_odds > previous_odds:
-                            highlight_color = QColor(0, 200, 0, 180)  # Semi-transparent green
-                        else:
-                            highlight_color = QColor(200, 0, 0, 180)  # Semi-transparent red
-                        
-                        item.setBackground(highlight_color)
-                        item.setForeground(QColor('black'))  # Keep text black for readability
-                        
-                        # Reset background after 5 seconds
-                        market_color = QColor(color)
-                        market_color.setAlpha(230)
-                        QTimer.singleShot(5000, lambda i=item, c=market_color: (
-                            i.setBackground(c),
-                            i.setForeground(QColor('black'))
-                        ))
-                    except (ValueError, IndexError):
-                        # If we can't parse the odds, just update without highlighting
-                        pass
-                else:
-                    # No change, maintain consistent background and text color
-                    if not row_data.get('is_header'):
-                        market_color = QColor(color)
-                        market_color.setAlpha(230)
-                        item.setBackground(market_color)
-                        item.setForeground(QColor('black'))
-        
-        # Resize the table
-        table.resizeColumnsToContents()
-        table.resizeRowsToContents()
+         """Update the table with efficient display of odds changes"""
+         table = tab_data.table_widget
+         
+         # Count the total number of changed cells
+         total_changes = sum(len(changes_dict) for changes_dict in changes.values())
+         
+         # Update the changes counter label
+         if hasattr(self, 'changes_counter_label'):
+             if total_changes > 0:
+                 self.changes_counter_label.setText(f"Lines Changed: {total_changes}")
+                 self.changes_counter_label.setStyleSheet("color: #dc3545; font-weight: bold;")
+                 
+                 # Reset the color after 5 seconds
+                 QTimer.singleShot(5000, lambda: self.changes_counter_label.setStyleSheet("color: #6c757d;"))
+             else:
+                 self.changes_counter_label.setText("No Changes")
+         
+         # Update table structure if needed
+         expected_cols = len(tab_data.bookmakers) + 1
+         if table.columnCount() != expected_cols:
+             table.setColumnCount(expected_cols)
+             table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
+         
+         expected_rows = len(tab_data.table_rows)
+         if table.rowCount() != expected_rows:
+             table.setRowCount(expected_rows)
+         
+         # Update all rows
+         for row_idx, row_label in enumerate(tab_data.table_rows):
+             row_data = tab_data.table_data[row_label]
+             game_id = row_data['game_id']
+             color = tab_data.get_game_color(game_id)
+             
+             # Create or update row header
+             header_item = table.item(row_idx, 0)
+             if not header_item:
+                 header_item = ColoredTableItem(row_label, game_id)
+                 table.setItem(row_idx, 0, header_item)
+             else:
+                 header_item.setText(row_label)
+             
+             # Apply header styling
+             if row_data.get('is_header'):
+                 font = QFont()
+                 font.setBold(True)
+                 header_item.setFont(font)
+                 header_item.setBackground(color)
+                 header_item.setForeground(QColor('black'))
+             else:
+                 market_color = QColor(color)
+                 market_color.setAlpha(230)
+                 header_item.setBackground(market_color)
+                 header_item.setForeground(QColor('black'))
+             
+             # Update bookmaker columns
+             for col_idx, bm in enumerate(tab_data.bookmakers, 1):
+                 current_value = row_data.get(bm, "")
+                 
+                 item = table.item(row_idx, col_idx)
+                 if not item:
+                     item = ColoredTableItem(current_value, game_id)
+                     table.setItem(row_idx, col_idx, item)
+                 else:
+                     item.setText(current_value)
+                 
+                 # Check if this cell has changed
+                 if row_label in changes and bm in changes[row_label]:
+                     old_value, new_value = changes[row_label][bm]
+                     
+                     # Parse the odds values for comparison
+                     try:
+                         current_odds = float(new_value.split()[0])
+                         previous_odds = float(old_value.split()[0])
+                         
+                         # Better odds (higher value) = green, worse odds = red
+                         if current_odds > previous_odds:
+                             highlight_color = QColor(0, 200, 0, 180)  # Semi-transparent green
+                         else:
+                             highlight_color = QColor(200, 0, 0, 180)  # Semi-transparent red
+                         
+                         item.setBackground(highlight_color)
+                         item.setForeground(QColor('black'))  # Keep text black for readability
+                         
+                         # Reset background after 5 seconds
+                         market_color = QColor(color)
+                         market_color.setAlpha(230)
+                         QTimer.singleShot(5000, lambda i=item, c=market_color: (
+                             i.setBackground(c),
+                             i.setForeground(QColor('black'))
+                         ))
+                     except (ValueError, IndexError):
+                         # If we can't parse the odds, just update without highlighting
+                         pass
+                 else:
+                     # No change, maintain consistent background and text color
+                     if not row_data.get('is_header'):
+                         market_color = QColor(color)
+                         market_color.setAlpha(230)
+                         item.setBackground(market_color)
+                         item.setForeground(QColor('black'))
+         
+         # Resize the table
+         table.resizeColumnsToContents()
+         table.resizeRowsToContents()
 
 
 
