@@ -17,6 +17,7 @@ import pandas as pd
 from GUItuneinwidget import TuneInWidget
 from GUIteamnewswidget import TeamNewsWidget
 from GUIbestlineswidget import *
+from HistoricalOddsClient import *
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -433,31 +434,11 @@ class ModernOddsWindow(QMainWindow):
         # Add a stretch to push everything to the left and right
         market_streaming_layout.addStretch(1)
         
-        # Add the TuneInWidget to the right side of market_streaming_layout
+        # Create and configure the TuneInWidget
         self.tune_in_widget = TuneInWidget()
         self.tune_in_widget.setVisible(False)  # Hidden by default
         self.tune_in_widget.setFixedWidth(650)  # Fixed width to make it compact
         market_streaming_layout.addWidget(self.tune_in_widget)
-        
-        # Create the team news widget
-        self.team_news_widget = TeamNewsWidget()
-        self.team_news_widget.setVisible(False)  # Hidden by default
-        self.team_news_widget.setFixedWidth(650)  # Fixed width to match tune_in_widget
-        
-        # Create news container and add to right side layout
-        self.news_container = QWidget()
-        self.news_container.setFixedWidth(650)  # Match the width of the widget
-        news_container_layout = QVBoxLayout(self.news_container)
-        news_container_layout.setContentsMargins(0, 0, 0, 0)  # Zero margins
-        news_container_layout.setSpacing(0)  # Zero spacing
-        news_container_layout.addWidget(self.team_news_widget)
-        
-        # Set initial state for the news container
-        self.news_container.setVisible(False)  # Hide container initially
-        
-        # Add news container to right side layout
-        right_side_layout.addWidget(self.news_container)
-        right_side_layout.addStretch(1)  # Push everything to the top
         
         # Add the market_streaming_layout to the main layout
         self.layout.addLayout(market_streaming_layout)
@@ -472,19 +453,52 @@ class ModernOddsWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.layout.addWidget(QLabel("Odds:"))
         
+        # Create the team news widget first
+        self.team_news_widget = TeamNewsWidget()
+        self.team_news_widget.setVisible(False)  # Hidden by default
+        self.team_news_widget.setFixedWidth(650)  # Fixed width
+        
+        # Create news container and add the team news widget
+        self.news_container = QWidget()
+        self.news_container.setFixedWidth(650)  # Match the width of the widget
+        news_container_layout = QVBoxLayout(self.news_container)
+        news_container_layout.setContentsMargins(0, 0, 0, 0)  # Zero margins
+        news_container_layout.setSpacing(0)  # Zero spacing
+        news_container_layout.addWidget(self.team_news_widget)
+        
+        # Set initial state for the news container
+        self.news_container.setVisible(False)  # Hide container initially
+        
         # Create the best lines container
         self.best_lines_container = QWidget()
         best_lines_layout = QVBoxLayout(self.best_lines_container)
         best_lines_layout.setContentsMargins(0, 0, 0, 0)
         
         # Add a header
-        best_lines_header = QLabel("Best Lines")
-        best_lines_header.setStyleSheet("font-weight: bold; font-size: 14px;")
+        best_lines_header = QLabel("Best Lines ⮟")
+        best_lines_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #7bd419")
         best_lines_layout.addWidget(best_lines_header)
         
         # Create the best lines widget
         self.best_lines_widget = BestLinesWidget()
         best_lines_layout.addWidget(self.best_lines_widget)
+        
+        # Create the historical odds container
+        self.historical_odds_container = QWidget()
+        historical_odds_layout = QVBoxLayout(self.historical_odds_container)
+        historical_odds_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create the historical odds widget
+        self.historical_odds_widget = HistoricalOddsWidget()
+        self.historical_odds_widget.api_key = SUPER_KEY  # Set API key
+        historical_odds_layout.addWidget(self.historical_odds_widget)
+        
+        # Create a container for the bottom right section (best lines + historical odds)
+        right_bottom_container = QWidget()
+        right_bottom_layout = QHBoxLayout(right_bottom_container)
+        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        right_bottom_layout.addWidget(self.best_lines_container)
+        right_bottom_layout.addWidget(self.historical_odds_container)
         
         # First, create a horizontal splitter for the bottom section
         self.horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -492,8 +506,8 @@ class ModernOddsWindow(QMainWindow):
         # Add the news container to the left side of horizontal splitter
         self.horizontal_splitter.addWidget(self.news_container)
         
-        # Add the best lines container to the right side of horizontal splitter  
-        self.horizontal_splitter.addWidget(self.best_lines_container)
+        # Add the right bottom container to the right side of horizontal splitter  
+        self.horizontal_splitter.addWidget(right_bottom_container)
         
         # Set initial sizes for horizontal splitter
         self.horizontal_splitter.setSizes([325, 325])  # Equal width initially
@@ -508,10 +522,6 @@ class ModernOddsWindow(QMainWindow):
         
         # Add the vertical splitter to the main layout
         self.layout.addWidget(self.vertical_splitter, 1)  # The 1 gives it stretch
-        
-        # Set initial visibility
-        self.news_container.setVisible(False)
-        self.best_lines_container.setVisible(True)
         
         # --------- AUTO-UPDATE CONTROLS ---------
         # Auto-update controls
@@ -650,12 +660,8 @@ class ModernOddsWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_data)
         self.props_button.clicked.connect(self.handle_props_button)
         self.news_toggle_button.clicked.connect(self.toggle_news_feed)
+        
 
-    # Rest of the class methods remain unchanged...
-    # (RestartTimer, update_status_text, initialize, populate_leagues, 
-    # handle_tab_change, create_league_tab, format_market_label, 
-    # format_price, display_odds, update_table_display, 
-    # toggle_auto_update, update_timer_interval, refresh_data)
 
     def RestartTimer(self):
         interval_ms = self.update_interval.value() * 60 * 1000
@@ -728,6 +734,10 @@ class ModernOddsWindow(QMainWindow):
         if league_name not in self.league_tabs:
             tab_data = LeagueTabData(league_name, sport_key)
             table_widget = tab_data.create_table_widget()
+            
+            # Connect selection signal for the new table
+            table_widget.itemSelectionChanged.connect(self.on_market_selection_changed)
+            
             self.tab_widget.addTab(table_widget, league_name)
             self.league_tabs[league_name] = tab_data
             self.current_league = league_name
@@ -1004,7 +1014,71 @@ class ModernOddsWindow(QMainWindow):
         else:
             print("No consolidated odds data available for best lines calculation.")
 
-
+    
+    def on_market_selection_changed(self):
+        """Handle market selection in the odds table"""
+        table = self.tab_widget.currentWidget()
+        if not table or not isinstance(table, QTableWidget):
+            return
+        
+        current_row = table.currentRow()
+        if current_row < 0:
+            return
+        
+        # Get event and market info from the selected row
+        header_item = table.item(current_row, 0)
+        if not header_item:
+            return
+        
+        row_label = header_item.text()
+        market_type = ""
+        
+        # Skip header rows
+        if "Game:" in row_label:
+            return
+        
+        # Try to determine market type from the row label
+        if "Moneyline" in row_label:
+            market_type = "h2h"
+        elif "Spread" in row_label:
+            market_type = "spreads"
+        elif "Total" in row_label:
+            market_type = "totals"
+        else:
+            # If we can't determine, don't update
+            return
+        
+        # Get game info
+        game_id = ""
+        home_team = ""
+        away_team = ""
+        
+        # Find the game ID from the item
+        if hasattr(header_item, 'game_id'):
+            game_id = header_item.game_id
+            
+            # Look for game header row to get teams
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                if item and "Game:" in item.text() and hasattr(item, 'game_id') and item.game_id == game_id:
+                    # Parse team names from header
+                    header_text = item.text()
+                    team_part = header_text.replace("Game:", "").strip()
+                    if "vs" in team_part:
+                        teams = team_part.split("vs")
+                        home_team = teams[0].strip()
+                        away_team = teams[1].strip()
+                    break
+        
+        if not game_id:
+            return
+        
+        # Get league and sport info
+        league_name = self.league_selector.currentText()
+        sport_key = self.data_manager.league_map.get(league_name)
+        
+        # Update the historical odds widget
+        self.historical_odds_widget.set_market(sport_key, game_id, market_type, home_team, away_team)
 
 
 
