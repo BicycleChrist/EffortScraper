@@ -28,11 +28,9 @@ class NewsWorker(QObject):
             # NBA
             "basketball_nba": {
                 "general": [
-                    "https://www.nba.com/rss/nba",
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
                     "https://www.fantasypros.com/nba/player-news.php",
-                    "https://www.insidehoops.com/blog/?feed=rss2",
                     "https://sports.yahoo.com/nba/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],

@@ -20,6 +20,7 @@ class TuneInWidget(QWidget):
         
         # URLs to be parsed
         self.urls = [
+            "https://the.streameast.app/v86",
             "https://the.streameast.app/nhlstreams3",
             "https://the.streameast.app/mlbstreams17",
             "https://the.streameast.app/nbastreams64",

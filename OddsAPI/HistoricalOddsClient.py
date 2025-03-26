@@ -2,25 +2,17 @@ import qasync
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from PyQt6.QtCore import Qt, QTimer
+
+import numpy as np
+import pyqtgraph as pg
+from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea
 )
-import pyqtgraph as pg
+
 from Creds import SUPER_KEY
 
-import qasync
-import asyncio
-import aiohttp
-from datetime import datetime, timedelta
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
-    QProgressBar, QCheckBox, QHBoxLayout, QScrollArea
-)
-import pyqtgraph as pg
-from Creds import SUPER_KEY
 
 class HistoricalOddsClient:
     """Client for fetching historical odds data from theOddsAPI"""
@@ -35,7 +27,7 @@ class HistoricalOddsClient:
                                      start_time, end_time=None, regions="us"):
         """Fetches historical odds snapshots"""
         if end_time is None:
-            end_time = datetime.utcnow()
+            end_time = datetime.now()
         else:
             end_time = datetime.fromisoformat(end_time.replace('Z', ''))
             
@@ -171,11 +163,12 @@ class HistoricalOddsWidget(QWidget):
         self.plot_layout = QVBoxLayout(self.plot_panel)
         self.plot_layout.setContentsMargins(0, 0, 0, 0)
         
-        self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setBackground('w')
+        # https://pyqtgraph.readthedocs.io/en/latest/api_reference/widgets/plotwidget.html
+        self.plot_widget = pg.PlotWidget(background="#29313D")
         self.plot_widget.setLabel('left', 'Odds')
         self.plot_widget.setLabel('bottom', 'Time')
-        self.plot_widget.addLegend()
+        #self.plot_widget.addLegend()
+        self.plot_widget.addItem(pg.GridItem())
         
         self.plot_layout.addWidget(self.plot_widget)
         content_layout.addWidget(self.plot_panel, 4)
@@ -245,7 +238,7 @@ class HistoricalOddsWidget(QWidget):
         if self._load_task and not self._load_task.done():
             return  # Skip if already loading
             
-        try:
+        try: 
             self._load_task = asyncio.create_task(self.load_data())
             await self._load_task
         except Exception as e:
@@ -262,7 +255,7 @@ class HistoricalOddsWidget(QWidget):
             return
             
         # Calculate time range
-        end_time = datetime.utcnow()
+        end_time = datetime.now()
         start_time = self.calculate_start_time(end_time)
         
         self.progress_bar.setValue(10)
@@ -379,14 +372,11 @@ class HistoricalOddsWidget(QWidget):
     def on_time_range_changed(self):
         """Handle time range dropdown changes"""
         asyncio.create_task(self.load_data())
-        
-    def on_refresh_clicked(self):
-        """Handle refresh button click"""
-        asyncio.create_task(self.load_data())
-
+    
     def update_plot(self, snapshots):
         """Enhanced plotting with point change visualization"""
         self.plot_widget.clear()
+        self.plot_widget.addItem(pg.GridItem())
         if not snapshots:
             self._show_no_data_message()
             return
@@ -397,7 +387,7 @@ class HistoricalOddsWidget(QWidget):
         ]
         
         # Some Legend options for graph display
-        self.plot_widget.addLegend(offset=(10, 10), labelTextSize='8pt')
+        #self.plot_widget.addLegend(offset=(10, 10), labelTextSize='8pt')
         
         # Group data by bookmaker and outcome
         plot_data = self._organize_plot_data(snapshots)
@@ -411,145 +401,299 @@ class HistoricalOddsWidget(QWidget):
             for outcome_key, points_data in outcomes.items():
                 self._plot_outcome_series(bookmaker, outcome_key, points_data, color)
         
-        self._configure_plot_axes(snapshots)
+        self.configure_plot_axes(snapshots)
     
     def _organize_plot_data(self, snapshots):
-        """Organize raw snapshots into plottable series"""
+        """Organize snapshot data using American odds directly"""
         plot_data = {}
+        
         for snapshot in snapshots:
             timestamp = datetime.fromisoformat(snapshot['timestamp'].replace('Z', '')).timestamp()
             
             for bookmaker in snapshot.get('data', {}).get('bookmakers', []):
                 bm_key = bookmaker['key']
+                
                 if bm_key not in plot_data:
                     plot_data[bm_key] = {}
                 
                 for market in bookmaker.get('markets', []):
                     for outcome in market.get('outcomes', []):
-                        self._process_outcome_point(
-                            plot_data, bm_key, outcome, timestamp
-                        )
+                        outcome_key = (outcome.get('name'), outcome.get('description', ''))
+                        
+                        if outcome_key not in plot_data[bm_key]:
+                            plot_data[bm_key][outcome_key] = {
+                                'timestamps': [],
+                                'american_prices': [],
+                                'points': []
+                            }
+                        
+                        # Add timestamp
+                        plot_data[bm_key][outcome_key]['timestamps'].append(timestamp)
+                        
+                        # Add American price exactly as it comes from the API
+                        if 'price' in outcome:
+                            american_price = outcome['price']
+                            # Format with sign if it's a number
+                            if isinstance(american_price, (int, float)):
+                                if american_price > 0:
+                                    american_price = f"+{american_price}"
+                                else:
+                                    american_price = f"{american_price}"
+                            plot_data[bm_key][outcome_key]['american_prices'].append(american_price)
+                        else:
+                            plot_data[bm_key][outcome_key]['american_prices'].append(None)
+                        
+                        # Add point if available
+                        if 'point' in outcome:
+                            plot_data[bm_key][outcome_key]['points'].append(outcome['point'])
+                        else:
+                            plot_data[bm_key][outcome_key]['points'].append(None)
+        
+        # Clean up data structure - remove None values
+        for bm_key, outcomes in plot_data.items():
+            for outcome_key, data in outcomes.items():
+                # Keep only entries with valid American prices
+                valid_indices = []
+                for i, price in enumerate(data['american_prices']):
+                    if price is not None:
+                        valid_indices.append(i)
+                
+                if valid_indices:
+                    data['timestamps'] = [data['timestamps'][i] for i in valid_indices]
+                    data['american_prices'] = [data['american_prices'][i] for i in valid_indices]
+                    
+                    # Only keep points that have corresponding valid prices
+                    if 'points' in data:
+                        data['points'] = [
+                            data['points'][i] if i < len(data['points']) else None 
+                            for i in valid_indices
+                        ]
+        
         return plot_data
     
-    def _process_outcome_point(self, plot_data, bookmaker_key, outcome, timestamp):
-        """Process an outcome point and add it to the plot data structure"""
-        outcome_key = (outcome.get('name'), outcome.get('description', ''))
-        
-        if bookmaker_key not in plot_data:
-            plot_data[bookmaker_key] = {}
-        
-        if outcome_key not in plot_data[bookmaker_key]:
-            plot_data[bookmaker_key][outcome_key] = {'timestamps': [], 'points': [], 'prices': []}
-        
-        # Convert American odds to decimal if needed
-        if 'price' in outcome:
-            american_price = outcome['price']
-            decimal_price = self._american_to_decimal(american_price)
-            plot_data[bookmaker_key][outcome_key]['timestamps'].append(timestamp)
-            plot_data[bookmaker_key][outcome_key]['prices'].append(decimal_price)
-            
-            # For point spreads, use the point value if available
-            if 'point' in outcome:
-                plot_data[bookmaker_key][outcome_key]['points'].append(outcome['point'])
-            else:
-                # For moneyline, just use the decimal price
-                plot_data[bookmaker_key][outcome_key]['points'].append(decimal_price)
-            
-    
     def _plot_outcome_series(self, bookmaker, outcome_key, points_data, color):
-        """Plot a single outcome series with proper styling"""
-        if not points_data['timestamps'] or not points_data['points']:
+        """Plot a single outcome series using American odds directly"""
+        if not points_data['timestamps'] or len(points_data['timestamps']) == 0:
             return
-            
-        import numpy as np
+        
         timestamps = np.array(points_data['timestamps'])
-        points = np.array(points_data['points'])
         
-        # Plot the line
-        name = f"{bookmaker} - {outcome_key[0]}"
-        if outcome_key[1]:
-            name += f" ({outcome_key[1]})"
+        # Check if we have price data
+        if 'american_prices' in points_data and points_data['american_prices'] and len(points_data['american_prices']) > 0:
+            american_prices = np.array(points_data['american_prices'])
+            
+            # Convert to numeric values for plotting
+            american_values = []
+            for price in american_prices:
+                try:
+                    if isinstance(price, str) and price.startswith('+'):
+                        american_values.append(float(price[1:]))
+                    elif isinstance(price, str) and price.startswith('-'):
+                        american_values.append(float(price))
+                    else:
+                        american_values.append(float(price))
+                except (ValueError, TypeError):
+                    # Default to a safe value if conversion fails
+                    american_values.append(-110.0)
+            
+            american_values = np.array(american_values)
+            
+            name = f"{bookmaker} - {outcome_key[0]}"
+            if outcome_key[1]:
+                name += f" ({outcome_key[1]})"
+            
+            # Plot using the American odds values directly
+            line = self.plot_widget.plot(
+                timestamps, 
+                american_values,
+                pen=pg.mkPen(color=color, width=2),
+                name=name,
+                symbol='o',
+                symbolSize=6,
+                symbolBrush=color
+            )
+            
+            # Add labels that show both American odds and points if available
+            for i, ts in enumerate(timestamps):
+                if i < len(american_values):
+                    american = american_prices[i]
+                    
+                    # Format label based on whether we have point data
+                    if ('points' in points_data and 
+                        points_data['points'] and 
+                        i < len(points_data['points']) and 
+                        points_data['points'][i] is not None):
+                        pt = points_data['points'][i]
+                        # 'american' here is actually in a string in decimal (with leading sign)
+                        label_text = f"{self._decimal_to_american(float(american))} ({pt:.1f})"
+                    else:
+                        label_text = f"{american}"
+                    
+                    label = pg.TextItem(label_text, anchor=(0.5, 1.5), color=color)
+                    self.plot_widget.addItem(label)
+                    label.setPos(ts, american_values[i])
         
-        line = self.plot_widget.plot(
-            timestamps, 
-            points, 
-            pen=pg.mkPen(color=color, width=2),
-            name=name,
-            symbol='o',
-            symbolSize=6,
-            symbolBrush=color
-        )
-        
-        # Add price labels
-        if 'prices' in points_data:
-            prices = np.array(points_data['prices'])
-            for ts, pt, pr in zip(timestamps, points, prices):
-                american = self._decimal_to_american(pr)
-                label_text = f"{pr:.2f}\n({american})" if self.market_key == 'h2h' else f"{pt:.1f}\n({american})"
-                label = pg.TextItem(label_text, anchor=(0.5, 1.5), color=color)
-                self.plot_widget.addItem(label)
-                label.setPos(ts, pt)
-
-    def _configure_plot_axes(self, snapshots):
-        """Configure plot axes and styling"""
+        # If we only have points data (no prices), plot those instead
+        elif 'points' in points_data and points_data['points'] and len(points_data['points']) > 0:
+            points = np.array(points_data['points'])
+            name = f"{bookmaker} - {outcome_key[0]} (Points)"
+            if outcome_key[1]:
+                name += f" ({outcome_key[1]})"
+            
+            line = self.plot_widget.plot(
+                timestamps, 
+                points,
+                pen=pg.mkPen(color=color, width=2, style=Qt.PenStyle.DashLine),
+                name=name,
+                symbol='s',
+                symbolSize=6,
+                symbolBrush=color
+            )
+    
+    def configure_plot_axes(self, snapshots):
+        """Configure plot axes optimized for American odds display"""
         if not snapshots:
             return
-            
-        # Set x-axis (time)
-        first_time = datetime.fromisoformat(snapshots[0]['timestamp'].replace('Z', ''))
-        last_time = datetime.fromisoformat(snapshots[-1]['timestamp'].replace('Z', ''))
-        self.plot_widget.setXRange(first_time.timestamp(), last_time.timestamp())
         
-        # Set y-axis based on market type
-        all_points = []
+        # Set up the time axis
+        first_time = datetime.fromisoformat(snapshots[0]['timestamp'].replace('Z', '')).timestamp()
+        last_time = datetime.fromisoformat(snapshots[-1]['timestamp'].replace('Z', '')).timestamp()
+        
+        # X-axis range
+        self.plot_widget.setXRange(first_time, last_time)
+        
+        # Create time formatter for X-axis
+        time_axis = pg.AxisItem(orientation='bottom')
+        
+        def timestamp_formatter(values, scale, spacing):
+            result = []
+            for value in values:
+                try:
+                    dt = datetime.fromtimestamp(value)
+                    if dt.minute == 0:
+                        # For whole hours, show date and hour
+                        label = dt.strftime('%m-%d %H:%M')
+                    else:
+                        # For other times, just show the time
+                        label = dt.strftime('%H:%M')
+                    
+                    result.append(label)
+                except:
+                    result.append('')
+            
+            return result
+        
+        time_axis.tickStrings = timestamp_formatter
+        self.plot_widget.setAxisItems({'bottom': time_axis})
+        self.plot_widget.setLabel('bottom', 'Time')
+        
+        # Collect all American prices to determine Y-axis range
+        all_american_prices = []
+        
         for snapshot in snapshots:
             for bookmaker in snapshot.get('data', {}).get('bookmakers', []):
                 for market in bookmaker.get('markets', []):
                     if market['key'] == self.market_key:
                         for outcome in market.get('outcomes', []):
-                            if 'point' in outcome:
-                                all_points.append(outcome['point'])
-                            elif 'price' in outcome:
-                                all_points.append(self._american_to_decimal(outcome['price']))
+                            if 'price' in outcome:
+                                american_price = outcome['price']
+                                # Convert to numeric for min/max calculations
+                                try:
+                                    if isinstance(american_price, str):
+                                        if american_price.startswith('+'):
+                                            all_american_prices.append(float(american_price[1:]))
+                                        elif american_price.startswith('-'):
+                                            all_american_prices.append(float(american_price))
+                                    else:
+                                        all_american_prices.append(float(american_price))
+                                except (ValueError, TypeError):
+                                    pass  # Skip invalid values
         
-        if all_points:
-            min_val = min(all_points)
-            max_val = max(all_points)
-            padding = (max_val - min_val) * 0.1
-            self.plot_widget.setYRange(min_val - padding, max_val + padding)
+        # Set Y-axis range for American odds with proper padding
+        if all_american_prices:
+            min_val = min(all_american_prices) * 1.05  # More padding for negative values
+            max_val = max(all_american_prices) * 1.05
             
-            # Create appropriate y-axis ticks
-            if self.market_key == 'h2h':
-                # For moneyline, show decimal and American odds
-                y_ticks = []
-                step = (max_val - min_val) / 5
-                current = min_val
-                while current <= max_val:
-                    american = self._decimal_to_american(current)
-                    y_ticks.append((current, f"{current:.2f}\n({american})"))
-                    current += step
-                self.plot_widget.getAxis('left').setTicks([y_ticks])
-            else:
-                # For spreads/totals, just show the points
-                self.plot_widget.setLabel('left', 'Points')
+            # Ensure we don't have identical min/max which would break the axis
+            if min_val == max_val:
+                if min_val > 0:
+                    min_val = min_val * 0.9
+                    max_val = max_val * 1.1
+                else:
+                    min_val = min_val * 1.1
+                    max_val = max_val * 0.9
+            
+            self.plot_widget.setYRange(min_val, max_val)
+            
+            # Set up Y-axis label and ticks
+            y_axis = self.plot_widget.getAxis('left')
+            y_axis.setLabel('American Odds')
+            
+            # Create appropriate Y-axis ticks
+            y_ticks = []
+            num_ticks = 5
+            step = (max_val - min_val) / num_ticks
+            current = min_val
+            
+            for i in range(num_ticks + 1):
+                # Format as American odds with +/- sign
+                if current >= 0:
+                    y_ticks.append((current, f"+{int(current)}"))
+                else:
+                    y_ticks.append((current, f"{int(current)}"))
+                current += step
+                
+            y_axis.setTicks([y_ticks])
+    
+    def _show_no_data_message(self, message="No historical data available"):
+        """Show a message when no data is available"""
+        self.no_data_text = pg.TextItem(message, anchor=(0.5, 0.5))
+        self.plot_widget.addItem(self.no_data_text)
+        self.no_data_text.setPos(0.5, 0.5)
 
-
-    # This 10th plus individual inclusion of this function what a shitshow
-    def _decimal_to_american(self, decimal_odds):
-        """Convert decimal odds to American odds format"""
-        if decimal_odds < 1.0:
-            return "N/A"  # Handle invalid cases
-        
-        if decimal_odds >= 2.0:
-            return f"+{round((decimal_odds - 1) * 100)}"
-        else:
-            return f"-{round(100 / (decimal_odds - 1))}"
-        
     def _american_to_decimal(self, american_odds):
-        """Convert American odds to decimal odds"""
-        if american_odds > 0:
-            return (american_odds / 100) + 1
-        else:
-            return (100 / abs(american_odds)) + 1
-
-
+        """Convert American odds to decimal odds with proper handling of extreme values"""
+        try:
+            if american_odds == 0:
+                return 1.0  # Handle zero case
+                
+            if american_odds > 0:
+                return (american_odds / 100) + 1
+            else:
+                return (100 / abs(american_odds)) + 1
+        except Exception as e:
+            print(f"Error converting American odds {american_odds} to decimal: {e}")
+            return 1.01  # Return a safe default
+    
+    def _decimal_to_american(self, decimal_odds):
+        """Convert decimal odds to American odds with safeguards"""
+        try:
+            if decimal_odds < 1.01:
+                return -10000  # Cap at -10000 for very low decimal odds
+            
+            if decimal_odds >= 2.0:
+                american = round((decimal_odds - 1) * 100)
+                return f"+{min(american, 10000)}"  # Cap at +10000
+            else:
+                # For favorites (decimal odds < 2.0)
+                american = round(100 / (decimal_odds - 1))
+                return f"-{min(american, 10000)}"  # Cap at -10000
+        except Exception as e:
+            print(f"Error converting decimal odds {decimal_odds} to American: {e}")
+            return "-110"  # Return a safe default
+    
+    def _decimal_to_american_int(self, decimal_odds):
+        """Convert decimal odds to American odds format as int with safeguards"""
+        try:
+            if decimal_odds < 1.01:
+                return -10000  # Cap at -10000 for very low decimal odds
+                
+            if decimal_odds >= 2.0:
+                american = round((decimal_odds - 1) * 100)
+                return min(american, 10000)  # Cap at +10000
+            else:
+                american = round(100 / (decimal_odds - 1))
+                return -min(american, 10000)  # Cap at -10000
+        except Exception as e:
+            print(f"Error converting decimal odds {decimal_odds} to American int: {e}")
+            return -110  # Return a safe default
