@@ -22,7 +22,7 @@ from HistoricalOddsClient import *
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
-#TODO: 
+#TODO: Toggeling on News widget removes ability to resize odds window/Best Lines & Historical widget
 
 
 
