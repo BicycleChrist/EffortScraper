@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
 
 from Creds import SUPER_KEY
 
+# TODO: Fix grapg output being erased after interacting with checboxes
+# Using checkboxes to add/remove plots of bookmakers removes them permanently
 
 class HistoricalOddsClient:
     """Client for fetching historical odds data from theOddsAPI"""

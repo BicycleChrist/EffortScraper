@@ -66,6 +66,7 @@ def parse_urls(urls):
 
 if __name__ == "__main__":
     urls = [
+        "https://the.streameast.app/v86",
         "https://the.streameast.app/nhlstreams3",
         "https://the.streameast.app/nhlstreams3",
         "https://the.streameast.app/mlbstreams17",
