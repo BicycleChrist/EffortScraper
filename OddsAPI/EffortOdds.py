@@ -706,7 +706,7 @@ class ModernOddsWindow(QMainWindow):
         await self.populate_leagues()
         self.leagues_loaded = True
 
-    async def populate_leagues(self, default_league="NBA"):
+    async def populate_leagues(self, default_league="MLB"):
         """Fetch and populate leagues in the dropdown"""
         leagues = await self.data_manager.fetch_leagues()
         print("Fetched leagues:", leagues)
@@ -728,21 +728,31 @@ class ModernOddsWindow(QMainWindow):
         """Handle tab switching events"""
         if index >= 0:
             self.current_league = self.tab_widget.tabText(index)
+            # Extract the league name without the market info
+            if "(" in self.current_league:
+                base_league = self.current_league.split(" (")[0]
+                # Optionally update league selector to match the tab
+                self.league_selector.setCurrentText(base_league)
 
-    def create_league_tab(self, league_name, sport_key):
-        """Create a new tab for a league"""
-        if league_name not in self.league_tabs:
+    def create_league_tab(self, league_name, sport_key, selected_markets=None):
+        """Create a new tab for a league with specific markets"""
+        # Create a unique tab identifier based on league name and selected markets
+        markets_str = "+".join(sorted(selected_markets)) if selected_markets else "default"
+        tab_id = f"{league_name} ({markets_str})"
+        
+        if tab_id not in self.league_tabs:
             tab_data = LeagueTabData(league_name, sport_key)
             table_widget = tab_data.create_table_widget()
             
             # Connect selection signal for the new table
             table_widget.itemSelectionChanged.connect(self.on_market_selection_changed)
             
-            self.tab_widget.addTab(table_widget, league_name)
-            self.league_tabs[league_name] = tab_data
-            self.current_league = league_name
+            self.tab_widget.addTab(table_widget, tab_id)
+            self.league_tabs[tab_id] = tab_data
+            self.current_league = tab_id
             self.tab_widget.setCurrentIndex(self.tab_widget.count() - 1)
-        return self.league_tabs[league_name]
+        return self.league_tabs[tab_id]
+
 
     # Proper formatting for 3-way markets (likely redundant, but im tilt)
     def format_market_label(self, market_key, outcome):
@@ -1111,8 +1121,11 @@ class ModernOddsWindow(QMainWindow):
                 self.update_status.setText("Error: Invalid league selection")
                 return
     
-            # Create or get existing tab
-            tab_data = self.create_league_tab(selected_league, sport_key)
+            # Create a unique tab based on league and currently selected markets
+            current_markets = self.selected_markets.copy()
+            
+            # Create or get existing tab (now with markets parameter)
+            tab_data = self.create_league_tab(selected_league, sport_key, current_markets)
             
             # Store current table state in a DataFrame before updating
             current_df = None
@@ -1158,7 +1171,7 @@ class ModernOddsWindow(QMainWindow):
                 self.progress.setValue(progress_value)
     
                 async with aiohttp.ClientSession() as session:
-                    available_markets = self.selected_markets.copy()
+                    available_markets = current_markets.copy()  # Use the current_markets variable
                     selected_region = self.selected_region
                     odds = await self.data_manager.prop_client.get_event_odds(
                         session, 
