@@ -342,6 +342,26 @@ class ModernOddsWindow(QMainWindow):
             }
         """)
         
+        # Create historical odds toggle button
+        self.history_toggle_button = QPushButton("Show Historical Odds ▼")
+        self.history_toggle_button.setCheckable(True)
+        self.history_toggle_button.setChecked(False)
+        self.history_toggle_button.clicked.connect(self.toggle_historical_odds)
+        self.history_toggle_button.setFixedWidth(150)
+        self.history_toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: none;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 9pt;
+            }
+            QPushButton:checked {
+                background-color: #34495E;
+            }
+        """)
+        
         # Create a dedicated container for the right side elements
         right_side_container = QWidget()
         right_side_layout = QVBoxLayout(right_side_container)
@@ -352,6 +372,7 @@ class ModernOddsWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(self.stream_toggle_button)
         buttons_layout.addWidget(self.news_toggle_button)
+        buttons_layout.addWidget(self.history_toggle_button)  # Add historical odds toggle button
         buttons_layout.setSpacing(4)  # Small spacing between buttons
         
         # Add the buttons layout to the right side layout
@@ -487,11 +508,16 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_container = QWidget()
         historical_odds_layout = QVBoxLayout(self.historical_odds_container)
         historical_odds_layout.setContentsMargins(0, 0, 0, 0)
+        self.historical_odds_container.setFixedWidth(750)
         
         # Create the historical odds widget
         self.historical_odds_widget = HistoricalOddsWidget()
         self.historical_odds_widget.api_key = SUPER_KEY  # Set API key
         historical_odds_layout.addWidget(self.historical_odds_widget)
+        
+        # Initially hide the historical container (important!)
+        self.historical_odds_container.setVisible(False)
+        self.historical_odds_widget.setVisible(False)
         
         # Create a container for the bottom right section (best lines + historical odds)
         right_bottom_container = QWidget()
@@ -1010,6 +1036,49 @@ class ModernOddsWindow(QMainWindow):
         
         # Force update to apply changes
         QTimer.singleShot(10, self.update)
+        
+        
+    def toggle_historical_odds(self):
+        """Toggle visibility of the historical odds widget"""
+        visible = self.history_toggle_button.isChecked()
+        
+        # Hide the streaming widget if showing historical odds
+        if visible:
+            self.stream_toggle_button.setChecked(False)
+            self.tune_in_widget.setVisible(False)
+            self.stream_toggle_button.setText("Show Streaming Links ▼")
+            
+            # Ensure news widget is also hidden to prevent UI conflicts
+            self.news_toggle_button.setChecked(False)
+            self.team_news_widget.setVisible(False)
+            self.news_container.setVisible(False)
+            self.news_toggle_button.setText("Show Injury News ▼")
+        
+        # Make the historical odds container visible/invisible based on toggle state
+        self.historical_odds_container.setVisible(visible)
+        
+        # Update button text
+        if visible:
+            self.history_toggle_button.setText("Hide Historical Odds ▲")
+        else:
+            self.history_toggle_button.setText("Show Historical Odds ▼")
+            
+            # If we're hiding, cancel any running data loads
+            if hasattr(self.historical_odds_widget, '_load_task') and self.historical_odds_widget._load_task:
+                try:
+                    self.historical_odds_widget._load_task.cancel()
+                except:
+                    pass
+        
+        # Force update to apply changes
+        # Make sure both are visible
+        self.historical_odds_container.setVisible(visible)
+        self.historical_odds_widget.setVisible(visible)
+        
+        # Force a layout update
+        self.historical_odds_container.updateGeometry()
+        self.historical_odds_widget.updateGeometry()
+        QTimer.singleShot(10, self.update)
     
     
     def update_best_lines_display(self):
@@ -1087,8 +1156,9 @@ class ModernOddsWindow(QMainWindow):
         league_name = self.league_selector.currentText()
         sport_key = self.data_manager.league_map.get(league_name)
         
-        # Update the historical odds widget
-        self.historical_odds_widget.set_market(sport_key, game_id, market_type, home_team, away_team)
+        # Only update the historical odds widget if it's visible
+        if self.historical_odds_container.isVisible() and hasattr(self, 'historical_odds_widget'):
+            self.historical_odds_widget.set_market(sport_key, game_id, market_type, home_team, away_team)
 
 
 
@@ -1424,9 +1494,7 @@ class ModernOddsWindow(QMainWindow):
          # Resize the table
          table.resizeColumnsToContents()
          table.resizeRowsToContents()
-
-
-
+    
 async def main():
     app = QApplication([])
     
