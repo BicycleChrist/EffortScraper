@@ -495,13 +495,45 @@ class ModernOddsWindow(QMainWindow):
         best_lines_layout = QVBoxLayout(self.best_lines_container)
         best_lines_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Add a header
+        # Create header layout with label and buttons
+        best_lines_header_layout = QHBoxLayout()
+        
+        # Add the header label
         best_lines_header = QLabel("Best Lines ⮟")
         best_lines_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #7bd419")
-        best_lines_layout.addWidget(best_lines_header)
+        best_lines_header_layout.addWidget(best_lines_header)
+        
+        # Add spacer to push buttons to the right
+        best_lines_header_layout.addStretch(1)
+        
+        # Add refresh button for splits data
+        self.splits_refresh_button = QPushButton("↻")
+        self.splits_refresh_button.setToolTip("Refresh Betting Splits Data")
+        self.splits_refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: none;
+                padding: 2px 4px;
+                border-radius: 3px;
+                font-size: 10pt;
+            }
+            QPushButton:hover {
+                background-color: #34495E;
+            }
+        """)
+        self.splits_refresh_button.setFixedWidth(25)
+        self.splits_refresh_button.clicked.connect(self.refresh_splits_data)
+        best_lines_header_layout.addWidget(self.splits_refresh_button)
         
         # Create the best lines widget
         self.best_lines_widget = BestLinesWidget()
+        
+        # Add the toggle button from the BestLinesWidget
+        best_lines_header_layout.addWidget(self.best_lines_widget.toggle_button)
+        
+        # Add the header layout and the widget to the container
+        best_lines_layout.addLayout(best_lines_header_layout)
         best_lines_layout.addWidget(self.best_lines_widget)
         
         # Create the historical odds container
@@ -611,33 +643,37 @@ class ModernOddsWindow(QMainWindow):
         has_props = sport_key in MAJOR_PROP_MARKETS  # Check if this league has props
         self.props_button.setEnabled(has_props)
         self.props_availability_label.setVisible(not has_props)
-        # self.update_market_selection() # not necessary?
+        
         if hasattr(self, 'team_news_widget'):
             self.team_news_widget.handle_league_change(sport_key)
+            
+        # Update splits data when league changes
+        if hasattr(self, 'best_lines_widget'):
+            self.best_lines_widget.set_sport(sport_key)
 
     
     
-    def handle_region_change(self, region):
-        """Handle region selection changes"""
-        if region == 'global' and self.region_checkboxes['global'].isChecked():
-            # Check all other regions when global is selected
-            for r, cb in self.region_checkboxes.items():
-                if r != 'global':
-                    cb.setChecked(True)
-            self.selected_region = "us,us2,eu,au,uk"  # Ensure it's a string, not a set
-        else:
-            # If global is unchecked, uncheck it when selecting individual regions
-            if region != 'global':
-                self.region_checkboxes['global'].setChecked(False)
-            
-            # Get all selected regions except 'global'
-            selected = [r for r, cb in self.region_checkboxes.items() 
-                       if cb.isChecked() and r != 'global']
-            
-            # Join selected regions with commas or default to "us"
-            self.selected_region = ",".join(selected) if selected else "us"  # Ensure string format
+    def handle_league_change(self):
+        """Handle league selection changes"""
         
-        print(f"Selected regions: {self.selected_region}")
+        # Ensure self.props_button exists before proceeding
+        if not hasattr(self, "props_button"):
+            print("Warning: props_button does not exist yet. Skipping handle_league_change.")
+            return
+        
+        selected_league = self.league_selector.currentText()
+        sport_key = self.data_manager.league_map.get(selected_league)
+    
+        has_props = sport_key in MAJOR_PROP_MARKETS  # Check if this league has props
+        self.props_button.setEnabled(has_props)
+        self.props_availability_label.setVisible(not has_props)
+        
+        if hasattr(self, 'team_news_widget'):
+            self.team_news_widget.handle_league_change(sport_key)
+            
+        # Update splits data when league changes
+        if hasattr(self, 'best_lines_widget'):
+            self.best_lines_widget.set_sport(sport_key)
     
     def get_valid_markets(self, sport_key):
         """Get valid markets for the selected sport"""
@@ -966,7 +1002,33 @@ class ModernOddsWindow(QMainWindow):
             self.timer.stop()
             print("timer stopped")
         # self.update_status_text() # crashes
+    
+    async def refresh_splits_data(self):
+        """Refresh betting splits data for the current sport"""
+        self.splits_refresh_button.setEnabled(False)
+        self.splits_refresh_button.setText("⟳")
         
+        try:
+            result = await self.best_lines_widget.refresh_splits_data()
+            if result:
+                # Show success indicator briefly
+                self.splits_refresh_button.setText("✓")
+                QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
+            else:
+                # Show error indicator briefly
+                self.splits_refresh_button.setText("✗")
+                QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
+        except Exception as e:
+            print(f"Error refreshing splits data: {e}")
+            self.splits_refresh_button.setText("✗")
+            QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
+        
+        self.splits_refresh_button.setEnabled(True)
+
+    
+    
+    
+      
     
     def update_timer_interval(self):
         """Update the timer interval when spinbox value changes"""

@@ -186,7 +186,7 @@ def scrape_betting_data(html_content: str) -> List[Dict[str, Any]]:
     return games_data
 
 
-def save_data(data, sport="betting", output_dir="data", output_format="json"):
+def save_data(data, sport="betting", output_dir="SplitsData", output_format="json"):
     """
     Save extracted data to file in the specified format.
     Default is JSON but can be expanded for other formats.
