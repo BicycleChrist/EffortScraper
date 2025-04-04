@@ -278,6 +278,9 @@ class PropsWindow(BaseTableWindow):
         self.best_over_color = QColor(0, 100, 0)  # Dark Green
         self.best_under_color = QColor(0, 70, 140)  # Dark Blue
         self.best_text_color = QColor(27, 16, 16) # Black Text
+        
+        # Flag to track if window is in process of closing
+        self._closing = False
             
     def UpdateIcon(self):
         framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
@@ -288,116 +291,163 @@ class PropsWindow(BaseTableWindow):
     
     def start_async_init(self):
         """Start the asynchronous initialization of the UI."""
+        # If window is closing, don't start init
+        if hasattr(self, '_closing') and self._closing:
+            print("Window is closing, skipping initialization")
+            return
+            
         import asyncio
-        asyncio.create_task(self.init_prop_ui())
+        
+        # Create task and store reference to it for possible cancellation
+        self._init_task = asyncio.create_task(self.init_prop_ui())
+        
+        # Add a callback to handle any exceptions
+        def init_done(task):
+            try:
+                task.result()  # This will raise any exceptions from the task
+            except asyncio.CancelledError:
+                print("Initialization was cancelled")
+            except Exception as e:
+                print(f"Error during initialization: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        self._init_task.add_done_callback(init_done)
 
     async def init_prop_ui(self):
-        # Create controls container
-        controls_widget = QWidget()
-        controls_layout = QHBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
-        controls_layout.setSpacing(5)  # Reduce spacing between widgets
-        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
+        # Check if window is closing before proceeding
+        if hasattr(self, '_closing') and self._closing:
+            print("Window is closing, aborting initialization")
+            return
+            
+        try:
+            # Create controls container
+            controls_widget = QWidget()
+            controls_layout = QHBoxLayout(controls_widget)
+            controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
+            controls_layout.setSpacing(5)  # Reduce spacing between widgets
+            self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
+            
+            # Prop type label
+            controls_layout.addWidget(QLabel("Select Prop Type:"))
         
-        # Prop type label
-        controls_layout.addWidget(QLabel("Select Prop Type:"))
-    
-        # Prop type selector
-        self.prop_selector = QComboBox()
-        controls_layout.addWidget(self.prop_selector)
-    
-        # Fetch button
-        self.fetch_button = QPushButton("Fetch Props")
-        self.fetch_button.setStyleSheet(self.fetch_button_style)
-        self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
-        controls_layout.addWidget(self.fetch_button)
-    
-        # Progress bar (moved to the right of the controls)
-        self.progress = QProgressBar()
-        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        controls_layout.addWidget(self.progress)
+            # Prop type selector
+            self.prop_selector = QComboBox()
+            controls_layout.addWidget(self.prop_selector)
         
-        # Add controls to the main layout
-        self.layout.addWidget(controls_widget)
+            # Fetch button
+            self.fetch_button = QPushButton("Fetch Props")
+            self.fetch_button.setStyleSheet(self.fetch_button_style)
+            self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
+            controls_layout.addWidget(self.fetch_button)
         
-        # Create main odds display tab widget and add to layout
-        self.props_tab_widget = QTabWidget()
-        self.props_tab_widget.currentChanged.connect(self.handle_tab_change)
-        self.layout.addWidget(self.props_tab_widget)
+            # Progress bar (moved to the right of the controls)
+            self.progress = QProgressBar()
+            self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            controls_layout.addWidget(self.progress)
+            
+            # Add controls to the main layout
+            self.layout.addWidget(controls_widget)
+            
+            # Create main odds display tab widget and add to layout
+            self.props_tab_widget = QTabWidget()
+            self.props_tab_widget.currentChanged.connect(self.handle_tab_change)
+            self.layout.addWidget(self.props_tab_widget)
+            
+            # Create a container for the bottom area (game selection and best lines)
+            bottom_container = QWidget()
+            bottom_layout = QHBoxLayout(bottom_container)
+            bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
+            
+            # 'game_group' and checkbox-buttons need to match width
+            game_selection_width = 600
+            game_selection_height = 250
+            
+            # Add the game selection box to the left
+            game_group = QGroupBox()
+            game_group_layout = QVBoxLayout(game_group)
+            game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
+            game_group_layout.setSpacing(0)  # Remove spacing between elements
+            game_group.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
+            game_group.setFixedHeight(game_selection_height) # not necessary?
+            
+            # Create horizontal layout for buttons
+            buttons_layout = QHBoxLayout()
+            buttons_layout.setSpacing(2)  # Reduce spacing between buttons
+            
+            select_all_button = QPushButton("Select All")
+            select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+            select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
+            select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+            
+            deselect_all_button = QPushButton("Deselect All")
+            deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
+            deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
+            deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+            
+            buttons_layout.addWidget(select_all_button)
+            buttons_layout.addWidget(deselect_all_button)
+            buttons_layout.addStretch()  # Add stretch to push buttons to the left
+            game_group_layout.addLayout(buttons_layout)
         
-        # Create a container for the bottom area (game selection and best lines)
-        bottom_container = QWidget()
-        bottom_layout = QHBoxLayout(bottom_container)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
+            # Add the game selection scroll area with improved spacing
+            self.game_selection_area = QScrollArea()
+            self.game_selection_area.setWidgetResizable(True)
+            self.game_selection_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.game_selection_area.setContentsMargins(0, 0, 0, 0)
+            
+            # Set a fixed width that's narrower to reduce the spacing
+            self.game_selection_area.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
+            
+            self.game_selection_widget = QWidget()
+            self.game_selection_layout = QGridLayout(self.game_selection_widget)
+            self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
+            self.game_selection_layout.setHorizontalSpacing(0)  # Set horizontal spacing to 0
+            self.game_selection_layout.setVerticalSpacing(0)    # Set vertical spacing to 0
+            
+            self.game_selection_area.setWidget(self.game_selection_widget)
+            game_group_layout.addWidget(self.game_selection_area)
         
-        # 'game_group' and checkbox-buttons need to match width
-        game_selection_width = 600
-        game_selection_height = 250
+            # Add the game selection box to the left side of the bottom container
+            game_group.setFixedHeight(game_selection_height)  # Reduced from 300 to make more compact
+            bottom_layout.addWidget(game_group)
         
-        # Add the game selection box to the left
-        game_group = QGroupBox()
-        game_group_layout = QVBoxLayout(game_group)
-        game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
-        game_group_layout.setSpacing(0)  # Remove spacing between elements
-        game_group.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
-        game_group.setFixedHeight(game_selection_height) # not necessary?
+            # Add the best lines widget to the right side of the bottom container
+            self.create_best_lines_widget()
+            bottom_layout.addWidget(self.best_lines_widget)
         
-        # Create horizontal layout for buttons
-        buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(2)  # Reduce spacing between buttons
+            # Add the bottom container to the main layout
+            self.layout.addWidget(bottom_container)
         
-        select_all_button = QPushButton("Select All")
-        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
-        select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
-        select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+            # Load prop markets
+            self.load_prop_markets()
         
-        deselect_all_button = QPushButton("Deselect All")
-        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-        deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
-        deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
+            # Check again if window is closing before making network requests
+            if hasattr(self, '_closing') and self._closing:
+                print("Window is closing during initialization, aborting")
+                return
         
-        buttons_layout.addWidget(select_all_button)
-        buttons_layout.addWidget(deselect_all_button)
-        buttons_layout.addStretch()  # Add stretch to push buttons to the left
-        game_group_layout.addLayout(buttons_layout)
-    
-        # Add the game selection scroll area with improved spacing
-        self.game_selection_area = QScrollArea()
-        self.game_selection_area.setWidgetResizable(True)
-        self.game_selection_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.game_selection_area.setContentsMargins(0, 0, 0, 0)
-        
-        # Set a fixed width that's narrower to reduce the spacing
-        self.game_selection_area.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
-        
-        self.game_selection_widget = QWidget()
-        self.game_selection_layout = QGridLayout(self.game_selection_widget)
-        self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
-        self.game_selection_layout.setHorizontalSpacing(0)  # Set horizontal spacing to 0
-        self.game_selection_layout.setVerticalSpacing(0)    # Set vertical spacing to 0
-        
-        self.game_selection_area.setWidget(self.game_selection_widget)
-        game_group_layout.addWidget(self.game_selection_area)
-    
-        # Add the game selection box to the left side of the bottom container
-        game_group.setFixedHeight(game_selection_height)  # Reduced from 300 to make more compact
-        bottom_layout.addWidget(game_group)
-    
-        # Add the best lines widget to the right side of the bottom container
-        self.create_best_lines_widget()
-        bottom_layout.addWidget(self.best_lines_widget)
-    
-        # Add the bottom container to the main layout
-        self.layout.addWidget(bottom_container)
-    
-        # Load prop markets
-        self.load_prop_markets()
-    
-        # Fetch and populate games
-        async with aiohttp.ClientSession() as session:
-            games = await self.prop_client.get_games(session)
-            self.populate_game_selection(games)
-            integrate_stats_with_props_window(self)
+            # Fetch and populate games
+            try:
+                async with aiohttp.ClientSession() as session:
+                    games = await self.prop_client.get_games(session)
+                    
+                    # Final check before populating UI
+                    if hasattr(self, '_closing') and self._closing:
+                        print("Window is closing after fetching games, aborting")
+                        return
+                        
+                    self.populate_game_selection(games)
+                    integrate_stats_with_props_window(self)
+            except Exception as e:
+                print(f"Error fetching games: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        except Exception as e:
+            print(f"Error in init_prop_ui: {e}")
+            import traceback
+            traceback.print_exc()
 
     def handle_tab_change(self, index):
         """Handle tab switching events to update best lines display"""
@@ -995,3 +1045,18 @@ class PropsWindow(BaseTableWindow):
         
         # Resize columns to fit content
         self.best_lines_widget.resizeColumnsToContents()
+    
+    
+    def closeEvent(self, event):
+        """Override close event to ensure proper cleanup"""
+        # Stop any timers or ongoing operations
+        if hasattr(self, 'icon_timer') and self.icon_timer:
+            self.icon_timer.stop()
+        
+        # Clear any data that might be expensive to recreate
+        self.game_checkboxes.clear()
+        self.market_groups.clear()
+        self.best_lines.clear()
+        
+        # Accept the close event to proceed with window closing
+        event.accept()

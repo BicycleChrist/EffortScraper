@@ -691,10 +691,20 @@ class ModernOddsWindow(QMainWindow):
         
         if sport_key in MAJOR_PROP_MARKETS:  # Ensure props exist for this league
             print("Props are available for this league. Creating PropsWindow...")  # Debug print
-            if not hasattr(self, "props_window") or self.props_window is None:
-                self.props_window = PropsWindow(sport_key, selected_league)
+            
+            # If there's an existing window, properly destroy it
+            if hasattr(self, "props_window") and self.props_window is not None:
+                try:
+                    self.props_window.close()
+                    self.props_window.deleteLater()  # Schedule for Qt deletion
+                    self.props_window = None
+                except Exception as e:
+                    print(f"Error cleaning up old props window: {e}")
+            
+            # Create a completely new instance with no reference to old data
+            self.props_window = PropsWindow(sport_key, selected_league)
+            self.props_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # Qt will delete the widget when closed
             self.props_window.show()
-            self.props_window.activateWindow()  # Brings the window to the front if it already exists
         else:
             print("No props available for this league.")  # Debug print
 
