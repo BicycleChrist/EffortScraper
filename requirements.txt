@@ -8,3 +8,6 @@ xgboost
 requests
 more-itertools
 lxml
+qasync
+aiohttp
+feedparser
