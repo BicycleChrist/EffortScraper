@@ -512,10 +512,10 @@ def integrate_stats_with_props_window(props_window):
         props_window.tab_widget_integrated = True
         
         def update_best_lines_table():
+            if not hasattr(props_window, 'new_best_lines_table') or not hasattr(props_window, 'best_lines_widget'): return;
+            if ((props_window.new_best_lines_table is None) or (props_window.best_lines_widget is None)): return;
+            print("updating best lines table...")
             try:
-                if not hasattr(props_window, 'new_best_lines_table') or not hasattr(props_window, 'best_lines_widget'):
-                    return
-                
                 original_table = props_window.best_lines_widget
                 new_table = props_window.new_best_lines_table
                 
@@ -533,22 +533,12 @@ def integrate_stats_with_props_window(props_window):
                             new_table.setItem(row, col, new_item)
                 
                 new_table.resizeColumnsToContents()
+                props_window.new_best_lines_table = new_table
             except Exception as e:
                 print(f"Error updating best lines table: {e}")
+            return
         
-        update_timer = QTimer()
-        update_timer.timeout.connect(update_best_lines_table)
-        update_timer.start(1000)
-        props_window.update_timer = update_timer
-        
-        original_update = props_window.update_best_lines_display
-        
-        def enhanced_update_best_lines_display(*args, **kwargs):
-            result = original_update(*args, **kwargs)
-            update_best_lines_table()
-            return result
-        
-        props_window.update_best_lines_display = enhanced_update_best_lines_display
+        props_window.update_timer = QTimer.singleShot(1000, update_best_lines_table)
         
         # Set initial sport for the stats widget
         advanced_stats_widget.set_sport(props_window.sport_key)

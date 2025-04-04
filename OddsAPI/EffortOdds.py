@@ -650,30 +650,30 @@ class ModernOddsWindow(QMainWindow):
         # Update splits data when league changes
         if hasattr(self, 'best_lines_widget'):
             self.best_lines_widget.set_sport(sport_key)
-
-    
-    
-    def handle_league_change(self):
-        """Handle league selection changes"""
-        
-        # Ensure self.props_button exists before proceeding
-        if not hasattr(self, "props_button"):
-            print("Warning: props_button does not exist yet. Skipping handle_league_change.")
-            return
-        
-        selected_league = self.league_selector.currentText()
-        sport_key = self.data_manager.league_map.get(selected_league)
-    
-        has_props = sport_key in MAJOR_PROP_MARKETS  # Check if this league has props
-        self.props_button.setEnabled(has_props)
-        self.props_availability_label.setVisible(not has_props)
-        
-        if hasattr(self, 'team_news_widget'):
-            self.team_news_widget.handle_league_change(sport_key)
+        return
+      
+    def handle_region_change(self, region):
+        """Handle region selection changes"""
+        if region == 'global' and self.region_checkboxes['global'].isChecked():
+            # Check all other regions when global is selected
+            for r, cb in self.region_checkboxes.items():
+                if r != 'global':
+                    cb.setChecked(True)
+            self.selected_region = "us,us2,eu,au,uk"  # Ensure it's a string, not a set
+        else:
+            # If global is unchecked, uncheck it when selecting individual regions
+            if region != 'global':
+                self.region_checkboxes['global'].setChecked(False)
             
-        # Update splits data when league changes
-        if hasattr(self, 'best_lines_widget'):
-            self.best_lines_widget.set_sport(sport_key)
+            # Get all selected regions except 'global'
+            selected = [r for r, cb in self.region_checkboxes.items() 
+                       if cb.isChecked() and r != 'global']
+            
+            # Join selected regions with commas or default to "us"
+            self.selected_region = ",".join(selected) if selected else "us"  # Ensure string format
+        
+        print(f"Selected regions: {self.selected_region}")
+        return
     
     def get_valid_markets(self, sport_key):
         """Get valid markets for the selected sport"""
