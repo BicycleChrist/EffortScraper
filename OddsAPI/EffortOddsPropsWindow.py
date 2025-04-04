@@ -5,7 +5,7 @@ from PyQt6.QtGui import QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QLabel, QProgressBar, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton,
-    QHBoxLayout, QGridLayout, QCheckBox, QScrollArea, QGroupBox
+    QHBoxLayout, QGridLayout, QCheckBox, QScrollArea, QGroupBox, QTabWidget
 )
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
@@ -256,6 +256,12 @@ class PropsWindow(BaseTableWindow):
         self.best_lines = {}  # Store the best lines for each market group
         self.best_lines_widget = None
 
+        # Add tab-related variables
+        self.props_tab_widget = QTabWidget()  # Main tab widget for the odds display
+        self.league_tabs = {}  # {market_type: LeagueTabData}
+        self.current_market = None
+        self.current_tab_data = None
+
         # Use a QTimer to schedule the async initialization
         self.timer = QTimer()
         self.timer.setSingleShot(True)  # Ensure the timer only fires once
@@ -272,8 +278,6 @@ class PropsWindow(BaseTableWindow):
         self.best_over_color = QColor(0, 100, 0)  # Dark Green
         self.best_under_color = QColor(0, 70, 140)  # Dark Blue
         self.best_text_color = QColor(27, 16, 16) # Black Text
-        
-        
             
     def UpdateIcon(self):
         framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
@@ -294,6 +298,7 @@ class PropsWindow(BaseTableWindow):
         controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
         controls_layout.setSpacing(5)  # Reduce spacing between widgets
         self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
+        
         # Prop type label
         controls_layout.addWidget(QLabel("Select Prop Type:"))
     
@@ -311,10 +316,15 @@ class PropsWindow(BaseTableWindow):
         self.progress = QProgressBar()
         self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controls_layout.addWidget(self.progress)
-    
+        
         # Add controls to the main layout
         self.layout.addWidget(controls_widget)
-    
+        
+        # Create main odds display tab widget and add to layout
+        self.props_tab_widget = QTabWidget()
+        self.props_tab_widget.currentChanged.connect(self.handle_tab_change)
+        self.layout.addWidget(self.props_tab_widget)
+        
         # Create a container for the bottom area (game selection and best lines)
         bottom_container = QWidget()
         bottom_layout = QHBoxLayout(bottom_container)
@@ -380,9 +390,6 @@ class PropsWindow(BaseTableWindow):
         # Add the bottom container to the main layout
         self.layout.addWidget(bottom_container)
     
-        # Create table
-        self.create_table()
-    
         # Load prop markets
         self.load_prop_markets()
     
@@ -391,6 +398,17 @@ class PropsWindow(BaseTableWindow):
             games = await self.prop_client.get_games(session)
             self.populate_game_selection(games)
             integrate_stats_with_props_window(self)
+
+    def handle_tab_change(self, index):
+        """Handle tab switching events to update best lines display"""
+        if index >= 0 and index < self.props_tab_widget.count():
+            tab_id = self.props_tab_widget.tabText(index)
+            if tab_id in self.league_tabs:
+                self.current_tab_data = self.league_tabs[tab_id]
+                self.current_market = tab_id
+                # Update best lines display based on the selected tab
+                self.update_best_lines_display()
+                self.highlight_best_lines()
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
@@ -448,11 +466,6 @@ class PropsWindow(BaseTableWindow):
     
         # Adjust the layout to fit the content
         self.game_selection_widget.adjustSize()
-
-    # Update the game selection area configuration in init_prop_ui method
-    # Replace the game_selection_area related code with this
-
-    # Update the portion of init_prop_ui where you create the game selection area
     
     def set_all_game_checkboxes(self, checked: bool):
         """Set all game checkboxes to checked or unchecked state."""
@@ -492,12 +505,36 @@ class PropsWindow(BaseTableWindow):
             selected_prop = self.prop_types[selected_index]
             await self.refresh_data({selected_prop})
 
+    def create_prop_tab(self, market_type):
+        """Create a new tab for a prop market"""
+        tab_id = market_type
+        
+        if tab_id not in self.league_tabs:
+            tab_data = LeagueTabData(self.league_name, self.sport_key)
+            table_widget = tab_data.create_table_widget()
+            self.props_tab_widget.addTab(table_widget, tab_id)
+            self.league_tabs[tab_id] = tab_data
+            
+        return self.league_tabs[tab_id]
+
     @qasync.asyncSlot()
     async def refresh_data(self, markets):
         """Handle data refresh with proper error handling and state management"""
         self.progress.setValue(0)
         
         try:
+            if not markets:
+                return
+                
+            market_type = list(markets)[0]  # Get the first market type
+            self.current_market = market_type
+            self.current_tab_data = self.create_prop_tab(market_type)
+            
+            # Switch to the tab we're refreshing
+            tab_index = self.props_tab_widget.indexOf(self.current_tab_data.table_widget)
+            if tab_index >= 0:
+                self.props_tab_widget.setCurrentIndex(tab_index)
+            
             # Initialize data structures if they don't exist
             if not hasattr(self, 'consolidated_odds_data'):
                 self.consolidated_odds_data = {'bookmakers': []}
@@ -542,7 +579,7 @@ class PropsWindow(BaseTableWindow):
                         # Store raw data by game
                         self.raw_odds_data_by_game[game_id] = odds
     
-                        # Process for table display
+                        # Process for table display using current tab data
                         self.process_odds_data(odds)
     
                         # Merge into consolidated data
@@ -572,7 +609,7 @@ class PropsWindow(BaseTableWindow):
                 
                 # Update displays if we got any data
                 if self.consolidated_odds_data['bookmakers']:
-                    self.tab_data.update_table_display()
+                    self.current_tab_data.update_table_display()
                     self.update_best_lines_display()
                 else:
                     print("No valid bookmaker data was processed")
@@ -586,8 +623,6 @@ class PropsWindow(BaseTableWindow):
         
         self.highlight_best_lines()
         self.progress.setValue(100)
-
-
 
     def find_best_lines(self):
         """Find the best lines for each market group"""
@@ -642,12 +677,14 @@ class PropsWindow(BaseTableWindow):
         return best_over, best_under
 
     def highlight_best_lines(self):
-        
         if not hasattr(self, 'consolidated_odds_data') or not self.consolidated_odds_data:
             print("No data available for highlighting")
             return
-    
-        table = self.tab_data.table_widget
+        
+        if not self.current_tab_data:
+            return 
+        
+        table = self.current_tab_data.table_widget
         bookmakers = [bm['title'] for bm in self.consolidated_odds_data['bookmakers']]
         
         # First reset all highlighting
@@ -658,14 +695,14 @@ class PropsWindow(BaseTableWindow):
                     # Reset to default colors but keep game-specific background
                     game_id = item.game_id if hasattr(item, 'game_id') else ''
                     if game_id:
-                        bg_color = self.tab_data.get_game_color(game_id)
+                        bg_color = self.current_tab_data.get_game_color(game_id)
                         item.setBackground(bg_color)
                     item.setForeground(QColor('black'))
     
         # Find and highlight best lines
         market_best_lines = {}
-        for row_idx, row_label in enumerate(self.tab_data.table_rows):
-            row_data = self.tab_data.table_data.get(row_label, {})
+        for row_idx, row_label in enumerate(self.current_tab_data.table_rows):
+            row_data = self.current_tab_data.table_data.get(row_label, {})
             
             # Skip header rows
             if row_data.get('is_header', False):
@@ -685,7 +722,7 @@ class PropsWindow(BaseTableWindow):
                 }
     
             # Check each bookmaker column
-            for col_idx, bm in enumerate(self.tab_data.bookmakers, 1):
+            for col_idx, bm in enumerate(self.current_tab_data.bookmakers, 1):
                 value = row_data.get(bm, "")
                 if not value:
                     continue
@@ -752,29 +789,30 @@ class PropsWindow(BaseTableWindow):
     
         print(f"Highlighted {len(market_best_lines)} markets")
     
-    # This is semi-jenk, can likley be half as long and twice as efficient
     def process_odds_data(self, odds):
         """Process odds data into table format without overwriting existing markets"""
         if not odds or 'bookmakers' not in odds:
             return
         
+        if not self.current_tab_data:
+            return
+            
         game_id = odds.get('id', 'unknown')
         home_team = odds.get('home_team', 'Unknown')
         away_team = odds.get('away_team', 'Unknown')
         
         for bm in odds['bookmakers']:
             bm_title = bm['title']
-            if bm_title not in self.tab_data.bookmakers:
-                self.tab_data.bookmakers.append(bm_title)
+            if bm_title not in self.current_tab_data.bookmakers:
+                self.current_tab_data.bookmakers.append(bm_title)
             
             # Group markets by player name and market key
             grouped_markets = {}
             for market in bm['markets']:
-                market_key = market['key']  # This is the specific market type (e.g., 'points', 'pra')
+                market_key = market['key']
                 for outcome in market['outcomes']:
                     player_name = outcome.get('description', outcome.get('name'))
-                    # Create a unique key for grouping that includes market type
-                    group_key = f"{player_name} - {market_key}"  # e.g. "Patrick Mahomes - passing_yards"
+                    group_key = f"{player_name} - {market_key}"
                     
                     if group_key not in grouped_markets:
                         grouped_markets[group_key] = {
@@ -783,21 +821,18 @@ class PropsWindow(BaseTableWindow):
                             'point': outcome.get('point', '')
                         }
                     
-                    # Store over/under odds
                     outcome_name = outcome.get('name', '').lower()
                     if outcome_name == 'over':
                         grouped_markets[group_key]['over'] = outcome.get('price', '')
                     elif outcome_name == 'under':
                         grouped_markets[group_key]['under'] = outcome.get('price', '')
-    
+        
             # Process the grouped markets into table data
             for label, data in grouped_markets.items():
-                # Initialize row if it doesn't exist
-                if label not in self.tab_data.table_rows:
-                    self.tab_data.table_rows.append(label)
-                    self.tab_data.table_data[label] = {'game_id': game_id}
+                if label not in self.current_tab_data.table_rows:
+                    self.current_tab_data.table_rows.append(label)
+                    self.current_tab_data.table_data[label] = {'game_id': game_id}
                 
-                # Format as "-142 O (15.5) +106 U"
                 over_price = data['over']
                 under_price = data['under']
                 point = data['point']
@@ -811,8 +846,7 @@ class PropsWindow(BaseTableWindow):
                 else:
                     price = f"({point})"
                     
-                # Update only this bookmaker's data for this market
-                self.tab_data.table_data[label][bm_title] = price
+                self.current_tab_data.table_data[label][bm_title] = price
     
     
     # Widget to try and calculate best lines for entire query based on deviation
@@ -822,7 +856,6 @@ class PropsWindow(BaseTableWindow):
         self.best_lines_widget.setColumnCount(5)
         self.best_lines_widget.setHorizontalHeaderLabels(["Player","Market","Best Line","Avg Odds","Implied Prob Deviation"]) #"Avg Odds" cannot be figured out im tard boy again
         self.best_lines_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.layout.addWidget(self.best_lines_widget)
 
     def update_best_lines_display(self):
         """Update the best lines widget with all accumulated market data"""
@@ -830,6 +863,9 @@ class PropsWindow(BaseTableWindow):
             print("No consolidated odds data available for best lines calculation")
             return
         
+        if not self.current_tab_data:
+            return
+            
         # Transform data for BestLinesCalculator
         table_data = {}
         bookmakers = []
@@ -840,6 +876,10 @@ class PropsWindow(BaseTableWindow):
                 bookmakers.append(bm_title)
             
             for market in bm.get('markets', []):
+                # Only include markets that match the current tab's market type
+                if market['key'] != self.current_market:
+                    continue
+                    
                 market_key = market['key']
                 game_id = market.get('game_id', '')
                 
@@ -869,12 +909,11 @@ class PropsWindow(BaseTableWindow):
             calculator = BestLinesCalculator(table_data, bookmakers)
             self.best_lines = calculator.calculate_best_lines()
             self._populate_best_lines_widget(self.best_lines)
-        else:
-            print("No transformed data available for best lines calculation")
             
             
     def _populate_best_lines_widget(self, best_lines):
         """Helper method to populate the best lines widget with calculated data."""
+        self.best_lines_widget.setRowCount(0)  # Clear existing rows
         self.best_lines_widget.setColumnCount(5)
         self.best_lines_widget.setHorizontalHeaderLabels(["Player", "Market", "Best Line", "Avg Odds", "Implied Prob Deviation"])
         
