@@ -1,3 +1,4 @@
+import pathlib
 import qasync
 import asyncio
 from datetime import datetime
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query
+from Creds import SUPER_KEY
 from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
 import pandas as pd
@@ -275,9 +277,9 @@ class ModernOddsWindow(QMainWindow):
         self.icon_timer.start(16)
     
     def UpdateIcon(self):
-        framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
-        next_icon = f"{framesdir}/frame{str(self.icon_frame).zfill(3)}.png"
-        self.setWindowIcon(QIcon(next_icon))
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
         self.icon_frame = ((self.icon_frame + 1) % 200)
         #print(next_icon)
     
@@ -286,7 +288,8 @@ class ModernOddsWindow(QMainWindow):
         """Initialize the user interface components"""
         self.setWindowTitle("Effort Odds")
         self.setGeometry(100, 100, 800, 600)
-        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
+        icon_path = pathlib.Path(__file__).parent / "AppIcon.png"
+        self.setWindowIcon(QIcon(str(icon_path)))
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -543,8 +546,7 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_container.setFixedWidth(750)
         
         # Create the historical odds widget
-        self.historical_odds_widget = HistoricalOddsWidget()
-        self.historical_odds_widget.api_key = SUPER_KEY  # Set API key
+        self.historical_odds_widget = HistoricalOddsWidget(SUPER_KEY, 10)
         historical_odds_layout.addWidget(self.historical_odds_widget)
         
         # Initially hide the historical container (important!)
@@ -1081,9 +1083,7 @@ class ModernOddsWindow(QMainWindow):
             # Calculate exact height for 3 articles
             article_height = 85
             container_height = (article_height * 3)
-            
-            # Set exact fixed height instead of min/max
-            self.news_container.setFixedHeight(container_height)
+            self.news_container.setMinimumHeight(container_height)
             
             # KEY FIX: Set negative top margin on progress bar to pull it upward
             prog_margins = self.progress.contentsMargins()
@@ -1199,34 +1199,16 @@ class ModernOddsWindow(QMainWindow):
             # If we can't determine, don't update
             return
         
-        # Get game info
-        game_id = ""
-        home_team = ""
-        away_team = ""
-        
         # Find the game ID from the item
-        if hasattr(header_item, 'game_id'):
-            game_id = header_item.game_id
-            
-            # Look for game header row to get teams
-            for row in range(table.rowCount()):
-                item = table.item(row, 0)
-                if item and "Game:" in item.text() and hasattr(item, 'game_id') and item.game_id == game_id:
-                    # Parse team names from header
-                    header_text = item.text()
-                    team_part = header_text.replace("Game:", "").strip()
-                    if "vs" in team_part:
-                        teams = team_part.split("vs")
-                        home_team = teams[0].strip()
-                        away_team = teams[1].strip()
-                    break
-        
-        if not game_id:
-            return
+        if not hasattr(header_item, 'game_id'): return;
+        game_id = header_item.game_id
         
         # Get league and sport info
         league_name = self.league_selector.currentText()
         sport_key = self.data_manager.league_map.get(league_name)
+        
+        game_text = header_item.text().split('|', maxsplit=1)[0].strip()
+        (home_team, away_team) = [text.strip() for text in game_text.split(' vs ', maxsplit=1)]
         
         # Only update the historical odds widget if it's visible
         if self.historical_odds_container.isVisible() and hasattr(self, 'historical_odds_widget'):

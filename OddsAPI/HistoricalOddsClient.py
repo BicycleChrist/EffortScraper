@@ -11,17 +11,16 @@ from PyQt6.QtWidgets import (
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea
 )
 
-from Creds import SUPER_KEY
 
 
 class HistoricalOddsClient:
     """Client for fetching historical odds data from theOddsAPI"""
-
-    def __init__(self, api_key):
+    
+    def __init__(self, api_key, interval_minutes:int):
         self.api_key = api_key
         self.base_url = "https://api.the-odds-api.com/v4/historical"
         self.cache = {}
-        self.min_interval = timedelta(minutes=10)  # Minimum snapshot interval
+        self.min_interval = timedelta(minutes=interval_minutes)
 
     async def get_historical_snapshots(self, session, sport_key, event_id, market,
                                      start_time, end_time=None, regions="us"):
@@ -125,15 +124,15 @@ class HistoricalOddsClient:
 class HistoricalOddsWidget(QWidget):
     """Widget for displaying historical odds movement with point change handling"""
 
-    def __init__(self, parent=None):
+    def __init__(self, api_key, interval_minutes:int, parent=None):
         super().__init__(parent)
         self.sport_key = None
         self.event_id = None
         self.market_key = None
         self.home_team = None
         self.away_team = None
-        self.api_key = SUPER_KEY
-        self.client = HistoricalOddsClient(self.api_key)  # Initialize client immediately
+        self.api_key = api_key
+        self.client = HistoricalOddsClient(self.api_key, interval_minutes)  # Initialize client immediately
         self.bookmaker_visible = {}
         self.current_snapshots = []
         self._load_task = None  # Track current loading task
@@ -419,6 +418,9 @@ class HistoricalOddsWidget(QWidget):
     @qasync.asyncSlot()
     async def on_time_range_changed(self):
         """Handle time range dropdown changes"""
+        current_time_range = int(self.time_range.currentText().removesuffix('h'))
+        self.client.min_interval = timedelta(minutes=(current_time_range * 10)) # always 6 points per time-range
+        print(f"time_range_changed:\nrange: {current_time_range} hours\ninterval: {self.client.min_interval}")
         self._load_task = asyncio.create_task(self.load_data())
 
     async def update_plot(self, snapshots):
