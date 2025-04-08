@@ -11,3 +11,4 @@ lxml
 qasync
 aiohttp
 feedparser
+pywin32 # windows BS to create desktop shortcut
