@@ -53,3 +53,5 @@ OddsAPI/BetrNotes.txt
 OddsAPI/RefernceDocsForApi.txt
 OddsAPI/betr_dumps/
 OddsAPI/savedata/
+OddsAPI/*.json
+OddsAPI/TTT_savedata/
