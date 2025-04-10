@@ -1,80 +1,297 @@
-import requests
-import pathlib
+import asyncio
+import aiohttp
 import json
+import pathlib
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
 
+# Import API key from Creds.py (make sure this file exists)
 from Creds import TT_KEY
 
+# Constants
+BASE_URL = "https://api.b365api.com"
+SPORT_ID = 92  # table tennis
+TARGET_LEAGUE_IDS = {
+    22307: "Setka Cup",
+    22742: "Czech Republic Liga Pro",
+    22534: "TT CUP",
+    24536: "Poland TT Elite Series",
+}
+DEFAULT_BOOKMAKER = "bet365"
+TIME_WINDOW_HOURS = 6  # Only fetch events within next 6 hours
+HISTORY_START_DATE = "20240101"  # Get history data from 2024-01-01
 
-def GetEvents(league_id:int, event_type:str):
+
+async def get_events_async(session: aiohttp.ClientSession, league_id: int, event_type: str) -> Dict:
+    """
+    Fetch upcoming or inplay events for a specific league
+    """
     assert(event_type in ("upcoming", "inplay"))
-    BASE_URL = "https://api.b365api.com"
-    SPORT_ID = 92 # table tennis
-    print(f"getting events [league_id: {league_id}; event_type: {event_type}]")
+    print(f"Getting {event_type} events [league_id: {league_id}]")
     
     params = {
         "token": TT_KEY,
         "sport_id": SPORT_ID,
         "league_id": league_id,
     }
-    response = requests.get(f"{BASE_URL}/v3/events/{event_type}", params)
-    return response.json()
-
-
-def GetMarkets(event_id:int, bookmakers:list[str]):
-    valid_bookmakers = ("bet365","10bet","ladbrokes","williamhill","betclic","pinnaclesports","planetwin365","ysb88","188bet","unibet","bwin","betfair","betfred","cloudbet","betsson","betdaq","paddypower","sbobet","betathome","dafabet","marathonbet","betvictor","everygame","interwetten","betway","1xbet","nitrogensports","skybet","marsbet","cashpoint","macauslot","hkjc","ggbet","mansion","spreadex","virginbet",)
-    assert(bookmakers[0] in valid_bookmakers)
-    # TODO: allow multiple bookmakers to be specified (or not because bet365 is the only valid one?)
     
-    print(f"fetching markets for event_id: {event_id}")
+    try:
+        async with session.get(f"{BASE_URL}/v3/events/{event_type}", params=params) as response:
+            if response.status != 200:
+                print(f"Error fetching {event_type} events for league {league_id}: {response.status}")
+                return {"success": 0, "results": []}
+            
+            data = await response.json()
+            print(f"Response for {event_type} events, league {league_id}: {data.get('success')}")
+            
+            # Debug the first few results
+            results = data.get("results", [])
+            if results:
+                print(f"First event structure: {results[0] if results else 'No events'}")
+            else:
+                print(f"No events found for league {league_id}")
+                
+            return data
+    except Exception as e:
+        print(f"Exception fetching {event_type} events for league {league_id}: {str(e)}")
+        return {"success": 0, "results": []}
+
+
+async def get_markets_async(session: aiohttp.ClientSession, event_id, bookmaker: str = DEFAULT_BOOKMAKER) -> Dict:
+    """
+    Fetch markets for a specific event
+    """
+    print(f"Fetching markets for event_id: {event_id}")
+    
     params = {
         "token": TT_KEY,
         "event_id": event_id,
-        "source": bookmakers[0],
+        "source": bookmaker,
     }
-    response = requests.get("https://api.b365api.com/v2/event/odds", params)
-    if (response.status_code != 200): print(f"REQUEST FAILED!!!"); print(f"event_id: {event_id}; response: {response.json()}"); exit(1)
-    result = response.json()
-    if (result["success"] != 1): print(f"unsuccessful request!"); print(f"event_id: {event_id}; response: {response.json()}");
-    return result["results"]
-
-
-def SaveJson(thejson:dict, name):
-    savedir = pathlib.Path.cwd()/"TTT_savedata"
-    if not savedir.exists(): savedir.mkdir();
-    filepath = savedir/f"{name.replace(' ','-')}.json"
-    print(f"saving data to: {filepath}")
-    with open(filepath, 'w', encoding='utf-8') as thefile:
-        json.dump(thejson, thefile, indent=2)
-    print("finished writing data")
-    return
-
-
-def Main():
-    TARGET_LEAGUE_IDS = {
-        22307: "Setka Cup",
-        22742: "Czech Republic Liga Pro",
-        22534: "TT CUP",
-        24536: "Poland TT Elite Series",
-    }
-    bookmakers = ["bet365"] # default
-    bookmaker_keys = [f"{name}_id" for name in bookmakers] # always "bet365_id" - never changes regardless of bookmaker????
     
-    upcoming_events = {}
-    for (ID, name) in TARGET_LEAGUE_IDS.items():
-        event = GetEvents(ID, "upcoming")
-        market_entries = []
-        for entry in event['results']:
-            valid_keys = [bm_key for bm_key in bookmaker_keys if bm_key in entry.keys()]
-            if (len(valid_keys) == 0): print(f"no valid bookmakers!"); print(entry); print('\n');
-            market_entry = {"event_id": entry['id'], "bookmakers": [entry[key] for key in valid_keys]}
-            market_entry['markets'] = GetMarkets(market_entry['event_id'], bookmakers)
-            market_entries.append(market_entry)
-        event["markets"] = market_entries
-        upcoming_events[name] = event
-        SaveJson(event, name)
-    return upcoming_events
+    try:
+        async with session.get(f"{BASE_URL}/v2/event/odds", params=params) as response:
+            if response.status != 200:
+                print(f"Error fetching markets for event {event_id}: {response.status}")
+                return {}
+            
+            result = await response.json()
+            if result.get("success") != 1:
+                print(f"Unsuccessful request for markets! Event ID: {event_id}")
+                return {}
+            
+            return result.get("results", {})
+    except Exception as e:
+        print(f"Exception fetching markets for event {event_id}: {str(e)}")
+        return {}
+
+
+async def get_history_async(session: aiohttp.ClientSession, event_id, quantity: int = 20) -> Dict:
+    """
+    Fetch historical head-to-head data for a specific event
+    """
+    print(f"Fetching history for event_id: {event_id}")
+    
+    params = {
+        "token": TT_KEY,
+        "event_id": event_id,
+        "qty": quantity,  # Maximum allowed by the API
+    }
+    
+    try:
+        async with session.get(f"{BASE_URL}/v1/event/history", params=params) as response:
+            if response.status != 200:
+                print(f"Error fetching history for event {event_id}: {response.status}")
+                return {}
+            
+            result = await response.json()
+            if result.get("success") != 1:
+                print(f"Unsuccessful request for history! Event ID: {event_id}")
+                return {}
+            
+            return result.get("results", {})
+    except Exception as e:
+        print(f"Exception fetching history for event {event_id}: {str(e)}")
+        return {}
+
+
+async def save_json_async(data: Dict, name: str) -> None:
+    """
+    Save data to a JSON file asynchronously
+    """
+    savedir = pathlib.Path.cwd() / "TTT_savedata"
+    if not savedir.exists():
+        savedir.mkdir()
+    
+    filepath = savedir / f"{name.replace(' ', '-')}.json"
+    print(f"Saving data to: {filepath}")
+    
+    # Run the file I/O in a thread to avoid blocking
+    await asyncio.to_thread(write_json_to_file, data, filepath)
+    print(f"Finished writing data to {filepath}")
+
+
+def write_json_to_file(data: Dict, filepath: pathlib.Path) -> None:
+    """
+    Helper function to write JSON data to a file
+    """
+    with open(filepath, 'w', encoding='utf-8') as thefile:
+        json.dump(data, thefile, indent=2)
+
+
+def is_within_time_window(event_time, hours: int = TIME_WINDOW_HOURS) -> bool:
+    """
+    Check if an event is within the specified time window
+    """
+    # Ensure event_time is an integer
+    if isinstance(event_time, str):
+        try:
+            event_time = int(event_time)
+        except ValueError:
+            return False
+    
+    current_time = int(time.time())
+    max_time = current_time + (hours * 3600)  # Convert hours to seconds
+    return current_time <= event_time <= max_time
+
+
+def format_timestamp(timestamp) -> str:
+    """
+    Convert unix timestamp to human-readable format
+    """
+    try:
+        return datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        return "Unknown time"
+
+
+async def process_league(session: aiohttp.ClientSession, league_id: int, league_name: str) -> Dict:
+    """
+    Process a league: fetch events, filter by time, get markets and history
+    """
+    print(f"\n{'='*50}\nProcessing league: {league_name} (ID: {league_id})\n{'='*50}")
+    
+    # Get upcoming events for this league
+    events_data = await get_events_async(session, league_id, "upcoming")
+    
+    if events_data.get("success") != 1:
+        print(f"Failed to get events for league {league_name}")
+        return {"success": 0, "results": [], "markets": [], "history": []}
+    
+    # Filter events within time window
+    filtered_results = []
+    for event in events_data.get("results", []):
+        event_time = event.get("time", 0)
+        # Debug the event time
+        print(f"Event time for {event.get('id')}: {event_time} (type: {type(event_time)})")
+        if is_within_time_window(event_time):
+            try:
+                event["formatted_time"] = format_timestamp(int(event_time))
+            except (ValueError, TypeError):
+                event["formatted_time"] = "Unknown time"
+            filtered_results.append(event)
+    
+    events_data["results"] = filtered_results
+    events_data["filtered_count"] = len(filtered_results)
+    events_data["original_count"] = len(events_data.get("results", []))
+    
+    print(f"Found {len(filtered_results)} events within {TIME_WINDOW_HOURS} hour window (from {len(events_data.get('results', []))} total events)")
+    
+    # For each event, get markets and history
+    market_entries = []
+    history_entries = []
+    
+    # Create tasks for fetching markets and history
+    market_tasks = []
+    history_tasks = []
+    
+    for event in filtered_results:
+        event_id = event.get("id")
+        if event_id:  # Make sure we have a valid event ID
+            print(f"Creating tasks for event ID: {event_id}")
+            market_tasks.append(get_markets_async(session, event_id))
+            history_tasks.append(get_history_async(session, event_id))
+        else:
+            print(f"Warning: Event without ID encountered: {event}")
+    
+    # Execute all market tasks concurrently
+    if market_tasks:
+        markets_results = await asyncio.gather(*market_tasks)
+        for i, markets in enumerate(markets_results):
+            if markets:
+                market_entry = {
+                    "event_id": filtered_results[i]["id"],
+                    "event_name": f"{filtered_results[i].get('home', {}).get('name', '')} vs {filtered_results[i].get('away', {}).get('name', '')}",
+                    "event_time": filtered_results[i].get("formatted_time", ""),
+                    "markets": markets
+                }
+                market_entries.append(market_entry)
+    
+    # Execute all history tasks concurrently
+    if history_tasks:
+        history_results = await asyncio.gather(*history_tasks)
+        for i, history in enumerate(history_results):
+            if history:
+                history_entry = {
+                    "event_id": filtered_results[i]["id"],
+                    "event_name": f"{filtered_results[i].get('home', {}).get('name', '')} vs {filtered_results[i].get('away', {}).get('name', '')}",
+                    "event_time": filtered_results[i].get("formatted_time", ""),
+                    "history": history
+                }
+                history_entries.append(history_entry)
+    
+    # Add markets and history to the events data
+    events_data["markets"] = market_entries
+    events_data["history"] = history_entries
+    
+    # Save the data
+    await save_json_async(events_data, league_name)
+    
+    return events_data
+
+
+async def main() -> None:
+    """
+    Main function to process all leagues
+    """
+    start_time = time.time()
+    print(f"Starting table tennis data collection at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Fetching events for the next {TIME_WINDOW_HOURS} hours")
+    print(f"Target leagues: {', '.join(TARGET_LEAGUE_IDS.values())}")
+    
+    # Create a client session
+    async with aiohttp.ClientSession() as session:
+        # Process each league concurrently
+        tasks = [process_league(session, league_id, league_name) 
+                 for league_id, league_name in TARGET_LEAGUE_IDS.items()]
+        
+        league_results = await asyncio.gather(*tasks)
+        
+        # Combine all league results
+        all_events = {name: result for name, result in zip(TARGET_LEAGUE_IDS.values(), league_results)}
+        
+        # Save combined results
+        await save_json_async(all_events, "all-upcoming-events")
+    
+    # Print summary
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    print("\n" + "="*80)
+    print(f"Data collection completed in {elapsed_time:.2f} seconds")
+    
+    # Count total events, markets, and history entries
+    total_events = sum(len(result.get("results", [])) for result in league_results)
+    total_markets = sum(len(result.get("markets", [])) for result in league_results)
+    total_history = sum(len(result.get("history", [])) for result in league_results)
+    
+    print(f"Total events collected: {total_events}")
+    print(f"Total markets collected: {total_markets}")
+    print(f"Total history entries collected: {total_history}")
+    print(f"All data saved to TTT_savedata directory")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    upcoming_events = Main()
-    SaveJson(upcoming_events, "all upcoming events")
+    asyncio.run(main())
