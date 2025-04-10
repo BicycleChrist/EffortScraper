@@ -20,6 +20,7 @@ from GUItuneinwidget import TuneInWidget
 from GUIteamnewswidget import TeamNewsWidget
 from GUIbestlineswidget import *
 from HistoricalOddsClient import *
+from TTwindow import TableTennisGUI
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -446,6 +447,12 @@ class ModernOddsWindow(QMainWindow):
         self.market_buttons["props"] = self.props_button
         left_layout.addWidget(self.props_button)
         
+        # Add Table Tennis Button
+        self.tt_button = QPushButton("TT🏓")
+        self.tt_button.setObjectName("market_tt")
+        self.tt_button.setStyleSheet(self.props_button_style)
+        left_layout.addWidget(self.tt_button)
+        
         # Add props availability label
         self.props_availability_label = QLabel("No Props available for this league")
         self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
@@ -734,6 +741,7 @@ class ModernOddsWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh_data)
         self.props_button.clicked.connect(self.handle_props_button)
         self.news_toggle_button.clicked.connect(self.toggle_news_feed)
+        self.tt_button.clicked.connect(self.handle_tt_button)
         
 
 
@@ -1213,6 +1221,26 @@ class ModernOddsWindow(QMainWindow):
         # Only update the historical odds widget if it's visible
         if self.historical_odds_container.isVisible() and hasattr(self, 'historical_odds_widget'):
             self.historical_odds_widget.set_market(sport_key, game_id, market_type, home_team, away_team)
+            
+        
+        
+    def handle_tt_button(self):
+        """Handle Table Tennis button click to open TableTennisGUI."""
+        print("Table Tennis button clicked.")
+        
+        # If there's an existing window, properly destroy it
+        if hasattr(self, "tt_window") and self.tt_window is not None:
+            try:
+                self.tt_window.close()
+                self.tt_window.deleteLater()  # Schedule for Qt deletion
+                self.tt_window = None
+            except Exception as e:
+                print(f"Error cleaning up old TT window: {e}")
+        
+        # Create a completely new instance
+        self.tt_window = TableTennisGUI()
+        self.tt_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # Qt will delete the widget when closed
+        self.tt_window.show()    
 
 
 

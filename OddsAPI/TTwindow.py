@@ -209,12 +209,52 @@ class TableTennisGUI(QMainWindow):
         
         # Odds details
         self.odds_group = QGroupBox("Betting Odds")
+        self.odds_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         odds_layout = QGridLayout(self.odds_group)
         
-        odds_layout.addWidget(QLabel("Market"), 0, 0)
-        odds_layout.addWidget(QLabel("Home"), 0, 1)
-        odds_layout.addWidget(QLabel("Away/Under"), 0, 2)
-        odds_layout.addWidget(QLabel("Handicap/Total"), 0, 3)
+        # Add odds format toggle at the top
+        odds_format_layout = QHBoxLayout()
+        odds_format_label = QLabel("Odds Format:")
+        odds_format_label.setFont(QFont("Arial", 10))
+        self.odds_format_checkbox = QPushButton("Decimal Odds")
+        self.odds_format_checkbox.setCheckable(True)
+        self.odds_format_checkbox.setChecked(False)  # Default to American odds (unchecked)
+        self.odds_format_checkbox.toggled.connect(self.toggle_odds_format)
+        self.odds_format_checkbox.setStyleSheet("""
+            QPushButton {
+                text-align: center;
+                padding: 3px;
+                border: none;
+                border-radius: 3px;
+                background-color: #2c3e50;
+            }
+            QPushButton:checked {
+                background-color: #3498db;
+            }
+        """)
+        odds_format_layout.addWidget(odds_format_label)
+        odds_format_layout.addWidget(self.odds_format_checkbox)
+        odds_format_layout.addStretch()
+        
+        odds_layout.addLayout(odds_format_layout, 0, 0, 1, 4)
+        
+        # Increase font size for headers and values
+        header_font = QFont("Arial", 11, QFont.Weight.Bold)
+        value_font = QFont("Arial", 11)
+        
+        market_label = QLabel("Market")
+        market_label.setFont(header_font)
+        home_label = QLabel("Home")
+        home_label.setFont(header_font)
+        away_label = QLabel("Away/Under")
+        away_label.setFont(header_font)
+        handicap_label = QLabel("Handicap/Total")
+        handicap_label.setFont(header_font)
+        
+        odds_layout.addWidget(market_label, 1, 0)
+        odds_layout.addWidget(home_label, 1, 1)
+        odds_layout.addWidget(away_label, 1, 2)
+        odds_layout.addWidget(handicap_label, 1, 3)
         
         self.odds_labels = {
             "moneyline_home": QLabel("-"),
@@ -227,22 +267,48 @@ class TableTennisGUI(QMainWindow):
             "total_points": QLabel("-")
         }
         
-        odds_layout.addWidget(QLabel("Moneyline"), 1, 0)
-        odds_layout.addWidget(self.odds_labels["moneyline_home"], 1, 1)
-        odds_layout.addWidget(self.odds_labels["moneyline_away"], 1, 2)
-        odds_layout.addWidget(QLabel("-"), 1, 3)
+        # Set larger font for all odds labels
+        for label in self.odds_labels.values():
+            label.setFont(value_font)
         
-        odds_layout.addWidget(QLabel("Spread"), 2, 0)
-        odds_layout.addWidget(self.odds_labels["spread_home"], 2, 1)
-        odds_layout.addWidget(self.odds_labels["spread_away"], 2, 2)
-        odds_layout.addWidget(self.odds_labels["spread_handicap"], 2, 3)
+        moneyline_label = QLabel("Moneyline")
+        moneyline_label.setFont(value_font)
+        spread_label = QLabel("Spread")
+        spread_label.setFont(value_font)
+        total_label = QLabel("Total")
+        total_label.setFont(value_font)
         
-        odds_layout.addWidget(QLabel("Total"), 3, 0)
-        odds_layout.addWidget(self.odds_labels["total_over"], 3, 1)
-        odds_layout.addWidget(self.odds_labels["total_under"], 3, 2)
-        odds_layout.addWidget(self.odds_labels["total_points"], 3, 3)
+        odds_layout.addWidget(moneyline_label, 2, 0)
+        odds_layout.addWidget(self.odds_labels["moneyline_home"], 2, 1)
+        odds_layout.addWidget(self.odds_labels["moneyline_away"], 2, 2)
+        odds_layout.addWidget(QLabel("-"), 2, 3)
+        
+        odds_layout.addWidget(spread_label, 3, 0)
+        odds_layout.addWidget(self.odds_labels["spread_home"], 3, 1)
+        odds_layout.addWidget(self.odds_labels["spread_away"], 3, 2)
+        odds_layout.addWidget(self.odds_labels["spread_handicap"], 3, 3)
+        
+        odds_layout.addWidget(total_label, 4, 0)
+        odds_layout.addWidget(self.odds_labels["total_over"], 4, 1)
+        odds_layout.addWidget(self.odds_labels["total_under"], 4, 2)
+        odds_layout.addWidget(self.odds_labels["total_points"], 4, 3)
+        
+        # Make row heights taller
+        odds_layout.setRowMinimumHeight(2, 40)
+        odds_layout.setRowMinimumHeight(3, 40)
+        odds_layout.setRowMinimumHeight(4, 40)
         
         self.details_layout.addWidget(self.odds_group)
+        
+        # Store the raw decimal odds for conversion between formats
+        self.raw_odds = {
+            "moneyline_home": "-",
+            "moneyline_away": "-",
+            "spread_home": "-",
+            "spread_away": "-",
+            "total_over": "-",
+            "total_under": "-"
+        }
         
         # Head-to-head
         self.h2h_group = QGroupBox("Head-to-Head History")
@@ -336,6 +402,70 @@ class TableTennisGUI(QMainWindow):
                 color: #f0f0f0;
             }
         """)
+
+    def decimal_to_american(self, decimal_odds):
+        """Convert decimal odds to American format"""
+        try:
+            decimal = float(decimal_odds)
+            if decimal >= 2.0:
+                # Positive American odds (underdog)
+                return f"+{int((decimal - 1) * 100)}"
+            else:
+                # Negative American odds (favorite)
+                return f"-{int(100 / (decimal - 1))}"
+        except (ValueError, ZeroDivisionError):
+            return "-"  # Return a dash if conversion fails
+
+    def american_to_decimal(self, american_odds):
+        """Convert American odds to decimal format"""
+        try:
+            # Remove the plus sign if it exists
+            american = american_odds.replace('+', '')
+            american = float(american)
+            
+            if american > 0:
+                # Positive American odds
+                return f"{(american / 100) + 1:.2f}"
+            else:
+                # Negative American odds
+                return f"{(100 / abs(american)) + 1:.2f}"
+        except (ValueError, ZeroDivisionError):
+            return "-"  # Return a dash if conversion fails
+
+    def toggle_odds_format(self):
+        """Toggle between American and Decimal odds formats"""
+        show_decimal = self.odds_format_checkbox.isChecked()
+        
+        if show_decimal:
+            self.odds_format_checkbox.setText("American Odds")
+            # Show raw decimal odds
+            for key, value in self.raw_odds.items():
+                if value != "-":
+                    self.odds_labels[key].setText(value)
+        else:
+            self.odds_format_checkbox.setText("Decimal Odds")
+            # Convert to American odds
+            for key, value in self.raw_odds.items():
+                if value != "-":
+                    self.odds_labels[key].setText(self.decimal_to_american(value))
+        
+        # Keep styling
+        for key in self.raw_odds.keys():
+            if key.startswith("moneyline"):
+                try:
+                    if show_decimal:
+                        odds_value = float(self.raw_odds[key])
+                    else:
+                        american = self.odds_labels[key].text()
+                        if american.startswith("+"):
+                            odds_value = float(american[1:]) / 100 + 1
+                        else:
+                            odds_value = 100 / float(american[1:]) + 1
+                    
+                    color = self.get_odds_color(odds_value)
+                    self.odds_labels[key].setStyleSheet(f"color: {color};")
+                except:
+                    pass
 
     def refresh_data(self):
         """Refresh data by running the client script"""
@@ -471,7 +601,14 @@ class TableTennisGUI(QMainWindow):
                         if market_odds and len(market_odds) > 0:
                             home_odd = market_odds[0].get('home_od', '-')
                             away_odd = market_odds[0].get('away_od', '-')
-                            odds_str = f"{home_odd} / {away_odd}"
+                            
+                            # Convert to American format for display in table
+                            if not self.odds_format_checkbox.isChecked():  # American format is default
+                                home_american = self.decimal_to_american(home_odd)
+                                away_american = self.decimal_to_american(away_odd)
+                                odds_str = f"{home_american} / {away_american}"
+                            else:
+                                odds_str = f"{home_odd} / {away_odd}"
                             break
                 
                 odds_item = QTableWidgetItem(odds_str)
@@ -565,16 +702,32 @@ class TableTennisGUI(QMainWindow):
                 
         # Update odds if available
         if market_data:
+            # Reset raw odds
+            for key in self.raw_odds.keys():
+                self.raw_odds[key] = "-"
+                
             # Moneyline
             moneyline_odds = market_data.get('odds', {}).get('92_1', [])
             if moneyline_odds and len(moneyline_odds) > 0:
-                self.odds_labels["moneyline_home"].setText(moneyline_odds[0].get('home_od', '-'))
-                self.odds_labels["moneyline_away"].setText(moneyline_odds[0].get('away_od', '-'))
+                # Store raw decimal odds
+                home_decimal = moneyline_odds[0].get('home_od', '-')
+                away_decimal = moneyline_odds[0].get('away_od', '-')
+                
+                self.raw_odds["moneyline_home"] = home_decimal
+                self.raw_odds["moneyline_away"] = away_decimal
+                
+                # Set display based on current format
+                if self.odds_format_checkbox.isChecked():  # Decimal format
+                    self.odds_labels["moneyline_home"].setText(home_decimal)
+                    self.odds_labels["moneyline_away"].setText(away_decimal)
+                else:  # American format
+                    self.odds_labels["moneyline_home"].setText(self.decimal_to_american(home_decimal))
+                    self.odds_labels["moneyline_away"].setText(self.decimal_to_american(away_decimal))
                 
                 # Color code based on value
                 try:
-                    home_odd = float(moneyline_odds[0].get('home_od', 0))
-                    away_odd = float(moneyline_odds[0].get('away_od', 0))
+                    home_odd = float(home_decimal)
+                    away_odd = float(away_decimal)
                     
                     # Set color based on odds value
                     home_color = self.get_odds_color(home_odd)
@@ -588,21 +741,51 @@ class TableTennisGUI(QMainWindow):
             # Spread
             spread_odds = market_data.get('odds', {}).get('92_2', [])
             if spread_odds and len(spread_odds) > 0:
-                self.odds_labels["spread_home"].setText(spread_odds[0].get('home_od', '-'))
-                self.odds_labels["spread_away"].setText(spread_odds[0].get('away_od', '-'))
+                # Store raw decimal odds
+                home_decimal = spread_odds[0].get('home_od', '-')
+                away_decimal = spread_odds[0].get('away_od', '-')
+                
+                self.raw_odds["spread_home"] = home_decimal
+                self.raw_odds["spread_away"] = away_decimal
+                
+                # Set display based on current format
+                if self.odds_format_checkbox.isChecked():  # Decimal format
+                    self.odds_labels["spread_home"].setText(home_decimal)
+                    self.odds_labels["spread_away"].setText(away_decimal)
+                else:  # American format
+                    self.odds_labels["spread_home"].setText(self.decimal_to_american(home_decimal))
+                    self.odds_labels["spread_away"].setText(self.decimal_to_american(away_decimal))
+                    
                 self.odds_labels["spread_handicap"].setText(spread_odds[0].get('handicap', '-'))
             
             # Totals
             total_odds = market_data.get('odds', {}).get('92_3', [])
             if total_odds and len(total_odds) > 0:
-                self.odds_labels["total_over"].setText(total_odds[0].get('over_od', '-'))
-                self.odds_labels["total_under"].setText(total_odds[0].get('under_od', '-'))
+                # Store raw decimal odds
+                over_decimal = total_odds[0].get('over_od', '-')
+                under_decimal = total_odds[0].get('under_od', '-')
+                
+                self.raw_odds["total_over"] = over_decimal
+                self.raw_odds["total_under"] = under_decimal
+                
+                # Set display based on current format
+                if self.odds_format_checkbox.isChecked():  # Decimal format
+                    self.odds_labels["total_over"].setText(over_decimal)
+                    self.odds_labels["total_under"].setText(under_decimal)
+                else:  # American format
+                    self.odds_labels["total_over"].setText(self.decimal_to_american(over_decimal))
+                    self.odds_labels["total_under"].setText(self.decimal_to_american(under_decimal))
+                    
                 self.odds_labels["total_points"].setText(total_odds[0].get('handicap', '-'))
         else:
             # Clear odds
             for label in self.odds_labels.values():
                 label.setText("-")
                 label.setStyleSheet("")
+                
+            # Clear raw odds
+            for key in self.raw_odds.keys():
+                self.raw_odds[key] = "-"
                 
         # Find H2H data
         h2h_data = None
