@@ -7,14 +7,16 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QComboBox, QTabWidget, QTableWidget, QTableWidgetItem, 
     QPushButton, QLineEdit, QSplitter, QGroupBox, QScrollArea, 
-    QGridLayout, QHeaderView, QSizePolicy
+    QGridLayout, QHeaderView, QSizePolicy, 
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QIcon
 
 # Import the client for data fetching
 import asyncio
 from TableTennisClient import main as fetch_data
+import pathlib # For icon
+
 
 class TableTennisGUI(QMainWindow):
     def __init__(self):
@@ -59,6 +61,9 @@ class TableTennisGUI(QMainWindow):
         
         # Set splitter sizes
         self.splitter.setSizes([250, 500, 450])
+        
+        icon_path = pathlib.Path(__file__).parent / "AppIcon.png"
+        self.setWindowIcon(QIcon(str(icon_path)))
         
         # Apply dark theme
         self.apply_dark_theme()
@@ -473,12 +478,23 @@ class TableTennisGUI(QMainWindow):
         QApplication.processEvents()
         
         try:
-            # Run client asynchronously
-            asyncio.run(fetch_data())
-            self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
+            # Create a QEventLoop to run the async code properly
+            loop = asyncio.get_event_loop()
             
-            # Load the updated data
-            self.load_data()
+            # If we're on the main thread and the loop is running
+            if loop.is_running():
+                # Create a Future to track when fetch_data completes
+                future = asyncio.ensure_future(fetch_data())
+                # Add a callback to update the UI when fetch_data completes
+                def on_complete(_):
+                    self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
+                    self.load_data()
+                future.add_done_callback(on_complete)
+            else:
+                # If not running, we can use loop.run_until_complete
+                loop.run_until_complete(fetch_data())
+                self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
+                self.load_data()
         except Exception as e:
             self.status_label.setText(f"Error refreshing data: {str(e)}")
             print(f"Error: {str(e)}")
