@@ -2,7 +2,7 @@
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton
-from LineCalculator import BestLinesCalculator
+import LineCalculator
 import json
 import os
 import asyncio
@@ -79,7 +79,7 @@ class BestLinesWidget(QTableWidget):
         """Toggle between best lines view and betting splits view"""
         self.show_splits = not self.show_splits
         
-        if self.show_splits:
+        if self.show_splits: 
             self.toggle_button.setText("Show Best Lines")
             # Update header labels for splits view
             self.setHorizontalHeaderLabels(["Game", "Market", "Option", "Handle %", "Bets %"])
@@ -351,87 +351,100 @@ class BestLinesWidget(QTableWidget):
 
     def _update_display_props(self, consolidated_odds_data):
         """Original update method for prop markets."""
-        # Clear existing data
-        self.setRowCount(0)
-
+        
+        print(f"Updating display with prop data containing {len(consolidated_odds_data.get('bookmakers', []))} bookmakers")
+    
         # Extract bookmakers list from the consolidated data
         bookmakers = [bm['title'] for bm in consolidated_odds_data.get('bookmakers', [])]
-
+        
+        if not bookmakers:
+            print("Warning: No bookmakers found in consolidated data")
+            return None
+    
         # Transform the data to the format BestLinesCalculator expects
         table_data = {}
-
+    
         # Process each bookmaker's markets
+        market_count = 0
         for bm in consolidated_odds_data.get('bookmakers', []):
             bm_title = bm['title']
-
+    
             for market in bm.get('markets', []):
+                market_count += 1
                 market_key = market['key']
-
+    
                 for outcome in market.get('outcomes', []):
                     player_name = outcome.get('description', outcome.get('name', ''))
-                    game_id = outcome.get('game_id', '')
-
+                    game_id = market.get('game_id', '')  # Get game_id from market instead of outcome
+    
                     # Create a row label like "Player Name - market_key"
                     row_label = f"{player_name} - {market_key}"
-
+    
                     # Initialize row data if it doesn't exist
                     if row_label not in table_data:
                         table_data[row_label] = {'game_id': game_id, 'is_header': False}
-
+    
                     # Store outcome data
                     outcome_name = outcome.get('name', '').lower()
                     point = outcome.get('point', '')
                     price = outcome.get('price', '')
-
+    
                     if outcome_name == 'over':
                         value = f"{price} O ({point})"
                     elif outcome_name == 'under':
                         value = f"{price} U ({point})"
                     else:
                         value = f"{price} ({point})"
-
+    
                     # Store the value for this bookmaker
                     table_data[row_label][bm_title] = value
-
+        
+        print(f"Processed {market_count} markets into {len(table_data)} table rows")
+    
         # Calculate best lines using the transformed data
-        calculator = BestLinesCalculator(table_data, bookmakers)
+        calculator = LineCalculator.calculate_best_lines(table_data, bookmakers)
         best_lines = calculator.calculate_best_lines()
-
+        
+        print(f"Calculated {len(best_lines)} best lines")
+    
         # Store the best lines for reference
         self.best_lines = best_lines
-
+    
         # Populate the widget with the results
         self._populate_widget(best_lines)
-
+        
+        print(f"Populated widget with {len(best_lines)} best lines")
+    
         return best_lines
+
 
     def _update_display_team_based(self, consolidated_odds_data):
         """Update method for team-based markets (spreads, totals, etc.) with proper odds averaging"""
         print("Starting to populate best lines widget with team-based consolidated data")
-
+    
         # Clear the current table
         self.setRowCount(0)
-
+    
         # Group the markets by type (spreads, totals, etc.) and game
         market_groups = {}
-
+    
         # Loop through all bookmakers and their markets
         for bm in consolidated_odds_data.get('bookmakers', []):
             bm_title = bm['title']
-
+    
             for market in bm.get('markets', []):
                 market_key = market['key']
-
+    
                 for outcome in market.get('outcomes', []):
                     game_id = outcome.get('game_id', '')
                     team_name = outcome.get('name', '')
                     point = outcome.get('point', '')
                     price = outcome.get('price', '')
-
+    
                     # Create a unique key for this market: game_id + market_type + team + point
-                    # We include the point value to differentiate between different lines for the same team
+                    # IMPORTANT: Changed to include point in the key to avoid overwriting different lines
                     market_id = f"{game_id}:{market_key}:{team_name}:{point}"
-
+    
                     if market_id not in market_groups:
                         market_groups[market_id] = {
                             'game_id': game_id,
@@ -442,7 +455,7 @@ class BestLinesWidget(QTableWidget):
                             'best_odds': float(-999999),
                             'best_bookmaker': None
                         }
-
+    
                     # Add this bookmaker's odds - convert to float for comparison
                     try:
                         odds_float = float(price)
@@ -450,7 +463,7 @@ class BestLinesWidget(QTableWidget):
                             'bookmaker': bm_title,
                             'odds': odds_float
                         })
-
+    
                         # Update best odds if this is better
                         if odds_float > market_groups[market_id]['best_odds']:
                             market_groups[market_id]['best_odds'] = odds_float
@@ -458,96 +471,102 @@ class BestLinesWidget(QTableWidget):
                     except ValueError:
                         # Skip this outcome if odds can't be converted to float
                         print(f"Warning: Could not convert odds '{price}' to float")
-
+    
         # Calculate average odds and deviation for each market using decimal odds
         for market_id, market_data in market_groups.items():
-            # Only proceed if we have odds from multiple bookmakers
-            if len(market_data['bookmakers']) > 1:
+            # Removed the filtering for multiple bookmakers to show more markets
+            if len(market_data['bookmakers']) > 0:  # Show even single-bookmaker markets
                 # Convert all American odds to decimal for proper averaging
                 decimal_odds_list = [self.american_to_decimal(bm['odds']) for bm in market_data['bookmakers']]
-
+    
                 # Calculate average in decimal format
                 avg_decimal_odds = sum(decimal_odds_list) / len(decimal_odds_list)
-
+    
                 # Store the average in American format for display
                 avg_american_odds = self.decimal_to_american(avg_decimal_odds)
                 market_data['avg_odds'] = avg_american_odds
-
+    
                 # Calculate implied probability from average decimal odds
                 avg_implied_prob = 1 / avg_decimal_odds
-
+    
                 # Calculate implied probability from best American odds
                 best_odds = market_data['best_odds']
                 best_decimal_odds = self.american_to_decimal(best_odds)
                 best_implied_prob = 1 / best_decimal_odds
-
+    
                 # Calculate deviation - higher is better value (positive EV)
                 deviation = (avg_implied_prob - best_implied_prob) * 100
                 market_data['deviation'] = deviation
-
+    
         # Sort markets by deviation (highest first)
         sorted_markets = sorted(
             market_groups.items(),
             key=lambda x: x[1].get('deviation', 0) if 'deviation' in x[1] else 0,
             reverse=True
         )
-
-        # Store the best lines for reference
+    
+        # Store the best lines for reference - include all markets
         self.best_lines = {market_id: data for market_id, data in sorted_markets}
-
+    
         # Log the number of markets found and analyzed
-        print(f"Found {len(market_groups)} markets and {len(sorted_markets)} with multiple bookmakers")
-
+        print(f"Found {len(market_groups)} markets and {len([m for m in market_groups.values() if len(m['bookmakers']) > 1])} with multiple bookmakers")
+    
         # Track the row count
         row = 0
-
-        # Populate the table with the best lines
+    
+        # Populate the table with the best lines - DISPLAY MORE ROWS
+        market_count = 0
         for market_id, market_data in sorted_markets:
-            # Only display markets with multiple bookmakers and a calculated deviation
-            if len(market_data['bookmakers']) > 1 and 'deviation' in market_data:
+            # Only display markets with a calculated deviation
+            if market_data.get('deviation') is not None:
+                # Limit to a reasonable number of rows (e.g., 250)
+                if market_count >= 250:
+                    break
+                    
                 # Add a new row
                 self.insertRow(row)
-
+    
                 # For the game name, we use the team name as a placeholder since we don't have the game header
                 game_or_team = market_data['team']
                 self.setItem(row, 0, QTableWidgetItem(game_or_team))
-
+    
                 # Set the market type and point
                 market_type = market_data['market_type'].capitalize()
                 point = market_data['point']
                 market_cell = f"{market_type} {point}"
                 self.setItem(row, 1, QTableWidgetItem(market_cell))
-
+    
                 # Set the best line
                 best_odds = market_data['best_odds']
                 best_bm = market_data['best_bookmaker']
                 best_line = f"{best_odds} @ {best_bm}"
                 self.setItem(row, 2, QTableWidgetItem(best_line))
-
+    
                 # Set the average odds (rounded to nearest whole number for readability)
                 avg_odds = market_data.get('avg_odds', 0)
                 # Format with proper sign
                 avg_odds_str = f"{avg_odds:.0f}"
                 self.setItem(row, 3, QTableWidgetItem(avg_odds_str))
-
+    
                 # Set the deviation with color coding
                 deviation = market_data.get('deviation', 0)
                 deviation_item = QTableWidgetItem(f"+{deviation:.2f}%")
-
+    
                 # Color code based on deviation value
                 if deviation > 5:
                     deviation_item.setBackground(QColor(0, 200, 0, 150))  # Green for good value
                 elif deviation > 2:
                     deviation_item.setBackground(QColor(200, 200, 0, 150))  # Yellow for moderate value
-
+    
                 self.setItem(row, 4, deviation_item)
-
+    
                 row += 1
-
+                market_count += 1
+    
         # Resize columns to fit content
         self.resizeColumnsToContents()
         print(f"Best lines widget populated with {row} rows")
-
+    
         return self.best_lines
 
     def _populate_widget(self, best_lines):

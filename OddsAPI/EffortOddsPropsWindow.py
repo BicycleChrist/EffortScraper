@@ -9,13 +9,14 @@ from PyQt6.QtWidgets import (
 )
 from PropQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
-from LineCalculator import *
+import LineCalculator
 from TrackingStatsWidget import integrate_stats_with_props_window
 import asyncio
+from GUIbestlineswidget import BestLinesWidget
 #TODO: This file is massive need refactor soon or eventloop woopty is imminent 
-
+#TODO: Best Lines widget is not populating, max tilt as its clearly a secret as to why
 # -----------------------------------------------------------------------------
-# Helper function to extract odds and point from a given value string.
+
 def extract_odds_point(value: str, indicator: str):
     """
     Parse a price string (e.g. "-142 O (15.5)") and extract the odds and point
@@ -88,8 +89,27 @@ class LeagueTabData:
             QColor(255, 240, 245),  # Pink Snow
             QColor(245, 240, 240),  # Soft Pink
         ]
-        self.table_widget = None
         self.last_update_time = None
+
+
+# -----------------------------------------------------------------------------
+# Base window class that provides a table and basic controls
+class BaseTableWindow(QMainWindow):
+    def __init__(self, title, sport_key, league_name):
+        super().__init__()
+        self.sport_key = sport_key
+        self.league_name = league_name
+        self.tab_data = LeagueTabData(league_name, sport_key)
+        self.table_widget = None
+        self.init_ui(title)
+
+    def init_ui(self, title):
+        self.setWindowTitle(title)
+        self.setGeometry(200, 200, 1000, 800)
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        self.layout = QVBoxLayout(main_widget)
+        grid_layout = QGridLayout()
 
     def create_table_widget(self):
         """Create and configure a new table widget for this league"""
@@ -112,10 +132,13 @@ class LeagueTabData:
 
     def get_game_color(self, game_id):
         """Get or assign a color for a specific game"""
-        if game_id not in self.game_colors:
-            self.game_colors[game_id] = self.color_palette[self.current_color_index]
-            self.current_color_index = (self.current_color_index + 1) % len(self.color_palette)
-        return self.game_colors[game_id]
+        game_colors = self.tab_data.game_colors
+        color_palette = self.tab_data.color_palette
+        current_color_index = self.tab_data.current_color_index
+        if game_id not in game_colors:
+            game_colors[game_id] = color_palette[current_color_index]
+            self.tab_data.current_color_index = (current_color_index + 1) % len(color_palette)
+        return game_colors[game_id]
 
     def update_table_display(self):
         # Create different color scheme for DFS site headers
@@ -124,19 +147,19 @@ class LeagueTabData:
         current_cols = table.columnCount()
         
         # Update table structure if needed
-        expected_cols = len(self.bookmakers) + 1
+        expected_cols = len(self.tab_data.bookmakers) + 1
         if current_cols != expected_cols:
             table.setColumnCount(expected_cols)
-            table.setHorizontalHeaderLabels(["Market/Outcome"] + self.bookmakers)
+            table.setHorizontalHeaderLabels(["Market/Outcome"] + self.tab_data.bookmakers)
             
-        expected_rows = len(self.table_rows)
+        expected_rows = len(self.tab_data.table_rows)
         if current_rows != expected_rows:
             table.setRowCount(expected_rows)
         
         needs_resize = False
         
-        for row_idx, row_label in enumerate(self.table_rows):
-            row_data = self.table_data[row_label]
+        for row_idx, row_label in enumerate(self.tab_data.table_rows):
+            row_data = self.tab_data.table_data[row_label]
             game_id = row_data['game_id']
             color = self.get_game_color(game_id)
             
@@ -161,9 +184,9 @@ class LeagueTabData:
                 header_item.setForeground(QColor('black'))
             
             # Update bookmaker columns
-            for col_idx, bm in enumerate(self.bookmakers, 1):
+            for col_idx, bm in enumerate(self.tab_data.bookmakers, 1):
                 current_value = row_data.get(bm, "")
-                previous_value = self.previous_data.get((row_label, bm))
+                previous_value = self.tab_data.previous_data.get((row_label, bm))
                 
                 item = table.item(row_idx, col_idx)
                 if not item:
@@ -189,11 +212,11 @@ class LeagueTabData:
                             i.setBackground(c),
                             i.setForeground(QColor('black'))
                         ))
-                    self.previous_data[(row_label, bm)] = current_value
+                    self.tab_data.previous_data[(row_label, bm)] = current_value
                     needs_resize = True
                 elif current_value != previous_value:
                     item.setText(current_value)
-                    self.previous_data[(row_label, bm)] = current_value
+                    self.tab_data.previous_data[(row_label, bm)] = current_value
                 
                 if not row_data.get('is_header') and item.background().color().alpha() != 180:
                     market_color = QColor(color)
@@ -205,31 +228,6 @@ class LeagueTabData:
             table.resizeColumnsToContents()
             table.resizeRowsToContents()
 
-# -----------------------------------------------------------------------------
-# Base window class that provides a table and basic controls
-class BaseTableWindow(QMainWindow):
-    def __init__(self, title, sport_key, league_name):
-        super().__init__()
-        self.sport_key = sport_key
-        self.league_name = league_name
-        self.tab_data = LeagueTabData(league_name, sport_key)
-        self.init_ui(title)
-
-    def init_ui(self, title):
-        self.setWindowTitle(title)
-        self.setGeometry(200, 200, 1000, 800)
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        self.layout = QVBoxLayout(main_widget)
-        grid_layout = QGridLayout()
-        
-    def create_table(self):
-        self.table_widget = self.tab_data.create_table_widget()
-        self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.layout.insertWidget(0, self.table_widget)
-
-    def add_control(self, widget):
-        self.layout.insertWidget(0, widget)
 
 # -----------------------------------------------------------------------------
 # PropsWindow: Displays player props and associated best lines
@@ -255,12 +253,14 @@ class PropsWindow(BaseTableWindow):
         self.market_groups = {}  # Store markets grouped by player and type
         self.best_lines = {}  # Store the best lines for each market group
         self.best_lines_widget = None
+        self.consolidated_odds_data = {'bookmakers': []}
+        self.bookmakers_map = {}
+        self.raw_odds_data_by_game = {}
 
         # Add tab-related variables
         self.props_tab_widget = QTabWidget()  # Main tab widget for the odds display
-        self.league_tabs = {}  # {market_type: LeagueTabData}
         self.current_market = None
-        self.current_tab_data = None
+        self.current_tab_data = self.tab_data
 
         # Use a QTimer to schedule the async initialization
         self.timer = QTimer()
@@ -278,9 +278,6 @@ class PropsWindow(BaseTableWindow):
         self.best_over_color = QColor(0, 100, 0)  # Dark Green
         self.best_under_color = QColor(0, 70, 140)  # Dark Blue
         self.best_text_color = QColor(27, 16, 16) # Black Text
-        
-        # Flag to track if window is in process of closing
-        self._closing = False
             
     def UpdateIcon(self):
         framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
@@ -291,179 +288,144 @@ class PropsWindow(BaseTableWindow):
     
     def start_async_init(self):
         """Start the asynchronous initialization of the UI."""
-        # If window is closing, don't start init
-        if hasattr(self, '_closing') and self._closing:
-            print("Window is closing, skipping initialization")
-            return
-            
         import asyncio
-        
-        # Create task and store reference to it for possible cancellation
-        self._init_task = asyncio.create_task(self.init_prop_ui())
-        
-        # Add a callback to handle any exceptions
-        def init_done(task):
-            try:
-                task.result()  # This will raise any exceptions from the task
-            except asyncio.CancelledError:
-                print("Initialization was cancelled")
-            except Exception as e:
-                print(f"Error during initialization: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        self._init_task.add_done_callback(init_done)
+        asyncio.create_task(self.init_prop_ui())
 
     async def init_prop_ui(self):
-        # Check if window is closing before proceeding
-        if hasattr(self, '_closing') and self._closing:
-            print("Window is closing, aborting initialization")
-            return
-            
-        try:
-            # Create controls container
-            controls_widget = QWidget()
-            controls_layout = QHBoxLayout(controls_widget)
-            controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
-            controls_layout.setSpacing(5)  # Reduce spacing between widgets
-            self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
-            
-            # Prop type label
-            controls_layout.addWidget(QLabel("Select Prop Type:"))
+        # Create controls container
+        controls_widget = QWidget()
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
+        controls_layout.setSpacing(5)  # Reduce spacing between widgets
+        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
         
-            # Prop type selector
-            self.prop_selector = QComboBox()
-            controls_layout.addWidget(self.prop_selector)
+        # Prop type label
+        controls_layout.addWidget(QLabel("Select Prop Type:"))
+    
+        # Prop type selector
+        self.prop_selector = QComboBox()
+        controls_layout.addWidget(self.prop_selector)
+    
+        # Fetch button
+        self.fetch_button = QPushButton("Fetch Props")
+        self.fetch_button.setStyleSheet(self.fetch_button_style)
+        self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
+        controls_layout.addWidget(self.fetch_button)
+    
+        # Progress bar (moved to the right of the controls)
+        self.progress = QProgressBar()
+        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls_layout.addWidget(self.progress)
         
-            # Fetch button
-            self.fetch_button = QPushButton("Fetch Props")
-            self.fetch_button.setStyleSheet(self.fetch_button_style)
-            self.fetch_button.clicked.connect(self.on_fetch_props_clicked)
-            controls_layout.addWidget(self.fetch_button)
+        # Add controls to the main layout
+        self.layout.addWidget(controls_widget)
         
-            # Progress bar (moved to the right of the controls)
-            self.progress = QProgressBar()
-            self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            controls_layout.addWidget(self.progress)
-            
-            # Add controls to the main layout
-            self.layout.addWidget(controls_widget)
-            
-            # Create main odds display tab widget and add to layout
-            self.props_tab_widget = QTabWidget()
-            self.props_tab_widget.currentChanged.connect(self.handle_tab_change)
-            self.layout.addWidget(self.props_tab_widget)
-            
-            # Create a container for the bottom area (game selection and best lines)
-            bottom_container = QWidget()
-            bottom_layout = QHBoxLayout(bottom_container)
-            bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
-            
-            # 'game_group' and checkbox-buttons need to match width
-            game_selection_width = 600
-            game_selection_height = 250
-            
-            # Add the game selection box to the left
-            game_group = QGroupBox()
-            game_group_layout = QVBoxLayout(game_group)
-            game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
-            game_group_layout.setSpacing(0)  # Remove spacing between elements
-            game_group.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
-            game_group.setFixedHeight(game_selection_height) # not necessary?
-            
-            # Create horizontal layout for buttons
-            buttons_layout = QHBoxLayout()
-            buttons_layout.setSpacing(2)  # Reduce spacing between buttons
-            
-            select_all_button = QPushButton("Select All")
-            select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
-            select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
-            select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
-            
-            deselect_all_button = QPushButton("Deselect All")
-            deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-            deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
-            deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
-            
-            buttons_layout.addWidget(select_all_button)
-            buttons_layout.addWidget(deselect_all_button)
-            buttons_layout.addStretch()  # Add stretch to push buttons to the left
-            game_group_layout.addLayout(buttons_layout)
+        # Create main odds display tab widget and add to layout
+        self.props_tab_widget = QTabWidget()
+        self.props_tab_widget.currentChanged.connect(self.handle_tab_change)
+        self.layout.addWidget(self.props_tab_widget)
         
-            # Add the game selection scroll area with improved spacing
-            self.game_selection_area = QScrollArea()
-            self.game_selection_area.setWidgetResizable(True)
-            self.game_selection_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self.game_selection_area.setContentsMargins(0, 0, 0, 0)
-            
-            # Set a fixed width that's narrower to reduce the spacing
-            self.game_selection_area.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
-            
-            self.game_selection_widget = QWidget()
-            self.game_selection_layout = QGridLayout(self.game_selection_widget)
-            self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
-            self.game_selection_layout.setHorizontalSpacing(0)  # Set horizontal spacing to 0
-            self.game_selection_layout.setVerticalSpacing(0)    # Set vertical spacing to 0
-            
-            self.game_selection_area.setWidget(self.game_selection_widget)
-            game_group_layout.addWidget(self.game_selection_area)
+        # Create a container for the bottom area (game selection and best lines)
+        bottom_container = QWidget()
+        bottom_layout = QHBoxLayout(bottom_container)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a cleaner look
         
-            # Add the game selection box to the left side of the bottom container
-            game_group.setFixedHeight(game_selection_height)  # Reduced from 300 to make more compact
-            bottom_layout.addWidget(game_group)
+        # 'game_group' and checkbox-buttons need to match width
+        game_selection_width = 600
+        game_selection_height = 250
         
-            # Add the best lines widget to the right side of the bottom container
-            self.create_best_lines_widget()
-            bottom_layout.addWidget(self.best_lines_widget)
+        # Add the game selection box to the left
+        game_group = QGroupBox()
+        game_group_layout = QVBoxLayout(game_group)
+        game_group_layout.setContentsMargins(2, 2, 2, 2)  # Tighter margins (reduced from 3,3,3,3)
+        game_group_layout.setSpacing(0)  # Remove spacing between elements
+        game_group.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
+        game_group.setFixedHeight(game_selection_height) # not necessary?
         
-            # Add the bottom container to the main layout
-            self.layout.addWidget(bottom_container)
+        # Create horizontal layout for buttons
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(2)  # Reduce spacing between buttons
         
-            # Load prop markets
-            self.load_prop_markets()
+        select_all_button = QPushButton("Select All")
+        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+        select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
+        select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
         
-            # Check again if window is closing before making network requests
-            if hasattr(self, '_closing') and self._closing:
-                print("Window is closing during initialization, aborting")
-                return
+        deselect_all_button = QPushButton("Deselect All")
+        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
+        deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
+        deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
         
-            # Fetch and populate games
-            try:
-                async with aiohttp.ClientSession() as session:
-                    games = await self.prop_client.get_games(session)
-                    
-                    # Final check before populating UI
-                    if hasattr(self, '_closing') and self._closing:
-                        print("Window is closing after fetching games, aborting")
-                        return
-                        
-                    self.populate_game_selection(games)
-                    integrate_stats_with_props_window(self)
-            except Exception as e:
-                print(f"Error fetching games: {e}")
-                import traceback
-                traceback.print_exc()
-                
-        except Exception as e:
-            print(f"Error in init_prop_ui: {e}")
-            import traceback
-            traceback.print_exc()
-
+        buttons_layout.addWidget(select_all_button)
+        buttons_layout.addWidget(deselect_all_button)
+        buttons_layout.addStretch()  # Add stretch to push buttons to the left
+        game_group_layout.addLayout(buttons_layout)
+    
+        # Add the game selection scroll area with improved spacing
+        self.game_selection_area = QScrollArea()
+        self.game_selection_area.setWidgetResizable(True)
+        self.game_selection_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.game_selection_area.setContentsMargins(0, 0, 0, 0)
+        
+        # Set a fixed width that's narrower to reduce the spacing
+        self.game_selection_area.setFixedWidth(game_selection_width)  # Adjust this value based on your needs
+        
+        self.game_selection_widget = QWidget()
+        self.game_selection_layout = QGridLayout(self.game_selection_widget)
+        self.game_selection_layout.setContentsMargins(0, 0, 0, 0)  # Remove all margins
+        self.game_selection_layout.setHorizontalSpacing(0)  # Set horizontal spacing to 0
+        self.game_selection_layout.setVerticalSpacing(0)    # Set vertical spacing to 0
+        
+        self.game_selection_area.setWidget(self.game_selection_widget)
+        game_group_layout.addWidget(self.game_selection_area)
+    
+        # Add the game selection box to the left side of the bottom container
+        game_group.setFixedHeight(game_selection_height)  # Reduced from 300 to make more compact
+        bottom_layout.addWidget(game_group)
+    
+        # Add the best lines widget to the right side of the bottom container
+        self.create_best_lines_widget()
+        bottom_layout.addWidget(self.best_lines_widget)
+    
+        # Add the bottom container to the main layout
+        self.layout.addWidget(bottom_container)
+    
+        # Load prop markets
+        self.load_prop_markets()
+    
+        # Fetch and populate games
+        async with aiohttp.ClientSession() as session:
+            games = await self.prop_client.get_games(session)
+            self.populate_game_selection(games)
+            integrate_stats_with_props_window(self)
+    
     def handle_tab_change(self, index):
         """Handle tab switching events to update best lines display"""
-        if index >= 0 and index < self.props_tab_widget.count():
+        print("HANDLE TAB CHANGE")
+        if 0 <= index < self.props_tab_widget.count():
             tab_id = self.props_tab_widget.tabText(index)
-            if tab_id in self.league_tabs:
-                self.current_tab_data = self.league_tabs[tab_id]
-                self.current_market = tab_id
-                # Update best lines display based on the selected tab
-                self.update_best_lines_display()
-                self.highlight_best_lines()
+            print(f"Tab changed to: {tab_id}")
+            self.current_market = tab_id
+            
+            # Add debug print to verify current market is set correctly
+            print(f"Current market set to: {self.current_market}")
+            
+            # Update best lines display based on the selected tab
+            self.update_best_lines_display()
+            self.highlight_best_lines()
+        else:
+            print(f"Warning: Invalid tab index: {index}")
 
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
         prop_markets = MAJOR_PROP_MARKETS.get(self.sport_key, {})
         self.prop_types = list(prop_markets.keys())
+        
+        # Store display names mapped to internal keys
+        self.display_to_key = {prop_markets[key]: key for key in self.prop_types}
+        self.key_to_display = {key: prop_markets[key] for key in self.prop_types}
+        
+        # Add display names to dropdown
         self.prop_selector.addItems([prop_markets[key] for key in self.prop_types])
 
     def populate_game_selection(self, games):
@@ -531,20 +493,20 @@ class PropsWindow(BaseTableWindow):
         
         for bm in dfs_props['bookmakers']:
             bm_title = bm['title']
-            if bm_title not in self.tab_data.bookmakers:
-                self.tab_data.bookmakers.append(bm_title)
+            if bm_title not in self.current_tab_data.bookmakers:
+                self.current_tab_data.bookmakers.append(bm_title)
             
             for market in bm['markets']:
                 for outcome in market['outcomes']:
                     player_name = outcome.get('description', outcome.get('name'))
                     label = f"{player_name} - DFS {market['key']}"
                     
-                    if label not in self.tab_data.table_rows:
-                        self.tab_data.table_rows.append(label)
-                        self.tab_data.table_data[label] = {'game_id': game_id}
+                    if label not in self.current_tab_data.table_rows:
+                        self.current_tab_data.table_rows.append(label)
+                        self.current_tab_data.table_data[label] = {'game_id': game_id}
                     
                     price = f"{outcome.get('price', '')} ({outcome.get('point', '')})"
-                    self.tab_data.table_data[label][bm_title] = price
+                    self.current_tab_data.table_data[label][bm_title] = price
 
     @qasync.asyncSlot()
     async def on_fetch_props_clicked(self):
@@ -557,15 +519,14 @@ class PropsWindow(BaseTableWindow):
 
     def create_prop_tab(self, market_type):
         """Create a new tab for a prop market"""
-        tab_id = market_type
-        
-        if tab_id not in self.league_tabs:
-            tab_data = LeagueTabData(self.league_name, self.sport_key)
-            table_widget = tab_data.create_table_widget()
-            self.props_tab_widget.addTab(table_widget, tab_id)
-            self.league_tabs[tab_id] = tab_data
-            
-        return self.league_tabs[tab_id]
+        display_name = self.key_to_display.get(market_type, market_type)
+        print(f"Creating new tab: {display_name} for market_type: {market_type}")
+        tab_data = LeagueTabData(self.league_name, self.sport_key)
+        self.tab_data = tab_data
+        self.current_tab_data = tab_data
+        self.create_table_widget()
+        self.props_tab_widget.addTab(self.table_widget, display_name)
+        return tab_data
 
     @qasync.asyncSlot()
     async def refresh_data(self, markets):
@@ -577,19 +538,15 @@ class PropsWindow(BaseTableWindow):
                 return
                 
             market_type = list(markets)[0]  # Get the first market type
+            print(f"Selected market type: {market_type}")
+            
             self.current_market = market_type
-            self.current_tab_data = self.create_prop_tab(market_type)
+            self.create_prop_tab(market_type)
             
             # Switch to the tab we're refreshing
-            tab_index = self.props_tab_widget.indexOf(self.current_tab_data.table_widget)
+            tab_index = self.props_tab_widget.indexOf(self.table_widget)
             if tab_index >= 0:
                 self.props_tab_widget.setCurrentIndex(tab_index)
-            
-            # Initialize data structures if they don't exist
-            if not hasattr(self, 'consolidated_odds_data'):
-                self.consolidated_odds_data = {'bookmakers': []}
-                self.bookmakers_map = {}
-                self.raw_odds_data_by_game = {}
     
             async with aiohttp.ClientSession() as session:
                 selected_games = [
@@ -659,8 +616,12 @@ class PropsWindow(BaseTableWindow):
                 
                 # Update displays if we got any data
                 if self.consolidated_odds_data['bookmakers']:
-                    self.current_tab_data.update_table_display()
+                    print("Updating displays with processed data")
+                    self.find_best_lines()
+                    self.update_table_display()
+                    # Update best lines display right after processing data
                     self.update_best_lines_display()
+                    self.highlight_best_lines()
                 else:
                     print("No valid bookmaker data was processed")
     
@@ -671,14 +632,13 @@ class PropsWindow(BaseTableWindow):
             # Ensure progress bar updates even on failure
             self.progress.setValue(0)
         
-        self.highlight_best_lines()
         self.progress.setValue(100)
 
     def find_best_lines(self):
         """Find the best lines for each market group"""
         # Group table rows by player and market type
-        market_groups = {}
-        for row_label in self.tab_data.table_rows:
+        market_groups = self.market_groups
+        for row_label in self.current_tab_data.table_rows:
             # Parse player name and market type from row label
             parts = row_label.split(' - ')
             if len(parts) >= 2:
@@ -687,7 +647,6 @@ class PropsWindow(BaseTableWindow):
                 # Create a unique key for this market group
                 market_key = f"{player_name}:{market_type}"
                 market_groups.setdefault(market_key, []).append(row_label)
-        self.market_groups = market_groups
         
         # Find best lines for each market group using the helper function
         for market_key, rows in market_groups.items():
@@ -697,11 +656,12 @@ class PropsWindow(BaseTableWindow):
     def find_best_market_lines(self, market_rows):
         """Find best over and under lines for a specific market"""
         best_over = {'odds': -999999, 'point': 999999, 'bookmaker': None}
-        best_under = {'odds': -999999, 'point': -999999, 'bookmaker': None}
+        best_under = {'odds': 999999, 'point': -999999, 'bookmaker': None}
+        print("FINDING BEST MARKET LINES")
         
         for row_label in market_rows:
-            row_data = self.tab_data.table_data[row_label]
-            for bm in self.tab_data.bookmakers:
+            row_data = self.current_tab_data.table_data[row_label]
+            for bm in self.current_tab_data.bookmakers:
                 if bm not in row_data:
                     continue
                 value = row_data[bm]
@@ -734,7 +694,7 @@ class PropsWindow(BaseTableWindow):
         if not self.current_tab_data:
             return 
         
-        table = self.current_tab_data.table_widget
+        table = self.table_widget
         bookmakers = [bm['title'] for bm in self.consolidated_odds_data['bookmakers']]
         
         # First reset all highlighting
@@ -745,7 +705,7 @@ class PropsWindow(BaseTableWindow):
                     # Reset to default colors but keep game-specific background
                     game_id = item.game_id if hasattr(item, 'game_id') else ''
                     if game_id:
-                        bg_color = self.current_tab_data.get_game_color(game_id)
+                        bg_color = self.get_game_color(game_id)
                         item.setBackground(bg_color)
                     item.setForeground(QColor('black'))
     
@@ -767,16 +727,16 @@ class PropsWindow(BaseTableWindow):
             
             if market_key not in market_best_lines:
                 market_best_lines[market_key] = {
-                    'over': {'odds': -999999, 'point': 999999, 'bookmaker': None, 'row': row_idx},
-                    'under': {'odds': -999999, 'point': -999999, 'bookmaker': None, 'row': row_idx}
+                    'over': {'odds': -999999.9, 'point': 999999.9, 'bookmaker': None, 'row': row_idx, 'col': 0},
+                    'under': {'odds': 999999.9, 'point': -999999.9, 'bookmaker': None, 'row': row_idx, 'col': 0},
                 }
-    
+            
             # Check each bookmaker column
             for col_idx, bm in enumerate(self.current_tab_data.bookmakers, 1):
                 value = row_data.get(bm, "")
                 if not value:
                     continue
-    
+                    
                 # Process over odds
                 over_result = extract_odds_point(value, 'O')
                 if over_result:
@@ -811,7 +771,7 @@ class PropsWindow(BaseTableWindow):
                             'col': col_idx
                         }
     
-        # Apply highlighting - now with enhanced visibility
+        # Apply highlighting
         for market_key, best in market_best_lines.items():
             # Highlight best OVER
             if best['over']['bookmaker']:
@@ -902,11 +862,13 @@ class PropsWindow(BaseTableWindow):
     # Widget to try and calculate best lines for entire query based on deviation
     def create_best_lines_widget(self):
         """Create a widget to display the best lines and their deviations."""
-        self.best_lines_widget = QTableWidget()
+        self.best_lines_widget = BestLinesWidget()
+        self.best_lines_widget.set_sport(self.sport_key)
         self.best_lines_widget.setColumnCount(5)
         self.best_lines_widget.setHorizontalHeaderLabels(["Player","Market","Best Line","Avg Odds","Implied Prob Deviation"]) #"Avg Odds" cannot be figured out im tard boy again
         self.best_lines_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
+    
+    # NEVER CHANGE THESE FUNCTIONS!!!
     def update_best_lines_display(self):
         """Update the best lines widget with all accumulated market data"""
         if not hasattr(self, 'consolidated_odds_data') or not self.consolidated_odds_data:
@@ -917,7 +879,7 @@ class PropsWindow(BaseTableWindow):
             return
             
         # Transform data for BestLinesCalculator
-        table_data = {}
+        table_data = self.current_tab_data.table_data
         bookmakers = []
         
         for bm in self.consolidated_odds_data.get('bookmakers', []):
@@ -955,108 +917,183 @@ class PropsWindow(BaseTableWindow):
                     table_data[row_label][bm_title] = value
         
         # Calculate and display best lines
-        if table_data:
-            calculator = BestLinesCalculator(table_data, bookmakers)
-            self.best_lines = calculator.calculate_best_lines()
-            self._populate_best_lines_widget(self.best_lines)
-            
-            
+        self.best_lines = LineCalculator.calculate_best_lines(table_data, bookmakers)
+        print("BEST LINES (from LineCalculator)")
+        print(self.best_lines)
+        self._populate_best_lines_widget(self.best_lines)
+        # self.best_lines_widget.update_display(self.consolidated_odds_data)
+        return
+    
+    # NEVER CHANGE THESE FUNCTIONS!!!
     def _populate_best_lines_widget(self, best_lines):
-        """Helper method to populate the best lines widget with calculated data."""
-        self.best_lines_widget.setRowCount(0)  # Clear existing rows
-        self.best_lines_widget.setColumnCount(5)
-        self.best_lines_widget.setHorizontalHeaderLabels(["Player", "Market", "Best Line", "Avg Odds", "Implied Prob Deviation"])
+        """
+        Correctly populate the Best Lines tab in the bottom tab panel.
+        The function directly accesses the QTableWidget inside the Best Lines tab.
+        """
+        print("Starting population of Best Lines tab (bottom panel left side)")
         
-        # Sort markets by max deviation (already computed as part of sorted_markets)
-        sorted_markets = []
-        for market_key, data in best_lines.items():
-            max_deviation = 0
-            over_dev = data['over']['deviation'] if data['over'] else 0
-            under_dev = data['under']['deviation'] if data['under'] else 0
-            max_deviation = max(over_dev, under_dev)
-            sorted_markets.append((market_key, data, max_deviation))
+        # Find the correct table widget in the Best Lines tab
+        best_lines_table = None
         
-        # Sort by max deviation in descending order
-        sorted_markets.sort(key=lambda x: x[2], reverse=True)
+        # The tab is likely a direct child of a tab widget, not the best_lines_widget property
+        # Let's try to find it by traversing the widget hierarchy
         
-        # Add one row per market showing the best line (over/under)
-        for market_key, data, max_deviation in sorted_markets:
-            player_name, market_type = market_key.split(':')
+        # In the actual PropsWindow class, we can directly access it if it's already defined
+        if hasattr(self, 'best_lines_table'):
+            best_lines_table = self.best_lines_table
+        
+        # If that doesn't work, find the table in the Best Lines tab
+        if not best_lines_table:
+            try:
+                # Assuming the tab widget is at the bottom of the window
+                # This is the tab widget containing "Best Lines" and "Advanced Stats" tabs
+                bottom_tab_widget = None
+                
+                # Check if we can access it directly
+                if hasattr(self, 'bottom_tab_widget'):
+                    bottom_tab_widget = self.bottom_tab_widget
+                
+                # If not, try another approach - look for the bottom tab container
+                if not bottom_tab_widget and hasattr(self, 'layout'):
+                    for i in range(self.layout.count()):
+                        item = self.layout.itemAt(i)
+                        if hasattr(item, 'widget') and item.widget():
+                            # Look for a tab widget in the bottom part
+                            for child in item.widget().findChildren(QTabWidget):
+                                # Check if this tab widget has "Best Lines" tab
+                                for tab_idx in range(child.count()):
+                                    if child.tabText(tab_idx).lower() == "best lines":
+                                        bottom_tab_widget = child
+                                        break
+                                if bottom_tab_widget:
+                                    break
+                        if bottom_tab_widget:
+                            break
+                
+                # If we found the tab widget, get the "Best Lines" tab content
+                if bottom_tab_widget:
+                    for tab_idx in range(bottom_tab_widget.count()):
+                        if bottom_tab_widget.tabText(tab_idx).lower() == "best lines":
+                            tab_content = bottom_tab_widget.widget(tab_idx)
+                            # Find the QTableWidget inside this tab
+                            for child in tab_content.findChildren(QTableWidget):
+                                best_lines_table = child
+                                break
+                            break
+            except Exception as e:
+                print(f"Error finding Best Lines tab: {str(e)}")
+        
+        # If we still don't have the table, fall back to the best_lines_widget property
+        if not best_lines_table:
+            print("WARNING: Could not find Best Lines tab table, using best_lines_widget directly")
+            best_lines_table = self.best_lines_widget
+        
+        # Make sure we have a table to work with
+        if not best_lines_table:
+            print("ERROR: Failed to find any Best Lines table widget!")
+            return
+        
+        print(f"Found Best Lines table widget: {best_lines_table}")
+        
+        # Now populate this table with the data
+        try:
+            # Clear existing rows
+            best_lines_table.setRowCount(0)
             
-            # Determine best line (over or under)
-            best_line = None
-            line_type = ""
-            over = data.get('over')
-            under = data.get('under')
+            # Set up columns
+            best_lines_table.setColumnCount(5)
+            best_lines_table.setHorizontalHeaderLabels(["Player", "Market", "Best Line", "Avg Odds", "Implied Prob Deviation"])
             
-            # Case 1: Both lines available
-            if over and under:
-                if over['deviation'] >= under['deviation']:
-                    best_line = over
-                    line_type = "OVER"
-                else:
-                    best_line = under
-                    line_type = "UNDER"
-            # Case 2: Only one line available
-            elif over:
-                best_line = over
-                line_type = "OVER"
-            elif under:
-                best_line = under
-                line_type = "UNDER"
-            else:
-                continue  # Skip if no lines
+            # Sort markets by deviation
+            sorted_markets = []
+            for market_key, data in best_lines.items():
+                # Extract market details
+                try:
+                    parts = market_key.split(':')
+                    if len(parts) < 2:
+                        continue
+                    
+                    player_name = parts[0]
+                    market_type = parts[1]
+                    
+                    # Get the best over/under line based on deviation
+                    over_dev = data['over']['deviation'] if data['over'] and 'deviation' in data['over'] else 0
+                    under_dev = data['under']['deviation'] if data['under'] and 'deviation' in data['under'] else 0
+                    
+                    # Determine which has highest deviation
+                    max_deviation = max(over_dev, under_dev)
+                    use_over = over_dev >= under_dev
+                    
+                    # Store for sorting
+                    sorted_markets.append((player_name, market_type, data, max_deviation, use_over))
+                except Exception as e:
+                    print(f"Error processing market {market_key}: {str(e)}")
+                    continue
             
-            # Skip lines with no bookmaker data
-            if not best_line or not best_line['bookmaker']:
-                continue
+            # Sort by deviation (highest first)
+            sorted_markets.sort(key=lambda x: x[3], reverse=True)
             
-            # Create row
-            row_position = self.best_lines_widget.rowCount()
-            self.best_lines_widget.insertRow(row_position)
-            
-            # Player Name
-            self.best_lines_widget.setItem(row_position, 0, QTableWidgetItem(player_name))
-            
-            # Market Type (without over/under)
-            self.best_lines_widget.setItem(row_position, 1, QTableWidgetItem(market_type))
-            
-            # Best Line (includes O/U and bookmaker)
-            line_text = f"{best_line['odds']} {line_type[0]} ({best_line['point']}) @ {best_line['bookmaker']}"
-            self.best_lines_widget.setItem(row_position, 2, QTableWidgetItem(line_text))
-            
-            # Avg Odds
-            avg_odds = best_line.get('avg_odds', 'N/A')
-            avg_item = QTableWidgetItem(f"{avg_odds:.0f}" if avg_odds != 'N/A' else "N/A")
-            self.best_lines_widget.setItem(row_position, 3, avg_item)
-            
-            # Deviation
-            if best_line['count'] > 1:
-                deviation = best_line['deviation']
-                deviation_item = QTableWidgetItem(f"+{deviation:.2f}%")
+            # Add rows (limit to 20 for performance)
+            for row_idx, (player_name, market_type, data, _, use_over) in enumerate(sorted_markets[:20]):
+                # Get the line data
+                line_data = data['over'] if use_over else data['under']
+                if not line_data:
+                    continue
+                
+                # Insert row
+                best_lines_table.insertRow(row_idx)
+                
+                # Column 0: Player name
+                player_item = QTableWidgetItem(player_name)
+                best_lines_table.setItem(row_idx, 0, player_item)
+                
+                # Column 1: Market type with OVER/UNDER
+                line_type = "OVER" if use_over else "UNDER"
+                # Clean up market name if needed
+                market_name = market_type.replace('batter_', '') if 'batter_' in market_type else market_type
+                market_item = QTableWidgetItem(f"{market_name} {line_type}")
+                best_lines_table.setItem(row_idx, 1, market_item)
+                
+                # Column 2: Best Line format
+                odds = line_data.get('odds', '')
+                point = line_data.get('point', '')
+                bookmaker = line_data.get('bookmaker', '')
+                
+                line_indicator = 'O' if use_over else 'U'
+                best_line_text = f"{odds} {line_indicator} ({point}) @ {bookmaker}"
+                line_item = QTableWidgetItem(best_line_text)
+                best_lines_table.setItem(row_idx, 2, line_item)
+                
+                # Column 3: Average odds
+                avg_odds = line_data.get('avg_odds', '')
+                best_lines_table.setItem(row_idx, 3, QTableWidgetItem(str(avg_odds)))
+                
+                # Column 4: Deviation
+                deviation = line_data.get('deviation', 0)
+                deviation_text = f"+{deviation:.2f}%" if deviation > 0 else f"{deviation:.2f}%"
+                deviation_item = QTableWidgetItem(deviation_text)
+                
                 # Color coding
-                if deviation > 10:
-                    deviation_item.setBackground(QColor(0, 200, 0, 150))
-                elif deviation > 5:
-                    deviation_item.setBackground(QColor(200, 200, 0, 150))
-                self.best_lines_widget.setItem(row_position, 4, deviation_item)
-            else:
-                self.best_lines_widget.setItem(row_position, 4, QTableWidgetItem("Solo Line"))
+                if deviation > 1.0:
+                    deviation_item.setBackground(QColor(0, 200, 0, 150))  # Green for high value
+                elif deviation > 0.5:
+                    deviation_item.setBackground(QColor(200, 200, 0, 150))  # Yellow for medium value
+                
+                best_lines_table.setItem(row_idx, 4, deviation_item)
+            
+            # Resize columns
+            best_lines_table.resizeColumnsToContents()
+            
+            # Make sure it's visible
+            best_lines_table.setVisible(True)
+            
+            # Force update
+            best_lines_table.update()
+            
+            print(f"Successfully populated Best Lines tab with {best_lines_table.rowCount()} rows")
+            
+        except Exception as e:
+            import traceback
+            print(f"ERROR in _populate_best_lines_widget: {str(e)}")
+            traceback.print_exc()
         
-        # Resize columns to fit content
-        self.best_lines_widget.resizeColumnsToContents()
-    
-    
-    def closeEvent(self, event):
-        """Override close event to ensure proper cleanup"""
-        # Stop any timers or ongoing operations
-        if hasattr(self, 'icon_timer') and self.icon_timer:
-            self.icon_timer.stop()
-        
-        # Clear any data that might be expensive to recreate
-        self.game_checkboxes.clear()
-        self.market_groups.clear()
-        self.best_lines.clear()
-        
-        # Accept the close event to proceed with window closing
-        event.accept()
