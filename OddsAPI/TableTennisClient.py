@@ -6,7 +6,6 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
-# Import API key from Creds.py (make sure this file exists)
 from Creds import TT_KEY
 
 # Constants
@@ -20,7 +19,6 @@ TARGET_LEAGUE_IDS = {
 }
 DEFAULT_BOOKMAKER = "bet365"
 TIME_WINDOW_HOURS = 6  # Only fetch events within next 6 hours
-HISTORY_START_DATE = "20240101"  # Get history data from 2024-01-01
 
 
 async def get_events_async(session: aiohttp.ClientSession, league_id: int, event_type: str) -> Dict:
@@ -87,6 +85,69 @@ async def get_markets_async(session: aiohttp.ClientSession, event_id, bookmaker:
         return {}
 
 
+async def get_event_view_async(session: aiohttp.ClientSession, event_id: str) -> Dict:
+    """
+    Fetch detailed event view data including set scores and point-by-point timeline
+    """
+    print(f"Fetching event view for event_id: {event_id}")
+    
+    params = {
+        "token": TT_KEY,
+        "event_id": event_id,
+    }
+    
+    try:
+        async with session.get(f"{BASE_URL}/v1/event/view", params=params) as response:
+            if response.status != 200:
+                print(f"Error fetching event view for event {event_id}: {response.status}")
+                return {}
+            
+            result = await response.json()
+            if result.get("success") != 1:
+                print(f"Unsuccessful request for event view! Event ID: {event_id}")
+                return {}
+            
+            # Return the first result if available
+            results = result.get("results", [])
+            if results and len(results) > 0:
+                event_data = results[0]
+                
+                # Process timeline data to make it easier to use for charting
+                if "timeline" in event_data:
+                    # Organize timeline by set (game)
+                    processed_timeline = {}
+                    
+                    for point in event_data["timeline"]:
+                        game_num = point.get("gm")
+                        team = point.get("te")  # 0 for home, 1 for away
+                        score = point.get("ss")
+                        
+                        if not game_num or team is None or not score:
+                            continue
+                            
+                        if game_num not in processed_timeline:
+                            processed_timeline[game_num] = []
+                            
+                        # Parse score (format: "3-2")
+                        if "-" in score:
+                            home_score, away_score = map(int, score.split("-"))
+                            processed_timeline[game_num].append({
+                                "point_num": len(processed_timeline[game_num]) + 1,
+                                "team": int(team),
+                                "home_score": home_score,
+                                "away_score": away_score
+                            })
+                    
+                    # Add the processed timeline to the event data
+                    event_data["processed_timeline"] = processed_timeline
+                    
+                return event_data
+            return {}
+    except Exception as e:
+        print(f"Exception fetching event view for event {event_id}: {str(e)}")
+        return {}
+
+
 async def get_history_async(session: aiohttp.ClientSession, event_id, quantity: int = 20) -> Dict:
     """
     Fetch historical head-to-head data for a specific event
@@ -114,6 +175,57 @@ async def get_history_async(session: aiohttp.ClientSession, event_id, quantity: 
     except Exception as e:
         print(f"Exception fetching history for event {event_id}: {str(e)}")
         return {}
+
+
+async def fetch_detailed_h2h_data(session: aiohttp.ClientSession, history_data: Dict) -> Dict:
+    """
+    Enhance history data with detailed set scores and point-by-point timeline for each match
+    """
+    if not history_data or "h2h" not in history_data:
+        return history_data
+        
+    h2h_matches = history_data.get("h2h", [])
+    detailed_matches = []
+    
+    # Create tasks for fetching event details for each h2h match
+    event_view_tasks = []
+    for match in h2h_matches:
+        match_id = match.get("id")
+        if match_id:
+            event_view_tasks.append(get_event_view_async(session, match_id))
+        else:
+            detailed_matches.append(match)  # Keep the original match if no ID
+    
+    # Execute all event view tasks concurrently
+    if event_view_tasks:
+        event_view_results = await asyncio.gather(*event_view_tasks)
+        
+        # Process results and enhance the h2h matches
+        for i, match in enumerate(h2h_matches):
+            match_id = match.get("id")
+            if match_id and i < len(event_view_results):
+                event_view_data = event_view_results[i]
+                if event_view_data:
+                    # Add the set scores to the match if available
+                    if "scores" in event_view_data:
+                        match["detailed_scores"] = event_view_data.get("scores", {})
+                    
+                    # Add the point-by-point timeline if available
+                    if "processed_timeline" in event_view_data:
+                        match["processed_timeline"] = event_view_data.get("processed_timeline", {})
+                    elif "timeline" in event_view_data:
+                        match["timeline"] = event_view_data.get("timeline", [])
+                        
+                detailed_matches.append(match)
+            elif not match_id:
+                detailed_matches.append(match)  # Keep the original match
+    else:
+        detailed_matches = h2h_matches
+    
+    # Replace the original h2h array with the enhanced one
+    history_data["h2h"] = detailed_matches
+    
+    return history_data
 
 
 async def save_json_async(data: Dict, name: str) -> None:
@@ -228,16 +340,21 @@ async def process_league(session: aiohttp.ClientSession, league_id: int, league_
                 }
                 market_entries.append(market_entry)
     
-    # Execute all history tasks concurrently
+    # Execute all history tasks concurrently and add detailed set scores
     if history_tasks:
         history_results = await asyncio.gather(*history_tasks)
+        
+        # Create enhanced history entries with detailed scores
         for i, history in enumerate(history_results):
             if history:
+                # Fetch detailed set scores for each h2h match
+                enhanced_history = await fetch_detailed_h2h_data(session, history)
+                
                 history_entry = {
                     "event_id": filtered_results[i]["id"],
                     "event_name": f"{filtered_results[i].get('home', {}).get('name', '')} vs {filtered_results[i].get('away', {}).get('name', '')}",
                     "event_time": filtered_results[i].get("formatted_time", ""),
-                    "history": history
+                    "history": enhanced_history
                 }
                 history_entries.append(history_entry)
     

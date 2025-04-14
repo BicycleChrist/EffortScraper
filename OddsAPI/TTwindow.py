@@ -7,15 +7,444 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QComboBox, QTabWidget, QTableWidget, QTableWidgetItem, 
     QPushButton, QLineEdit, QSplitter, QGroupBox, QScrollArea, 
-    QGridLayout, QHeaderView, QSizePolicy, 
+    QGridLayout, QHeaderView, QSizePolicy, QDialog, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QFont, QColor, QIcon
+
+# Import matplotlib for charts
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 # Import the client for data fetching
 import asyncio
 from TableTennisClient import main as fetch_data
 import pathlib # For icon
+
+
+class PointProgressionCanvas(FigureCanvas):
+    """Canvas for drawing point progression charts"""
+    def __init__(self, parent=None, width=5, height=4, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = self.fig.add_subplot(111)
+        
+        # Set dark theme style for the figure
+        self.fig.patch.set_facecolor('#2d2d2d')
+        self.axes.set_facecolor('#2d2d2d')
+        self.axes.spines['bottom'].set_color('#7f8c8d')
+        self.axes.spines['top'].set_color('#7f8c8d') 
+        self.axes.spines['right'].set_color('#7f8c8d')
+        self.axes.spines['left'].set_color('#7f8c8d')
+        self.axes.tick_params(axis='x', colors='#f0f0f0')
+        self.axes.tick_params(axis='y', colors='#f0f0f0')
+        self.axes.yaxis.label.set_color('#f0f0f0')
+        self.axes.xaxis.label.set_color('#f0f0f0')
+        self.axes.title.set_color('#f0f0f0')
+        self.axes.grid(color='#3a3a3a', linestyle='-', linewidth=0.5, alpha=0.7)
+        
+        super().__init__(self.fig)
+        self.setMinimumSize(400, 300)
+    
+    def plot_point_progression(self, set_data, home_name, away_name, set_number):
+        """Plot point progression for a single set"""
+        # Clear previous plot
+        self.axes.clear()
+        
+        # Set style again after clearing
+        self.axes.set_facecolor('#2d2d2d')
+        self.axes.spines['bottom'].set_color('#7f8c8d')
+        self.axes.spines['top'].set_color('#7f8c8d')
+        self.axes.spines['right'].set_color('#7f8c8d')
+        self.axes.spines['left'].set_color('#7f8c8d')
+        self.axes.tick_params(axis='x', colors='#f0f0f0')
+        self.axes.tick_params(axis='y', colors='#f0f0f0')
+        self.axes.grid(color='#3a3a3a', linestyle='-', linewidth=0.5, alpha=0.7)
+        
+        # Extract data
+        point_numbers = [point["point_num"] for point in set_data]
+        home_scores = [point["home_score"] for point in set_data]
+        away_scores = [point["away_score"] for point in set_data]
+        
+        # Plot home team points in red and away team in green
+        home_line, = self.axes.plot(point_numbers, home_scores, 'r-o', label=home_name, linewidth=2, markersize=4)
+        away_line, = self.axes.plot(point_numbers, away_scores, 'g-o', label=away_name, linewidth=2, markersize=4)
+        
+        # Set labels and title
+        self.axes.set_title(f"Set {set_number}")
+        self.axes.set_xlabel("Point Number")
+        self.axes.set_ylabel("Score")
+        
+        # Add legend
+        self.axes.legend(loc='upper left')
+        
+        # Add grid
+        self.axes.grid(True)
+        
+        # Set y-axis to start from 0 and go to max score + 1
+        max_score = max(max(home_scores), max(away_scores)) if home_scores and away_scores else 0
+        self.axes.set_ylim(0, max_score + 1)
+        
+        # Set x-axis to match points
+        self.axes.set_xlim(1, max(point_numbers) if point_numbers else 1)
+        
+        # Show all integer ticks on y-axis
+        self.axes.set_yticks(list(range(0, max_score + 2)))
+        
+        # Add annotation for the final score
+        if point_numbers:
+            final_point = len(point_numbers) - 1
+            final_home = home_scores[final_point]
+            final_away = away_scores[final_point]
+            
+            # Add final score annotation
+            self.axes.annotate(f"{final_home}", 
+                xy=(point_numbers[final_point], home_scores[final_point]),
+                xytext=(10, 0),
+                textcoords="offset points",
+                color='red',
+                fontweight='bold')
+                
+            self.axes.annotate(f"{final_away}", 
+                xy=(point_numbers[final_point], away_scores[final_point]),
+                xytext=(10, 0),
+                textcoords="offset points",
+                color='green',
+                fontweight='bold')
+        
+        self.fig.tight_layout()
+        self.draw()
+
+
+class SetScoreDialog(QDialog):
+    """Dialog to display detailed set scores and point progression for a match"""
+    def __init__(self, parent=None, match_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Scores")
+        self.setMinimumSize(1000, 700)  # Increased size to accommodate charts
+        
+        # Main layout
+        layout = QVBoxLayout(self)
+        
+        # Match title
+        if match_data:
+            home_name = match_data.get('home', {}).get('name', 'Home')
+            away_name = match_data.get('away', {}).get('name', 'Away')
+            date_str = "Unknown Date"
+            if match_data.get('time'):
+                try:
+                    match_time = int(match_data.get('time'))
+                    date_str = datetime.fromtimestamp(match_time).strftime('%Y-%m-%d')
+                except:
+                    pass
+            
+            # Match title with date
+            title_label = QLabel(f"{home_name} vs {away_name} ({date_str})")
+            title_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+            title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(title_label)
+            
+            # Final score
+            score_str = match_data.get('ss', 'Unknown Score')
+            score_label = QLabel(f"Final Score: {score_str}")
+            score_label.setFont(QFont("Arial", 12))
+            score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(score_label)
+            
+            # Player names in a larger display
+            players_widget = QWidget()
+            players_layout = QHBoxLayout(players_widget)
+            
+            home_player_label = QLabel(home_name)
+            home_player_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+            home_player_label.setStyleSheet("color: #e74c3c;")  # Red for home player
+            home_player_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            vs_label = QLabel("vs")
+            vs_label.setFont(QFont("Arial", 16))
+            vs_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            away_player_label = QLabel(away_name)
+            away_player_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+            away_player_label.setStyleSheet("color: #2ecc71;")  # Green for away player
+            away_player_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            players_layout.addWidget(home_player_label)
+            players_layout.addWidget(vs_label)
+            players_layout.addWidget(away_player_label)
+            
+            layout.addWidget(players_widget)
+            
+            # Set scores and charts
+            detailed_scores = match_data.get('detailed_scores', {})
+            if detailed_scores:
+                # Add tab option for viewing individual sets
+                tab_option = QPushButton("View Sets in Tabs")
+                tab_option.setCheckable(True)
+                tab_option.setChecked(False)
+                tab_option.toggled.connect(lambda checked: self.toggle_view_mode(checked, match_data, home_name, away_name))
+                tab_option.setMaximumWidth(200)
+                tab_option.setStyleSheet("""
+                    QPushButton {
+                        background-color: #34495e;
+                        padding: 5px;
+                        border-radius: 3px;
+                    }
+                    QPushButton:checked {
+                        background-color: #3498db;
+                    }
+                """)
+                
+                layout.addWidget(tab_option, alignment=Qt.AlignmentFlag.AlignCenter)
+                
+                # Create stacked widget to switch between views
+                self.stacked_widget = QStackedWidget()
+                layout.addWidget(self.stacked_widget)
+                
+                # 1. Create comprehensive view (all sets at once)
+                all_sets_widget = QScrollArea()
+                all_sets_widget.setWidgetResizable(True)
+                all_sets_content = QWidget()
+                all_sets_layout = QVBoxLayout(all_sets_content)
+                
+                # Keep track of which sets have timeline data
+                sets_with_timeline = set()
+                
+                # Get timeline data if available
+                timeline_data = match_data.get('processed_timeline', {})
+                
+                # Create a set score summary at the top
+                summary_group = QGroupBox("Set Scores Summary")
+                summary_layout = QGridLayout()
+                
+                # Headers
+                set_header = QLabel("Set")
+                set_header.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+                home_header = QLabel(home_name)
+                home_header.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+                away_header = QLabel(away_name)
+                away_header.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+                
+                summary_layout.addWidget(set_header, 0, 0)
+                summary_layout.addWidget(home_header, 0, 1)
+                summary_layout.addWidget(away_header, 0, 2)
+                
+                # Add set scores
+                for i, (set_num, set_data) in enumerate(sorted(detailed_scores.items(), key=lambda x: int(x[0]))):
+                    set_label = QLabel(f"Set {set_num}")
+                    home_score = set_data.get('home', '-')
+                    away_score = set_data.get('away', '-')
+                    
+                    home_score_label = QLabel(home_score)
+                    away_score_label = QLabel(away_score)
+                    
+                    # Make score bold
+                    home_score_label.setFont(QFont("Arial", 11))
+                    away_score_label.setFont(QFont("Arial", 11))
+                    
+                    # Highlight winner
+                    try:
+                        if int(home_score) > int(away_score):
+                            home_score_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
+                        else:
+                            away_score_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
+                    except:
+                        pass
+                    
+                    summary_layout.addWidget(set_label, i+1, 0)
+                    summary_layout.addWidget(home_score_label, i+1, 1)
+                    summary_layout.addWidget(away_score_label, i+1, 2)
+                
+                summary_group.setLayout(summary_layout)
+                all_sets_layout.addWidget(summary_group)
+                
+                # Create grid for charts (2 columns if 4+ sets)
+                use_grid = len(detailed_scores) >= 3
+                if use_grid:
+                    charts_widget = QWidget()
+                    if len(detailed_scores) >= 4:
+                        charts_layout = QGridLayout(charts_widget)
+                    else:
+                        charts_layout = QVBoxLayout(charts_widget)
+                    
+                    # Add charts to grid/column
+                    row, col = 0, 0
+                    for set_num, set_data in sorted(detailed_scores.items(), key=lambda x: int(x[0])):
+                        set_group = QGroupBox(f"Set {set_num}")
+                        set_layout = QVBoxLayout(set_group)
+                        
+                        if timeline_data and set_num in timeline_data:
+                            # Create point progression chart
+                            chart = PointProgressionCanvas(self, width=5, height=3, dpi=100)
+                            chart.plot_point_progression(timeline_data[set_num], home_name, away_name, set_num)
+                            set_layout.addWidget(chart)
+                            sets_with_timeline.add(set_num)
+                        else:
+                            # No point progression data
+                            no_data = QLabel("No point progression data")
+                            no_data.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                            set_layout.addWidget(no_data)
+                        
+                        if len(detailed_scores) >= 4:
+                            charts_layout.addWidget(set_group, row, col)
+                            col += 1
+                            if col > 1:  # 2 columns max
+                                col = 0
+                                row += 1
+                        else:
+                            charts_layout.addWidget(set_group)
+                    
+                    all_sets_layout.addWidget(charts_widget)
+                else:
+                    # For 1-2 sets, just add charts directly in a column
+                    for set_num, set_data in sorted(detailed_scores.items(), key=lambda x: int(x[0])):
+                        set_group = QGroupBox(f"Set {set_num}")
+                        set_layout = QVBoxLayout(set_group)
+                        
+                        if timeline_data and set_num in timeline_data:
+                            # Create point progression chart
+                            chart = PointProgressionCanvas(self, width=6, height=3, dpi=100)
+                            chart.plot_point_progression(timeline_data[set_num], home_name, away_name, set_num)
+                            set_layout.addWidget(chart)
+                            sets_with_timeline.add(set_num)
+                        else:
+                            # No point progression data
+                            no_data = QLabel("No point progression data")
+                            no_data.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                            set_layout.addWidget(no_data)
+                            
+                        all_sets_layout.addWidget(set_group)
+                
+                # If we have no timeline data at all, show a message
+                if not sets_with_timeline and detailed_scores:
+                    note_label = QLabel("Note: Point progression data is not available for this match.")
+                    note_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    note_label.setStyleSheet("color: #f39c12;")  # Orange warning color
+                    all_sets_layout.addWidget(note_label)
+                
+                all_sets_widget.setWidget(all_sets_content)
+                self.stacked_widget.addWidget(all_sets_widget)
+                
+                # 2. Create tab view (each set in a tab)
+                tab_widget = QTabWidget()
+                for set_num, set_data in sorted(detailed_scores.items(), key=lambda x: int(x[0])):
+                    set_tab = QWidget()
+                    set_layout = QVBoxLayout(set_tab)
+                    
+                    # Score summary
+                    score_group = QGroupBox(f"Set {set_num} Score")
+                    score_layout = QHBoxLayout(score_group)
+                    
+                    home_score = set_data.get('home', '-')
+                    away_score = set_data.get('away', '-')
+                    
+                    home_label = QLabel(f"{home_name}: ")
+                    home_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+                    home_score_label = QLabel(home_score)
+                    home_score_label.setFont(QFont("Arial", 10))
+                    
+                    away_label = QLabel(f"{away_name}: ")
+                    away_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+                    away_score_label = QLabel(away_score)
+                    away_score_label.setFont(QFont("Arial", 10))
+                    
+                    # Highlight winner
+                    try:
+                        if int(home_score) > int(away_score):
+                            home_score_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
+                        else:
+                            away_score_label.setStyleSheet("font-weight: bold; color: #2ecc71;")
+                    except:
+                        pass
+                    
+                    score_layout.addWidget(home_label)
+                    score_layout.addWidget(home_score_label)
+                    score_layout.addStretch()
+                    score_layout.addWidget(away_label)
+                    score_layout.addWidget(away_score_label)
+                    
+                    set_layout.addWidget(score_group)
+                    
+                    # Check if we have point progression data for this set
+                    if timeline_data and set_num in timeline_data:
+                        # Create and add point progression chart
+                        point_chart = PointProgressionCanvas(self, width=6, height=4, dpi=100)
+                        point_chart.plot_point_progression(timeline_data[set_num], home_name, away_name, set_num)
+                        set_layout.addWidget(point_chart)
+                    else:
+                        # No point progression data
+                        no_chart_label = QLabel("No point progression data available for this set")
+                        no_chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        set_layout.addWidget(no_chart_label)
+                    
+                    tab_widget.addTab(set_tab, f"Set {set_num}")
+                
+                self.stacked_widget.addWidget(tab_widget)
+                
+                # Default to comprehensive view
+                self.stacked_widget.setCurrentIndex(0)
+            else:
+                no_details_label = QLabel("No detailed set scores available for this match")
+                no_details_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(no_details_label)
+        else:
+            error_label = QLabel("No match data available")
+            error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(error_label)
+        
+        # Button box
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #f0f0f0;
+            }
+            QLabel {
+                color: #f0f0f0;
+            }
+            QGroupBox {
+                border: 1px solid #3a3a3a;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px 0 3px;
+                color: #3498db;
+            }
+            QTabWidget::pane {
+                border: 1px solid #3a3a3a;
+                background-color: #2d2d2d;
+            }
+            QTabBar::tab {
+                background-color: #2c3e50;
+                color: #f0f0f0;
+                padding: 8px 12px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: #3498db;
+                font-weight: bold;
+            }
+            QScrollArea {
+                border: none;
+            }
+        """)
+    
+    def toggle_view_mode(self, tab_mode, match_data, home_name, away_name):
+        """Toggle between comprehensive and tab view modes"""
+        if tab_mode:
+            self.stacked_widget.setCurrentIndex(1)  # Tab view
+        else:
+            self.stacked_widget.setCurrentIndex(0)  # Comprehensive view
 
 
 class TableTennisGUI(QMainWindow):
@@ -323,9 +752,11 @@ class TableTennisGUI(QMainWindow):
         self.h2h_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
         h2h_layout.addWidget(self.h2h_summary)
         
-        self.h2h_table = QTableWidget(0, 4)
-        self.h2h_table.setHorizontalHeaderLabels(["Date", "Home", "Away", "Score"])
+        self.h2h_table = QTableWidget(0, 5)  # Updated to 5 columns to include the "Sets" button
+        self.h2h_table.setHorizontalHeaderLabels(["Date", "Home", "Away", "Score", "Details"])
         self.h2h_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.h2h_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.h2h_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.h2h_table.verticalHeader().setVisible(False)
         self.h2h_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         h2h_layout.addWidget(self.h2h_table)
@@ -406,6 +837,14 @@ class TableTennisGUI(QMainWindow):
             QLabel {
                 color: #f0f0f0;
             }
+            QDialog {
+                background-color: #1e1e1e;
+                color: #f0f0f0;
+            }
+            QDialogButtonBox > QPushButton {
+                min-width: 80px;
+                padding: 6px;
+            }
         """)
 
     def decimal_to_american(self, decimal_odds):
@@ -478,23 +917,12 @@ class TableTennisGUI(QMainWindow):
         QApplication.processEvents()
         
         try:
-            # Create a QEventLoop to run the async code properly
-            loop = asyncio.get_event_loop()
+            # Run client asynchronously
+            asyncio.run(fetch_data())
+            self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
             
-            # If we're on the main thread and the loop is running
-            if loop.is_running():
-                # Create a Future to track when fetch_data completes
-                future = asyncio.ensure_future(fetch_data())
-                # Add a callback to update the UI when fetch_data completes
-                def on_complete(_):
-                    self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
-                    self.load_data()
-                future.add_done_callback(on_complete)
-            else:
-                # If not running, we can use loop.run_until_complete
-                loop.run_until_complete(fetch_data())
-                self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
-                self.load_data()
+            # Load the updated data
+            self.load_data()
         except Exception as e:
             self.status_label.setText(f"Error refreshing data: {str(e)}")
             print(f"Error: {str(e)}")
@@ -812,7 +1240,7 @@ class TableTennisGUI(QMainWindow):
                 
         # Update H2H table
         self.update_h2h_data(h2h_data, home_name, away_name)
-
+        
     def update_h2h_data(self, h2h_data, home_name, away_name):
         """Update head-to-head data display"""
         # Clear table
@@ -857,6 +1285,21 @@ class TableTennisGUI(QMainWindow):
             self.h2h_table.setItem(i, 2, away_item)
             self.h2h_table.setItem(i, 3, score_item)
             
+            # Add "View Sets" button if detailed scores are available
+            has_detailed_scores = 'detailed_scores' in match and match['detailed_scores']
+            
+            # Create button cell
+            btn_cell = QTableWidgetItem("View Sets" if has_detailed_scores else "N/A")
+            if has_detailed_scores:
+                btn_cell.setForeground(QColor("#3498db"))
+                btn_cell.setFlags(btn_cell.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                # Store match data for retrieval when clicked
+                btn_cell.setData(Qt.ItemDataRole.UserRole, match)
+            else:
+                btn_cell.setForeground(QColor("#7f8c8d"))  # Gray text for N/A
+            
+            self.h2h_table.setItem(i, 4, btn_cell)
+            
             # Count wins for probability
             total_matches += 1
             
@@ -878,6 +1321,9 @@ class TableTennisGUI(QMainWindow):
                             away_wins += 1
                 except:
                     pass
+        
+        # Connect table click for set scores
+        self.h2h_table.cellClicked.connect(self.handle_h2h_cell_click)
         
         # Update H2H summary
         self.h2h_summary.setText(f"Head-to-Head: {len(h2h_matches)} previous matches")
@@ -910,6 +1356,18 @@ class TableTennisGUI(QMainWindow):
             else:
                 self.away_prob.setStyleSheet("color: #f39c12; font-weight: bold;")
                 
+    def handle_h2h_cell_click(self, row, column):
+        """Handle clicks on the H2H table to show set scores"""
+        if column == 4:  # "View Sets" column
+            item = self.h2h_table.item(row, column)
+            if item and item.text() == "View Sets":
+                # Get match data stored in the item
+                match_data = item.data(Qt.ItemDataRole.UserRole)
+                if match_data:
+                    # Show set score dialog
+                    dialog = SetScoreDialog(self, match_data)
+                    dialog.exec()
+    
     def get_odds_color(self, odds_value):
         """Return a color based on odds value"""
         if odds_value <= 1.5:
