@@ -7,17 +7,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QComboBox, QTabWidget, QTableWidget, QTableWidgetItem, 
     QPushButton, QLineEdit, QSplitter, QGroupBox, QScrollArea, 
-    QGridLayout, QHeaderView, QSizePolicy, QDialog, QDialogButtonBox,
+    QGridLayout, QHeaderView, QSizePolicy, QDialog, QDialogButtonBox,QStackedWidget
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QFont, QColor, QIcon
-
-# Import matplotlib for charts
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-
-# Import the client for data fetching
 import asyncio
 from TableTennisClient import main as fetch_data
 import pathlib # For icon
@@ -471,7 +467,7 @@ class TableTennisGUI(QMainWindow):
         # Set up auto-refresh timer (every 5 minutes)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_data)
-        self.refresh_timer.start(300000)  # 5 minutes
+        self.refresh_timer.start(1800000)  # 30 minutes
 
     def setup_ui(self):
         # Create central widget and main layout

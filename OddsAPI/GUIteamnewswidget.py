@@ -11,6 +11,26 @@ from PyQt6.QtWidgets import (
 )
 
 
+#TODO: Manually scrape Fantasy pros as their Rss feed keeps returning errors despite being populated
+# Below is an example "player-news-item" div
+"""
+<div class="player-news-item">
+    <div class="clearfix">
+        <div class="two columns player-news-image" style="padding: 8px 8px 0; background-color: #f7f7f7;">
+            <a href="/nfl/players/trey-mcbride.php"><img src="https://images.fantasypros.com/images/players/nfl/22936/headshot/100x100.png" alt="Trey McBride" style="width: 100%;"></a><p style="font-size:11px; line-height:15px; margin-top:10px;"><a href="/nfl/players/trey-mcbride.php">» Rankings</a><br><a href="/nfl/stats/trey-mcbride.php">» Stats</a><br><a href="/nfl/news/trey-mcbride.php">» More News</a></p>        </div>
+        <div class="ten columns">
+            <div class="player-news-header clearfix"><div class="ten columns"><span style="font-size:16px; font-weight:bold;"><a href="/nfl/news/509904/trey-mcbride-signs-four-year-extension-with-cardinals-.php" target="_blank">Trey McBride signs four-year extension with Cardinals </a></span><br><p>Thu, Apr 3rd 6:33pm EDT<br>
+By <a href="/news/correspondents/ari-koslow.php" target="_blank">Ari Koslow</a></p></div></div><p>The Cardinals signed TE Trey McBride to a four-year, $76 million extension.</p><p><b><em>Fantasy Impact:</em></b> The extension makes McBride the highest paid tight end in NFL history. It also includes $43 million in guaranteed money. McBride is coming off a career season and remains one of the top tight ends in fantasy football. </p><span class="pull-left"><p>Category: 
+<a href="/nfl/transactions.php">Transactions</a></p></span>
+<span class="pull-right fp-vote-container" data-itemid="n-509904"></span>        </div>
+    </div>
+</div>
+
+"""
+
+
+
+
 class NewsWorker(QObject):
     """Background worker to fetch news without blocking the UI"""
     news_fetched = pyqtSignal(list)
@@ -30,7 +50,7 @@ class NewsWorker(QObject):
                 "general": [
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
-                    "https://www.fantasypros.com/nba/player-news.php",
+                    "https://www.fantasypros.com/nba/player-news",
                     "https://sports.yahoo.com/nba/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],
@@ -41,8 +61,8 @@ class NewsWorker(QObject):
                     "https://www.nfl.com/rss/rsslanding?searchString=home",
                     "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
-                    "https://www.fantasypros.com/nfl/news/injury.php?format=rss",                    
-                    "https://www.cbssports.com/rss/headlines/nfl/injuries",
+                    "https://www.fantasypros.com/nfl/player-news",                    
+                    "https://www.cbssports.com/rss/headlines/nfl",
                     "https://sports.yahoo.com/nfl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl"
                 ]
@@ -53,8 +73,8 @@ class NewsWorker(QObject):
                     "https://www.mlb.com/feeds/news/rss.xml",
                     "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
-                    "https://www.fantasypros.com/mlb/news/injury.php?format=rss",
-                    "https://www.cbssports.com/rss/headlines/mlb/injuries",
+                    "https://www.fantasypros.com/mlb/injury-news",
+                    "https://www.cbssports.com/rss/headlines/mlb/",
                     "https://sports.yahoo.com/mlb/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb"
                 ]
@@ -65,7 +85,7 @@ class NewsWorker(QObject):
                     "http://www.nhl.com/rss/news.xml",
                     "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
-                    "https://www.fantasypros.com/nhl/news/injury.php?format=rss",
+                    "https://www.fantasypros.com/nhl/player-news",
                     "https://www.cbssports.com/rss/headlines/nhl/injuries",
                     "https://sports.yahoo.com/nhl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"

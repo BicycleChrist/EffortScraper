@@ -9,6 +9,9 @@ from PyQt6.QtWidgets import (
 )
 import traceback
 from MLBpercentilerankings import fetch_leaderboard_data, PITCHER_URL, HITTER_URL
+import requests
+from bs4 import BeautifulSoup
+
 
 class FrozenTableWidget(QTableWidget):
     """Widget for displaying frozen columns"""
@@ -67,6 +70,13 @@ class AdvancedStatsWidget(QWidget):
         self.frozen_table = FrozenTableWidget()
         self.frozen_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         
+        self.view_selector = QComboBox()
+        self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats"])
+        self.view_selector.currentIndexChanged.connect(self.on_view_mode_changed)
+        controls_layout.addWidget(QLabel("View:"))
+        controls_layout.addWidget(self.view_selector)
+        
+        
         # Create main stats table
         self.stats_table = QTableWidget()
         self.stats_table.setSortingEnabled(True)
@@ -123,7 +133,72 @@ class AdvancedStatsWidget(QWidget):
             self.init_nba_stats_client()
         else:
             self.show_loading_state()
+        if self.is_stuffplus_mode():
+            self.loading_task = asyncio.create_task(self.load_stuffplus_data())
+        else:
             self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+    
+    
+    
+         ######################            MLB STUFF PLUS LOGIC       ################### 
+    def is_stuffplus_mode(self):
+        return self.view_selector.currentText() == "Stuff+ Stats"
+    
+    def on_view_mode_changed(self, index):
+        if self.current_sport == 'baseball_mlb':
+            self.show_loading_state()
+            if self.loading_task and not self.loading_task.done():
+                self.loading_task.cancel()
+            if self.is_stuffplus_mode():
+                self.loading_task = asyncio.create_task(self.load_stuffplus_data())
+            else:
+                self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+    
+    def fetch_stuffplus_data(self):
+        url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception("Failed to fetch Fangraphs Stuff+ page")
+        soup = BeautifulSoup(response.content, 'lxml')
+        table_wrapper = soup.find('div', class_="fg-data-grid table-type").find('div', class_='table-wrapper-inner')
+        dfs = pd.read_html(table_wrapper.encode(), encoding="utf-8")
+        df = dfs[0]
+    
+        # Clean columns
+        df = df.loc[:, ~df.columns.str.contains('Line Break', na=False)]
+        df = df.rename(columns={
+            'Name': 'Name','Team': 'Team', '#': 'Index',            
+            'IPIP - Innings Pitched': 'IP',
+            'Stf+ FA': 'FA', 'Stf+ SI': 'SI', 'Stf+ FC': 'FC', 'Stf+ FS': 'FS',
+            'Stf+ SL': 'SL', 'Stf+ CU': 'CU', 'Stf+ CH': 'CH', 'Stf+ KC': 'KC', 'Stf+ FO': 'FO',
+            'Stuff+': 'Stuff+', 'Location+': 'Location+', 'Pitching+': 'Pitching+'
+        })
+        df = df.drop(columns=[col for col in df.columns if col.lower() in ['#', 'rk']], errors='ignore')
+        return df
+
+    
+    async def load_stuffplus_data(self):
+        try:
+            if self.current_sport != 'baseball_mlb':
+                return
+            df = await asyncio.get_event_loop().run_in_executor(None, self.fetch_stuffplus_data)
+            df['type'] = 'Pitcher'
+            if df is None or df.empty:
+                raise Exception("Failed to fetch Stuff+ data")
+            self.display_stats_data(df)
+        except asyncio.CancelledError:
+            print("Stuff+ loading cancelled")
+        except Exception as e:
+            print(f"Error loading Stuff+ data: {e}")
+            self.clear_tables()
+            self.stats_table.setRowCount(1)
+            self.stats_table.setItem(0, 0, QTableWidgetItem(f"Error loading data: {str(e)}"))
+        finally:
+            self.hide_loading_state()
+
+        ######################            MLB STUFF PLUS LOGIC       ################### 
+    
+    
     
     def show_loading_state(self):
         """Show loading state in the tables"""
@@ -202,6 +277,9 @@ class AdvancedStatsWidget(QWidget):
                 )
                 return True
         return super().eventFilter(obj, event)
+    
+    
+    
     
     def sync_frozen_table_scroll(self, value):
         """Sync the vertical scrolling of the frozen table"""
@@ -391,15 +469,32 @@ class AdvancedStatsWidget(QWidget):
     
     def get_key_columns_for_dataframe(self, df):
         """Return the most important columns for the given dataframe type"""
-        # Hitter columns to include: hitter_cols = ['xwoba', 'xba', 'xslg', 'xiso', 'xobp', 'brl', 'brl_percent', 'exit_velocity', 'max_ev', 
-        # 'hard_hit_percent', 'k_percent', 'bb_percent', 'whiff_percent', 'chase_percent', 'arm_strength', 'sprint_speed', 'oaa', 'bat_speed', 'squared_up_rate', 'swing_length']
         if self.current_sport == 'baseball_mlb':
+            if self.is_stuffplus_mode():
+                # Just use ALL actual columns from the dataframe
+                # Filter out any Index/# columns if needed
+                columns = [col for col in df.columns if not col.startswith('#') and col != 'Index' and col != '']
+                # Make sure Name and Team are first
+                if 'Name' in columns:
+                    columns.remove('Name')
+                    columns = ['Name'] + columns
+                if 'Team' in columns:
+                    columns.remove('Team')
+                    columns = columns[:1] + ['Team'] + columns[1:]
+                # Add type column which we know is added
+                if 'type' in df.columns and 'type' not in columns:
+                    columns.append('type')
+                # Return all available columns
+                return columns
+            
+            # Your existing code for percentile mode
             key_cols = ['player_name','xwoba', 'xba', 'xslg', 'xiso', 'xobp', 'brl', 'brl_percent', 'exit_velocity', 'max_ev', 'hard_hit_percent', 'k_percent', 
                         'bb_percent', 'whiff_percent', 'chase_percent', 'arm_strength', 'xera', 'fb_velocity', 'fb_spin', 'curve_spin']
             percentile_cols = [col for col in df.columns if col.endswith('_percentile')]
             key_cols.extend(percentile_cols)
             return key_cols[:20]
         
+        # Rest of your existing function remains unchanged
         key_cols = []
         id_cols = ['PLAYER_NAME', 'PLAYER', 'TEAM_ABBREVIATION', 'TEAM']
         for col in id_cols:
