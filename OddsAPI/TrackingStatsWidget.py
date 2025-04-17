@@ -1,7 +1,7 @@
 import asyncio
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QBrush
 from PyQt6.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, 
     QWidget, QComboBox, QLabel, QHBoxLayout, QPushButton,
@@ -11,7 +11,7 @@ import traceback
 from MLBpercentilerankings import fetch_leaderboard_data, PITCHER_URL, HITTER_URL
 import requests
 from bs4 import BeautifulSoup
-
+from GUIMLBlineups import *
 
 class FrozenTableWidget(QTableWidget):
     """Widget for displaying frozen columns"""
@@ -186,6 +186,10 @@ class AdvancedStatsWidget(QWidget):
             if df is None or df.empty:
                 raise Exception("Failed to fetch Stuff+ data")
             self.display_stats_data(df)
+            
+            # Highlight days SP's for MLB in Adv stats tab
+            pitchers, _ = get_todays_pitchers()
+            self.highlight_todays_pitchers(pitchers)
         except asyncio.CancelledError:
             print("Stuff+ loading cancelled")
         except Exception as e:
@@ -195,6 +199,79 @@ class AdvancedStatsWidget(QWidget):
             self.stats_table.setItem(0, 0, QTableWidgetItem(f"Error loading data: {str(e)}"))
         finally:
             self.hide_loading_state()
+            
+    
+    
+    def highlight_todays_pitchers(self, pitcher_names):
+        """Highlight today's starting pitchers in the stats table."""
+        if self.current_sport != 'baseball_mlb':
+            return
+    
+        if self.stats_table.rowCount() == 0:
+            return
+    
+        if not pitcher_names:
+            print("No pitchers to highlight")
+            return
+    
+        def normalize_name(name):
+            if ',' in name:
+                parts = [part.strip() for part in name.split(',')]
+                if len(parts) == 2:
+                    return f"{parts[1]} {parts[0]}"
+            return name.strip()
+    
+        name_column = 'Name' if self.is_stuffplus_mode() else 'player_name'
+        name_column_idx = -1
+    
+        for i in range(self.stats_table.columnCount()):
+            header = self.stats_table.horizontalHeaderItem(i)
+            if header and header.text() == name_column:
+                name_column_idx = i
+                break
+    
+        if name_column_idx == -1:
+            print(f"Could not find column '{name_column}' to highlight pitchers")
+            return
+    
+        highlight_color = QBrush(QColor(255, 255, 0, 100))  # Light yellow
+        rows_highlighted = []
+    
+        normalized_pitchers = set(p.lower().strip() for p in pitcher_names)
+    
+        for row in range(self.stats_table.rowCount()):
+            item = self.stats_table.item(row, name_column_idx)
+            if not item:
+                continue
+    
+            raw_name = item.text()
+            player_name = normalize_name(raw_name).lower()
+    
+            if player_name in normalized_pitchers:
+                for col in range(self.stats_table.columnCount()):
+                    cell = self.stats_table.item(row, col)
+                    if cell:
+                        cell.setBackground(highlight_color)
+                rows_highlighted.append(row)
+    
+        # Sort highlighted rows to the top
+        temp_col = self.stats_table.columnCount()
+        self.stats_table.insertColumn(temp_col)
+        self.stats_table.setHorizontalHeaderItem(temp_col, QTableWidgetItem("SP_Sort"))
+    
+        for row in range(self.stats_table.rowCount()):
+            flag = "1" if row in rows_highlighted else "0"
+            self.stats_table.setItem(row, temp_col, QTableWidgetItem(flag))
+    
+        self.stats_table.sortItems(temp_col, Qt.SortOrder.DescendingOrder)
+        self.stats_table.removeColumn(temp_col)
+    
+        print(f"Highlighted and sorted {len(rows_highlighted)} pitchers out of {len(pitcher_names)} probable pitchers")
+
+            
+            
+            
+            
 
         ######################            MLB STUFF PLUS LOGIC       ################### 
     
@@ -244,8 +321,13 @@ class AdvancedStatsWidget(QWidget):
             hitter_df['type'] = 'Hitter'
             combined_df = pd.concat([pitcher_df, hitter_df])
             
+            
             # Display the data
             self.display_stats_data(combined_df)
+            
+            # Highlight days SP's for MLB in Adv stats tab
+            pitchers, _ = get_todays_pitchers()
+            self.highlight_todays_pitchers(pitchers)
             
         except asyncio.CancelledError:
             print("MLB data loading cancelled")
