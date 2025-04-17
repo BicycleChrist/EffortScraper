@@ -5,7 +5,7 @@ from PyQt6.QtGui import QColor, QFont, QBrush
 from PyQt6.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, 
     QWidget, QComboBox, QLabel, QHBoxLayout, QPushButton,
-    QHeaderView, QScrollBar, QAbstractItemView, QSplitter
+    QHeaderView, QScrollBar, QAbstractItemView, QSplitter, QLineEdit
 )
 import traceback
 from MLBpercentilerankings import fetch_leaderboard_data, PITCHER_URL, HITTER_URL
@@ -39,6 +39,10 @@ class AdvancedStatsWidget(QWidget):
         self.current_sport = None
         self.loading_task = None
         
+        # Cache variables
+        self.cached_data = {}  # Dictionary to store cached data
+        self.cache_timestamp = {}  # Dictionary to store when data was last fetched
+        
     def init_ui(self):
         """Initialize the UI components"""
         layout = QVBoxLayout(self)
@@ -60,6 +64,15 @@ class AdvancedStatsWidget(QWidget):
         self.refresh_button.clicked.connect(self.on_refresh_clicked)
         controls_layout.addWidget(self.refresh_button)
         
+        # View Selector
+        self.view_selector = QComboBox()
+        self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats"])
+        self.view_selector.currentIndexChanged.connect(self.on_view_mode_changed)
+        controls_layout.addWidget(QLabel("View:"))
+        controls_layout.addWidget(self.view_selector)
+        
+        
+        
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
         
@@ -70,11 +83,18 @@ class AdvancedStatsWidget(QWidget):
         self.frozen_table = FrozenTableWidget()
         self.frozen_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         
-        self.view_selector = QComboBox()
-        self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats"])
-        self.view_selector.currentIndexChanged.connect(self.on_view_mode_changed)
-        controls_layout.addWidget(QLabel("View:"))
-        controls_layout.addWidget(self.view_selector)
+        
+        
+        
+        # Search bar
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("Search:"))
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Filter by name...")
+        self.search_field.textChanged.connect(self.filter_data)
+        self.search_field.setClearButtonEnabled(True)
+        search_layout.addWidget(self.search_field)
+        layout.insertLayout(1, search_layout)  # Insert between controls and tables
         
         
         # Create main stats table
@@ -125,6 +145,13 @@ class AdvancedStatsWidget(QWidget):
             self.frozen_table.setVisible(nba_mode)  # Only show team sidebar for NBA
             print(f"Set team sidebar visibility to {nba_mode} for sport: {sport_key}")
         
+        # Check if we have cached data for this sport and view mode
+        cache_key = self.get_cache_key()
+        if cache_key in self.cached_data:
+            print(f"Using cached data for {cache_key}")
+            self.display_stats_data(self.cached_data[cache_key])
+            return
+        
         # Cancel any existing loading task
         if self.loading_task and not self.loading_task.done():
             self.loading_task.cancel()
@@ -138,14 +165,83 @@ class AdvancedStatsWidget(QWidget):
         else:
             self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
     
+    def filter_data(self, text):
+        """Filter the table data based on search text"""
+        search_text = text.lower()
+        
+        # If search text is empty, show all rows
+        if not search_text:
+            for row in range(self.stats_table.rowCount()):
+                self.stats_table.setRowHidden(row, False)
+                self.frozen_table.setRowHidden(row, False)
+            return
+            
+        # Get the name column index from frozen table
+        name_col_idx = -1
+        for col in range(self.frozen_table.columnCount()):
+            header = self.frozen_table.horizontalHeaderItem(col)
+            if header and header.text() in ['Player', 'Name', 'Last Name', 'First Name']:
+                name_col_idx = col
+                break
+        
+        # If name column not found, search all columns
+        if name_col_idx == -1:
+            print("Name column not found, searching all columns")
+            for row in range(self.stats_table.rowCount()):
+                row_visible = False
+                
+                # Search in frozen table
+                for col in range(self.frozen_table.columnCount()):
+                    item = self.frozen_table.item(row, col)
+                    if item and search_text in item.text().lower():
+                        row_visible = True
+                        break
+                        
+                # Search in main table if not found in frozen table
+                if not row_visible:
+                    for col in range(self.stats_table.columnCount()):
+                        item = self.stats_table.item(row, col)
+                        if item and search_text in item.text().lower():
+                            row_visible = True
+                            break
+                
+                self.stats_table.setRowHidden(row, not row_visible)
+                self.frozen_table.setRowHidden(row, not row_visible)
+        else:
+            # Search only in the name column for efficiency
+            for row in range(self.frozen_table.rowCount()):
+                item = self.frozen_table.item(row, name_col_idx)
+                row_visible = item and search_text in item.text().lower()
+                self.stats_table.setRowHidden(row, not row_visible)
+                self.frozen_table.setRowHidden(row, not row_visible)
+        
+        # Sync row heights and scrollbars after filtering
+        self.sync_frozen_table_scroll(self.stats_table.verticalScrollBar().value())
     
     
-         ######################            MLB STUFF PLUS LOGIC       ################### 
+    
+    def get_cache_key(self):
+        """Generate a unique key for the current sport and view configuration"""
+        if self.current_sport == 'basketball_nba':
+            return f"{self.current_sport}_{self.current_tab}"
+        else:  # MLB
+            view_mode = "stuffplus" if self.is_stuffplus_mode() else "percentile"
+            return f"{self.current_sport}_{view_mode}"
+    
+    
     def is_stuffplus_mode(self):
         return self.view_selector.currentText() == "Stuff+ Stats"
     
     def on_view_mode_changed(self, index):
         if self.current_sport == 'baseball_mlb':
+            # Check if we have cached data for this view mode
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                self.display_stats_data(self.cached_data[cache_key])
+                return
+                
+            # If no cached data, load it
             self.show_loading_state()
             if self.loading_task and not self.loading_task.done():
                 self.loading_task.cancel()
@@ -181,10 +277,23 @@ class AdvancedStatsWidget(QWidget):
         try:
             if self.current_sport != 'baseball_mlb':
                 return
-            df = await asyncio.get_event_loop().run_in_executor(None, self.fetch_stuffplus_data)
-            df['type'] = 'Pitcher'
-            if df is None or df.empty:
-                raise Exception("Failed to fetch Stuff+ data")
+                
+            # Check cache first
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                df = self.cached_data[cache_key]
+            else:
+                df = await asyncio.get_event_loop().run_in_executor(None, self.fetch_stuffplus_data)
+                df['type'] = 'Pitcher'
+                if df is None or df.empty:
+                    raise Exception("Failed to fetch Stuff+ data")
+                    
+                # Store in cache
+                self.cached_data[cache_key] = df
+                self.cache_timestamp[cache_key] = pd.Timestamp.now()
+                print(f"Cached Stuff+ data at {self.cache_timestamp[cache_key]}")
+                
             self.display_stats_data(df)
             
             # Highlight days SP's for MLB in Adv stats tab
@@ -234,7 +343,7 @@ class AdvancedStatsWidget(QWidget):
             print(f"Could not find column '{name_column}' to highlight pitchers")
             return
     
-        highlight_color = QBrush(QColor(255, 255, 0, 100))  # Light yellow
+        highlight_color = QBrush(QColor(97,95,2))  # Light yellow
         rows_highlighted = []
     
         normalized_pitchers = set(p.lower().strip() for p in pitcher_names)
@@ -267,15 +376,6 @@ class AdvancedStatsWidget(QWidget):
         self.stats_table.removeColumn(temp_col)
     
         print(f"Highlighted and sorted {len(rows_highlighted)} pitchers out of {len(pitcher_names)} probable pitchers")
-
-            
-            
-            
-            
-
-        ######################            MLB STUFF PLUS LOGIC       ################### 
-    
-    
     
     def show_loading_state(self):
         """Show loading state in the tables"""
@@ -293,7 +393,14 @@ class AdvancedStatsWidget(QWidget):
         try:
             from NBAtrackingstats import SimpleNBAStatsClient
             self.stats_client = SimpleNBAStatsClient()
-            asyncio.create_task(self.load_stats_data(self.current_tab))
+            
+            # Check cache first for the current tab
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                self.display_stats_data(self.cached_data[cache_key])
+            else:
+                asyncio.create_task(self.load_stats_data(self.current_tab))
         except Exception as e:
             print(f"Error initializing NBA stats client: {e}")
     
@@ -303,24 +410,34 @@ class AdvancedStatsWidget(QWidget):
             if self.current_sport != 'baseball_mlb':
                 return
                 
-            # Fetch data using run_in_executor for synchronous requests
-            pitcher_df = await asyncio.get_event_loop().run_in_executor(
-                None, 
-                lambda: fetch_leaderboard_data(PITCHER_URL)
-            )
-            hitter_df = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: fetch_leaderboard_data(HITTER_URL)
-            )
-            
-            if pitcher_df is None or hitter_df is None:
-                raise Exception("Failed to fetch MLB percentile data")
-            
-            # Combine dataframes
-            pitcher_df['type'] = 'Pitcher'
-            hitter_df['type'] = 'Hitter'
-            combined_df = pd.concat([pitcher_df, hitter_df])
-            
+            # Check cache first
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                combined_df = self.cached_data[cache_key]
+            else:
+                # Fetch data using run_in_executor for synchronous requests
+                pitcher_df = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: fetch_leaderboard_data(PITCHER_URL)
+                )
+                hitter_df = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: fetch_leaderboard_data(HITTER_URL)
+                )
+                
+                if pitcher_df is None or hitter_df is None:
+                    raise Exception("Failed to fetch MLB percentile data")
+                
+                # Combine dataframes
+                pitcher_df['type'] = 'Pitcher'
+                hitter_df['type'] = 'Hitter'
+                combined_df = pd.concat([pitcher_df, hitter_df])
+                
+                # Store in cache
+                self.cached_data[cache_key] = combined_df
+                self.cache_timestamp[cache_key] = pd.Timestamp.now()
+                print(f"Cached percentile data at {self.cache_timestamp[cache_key]}")
             
             # Display the data
             self.display_stats_data(combined_df)
@@ -348,6 +465,12 @@ class AdvancedStatsWidget(QWidget):
         self.frozen_table.setRowCount(0)
         self.frozen_table.setColumnCount(0)
     
+    def clear_cache(self):
+        """Clear all cached data"""
+        self.cached_data = {}
+        self.cache_timestamp = {}
+        print("Cache cleared")
+    
     def eventFilter(self, obj, event):
         """Event filter for tables and headers"""
         if obj == self.stats_table.horizontalHeader() and event.type() == QEvent.Type.Resize:
@@ -359,9 +482,6 @@ class AdvancedStatsWidget(QWidget):
                 )
                 return True
         return super().eventFilter(obj, event)
-    
-    
-    
     
     def sync_frozen_table_scroll(self, value):
         """Sync the vertical scrolling of the frozen table"""
@@ -387,15 +507,33 @@ class AdvancedStatsWidget(QWidget):
         stats_types = ["passing", "rebounding", "touches", "defense", "traditional"]
         if index < len(stats_types):
             self.current_tab = stats_types[index]
-            asyncio.create_task(self.load_stats_data(self.current_tab))
+            
+            # Check if we have cached data for this tab
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                self.display_stats_data(self.cached_data[cache_key])
+            else:
+                asyncio.create_task(self.load_stats_data(self.current_tab))
     
     def on_refresh_clicked(self):
-        """Handle refresh button click"""
+        """Handle refresh button click - force refresh regardless of cache"""
+        # Clear cache for the current view
+        cache_key = self.get_cache_key()
+        if cache_key in self.cached_data:
+            del self.cached_data[cache_key]
+            if cache_key in self.cache_timestamp:
+                del self.cache_timestamp[cache_key]
+            print(f"Cleared cache for {cache_key}")
+            
         if self.current_sport == 'basketball_nba' and self.stats_client:
             asyncio.create_task(self.load_stats_data(self.current_tab))
         elif self.current_sport == 'baseball_mlb':
             self.show_loading_state()
-            self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+            if self.is_stuffplus_mode():
+                self.loading_task = asyncio.create_task(self.load_stuffplus_data())
+            else:
+                self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
     
     async def load_stats_data(self, stats_type):
         """Load the specified stats data type (NBA only)"""
@@ -403,17 +541,29 @@ class AdvancedStatsWidget(QWidget):
             return
         
         try:
-            df = None
-            if stats_type == "passing":
-                df = self.stats_client.get_passing_stats()
-            elif stats_type == "rebounding":
-                df = self.stats_client.get_rebounding_stats()
-            elif stats_type == "touches":
-                df = self.stats_client.get_touches_stats()
-            elif stats_type == "defense":
-                df = self.stats_client.get_defense_stats()
-            elif stats_type == "traditional":
-                df = self.stats_client.get_traditional_stats()
+            # Check cache first
+            cache_key = self.get_cache_key()
+            if cache_key in self.cached_data:
+                print(f"Using cached data for {cache_key}")
+                df = self.cached_data[cache_key]
+            else:
+                df = None
+                if stats_type == "passing":
+                    df = self.stats_client.get_passing_stats()
+                elif stats_type == "rebounding":
+                    df = self.stats_client.get_rebounding_stats()
+                elif stats_type == "touches":
+                    df = self.stats_client.get_touches_stats()
+                elif stats_type == "defense":
+                    df = self.stats_client.get_defense_stats()
+                elif stats_type == "traditional":
+                    df = self.stats_client.get_traditional_stats()
+                
+                if df is not None and not df.empty:
+                    # Store in cache
+                    self.cached_data[cache_key] = df
+                    self.cache_timestamp[cache_key] = pd.Timestamp.now()
+                    print(f"Cached {stats_type} data at {self.cache_timestamp[cache_key]}")
             
             if df is not None and not df.empty:
                 self.display_stats_data(df)
@@ -488,6 +638,11 @@ class AdvancedStatsWidget(QWidget):
             self.stats_table.horizontalHeader().sortIndicatorChanged.connect(
                 self.on_main_table_sort
             )
+            
+            # Add highlight for MLB pitchers if we're displaying MLB data
+            if self.current_sport == 'baseball_mlb':
+                pitchers, _ = get_todays_pitchers()
+                self.highlight_todays_pitchers(pitchers)
             
         except Exception as e:
             print(f"Error displaying stats data: {e}")
