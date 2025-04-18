@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox
 )
-
+from fpscraper import FantasyProsScraper
 
 #TODO: Manually scrape Fantasy pros as their Rss feed keeps returning errors despite being populated
 # Below is an example "player-news-item" div
@@ -29,6 +29,13 @@ By <a href="/news/correspondents/ari-koslow.php" target="_blank">Ari Koslow</a><
 """
 
 
+# not actually RSS feeds
+fantasypros_links = {
+    "NBA": "https://www.fantasypros.com/nba/player-news",
+    "NFL": "https://www.fantasypros.com/nfl/player-news",
+    "MLB": "https://www.fantasypros.com/mlb/injury-news",
+    "NHL": "https://www.fantasypros.com/nhl/player-news",
+}
 
 
 class NewsWorker(QObject):
@@ -43,6 +50,9 @@ class NewsWorker(QObject):
         self.team_name = None
         self.running = False
         self.news_items = None
+        self.print_fetches = False
+        self.scraper = FantasyProsScraper()
+        print(f"[NewsWorker] printing_fetches: {self.print_fetches}")
         
         self.rss_urls = {
             # NBA
@@ -50,7 +60,6 @@ class NewsWorker(QObject):
                 "general": [
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
-                    "https://www.fantasypros.com/nba/player-news",
                     "https://sports.yahoo.com/nba/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],
@@ -61,7 +70,6 @@ class NewsWorker(QObject):
                     "https://www.nfl.com/rss/rsslanding?searchString=home",
                     "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
-                    "https://www.fantasypros.com/nfl/player-news",                    
                     "https://www.cbssports.com/rss/headlines/nfl",
                     "https://sports.yahoo.com/nfl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl"
@@ -73,7 +81,6 @@ class NewsWorker(QObject):
                     "https://www.mlb.com/feeds/news/rss.xml",
                     "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
-                    "https://www.fantasypros.com/mlb/injury-news",
                     "https://www.cbssports.com/rss/headlines/mlb/",
                     "https://sports.yahoo.com/mlb/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb"
@@ -85,7 +92,6 @@ class NewsWorker(QObject):
                     "http://www.nhl.com/rss/news.xml",
                     "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
-                    "https://www.fantasypros.com/nhl/player-news",
                     "https://www.cbssports.com/rss/headlines/nhl/injuries",
                     "https://sports.yahoo.com/nhl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
@@ -114,6 +120,10 @@ class NewsWorker(QObject):
 
         # Score each item based on injury relevance
         for item in news_items:
+            # Skip if item already has an injury score
+            if 'injury_score' in item:
+                continue
+                
             injury_score = 0
             title = item['title'].lower()
             desc = item['description'].lower()
@@ -139,16 +149,16 @@ class NewsWorker(QObject):
 
     async def fetch_rss_feed(self, url):
         """Fetch and parse an RSS feed"""
-        print(f"fetching rss feed: {url}")
+        if self.print_fetches: print(f"fetching rss feed: {url}");
         try:
             feed = feedparser.parse(url)
             
             # Check if feed parsed correctly
             if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
-                print(f"Warning parsing RSS feed {url}: {feed.bozo_exception}")
+                if self.print_fetches: print(f"Warning parsing RSS feed {url}: {feed.bozo_exception}");
             
             fetched_news_items = []
-            print(f"parsing {len(feed.entries)} entries")
+            if self.print_fetches: print(f"parsing {len(feed.entries)} entries");
             
             for entry in feed.entries:  # Limit to 10 items per feed
                 # Extract date (handling various formats)
@@ -188,12 +198,30 @@ class NewsWorker(QObject):
                     'source': feed.feed.title if hasattr(feed, 'feed') and hasattr(feed.feed, 'title') else url.split('/')[2],
                     'image_url': image_url
                 })
-            print(f"items parsed: {len(fetched_news_items)}")
+            
+            if self.print_fetches: print(f"items parsed: {len(fetched_news_items)}");
             return fetched_news_items
         except Exception as e:
             print(f"Error fetching RSS feed {url}: {str(e)}")
             return []
-
+            
+    async def fetch_fantasypros_news(self):
+        """Fetch news from FantasyPros website using HTML scraping"""
+        try:
+            # Use the appropriate method based on league
+            if self.league_key == "basketball_nba":
+                return self.scraper.scrape_nba_news()
+            elif self.league_key == "football_nfl":
+                return self.scraper.scrape_nfl_news()
+            elif self.league_key == "baseball_mlb":
+                return self.scraper.scrape_mlb_news()
+            elif self.league_key == "icehockey_nhl":
+                return self.scraper.scrape_nhl_news()
+            else:
+                return []
+        except Exception as e:
+            print(f"Error fetching FantasyPros news: {str(e)}")
+            return []
 
     async def fetch_news(self):
         """Fetch news from all configured sources"""
@@ -216,7 +244,9 @@ class NewsWorker(QObject):
 
             # Fetch from all RSS sources in parallel
             tasks = [self.fetch_rss_feed(url) for url in sources]
-
+            
+            # Add FantasyPros scraping task
+            tasks.append(self.fetch_fantasypros_news())
 
             # Execute all tasks
             results = await asyncio.gather(*tasks)
@@ -378,6 +408,8 @@ class TeamNewsWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.refresh_disabled = False
+        
         self.current_league = None
         self.current_team = None
         self.show_injuries_only = False
@@ -414,7 +446,7 @@ class TeamNewsWidget(QWidget):
         refresh_layout.setSpacing(2)
         refresh_layout.addWidget(QLabel("Refresh Freq"))
         self.refresh_interval = QSpinBox()
-        self.refresh_interval.setRange(1, 30)
+        self.refresh_interval.setRange(0, 30)
         self.refresh_interval.setValue(5)
         self.refresh_interval.setSuffix(" min")
         self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
@@ -662,9 +694,15 @@ class TeamNewsWidget(QWidget):
     def update_refresh_interval(self):
         """Update the timer interval when spinbox value changes"""
         new_interval = self.refresh_interval.value()
-        if new_interval != self.current_refresh_interval:
+        if new_interval <= 0:
+            print("[TeamNewsWidget] disabling refresh")
+            self.current_refresh_interval = 0
+            self.refresh_disabled = True
+            self.refresh_timer.stop()
+        elif new_interval != self.current_refresh_interval:
             self.current_refresh_interval = new_interval
             interval_ms = new_interval * 60 * 1000  # Convert minutes to milliseconds
+            self.refresh_disabled = False
             self.refresh_timer.stop()
             self.refresh_timer.start(interval_ms)
             print(f"News refresh interval updated to {new_interval} minutes")

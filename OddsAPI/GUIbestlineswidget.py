@@ -328,10 +328,6 @@ class BestLinesWidget(QTableWidget):
             print("No consolidated odds data available. Skipping update.")
             return None
 
-        # If in splits view, don't update best lines display
-        if self.show_splits:
-            return self.best_lines
-
         # Check if this is prop data or team-based data
         # If any market has 'player_' in the key, it's likely prop data
         is_prop_data = False

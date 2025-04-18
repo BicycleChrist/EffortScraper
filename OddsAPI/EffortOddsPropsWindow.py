@@ -1033,8 +1033,8 @@ class PropsWindow(BaseTableWindow):
             # Sort by deviation (highest first)
             sorted_markets.sort(key=lambda x: x[3], reverse=True)
             
-            # Add rows (limit to 20 for performance)
-            for row_idx, (player_name, market_type, data, _, use_over) in enumerate(sorted_markets[:-1]):
+            # Limit best lines results with sorted_markets for testing
+            for row_idx, (player_name, market_type, data, _, use_over) in enumerate(sorted_markets):
                 # Get the line data
                 line_data = data['over'] if use_over else data['under']
                 if not line_data:

@@ -540,8 +540,12 @@ class ModernOddsWindow(QMainWindow):
         # Create the best lines widget
         self.best_lines_widget = BestLinesWidget()
         
+        def UpdateBestLinesHeader():
+            best_lines_header.setText("Splits ⮟" if self.best_lines_widget.show_splits else "Best Lines ⮟")
+        
         # Add the toggle button from the BestLinesWidget
         best_lines_header_layout.addWidget(self.best_lines_widget.toggle_button)
+        self.best_lines_widget.toggle_button.clicked.connect(UpdateBestLinesHeader)
         
         # Add the header layout and the widget to the container
         best_lines_layout.addLayout(best_lines_header_layout)
@@ -1075,12 +1079,6 @@ class ModernOddsWindow(QMainWindow):
         """Toggle visibility of the news feed widget with optimized spacing"""
         visible = self.news_toggle_button.isChecked()
         
-        # Hide the streaming widget if showing news
-        if visible:
-            self.stream_toggle_button.setChecked(False)
-            self.tune_in_widget.setVisible(False)
-            self.stream_toggle_button.setText("Show Streaming Links ▼")
-        
         # Make the widget visible first (needed for proper layout calculations)
         self.news_container.setVisible(visible)
         self.team_news_widget.setVisible(visible)
@@ -1104,9 +1102,6 @@ class ModernOddsWindow(QMainWindow):
         else:
             self.news_toggle_button.setText("Show Injury News ▼")
             
-            # Collapse container completely
-            self.news_container.setFixedHeight(0)
-            
             # Reset progress bar margins to normal
             prog_margins = self.progress.contentsMargins()
             prog_margins.setTop(0)
@@ -1122,18 +1117,6 @@ class ModernOddsWindow(QMainWindow):
     def toggle_historical_odds(self):
         """Toggle visibility of the historical odds widget"""
         visible = self.history_toggle_button.isChecked()
-        
-        # Hide the streaming widget if showing historical odds
-        if visible:
-            self.stream_toggle_button.setChecked(False)
-            self.tune_in_widget.setVisible(False)
-            self.stream_toggle_button.setText("Show Streaming Links ▼")
-            
-            # Ensure news widget is also hidden to prevent UI conflicts
-            self.news_toggle_button.setChecked(False)
-            self.team_news_widget.setVisible(False)
-            self.news_container.setVisible(False)
-            self.news_toggle_button.setText("Show Injury News ▼")
         
         # Make the historical odds container visible/invisible based on toggle state
         self.historical_odds_container.setVisible(visible)
