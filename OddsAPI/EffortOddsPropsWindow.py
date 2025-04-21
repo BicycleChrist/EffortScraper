@@ -345,21 +345,6 @@ class PropsWindow(BaseTableWindow):
         # Create horizontal layout for buttons
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(2)  # Reduce spacing between buttons
-        
-        select_all_button = QPushButton("Select All")
-        select_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(True))
-        select_all_button.setFixedSize(select_all_button.sizeHint().width() // 2, select_all_button.sizeHint().height())
-        select_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
-        
-        deselect_all_button = QPushButton("Deselect All")
-        deselect_all_button.clicked.connect(lambda: self.set_all_game_checkboxes(False))
-        deselect_all_button.setFixedSize(deselect_all_button.sizeHint().width() // 2, deselect_all_button.sizeHint().height())
-        deselect_all_button.setMaximumWidth(80)  # Limit width to 80 pixels
-        
-        buttons_layout.addWidget(select_all_button)
-        buttons_layout.addWidget(deselect_all_button)
-        buttons_layout.addStretch()  # Add stretch to push buttons to the left
-        game_group_layout.addLayout(buttons_layout)
     
         # Add the game selection scroll area with improved spacing
         self.game_selection_area = QScrollArea()
@@ -429,55 +414,142 @@ class PropsWindow(BaseTableWindow):
         self.prop_selector.addItems([prop_markets[key] for key in self.prop_types])
 
     def populate_game_selection(self, games):
-        """Populate the game selection area with checkboxes for each game."""
-        # Clear existing checkboxes
+        """Populate the game selection area with an interactive, modern list of games."""
+        # Clear existing widgets and checkboxes
         for i in reversed(range(self.game_selection_layout.count())):
             widget = self.game_selection_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
         self.game_checkboxes.clear()
-    
-        # Use just 2 columns to match the screenshot layout
-        num_columns = 2
         
-        # Set zero spacing for the grid layout and remove margins
-        self.game_selection_layout.setSpacing(0)
-        self.game_selection_layout.setContentsMargins(0, 0, 0, 0)
-        self.game_selection_layout.setHorizontalSpacing(0) # Explicitly set horizontal spacing to 0
-        self.game_selection_layout.setVerticalSpacing(0)   # Explicitly set vertical spacing to 0
-    
-        # Add a checkbox for each game
-        for idx, game in enumerate(games):
+        # Set dimensions
+        game_selection_width = 600
+        game_selection_height = 250
+        
+        # Create container with modern styling
+        container = QWidget()
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Create header with buttons
+        header = QWidget()
+        header.setObjectName("gameSelectionHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(10, 5, 10, 5)
+        
+        # Add title and buttons to header
+        header_layout.addWidget(QLabel("Game Selection"))
+        header_layout.addStretch()
+        
+        # Button container
+        button_container = QWidget()
+        button_layout = QHBoxLayout(button_container)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(8)
+        
+        # Add select/deselect buttons
+        select_all = QPushButton("Select All")
+        select_all.setObjectName("selectAllButton")
+        select_all.clicked.connect(lambda: self.set_all_game_checkboxes(True))
+        
+        deselect_all = QPushButton("Deselect All")
+        deselect_all.setObjectName("deselectAllButton")
+        deselect_all.clicked.connect(lambda: self.set_all_game_checkboxes(False))
+        
+        button_layout.addWidget(select_all)
+        button_layout.addWidget(deselect_all)
+        header_layout.addWidget(button_container)
+        main_layout.addWidget(header)
+        
+        # Create game list scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setObjectName("gameListScrollArea")
+        
+        # Create games container
+        games_list = QWidget()
+        games_layout = QVBoxLayout(games_list)
+        games_layout.setContentsMargins(8, 8, 8, 8)
+        games_layout.setSpacing(1)  # Minimal spacing between games
+        
+        # Add all games in a single list
+        for game in games:
             game_id = game.get('id', '')
             home_team = game.get('home_team', 'Unknown')
             away_team = game.get('away_team', 'Unknown')
-            game_label = f"{home_team} vs {away_team}"
             
-            checkbox = QCheckBox(game_label)
-            checkbox.setChecked(True)  # Default to selected
+            # Create game item
+            game_widget = QWidget()
+            game_widget.setObjectName("gameItem")
+            game_layout = QHBoxLayout(game_widget)
+            game_layout.setContentsMargins(5, 2, 5, 2)  # Tighter margins
             
-            # Tighter styling with reduced height and zero vertical margins
-            checkbox.setStyleSheet("""
-                QCheckBox { 
-                    padding: 0px; 
-                    margin: 0px; 
-                    min-height: 14px; 
-                    max-height: 14px; 
-                    height: 14px;
-                    font-size: 9pt;
-                    spacing: 2px; /* Reduce space between checkbox and text */
-                }
-            """)
-            
+            # Add checkbox
+            checkbox = QCheckBox(f"{away_team} vs {home_team}")
+            checkbox.setChecked(True)
+            checkbox.setObjectName("gameCheckbox")
             self.game_checkboxes[game_id] = checkbox
-    
-            # Calculate row and column positions
-            row = idx // num_columns
-            col = idx % num_columns
-            self.game_selection_layout.addWidget(checkbox, row, col)
-    
-        # Adjust the layout to fit the content
-        self.game_selection_widget.adjustSize()
+            
+            game_layout.addWidget(checkbox)
+            games_layout.addWidget(game_widget)
+        
+        games_layout.addStretch()  # Push everything to the top
+        scroll_area.setWidget(games_list)
+        main_layout.addWidget(scroll_area)
+        
+        # Apply styling to game checkbox
+        container.setStyleSheet("""
+            QWidget { color: white; font-size: 10pt; }
+            #gameSelectionHeader {
+                background-color: #1E2A38;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            #selectAllButton, #deselectAllButton {
+                background-color: #2C3E50;
+                border: none;
+                padding: 4px 12px;
+                border-radius: 3px;
+            }
+            #selectAllButton:hover, #deselectAllButton:hover { background-color: #34495E; }
+            #selectAllButton:pressed, #deselectAllButton:pressed { background-color: #1ABC9C; }
+            #gameListScrollArea {
+                background-color: #2C3E50;
+                border: none;
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+            #gameItem { 
+                padding: 1px 0px;
+                border-bottom: 1px solid rgba(52, 73, 94, 0.3);
+            }
+            #gameItem:hover { background-color: rgba(52, 73, 94, 0.5); }
+            #gameCheckbox { 
+                spacing: 5px;
+                font-size: 9.5pt;
+            }
+            #gameCheckbox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+            }
+            #gameCheckbox::indicator:unchecked {
+                background-color: #34495E;
+                border: 1px solid #7F8C8D;
+            }
+            #gameCheckbox::indicator:checked {
+                background-color: #1ABC9C;
+                border: 1px solid #16A085;
+            }
+        """)
+        
+        # Set fixed size and update widget
+        container.setFixedSize(game_selection_width, game_selection_height)
+        self.game_selection_widget = container
+        self.game_selection_area.setWidget(container)
+        self.game_selection_layout = main_layout
     
     def set_all_game_checkboxes(self, checked: bool):
         """Set all game checkboxes to checked or unchecked state."""
