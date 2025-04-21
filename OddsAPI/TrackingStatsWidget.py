@@ -1,4 +1,6 @@
 import asyncio
+import json
+
 import pandas as pd
 from PyQt6.QtCore import Qt, QTimer, QEvent, QObject
 from PyQt6.QtGui import QColor, QFont, QBrush
@@ -8,6 +10,9 @@ from PyQt6.QtWidgets import (
     QHeaderView, QScrollBar, QAbstractItemView, QSplitter, QLineEdit
 )
 import traceback
+
+import update_importpaths
+from MLBAnalytics import parkfactors
 from MLBpercentilerankings import fetch_leaderboard_data, PITCHER_URL, HITTER_URL
 import requests
 from bs4 import BeautifulSoup
@@ -42,6 +47,7 @@ class AdvancedStatsWidget(QWidget):
         # Cache variables
         self.cached_data = {}  # Dictionary to store cached data
         self.cache_timestamp = {}  # Dictionary to store when data was last fetched
+        self.stored_pitchers = None
         
     def init_ui(self):
         """Initialize the UI components"""
@@ -66,7 +72,7 @@ class AdvancedStatsWidget(QWidget):
         
         # View Selector
         self.view_selector = QComboBox()
-        self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats"])
+        self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats", "SP Climate"])
         self.view_selector.currentIndexChanged.connect(self.on_view_mode_changed)
         controls_layout.addWidget(QLabel("View:"))
         controls_layout.addWidget(self.view_selector)
@@ -140,10 +146,19 @@ class AdvancedStatsWidget(QWidget):
         self.stats_selector.setVisible(nba_mode)
         
         # Show/hide the team sidebar (frozen table with team names)
-        # This is what you're seeing in your screenshots
         if hasattr(self, 'frozen_table'):
-            self.frozen_table.setVisible(nba_mode)  # Only show team sidebar for NBA
+            self.frozen_table.setVisible(nba_mode)
             print(f"Set team sidebar visibility to {nba_mode} for sport: {sport_key}")
+        
+        # For MLB, fetch pitchers once and store them
+        if sport_key == 'baseball_mlb' and self.stored_pitchers is None:
+            try:
+                pitchers, _ = get_todays_pitchers()
+                self.stored_pitchers = pitchers
+                print(f"Cached {len(pitchers)} pitchers for highlighting")
+            except Exception as e:
+                print(f"Error fetching pitchers: {e}")
+                self.stored_pitchers = []
         
         # Check if we have cached data for this sport and view mode
         cache_key = self.get_cache_key()
@@ -160,10 +175,10 @@ class AdvancedStatsWidget(QWidget):
             self.init_nba_stats_client()
         else:
             self.show_loading_state()
-        if self.is_stuffplus_mode():
-            self.loading_task = asyncio.create_task(self.load_stuffplus_data())
-        else:
-            self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+            if self.is_stuffplus_mode():
+                self.loading_task = asyncio.create_task(self.load_stuffplus_data())
+            else:
+                self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
     
     def filter_data(self, text):
         """Filter the table data based on search text"""
@@ -180,7 +195,7 @@ class AdvancedStatsWidget(QWidget):
         name_col_idx = -1
         for col in range(self.frozen_table.columnCount()):
             header = self.frozen_table.horizontalHeaderItem(col)
-            if header and header.text() in ['Player', 'Name', 'Last Name', 'First Name']:
+            if header and (header.text().upper().strip() in ['PLAYER', 'NAME', 'LAST NAME', 'FIRST NAME', 'PLAYER_NAME']):
                 name_col_idx = col
                 break
         
@@ -225,7 +240,15 @@ class AdvancedStatsWidget(QWidget):
         if self.current_sport == 'basketball_nba':
             return f"{self.current_sport}_{self.current_tab}"
         else:  # MLB
-            view_mode = "stuffplus" if self.is_stuffplus_mode() else "percentile"
+            view_text = self.view_selector.currentText()
+            if view_text == "Stuff+ Stats":
+                view_mode = "stuffplus"
+            elif view_text == "Percentile Stats":
+                view_mode = "percentile"
+            elif view_text == "SP Climate":
+                view_mode = "parkfactors"
+            else:
+                view_mode = "unknown"
             return f"{self.current_sport}_{view_mode}"
     
     
@@ -236,19 +259,45 @@ class AdvancedStatsWidget(QWidget):
         if self.current_sport == 'baseball_mlb':
             # Check if we have cached data for this view mode
             cache_key = self.get_cache_key()
+            if index == 2:  # SP Climate view
+                cache_key = "parkfactors"
+            
             if cache_key in self.cached_data:
                 print(f"Using cached data for {cache_key}")
-                self.display_stats_data(self.cached_data[cache_key])
+                df = self.cached_data[cache_key]
+                self.display_stats_data(df)
+                
+                # Apply highlighting with cached pitchers
+                if self.stored_pitchers and index != 2:  # Don't highlight park factors
+                    self.highlight_todays_pitchers(self.stored_pitchers)
                 return
                 
             # If no cached data, load it
             self.show_loading_state()
             if self.loading_task and not self.loading_task.done():
                 self.loading_task.cancel()
-            if self.is_stuffplus_mode():
+                
+            if index == 0:  # Stuff+ Stats
                 self.loading_task = asyncio.create_task(self.load_stuffplus_data())
-            else:
+            elif index == 1:  # Percentile Stats
                 self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+            elif index == 2:  # SP Climate
+                # Load park factors data directly as DataFrame
+                try:
+                    df = parkfactors.main(single_year=1)[0]
+                    
+                    # Cache the data
+                    self.cached_data[cache_key] = df
+                    self.cache_timestamp[cache_key] = pd.Timestamp.now()
+                    
+                    # Display the data
+                    self.display_stats_data(df)
+                    self.hide_loading_state()
+                except Exception as e:
+                    print(f"Error loading park factors: {e}")
+                    self.hide_loading_state()
+
+        
     
     def fetch_stuffplus_data(self):
         url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
@@ -293,12 +342,16 @@ class AdvancedStatsWidget(QWidget):
                 self.cached_data[cache_key] = df
                 self.cache_timestamp[cache_key] = pd.Timestamp.now()
                 print(f"Cached Stuff+ data at {self.cache_timestamp[cache_key]}")
-                
+            
+            # Display the data
             self.display_stats_data(df)
             
-            # Highlight days SP's for MLB in Adv stats tab
-            pitchers, _ = get_todays_pitchers()
-            self.highlight_todays_pitchers(pitchers)
+            # Highlight pitchers using cached pitcher list
+            if self.stored_pitchers is None:
+                self.stored_pitchers, _ = get_todays_pitchers()
+                print(f"Fetched and cached {len(self.stored_pitchers)} pitchers")
+            
+            self.highlight_todays_pitchers(self.stored_pitchers)
         except asyncio.CancelledError:
             print("Stuff+ loading cancelled")
         except Exception as e:
@@ -330,7 +383,7 @@ class AdvancedStatsWidget(QWidget):
                     return f"{parts[1]} {parts[0]}"
             return name.strip()
     
-        name_column = 'Name' if self.is_stuffplus_mode() else 'player_name'
+        name_column = 'player_name'
         name_column_idx = -1
     
         for i in range(self.stats_table.columnCount()):
@@ -439,13 +492,15 @@ class AdvancedStatsWidget(QWidget):
                 self.cache_timestamp[cache_key] = pd.Timestamp.now()
                 print(f"Cached percentile data at {self.cache_timestamp[cache_key]}")
             
-            # Display the data
+            # Actually display the data (was missing in original code!)
             self.display_stats_data(combined_df)
             
-            # Highlight days SP's for MLB in Adv stats tab
-            pitchers, _ = get_todays_pitchers()
-            self.highlight_todays_pitchers(pitchers)
+            # Highlight today's pitchers using cached list
+            if self.stored_pitchers is None:
+                self.stored_pitchers, _ = get_todays_pitchers()
+                print(f"Fetched and cached {len(self.stored_pitchers)} pitchers")
             
+            self.highlight_todays_pitchers(self.stored_pitchers)
         except asyncio.CancelledError:
             print("MLB data loading cancelled")
         except Exception as e:
@@ -455,6 +510,7 @@ class AdvancedStatsWidget(QWidget):
             self.stats_table.setItem(0, 0, QTableWidgetItem(f"Error loading data: {str(e)}"))
         finally:
             self.hide_loading_state()
+
     
     def clear_tables(self):
         """Clear both tables"""
@@ -572,77 +628,108 @@ class AdvancedStatsWidget(QWidget):
             traceback.print_exc()
     
     def display_stats_data(self, df):
-        """Display the stats data in the table"""
+        """Display the stats data in the table with frozen columns for NBA data"""
         try:
             self.clear_tables()
             
-            key_cols = self.get_key_columns_for_dataframe(df)
-            frozen_cols = []
-            frozen_headers = []
-            
-            for col in ['PLAYER_NAME', 'PLAYER', 'TEAM_ABBREVIATION', 'TEAM', 'MIN', 'last_name', 'first_name', 'type', 'team_name']:
-                if col in key_cols:
-                    frozen_cols.append(col)
-                    if col == 'PLAYER_NAME' or col == 'PLAYER':
+            # Only proceed with frozen columns for NBA data
+            if self.current_sport == 'basketball_nba':
+                # Define which columns to freeze for NBA - specifically PLAYER_NAME and MIN
+                frozen_columns = []
+                if 'PLAYER_NAME' in df.columns:
+                    frozen_columns.append('PLAYER_NAME')
+                if 'MIN' in df.columns:
+                    frozen_columns.append('MIN')
+                
+                # Get all columns not in frozen columns
+                main_columns = [col for col in df.columns if col not in frozen_columns and col != 'Index']
+                
+                # Set up frozen table
+                self.frozen_table.setColumnCount(len(frozen_columns))
+                frozen_headers = []
+                for col in frozen_columns:
+                    if col == 'PLAYER_NAME':
                         frozen_headers.append('Player')
-                    elif col == 'TEAM_ABBREVIATION' or col == 'TEAM':
-                        frozen_headers.append('Team')
-                    elif col == 'last_name':
-                        frozen_headers.append('Last Name')
-                    elif col == 'first_name':
-                        frozen_headers.append('First Name')
-                    elif col == 'type':
-                        frozen_headers.append('Type')
-                    elif col == 'team_name':
-                        frozen_headers.append('Team')
                     else:
                         frozen_headers.append(col)
-            
-            main_cols = [col for col in key_cols if col not in frozen_cols]
-            
-            self.frozen_table.setColumnCount(len(frozen_cols))
-            self.frozen_table.setHorizontalHeaderLabels(frozen_headers)
-            self.stats_table.setColumnCount(len(main_cols))
-            self.stats_table.setHorizontalHeaderLabels(main_cols)
-            
-            if 'MIN' in df.columns:
-                df = df.sort_values(by='MIN', ascending=False)
-            
-            df_display = df
-            
-            self.frozen_table.setSortingEnabled(False)
-            self.stats_table.setSortingEnabled(False)
-            
-            for idx, row in df_display.iterrows():
-                frozen_row_pos = self.frozen_table.rowCount()
-                self.frozen_table.insertRow(frozen_row_pos)
-                main_row_pos = self.stats_table.rowCount()
-                self.stats_table.insertRow(main_row_pos)
+                self.frozen_table.setHorizontalHeaderLabels(frozen_headers)
                 
-                for col_idx, col_name in enumerate(frozen_cols):
-                    value = row.get(col_name, '')
-                    item = self.create_table_item(value)
-                    self.frozen_table.setItem(frozen_row_pos, col_idx, item)
+                # Set up main table
+                self.stats_table.setColumnCount(len(main_columns))
+                self.stats_table.setHorizontalHeaderLabels(main_columns)
                 
-                for col_idx, col_name in enumerate(main_cols):
-                    value = row.get(col_name, '')
-                    item = self.create_table_item(value)
-                    self.stats_table.setItem(main_row_pos, col_idx, item)
+                # Make frozen table visible for NBA data
+                self.frozen_table.setVisible(True)
+                
+                # Disable sorting temporarily for faster loading
+                self.frozen_table.setSortingEnabled(False)
+                self.stats_table.setSortingEnabled(False)
+                
+                # Load the data row by row
+                for idx, row in df.iterrows():
+                    frozen_row_pos = self.frozen_table.rowCount()
+                    self.frozen_table.insertRow(frozen_row_pos)
+                    main_row_pos = self.stats_table.rowCount()
+                    self.stats_table.insertRow(main_row_pos)
+                    
+                    # Fill frozen table columns
+                    for col_idx, col_name in enumerate(frozen_columns):
+                        value = row.get(col_name, '')
+                        item = self.create_table_item(value)
+                        self.frozen_table.setItem(frozen_row_pos, col_idx, item)
+                    
+                    # Fill main table columns
+                    for col_idx, col_name in enumerate(main_columns):
+                        value = row.get(col_name, '')
+                        item = self.create_table_item(value)
+                        self.stats_table.setItem(main_row_pos, col_idx, item)
+            else:
+                # For MLB and other sports, use the existing implementation
+                # Just load everything directly in the main table
+                all_columns = [col for col in df.columns if col != 'Index']
+                
+                # Set up the table with all columns
+                self.stats_table.setColumnCount(len(all_columns))
+                self.stats_table.setHorizontalHeaderLabels(all_columns)
+                
+                # Set the frozen table to have 0 columns
+                self.frozen_table.setColumnCount(0)
+                self.frozen_table.setVisible(False)
+                
+                # Disable sorting temporarily for faster loading
+                self.stats_table.setSortingEnabled(False)
+                
+                # Load the data row by row
+                for idx, row in df.iterrows():
+                    row_pos = self.stats_table.rowCount()
+                    self.stats_table.insertRow(row_pos)
+                    
+                    # Fill all columns in the main table
+                    for col_idx, col_name in enumerate(all_columns):
+                        value = row.get(col_name, '')
+                        item = self.create_table_item(value)
+                        self.stats_table.setItem(row_pos, col_idx, item)
             
+            # Re-enable sorting
             self.stats_table.setSortingEnabled(True)
             self.stats_table.verticalHeader().hide()
-            self.frozen_table.resizeColumnsToContents()
+            if self.frozen_table.isVisible():
+                self.frozen_table.verticalHeader().hide()
+            
+            # Resize columns to fit content
             self.stats_table.resizeColumnsToContents()
-            self.update_frozen_table_geometry()
+            if self.frozen_table.isVisible():
+                self.frozen_table.resizeColumnsToContents()
+                self.update_frozen_table_geometry()
+                
+                # Connect sort indicator change signal
+                self.stats_table.horizontalHeader().sortIndicatorChanged.connect(
+                    self.on_main_table_sort
+                )
             
-            self.stats_table.horizontalHeader().sortIndicatorChanged.connect(
-                self.on_main_table_sort
-            )
-            
-            # Add highlight for MLB pitchers if we're displaying MLB data
-            if self.current_sport == 'baseball_mlb':
-                pitchers, _ = get_todays_pitchers()
-                self.highlight_todays_pitchers(pitchers)
+            # For MLB data, handle highlighting pitchers
+            if self.current_sport == 'baseball_mlb' and self.stored_pitchers:
+                self.highlight_todays_pitchers(self.stored_pitchers)
             
         except Exception as e:
             print(f"Error displaying stats data: {e}")

@@ -11,6 +11,38 @@ def GetPage(url) -> BeautifulSoup | None:
         return None
     return BeautifulSoup(response.content, 'html.parser')
 
+home_team_ballparks = {
+    "ARI": "Chase Field",
+    "ATL": "Truist Park",
+    "BAL": "Oriole Park at Camden Yards",
+    "BOS": "Fenway Park",
+    "CHC": "Wrigley Field",
+    "CHW": "Guaranteed Rate Field",
+    "CIN": "Great American Ball Park",
+    "CLE": "Progressive Field",
+    "COL": "Coors Field",
+    "DET": "Comerica Park",
+    "HOU": "Minute Maid Park",
+    "KC": "Kauffman Stadium",
+    "LAA": "Angel Stadium",
+    "LAD": "Dodger Stadium",
+    "MIA": "LoanDepot Park",
+    "MIL": "American Family Field",
+    "MIN": "Target Field",
+    "NYM": "Citi Field",
+    "NYY": "Yankee Stadium",
+    "OAK": "Sutter Health Park",
+    "PHI": "Citizens Bank Park",
+    "PIT": "PNC Park",
+    "SD": "Petco Park",
+    "SEA": "T-Mobile Park",
+    "SF": "Oracle Park",
+    "STL": "Busch Stadium",
+    "TB": "Steinbrenner Field", # Will return to Tropicana Field in 2026
+    "TEX": "Globe Life Field",
+    "TOR": "Rogers Centre",
+    "WSH": "Nationals Park"
+}
 
 def Main():
     soup = GetPage('https://www.rotowire.com/baseball/daily-lineups.php')
@@ -68,6 +100,7 @@ def Main():
             },
             "Umpire": umpiretext.removeprefix("Umpire:"),
             "Weather": weathertext.removeprefix("Weather:"),
+            "Stadium": home_team_ballparks.get(home_team, f'UNKNOWN STADIUM ({home_team})'),
         }
         matchups.append(matchup)
     

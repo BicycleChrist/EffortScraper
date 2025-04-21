@@ -20,6 +20,7 @@ symlink_into = {
     "MLBAnalytics": [],
     "Imgui": [],
     "Database": [],
+    "OddsAPI": [],
 }
 
 
