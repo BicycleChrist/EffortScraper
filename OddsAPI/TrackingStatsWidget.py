@@ -57,7 +57,8 @@ class AdvancedStatsWidget(QWidget):
         controls_layout = QHBoxLayout()
         
         # Stats type selector (NBA only)
-        controls_layout.addWidget(QLabel("Stats Type:"))
+        self.stats_type_label = QLabel("View:")
+        controls_layout.addWidget(self.stats_type_label)
         self.stats_selector = QComboBox()
         self.stats_selector.addItems([
             "Passing", "Rebounding", "Touches", "Defense", "Traditional"
@@ -74,10 +75,9 @@ class AdvancedStatsWidget(QWidget):
         self.view_selector = QComboBox()
         self.view_selector.addItems(["Percentile Stats", "Stuff+ Stats", "SP Climate"])
         self.view_selector.currentIndexChanged.connect(self.on_view_mode_changed)
-        controls_layout.addWidget(QLabel("View:"))
+        self.view_label = QLabel("View:")
+        controls_layout.addWidget(self.view_label)
         controls_layout.addWidget(self.view_selector)
-        
-        
         
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
@@ -144,6 +144,9 @@ class AdvancedStatsWidget(QWidget):
         
         # Show/hide the NBA-specific controls
         self.stats_selector.setVisible(nba_mode)
+        self.stats_type_label.setVisible(nba_mode)
+        self.view_label.setVisible(not nba_mode)
+        self.view_selector.setVisible(not nba_mode)
         
         # Show/hide the team sidebar (frozen table with team names)
         if hasattr(self, 'frozen_table'):
