@@ -2,15 +2,27 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem,
-    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem
+    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget
 )
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF
+# Import QOpenGLWidget from the correct module
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from OpenGL.GLUT import *
+
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint
 import sys
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
 from weatherman import WeatherService, STADIUM_DATA
+from weatherman import open_weather_key
+
+
+    
+    
+    
 
 
 #TODO: Get more accurate dimensions for ball parks for better outline drawing 
@@ -460,25 +472,6 @@ class StadiumView(QGraphicsView):
         # Apply to all wind vector items
         for item in self.weather_layer.childItems():
             item.setOpacity(opacity)
-        
-        def add_arrowhead(self, x, y, angle, size, color):
-            """Add an arrowhead to a wind vector"""
-            angle1 = angle + math.radians(150)
-            angle2 = angle + math.radians(210)
-            
-            arrow1_x = x + size * math.cos(angle1)
-            arrow1_y = y + size * math.sin(angle1)
-            arrow2_x = x + size * math.cos(angle2)
-            arrow2_y = y + size * math.sin(angle2)
-            
-            line1 = QGraphicsLineItem(x, y, arrow1_x, arrow1_y)
-            line2 = QGraphicsLineItem(x, y, arrow2_x, arrow2_y)
-            
-            line1.setPen(QPen(color, 3))
-            line2.setPen(QPen(color, 3))
-            
-            self.weather_layer.addToGroup(line1)
-            self.weather_layer.addToGroup(line2)
     
     def start_ball_trajectory(self, trajectory_data):
         """Initialize the ball trajectory visualization"""
@@ -563,9 +556,6 @@ class StadiumView(QGraphicsView):
         
         return True
     
-    
-############################## Vector animation logic ##################    
-    
     def stop_wind_animation(self):
         """Stop the wind vector animation"""
         if hasattr(self, 'wind_animation_timer') and self.wind_animation_timer.isActive():
@@ -607,166 +597,550 @@ class StadiumView(QGraphicsView):
             )
         
         return base
-    
-    
-    
-    
 
 
-class UmpireView(QGraphicsView):
+# ==============================================
+# 3D Umpire View
+# ==============================================
+class UmpireView3D(QOpenGLWidget):
+    """3D view from the umpire's perspective using OpenGL"""
+    
     def __init__(self, parent=None):
+        # Set up OpenGL format with multisampling for antialiasing
+        fmt = QSurfaceFormat()
+        fmt.setSamples(4)  # 4x multisampling
+        fmt.setDepthBufferSize(24)  # 24-bit depth buffer
+        QSurfaceFormat.setDefaultFormat(fmt)
+        
         super().__init__(parent)
         
-        # Set up the graphics scene
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
-        
-        # Enable antialiasing for smoother graphics
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Set background to sky blue
-        self.setBackgroundBrush(QBrush(QColor(135, 206, 235)))
-        
-        # Setup field elements
-        self.setup_field()
-        
-        # Ball item
-        self.ball_item = None
-        
-        # Set minimum size
+        # Set widget attributes
         self.setMinimumSize(500, 300)
+        
+        # Camera positioning - lower and closer to simulate umpire view
+        self.camera_position = [0, 5, 3]  # X, Y, Z (right behind home plate, crouched)
+        self.look_at = [0, -60, 0]  # Looking toward pitcher's mound
+        self.up_vector = [0, 0, 1]  # Z is up
+        
+        # Field dimensions (in feet)
+        self.field_width = 300
+        self.field_depth = 400
+        
+        # Ball data
+        self.ball_position = None
+        self.ball_radius = 0.25  # Increased baseball radius for visibility
+        self.show_ball = False
+        
+        # Animation
+        self.frame_count = 0
+        
+        # Colors - more realistic field colors
+        self.grass_color = [0.13, 0.55, 0.13]  # Richer green
+        self.dirt_color = [0.76, 0.60, 0.42]   # More textured brown
+        self.mound_color = [0.72, 0.55, 0.32]  # Slightly darker brown
+        self.line_color = [1.0, 1.0, 1.0]      # White
+        self.ball_color = [1.0, 1.0, 1.0]      # White
+        self.ball_seam_color = [0.9, 0.2, 0.2] # Red seams for visibility
+        
+        # Allow mouse interaction for rotating the view
+        self.last_pos = QPoint()
+        self.setMouseTracking(True)
+        
+        # Rotation angles - start with a slight tilt for better perspective
+        self.x_rotation = -5
+        self.y_rotation = 0
+        
+        # Initialize GLU quadric for smooth spheres
+        self.quadric = None
+        
+        # Initialize GLUT (needed for some primitive shapes)
+        try:
+            glutInit()
+        except:
+            print("Warning: Could not initialize GLUT. Some 3D shapes may not render correctly.")
     
-    def setup_field(self):
-        """Set up the field from umpire perspective"""
-        # Create field surface
-        field_path = QPainterPath()
+    def initializeGL(self):
+        """Initialize OpenGL settings"""
+        # Set clear color (sky blue)
+        glClearColor(0.53, 0.81, 0.92, 1.0)
         
-        # Draw the basic field trapezoid
-        # Bottom of the view (wider part)
-        field_path.moveTo(-300, 200)
-        field_path.lineTo(300, 200)
+        # Enable depth testing for proper 3D rendering
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LESS)
         
-        # Top of the view (narrower part - distant outfield)
-        field_path.lineTo(150, -100)
-        field_path.lineTo(-150, -100)
-        field_path.closeSubpath()
+        # Enable lighting for more realistic rendering
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
         
-        # Create field item
-        field_item = QGraphicsPathItem(field_path)
-        field_item.setBrush(QBrush(QColor(20, 90, 50)))  # Dark green for grass
-        field_item.setPen(QPen(Qt.GlobalColor.black, 1))
-        self.scene.addItem(field_item)
+        # Set up light 0 (main light)
+        glLightfv(GL_LIGHT0, GL_POSITION, [1000, 1000, 2000, 0])  # Directional light
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])   # White light
         
-        # Draw the infield dirt circle
-        infield_dirt = QGraphicsEllipseItem(-120, 50, 240, 100)
-        infield_dirt.setBrush(QBrush(QColor(200, 150, 100)))  # Light brown for dirt
-        infield_dirt.setPen(QPen(Qt.PenStyle.NoPen))
-        self.scene.addItem(infield_dirt)
+        # Enable color material for simpler material handling
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+        
+        # Enable blending for transparency
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Enable antialiasing
+        glEnable(GL_LINE_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        
+        # Initialize GLU quadric for smooth spheres
+        self.quadric = gluNewQuadric()
+        gluQuadricDrawStyle(self.quadric, GLU_FILL)
+        gluQuadricNormals(self.quadric, GLU_SMOOTH)
+        gluQuadricTexture(self.quadric, GL_TRUE)
+        
+        # Create display lists for performance
+        self.create_field_display_list()
+    
+    def create_field_display_list(self):
+        """Create a display list for the baseball field"""
+        self.field_list = glGenLists(1)
+        glNewList(self.field_list, GL_COMPILE)
+        
+        # Draw the infield dirt (more realistic shape)
+        glColor3fv(self.dirt_color)
+        self.draw_dirt_infield()
+        
+        # Draw the grass outfield
+        glColor3fv(self.grass_color)
+        self.draw_grass_outfield()
         
         # Draw the pitcher's mound
-        mound = QGraphicsEllipseItem(-15, 40, 30, 15)
-        mound.setBrush(QBrush(QColor(180, 130, 80)))  # Slightly darker brown
-        mound.setPen(QPen(Qt.PenStyle.NoPen))
-        self.scene.addItem(mound)
+        glColor3fv(self.mound_color)
+        glPushMatrix()
+        glTranslatef(0, -60.5, 0)  # Position the mound
+        glutSolidCylinder(10, 1.0, 20, 5)  # Radius, height, slices, stacks
+        glPopMatrix()
         
-        # Add the foul lines
-        left_foul = QGraphicsLineItem(-60, 170, -150, -100)
-        left_foul.setPen(QPen(QColor(255, 255, 255), 2))
-        self.scene.addItem(left_foul)
+        # Draw foul lines with thicker, more visible lines
+        glColor3fv(self.line_color)
+        glLineWidth(3.0)
+        glBegin(GL_LINES)
+        # Left foul line
+        glVertex3f(0, 0, 0.05)
+        glVertex3f(-self.field_width / 3, -self.field_depth, 0.05)
+        # Right foul line
+        glVertex3f(0, 0, 0.05)
+        glVertex3f(self.field_width / 3, -self.field_depth, 0.05)
+        glEnd()
         
-        right_foul = QGraphicsLineItem(60, 170, 150, -100)
-        right_foul.setPen(QPen(QColor(255, 255, 255), 2))
-        self.scene.addItem(right_foul)
+        # Draw home plate (more pronounced)
+        self.draw_home_plate()
         
-        # Home plate
-        home_path = QPainterPath()
-        home_path.moveTo(0, 190)
-        home_path.lineTo(-10, 180)
-        home_path.lineTo(0, 170)
-        home_path.lineTo(10, 180)
-        home_path.closeSubpath()
+        # Draw bases (more visible)
+        self.draw_bases()
         
-        home_plate = QGraphicsPathItem(home_path)
-        home_plate.setBrush(QBrush(QColor(255, 255, 255)))
-        home_plate.setPen(QPen(Qt.GlobalColor.black, 1))
-        self.scene.addItem(home_plate)
-        
-        # Add bases
-        first_base = QGraphicsRectItem(90, 100, 10, 10)
-        first_base.setBrush(QBrush(QColor(255, 255, 255)))
-        first_base.setPen(QPen(Qt.GlobalColor.black, 1))
-        self.scene.addItem(first_base)
-        
-        second_base = QGraphicsRectItem(-5, 30, 10, 10)
-        second_base.setBrush(QBrush(QColor(255, 255, 255)))
-        second_base.setPen(QPen(Qt.GlobalColor.black, 1))
-        self.scene.addItem(second_base)
-        
-        third_base = QGraphicsRectItem(-100, 100, 10, 10)
-        third_base.setBrush(QBrush(QColor(255, 255, 255)))
-        third_base.setPen(QPen(Qt.GlobalColor.black, 1))
-        self.scene.addItem(third_base)
-        
-        # Set scene rect for proper sizing
-        self.scene.setSceneRect(-300, -150, 600, 400)
+        glEndList()
     
-    def project_ball_position(self, x, y, z):
-        """Project 3D coordinates to 2D screen coordinates with perspective"""
-        # Improved perspective transformation
-        distance_factor = 250 - min(200, y)  # Adjust range for better depth perception
-        scale_factor = distance_factor / 250  # Scale from 0 to 1
+    def draw_dirt_infield(self):
+        """Draw the dirt infield area more realistically"""
+        # Infield dirt area
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0, -60, 0.01)  # Center of the infield (approx. pitcher's mound)
         
-        # Calculate screen position with improved scaling
-        screen_x = x * scale_factor * 1.2  # Widen the x-axis movement
-        screen_y = 180 - (y * 0.8 * scale_factor) - (z * 0.9 * scale_factor)
+        # Create a diamond-shaped infield with rounded corners
+        radius = 95  # Radius of dirt infield 
+        segments = 40  # Number of segments for the circle
         
-        # Calculate ball size (smaller as it gets further away)
-        # Improved sizing for better perspective
-        ball_size = max(5.0, 30.0 * (1.0 - (0.6 * scale_factor)))
+        for i in range(segments + 1):
+            angle = 2.0 * math.pi * i / segments
+            x = radius * math.cos(angle)
+            y = -60 + radius * math.sin(angle)
+            glVertex3f(x, y, 0.01)
         
-        return screen_x, screen_y, ball_size
+        glEnd()
+        
+    def draw_grass_outfield(self):
+        """Draw the grass outfield area"""
+        # Outfield grass area
+        glBegin(GL_TRIANGLE_FAN)
+        # Center point at far outfield
+        glVertex3f(0, -250, 0)
+        
+        # Create outfield arc
+        radius = 300  # Outfield radius
+        start_angle = -math.pi/3  # Start at around -60 degrees
+        end_angle = math.pi/3     # End at around 60 degrees
+        segments = 30
+        
+        # Draw the outfield arc
+        for i in range(segments + 1):
+            angle = start_angle + (end_angle - start_angle) * i / segments
+            x = radius * math.cos(angle)
+            y = -150 + radius * math.sin(angle)
+            glVertex3f(x, y, 0)
+        
+        # Connect back to sidelines
+        glVertex3f(self.field_width/3, 0, 0)
+        glVertex3f(-self.field_width/3, 0, 0)
+        
+        glEnd()
+    
+    def draw_home_plate(self):
+        """Draw home plate - more visible and realistic"""
+        glColor3fv(self.line_color)
+        
+        # Home plate is a pentagon
+        glBegin(GL_POLYGON)
+        glVertex3f(0, 0, 0.1)          # Point facing pitcher
+        glVertex3f(-8.5, -8.5, 0.1)    # Back left corner
+        glVertex3f(-8.5, -17, 0.1)     # Back edge left
+        glVertex3f(8.5, -17, 0.1)      # Back edge right
+        glVertex3f(8.5, -8.5, 0.1)     # Back right corner
+        glEnd()
+        
+        # Add a dark outline for better visibility
+        glColor3f(0.1, 0.1, 0.1)
+        glLineWidth(0.95)
+        glBegin(GL_LINE_LOOP)
+        glVertex3f(0, 0, 0.11)
+        glVertex3f(-8.5, -8.5, 0.11)
+        glVertex3f(-8.5, -17, 0.11)
+        glVertex3f(8.5, -17, 0.11)
+        glVertex3f(8.5, -8.5, 0.11)
+        glEnd()
+    
+    def draw_bases(self):
+        """Draw the three bases (first, second, third) - more visible"""
+        base_size = 15  # Size of the base in inches
+        
+        # Convert to feet for our scale
+        base_size = base_size / 12
+        
+        # Draw bases with white fill and black outline
+        # First base
+        self.draw_base(90, -90, base_size)
+        
+        # Second base
+        self.draw_base(0, -127.3, base_size)  # 90 * sqrt(2) = 127.3
+        
+        # Third base
+        self.draw_base(-90, -90, base_size)
+    
+    def draw_base(self, x, y, size):
+        """Helper to draw a single base with outline"""
+        # Draw white base
+        glColor3fv(self.line_color)
+        glPushMatrix()
+        glTranslatef(x, y, 0.1)
+        glRotatef(45, 0, 0, 1)  # Orient the base diamond-shaped
+        
+        glBegin(GL_QUADS)
+        glVertex3f(-size/2, -size/2, 0)
+        glVertex3f(size/2, -size/2, 0)
+        glVertex3f(size/2, size/2, 0)
+        glVertex3f(-size/2, size/2, 0)
+        glEnd()
+        
+        # Draw black outline
+        glColor3f(0.1, 0.1, 0.1)
+        glLineWidth(1.5)
+        glBegin(GL_LINE_LOOP)
+        glVertex3f(-size/2, -size/2, 0.01)
+        glVertex3f(size/2, -size/2, 0.01)
+        glVertex3f(size/2, size/2, 0.01)
+        glVertex3f(-size/2, size/2, 0.01)
+        glEnd()
+        
+        glPopMatrix()
+    
+    def resizeGL(self, width, height):
+        """Handle widget resize events"""
+        # Prevent division by zero
+        if height == 0:
+            height = 1
+            
+        # Set viewport to cover the entire widget
+        glViewport(0, 0, width, height)
+        
+        # Set up perspective projection
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        aspect = width / height
+        gluPerspective(45.0, aspect, 0.1, 1000.0)
+        
+        # Return to model view mode
+        glMatrixMode(GL_MODELVIEW)
+    
+    def paintGL(self):
+        """Render the scene"""
+        # Clear color and depth buffers
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        
+        # Set up camera
+        glLoadIdentity()
+        
+        # Position camera behind home plate looking toward the field
+        # Apply rotation for interactive viewing
+        gluLookAt(
+            self.camera_position[0], self.camera_position[1], self.camera_position[2],
+            self.look_at[0], self.look_at[1], self.look_at[2],
+            self.up_vector[0], self.up_vector[1], self.up_vector[2]
+        )
+        
+        # Apply user rotation
+        glRotatef(self.x_rotation, 1.0, 0.0, 0.0)
+        glRotatef(self.y_rotation, 0.0, 1.0, 0.0)
+        
+        # Draw the field using display list for performance
+        glCallList(self.field_list)
+        
+        # Draw the ball if it's active
+        if self.show_ball and self.ball_position is not None:
+            x, y, z = self.ball_position
+            
+            # Draw ball shadow first (black transparent circle on ground)
+            glPushMatrix()
+            glColor4f(0, 0, 0, 0.3)  # Transparent black for shadow
+            glTranslatef(x, y, 0.05)  # Just above ground level
+            glScalef(1.0, 1.0, 0.1)   # Flatten to make a shadow
+            
+            # Scale shadow based on height (smaller when higher)
+            shadow_scale = max(0.5, 1.0 - z/150)
+            glScalef(shadow_scale, shadow_scale, 1.0)
+            
+            gluDisk(self.quadric, 0, self.ball_radius * 1.2, 20, 1)
+            glPopMatrix()
+            
+            # Now draw the actual ball
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            
+            # Draw white ball
+            glColor3fv(self.ball_color)
+            gluSphere(self.quadric, self.ball_radius, 20, 20)  # radius, slices, stacks
+            
+            # Draw red seams for better visibility
+            self.draw_ball_seams()
+            
+            glPopMatrix()
+    
+    def draw_ball_seams(self):
+        """Draw simplified baseball seams for better visibility"""
+        glColor3fv(self.ball_seam_color)
+        glLineWidth(2.0)
+        
+        # Draw two curves to represent seams
+        glBegin(GL_LINE_STRIP)
+        for i in range(21):
+            t = i / 20.0
+            angle = t * math.pi * 2
+            x = self.ball_radius * 1.05 * math.sin(angle)
+            y = self.ball_radius * 1.05 * math.cos(angle)
+            z = self.ball_radius * 0.3 * math.sin(angle * 2)
+            glVertex3f(x, y, z)
+        glEnd()
+        
+        glBegin(GL_LINE_STRIP)
+        for i in range(21):
+            t = i / 20.0
+            angle = t * math.pi * 2
+            x = self.ball_radius * 1.05 * math.sin(angle)
+            z = self.ball_radius * 1.05 * math.cos(angle)
+            y = self.ball_radius * 0.3 * math.sin(angle * 2)
+            glVertex3f(x, y, z)
+        glEnd()
     
     def update_ball_position(self, x, y, z):
-        """Update the ball position with 3D coordinates"""
-        # If no ball exists yet, create one
-        if not self.ball_item:
-            self.ball_item = QGraphicsEllipseItem(0, 0, 20, 20)
-            self.ball_item.setBrush(QBrush(QColor(255, 255, 255)))
-            self.ball_item.setPen(QPen(Qt.GlobalColor.black, 1))
-            self.scene.addItem(self.ball_item)
+        """Update the ball position with 3D coordinates
         
-        # Project 3D position to 2D screen coordinates
-        screen_x, screen_y, ball_size = self.project_ball_position(x, y, z)
+        Args:
+            x (float): Left/right position in feet (left is negative)
+            y (float): Forward/backward position in feet (forward/outfield is negative)
+            z (float): Height in feet
+            
+        Returns:
+            tuple: The (x, y, z) position that was set
+        """
+        # Store the position
+        self.ball_position = (x, y, z)
+        self.show_ball = True
         
-        # Update ball position and size
-        self.ball_item.setRect(screen_x - ball_size/2, screen_y - ball_size/2, 
-                              ball_size, ball_size)
+        # Trigger a redraw
+        self.update()
         
-        # Make sure the ball is visible (bring to front)
-        self.ball_item.setZValue(10)
-        
-        return screen_x, screen_y, ball_size
+        return self.ball_position
     
     def clear_ball(self):
         """Remove the ball from the scene"""
-        if self.ball_item:
-            self.scene.removeItem(self.ball_item)
-            self.ball_item = None
+        self.show_ball = False
+        self.ball_position = None
+        self.update()
+    
+    def mousePressEvent(self, event):
+        """Handle mouse press for camera rotation"""
+        self.last_pos = event.pos()
+    
+    def mouseMoveEvent(self, event):
+        """Handle mouse movement for camera rotation"""
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            dx = event.x() - self.last_pos.x()
+            dy = event.y() - self.last_pos.y()
+            
+            # Rotate the scene based on mouse movement
+            self.y_rotation += dx / 2.0
+            self.x_rotation += dy / 2.0
+            
+            # Limit vertical rotation to prevent flipping
+            self.x_rotation = max(-70, min(20, self.x_rotation))
+            
+            self.update()
+            self.last_pos = event.pos()
+
+
+class WindVectorWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(180)  # Ensure enough space for wind vectors
+        self.setMaximumHeight(180)  # Fixed height
+        
+        # Set background color
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor(20, 20, 20))  # Dark background
+        self.setPalette(palette)
+        
+        # Wind data
+        self.wind_speed = 0
+        self.wind_direction = 0
+        self.animation_state = 0
+        
+        # Animation timer
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(self.pulse_animation)
+        
+    def set_wind_data(self, speed, direction):
+        """Set wind data and update display"""
+        self.wind_speed = speed
+        self.wind_direction = direction
+        self.update()
+        
+        # Start animation if not already running
+        if not self.animation_timer.isActive():
+            self.animation_timer.start(500)  # 500ms pulse interval
+    
+    def pulse_animation(self):
+        """Create pulsing effect for wind vectors"""
+        self.animation_state = (self.animation_state + 1) % 3
+        self.update()
+    
+    def paintEvent(self, event):
+        """Draw wind vector indicators"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Draw wind vectors in center of widget
+        width = self.width()
+        height = self.height()
+        
+        # Create three large prominent arrows across the top area
+        arrow_positions = [
+            QPointF(width * 0.25, height * 0.55),  # Left
+            QPointF(width * 0.5, height * 0.55),   # Center
+            QPointF(width * 0.75, height * 0.55)   # Right
+        ]
+        
+        # Convert meteorological to mathematical angle
+        math_angle = (270 - self.wind_direction) % 360
+        rad_angle = math.radians(math_angle)
+        
+        # Scale based on wind speed
+        scale_factor = 20  # Large scale for visibility
+        length = scale_factor * max(2, self.wind_speed)  # Minimum size for visibility
+        
+        # Get color based on wind speed and animation state
+        if self.wind_speed < 5:
+            base_color = QColor(80, 200, 255)  # Bright blue for light wind
+        elif self.wind_speed < 10:
+            base_color = QColor(50, 255, 120)  # Bright green for moderate wind
+        else:
+            base_color = QColor(255, 60, 60)  # Bright red for strong wind
+            
+        # Adjust brightness based on animation state
+        brightness_factor = 1.0 + (self.animation_state * 0.1)  # 1.0, 1.1, or 1.2
+        color = QColor(
+            min(255, int(base_color.red() * brightness_factor)),
+            min(255, int(base_color.green() * brightness_factor)),
+            min(255, int(base_color.blue() * brightness_factor))
+        )
+        
+        # Draw arrows
+        for center_point in arrow_positions:
+            # Calculate endpoint
+            end_x = center_point.x() + length * math.cos(rad_angle)
+            end_y = center_point.y() + length * math.sin(rad_angle)
+            
+            # Check if endpoint is within bounds
+            end_x = max(20, min(end_x, width - 20))  # Keep 20px from edges
+            end_y = max(20, min(end_y, height - 20))
+            
+            end_point = QPointF(end_x, end_y)
+            
+            # Create the arrow shaft with thicker line
+            pen = QPen(color, 14)  # Thick line
+            painter.setPen(pen)
+            painter.drawLine(center_point, end_point)
+            
+            # Add arrowhead
+            self.draw_arrowhead(painter, end_point, rad_angle, 30, color)
+        
+        # Add wind speed text label (only once, in the center)
+        painter.setPen(QPen(color, 1))
+        font = painter.font()
+        font.setPointSize(18)
+        painter.setFont(font)
+        
+        # Position text near the center arrow
+        center_arrow_pos = arrow_positions[1]
+        center_arrow_end_x = center_arrow_pos.x() + length * math.cos(rad_angle)
+        center_arrow_end_y = center_arrow_pos.y() + length * math.sin(rad_angle)
+        
+        # Draw text with no opacity changes
+        text = f"{self.wind_speed} mph"
+        painter.drawText(QPointF(center_arrow_end_x + 10, center_arrow_end_y + 5), text)
+        
+    def draw_arrowhead(self, painter, point, angle, size, color):
+        """Draw an arrowhead at the specified position"""
+        angle1 = angle + math.radians(150)
+        angle2 = angle + math.radians(210)
+        
+        arrow1_x = point.x() + size * math.cos(angle1)
+        arrow1_y = point.y() + size * math.sin(angle1)
+        arrow2_x = point.x() + size * math.cos(angle2)
+        arrow2_y = point.y() + size * math.sin(angle2)
+        
+        arrow1_point = QPointF(arrow1_x, arrow1_y)
+        arrow2_point = QPointF(arrow2_x, arrow2_y)
+        
+        # Use the current pen
+        painter.drawLine(point, arrow1_point)
+        painter.drawLine(point, arrow2_point)
+    
+    def hideEvent(self, event):
+        """Handle widget hide event"""
+        if self.animation_timer.isActive():
+            self.animation_timer.stop()
+        super().hideEvent(event)
+    
+    def closeEvent(self, event):
+        """Handle widget close event"""
+        if self.animation_timer.isActive():
+            self.animation_timer.stop()
+        super().closeEvent(event)
+
 
 
 class SplitView(QWidget):
     """Widget that contains both top-down and umpire views"""
-    def __init__(self, stadium_image_path, lat, lon, altitude, parent=None, api_key=None):
+    def __init__(self, stadium_image_path, lat, lon, altitude, parent=None, api_key=open_weather_key):
         super().__init__(parent)
         
-        # Set up weather service with the API key
-        try:
-            from Creds import open_weather_key
-            self.api_key = api_key or open_weather_key
-        except ImportError:
-            self.api_key = api_key or "YOUR_OPENWEATHER_API_KEY"
-        
-        self.weather_service = WeatherService(self.api_key)
+        self.weather_service = WeatherService(api_key)
         
         # Initialize physics simulator
         self.ball_simulator = BallFlightSimulator()
@@ -785,55 +1159,108 @@ class SplitView(QWidget):
         self.current_frame = 0
         
         # Setup UI
-        # Setup UI
         self.setup_ui()
         
         # Animation timer
         self.animation_timer = QTimer(self)
         self.animation_timer.timeout.connect(self.update_animation)
         
-        
         # Fetch initial weather data
         self.fetch_weather_data()
     
+    # Modification for SplitView.setup_ui() method to reorganize the top section
     def setup_ui(self):
         """Set up the split view UI layout"""
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
         
-        # Top section with stadium info and miniature view
+        # Create top section with wind vector widget and miniature view side by side
         top_layout = QHBoxLayout()
         
-        # Stadium name and info
-        self.info_label = QLabel("Stadium Info")
-        top_layout.addWidget(self.info_label)
+        # Add the wind vector widget taking 70% of the width (increased from 60%)
+        self.wind_vector_widget = WindVectorWidget()
+        top_layout.addWidget(self.wind_vector_widget, 70)  # Increased from 60
         
-        # Miniature view of the actual stadium image
+        # Create a container for the stadium image
+        stadium_container = QWidget()
+        stadium_layout = QVBoxLayout(stadium_container)
+        stadium_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Miniature view of the actual stadium image - make larger
         self.mini_view = QLabel()
-        self.mini_view.setFixedSize(150, 100)
+        self.mini_view.setMinimumSize(200, 150)  # Increased size
         self.mini_view.setScaledContents(True)
         self.mini_view.setPixmap(self.stadium_pixmap)
         self.mini_view.setFrameShape(QLabel.Shape.Box)
-        top_layout.addWidget(self.mini_view)
+        stadium_layout.addWidget(self.mini_view)
+        
+        # The stadium info label is now moved to the stadium view
+        # and no longer added to the top layout
+        self.info_label = QLabel("Stadium Info")
+        
+        top_layout.addWidget(stadium_container, 30)  # Decreased from 40
         
         self.layout.addLayout(top_layout)
         
         # Main views container - side by side
         views_layout = QHBoxLayout()
         
-        # Top-down stadium view on the left (make it narrower)
+        # Container for top-down stadium view with overlay elements
+        stadium_view_container = QWidget()
+        stadium_view_layout = QVBoxLayout(stadium_view_container)
+        stadium_view_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Top-down stadium view
         self.stadium_view = StadiumView()
         self.stadium_view.setMinimumSize(1000, 850)
-        views_layout.addWidget(self.stadium_view, 85)  # 40% of width
+        stadium_view_layout.addWidget(self.stadium_view)
         
-        # Umpire perspective view on the right (make it wider)
-        self.umpire_view = UmpireView()
+        # Stadium info label positioned at top-right of stadium view using absolute positioning
+        self.info_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 120); padding: 5px;")
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.info_label.setMinimumSize(100,80)
+        self.info_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.info_label.setParent(self.stadium_view)
+        self.info_label.move(self.stadium_view.width() - 150, 10)  # Position in top right
+        self.info_label.show()
+        
+        # Connect resize event to reposition the label
+        self.stadium_view.resizeEvent = lambda event: (
+            self.info_label.move(self.stadium_view.width() - 150, 10),
+            type(self.stadium_view).resizeEvent(self.stadium_view, event)
+        )
+        
+        # Add flight stats list widget positioned at bottom right of stadium view
+        self.flight_stats_list = QListWidget(self.stadium_view)
+        self.flight_stats_list.setMinimumWidth(400)  # Increased from 300
+        self.flight_stats_list.setMaximumHeight(150)
+        self.flight_stats_list.setStyleSheet("background-color: rgba(0, 0, 0, 150); color: white;")
+        self.flight_stats_list.move(
+            self.stadium_view.width() - 420,  # Position 420px from right edge
+            self.stadium_view.height() - 160   # Position 160px from bottom
+        )
+        self.flight_stats_list.show()
+        
+        # Update flight_stats_list position when stadium_view is resized
+        original_resize_event = self.stadium_view.resizeEvent
+        def new_resize_event(event):
+            original_resize_event(event)
+            self.flight_stats_list.move(
+                self.stadium_view.width() - 420,
+                self.stadium_view.height() - 160
+            )
+        self.stadium_view.resizeEvent = new_resize_event
+        
+        views_layout.addWidget(stadium_view_container, 85)
+        
+        # 3D umpire view on the right
+        self.umpire_view = UmpireView3D()
         self.umpire_view.setMinimumSize(800, 600)
-        views_layout.addWidget(self.umpire_view, 75)  # 60% of width
+        views_layout.addWidget(self.umpire_view, 75)
         
         self.layout.addLayout(views_layout)
         
-        # Weather and simulation status label
+        # Weather status label
         self.weather_label = QLabel("Weather data: Not loaded")
         self.layout.addWidget(self.weather_label)
     
@@ -904,12 +1331,13 @@ class SplitView(QWidget):
     def update_weather_visualization(self):
         """Update the visual representation of weather conditions"""
         if self.weather_data:
-            # Draw wind vectors in top-down view
-            self.stadium_view.draw_wind_indicators(
+            # Update wind vectors in the dedicated widget instead of StadiumView
+            self.wind_vector_widget.set_wind_data(
                 self.weather_data["wind_speed"],
                 self.weather_data["wind_direction"]
             )
     
+    # Modification for simulate_ball_flight method to update the flight stats list
     def simulate_ball_flight(self, exit_velocity, launch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions"""
         if not self.weather_data:
@@ -942,13 +1370,22 @@ class SplitView(QWidget):
         # Check if it's a home run
         is_home_run = self.check_if_home_run(self.trajectory_data)
         
-        # Update status with distance
+        # Calculate stats
         distance = self.trajectory_data["distance"]
         max_height = max(self.trajectory_data["z"])
-        hr_text = " - HOME RUN!" if is_home_run else ""
+        hr_text = "HOME RUN!" if is_home_run else ""
+        
+        # Create stats text
+        stats_text = f"Exit Vel: {exit_velocity} mph | Launch: {launch_angle}° | Spin: {spin_rate} rpm | Dist: {distance:.1f} ft | Height: {max_height:.1f} ft {hr_text}"
+        
+        # Add to flight stats list
+        self.flight_stats_list.addItem(stats_text)
+        self.flight_stats_list.scrollToBottom()
+        
+        # Also update the weather label for backward compatibility
         self.weather_label.setText(
             f"{self.weather_label.text()} | Distance: {distance:.1f} ft | "
-            f"Max Height: {max_height:.1f} ft{hr_text}"
+            f"Max Height: {max_height:.1f} ft{' - ' + hr_text if hr_text else ''}"
         )
         
         # Start animation timer
@@ -972,10 +1409,11 @@ class SplitView(QWidget):
             self.current_frame
         )
         
-        # Update ball position in umpire view
+        # Update ball position in 3D umpire view
         # Convert ball coordinates for umpire view perspective
-        x = self.trajectory_data["y"][self.current_frame]  # Side to side
-        y = self.trajectory_data["x"][self.current_frame]  # Distance from plate
+        # Note: For 3D view, we can use the actual coordinates directly
+        x = self.trajectory_data["y"][self.current_frame]  # Side to side (left/right field)
+        y = -self.trajectory_data["x"][self.current_frame]  # Distance from plate (negative is toward outfield)
         z = self.trajectory_data["z"][self.current_frame]  # Height
         
         self.umpire_view.update_ball_position(x, y, z)
@@ -1024,7 +1462,7 @@ class MLBWeatherApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MLB Weather & Ball Flight Simulator")
-        self.setMinimumSize(1000, 700)  # Larger size for split view
+        self.setMinimumSize(1200, 950)  # Increased size for better display with wind widget
 
         # Create central widget and layout
         central_widget = QWidget()
@@ -1032,13 +1470,15 @@ class MLBWeatherApp(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Stadium selection
-        stadium_layout = QVBoxLayout()
+        stadium_layout = QHBoxLayout()  # Changed to horizontal layout for better space usage
         stadium_label = QLabel("Select Stadium:")
         self.stadium_combo = QComboBox()
         self.stadium_combo.addItems(STADIUM_DATA.keys())
         self.stadium_combo.currentTextChanged.connect(self.change_stadium)
+        self.stadium_combo.setMinimumWidth(200)  # Ensure enough width for stadium names
         stadium_layout.addWidget(stadium_label)
         stadium_layout.addWidget(self.stadium_combo)
+        stadium_layout.addStretch()  # Add stretch to push controls to the left
         main_layout.addLayout(stadium_layout)
 
         # Create split view widget with default stadium
@@ -1053,128 +1493,112 @@ class MLBWeatherApp(QMainWindow):
         self.stadium_widget.dimensions = STADIUM_DATA[default_stadium]["dimensions"]
         self.stadium_widget.stadium_name = default_stadium
         
-        main_layout.addWidget(self.stadium_widget)
+        # Add the split view with stretching to take most of the space
+        main_layout.addWidget(self.stadium_widget, 1)  # Use stretch factor
 
-        # Ball flight controls
-        controls_layout = QVBoxLayout()
+        # Ball flight controls in a horizontal layout for better space usage
+        controls_container = QWidget()
+        controls_main_layout = QVBoxLayout(controls_container)
+        controls_main_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Top row of controls
+        top_controls = QHBoxLayout()
 
         # Exit Velocity control
+        ev_group = QGroupBox("Exit Velocity (mph)")
         ev_layout = QVBoxLayout()
-        ev_label = QLabel("Exit Velocity (mph):")
         self.ev_slider = QSlider(Qt.Orientation.Horizontal)
         self.ev_slider.setRange(80, 120)
         self.ev_slider.setValue(100)
         self.ev_value = QLabel("100")
+        self.ev_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ev_slider.valueChanged.connect(lambda v: self.ev_value.setText(str(v)))
-        ev_layout.addWidget(ev_label)
         ev_layout.addWidget(self.ev_slider)
         ev_layout.addWidget(self.ev_value)
-        controls_layout.addLayout(ev_layout)
+        ev_group.setLayout(ev_layout)
+        top_controls.addWidget(ev_group)
 
         # Launch Angle control
+        la_group = QGroupBox("Launch Angle (degrees)")
         la_layout = QVBoxLayout()
-        la_label = QLabel("Launch Angle (degrees):")
         self.la_slider = QSlider(Qt.Orientation.Horizontal)
         self.la_slider.setRange(0, 45)
         self.la_slider.setValue(25)
         self.la_value = QLabel("25")
+        self.la_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.la_slider.valueChanged.connect(lambda v: self.la_value.setText(str(v)))
-        la_layout.addWidget(la_label)
         la_layout.addWidget(self.la_slider)
         la_layout.addWidget(self.la_value)
-        controls_layout.addLayout(la_layout)
+        la_group.setLayout(la_layout)
+        top_controls.addWidget(la_group)
         
-        # Spin rate control
+        # Spin rate control  
+        spin_group = QGroupBox("Spin Rate (rpm)")
         spin_layout = QVBoxLayout()
-        spin_label = QLabel("Spin Rate (rpm):")
         self.spin_slider = QSlider(Qt.Orientation.Horizontal)
         self.spin_slider.setRange(1000, 3000)
         self.spin_slider.setValue(1800)
         self.spin_value = QLabel("1800")
+        self.spin_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.spin_slider.valueChanged.connect(lambda v: self.spin_value.setText(str(v)))
-        spin_layout.addWidget(spin_label)
         spin_layout.addWidget(self.spin_slider)
         spin_layout.addWidget(self.spin_value)
-        controls_layout.addLayout(spin_layout)
+        spin_group.setLayout(spin_layout)
+        top_controls.addWidget(spin_group)
+        
+        controls_main_layout.addLayout(top_controls)
+        
+        # Bottom row of controls
+        bottom_controls = QHBoxLayout()
 
         # Wind override controls
         wind_group = QGroupBox("Override Weather")
-        wind_layout = QVBoxLayout()
-
+        wind_layout = QGridLayout()  # Use grid layout for better organization
+        
         # Wind speed
-        wind_speed_layout = QHBoxLayout()
-        wind_speed_layout.addWidget(QLabel("Wind Speed (mph):"))
+        wind_layout.addWidget(QLabel("Wind Speed (mph):"), 0, 0)
         self.wind_speed_spin = QSpinBox()
         self.wind_speed_spin.setRange(0, 40)
         self.wind_speed_spin.setValue(10)
-        wind_speed_layout.addWidget(self.wind_speed_spin)
-        wind_layout.addLayout(wind_speed_layout)
-
+        wind_layout.addWidget(self.wind_speed_spin, 0, 1)
+        
         # Wind direction
-        wind_dir_layout = QHBoxLayout()
-        wind_dir_layout.addWidget(QLabel("Wind Direction (°):"))
+        wind_layout.addWidget(QLabel("Wind Direction (°):"), 1, 0)
         self.wind_dir_spin = QSpinBox()
         self.wind_dir_spin.setRange(0, 359)
         self.wind_dir_spin.setValue(0)
-        wind_dir_layout.addWidget(self.wind_dir_spin)
-        wind_layout.addLayout(wind_dir_layout)
-
+        wind_layout.addWidget(self.wind_dir_spin, 1, 1)
+        
         # Override checkbox
         self.override_weather = QCheckBox("Override Weather Data")
-        wind_layout.addWidget(self.override_weather)
-
+        wind_layout.addWidget(self.override_weather, 2, 0, 1, 2)  # Span two columns
+        
         wind_group.setLayout(wind_layout)
-        controls_layout.addWidget(wind_group)
-
+        bottom_controls.addWidget(wind_group)
+        
+        # Action buttons
+        button_layout = QVBoxLayout()
+        
         # Simulate button
         self.simulate_btn = QPushButton("Simulate Ball Flight")
+        self.simulate_btn.setMinimumHeight(40)  # Make button taller for emphasis
         self.simulate_btn.clicked.connect(self.simulate_flight)
-        controls_layout.addWidget(self.simulate_btn)
-
+        button_layout.addWidget(self.simulate_btn)
+        
         # Update weather button
         self.update_weather_btn = QPushButton("Update Weather Data")
         self.update_weather_btn.clicked.connect(self.update_weather)
-        controls_layout.addWidget(self.update_weather_btn)
-
-        # Change Stadium upon selection
-        self.stadium_combo.currentTextChanged.connect(self.change_stadium)
-
-        main_layout.addLayout(controls_layout)
-
-    def update_stadium(self, stadium_name):
-        if stadium_name not in STADIUM_DATA:
-            return
-            
-        data = STADIUM_DATA[stadium_name]
-        self.stadium_pixmap = QPixmap(data["image_path"])
-        self.mini_view.setPixmap(self.stadium_pixmap)
-        self.lat = data["lat"]
-        self.lon = data["lon"]
-        self.altitude = data["altitude"]
-        self.dimensions = data["dimensions"]
-        self.stadium_name = stadium_name
+        button_layout.addWidget(self.update_weather_btn)
         
-        # Update stadium name and info label
-        self.info_label.setText(f"{stadium_name}\nAlt: {self.altitude} ft")
+        button_layout.addStretch()
+        bottom_controls.addLayout(button_layout)
         
-        # Draw the new stadium outline in top-down view
-        self.stadium_view.draw_stadium(self.dimensions)
-        
-        # Reset weather and simulation data
-        self.weather_data = None
-        self.trajectory_data = None
-        self.current_frame = 0
-        self.umpire_view.clear_ball()
-        self.update()
-        
-        # Update weather if we already have it
-        if self.weather_data:
-            self.update_weather_visualization()
+        controls_main_layout.addLayout(bottom_controls)
+        main_layout.addWidget(controls_container)
 
     def change_stadium(self, stadium_name):
         """Update the stadium when selection changes"""
         self.stadium_widget.update_stadium(stadium_name)
-
 
     def simulate_flight(self):
         exit_velocity = self.ev_slider.value()
