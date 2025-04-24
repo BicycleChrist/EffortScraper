@@ -23,12 +23,13 @@ from weatherman import WeatherService, STADIUM_DATA
 from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
-    
-    
-    
+from pywavefront import Wavefront
 
 
-#TODO: Get more accurate dimensions for ball parks for better outline drawing 
+
+# Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
+#TODO: PROPERLY LOAD AND DISPLAY .OBJ PARK MODEL IN QopenGLWidget 
+# Load the materials as well if possible from baseballfield.mtl
 
 # ==============================================
 # Ball Flight Physics Component

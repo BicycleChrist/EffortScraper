@@ -4,7 +4,7 @@ from PyQt6.QtCore import Qt, QPointF
 import math
 import numpy as np
 import requests
-
+from Creds import open_weather_key
 # ==============================================
 # Stadium Data
 # ==============================================
@@ -406,14 +406,9 @@ STADIUM_DATA = {
 # Weather Service Component
 # ==============================================
 class WeatherService:
-    def __init__(self, api_key=None):
-        # Import API key from Creds if available
-        try:
-            from Creds import open_weather_key
-            self.api_key = api_key or open_weather_key
-        except ImportError:
-            self.api_key = api_key or "YOUR_OPENWEATHER_API_KEY"
-            
+    def __init__(self, api_key=open_weather_key):
+        self.api_key = api_key or open_weather_key
+        
         self.base_url = "https://api.openweathermap.org/data/2.5/weather"
 
     def get_weather_by_location(self, lat, lon):
