@@ -9,7 +9,10 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *
-
+from svg.path import parse_path
+from xml.dom import minidom
+from PyQt6.QtSvg import QtSvg, QSvgRenderer
+from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint
 import sys
@@ -18,8 +21,8 @@ import math
 from scipy.integrate import solve_ivp
 from weatherman import WeatherService, STADIUM_DATA
 from weatherman import open_weather_key
-
-
+from pathlib import Path
+from svgpathtools import svg2paths
     
     
     
@@ -191,11 +194,15 @@ class StadiumView(QGraphicsView):
         self.scene.addItem(self.weather_layer)
         self.scene.addItem(self.ball_layer)
         
+        # SVG renderer and items
+        self.svg_renderer = None
+        self.stadium_svg_item = None
+        
         # Ball and trajectory items
         self.ball_item = None
         self.shadow_item = None
         self.trajectory_path = None
-        scale_factor = 2.0
+        
         # Set background color
         self.setBackgroundBrush(QBrush(QColor(20, 90, 50)))  # Dark green for grass
         
@@ -203,7 +210,7 @@ class StadiumView(QGraphicsView):
         self.setMouseTracking(True)
         
         # Set the scene rect to a much larger size initially
-        self.scene.setSceneRect(-500, -500, 1000, 1000)  # Increased from -200, -200, 400, 400
+        self.scene.setSceneRect(-500, -500, 1000, 1000)
         
         # Fit the view to the scene
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -213,153 +220,133 @@ class StadiumView(QGraphicsView):
         super().resizeEvent(event)
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
     
-    def draw_stadium(self, dimensions):
-        """Draw the stadium outline based on provided dimensions"""
+    def load_stadium_svg(self, svg_path, dimensions):
+        """Load an SVG stadium outline and set it up in the view"""
         # Delete all stadium items and create a new layer
         self.scene.removeItem(self.stadium_layer)
         self.stadium_layer = QGraphicsItemGroup()
         self.scene.addItem(self.stadium_layer)
         
-        # Get dimensions
-        left_field = dimensions["left_field"]
-        left_center = dimensions["left_center"]
-        center_field = dimensions["center_field"]
-        right_center = dimensions["right_center"]
-        right_field = dimensions["right_field"]
+        # Create SVG renderer
+        try:
+            self.svg_renderer = QSvgRenderer(svg_path)
+            
+            # Check if the SVG loaded successfully
+            if not self.svg_renderer.isValid():
+                print(f"Invalid SVG file: {svg_path}")
+                # Fall back to drawing method if SVG is invalid
+                self.draw_stadium(dimensions)
+                return
+            
+            # Create SVG item
+            self.stadium_svg_item = QGraphicsSvgItem()
+            self.stadium_svg_item.setSharedRenderer(self.svg_renderer)
+            
+            # Get the SVG's default size
+            default_size = self.svg_renderer.defaultSize()
+            if default_size.width() <= 0 or default_size.height() <= 0:
+                print(f"Invalid SVG dimensions: {default_size.width()} x {default_size.height()}")
+                # Fall back to drawing method
+                self.draw_stadium(dimensions)
+                return
+            
+            # Determine appropriate scaling and positioning
+            scale_factor = 2.0
+            
+            # Get maximum distance for proper scaling
+            max_distance = max(
+                dimensions["left_field"],
+                dimensions["left_center"],
+                dimensions["center_field"],
+                dimensions["right_center"],
+                dimensions["right_field"]
+            ) * scale_factor
+            
+            # Calculate the scaling ratio to fit our desired size
+            svg_size = QSizeF(max_distance * 2, max_distance * 2)
+            scale_x = svg_size.width() / default_size.width()
+            scale_y = svg_size.height() / default_size.height()
+            
+            # Apply scaling transform to the SVG item
+            scale = min(scale_x, scale_y)
+            self.stadium_svg_item.setScale(scale)
+            
+            # Center the SVG on home plate (0,0)
+            # SVG has its own coordinate system, so we need to adjust positioning
+            # to ensure home plate is at (0,0) in the scene
+            svg_center_x = default_size.width() / 2
+            svg_center_y = default_size.height() / 2
+            
+            self.stadium_svg_item.setPos(
+                -svg_center_x * scale,
+                -svg_center_y * scale
+            )
+            
+            # Add to stadium layer
+            self.stadium_layer.addToGroup(self.stadium_svg_item)
+            
+            # Add distance markers
+            self.add_distance_markers(dimensions, scale_factor)
+            
+            # Resize scene to fit the stadium with margin
+            margin = 150
+            self.scene.setSceneRect(
+                -max_distance-margin, 
+                -max_distance-margin, 
+                (max_distance+margin)*2, 
+                (max_distance+margin)*2
+            )
+            
+            # Force view update
+            self.resetCachedContent()
+            self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.update()
         
-        # Scale factor to make the field larger
-        scale_factor = 2.0
+        except Exception as e:
+            print(f"Error loading SVG: {e}")
+            # Fall back to drawing method
+            self.draw_stadium(dimensions)
+    
+    def draw_stadium(self, dimensions):
+        """Legacy method for backward compatibility - creates and loads SVG on the fly"""
+        # Generate a basic SVG based on dimensions
+        svg_path = f"temp_stadium_{id(dimensions)}.svg"
+        svg_manager = StadiumSVGManager()
+        svg_content = svg_manager.generate_basic_stadium_svg("Stadium", dimensions)
         
-        # Apply scaling to dimensions
-        left_field *= scale_factor
-        left_center *= scale_factor
-        center_field *= scale_factor
-        right_center *= scale_factor
-        right_field *= scale_factor
+        # Save to temporary file
+        with open(svg_path, 'w') as f:
+            f.write(svg_content)
         
-        # Create a path for the outfield wall
-        wall_path = QPainterPath()
-        
-        # Start at home plate
-        wall_path.moveTo(0, 0)
-        
-        # Draw foul line to left field corner
+        # Load the SVG
+        self.load_stadium_svg(svg_path, dimensions)
+    
+    def add_distance_markers(self, dimensions, scale_factor):
+        """Add distance markers at key points along the outfield wall"""
+        # Calculate points for distance markers
+        # Left field corner
         left_angle = math.radians(45)
-        left_x = -left_field * math.sin(left_angle)
-        left_y = -left_field * math.cos(left_angle)
-        wall_path.lineTo(left_x, left_y)
+        left_x = -dimensions["left_field"] * scale_factor * math.sin(left_angle)
+        left_y = -dimensions["left_field"] * scale_factor * math.cos(left_angle)
         
         # Left-center
         left_center_angle = math.radians(22.5)
-        left_center_x = -left_center * math.sin(left_center_angle)
-        left_center_y = -left_center * math.cos(left_center_angle)
+        left_center_x = -dimensions["left_center"] * scale_factor * math.sin(left_center_angle)
+        left_center_y = -dimensions["left_center"] * scale_factor * math.cos(left_center_angle)
         
         # Center field
-        center_y = -center_field
+        center_y = -dimensions["center_field"] * scale_factor
         
         # Right-center
         right_center_angle = math.radians(22.5)
-        right_center_x = right_center * math.sin(right_center_angle)
-        right_center_y = -right_center * math.cos(right_center_angle)
+        right_center_x = dimensions["right_center"] * scale_factor * math.sin(right_center_angle)
+        right_center_y = -dimensions["right_center"] * scale_factor * math.cos(right_center_angle)
         
         # Right field corner
         right_angle = math.radians(45)
-        right_x = right_field * math.sin(right_angle)
-        right_y = -right_field * math.cos(right_angle)
-        
-        # Create a smooth curved outfield wall
-        wall_path.cubicTo(left_center_x, left_center_y, 0, center_y, right_center_x, right_center_y)
-        wall_path.lineTo(right_x, right_y)
-        
-        # Back to home plate
-        wall_path.lineTo(0, 0)
-        
-        # Create outfield wall item
-        outfield_wall = QGraphicsPathItem(wall_path)
-        outfield_wall.setPen(QPen(QColor(255, 255, 255), 3))
-        self.stadium_layer.addToGroup(outfield_wall)
-        
-        # Create the base diamond shape
-        infield_size = 90 * scale_factor
-        diamond_path = QPainterPath()
-        diamond_path.moveTo(0, 0)  # Home plate
-        diamond_path.lineTo(infield_size, -infield_size)  # First base
-        diamond_path.lineTo(0, -infield_size*2)  # Second base
-        diamond_path.lineTo(-infield_size, -infield_size)  # Third base
-        diamond_path.lineTo(0, 0)  # Back to home
-        
-        # Draw the baselines
-        baselines = QGraphicsPathItem(diamond_path)
-        baselines.setPen(QPen(QColor(255, 255, 255), 2))
-        self.stadium_layer.addToGroup(baselines)
-        
-        # Draw bases with larger size for visibility
-        base_size = 12
-        
-        # Home plate
-        home = QGraphicsEllipseItem(-base_size/2, -base_size/2, base_size, base_size)
-        home.setBrush(QBrush(QColor(255, 255, 255)))
-        self.stadium_layer.addToGroup(home)
-        
-        # First base
-        first = QGraphicsEllipseItem(infield_size - base_size/2, -infield_size - base_size/2, 
-                                    base_size, base_size)
-        first.setBrush(QBrush(QColor(255, 255, 255)))
-        self.stadium_layer.addToGroup(first)
-        
-        # Second base
-        second = QGraphicsEllipseItem(-base_size/2, -infield_size*2 - base_size/2, 
-                                     base_size, base_size)
-        second.setBrush(QBrush(QColor(255, 255, 255)))
-        self.stadium_layer.addToGroup(second)
-        
-        # Third base
-        third = QGraphicsEllipseItem(-infield_size - base_size/2, -infield_size - base_size/2, 
-                                    base_size, base_size)
-        third.setBrush(QBrush(QColor(255, 255, 255)))
-        self.stadium_layer.addToGroup(third)
-        
-        # Add distance markers with larger font
-        self.add_distance_marker(left_x, left_y, f"{dimensions['left_field']}'", -1)
-        self.add_distance_marker(left_center_x, left_center_y, f"{dimensions['left_center']}'", -1)
-        self.add_distance_marker(0, center_y, f"{dimensions['center_field']}'", 0)
-        self.add_distance_marker(right_center_x, right_center_y, f"{dimensions['right_center']}'", 1)
-        self.add_distance_marker(right_x, right_y, f"{dimensions['right_field']}'", 1)
-        
-        # Resize and fit the scene - use larger margin
-        margin = 150
-        max_distance = max(left_field, left_center, center_field, right_center, right_field)
-        
-        self.scene.setSceneRect(-max_distance-margin, -max_distance-margin, 
-                               (max_distance+margin)*2, (max_distance+margin)*2)
-        
-        # Force a complete update of the view
-        self.resetCachedContent()
-        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        self.update()
-    
-    def add_distance_marker(self, x, y, text, align):
-        """Add a distance marker at the specified location"""
-        text_item = self.scene.addSimpleText(text)
-        text_item.setBrush(QBrush(QColor(255, 255, 255)))
-        
-        # Make text larger
-        font = text_item.font()
-        font.setPointSize(14)  # Increased from 12
-        text_item.setFont(font)
-        
-        # Position text based on alignment
-        text_width = text_item.boundingRect().width()
-        text_height = text_item.boundingRect().height()
-        
-        if align < 0:  # Left-aligned
-            text_item.setPos(x - text_width, y - text_height/2)
-        elif align > 0:  # Right-aligned
-            text_item.setPos(x, y - text_height/2)
-        else:  # Center-aligned
-            text_item.setPos(x - text_width/2, y - text_height)
-        
-        self.stadium_layer.addToGroup(text_item)
+        right_x = dimensions["right_field"] * scale_factor * math.sin(right_angle)
+        right_y = -dimensions["right_field"] * scale_factor * math.cos(right_angle)
+
     
     def draw_wind_indicators(self, speed, direction):
         """Draw wind vector indicators on the field with animation"""
@@ -480,7 +467,7 @@ class StadiumView(QGraphicsView):
             item = self.ball_layer.childItems()[0]
             self.scene.removeItem(item)
         
-        # Scale factor - must match the one used in draw_stadium
+        # Scale factor - must match the one used in load_stadium_svg
         scale_factor = 2.0
         
         # Create the ball
@@ -498,10 +485,10 @@ class StadiumView(QGraphicsView):
         # Create trajectory path with proper scaling
         path = QPainterPath()
         
-        # Starting point (home plate)
+        # Starting point (home plate at 0,0)
         path.moveTo(0, 0)
         
-        # Add points along trajectory - with proper scaling
+        # Add points along trajectory with proper scaling
         for i in range(0, len(trajectory_data["x"]), 5):
             # Scale the coordinates to match our field display
             scene_x = trajectory_data["y"][i] * scale_factor
@@ -512,14 +499,57 @@ class StadiumView(QGraphicsView):
         # Create path item with thicker, more visible line
         self.trajectory_path = QGraphicsPathItem(path)
         self.trajectory_path.setPen(QPen(QColor(255, 140, 0), 3, Qt.PenStyle.DashLine))
+        self.trajectory_path.setZValue(100)  # Put trajectory on top of everything
         
-        # Add items to scene
+        # Add items to scene - add to ball layer which is on top of stadium layer
         self.ball_layer.addToGroup(self.shadow_item)
         self.ball_layer.addToGroup(self.trajectory_path)
         self.ball_layer.addToGroup(self.ball_item)
         
+        # Make sure ball layer is visible
+        self.ball_layer.setVisible(True)
+        self.ball_layer.setZValue(100)  # Ensure ball layer is on top
+        
         # Set initial positions
         self.update_ball_position(trajectory_data, 0)
+        
+        return True
+
+    def update_ball_position(self, trajectory_data, frame):
+        """Update the ball position for animation"""
+        if frame >= len(trajectory_data["x"]):
+            return False
+        
+        # Scale factor - must match the one used in load_stadium_svg
+        scale_factor = 2.0
+        
+        # Get coordinates with proper scaling
+        x = trajectory_data["y"][frame] * scale_factor
+        y = -trajectory_data["x"][frame] * scale_factor
+        z = trajectory_data["z"][frame]
+        
+        # Update ball position
+        self.ball_item.setPos(x, y)
+        
+        # Scale ball based on height
+        height_factor = max(0.8, min(1.5, 1 + z/100))
+        self.ball_item.setScale(height_factor)
+        
+        # Update shadow position (directly below ball on ground)
+        self.shadow_item.setPos(x, y)
+        
+        # Make shadow more transparent based on height
+        opacity = max(0.2, 1.0 - z/200)
+        self.shadow_item.setOpacity(opacity)
+        
+        # Scale shadow size inversely proportional to height
+        shadow_scale = max(0.5, 1.0 - z/300)
+        self.shadow_item.setScale(shadow_scale)
+        
+        # Ensure the ball items are visible
+        self.ball_item.setVisible(True)
+        self.shadow_item.setVisible(True)
+        self.trajectory_path.setVisible(True)
         
         return True
     
@@ -561,15 +591,6 @@ class StadiumView(QGraphicsView):
         if hasattr(self, 'wind_animation_timer') and self.wind_animation_timer.isActive():
             self.wind_animation_timer.stop()
 
-    def hideEvent(self, event):
-        """Handle widget hide event"""
-        self.stop_wind_animation()
-        super().hideEvent(event)
-    
-    def closeEvent(self, event):
-        """Handle widget close event"""
-        self.stop_wind_animation()
-        super().closeEvent(event)
     
     def get_wind_color(self, speed, animation_state):
         """Get color for wind vector based on speed and animation state"""
@@ -603,394 +624,152 @@ class StadiumView(QGraphicsView):
 # 3D Umpire View
 # ==============================================
 class UmpireView3D(QOpenGLWidget):
-    """3D view from the umpire's perspective using OpenGL"""
-    
     def __init__(self, parent=None):
-        # Set up OpenGL format with multisampling for antialiasing
-        fmt = QSurfaceFormat()
-        fmt.setSamples(4)  # 4x multisampling
-        fmt.setDepthBufferSize(24)  # 24-bit depth buffer
-        QSurfaceFormat.setDefaultFormat(fmt)
-        
         super().__init__(parent)
+        self.stadium_outline = []
+        self.ball_pos = None
+        self.textures = {}
         
-        # Set widget attributes
-        self.setMinimumSize(500, 300)
+        # Improved camera setup
+        self.camera = {
+            'pos': [0, 15, 3],
+            'target': [0, -100, 0],
+            'up': [0, 0, 1],
+            'fov': 45
+        }
         
-        # Camera positioning - lower and closer to simulate umpire view
-        self.camera_position = [0, 5, 3]  # X, Y, Z (right behind home plate, crouched)
-        self.look_at = [0, -60, 0]  # Looking toward pitcher's mound
-        self.up_vector = [0, 0, 1]  # Z is up
-        
-        # Field dimensions (in feet)
-        self.field_width = 300
-        self.field_depth = 400
-        
-        # Ball data
-        self.ball_position = None
-        self.ball_radius = 0.25  # Increased baseball radius for visibility
-        self.show_ball = False
-        
-        # Animation
-        self.frame_count = 0
-        
-        # Colors - more realistic field colors
-        self.grass_color = [0.13, 0.55, 0.13]  # Richer green
-        self.dirt_color = [0.76, 0.60, 0.42]   # More textured brown
-        self.mound_color = [0.72, 0.55, 0.32]  # Slightly darker brown
-        self.line_color = [1.0, 1.0, 1.0]      # White
-        self.ball_color = [1.0, 1.0, 1.0]      # White
-        self.ball_seam_color = [0.9, 0.2, 0.2] # Red seams for visibility
-        
-        # Allow mouse interaction for rotating the view
-        self.last_pos = QPoint()
-        self.setMouseTracking(True)
-        
-        # Rotation angles - start with a slight tilt for better perspective
-        self.x_rotation = -5
-        self.y_rotation = 0
-        
-        # Initialize GLU quadric for smooth spheres
-        self.quadric = None
-        
-        # Initialize GLUT (needed for some primitive shapes)
-        try:
-            glutInit()
-        except:
-            print("Warning: Could not initialize GLUT. Some 3D shapes may not render correctly.")
-    
+        # Enhanced materials
+        self.materials = {
+            'grass': [0.15, 0.6, 0.15, 1.0],
+            'wall': [0.4, 0.4, 0.4, 1.0],
+            'dirt': [0.7, 0.5, 0.3, 1.0]
+        }
+
     def initializeGL(self):
-        """Initialize OpenGL settings"""
-        # Set clear color (sky blue)
-        glClearColor(0.53, 0.81, 0.92, 1.0)
-        
-        # Enable depth testing for proper 3D rendering
         glEnable(GL_DEPTH_TEST)
-        glDepthFunc(GL_LESS)
-        
-        # Enable lighting for more realistic rendering
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
+        glLightfv(GL_LIGHT0, GL_POSITION, [5, 5, 10, 1])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1, 1, 1, 1])
+        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.5, 0.5, 0.5, 1])
+
+    def load_stadium_svg(self, svg_path):
+        """Extract clean outline from SVG"""
         
-        # Set up light 0 (main light)
-        glLightfv(GL_LIGHT0, GL_POSITION, [1000, 1000, 2000, 0])  # Directional light
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])   # White light
-        
-        # Enable color material for simpler material handling
-        glEnable(GL_COLOR_MATERIAL)
-        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
-        
-        # Enable blending for transparency
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        
-        # Enable antialiasing
-        glEnable(GL_LINE_SMOOTH)
-        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        
-        # Initialize GLU quadric for smooth spheres
-        self.quadric = gluNewQuadric()
-        gluQuadricDrawStyle(self.quadric, GLU_FILL)
-        gluQuadricNormals(self.quadric, GLU_SMOOTH)
-        gluQuadricTexture(self.quadric, GL_TRUE)
-        
-        # Create display lists for performance
-        self.create_field_display_list()
+        try:
+            doc = minidom.parse(svg_path)
+            path_strings = [path.getAttribute('d') 
+                          for path in doc.getElementsByTagName('path')
+                          if 'outfield' in path.getAttribute('id').lower()]
+            if path_strings:
+                path = parse_path(path_strings[0])
+                self.stadium_outline = [(p.real, p.imag) for p in 
+                                      (path[0].start, *[seg.end for seg in path])]
+        except Exception as e:
+            print(f"3D SVG Error: {e}")
+            self.generate_default_outline()
+
+    def generate_default_outline(self):
+        """Parametric stadium outline"""
+        self.stadium_outline = []
+        for angle in np.linspace(-45, 45, 50):
+            rad = np.radians(angle)
+            x = 300 * np.sin(rad)
+            y = -300 * np.cos(rad)
+            self.stadium_outline.append((x, y))
+
+
+    def clear_ball(self):
+        """Clear any displayed ball from the 3D view"""
+        self.ball_pos = None
+        self.update()  # Request a redraw of the scene
     
-    def create_field_display_list(self):
-        """Create a display list for the baseball field"""
-        self.field_list = glGenLists(1)
-        glNewList(self.field_list, GL_COMPILE)
-        
-        # Draw the infield dirt (more realistic shape)
-        glColor3fv(self.dirt_color)
-        self.draw_dirt_infield()
-        
-        # Draw the grass outfield
-        glColor3fv(self.grass_color)
-        self.draw_grass_outfield()
-        
-        # Draw the pitcher's mound
-        glColor3fv(self.mound_color)
-        glPushMatrix()
-        glTranslatef(0, -60.5, 0)  # Position the mound
-        glutSolidCylinder(10, 1.0, 20, 5)  # Radius, height, slices, stacks
-        glPopMatrix()
-        
-        # Draw foul lines with thicker, more visible lines
-        glColor3fv(self.line_color)
-        glLineWidth(3.0)
-        glBegin(GL_LINES)
-        # Left foul line
-        glVertex3f(0, 0, 0.05)
-        glVertex3f(-self.field_width / 3, -self.field_depth, 0.05)
-        # Right foul line
-        glVertex3f(0, 0, 0.05)
-        glVertex3f(self.field_width / 3, -self.field_depth, 0.05)
-        glEnd()
-        
-        # Draw home plate (more pronounced)
-        self.draw_home_plate()
-        
-        # Draw bases (more visible)
-        self.draw_bases()
-        
-        glEndList()
     
-    def draw_dirt_infield(self):
-        """Draw the dirt infield area more realistically"""
-        # Infield dirt area
-        glBegin(GL_TRIANGLE_FAN)
-        glVertex3f(0, -60, 0.01)  # Center of the infield (approx. pitcher's mound)
+    def update_ball_position(self, x, y, z):
+        """Update the position of the ball in the 3D view
         
-        # Create a diamond-shaped infield with rounded corners
-        radius = 95  # Radius of dirt infield 
-        segments = 40  # Number of segments for the circle
+        Args:
+            x: x-coordinate (lateral position)
+            y: y-coordinate (distance from home plate)
+            z: z-coordinate (height)
+        """
+        # Store the new ball position
+        self.ball_pos = (float(x), float(y), float(z))
         
-        for i in range(segments + 1):
-            angle = 2.0 * math.pi * i / segments
-            x = radius * math.cos(angle)
-            y = -60 + radius * math.sin(angle)
-            glVertex3f(x, y, 0.01)
+        # Request a redraw of the scene
+        self.update()
         
-        glEnd()
         
-    def draw_grass_outfield(self):
-        """Draw the grass outfield area"""
-        # Outfield grass area
-        glBegin(GL_TRIANGLE_FAN)
-        # Center point at far outfield
-        glVertex3f(0, -250, 0)
-        
-        # Create outfield arc
-        radius = 300  # Outfield radius
-        start_angle = -math.pi/3  # Start at around -60 degrees
-        end_angle = math.pi/3     # End at around 60 degrees
-        segments = 30
-        
-        # Draw the outfield arc
-        for i in range(segments + 1):
-            angle = start_angle + (end_angle - start_angle) * i / segments
-            x = radius * math.cos(angle)
-            y = -150 + radius * math.sin(angle)
-            glVertex3f(x, y, 0)
-        
-        # Connect back to sidelines
-        glVertex3f(self.field_width/3, 0, 0)
-        glVertex3f(-self.field_width/3, 0, 0)
-        
-        glEnd()
-    
-    def draw_home_plate(self):
-        """Draw home plate - more visible and realistic"""
-        glColor3fv(self.line_color)
-        
-        # Home plate is a pentagon
-        glBegin(GL_POLYGON)
-        glVertex3f(0, 0, 0.1)          # Point facing pitcher
-        glVertex3f(-8.5, -8.5, 0.1)    # Back left corner
-        glVertex3f(-8.5, -17, 0.1)     # Back edge left
-        glVertex3f(8.5, -17, 0.1)      # Back edge right
-        glVertex3f(8.5, -8.5, 0.1)     # Back right corner
-        glEnd()
-        
-        # Add a dark outline for better visibility
-        glColor3f(0.1, 0.1, 0.1)
-        glLineWidth(0.95)
-        glBegin(GL_LINE_LOOP)
-        glVertex3f(0, 0, 0.11)
-        glVertex3f(-8.5, -8.5, 0.11)
-        glVertex3f(-8.5, -17, 0.11)
-        glVertex3f(8.5, -17, 0.11)
-        glVertex3f(8.5, -8.5, 0.11)
-        glEnd()
-    
-    def draw_bases(self):
-        """Draw the three bases (first, second, third) - more visible"""
-        base_size = 15  # Size of the base in inches
-        
-        # Convert to feet for our scale
-        base_size = base_size / 12
-        
-        # Draw bases with white fill and black outline
-        # First base
-        self.draw_base(90, -90, base_size)
-        
-        # Second base
-        self.draw_base(0, -127.3, base_size)  # 90 * sqrt(2) = 127.3
-        
-        # Third base
-        self.draw_base(-90, -90, base_size)
-    
-    def draw_base(self, x, y, size):
-        """Helper to draw a single base with outline"""
-        # Draw white base
-        glColor3fv(self.line_color)
-        glPushMatrix()
-        glTranslatef(x, y, 0.1)
-        glRotatef(45, 0, 0, 1)  # Orient the base diamond-shaped
-        
-        glBegin(GL_QUADS)
-        glVertex3f(-size/2, -size/2, 0)
-        glVertex3f(size/2, -size/2, 0)
-        glVertex3f(size/2, size/2, 0)
-        glVertex3f(-size/2, size/2, 0)
-        glEnd()
-        
-        # Draw black outline
-        glColor3f(0.1, 0.1, 0.1)
-        glLineWidth(1.5)
-        glBegin(GL_LINE_LOOP)
-        glVertex3f(-size/2, -size/2, 0.01)
-        glVertex3f(size/2, -size/2, 0.01)
-        glVertex3f(size/2, size/2, 0.01)
-        glVertex3f(-size/2, size/2, 0.01)
-        glEnd()
-        
-        glPopMatrix()
-    
-    def resizeGL(self, width, height):
-        """Handle widget resize events"""
-        # Prevent division by zero
-        if height == 0:
-            height = 1
-            
-        # Set viewport to cover the entire widget
-        glViewport(0, 0, width, height)
-        
-        # Set up perspective projection
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        aspect = width / height
-        gluPerspective(45.0, aspect, 0.1, 1000.0)
-        
-        # Return to model view mode
-        glMatrixMode(GL_MODELVIEW)
-    
     def paintGL(self):
-        """Render the scene"""
-        # Clear color and depth buffers
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        
-        # Set up camera
         glLoadIdentity()
+        gluPerspective(self.camera['fov'], 
+                      self.width()/self.height(), 0.1, 500)
+        gluLookAt(*self.camera['pos'], 
+                 *self.camera['target'], 
+                 *self.camera['up'])
         
-        # Position camera behind home plate looking toward the field
-        # Apply rotation for interactive viewing
-        gluLookAt(
-            self.camera_position[0], self.camera_position[1], self.camera_position[2],
-            self.look_at[0], self.look_at[1], self.look_at[2],
-            self.up_vector[0], self.up_vector[1], self.up_vector[2]
-        )
+        # Draw field
+        self.draw_field()
         
-        # Apply user rotation
-        glRotatef(self.x_rotation, 1.0, 0.0, 0.0)
-        glRotatef(self.y_rotation, 0.0, 1.0, 0.0)
+        # Draw walls
+        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, self.materials['wall'])
+        glBegin(GL_QUAD_STRIP)
+        for x, y in self.stadium_outline:
+            glVertex3f(x, y, 0)
+            glVertex3f(x, y, 8)  # 8ft high wall
+        glEnd()
         
-        # Draw the field using display list for performance
-        glCallList(self.field_list)
-        
-        # Draw the ball if it's active
-        if self.show_ball and self.ball_position is not None:
-            x, y, z = self.ball_position
+        # Draw ball if position is set
+        if self.ball_pos is not None:
+            x, y, z = self.ball_pos
             
-            # Draw ball shadow first (black transparent circle on ground)
-            glPushMatrix()
-            glColor4f(0, 0, 0, 0.3)  # Transparent black for shadow
-            glTranslatef(x, y, 0.05)  # Just above ground level
-            glScalef(1.0, 1.0, 0.1)   # Flatten to make a shadow
+            # Set ball material (white)
+            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
             
-            # Scale shadow based on height (smaller when higher)
-            shadow_scale = max(0.5, 1.0 - z/150)
-            glScalef(shadow_scale, shadow_scale, 1.0)
-            
-            gluDisk(self.quadric, 0, self.ball_radius * 1.2, 20, 1)
-            glPopMatrix()
-            
-            # Now draw the actual ball
+            # Draw the ball
             glPushMatrix()
             glTranslatef(x, y, z)
             
-            # Draw white ball
-            glColor3fv(self.ball_color)
-            gluSphere(self.quadric, self.ball_radius, 20, 20)  # radius, slices, stacks
-            
-            # Draw red seams for better visibility
-            self.draw_ball_seams()
+            # Draw a sphere for the ball
+            # Create a sphere with radius 0.5 (baseball size)
+            sphere = gluNewQuadric()
+            gluQuadricDrawStyle(sphere, GLU_FILL)
+            gluQuadricNormals(sphere, GLU_SMOOTH)
+            gluSphere(sphere, 0.5, 16, 16)
+            gluDeleteQuadric(sphere)
             
             glPopMatrix()
-    
-    def draw_ball_seams(self):
-        """Draw simplified baseball seams for better visibility"""
-        glColor3fv(self.ball_seam_color)
-        glLineWidth(2.0)
-        
-        # Draw two curves to represent seams
-        glBegin(GL_LINE_STRIP)
-        for i in range(21):
-            t = i / 20.0
-            angle = t * math.pi * 2
-            x = self.ball_radius * 1.05 * math.sin(angle)
-            y = self.ball_radius * 1.05 * math.cos(angle)
-            z = self.ball_radius * 0.3 * math.sin(angle * 2)
-            glVertex3f(x, y, z)
+            
+            # Draw shadow on the ground
+            glPushMatrix()
+            glTranslatef(x, y, 0.01)  # Slightly above ground to avoid z-fighting
+            
+            # Set shadow material (semi-transparent black)
+            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, 0.5])
+            
+            # Draw a flattened sphere for the shadow
+            # Shadow size decreases with height
+            shadow_scale = max(0.5, 1.0 - z/30)
+            
+            glScalef(shadow_scale, shadow_scale, 0.1)
+            shadow = gluNewQuadric()
+            gluQuadricDrawStyle(shadow, GLU_FILL)
+            gluQuadricNormals(shadow, GLU_SMOOTH)
+            gluSphere(shadow, 0.5, 16, 16)
+            gluDeleteQuadric(shadow)
+            
+            glPopMatrix()
+
+    def draw_field(self):
+        """High-quality field rendering"""
+        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, self.materials['grass'])
+        glBegin(GL_QUADS)
+        glVertex3f(-300, -400, 0)
+        glVertex3f(300, -400, 0)
+        glVertex3f(300, 100, 0)
+        glVertex3f(-300, 100, 0)
         glEnd()
-        
-        glBegin(GL_LINE_STRIP)
-        for i in range(21):
-            t = i / 20.0
-            angle = t * math.pi * 2
-            x = self.ball_radius * 1.05 * math.sin(angle)
-            z = self.ball_radius * 1.05 * math.cos(angle)
-            y = self.ball_radius * 0.3 * math.sin(angle * 2)
-            glVertex3f(x, y, z)
-        glEnd()
-    
-    def update_ball_position(self, x, y, z):
-        """Update the ball position with 3D coordinates
-        
-        Args:
-            x (float): Left/right position in feet (left is negative)
-            y (float): Forward/backward position in feet (forward/outfield is negative)
-            z (float): Height in feet
-            
-        Returns:
-            tuple: The (x, y, z) position that was set
-        """
-        # Store the position
-        self.ball_position = (x, y, z)
-        self.show_ball = True
-        
-        # Trigger a redraw
-        self.update()
-        
-        return self.ball_position
-    
-    def clear_ball(self):
-        """Remove the ball from the scene"""
-        self.show_ball = False
-        self.ball_position = None
-        self.update()
-    
-    def mousePressEvent(self, event):
-        """Handle mouse press for camera rotation"""
-        self.last_pos = event.pos()
-    
-    def mouseMoveEvent(self, event):
-        """Handle mouse movement for camera rotation"""
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            dx = event.x() - self.last_pos.x()
-            dy = event.y() - self.last_pos.y()
-            
-            # Rotate the scene based on mouse movement
-            self.y_rotation += dx / 2.0
-            self.x_rotation += dy / 2.0
-            
-            # Limit vertical rotation to prevent flipping
-            self.x_rotation = max(-70, min(20, self.x_rotation))
-            
-            self.update()
-            self.last_pos = event.pos()
 
 
 class WindVectorWidget(QWidget):
@@ -1095,14 +874,16 @@ class WindVectorWidget(QWidget):
         font.setPointSize(18)
         painter.setFont(font)
         
-        # Position text near the center arrow
-        center_arrow_pos = arrow_positions[1]
-        center_arrow_end_x = center_arrow_pos.x() + length * math.cos(rad_angle)
-        center_arrow_end_y = center_arrow_pos.y() + length * math.sin(rad_angle)
-        
-        # Draw text with no opacity changes
+        # Draw MPH text at fixed position beneath the arrows
         text = f"{self.wind_speed} mph"
-        painter.drawText(QPointF(center_arrow_end_x + 10, center_arrow_end_y + 5), text)
+        
+        font_metrics = painter.fontMetrics()
+        text_width = font_metrics.horizontalAdvance(text)
+        
+        fixed_text_x = self.width() / 2 - text_width / 2
+        fixed_text_y = self.height() - 10  # Lower, but still inside the widget
+        
+        painter.drawText(QPointF(fixed_text_x, fixed_text_y), text)
         
     def draw_arrowhead(self, painter, point, angle, size, color):
         """Draw an arrowhead at the specified position"""
@@ -1135,6 +916,43 @@ class WindVectorWidget(QWidget):
 
 
 
+
+class StadiumSVGManager:
+    def get_clean_outline(self, svg_path):
+        """Extract simplified path from SVG"""
+        try:
+            paths, _ = svg2paths(svg_path)
+            return max(paths, key=lambda p: p.length())
+        except:
+            return None
+    
+    def get_svg_path(self, stadium_name):
+        """Get the SVG path for a given stadium name"""
+        # Check if the stadium exists in the stadium data
+        if stadium_name not in STADIUM_DATA:
+            print(f"Stadium {stadium_name} not found in STADIUM_DATA")
+            return None
+        
+        # Get the image path from the stadium data
+        image_path = STADIUM_DATA[stadium_name]["image_path"]
+        
+        # Extract the filename without path or extension
+        filename = Path(image_path).stem
+        
+        # Create the SVG path in the SVGMLBstadiumgraphics directory
+        svg_path = f"MLBstadiumgraphics/SVGMLBstadiumgraphics/{filename}.svg"
+        
+        # Check if the SVG file exists
+        if not Path(svg_path).exists():
+            print(f"SVG file not found: {svg_path}")
+            return None
+        
+        return svg_path
+
+
+
+
+
 class SplitView(QWidget):
     """Widget that contains both top-down and umpire views"""
     def __init__(self, stadium_image_path, lat, lon, altitude, parent=None, api_key=open_weather_key):
@@ -1153,6 +971,9 @@ class SplitView(QWidget):
         self.dimensions = None
         self.stadium_name = ""
         
+        # Add SVG manager
+        self.svg_manager = StadiumSVGManager()
+        
         # Weather and simulation data
         self.weather_data = None
         self.trajectory_data = None
@@ -1168,7 +989,42 @@ class SplitView(QWidget):
         # Fetch initial weather data
         self.fetch_weather_data()
     
-    # Modification for SplitView.setup_ui() method to reorganize the top section
+    
+    
+    
+    
+    
+    # In SplitView class
+    def update_stadium(self, stadium_name):
+        """Update the stadium when selection changes"""
+        # Get SVG path for the selected stadium
+        svg_path = self.svg_manager.get_svg_path(stadium_name)
+        
+        if stadium_name in STADIUM_DATA:
+            # Update stadium properties
+            self.dimensions = STADIUM_DATA[stadium_name]["dimensions"]
+            self.stadium_name = stadium_name
+            
+            # IMPORTANT: Update the latitude and longitude
+            self.lat = STADIUM_DATA[stadium_name]["lat"]
+            self.lon = STADIUM_DATA[stadium_name]["lon"]
+            self.altitude = STADIUM_DATA[stadium_name]["altitude"]
+            
+            print(f"Updated stadium coordinates: lat={self.lat}, lon={self.lon}")
+            
+            # Update the stadium info label
+            stadium_info = f"{stadium_name}\nAlt: {self.altitude} ft"
+            self.info_label.setText(stadium_info)
+            
+            # 2D View
+            self.stadium_view.load_stadium_svg(svg_path, self.dimensions)
+            
+            # 3D View
+            self.umpire_view.load_stadium_svg(svg_path)
+            self.umpire_view.update()
+        else:
+            print(f"Stadium {stadium_name} not found in STADIUM_DATA")
+    
     def setup_ui(self):
         """Set up the split view UI layout"""
         self.layout = QVBoxLayout(self)
@@ -1190,7 +1046,17 @@ class SplitView(QWidget):
         self.mini_view = QLabel()
         self.mini_view.setMinimumSize(200, 150)  # Increased size
         self.mini_view.setScaledContents(True)
-        self.mini_view.setPixmap(self.stadium_pixmap)
+        
+        def update_stadium_image(self, stadium_name):
+             image_path = os.path.join("EffortScraper/OddsAPI","MLBstadiumgraphics", f"{stadium_name}.gif")
+             if os.path.exists(image_path):
+                 pixmap = QPixmap(image_path)
+                 self.mini_view.setPixmap(pixmap)
+             else:
+                 print(f"⚠️ Image not found for: {stadium_name}")
+
+        
+        
         self.mini_view.setFrameShape(QLabel.Shape.Box)
         stadium_layout.addWidget(self.mini_view)
         
@@ -1243,6 +1109,7 @@ class SplitView(QWidget):
         
         # Update flight_stats_list position when stadium_view is resized
         original_resize_event = self.stadium_view.resizeEvent
+        
         def new_resize_event(event):
             original_resize_event(event)
             self.flight_stats_list.move(
@@ -1264,46 +1131,26 @@ class SplitView(QWidget):
         self.weather_label = QLabel("Weather data: Not loaded")
         self.layout.addWidget(self.weather_label)
     
-    def update_stadium(self, stadium_name):
-        """Update the stadium with data from the selected stadium"""
-        if stadium_name not in STADIUM_DATA:
-            return
-            
-        data = STADIUM_DATA[stadium_name]
-        self.stadium_pixmap = QPixmap(data["image_path"])
-        self.mini_view.setPixmap(self.stadium_pixmap)
-        self.lat = data["lat"]
-        self.lon = data["lon"]
-        self.altitude = data["altitude"]
-        self.dimensions = data["dimensions"]
-        self.stadium_name = stadium_name
-        
-        # Update stadium name and info label
-        self.info_label.setText(f"{stadium_name}\nAlt: {self.altitude} ft")
-        
-        # Draw the new stadium outline in top-down view
-        self.stadium_view.draw_stadium(self.dimensions)
-        
-        # Reset weather and simulation data
-        self.weather_data = None
-        self.trajectory_data = None
-        self.current_frame = 0
-        self.umpire_view.clear_ball()
-        self.update()
-        
-        # Update weather if we already have it
-        if self.weather_data:
-            self.update_weather_visualization()
+    
+    
+    
     
     def fetch_weather_data(self):
         """Fetch real weather data for the stadium location"""
         try:
+            print(f"Fetching weather data for lat: {self.lat}, lon: {self.lon}")
             weather_json = self.weather_service.get_weather_by_location(self.lat, self.lon)
+            print("Weather JSON received:", weather_json)
+            
             self.weather_data = self.weather_service.extract_weather_data(weather_json)
+            print("Extracted weather data:", self.weather_data)
+            
             self.update_weather_label()
             self.update_weather_visualization()
         except Exception as e:
             print(f"Error fetching weather data: {e}")
+            import traceback
+            traceback.print_exc()
             
     def set_custom_weather(self, wind_speed, wind_direction):
         """Set custom weather data for simulation"""
@@ -1358,8 +1205,14 @@ class SplitView(QWidget):
             self.altitude
         )
         
+        # Log trajectory data for debugging
+        print(f"Trajectory starting point: ({self.trajectory_data['x'][0]}, {self.trajectory_data['y'][0]})")
+        print(f"Ball will travel: {self.trajectory_data['distance']:.1f} feet")
+        
         # Initialize ball visualization in top-down view
-        self.stadium_view.start_ball_trajectory(self.trajectory_data)
+        success = self.stadium_view.start_ball_trajectory(self.trajectory_data)
+        if not success:
+            print("Warning: Failed to visualize trajectory in 2D view")
         
         # Clear any existing ball in umpire view
         self.umpire_view.clear_ball()
@@ -1598,7 +1451,12 @@ class MLBWeatherApp(QMainWindow):
 
     def change_stadium(self, stadium_name):
         """Update the stadium when selection changes"""
+        # Update the stadium view
         self.stadium_widget.update_stadium(stadium_name)
+        
+        # Also update the weather data for the new stadium location
+        print(f"Requesting weather update for new stadium: {stadium_name}")
+        self.stadium_widget.fetch_weather_data()
 
     def simulate_flight(self):
         exit_velocity = self.ev_slider.value()
