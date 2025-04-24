@@ -258,19 +258,19 @@ class AdvancedStatsWidget(QWidget):
     def is_stuffplus_mode(self):
         return self.view_selector.currentText() == "Stuff+ Stats"
     
+    
     def on_view_mode_changed(self, index):
         if self.current_sport == 'baseball_mlb':
-            # Check if we have cached data for this view mode
+            # Get the correct cache key for the selected view
             cache_key = self.get_cache_key()
-            if index == 2:  # SP Climate view
-                cache_key = "parkfactors"
             
+            # Check if we have cached data for this view mode
             if cache_key in self.cached_data:
                 print(f"Using cached data for {cache_key}")
                 df = self.cached_data[cache_key]
                 self.display_stats_data(df)
                 
-                # Apply highlighting with cached pitchers
+                # Apply highlighting with cached pitchers (except for park factors)
                 if self.stored_pitchers and index != 2:  # Don't highlight park factors
                     self.highlight_todays_pitchers(self.stored_pitchers)
                 return
@@ -280,10 +280,10 @@ class AdvancedStatsWidget(QWidget):
             if self.loading_task and not self.loading_task.done():
                 self.loading_task.cancel()
                 
-            if index == 0:  # Stuff+ Stats
-                self.loading_task = asyncio.create_task(self.load_stuffplus_data())
-            elif index == 1:  # Percentile Stats
+            if index == 0:  # Percentile Stats
                 self.loading_task = asyncio.create_task(self.load_mlb_percentile_data())
+            elif index == 1:  # Stuff+ Stats  
+                self.loading_task = asyncio.create_task(self.load_stuffplus_data())
             elif index == 2:  # SP Climate
                 # Load park factors data directly as DataFrame
                 try:
@@ -300,6 +300,7 @@ class AdvancedStatsWidget(QWidget):
                     print(f"Error loading park factors: {e}")
                     self.hide_loading_state()
 
+
         
     
     def fetch_stuffplus_data(self):
@@ -312,10 +313,10 @@ class AdvancedStatsWidget(QWidget):
         dfs = pd.read_html(table_wrapper.encode(), encoding="utf-8")
         df = dfs[0]
     
-        # Clean columns
+        # Note the jenk here, as the headers for these DF's are tilting as all hell
         df = df.loc[:, ~df.columns.str.contains('Line Break', na=False)]
         df = df.rename(columns={
-            'Name': 'Name','Team': 'Team', '#': 'Index',            
+            'Name': 'player_name','Team': 'Team', '#': 'Index',            
             'IPIP - Innings Pitched': 'IP',
             'Stf+ FA': 'FA', 'Stf+ SI': 'SI', 'Stf+ FC': 'FC', 'Stf+ FS': 'FS',
             'Stf+ SL': 'SL', 'Stf+ CU': 'CU', 'Stf+ CH': 'CH', 'Stf+ KC': 'KC', 'Stf+ FO': 'FO',
