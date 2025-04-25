@@ -862,16 +862,16 @@ class WindVectorWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Draw wind vectors in center of widget
+        # Draw wind vectors across the full width
         width = self.width()
         height = self.height()
         
-        # Create three large prominent arrows across the top area
-        arrow_positions = [
-            QPointF(width * 0.25, height * 0.55),  # Left
-            QPointF(width * 0.5, height * 0.55),   # Center
-            QPointF(width * 0.75, height * 0.55)   # Right
-        ]
+        # Create more arrow positions spread across the full width
+        num_arrows = 5  # Increase number of arrows
+        arrow_positions = []
+        for i in range(num_arrows):
+            x_pos = width * (i + 0.5) / num_arrows  # Evenly space across width
+            arrow_positions.append(QPointF(x_pos, height * 0.55))
         
         # Convert meteorological to mathematical angle
         math_angle = (270 - self.wind_direction) % 360
@@ -1078,41 +1078,12 @@ class SplitView(QWidget):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
         
-        # Create top section with wind vector widget and miniature view side by side
-        top_layout = QHBoxLayout()
+        # Create top section with only the wind vector widget taking full width
+        top_layout = QVBoxLayout()  # Changed to vertical layout
         
-        # Add the wind vector widget taking 70% of the width (increased from 60%)
+        # Add the wind vector widget taking full width
         self.wind_vector_widget = WindVectorWidget()
-        top_layout.addWidget(self.wind_vector_widget, 70)  # Increased from 60
-        
-        # Create a container for the stadium image
-        stadium_container = QWidget()
-        stadium_layout = QVBoxLayout(stadium_container)
-        stadium_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Miniature view of the actual stadium image - make larger
-        self.mini_view = QLabel()
-        self.mini_view.setMinimumSize(200, 150)  # Increased size
-        self.mini_view.setScaledContents(True)
-        
-        def update_stadium_image(self, stadium_name):
-             image_path = os.path.join("EffortScraper/OddsAPI","MLBstadiumgraphics", f"{stadium_name}.gif")
-             if os.path.exists(image_path):
-                 pixmap = QPixmap(image_path)
-                 self.mini_view.setPixmap(pixmap)
-             else:
-                 print(f"⚠️ Image not found for: {stadium_name}")
-
-        
-        
-        self.mini_view.setFrameShape(QLabel.Shape.Box)
-        stadium_layout.addWidget(self.mini_view)
-        
-        # The stadium info label is now moved to the stadium view
-        # and no longer added to the top layout
-        self.info_label = QLabel("Stadium Info")
-        
-        top_layout.addWidget(stadium_container, 30)  # Decreased from 40
+        top_layout.addWidget(self.wind_vector_widget)
         
         self.layout.addLayout(top_layout)
         
@@ -1129,13 +1100,14 @@ class SplitView(QWidget):
         self.stadium_view.setMinimumSize(1000, 850)
         stadium_view_layout.addWidget(self.stadium_view)
         
-        # Stadium info label positioned at top-right of stadium view using absolute positioning
+        # Stadium info label positioned at top-right of stadium view
+        self.info_label = QLabel("Stadium Info")
         self.info_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 120); padding: 5px;")
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         self.info_label.setMinimumSize(100,80)
         self.info_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.info_label.setParent(self.stadium_view)
-        self.info_label.move(self.stadium_view.width() - 150, 10)  # Position in top right
+        self.info_label.move(self.stadium_view.width() - 150, 10)
         self.info_label.show()
         
         # Connect resize event to reposition the label
@@ -1146,12 +1118,12 @@ class SplitView(QWidget):
         
         # Add flight stats list widget positioned at bottom right of stadium view
         self.flight_stats_list = QListWidget(self.stadium_view)
-        self.flight_stats_list.setMinimumWidth(400)  # Increased from 300
+        self.flight_stats_list.setMinimumWidth(400)
         self.flight_stats_list.setMaximumHeight(150)
         self.flight_stats_list.setStyleSheet("background-color: rgba(0, 0, 0, 150); color: white;")
         self.flight_stats_list.move(
-            self.stadium_view.width() - 420,  # Position 420px from right edge
-            self.stadium_view.height() - 160   # Position 160px from bottom
+            self.stadium_view.width() - 420,
+            self.stadium_view.height() - 160
         )
         self.flight_stats_list.show()
         
