@@ -24,12 +24,22 @@ from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
 from pywavefront import Wavefront
-
+from pyqtgraph import Vector
 
 
 # Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
 #TODO: PROPERLY LOAD AND DISPLAY .OBJ PARK MODEL IN QopenGLWidget 
 # Load the materials as well if possible from baseballfield.mtl
+
+fmt = QSurfaceFormat()
+fmt.setSamples(4)
+fmt.setDepthBufferSize(24)
+fmt.setStencilBufferSize(8)
+fmt.setVersion(3, 3)
+fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+QSurfaceFormat.setDefaultFormat(fmt)
+
+
 
 # ==============================================
 # Ball Flight Physics Component
@@ -43,6 +53,8 @@ class BallFlightSimulator:
         self.C_d = 0.3  # drag coefficient
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
+        OBJ_POSITION = [-515.808441, 41.099228, -760.366211]  
+        OBJ_SCALE = 0.1  # Initial scale factor
 
     def calculate_trajectory(self, exit_velocity, launch_angle, wind_speed, wind_direction, temp, humidity, altitude):
         """Calculate ball trajectory based on initial conditions and environment"""
@@ -627,57 +639,80 @@ class StadiumView(QGraphicsView):
 class UmpireView3D(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.stadium_outline = []
         self.ball_pos = None
-        self.textures = {}
+        self.ballpark_model = None
+        self.textures = {}  # For texture caching if needed
         
-        # Improved camera setup
+        # Set format for better rendering
+        fmt = QSurfaceFormat()
+        fmt.setSamples(4)  # 4x MSAA
+        self.setFormat(fmt)
+        
+        # Load model with error handling
+        try:
+            self.ballpark_model = Wavefront(
+                'baseballfield.obj',
+                create_materials=True,
+                collect_faces=True,
+                strict=False,  # Tolerate format issues
+                parse=True
+            )
+            print(f"Loaded 3D model with {len(self.ballpark_model.materials)} materials")
+        except Exception as e:
+            print(f"Error loading 3D model: {str(e)}")
+            self.ballpark_model = None
+        
+        # Camera setup
         self.camera = {
-            'pos': [0, 15, 3],
-            'target': [0, -100, 0],
+            'pos': [-20.254,18.313,7.4765],
+            'target': [0,0,0],
             'up': [0, 0, 1],
-            'fov': 45
+            'fov': 55
         }
         
-        # Enhanced materials
-        self.materials = {
-            'grass': [0.15, 0.6, 0.15, 1.0],
-            'wall': [0.4, 0.4, 0.4, 1.0],
-            'dirt': [0.7, 0.5, 0.3, 1.0]
-        }
+        
+       
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
+        glEnable(GL_COLOR_MATERIAL)
+        glClearColor(0.1, 0.1, 0.15, 1.0)
+        
+        if self.ballpark_model:
+            self.compile_stadium_display_list()
+        
         glLightfv(GL_LIGHT0, GL_POSITION, [5, 5, 10, 1])
         glLightfv(GL_LIGHT0, GL_DIFFUSE, [1, 1, 1, 1])
         glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.5, 0.5, 0.5, 1])
-
-    def load_stadium_svg(self, svg_path):
-        """Extract clean outline from SVG"""
+        self.stadium_display_list = None
         
-        try:
-            doc = minidom.parse(svg_path)
-            path_strings = [path.getAttribute('d') 
-                          for path in doc.getElementsByTagName('path')
-                          if 'outfield' in path.getAttribute('id').lower()]
-            if path_strings:
-                path = parse_path(path_strings[0])
-                self.stadium_outline = [(p.real, p.imag) for p in 
-                                      (path[0].start, *[seg.end for seg in path])]
-        except Exception as e:
-            print(f"3D SVG Error: {e}")
-            self.generate_default_outline()
+        if self.stadium_display_list is None and self.ballpark_model:
+            self.stadium_display_list = glGenLists(1)
+            glNewList(self.stadium_display_list, GL_COMPILE)
+        
+            glPushMatrix()
+            glTranslatef(0,0,0)
+            glScalef(0.1, 0.1, 0.1)
+        
+            vertices = self.ballpark_model.vertices
+            for mesh in self.ballpark_model.mesh_list:
+                # set material...
+                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+                glBegin(GL_TRIANGLES)
+                for face in mesh.faces:
+                    for vertex_i in face:
+                        glVertex3f(*vertices[vertex_i])
+                glEnd()
+        
 
-    def generate_default_outline(self):
-        """Parametric stadium outline"""
-        self.stadium_outline = []
-        for angle in np.linspace(-45, 45, 50):
-            rad = np.radians(angle)
-            x = 300 * np.sin(rad)
-            y = -300 * np.cos(rad)
-            self.stadium_outline.append((x, y))
+            glPopMatrix()
+            glEndList()
+        
+
+    
 
 
     def clear_ball(self):
@@ -705,72 +740,122 @@ class UmpireView3D(QOpenGLWidget):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
         gluPerspective(self.camera['fov'], 
-                      self.width()/self.height(), 0.1, 500)
-        gluLookAt(*self.camera['pos'], 
-                 *self.camera['target'], 
+                      self.width()/self.height(), 
+                      0.1, 500)
+        gluLookAt(*self.camera['pos'],
+                 *self.camera['target'],
                  *self.camera['up'])
         
-        # Draw field
-        self.draw_field()
+        # Lighting setup
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glLightfv(GL_LIGHT0, GL_POSITION, [50, 50, 100, 1])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1, 1, 1, 1])
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [1, 1, 1, 1])
+        glEnable(GL_COLOR_MATERIAL)
         
-        # Draw walls
-        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, self.materials['wall'])
-        glBegin(GL_QUAD_STRIP)
-        for x, y in self.stadium_outline:
-            glVertex3f(x, y, 0)
-            glVertex3f(x, y, 8)  # 8ft high wall
-        glEnd()
+        if self.stadium_display_list:
+            glCallList(self.stadium_display_list)
         
-        # Draw ball if position is set
+        # Render stadium model
+        #if self.ballpark_model:
+        #    glPushMatrix()
+        #    glTranslatef(-515.808441, 41.099228, -760.366211)
+        #    glScalef(0.1, 0.1, 0.1)
+        #    
+        #    vertices = self.ballpark_model.vertices
+        #    for mesh in self.ballpark_model.mesh_list:
+        #        # Set material before glBegin()
+        #        if hasattr(mesh, 'materials') and mesh.materials:
+        #            try:
+        #                mtl_name = mesh.materials[0]
+        #                if mtl_name in self.ballpark_model.materials:
+        #                    mtl = self.ballpark_model.materials[mtl_name]
+        #                    glMaterialfv(GL_FRONT, GL_AMBIENT, mtl.ambient)
+        #                    glMaterialfv(GL_FRONT, GL_DIFFUSE, mtl.diffuse)
+        #                    glMaterialfv(GL_FRONT, GL_SPECULAR, mtl.specular)
+        #                    glMaterialf(GL_FRONT, GL_SHININESS, mtl.shininess)
+        #            except Exception as e:
+        #                print(f"Material error: {str(e)}")
+        #                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+        #        else:
+        #            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+        #        
+        #        glBegin(GL_TRIANGLES)
+        #        for face in mesh.faces:
+        #            for vertex_i in face:
+        #                glVertex3f(*vertices[vertex_i])
+        #        glEnd()
+        #    
+        #    glPopMatrix()
+        
+        # Ball rendering
         if self.ball_pos is not None:
             x, y, z = self.ball_pos
             
-            # Set ball material (white)
             glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
             
-            # Draw the ball
             glPushMatrix()
             glTranslatef(x, y, z)
-            
-            # Draw a sphere for the ball
-            # Create a sphere with radius 0.5 (baseball size)
             sphere = gluNewQuadric()
             gluQuadricDrawStyle(sphere, GLU_FILL)
             gluQuadricNormals(sphere, GLU_SMOOTH)
             gluSphere(sphere, 0.5, 16, 16)
             gluDeleteQuadric(sphere)
-            
             glPopMatrix()
             
-            # Draw shadow on the ground
             glPushMatrix()
-            glTranslatef(x, y, 0.01)  # Slightly above ground to avoid z-fighting
-            
-            # Set shadow material (semi-transparent black)
+            glTranslatef(x, y, 0.01)
             glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, 0.5])
-            
-            # Draw a flattened sphere for the shadow
-            # Shadow size decreases with height
             shadow_scale = max(0.5, 1.0 - z/30)
-            
             glScalef(shadow_scale, shadow_scale, 0.1)
             shadow = gluNewQuadric()
             gluQuadricDrawStyle(shadow, GLU_FILL)
             gluQuadricNormals(shadow, GLU_SMOOTH)
             gluSphere(shadow, 0.5, 16, 16)
             gluDeleteQuadric(shadow)
-            
             glPopMatrix()
 
-    def draw_field(self):
-        """High-quality field rendering"""
-        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, self.materials['grass'])
-        glBegin(GL_QUADS)
-        glVertex3f(-300, -400, 0)
-        glVertex3f(300, -400, 0)
-        glVertex3f(300, 100, 0)
-        glVertex3f(-300, 100, 0)
-        glEnd()
+    def compile_stadium_display_list(self):
+        if not self.ballpark_model:
+            return
+        
+        self.stadium_display_list = glGenLists(1)
+        glNewList(self.stadium_display_list, GL_COMPILE)
+    
+        glPushMatrix()
+        glTranslatef(-515.808441, 41.099228, -760.366211)
+        glScalef(0.1, 0.1, 0.1)
+    
+        vertices = self.ballpark_model.vertices
+        for mesh in self.ballpark_model.mesh_list:
+            # Set material before drawing
+            if hasattr(mesh, 'materials') and mesh.materials:
+                try:
+                    mtl_name = mesh.materials[0]
+                    if mtl_name in self.ballpark_model.materials:
+                        mtl = self.ballpark_model.materials[mtl_name]
+                        glMaterialfv(GL_FRONT, GL_AMBIENT, mtl.ambient)
+                        glMaterialfv(GL_FRONT, GL_DIFFUSE, mtl.diffuse)
+                        glMaterialfv(GL_FRONT, GL_SPECULAR, mtl.specular)
+                        glMaterialf(GL_FRONT, GL_SHININESS, mtl.shininess)
+                except Exception as e:
+                    print(f"Material error: {str(e)}")
+                    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+            else:
+                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+    
+            glBegin(GL_TRIANGLES)
+            for face in mesh.faces:
+                for vertex_i in face:
+                    glVertex3f(*vertices[vertex_i])
+            glEnd()
+    
+        glPopMatrix()
+        glEndList()
+        print("✅ Stadium model compiled into display list")
+
+    
 
 
 class WindVectorWidget(QWidget):
@@ -1021,7 +1106,6 @@ class SplitView(QWidget):
             self.stadium_view.load_stadium_svg(svg_path, self.dimensions)
             
             # 3D View
-            self.umpire_view.load_stadium_svg(svg_path)
             self.umpire_view.update()
         else:
             print(f"Stadium {stadium_name} not found in STADIUM_DATA")
