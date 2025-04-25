@@ -24,7 +24,7 @@ from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
 from pywavefront import Wavefront
-from pyqtgraph import Vector
+
 
 
 # Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
@@ -53,7 +53,7 @@ class BallFlightSimulator:
         self.C_d = 0.3  # drag coefficient
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
-        OBJ_POSITION = [-515.808441, 41.099228, -760.366211]  
+        OBJ_POSITION = [0,0,0]  
         OBJ_SCALE = 0.1  # Initial scale factor
 
     def calculate_trajectory(self, exit_velocity, launch_angle, wind_speed, wind_direction, temp, humidity, altitude):
@@ -483,6 +483,10 @@ class StadiumView(QGraphicsView):
         # Scale factor - must match the one used in load_stadium_svg
         scale_factor = 2.0
         
+        # Set a fixed home plate position - this is the key change
+        fixed_home_x = 0
+        fixed_home_y = 255  # Adjust this value to match your desired position
+        
         # Create the ball
         ball_size = 10
         self.ball_item = QGraphicsEllipseItem(-ball_size/2, -ball_size/2, ball_size, ball_size)
@@ -495,36 +499,38 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setBrush(QBrush(QColor(0, 0, 0, 150)))
         self.shadow_item.setPen(QPen(Qt.PenStyle.NoPen))
         
-        # Create trajectory path with proper scaling
+        # Create trajectory path with fixed starting point
         path = QPainterPath()
+        path.moveTo(fixed_home_x, fixed_home_y)
         
-        # Starting point (home plate at 0,0)
-        path.moveTo(0, 0)
-        
-        # Add points along trajectory with proper scaling
         for i in range(0, len(trajectory_data["x"]), 5):
-            # Scale the coordinates to match our field display
-            scene_x = trajectory_data["y"][i] * scale_factor
-            scene_y = -trajectory_data["x"][i] * scale_factor
-            
+            scene_x = fixed_home_x + trajectory_data["y"][i] * scale_factor
+            scene_y = fixed_home_y - trajectory_data["x"][i] * scale_factor
             path.lineTo(scene_x, scene_y)
         
-        # Create path item with thicker, more visible line
         self.trajectory_path = QGraphicsPathItem(path)
         self.trajectory_path.setPen(QPen(QColor(255, 140, 0), 3, Qt.PenStyle.DashLine))
-        self.trajectory_path.setZValue(100)  # Put trajectory on top of everything
         
-        # Add items to scene - add to ball layer which is on top of stadium layer
+        # Add everything to the scene
         self.ball_layer.addToGroup(self.shadow_item)
         self.ball_layer.addToGroup(self.trajectory_path)
         self.ball_layer.addToGroup(self.ball_item)
         
-        # Make sure ball layer is visible
-        self.ball_layer.setVisible(True)
-        self.ball_layer.setZValue(100)  # Ensure ball layer is on top
+        # Set the ball position DIRECTLY - not through setPos
+        self.ball_item.setX(fixed_home_x)
+        self.ball_item.setY(fixed_home_y)
         
-        # Set initial positions
-        self.update_ball_position(trajectory_data, 0)
+        # Set the shadow position DIRECTLY
+        self.shadow_item.setX(fixed_home_x)
+        self.shadow_item.setY(fixed_home_y)
+        
+        # Store the home position for animation
+        self.home_plate_x = fixed_home_x
+        self.home_plate_y = fixed_home_y
+        
+        # Make visible
+        self.ball_layer.setVisible(True)
+        self.ball_layer.setZValue(100)
         
         return True
 
@@ -536,20 +542,20 @@ class StadiumView(QGraphicsView):
         # Scale factor - must match the one used in load_stadium_svg
         scale_factor = 2.0
         
-        # Get coordinates with proper scaling
-        x = trajectory_data["y"][frame] * scale_factor
-        y = -trajectory_data["x"][frame] * scale_factor
+        # Get coordinates with proper scaling from the home plate position
+        x = self.home_plate_x + trajectory_data["y"][frame] * scale_factor
+        y = self.home_plate_y - trajectory_data["x"][frame] * scale_factor
         z = trajectory_data["z"][frame]
         
-        # Update ball position
-        self.ball_item.setPos(x, y)
+        # Set positions DIRECTLY
+        self.ball_item.setX(x)
+        self.ball_item.setY(y)
+        self.shadow_item.setX(x)
+        self.shadow_item.setY(y)
         
         # Scale ball based on height
         height_factor = max(0.8, min(1.5, 1 + z/100))
         self.ball_item.setScale(height_factor)
-        
-        # Update shadow position (directly below ball on ground)
-        self.shadow_item.setPos(x, y)
         
         # Make shadow more transparent based on height
         opacity = max(0.2, 1.0 - z/200)
@@ -558,46 +564,10 @@ class StadiumView(QGraphicsView):
         # Scale shadow size inversely proportional to height
         shadow_scale = max(0.5, 1.0 - z/300)
         self.shadow_item.setScale(shadow_scale)
-        
-        # Ensure the ball items are visible
-        self.ball_item.setVisible(True)
-        self.shadow_item.setVisible(True)
-        self.trajectory_path.setVisible(True)
         
         return True
     
-    def update_ball_position(self, trajectory_data, frame):
-        """Update the ball position for animation"""
-        if frame >= len(trajectory_data["x"]):
-            return False
-        
-        # Scale factor - must match the one used in draw_stadium
-        scale_factor = 2.0
-        
-        # Get coordinates with proper scaling
-        x = trajectory_data["y"][frame] * scale_factor
-        y = -trajectory_data["x"][frame] * scale_factor
-        z = trajectory_data["z"][frame]
-        
-        # Update ball position
-        self.ball_item.setPos(x, y)
-        
-        # Scale ball based on height
-        height_factor = max(0.8, min(1.5, 1 + z/100))
-        self.ball_item.setScale(height_factor)
-        
-        # Update shadow position (directly below ball on ground)
-        self.shadow_item.setPos(x, y)
-        
-        # Make shadow more transparent based on height
-        opacity = max(0.2, 1.0 - z/200)
-        self.shadow_item.setOpacity(opacity)
-        
-        # Scale shadow size inversely proportional to height
-        shadow_scale = max(0.5, 1.0 - z/300)
-        self.shadow_item.setScale(shadow_scale)
-        
-        return True
+
     
     def stop_wind_animation(self):
         """Stop the wind vector animation"""
@@ -664,7 +634,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Camera setup
         self.camera = {
-            'pos': [-20.254,18.313,7.4765],
+            'pos': [-24.254,15.313,5.4765],
             'target': [0,0,0],
             'up': [0, 0, 1],
             'fov': 55
@@ -739,62 +709,47 @@ class UmpireView3D(QOpenGLWidget):
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
-        gluPerspective(self.camera['fov'], 
-                      self.width()/self.height(), 
-                      0.1, 500)
-        gluLookAt(*self.camera['pos'],
-                 *self.camera['target'],
-                 *self.camera['up'])
         
-        # Lighting setup
+        # Set up perspective
+        gluPerspective(self.camera['fov'], self.width()/self.height(), 0.1, 500)
+        gluLookAt(*self.camera['pos'], *self.camera['target'], *self.camera['up'])
+        
+        # Improved lighting setup
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
-        glLightfv(GL_LIGHT0, GL_POSITION, [50, 50, 100, 1])
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1, 1, 1, 1])
-        glLightfv(GL_LIGHT0, GL_SPECULAR, [1, 1, 1, 1])
-        glEnable(GL_COLOR_MATERIAL)
+        glEnable(GL_LIGHT1)  # Add a second light
         
+        # Main light (simulates sun)
+        glLightfv(GL_LIGHT0, GL_POSITION, [50, 50, 100, 1])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.8, 0.8, 0.8, 1])
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [0.5, 0.5, 0.5, 1])
+        
+        # Fill light (simulates ambient light)
+        glLightfv(GL_LIGHT1, GL_POSITION, [-30, -30, 50, 1])
+        glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.4, 0.4, 0.5, 1])
+        glLightfv(GL_LIGHT1, GL_AMBIENT, [0.2, 0.2, 0.3, 1])
+        
+        # Global ambient light for better visibility
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
+        
+        # Enable material properties
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT, GL_AMBIENT_AND_DIFFUSE)
+        
+        # Render stadium model using display list if available
         if self.stadium_display_list:
             glCallList(self.stadium_display_list)
-        
-        # Render stadium model
-        #if self.ballpark_model:
-        #    glPushMatrix()
-        #    glTranslatef(-515.808441, 41.099228, -760.366211)
-        #    glScalef(0.1, 0.1, 0.1)
-        #    
-        #    vertices = self.ballpark_model.vertices
-        #    for mesh in self.ballpark_model.mesh_list:
-        #        # Set material before glBegin()
-        #        if hasattr(mesh, 'materials') and mesh.materials:
-        #            try:
-        #                mtl_name = mesh.materials[0]
-        #                if mtl_name in self.ballpark_model.materials:
-        #                    mtl = self.ballpark_model.materials[mtl_name]
-        #                    glMaterialfv(GL_FRONT, GL_AMBIENT, mtl.ambient)
-        #                    glMaterialfv(GL_FRONT, GL_DIFFUSE, mtl.diffuse)
-        #                    glMaterialfv(GL_FRONT, GL_SPECULAR, mtl.specular)
-        #                    glMaterialf(GL_FRONT, GL_SHININESS, mtl.shininess)
-        #            except Exception as e:
-        #                print(f"Material error: {str(e)}")
-        #                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
-        #        else:
-        #            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
-        #        
-        #        glBegin(GL_TRIANGLES)
-        #        for face in mesh.faces:
-        #            for vertex_i in face:
-        #                glVertex3f(*vertices[vertex_i])
-        #        glEnd()
-        #    
-        #    glPopMatrix()
         
         # Ball rendering
         if self.ball_pos is not None:
             x, y, z = self.ball_pos
             
+            # Set white material for the ball
             glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
+            glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
+            glMaterialf(GL_FRONT, GL_SHININESS, 80.0)
             
+            # Draw ball
             glPushMatrix()
             glTranslatef(x, y, z)
             sphere = gluNewQuadric()
@@ -804,15 +759,22 @@ class UmpireView3D(QOpenGLWidget):
             gluDeleteQuadric(sphere)
             glPopMatrix()
             
+            # Draw shadow - more subtle shadow with transparency
             glPushMatrix()
-            glTranslatef(x, y, 0.01)
+            glTranslatef(x, y, 0.01)  # Just above ground
             glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, 0.5])
+            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.0, 0.0, 0.0, 0.0])
+            glMaterialf(GL_FRONT, GL_SHININESS, 0.0)
+            
+            # Shadow size scales with height
             shadow_scale = max(0.5, 1.0 - z/30)
             glScalef(shadow_scale, shadow_scale, 0.1)
+            
+            # Draw shadow
             shadow = gluNewQuadric()
             gluQuadricDrawStyle(shadow, GLU_FILL)
             gluQuadricNormals(shadow, GLU_SMOOTH)
-            gluSphere(shadow, 0.5, 16, 16)
+            gluDisk(shadow, 0, 0.5, 16, 1)  # Use disk instead of sphere for shadow
             gluDeleteQuadric(shadow)
             glPopMatrix()
 
@@ -824,8 +786,9 @@ class UmpireView3D(QOpenGLWidget):
         glNewList(self.stadium_display_list, GL_COMPILE)
     
         glPushMatrix()
-        glTranslatef(-515.808441, 41.099228, -760.366211)
+        glTranslatef(0,0,0,)
         glScalef(0.1, 0.1, 0.1)
+        glRotatef(-90, 1, 0, 0)
     
         vertices = self.ballpark_model.vertices
         for mesh in self.ballpark_model.mesh_list:
