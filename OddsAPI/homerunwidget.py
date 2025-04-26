@@ -86,6 +86,7 @@ class BallFlightSimulator:
             max_step=0.01
         )
 
+        # TODO: why the hell is this only using solution.y????
         # Convert back to imperial units for display
         x = solution.y[0] * 3.28084  # m to ft
         y = solution.y[1] * 3.28084  # m to ft
@@ -298,8 +299,6 @@ class StadiumView(QGraphicsView):
             # Add to stadium layer
             self.stadium_layer.addToGroup(self.stadium_svg_item)
             
-            # Add distance markers
-            self.add_distance_markers(dimensions, scale_factor)
             
             # Resize scene to fit the stadium with margin
             margin = 150
@@ -318,47 +317,9 @@ class StadiumView(QGraphicsView):
         except Exception as e:
             print(f"Error loading SVG: {e}")
             # Fall back to drawing method
-            self.draw_stadium(dimensions)
     
-    def draw_stadium(self, dimensions):
-        """Legacy method for backward compatibility - creates and loads SVG on the fly"""
-        # Generate a basic SVG based on dimensions
-        svg_path = f"temp_stadium_{id(dimensions)}.svg"
-        svg_manager = StadiumSVGManager()
-        svg_content = svg_manager.generate_basic_stadium_svg("Stadium", dimensions)
-        
-        # Save to temporary file
-        with open(svg_path, 'w') as f:
-            f.write(svg_content)
-        
-        # Load the SVG
-        self.load_stadium_svg(svg_path, dimensions)
     
-    def add_distance_markers(self, dimensions, scale_factor):
-        """Add distance markers at key points along the outfield wall"""
-        # Calculate points for distance markers
-        # Left field corner
-        left_angle = math.radians(45)
-        left_x = -dimensions["left_field"] * scale_factor * math.sin(left_angle)
-        left_y = -dimensions["left_field"] * scale_factor * math.cos(left_angle)
-        
-        # Left-center
-        left_center_angle = math.radians(22.5)
-        left_center_x = -dimensions["left_center"] * scale_factor * math.sin(left_center_angle)
-        left_center_y = -dimensions["left_center"] * scale_factor * math.cos(left_center_angle)
-        
-        # Center field
-        center_y = -dimensions["center_field"] * scale_factor
-        
-        # Right-center
-        right_center_angle = math.radians(22.5)
-        right_center_x = dimensions["right_center"] * scale_factor * math.sin(right_center_angle)
-        right_center_y = -dimensions["right_center"] * scale_factor * math.cos(right_center_angle)
-        
-        # Right field corner
-        right_angle = math.radians(45)
-        right_x = dimensions["right_field"] * scale_factor * math.sin(right_angle)
-        right_y = -dimensions["right_field"] * scale_factor * math.cos(right_angle)
+    
 
     
     def draw_wind_indicators(self, speed, direction):
@@ -634,13 +595,13 @@ class UmpireView3D(QOpenGLWidget):
         
         # Camera setup
         self.camera = {
-            'pos': [-24.254,15.313,5.4765],
-            'target': [0,0,0],
-            'up': [0, 0, 1],
-            'fov': 55
+            'pos': [-10.5, 3.5, 3],
+            'target': [0, 0, 0],
+            'up': [0, 1, 0],
+            'fov': 90
         }
         
-        
+        self.control_mode = 'camera'
        
 
     def initializeGL(self):
@@ -704,8 +665,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Request a redraw of the scene
         self.update()
-        
-        
+    
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -713,24 +673,6 @@ class UmpireView3D(QOpenGLWidget):
         # Set up perspective
         gluPerspective(self.camera['fov'], self.width()/self.height(), 0.1, 500)
         gluLookAt(*self.camera['pos'], *self.camera['target'], *self.camera['up'])
-        
-        # Improved lighting setup
-        glEnable(GL_LIGHTING)
-        glEnable(GL_LIGHT0)
-        glEnable(GL_LIGHT1)  # Add a second light
-        
-        # Main light (simulates sun)
-        glLightfv(GL_LIGHT0, GL_POSITION, [50, 50, 100, 1])
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.8, 0.8, 0.8, 1])
-        glLightfv(GL_LIGHT0, GL_SPECULAR, [0.5, 0.5, 0.5, 1])
-        
-        # Fill light (simulates ambient light)
-        glLightfv(GL_LIGHT1, GL_POSITION, [-30, -30, 50, 1])
-        glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.4, 0.4, 0.5, 1])
-        glLightfv(GL_LIGHT1, GL_AMBIENT, [0.2, 0.2, 0.3, 1])
-        
-        # Global ambient light for better visibility
-        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
         
         # Enable material properties
         glEnable(GL_COLOR_MATERIAL)
@@ -792,6 +734,11 @@ class UmpireView3D(QOpenGLWidget):
     
         vertices = self.ballpark_model.vertices
         for mesh in self.ballpark_model.mesh_list:
+            if not hasattr(mesh, 'materials'):
+                print(f"mesh does not have any materials: {mesh}")
+            elif not mesh.materials:
+                print(f"mesh has no materials - nothing is loaded! {mesh}")
+            
             # Set material before drawing
             if hasattr(mesh, 'materials') and mesh.materials:
                 try:
@@ -804,8 +751,10 @@ class UmpireView3D(QOpenGLWidget):
                         glMaterialf(GL_FRONT, GL_SHININESS, mtl.shininess)
                 except Exception as e:
                     print(f"Material error: {str(e)}")
+                    print("OH NO SOME BULLSHIT!!!")
                     glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
             else:
+                print("OH NO SOME BULLSHIT!!!")
                 glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
     
             glBegin(GL_TRIANGLES)
@@ -1143,7 +1092,7 @@ class SplitView(QWidget):
         # 3D umpire view on the right
         self.umpire_view = UmpireView3D()
         self.umpire_view.setMinimumSize(800, 600)
-        views_layout.addWidget(self.umpire_view, 75)
+        views_layout.addWidget(self.umpire_view)
         
         self.layout.addLayout(views_layout)
         
@@ -1285,8 +1234,8 @@ class SplitView(QWidget):
         # Update ball position in 3D umpire view
         # Convert ball coordinates for umpire view perspective
         # Note: For 3D view, we can use the actual coordinates directly
-        x = self.trajectory_data["y"][self.current_frame]  # Side to side (left/right field)
-        y = -self.trajectory_data["x"][self.current_frame]  # Distance from plate (negative is toward outfield)
+        x = self.trajectory_data["x"][self.current_frame]  # Side to side (left/right field)
+        y = self.trajectory_data["y"][self.current_frame]  # Distance from plate (negative is toward outfield)
         z = self.trajectory_data["z"][self.current_frame]  # Height
         
         self.umpire_view.update_ball_position(x, y, z)
@@ -1395,7 +1344,7 @@ class MLBWeatherApp(QMainWindow):
         la_group = QGroupBox("Launch Angle (degrees)")
         la_layout = QVBoxLayout()
         self.la_slider = QSlider(Qt.Orientation.Horizontal)
-        self.la_slider.setRange(0, 45)
+        self.la_slider.setRange(0, 90)
         self.la_slider.setValue(25)
         self.la_value = QLabel("25")
         self.la_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1468,6 +1417,32 @@ class MLBWeatherApp(QMainWindow):
         
         controls_main_layout.addLayout(bottom_controls)
         main_layout.addWidget(controls_container)
+        self.control_target = 'pos'
+        self.control_index = 2
+        self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
+    
+    def keyPressEvent(self, a0):
+        self.clearFocus()
+        print(f"Keypress: {a0.key()}")
+        if (a0.key() == Qt.Key.Key_C):
+            print(self.stadium_widget.umpire_view.control_mode)
+        
+        if (a0.key() in (Qt.Key.Key_Comma, Qt.Key.Key_Period)):
+            if (a0.key() == Qt.Key.Key_Comma):  self.control_value -= 0.1;
+            if (a0.key() == Qt.Key.Key_Period): self.control_value += 0.1;
+            self.stadium_widget.umpire_view.camera[self.control_target][self.control_index] = self.control_value
+            print(f"control value: {self.control_value}")
+            self.stadium_widget.umpire_view.update()
+        
+        for I in range(3):
+            if (a0.key() == eval(f"Qt.Key.Key_{I+1}")):
+                print(f"control index: {I}")
+                self.control_index = I
+                self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
+                print(f"control value: {self.control_value}")
+                
+        super().keyPressEvent(a0) # delegate back to base keybind handling
+        return
 
     def change_stadium(self, stadium_name):
         """Update the stadium when selection changes"""

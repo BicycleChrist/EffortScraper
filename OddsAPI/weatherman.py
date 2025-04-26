@@ -10,7 +10,7 @@ from Creds import open_weather_key
 # ==============================================
 STADIUM_DATA = {
     "American Family field": {  # Milwaukee Brewers
-        "image_path": "MLBstadiumgraphics/GreatAmericanBallpark.gif",
+        "image_path": "MLBstadiumgraphics/AmericanFamilyField.gif",
         "lat": 43.0280,
         "lon": -87.9712,
         "altitude": 602,
