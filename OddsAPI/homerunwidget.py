@@ -602,7 +602,115 @@ class UmpireView3D(QOpenGLWidget):
         }
         
         self.control_mode = 'camera'
-       
+        
+        # Model properties - adjusted for better positioning
+        self.model_position = [0, 0, 0]
+        self.model_scale = 1.0     # Try different scales as needed
+        self.model_rotation = [0, 0, 0]  # No rotation initially
+        
+        # breaks everything if commented out will remove FUCKING INANE
+        self.load_timer = QTimer(self)
+        self.load_timer.setSingleShot(True)
+        self.load_timer.timeout.connect(self.load_model)
+        self.load_timer.start(1)
+
+    def load_model(self):
+        """Load the 3D model"""
+        try:
+            import pyassimp
+            print("Loading model with PyAssimp...")
+    
+            # Use context manager to ensure proper release of resources
+            with pyassimp.load('baseballfield.obj',
+                    processing=pyassimp.postprocess.aiProcess_Triangulate |
+                               pyassimp.postprocess.aiProcess_JoinIdenticalVertices |
+                               pyassimp.postprocess.aiProcess_GenSmoothNormals
+                ) as scene:
+    
+                if scene.meshes:
+                    print(f"Successfully loaded model with {len(scene.meshes)} meshes")
+                    if hasattr(scene, 'materials'):
+                        print(f"Model has {len(scene.materials)} materials")
+    
+                    # Store the scene (deepcopy or reference depending on your flow)
+                    self.model = scene
+    
+                    # Compile display list for faster rendering
+                    self.compile_display_list()
+
+    
+    
+    def compile_display_list(self):
+        """Compile the model into a display list for faster rendering"""
+        if not self.model:
+            return
+            
+        # Delete existing display list if any
+        if self.display_list is not None:
+            glDeleteLists(self.display_list, 1)
+        
+        # Create new display list
+        self.display_list = glGenLists(1)
+        glNewList(self.display_list, GL_COMPILE)
+        
+        # Draw model differently based on how it was loaded
+        if hasattr(self.model, 'meshes'):  # PyAssimp model
+            self.compile_assimp_model()
+        else:  # Fallback model
+            self.compile_fallback_model()
+        
+        glEndList()
+        print("Model compiled into display list")
+    
+    def compile_assimp_model(self):
+        """Compile PyAssimp model into display list"""
+        # Draw each mesh with its material
+        for mesh in self.model.meshes:
+            # Apply material if available
+            if mesh.materialindex < len(self.model.materials):
+                material = self.model.materials[mesh.materialindex]
+                
+                # Apply diffuse color
+                if hasattr(material, 'properties') and 'diffuse' in material.properties:
+                    diffuse = material.properties['diffuse']
+                    glColor4f(*diffuse)
+                else:
+                    glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
+            else:
+                glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
+            
+            # Draw mesh triangles
+            glBegin(GL_TRIANGLES)
+            for face in mesh.faces:
+                for index in face:
+                    # Apply normal if available
+                    if mesh.normals.size > 0 and index < len(mesh.normals):
+                        glNormal3fv(mesh.normals[index])
+                    
+                    # Apply vertex
+                    if index < len(mesh.vertices):
+                        glVertex3fv(mesh.vertices[index])
+            glEnd()
+    
+    def compile_fallback_model(self):
+        """Compile fallback model into display list"""
+        # Draw each face
+        glBegin(GL_TRIANGLES)
+        for face in self.model['faces']:
+            # Apply material color if available
+            mtl_name = face.get('material')
+            if mtl_name and mtl_name in self.model['materials']:
+                diffuse = self.model['materials'][mtl_name].get('diffuse', [0.8, 0.8, 0.8, 1.0])
+                glColor4f(*diffuse)
+            else:
+                glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
+            
+            # Draw face vertices
+            for idx in face['indices']:
+                # Apply vertex
+                if idx < len(self.model['vertices']):
+                    glVertex3fv(self.model['vertices'][idx])
+        glEnd()
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
