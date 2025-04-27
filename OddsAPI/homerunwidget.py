@@ -449,7 +449,7 @@ class StadiumView(QGraphicsView):
         fixed_home_y = 255  # Adjust this value to match your desired position
         
         # Create the ball
-        ball_size = 10
+        ball_size = 10 
         self.ball_item = QGraphicsEllipseItem(-ball_size/2, -ball_size/2, ball_size, ball_size)
         self.ball_item.setBrush(QBrush(QColor(255, 255, 255)))
         self.ball_item.setPen(QPen(Qt.GlobalColor.black, 1))
@@ -595,160 +595,54 @@ class UmpireView3D(QOpenGLWidget):
         
         # Camera setup
         self.camera = {
-            'pos': [-10.5, 3.5, 3],
-            'target': [0, 0, 0],
+            'pos': [-1.600,0.6,-0.801],
+            'target': [13.9,-0.6,14.5],
             'up': [0, 1, 0],
-            'fov': 90
+            'fov': 50
         }
         
         self.control_mode = 'camera'
-        
-        # Model properties - adjusted for better positioning
-        self.model_position = [0, 0, 0]
-        self.model_scale = 1.0     # Try different scales as needed
-        self.model_rotation = [0, 0, 0]  # No rotation initially
-        
-        # breaks everything if commented out will remove FUCKING INANE
-        self.load_timer = QTimer(self)
-        self.load_timer.setSingleShot(True)
-        self.load_timer.timeout.connect(self.load_model)
-        self.load_timer.start(1)
-
-    def load_model(self):
-        """Load the 3D model"""
-        try:
-            import pyassimp
-            print("Loading model with PyAssimp...")
-    
-            # Use context manager to ensure proper release of resources
-            with pyassimp.load('baseballfield.obj',
-                    processing=pyassimp.postprocess.aiProcess_Triangulate |
-                               pyassimp.postprocess.aiProcess_JoinIdenticalVertices |
-                               pyassimp.postprocess.aiProcess_GenSmoothNormals
-                ) as scene:
-    
-                if scene.meshes:
-                    print(f"Successfully loaded model with {len(scene.meshes)} meshes")
-                    if hasattr(scene, 'materials'):
-                        print(f"Model has {len(scene.materials)} materials")
-    
-                    # Store the scene (deepcopy or reference depending on your flow)
-                    self.model = scene
-    
-                    # Compile display list for faster rendering
-                    self.compile_display_list()
-
-    
-    
-    def compile_display_list(self):
-        """Compile the model into a display list for faster rendering"""
-        if not self.model:
-            return
-            
-        # Delete existing display list if any
-        if self.display_list is not None:
-            glDeleteLists(self.display_list, 1)
-        
-        # Create new display list
-        self.display_list = glGenLists(1)
-        glNewList(self.display_list, GL_COMPILE)
-        
-        # Draw model differently based on how it was loaded
-        if hasattr(self.model, 'meshes'):  # PyAssimp model
-            self.compile_assimp_model()
-        else:  # Fallback model
-            self.compile_fallback_model()
-        
-        glEndList()
-        print("Model compiled into display list")
-    
-    def compile_assimp_model(self):
-        """Compile PyAssimp model into display list"""
-        # Draw each mesh with its material
-        for mesh in self.model.meshes:
-            # Apply material if available
-            if mesh.materialindex < len(self.model.materials):
-                material = self.model.materials[mesh.materialindex]
-                
-                # Apply diffuse color
-                if hasattr(material, 'properties') and 'diffuse' in material.properties:
-                    diffuse = material.properties['diffuse']
-                    glColor4f(*diffuse)
-                else:
-                    glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
-            else:
-                glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
-            
-            # Draw mesh triangles
-            glBegin(GL_TRIANGLES)
-            for face in mesh.faces:
-                for index in face:
-                    # Apply normal if available
-                    if mesh.normals.size > 0 and index < len(mesh.normals):
-                        glNormal3fv(mesh.normals[index])
-                    
-                    # Apply vertex
-                    if index < len(mesh.vertices):
-                        glVertex3fv(mesh.vertices[index])
-            glEnd()
-    
-    def compile_fallback_model(self):
-        """Compile fallback model into display list"""
-        # Draw each face
-        glBegin(GL_TRIANGLES)
-        for face in self.model['faces']:
-            # Apply material color if available
-            mtl_name = face.get('material')
-            if mtl_name and mtl_name in self.model['materials']:
-                diffuse = self.model['materials'][mtl_name].get('diffuse', [0.8, 0.8, 0.8, 1.0])
-                glColor4f(*diffuse)
-            else:
-                glColor4f(0.8, 0.8, 0.8, 1.0)  # Default color
-            
-            # Draw face vertices
-            for idx in face['indices']:
-                # Apply vertex
-                if idx < len(self.model['vertices']):
-                    glVertex3fv(self.model['vertices'][idx])
-        glEnd()
+       
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LEQUAL)
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
-        glEnable(GL_COLOR_MATERIAL)
-        glClearColor(0.1, 0.1, 0.15, 1.0)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         
-        if self.ballpark_model:
-            self.compile_stadium_display_list()
+        # Use a dark blue background for better contrast
+        glClearColor(0.05, 0.05, 0.15, 1.0)
         
-        glLightfv(GL_LIGHT0, GL_POSITION, [5, 5, 10, 1])
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1, 1, 1, 1])
-        glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.5, 0.5, 0.5, 1])
+        # CRITICAL: Disable color material mode completely
+        glDisable(GL_COLOR_MATERIAL)
+        
+        # Use stronger lighting with more ambient and proper positioning
+        glLightfv(GL_LIGHT0, GL_POSITION, [50.0, 50.0, 50.0, 0.0])  # Directional light
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])      # Full white diffuse
+        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.6, 0.6, 0.6, 1.0])      # Strong ambient
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])     # Full specular
+        
+        # Add a second light source for better illumination
+        glEnable(GL_LIGHT1)
+        glLightfv(GL_LIGHT1, GL_POSITION, [-30.0, 20.0, 40.0, 0.0]) # From another angle
+        glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.7, 0.7, 0.8, 1.0])      # Slightly blue diffuse
+        glLightfv(GL_LIGHT1, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])      # Some ambient
+        glLightfv(GL_LIGHT1, GL_SPECULAR, [0.5, 0.5, 0.6, 1.0])     # Some specular
+        
+        # Ensure normal vectors are normalized for proper lighting
+        glEnable(GL_NORMALIZE)
+        
+        # IMPORTANT: Enable two-sided lighting so both sides of faces are lit
+        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)
+        
+        # REMOVE THE EXISTING DISPLAY LIST CODE HERE
         self.stadium_display_list = None
         
-        if self.stadium_display_list is None and self.ballpark_model:
-            self.stadium_display_list = glGenLists(1)
-            glNewList(self.stadium_display_list, GL_COMPILE)
-        
-            glPushMatrix()
-            glTranslatef(0,0,0)
-            glScalef(0.1, 0.1, 0.1)
-        
-            vertices = self.ballpark_model.vertices
-            for mesh in self.ballpark_model.mesh_list:
-                # set material...
-                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
-                glBegin(GL_TRIANGLES)
-                for face in mesh.faces:
-                    for vertex_i in face:
-                        glVertex3f(*vertices[vertex_i])
-                glEnd()
-        
-
-            glPopMatrix()
-            glEndList()
+        # Compile the proper display list with materials
+        if self.ballpark_model:
+            self.compile_stadium_display_list()
         
 
     
@@ -783,7 +677,7 @@ class UmpireView3D(QOpenGLWidget):
         gluLookAt(*self.camera['pos'], *self.camera['target'], *self.camera['up'])
         
         # Enable material properties
-        glEnable(GL_COLOR_MATERIAL)
+        glDisable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT, GL_AMBIENT_AND_DIFFUSE)
         
         # Render stadium model using display list if available
@@ -828,52 +722,232 @@ class UmpireView3D(QOpenGLWidget):
             gluDeleteQuadric(shadow)
             glPopMatrix()
 
+
+
+    # Manually set mat values, dont use .mtl file
+    #def compile_stadium_display_list(self):
+    #    if not self.ballpark_model:
+    #        return
+    #    
+    #    self.stadium_display_list = glGenLists(1)
+    #    glNewList(self.stadium_display_list, GL_COMPILE)
+    #
+    #    glPushMatrix()
+    #    glTranslatef(0, 0, 0)
+    #    glScalef(0.1, 0.1, 0.1)
+    #    glRotatef(-90, 1, 0, 0)
+    #
+    #    # Disable color material so our manual material settings take effect
+    #    glDisable(GL_COLOR_MATERIAL)
+    #    
+    #    vertices = self.ballpark_model.vertices
+    #    for mesh in self.ballpark_model.mesh_list:
+    #        # Get material name
+    #        material_name = None
+    #        if hasattr(mesh, 'materials') and mesh.materials:
+    #            material = mesh.materials[0]
+    #            if isinstance(material, str):
+    #                material_name = material
+    #            elif hasattr(material, 'name'):
+    #                material_name = material.name
+    #        
+    #        # Force vibrant colors based on material name
+    #        if material_name == "grass":
+    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.15, 0.75, 0.2, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.2, 0.6, 0.3, 1.0])
+    #            glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
+    #        elif material_name == "dirt":
+    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
+    #            glMaterialf(GL_FRONT, GL_SHININESS, 16.0)
+    #        elif material_name == "bases":
+    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.98, 0.98, 0.98, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.9, 0.9, 0.9, 1.0])
+    #            glMaterialf(GL_FRONT, GL_SHININESS, 96.0)
+    #        elif material_name and "Cable" in material_name:
+    #            if "CableB" in material_name:
+    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.05, 0.2, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.35, 0.9, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.8, 1.0])
+    #            elif "CableG" in material_name:
+    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.8, 0.2, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.7, 0.5, 1.0])
+    #            elif "CableY" in material_name:
+    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.05, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.95, 0.8, 0.0, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.8, 0.7, 0.3, 1.0])
+    #            else:
+    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.1, 0.1, 0.1, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.2, 0.2, 0.25, 1.0])
+    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.4, 0.5, 1.0])
+    #        else:
+    #            # Default to light gray for unrecognized materials
+    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
+    #            glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
+    #            
+    #        # Draw the mesh with the selected material
+    #        glBegin(GL_TRIANGLES)
+    #        for face in mesh.faces:
+    #            for vertex_i in face:
+    #                glVertex3f(*vertices[vertex_i])
+    #        glEnd()
+    #
+    #    # Re-enable color material for other rendering
+    #    glEnable(GL_COLOR_MATERIAL)
+    #    
+    #    glPopMatrix()
+    #    glEndList()
+    #    print("✅ Stadium model compiled into display list")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ # this function actually tries to load the mats from .mtl file
+
     def compile_stadium_display_list(self):
         if not self.ballpark_model:
             return
         
+        # Generate a new display list
         self.stadium_display_list = glGenLists(1)
         glNewList(self.stadium_display_list, GL_COMPILE)
-    
+        
+        # Basic model transformations
         glPushMatrix()
-        glTranslatef(0,0,0,)
+        glTranslatef(0, 0, 0)
         glScalef(0.1, 0.1, 0.1)
-        glRotatef(-90, 1, 0, 0)
-    
+        glRotatef(0, 1, 0, 0)  # Add rotation for proper orientation
+        
+        # Make sure color material is disabled, will delete later
+        glDisable(GL_COLOR_MATERIAL)
+        
         vertices = self.ballpark_model.vertices
-        for mesh in self.ballpark_model.mesh_list:
-            if not hasattr(mesh, 'materials'):
-                print(f"mesh does not have any materials: {mesh}")
-            elif not mesh.materials:
-                print(f"mesh has no materials - nothing is loaded! {mesh}")
+        
+        # Process each mesh with its own material based on new names
+        for mesh_index, mesh in enumerate(self.ballpark_model.mesh_list):
+            # Get material name for this mesh
+            material_name = None
+            if hasattr(mesh, 'materials') and mesh.materials and len(mesh.materials) > 0:
+                material = mesh.materials[0]
+                if isinstance(material, str):
+                    material_name = material
+                elif hasattr(material, 'name'):
+                    material_name = material.name
             
-            # Set material before drawing
-            if hasattr(mesh, 'materials') and mesh.materials:
-                try:
-                    mtl_name = mesh.materials[0]
-                    if mtl_name in self.ballpark_model.materials:
-                        mtl = self.ballpark_model.materials[mtl_name]
-                        glMaterialfv(GL_FRONT, GL_AMBIENT, mtl.ambient)
-                        glMaterialfv(GL_FRONT, GL_DIFFUSE, mtl.diffuse)
-                        glMaterialfv(GL_FRONT, GL_SPECULAR, mtl.specular)
-                        glMaterialf(GL_FRONT, GL_SHININESS, mtl.shininess)
-                except Exception as e:
-                    print(f"Material error: {str(e)}")
-                    print("OH NO SOME BULLSHIT!!!")
-                    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
+            # Get mesh name if available (should be available with new Blender export)
+            mesh_name = ""
+            if hasattr(mesh, 'name'):
+                mesh_name = mesh.name
+            
+            print(f"Processing mesh {mesh_index}: {mesh_name} with material: {material_name}")
+            
+            # Apply materials based on mesh name
+            if "Infield" in mesh_name or mesh_name == "Infield":
+                # Dirt infield
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 64.0)
+                print(f"Applied dirt material to infield")
+                
+            elif "outfield" in mesh_name or mesh_name == "outfield":
+                # Green grass outfield
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.05, 0.75, 0.05, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.1, 0.3, 0.1, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                print(f"Applied grass material to outfield")
+                
+            elif "EffortText" in mesh_name or mesh_name == "EffortText":
+                # Nearly transparent material for EffortText
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, [0.15, 0.05, 0.05, 0.05])  # No emission
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 128.0)
+                glDisable(GL_BLEND)
+                
+            elif "homeplate" in mesh_name:
+                # White for home plate
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.95, 0.95, 0.95, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.8, 0.8, 0.8, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 96.0)
+                print(f"Applied white material to homeplate")
+                
+            elif "pitchersmound" in mesh_name:
+                # Slightly different dirt color for pitcher's mound
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.22, 0.17, 0.12, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.7, 0.4, 0.2, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                print(f"Applied mound material to pitchersmound")
+                
+            elif "Dugout" in mesh_name or "dugout" in mesh_name:
+                # Gray concrete for dugouts
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.6, 0.6, 0.6, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 48.0)
+                print(f"Applied concrete material to dugout")
+                
+            elif "Graffiti" in mesh_name:
+                # Graffiti wall - you could use a texture here in the future
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 8.0)
+                print(f"Applied wall material to Graffiti Wall")
+                
+            elif "Cylinder" in mesh_name or "Box" in mesh_name:
+                # Stadium structures - light blue/gray
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.25, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.5, 0.5, 0.6, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.4, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                print(f"Applied structure material to {mesh_name}")
+                
             else:
-                print("OH NO SOME BULLSHIT!!!")
-                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
-    
+                # Default white material for unrecognized meshes
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
+                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                print(f"Applied default material to {mesh_name}")
+            
+            # Draw the triangles for this mesh
             glBegin(GL_TRIANGLES)
             for face in mesh.faces:
                 for vertex_i in face:
                     glVertex3f(*vertices[vertex_i])
             glEnd()
-    
+        
         glPopMatrix()
         glEndList()
-        print("✅ Stadium model compiled into display list")
+        print("✅ Stadium model compiled into display list with materials based on mesh names")
 
     
 
@@ -1529,28 +1603,55 @@ class MLBWeatherApp(QMainWindow):
         self.control_index = 2
         self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
     
-    def keyPressEvent(self, a0):
-        self.clearFocus()
-        print(f"Keypress: {a0.key()}")
-        if (a0.key() == Qt.Key.Key_C):
-            print(self.stadium_widget.umpire_view.control_mode)
+    def keyPrsEvent(self, event):
+        step = 0.1  # Movement step size
         
-        if (a0.key() in (Qt.Key.Key_Comma, Qt.Key.Key_Period)):
-            if (a0.key() == Qt.Key.Key_Comma):  self.control_value -= 0.1;
-            if (a0.key() == Qt.Key.Key_Period): self.control_value += 0.1;
-            self.stadium_widget.umpire_view.camera[self.control_target][self.control_index] = self.control_value
-            print(f"control value: {self.control_value}")
-            self.stadium_widget.umpire_view.update()
+        # Position controls
+        if event.key() == Qt.Key.Key_W:  # Move forward
+            self.stadium_widget.umpire_view.camera['pos'][2] += step
+        elif event.key() == Qt.Key.Key_S:  # Move backward
+            self.stadium_widget.umpire_view.camera['pos'][2] -= step
+        elif event.key() == Qt.Key.Key_A:  # Move left
+            self.stadium_widget.umpire_view.camera['pos'][0] -= step
+        elif event.key() == Qt.Key.Key_D:  # Move right
+            self.stadium_widget.umpire_view.camera['pos'][0] += step
+        elif event.key() == Qt.Key.Key_Q:  # Move up
+            self.stadium_widget.umpire_view.camera['pos'][1] += step
+        elif event.key() == Qt.Key.Key_E:  # Move down
+            self.stadium_widget.umpire_view.camera['pos'][1] -= step
         
-        for I in range(3):
-            if (a0.key() == eval(f"Qt.Key.Key_{I+1}")):
-                print(f"control index: {I}")
-                self.control_index = I
-                self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
-                print(f"control value: {self.control_value}")
-                
-        super().keyPressEvent(a0) # delegate back to base keybind handling
-        return
+        # Target controls (shift + key)
+        elif event.key() == Qt.Key.Key_I:  # Target forward
+            self.stadium_widget.umpire_view.camera['target'][2] += step
+        elif event.key() == Qt.Key.Key_K:  # Target backward
+            self.stadium_widget.umpire_view.camera['target'][2] -= step
+        elif event.key() == Qt.Key.Key_J:  # Target left
+            self.stadium_widget.umpire_view.camera['target'][0] -= step
+        elif event.key() == Qt.Key.Key_L:  # Target right
+            self.stadium_widget.umpire_view.camera['target'][0] += step
+        elif event.key() == Qt.Key.Key_U:  # Target up
+            self.stadium_widget.umpire_view.camera['target'][1] += step
+        elif event.key() == Qt.Key.Key_O:  # Target down
+            self.stadium_widget.umpire_view.camera['target'][1] -= step
+        # Field of view controls
+        elif event.key() == Qt.Key.Key_Plus:  # Zoom in
+            self.stadium_widget.umpire_view.camera['fov'] = max(20, self.stadium_widget.umpire_view.camera['fov'] - 5)
+        elif event.key() == Qt.Key.Key_Minus:  # Zoom out
+            self.stadium_widget.umpire_view.camera['fov'] = min(120, self.stadium_widget.umpire_view.camera['fov'] + 5)
+        
+        # Print current camera settings
+        elif event.key() == Qt.Key.Key_P:
+            print("Camera settings:")
+            print(f"  Position: {self.stadium_widget.umpire_view.camera['pos']}")
+            print(f"  Target: {self.stadium_widget.umpire_view.camera['target']}")
+            print(f"  FOV: {self.stadium_widget.umpire_view.camera['fov']}")
+        
+        # Update the view
+        self.stadium_widget.umpire_view.update()
+        print(f"Camera position: {self.stadium_widget.umpire_view.camera['pos']}")
+        print(f"Camera target: {self.stadium_widget.umpire_view.camera['target']}")
+        
+        super().keyPressEvent(event)
 
     def change_stadium(self, stadium_name):
         """Update the stadium when selection changes"""
