@@ -924,7 +924,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Camera setup
         self.camera = {
-            'pos': [-1.600,0.6,-0.801],
+            'pos': [-10.6, 2.6, -5 ],
             'target': [13.9,-0.6,14.5],
             'up': [0, 1, 0],
             'fov': 50
@@ -1324,8 +1324,8 @@ class WindVectorWidget(QWidget):
         width = self.width()
         height = self.height()
         
-        # Create more arrow positions spread across the full width
-        num_arrows = 5  # Increase number of arrows
+        # Create arrow positions spread across the full width
+        num_arrows = 4
         arrow_positions = []
         for i in range(num_arrows):
             x_pos = width * (i + 0.5) / num_arrows  # Evenly space across width
@@ -1336,8 +1336,8 @@ class WindVectorWidget(QWidget):
         rad_angle = math.radians(math_angle)
         
         # Scale based on wind speed
-        scale_factor = 20  # Large scale for visibility
-        length = scale_factor * max(2, self.wind_speed)  # Minimum size for visibility
+        scale_factor = 20
+        length = scale_factor * max(2, self.wind_speed)
         
         # Get color based on wind speed and animation state
         if self.wind_speed < 5:
@@ -1348,7 +1348,7 @@ class WindVectorWidget(QWidget):
             base_color = QColor(255, 60, 60)  # Bright red for strong wind
             
         # Adjust brightness based on animation state
-        brightness_factor = 1.0 + (self.animation_state * 0.1)  # 1.0, 1.1, or 1.2
+        brightness_factor = 1.0 + (self.animation_state * 0.1)
         color = QColor(
             min(255, int(base_color.red() * brightness_factor)),
             min(255, int(base_color.green() * brightness_factor)),
@@ -1362,52 +1362,57 @@ class WindVectorWidget(QWidget):
             end_y = center_point.y() + length * math.sin(rad_angle)
             
             # Check if endpoint is within bounds
-            end_x = max(20, min(end_x, width - 20))  # Keep 20px from edges
+            end_x = max(20, min(end_x, width - 20))
             end_y = max(20, min(end_y, height - 20))
             
             end_point = QPointF(end_x, end_y)
             
-            # Create the arrow shaft with thicker line
-            pen = QPen(color, 14)  # Thick line
-            painter.setPen(pen)
+            # Draw the arrow shaft
+            shaft_pen = QPen(color, 11)
+            painter.setPen(shaft_pen)
             painter.drawLine(center_point, end_point)
             
-            # Add arrowhead
-            self.draw_arrowhead(painter, end_point, rad_angle, 30, color)
+            # Draw arrowhead with slightly adjusted properties to reduce bloom
+            arrowhead_size = 25
+            angle1 = rad_angle + math.radians(150)
+            angle2 = rad_angle + math.radians(210)
+            
+            # Calculate arrowhead points
+            # Create a small gap between the tip and where arrowhead lines start
+            gap = 0.5
+            tip_x = end_x - gap * math.cos(rad_angle)
+            tip_y = end_y - gap * math.sin(rad_angle)
+            
+            arrow1_x = tip_x + arrowhead_size * math.cos(angle1)
+            arrow1_y = tip_y + arrowhead_size * math.sin(angle1)
+            arrow2_x = tip_x + arrowhead_size * math.cos(angle2)
+            arrow2_y = tip_y + arrowhead_size * math.sin(angle2)
+            
+            arrow1_point = QPointF(arrow1_x, arrow1_y)
+            arrow2_point = QPointF(arrow2_x, arrow2_y)
+            
+            # Draw arrowhead with slightly thinner lines
+            arrowhead_pen = QPen(color, 12)
+            painter.setPen(arrowhead_pen)
+            painter.drawLine(QPointF(tip_x, tip_y), arrow1_point)
+            painter.drawLine(QPointF(tip_x, tip_y), arrow2_point)
         
-        # Add wind speed text label (only once, in the center)
-        painter.setPen(QPen(color, 1))
+        # Add wind speed text label
+        text_pen = QPen(color, 1)
+        painter.setPen(text_pen)
         font = painter.font()
         font.setPointSize(18)
         painter.setFont(font)
         
-        # Draw MPH text at fixed position beneath the arrows
+        # Draw MPH text
         text = f"{self.wind_speed} mph"
-        
         font_metrics = painter.fontMetrics()
         text_width = font_metrics.horizontalAdvance(text)
-        
         fixed_text_x = self.width() / 2 - text_width / 2
-        fixed_text_y = self.height() - 10  # Lower, but still inside the widget
+        fixed_text_y = self.height() - 10
         
         painter.drawText(QPointF(fixed_text_x, fixed_text_y), text)
         
-    def draw_arrowhead(self, painter, point, angle, size, color):
-        """Draw an arrowhead at the specified position"""
-        angle1 = angle + math.radians(150)
-        angle2 = angle + math.radians(210)
-        
-        arrow1_x = point.x() + size * math.cos(angle1)
-        arrow1_y = point.y() + size * math.sin(angle1)
-        arrow2_x = point.x() + size * math.cos(angle2)
-        arrow2_y = point.y() + size * math.sin(angle2)
-        
-        arrow1_point = QPointF(arrow1_x, arrow1_y)
-        arrow2_point = QPointF(arrow2_x, arrow2_y)
-        
-        # Use the current pen
-        painter.drawLine(point, arrow1_point)
-        painter.drawLine(point, arrow2_point)
     
     def hideEvent(self, event):
         """Handle widget hide event"""
