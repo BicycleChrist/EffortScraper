@@ -24,6 +24,7 @@ from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
 from pywavefront import Wavefront
+import csv
 
 
 
@@ -90,16 +91,24 @@ class BallFlightSimulator:
             t_span,
             initial_state,
             method='RK45',
-            max_step=0.01
+            max_step=0.05,
+            rtol=1e-6,      # Tighter tolerance
+            atol=1e-6,      # Tighter tolerance
+            first_step=0.01
         )
     
-        # Convert to imperial units for display
+        # Convert position to imperial units for display
         x = solution.y[0] * 3.28084  # m to ft (distance toward center field)
         y = solution.y[1] * 3.28084  # m to ft (height)
         z = solution.y[2] * 3.28084  # m to ft (left/right field distance)
         
+        # Also extract velocities from the solution
+        vx = solution.y[3] * 3.28084  # m/s to ft/s
+        vy = solution.y[4] * 3.28084  # m/s to ft/s
+        vz = solution.y[5] * 3.28084  # m/s to ft/s
+        
         # Find landing point (where y reaches field level)
-        field_level = start_y * 3.28084  # Convert the starting height to feet for comparison
+        field_level = start_y * 3.28084
         landing_idx = np.argmax(y < field_level)
         if landing_idx == 0 and y[-1] > field_level:
             landing_idx = len(y) - 1
@@ -112,39 +121,64 @@ class BallFlightSimulator:
             "x": x[:landing_idx+1],  # Center field direction
             "y": y[:landing_idx+1],  # Height
             "z": z[:landing_idx+1],  # Left/right field direction
+            "vx": vx[:landing_idx+1],  # Velocity in x direction
+            "vy": vy[:landing_idx+1],  # Velocity in y direction
+            "vz": vz[:landing_idx+1],  # Velocity in z direction
             "distance": distance,
-            "start_x": start_x * 3.28084,  # Store starting position in feet
+            "start_x": start_x * 3.28084,
             "start_y": start_y * 3.28084,
             "start_z": start_z * 3.28084
         }
 
     def baseball_ode(self, t, state, wind_speed, wind_direction, air_density):
-        """ODE system for baseball flight using the standard coordinate system"""
+        """ODE system for baseball flight with proper time-dependent physics
+        
+        Parameters:
+        t (float): Time variable for time-dependent forces
+        state (array): Current state [x, y, z, vx, vy, vz]
+        wind_speed (float): Wind speed in m/s
+        wind_direction (float): Wind direction in radians
+        air_density (float): Air density in kg/m³
+        
+        Returns:
+        array: Derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt,F dvz/dt]
+        """
         x, y, z, vx, vy, vz = state
-
-        # Wind components (convert from meteorological to cartesian)
-        # In meteorological, 0° is North, 90° is East, 180° is South, 270° is West
-        # Transform to our coordinate system where:
-        # positive x is toward center field (roughly North)
-        # positive z is toward right field (roughly East)
-        wind_x = wind_speed * np.cos(wind_direction)  # North component (center field)
-        wind_z = wind_speed * np.sin(wind_direction)  # East component (right field)
-
+    
+        # Wind components with time-dependent variation (like gusts)
+        # Add a small sinusoidal variation to wind speed basFed on time
+        wind_variation = 0.1 * np.sin(2 * np.pi * t)  # 10% variation with 1Hz frequency
+        current_wind_speed = wind_speed * (1 + wind_variation)
+        
+        # Wind direction can also vary with time
+        dir_variation = np.radians(5) * np.sin(np.pi * t)  # ±5 degrees variation
+        current_wind_direction = wind_direction + dir_variation
+        
+        # Calculate wind components with time-dependent variations
+        wind_x = current_wind_speed * np.cos(current_wind_direction)
+        wind_z = current_wind_speed * np.sin(current_wind_direction)
+    
         # Relative velocity (ball velocity - wind velocity)
         v_rel_x = vx - wind_x
         v_rel_y = vy  # No wind in vertical direction
         v_rel_z = vz - wind_z
-
+    
         v_rel = np.sqrt(v_rel_x**2 + v_rel_y**2 + v_rel_z**2)
-
-        # Drag force
+    
+        # Drag force - may increase over time as the ball gets wet or changes
+        # This simulates increasing drag as flight time increases
+        drag_time_factor = 1.0 + 0.05 * min(t, 5.0)  # Max 25% increase over 5 seconds
+        
         A = np.pi * (self.d/2)**2  # cross-sectional area
-        F_drag = 0.5 * air_density * v_rel**2 * self.C_d * A
-
-        # Magnus force (simplified)
-        omega_rad = self.omega * 2 * np.pi / 60  # rpm to rad/s
+        F_drag = 0.5 * air_density * v_rel**2 * self.C_d * A * drag_time_factor
+    
+        # Magnus force - spin rate might decrease over time
+        spin_decay = np.exp(-0.1 * t)  # Exponential decay of spin
+        current_omega = self.omega * spin_decay
+        omega_rad = current_omega * 2 * np.pi / 60  # rpm to rad/s
+        
         F_magnus = 0.5 * air_density * v_rel * self.d**3 * self.C_l * omega_rad
-
+    
         # Unit vector of relative velocity
         if v_rel > 0:
             v_rel_unit_x = v_rel_x / v_rel
@@ -152,21 +186,21 @@ class BallFlightSimulator:
             v_rel_unit_z = v_rel_z / v_rel
         else:
             v_rel_unit_x, v_rel_unit_y, v_rel_unit_z = 0, 0, 0
-
+    
         # Drag acceleration components
         ax_drag = -F_drag * v_rel_unit_x / self.m
         ay_drag = -F_drag * v_rel_unit_y / self.m
         az_drag = -F_drag * v_rel_unit_z / self.m
-
-        # Magnus acceleration (simplified - assuming backspin)
-        # For backspin, the Magnus force is mostly upward
+    
+        # Magnus acceleration
         ay_magnus = F_magnus / self.m
-
-        # Total acceleration
+    
+        # Total acceleration including time-dependent components
         ax = ax_drag
-        ay = ay_drag + ay_magnus - self.g  # Subtract gravity
+        ay = ay_drag + ay_magnus - self.g
         az = az_drag
-
+    
+        # Return derivatives
         return [vx, vy, vz, ax, ay, az]
 
     def calculate_air_density(self, temp_f, humidity, altitude_ft):
@@ -201,6 +235,199 @@ class BallFlightSimulator:
         rho = (p - e) / (Rd * T) + e / (Rv * T)
 
         return rho
+
+    def log_trajectory_physics(self, trajectory_data, filename="ball_physics_log.csv"):
+        """
+        Create a detailed CSV log of the ball's physics at each timestep
+        
+        Parameters:
+        trajectory_data (dict): The trajectory data dictionary from calculate_trajectory
+        filename (str): Output filename for the CSV log
+        """
+        # Open file for writing
+        with open(filename, 'w', newline='') as csvfile:
+            # Define CSV header
+            fieldnames = [
+                'time', 
+                'x_pos_ft', 'y_pos_ft', 'z_pos_ft',
+                'x_vel_ft_s', 'y_vel_ft_s', 'z_vel_ft_s', 
+                'speed_mph',
+                'x_accel_ft_s2', 'y_accel_ft_s2', 'z_accel_ft_s2',
+                'accel_magnitude_ft_s2',
+                'height_change_rate_ft_s',
+                'distance_from_start_ft'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Retrieve trajectory data
+            times = trajectory_data['time']
+            x_pos = trajectory_data['x']
+            y_pos = trajectory_data['y']
+            z_pos = trajectory_data['z']
+            x_vel = trajectory_data['vx']
+            y_vel = trajectory_data['vy']
+            z_vel = trajectory_data['vz']
+            
+            # Calculate derivatives for acceleration
+            x_accel = np.zeros_like(x_vel)
+            y_accel = np.zeros_like(y_vel)
+            z_accel = np.zeros_like(z_vel)
+            
+            # Calculate accelerations using finite differences
+            for i in range(1, len(times)-1):
+                dt1 = times[i] - times[i-1]
+                dt2 = times[i+1] - times[i]
+                dt_avg = (dt1 + dt2) / 2
+                
+                # Central difference for better accuracy
+                x_accel[i] = (x_vel[i+1] - x_vel[i-1]) / (dt1 + dt2)
+                y_accel[i] = (y_vel[i+1] - y_vel[i-1]) / (dt1 + dt2)
+                z_accel[i] = (z_vel[i+1] - z_vel[i-1]) / (dt1 + dt2)
+            
+            # Handle endpoints (forward/backward difference)
+            if len(times) > 1:
+                dt = times[1] - times[0]
+                x_accel[0] = (x_vel[1] - x_vel[0]) / dt
+                y_accel[0] = (y_vel[1] - y_vel[0]) / dt
+                z_accel[0] = (z_vel[1] - z_vel[0]) / dt
+                
+                dt = times[-1] - times[-2]
+                x_accel[-1] = (x_vel[-1] - x_vel[-2]) / dt
+                y_accel[-1] = (y_vel[-1] - y_vel[-2]) / dt
+                z_accel[-1] = (z_vel[-1] - z_vel[-2]) / dt
+            
+            # Write data row by row
+            for i in range(len(times)):
+                # Calculate derived metrics
+                speed_mph = np.sqrt(x_vel[i]**2 + y_vel[i]**2 + z_vel[i]**2) * 0.681818  # ft/s to mph
+                accel_magnitude = np.sqrt(x_accel[i]**2 + y_accel[i]**2 + z_accel[i]**2)
+                distance = np.sqrt((x_pos[i] - x_pos[0])**2 + (z_pos[i] - z_pos[0])**2)
+                
+                # Write row
+                writer.writerow({
+                    'time': f"{times[i]:.4f}",
+                    'x_pos_ft': f"{x_pos[i]:.4f}",
+                    'y_pos_ft': f"{y_pos[i]:.4f}",
+                    'z_pos_ft': f"{z_pos[i]:.4f}",
+                    'x_vel_ft_s': f"{x_vel[i]:.4f}",
+                    'y_vel_ft_s': f"{y_vel[i]:.4f}",
+                    'z_vel_ft_s': f"{z_vel[i]:.4f}",
+                    'speed_mph': f"{speed_mph:.4f}",
+                    'x_accel_ft_s2': f"{x_accel[i]:.4f}",
+                    'y_accel_ft_s2': f"{y_accel[i]:.4f}",
+                    'z_accel_ft_s2': f"{z_accel[i]:.4f}",
+                    'accel_magnitude_ft_s2': f"{accel_magnitude:.4f}",
+                    'height_change_rate_ft_s': f"{y_vel[i]:.4f}",
+                    'distance_from_start_ft': f"{distance:.4f}"
+                })
+        
+        print(f"Physics log written to {filename}")
+        return filename
+
+
+
+# Add a method to print a physics summary to the console
+def print_physics_summary(trajectory_data):
+    """Print a summary of physics data to help debug acceleration issues"""
+    # Get the number of timesteps
+    n_steps = len(trajectory_data['time'])
+    
+    if n_steps < 2:
+        print("Not enough data points for physics summary")
+        return
+    
+    # Print header
+    print("\n--- BALL PHYSICS SUMMARY ---")
+    
+    # Sample points (start, 25%, 50%, 75%, end)
+    # sample_points = [0, n_steps//4, n_steps//2, 3*n_steps//4, n_steps-1]
+    sample_points = [I for I in range(n_steps)]
+    
+    print("time | x_pos_ft | y_pos_ft | z_pos_ft | x_vel_ft_s | y_vel_ft_s | z_vel_ft_s | speed_mph | x_accel_ft_s2 | y_accel_ft_s2 | z_accel_ft_s2 | accel_magnitude_ft_s2")
+    print("---------+-------------------------+---------------------------+-------------+-----------------")
+    
+    # Calculate y-acceleration using finite differences
+    y_accel = []
+    for i in range(1, n_steps-1):
+        dt1 = trajectory_data['time'][i] - trajectory_data['time'][i-1]
+        dt2 = trajectory_data['time'][i+1] - trajectory_data['time'][i]
+        dt_avg = (dt1 + dt2) / 2
+        y_accel.append((trajectory_data['vy'][i+1] - trajectory_data['vy'][i-1]) / (dt1 + dt2))
+    
+    # Handle endpoints
+    if n_steps > 1:
+        dt = trajectory_data['time'][1] - trajectory_data['time'][0]
+        y_accel.insert(0, (trajectory_data['vy'][1] - trajectory_data['vy'][0]) / dt)
+        
+        dt = trajectory_data['time'][-1] - trajectory_data['time'][-2]
+        y_accel.append((trajectory_data['vy'][-1] - trajectory_data['vy'][-2]) / dt)
+    
+    # Print sample points
+    for idx in sample_points:
+        time = trajectory_data['time'][idx]
+        pos_x = trajectory_data['x'][idx]
+        pos_y = trajectory_data['y'][idx]
+        pos_z = trajectory_data['z'][idx]
+        vel_x = trajectory_data['vx'][idx]
+        vel_y = trajectory_data['vy'][idx]
+        vel_z = trajectory_data['vz'][idx]
+        speed = (vel_x**2 + vel_y**2 + vel_z**2)**0.5 * 0.681818  # Convert ft/s to mph
+        
+        # Format string for output
+        pos_str = f"({pos_x:7.2f}, {pos_y:6.2f}, {pos_z:6.2f})"
+        vel_str = f"({vel_x:7.2f}, {vel_y:6.2f}, {vel_z:6.2f})"
+        
+        # Print the row
+        accel = y_accel[idx] if idx < len(y_accel) else "N/A"
+        print(f"{time:7.2f} | {pos_str:23} | {vel_str:25} | {speed:11.2f} | {accel if isinstance(accel, str) else accel:7.2f}")
+    
+    # Calculate and print key metrics
+    max_height = max(trajectory_data['y'])
+    max_height_idx = trajectory_data['y'].tolist().index(max_height)
+    max_height_time = trajectory_data['time'][max_height_idx]
+    
+    # Find where y velocity changes from positive to negative (peak of trajectory)
+    peak_idx = None
+    for i in range(1, n_steps):
+        if trajectory_data['vy'][i-1] > 0 and trajectory_data['vy'][i] <= 0:
+            peak_idx = i
+            break
+    
+    print("\n--- KEY METRICS ---")
+    print(f"Initial Y-Velocity: {trajectory_data['vy'][0]:.2f} ft/s")
+    print(f"Maximum Height: {max_height:.2f} ft at time {max_height_time:.2f} s")
+    
+    if peak_idx is not None:
+        peak_time = trajectory_data['time'][peak_idx]
+        print(f"Trajectory Peak: at time {peak_time:.2f} s")
+        
+        # Calculate average y-acceleration during ascent
+        avg_y_accel_ascent = (trajectory_data['vy'][peak_idx] - trajectory_data['vy'][0]) / peak_time
+        print(f"Average Y-Acceleration (ascent): {avg_y_accel_ascent:.2f} ft/s²")
+        
+        # For descent, use the last point
+        if peak_idx < n_steps - 1:
+            descent_time = trajectory_data['time'][-1] - peak_time
+            avg_y_accel_descent = (trajectory_data['vy'][-1] - trajectory_data['vy'][peak_idx]) / descent_time
+            print(f"Average Y-Acceleration (descent): {avg_y_accel_descent:.2f} ft/s²")
+    
+    # Check for expected gravitational acceleration (should be around -32 ft/s²)
+    grav_accel_approx = sum(y_accel) / len(y_accel) if y_accel else 0
+    print(f"Average Y-Acceleration (overall): {grav_accel_approx:.2f} ft/s²")
+    print(f"Expected gravitational acceleration: -32.2 ft/s²")
+    
+    # Verdict
+    if abs(grav_accel_approx + 32.2) > 5:  # More than 5 ft/s² different from expected
+        print("\nVERDICT: Gravity acceleration appears INCORRECT")
+    else:
+        print("\nVERDICT: Gravity acceleration appears correct")
+    
+    print("------------------------\n")
+
+
+
+
 
 
 class StadiumView(QGraphicsView):
@@ -578,7 +805,7 @@ class StadiumView(QGraphicsView):
         return True
 
     def update_ball_position(self, trajectory_data, frame):
-        """Update the ball position for animation"""
+        """Update the ball position for animation with velocity-based visual effects"""
         if frame >= len(trajectory_data["x"]):
             return False
         
@@ -586,23 +813,36 @@ class StadiumView(QGraphicsView):
         scale_factor = 2.0
         
         # Get coordinates with proper scaling from the home plate position
-        # For top-down 2D view:
-        # - Scene X maps to Z (left/right field)
-        # - Scene Y maps to -X (center field, negated for screen coordinates)
-        # - Height (Y) is used for visual scaling effects
         x = self.home_plate_x + trajectory_data["z"][frame] * scale_factor
         y = self.home_plate_y - trajectory_data["x"][frame] * scale_factor
-        height = trajectory_data["y"][frame]  # Use height for scaling
+        height = trajectory_data["y"][frame]
         
-        # Set positions DIRECTLY
-        self.ball_item.setX(x)
-        self.ball_item.setY(y)
-        self.shadow_item.setX(x)
-        self.shadow_item.setY(y)
+        # Get velocity data for visual effects
+        vx = trajectory_data["vx"][frame]
+        vy = trajectory_data["vy"][frame]
+        vz = trajectory_data["vz"][frame]
         
-        # Scale ball based on height
+        # Calculate speed magnitude for scaling effects
+        speed_magnitude = np.sqrt(vx**2 + vy**2 + vz**2)
+        
+        # Set positions
+        self.ball_item.setPos(x, y)
+        self.shadow_item.setPos(x, y)
+        
+        # Scale ball based on height and speed
         height_factor = max(0.8, min(1.5, 1 + height/100))
-        self.ball_item.setScale(height_factor)
+        speed_factor = max(0.9, min(1.2, 1 + speed_magnitude/300))
+        self.ball_item.setScale(height_factor * speed_factor)
+        
+        # Add speed-based color effect to the ball
+        speed_threshold = 25
+        if speed_magnitude > speed_threshold:
+            # Add reddish tint for high speed
+            speed_color = QColor(255, 255 - min(100, int(speed_magnitude - speed_threshold)), 255 - min(150, int(speed_magnitude - speed_threshold)))
+            self.ball_item.setBrush(QBrush(speed_color))
+        else:
+            # Normal white ball at lower speeds
+            self.ball_item.setBrush(QBrush(QColor(255, 255, 255)))
         
         # Make shadow more transparent based on height
         opacity = max(0.2, 1.0 - height/200)
@@ -657,8 +897,11 @@ class UmpireView3D(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ball_pos = None
+        self.ball_vel = None  # Add velocity storage
+        self.prev_ball_pos = None  # Track previous position for trail effect
+        self.ball_trail = []  # Store recent ball positions for trail effect
         self.ballpark_model = None
-        self.textures = {}  # For texture caching if needed
+        self.textures = {}
         
         # Set format for better rendering
         fmt = QSurfaceFormat()
@@ -733,6 +976,9 @@ class UmpireView3D(QOpenGLWidget):
     def clear_ball(self):
         """Clear any displayed ball from the 3D view"""
         self.ball_pos = None
+        self.ball_vel = None
+        self.prev_ball_pos = None
+        # self.ball_trail = []
         self.update()  # Request a redraw of the scene
     
     def paintGL(self):
@@ -772,42 +1018,131 @@ class UmpireView3D(QOpenGLWidget):
             gluDeleteQuadric(indicator)
             glPopMatrix()
         
+        # Draw ball trail (new code)
+        if self.ball_trail:
+            glPushMatrix()
+            # Use a gradient of transparency for the trail
+            for i, (trail_pos, alpha) in enumerate(self.ball_trail):
+                x, y, z = trail_pos
+                # Make trail segments increasingly transparent
+                alpha = alpha * 0.9  # Further reduce alpha
+                
+                # Set material for trail segment
+                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, alpha])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, alpha])
+                glMaterialf(GL_FRONT, GL_SHININESS, 80.0)
+                
+                # Draw smaller spheres for trail
+                glPushMatrix()
+                glTranslatef(x, y, z)
+                # Scale based on position in trail (smaller toward end)
+                scale_factor = 0.8 - (i * 0.1)
+                trail_size = max(0.05, 0.2 * scale_factor)
+                sphere = gluNewQuadric()
+                gluQuadricDrawStyle(sphere, GLU_FILL)
+                gluQuadricNormals(sphere, GLU_SMOOTH)
+                gluSphere(sphere, trail_size, 8, 8)  # Smaller, less detailed spheres for trail
+                gluDeleteQuadric(sphere)
+                glPopMatrix()
+                
+                # Update alpha for next segment
+                # self.ball_trail[i] = (trail_pos, alpha)
+            glPopMatrix()
         
-        # Ball rendering
+        # Ball rendering (with velocity-based effects)
         if self.ball_pos is not None:
             x, y, z = self.ball_pos
             
-            # Set white material for the ball
-            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
+            # Calculate ball speed if velocity data exists
+            ball_speed = 0
+            if self.ball_vel is not None:
+                vx, vy, vz = self.ball_vel
+                ball_speed = (vx**2 + vy**2 + vz**2)**0.5
+                
+                # Update ball trail
+                if self.prev_ball_pos is not None:
+                    # Only add to trail if ball has moved sufficiently
+                    px, py, pz = self.prev_ball_pos
+                    dist = ((x-px)**2 + (y-py)**2 + (z-pz)**2)**0.5
+                    if dist > 0.1:  # Minimum distance to add a trail point
+                        # Add current position to trail with full opacity
+                        self.ball_trail.insert(0, ((x, y, z), 0.7))
+            
+            # Store current position for next frame
+            self.prev_ball_pos = (x, y, z)
+            
+            # Set white material for the ball (with velocity-based effects)
+            # Use more red for faster balls
+            red = min(1.0, 0.8 + ball_speed/30)
+            green = max(0.7, 1.0 - ball_speed/20)
+            blue = max(0.7, 1.0 - ball_speed/20)
+            
+            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [red, green, blue, 1.0])
             glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
             glMaterialf(GL_FRONT, GL_SHININESS, 80.0)
             
-            # Draw ball
+            # Draw ball with size based slightly on velocity (motion blur effect)
             glPushMatrix()
             glTranslatef(x, y, z)
+            
+            # Add slight stretching in direction of motion for high velocities
+            if self.ball_vel is not None and ball_speed > 5:
+                vx, vy, vz = self.ball_vel
+                # Normalize velocity vector
+                norm = (vx**2 + vy**2 + vz**2)**0.5
+                if norm > 0:
+                    vx, vy, vz = vx/norm, vy/norm, vz/norm
+                
+                # Calculate rotation axis and angle to stretch ball along velocity
+                stretch_factor = min(1.5, 1.0 + ball_speed/30)
+                
+                # Apply stretch transformation using a scaling matrix
+                if ball_speed > 10:  # Only stretch for higher speeds
+                    # Create rotation to align with velocity vector
+                    # Find rotation axis (cross product of [0,0,1] and velocity)
+                    axis_x = -vy
+                    axis_y = vx
+                    axis_z = 0
+                    axis_len = (axis_x**2 + axis_y**2 + axis_z**2)**0.5
+                    
+                    if axis_len > 0.001:  # Avoid division by near-zero
+                        axis_x, axis_y, axis_z = axis_x/axis_len, axis_y/axis_len, axis_z/axis_len
+                        # Calculate rotation angle
+                        angle = math.degrees(math.acos(vz/norm))
+                        # Apply rotation
+                        glRotatef(angle, axis_x, axis_y, axis_z)
+                        # Stretch along z-axis (now aligned with velocity)
+                        glScalef(1.0, 1.0, stretch_factor)
+            
+            # Ball size
+            ball_size = 0.2
+            
             sphere = gluNewQuadric()
             gluQuadricDrawStyle(sphere, GLU_FILL)
             gluQuadricNormals(sphere, GLU_SMOOTH)
-            gluSphere(sphere, 0.2, 16, 16)
+            gluSphere(sphere, ball_size, 16, 16)
             gluDeleteQuadric(sphere)
             glPopMatrix()
             
-            # Draw shadow - more subtle shadow with transparency
+            # Draw shadow with proper physics
             glPushMatrix()
-            glTranslatef(x, y, 0.01)  # Just above ground
-            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, 0.5])
+            glTranslatef(x, 0.01, z)  # Shadow is at ground level
+            
+            # Shadow darkness based on height
+            shadow_alpha = max(0.1, min(0.6, 0.6 - y/20))
+            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, shadow_alpha])
             glMaterialfv(GL_FRONT, GL_SPECULAR, [0.0, 0.0, 0.0, 0.0])
             glMaterialf(GL_FRONT, GL_SHININESS, 0.0)
             
             # Shadow size scales with height
-            shadow_scale = max(0.5, 1.0 - z/30)
-            glScalef(shadow_scale, shadow_scale, 0.1)
+            shadow_scale = max(0.5, min(1.0, 0.8 + 0.2*(10-y)/10))
+            glScalef(shadow_scale, 0.1, shadow_scale)
             
             # Draw shadow
             shadow = gluNewQuadric()
             gluQuadricDrawStyle(shadow, GLU_FILL)
             gluQuadricNormals(shadow, GLU_SMOOTH)
-            gluDisk(shadow, 0, 0.5, 16, 1)  # Use disk instead of sphere for shadow
+            gluDisk(shadow, 0, 0.5, 16, 1)
             gluDeleteQuadric(shadow)
             glPopMatrix()
 
@@ -825,7 +1160,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Basic model transformations
         glPushMatrix()
-        glScalef(0.1, 0.1, 0.1)
+        glScalef(0.7, 0.7, 0.7)
         vertices = self.ballpark_model.vertices
         
         # Process each mesh with its own material based on new names
@@ -1345,7 +1680,6 @@ class SplitView(QWidget):
                 self.weather_data["wind_direction"]
             )
     
-    # Modification for simulate_ball_flight method to update the flight stats list
     def simulate_ball_flight(self, exit_velocity, launch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions and custom starting position"""
         if not self.weather_data:
@@ -1374,9 +1708,19 @@ class SplitView(QWidget):
             start_z
         )
         
+        # Generate physics log
+        log_filename = f"ball_physics_ev{exit_velocity}_la{launch_angle}_sr{spin_rate}.csv"
+        self.ball_simulator.log_trajectory_physics(self.trajectory_data, log_filename)
+        
+        # Add log message to flight stats
+        self.flight_stats_list.addItem(f"Physics log written to: {log_filename}")
+        
         # Log trajectory data for debugging
         print(f"Starting point: ({self.trajectory_data['start_x']:.1f}, {self.trajectory_data['start_y']:.1f}, {self.trajectory_data['start_z']:.1f})")
         print(f"Ball will travel: {self.trajectory_data['distance']:.1f} feet")
+        
+        # Print physics summary
+        print_physics_summary(self.trajectory_data)
         
         # Initialize ball visualization in top-down view
         success = self.stadium_view.start_ball_trajectory(self.trajectory_data)
@@ -1394,7 +1738,7 @@ class SplitView(QWidget):
         
         # Calculate stats
         distance = self.trajectory_data["distance"]
-        max_height = max(self.trajectory_data["y"]) # make sure is y axis
+        max_height = max(self.trajectory_data["y"])
         hr_text = "HOME RUN!" if is_home_run else ""
         
         # Create stats text
@@ -1414,7 +1758,7 @@ class SplitView(QWidget):
         self.animation_timer.start(30)  # 30ms per frame (~33fps)
     
     def update_animation(self):
-        """Update animation frame for both views"""
+        """Update animation frame for both views with proper physics"""
         if not self.trajectory_data:
             return
             
@@ -1432,14 +1776,18 @@ class SplitView(QWidget):
         )
         
         # Update ball position in 3D umpire view
-        # The 3D OpenGL world has a coordinate system:
-        # X - toward outfield (positive is outfield)
-        # Y - up (positive is up)
-        # Z - across field (positive is right field)
         # Convert from feet to meters for the 3D view
         x = self.trajectory_data["x"][self.current_frame] / 3.28084
         y = self.trajectory_data["y"][self.current_frame] / 3.28084
         z = self.trajectory_data["z"][self.current_frame] / 3.28084
+        
+        # Get velocities for the current frame
+        vx = self.trajectory_data["vx"][self.current_frame] / 3.28084  # Convert ft/s to m/s
+        vy = self.trajectory_data["vy"][self.current_frame] / 3.28084
+        vz = self.trajectory_data["vz"][self.current_frame] / 3.28084
+        
+        # Store velocity in the umpire view for visual effects
+        self.umpire_view.ball_vel = (vx, vy, vz)
         
         # Apply proper coordinate mapping for 3D view
         self.umpire_view.ball_pos = (x, y, z)
@@ -1538,7 +1886,7 @@ class MLBWeatherApp(QMainWindow):
         ev_group = QGroupBox("Exit Velocity (mph)")
         ev_layout = QVBoxLayout()
         self.ev_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ev_slider.setRange(80, 120)
+        self.ev_slider.setRange(0, 160)
         self.ev_slider.setValue(100)
         self.ev_value = QLabel("100")
         self.ev_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1704,36 +2052,44 @@ class MLBWeatherApp(QMainWindow):
     #     return
     
     def keyPressEvent(self, event):
-        step = 0.1  # Movement step size
+        camera_step = 1
+        target_step = camera_step*5
+        # Movement step size
         self.clearFocus()
         print(event.key())
         # Position controls
         if event.key() == Qt.Key.Key_W:  # Move forward
-            self.stadium_widget.umpire_view.camera['pos'][0] += step
+            self.stadium_widget.umpire_view.camera['pos'][0] += camera_step
+            self.stadium_widget.umpire_view.camera['target'][0] += camera_step
         elif event.key() == Qt.Key.Key_S:  # Move backward
-            self.stadium_widget.umpire_view.camera['pos'][0] -= step
+            self.stadium_widget.umpire_view.camera['pos'][0] -= camera_step
+            self.stadium_widget.umpire_view.camera['target'][0] -= camera_step
         elif event.key() == Qt.Key.Key_A:  # Move left
-            self.stadium_widget.umpire_view.camera['pos'][2] -= step
+            self.stadium_widget.umpire_view.camera['pos'][2] -= camera_step
+            self.stadium_widget.umpire_view.camera['target'][2] -= camera_step
         elif event.key() == Qt.Key.Key_D:  # Move right
-            self.stadium_widget.umpire_view.camera['pos'][2] += step
-        elif event.key() == Qt.Key.Key_Q:  # Move up
-            self.stadium_widget.umpire_view.camera['pos'][1] += step
-        elif event.key() == Qt.Key.Key_E:  # Move down
-            self.stadium_widget.umpire_view.camera['pos'][1] -= step
+            self.stadium_widget.umpire_view.camera['pos'][2] += camera_step
+            self.stadium_widget.umpire_view.camera['target'][2] += camera_step
+        elif event.key() == Qt.Key.Key_E:  # Move up
+            self.stadium_widget.umpire_view.camera['pos'][1] += camera_step
+            self.stadium_widget.umpire_view.camera['target'][1] += camera_step
+        elif event.key() == Qt.Key.Key_Q:  # Move down
+            self.stadium_widget.umpire_view.camera['pos'][1] -= camera_step
+            self.stadium_widget.umpire_view.camera['target'][1] -= camera_step
         
         # Target controls (shift + key)
         elif event.key() == Qt.Key.Key_I:  # Target forward
-            self.stadium_widget.umpire_view.camera['target'][0] += step
+            self.stadium_widget.umpire_view.camera['target'][0] += target_step
         elif event.key() == Qt.Key.Key_K:  # Target backward
-            self.stadium_widget.umpire_view.camera['target'][0] -= step
+            self.stadium_widget.umpire_view.camera['target'][0] -= target_step
         elif event.key() == Qt.Key.Key_J:  # Target left
-            self.stadium_widget.umpire_view.camera['target'][2] -= step
+            self.stadium_widget.umpire_view.camera['target'][2] -= target_step
         elif event.key() == Qt.Key.Key_L:  # Target right
-            self.stadium_widget.umpire_view.camera['target'][2] += step
-        elif event.key() == Qt.Key.Key_U:  # Target up
-            self.stadium_widget.umpire_view.camera['target'][1] += step
-        elif event.key() == Qt.Key.Key_O:  # Target down
-            self.stadium_widget.umpire_view.camera['target'][1] -= step
+            self.stadium_widget.umpire_view.camera['target'][2] += target_step
+        elif event.key() == Qt.Key.Key_O:  # Target up
+            self.stadium_widget.umpire_view.camera['target'][1] += target_step
+        elif event.key() == Qt.Key.Key_U:  # Target down
+            self.stadium_widget.umpire_view.camera['target'][1] -= target_step
         # Field of view controls
         elif event.key() == Qt.Key.Key_Plus:  # Zoom in
             self.stadium_widget.umpire_view.camera['fov'] = max(20, self.stadium_widget.umpire_view.camera['fov'] - 5)
