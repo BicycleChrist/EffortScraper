@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem,
-    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget,QDoubleSpinBox
+    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget, QDoubleSpinBox, QTabWidget
 )
 # Import QOpenGLWidget from the correct module
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -14,7 +14,7 @@ from xml.dom import minidom
 from PyQt6.QtSvg import QtSvg, QSvgRenderer
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal
 import sys
 import numpy as np
 import math
@@ -931,38 +931,41 @@ class UmpireView3D(QOpenGLWidget):
         }
         
         self.control_mode = 'camera'
-       
+        
+        self.light_params = [
+        {
+            'position': [0.0, 15.0, 0.0, 1.0],
+            'diffuse': [1.0, 1.0, 1.0, 1.0],
+            'ambient': [0.6, 0.6, 0.6, 1.0],
+            'specular': [1.0, 1.0, 1.0, 1.0],
+            'enabled': True
+        },
+        {
+            'position': [10.0, 8.0, 10.0, 1.0],
+            'diffuse': [0.7, 0.7, 0.8, 1.0],
+            'ambient': [0.3, 0.3, 0.3, 1.0],
+            'specular': [0.5, 0.5, 0.6, 1.0],
+            'enabled': True
+        }
+    ]
 
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LEQUAL)
         glEnable(GL_LIGHTING)
-        glEnable(GL_LIGHT0)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         
         # Use a dark blue background for better contrast
         glClearColor(0.05, 0.05, 0.15, 1.0)
         
-        
-        # Use stronger lighting with more ambient and proper positioning
-        glLightfv(GL_LIGHT0, GL_POSITION, [5.0, 5.0, 5.0, 1.0])  # Directional light
-        glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])      # Full white diffuse
-        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.6, 0.6, 0.6, 1.0])      # Strong ambient
-        glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])     # Full specular
-        
-        # Add a second light source for better illumination
-        glEnable(GL_LIGHT1)
-        glLightfv(GL_LIGHT1, GL_POSITION, [-3.0, 2.0, 4.0, 1.0]) # From another angle
-        glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.7, 0.7, 0.8, 1.0])      # Slightly blue diffuse
-        glLightfv(GL_LIGHT1, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])      # Some ambient
-        glLightfv(GL_LIGHT1, GL_SPECULAR, [0.5, 0.5, 0.6, 1.0])     # Some specular
-        
-        # Ensure normal vectors are normalized for proper lighting
+        # Enable normal vectors normalization for proper lighting
         glEnable(GL_NORMALIZE)
         
+        # Set up lights based on parameters
+        self.set_lighting(self.light_params)
         
-        # REMOVE THE EXISTING DISPLAY LIST CODE HERE
+        # Initialize stadium display list
         self.stadium_display_list = None
         
         # Compile the proper display list with materials
@@ -1143,6 +1146,7 @@ class UmpireView3D(QOpenGLWidget):
             gluQuadricDrawStyle(shadow, GLU_FILL)
             gluQuadricNormals(shadow, GLU_SMOOTH)
             gluDisk(shadow, 0, 0.5, 16, 1)
+            self.draw_light_sources(hasattr(self, 'show_lights') and self.show_lights)
             gluDeleteQuadric(shadow)
             glPopMatrix()
 
@@ -1275,6 +1279,111 @@ class UmpireView3D(QOpenGLWidget):
         """Clear any displayed ball from the 3D view but keep the starting position"""
         self.ball_pos = None
         self.update()  # Request a redraw of the scene
+    
+    def set_lighting(self, light_params):
+        """Update OpenGL lighting based on parameters"""
+        # Store light parameters
+        self.light_params = light_params
+        
+        # Make sure we're in a valid OpenGL context
+        self.makeCurrent()
+        
+        # Update OpenGL light settings
+        for i, light in enumerate(light_params):
+            # OpenGL typically supports 8 lights (0-7)
+            if i >= 8:
+                print(f"Warning: Exceeded maximum number of OpenGL lights (8)")
+                break
+                
+            # Get the correct OpenGL light constant
+            if i == 0:
+                light_id = GL_LIGHT0
+            elif i == 1:
+                light_id = GL_LIGHT1
+            # Add more cases if needed
+            else:
+                light_constants = [GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3, GL_LIGHT4, GL_LIGHT5, GL_LIGHT6, GL_LIGHT7]
+                light_id = light_constants[i]  # This might work in some implementations
+            
+            try:
+                if light['enabled']:
+                    glEnable(light_id)
+                    glLightfv(light_id, GL_POSITION, light['position'])
+                    glLightfv(light_id, GL_AMBIENT, light['ambient'])
+                    glLightfv(light_id, GL_DIFFUSE, light['diffuse'])
+                    glLightfv(light_id, GL_SPECULAR, light['specular'])
+                else:
+                    glDisable(light_id)
+            except Exception as e:
+                print(f"Error setting light {i}: {e}")
+        
+        # Request a redraw
+        self.update()
+
+    def draw_light_sources(self, show_lights):
+        """Draw spheres to visualize light positions"""
+        if not show_lights or not hasattr(self, 'light_params'):
+            return
+        
+        # Save current material and lighting state
+        glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT)
+        
+        # Temporarily disable lighting for the light source indicators
+        glDisable(GL_LIGHTING)
+        
+        for i, light in enumerate(self.light_params):
+            if not light['enabled']:
+                continue
+            
+            # Extract position
+            x, y, z = light['position'][0:3]
+            
+            # Use light's own color for the sphere, but make it brighter
+            r = min(1.0, light['diffuse'][0] * 1.5)
+            g = min(1.0, light['diffuse'][1] * 1.5)
+            b = min(1.0, light['diffuse'][2] * 1.5)
+            
+            # Draw a larger sphere to represent the light
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            
+            # Draw sphere with flat shading for better visibility
+            glColor4f(r, g, b, 0.8)
+            sphere = gluNewQuadric()
+            gluQuadricDrawStyle(sphere, GLU_FILL)
+            gluSphere(sphere, 0.5, 16, 16)  # Larger sphere (0.5 instead of 0.3)
+            gluDeleteQuadric(sphere)
+            
+            # Draw coordinate axes to show light position better
+            # X axis (red)
+            glBegin(GL_LINES)
+            glColor3f(1.0, 0.0, 0.0)
+            glVertex3f(0, 0, 0)
+            glVertex3f(1.0, 0, 0)
+            
+            # Y axis (green)
+            glColor3f(0.0, 1.0, 0.0)
+            glVertex3f(0, 0, 0)
+            glVertex3f(0, 1.0, 0)
+            
+            # Z axis (blue)
+            glColor3f(0.0, 0.0, 1.0)
+            glVertex3f(0, 0, 0)
+            glVertex3f(0, 0, 1.0)
+            glEnd()
+            
+            # Draw text label with light number
+            glRasterPos3f(0.6, 0.6, 0.6)
+            # Would need GLUT for text rendering
+            # glutBitmapString(GLUT_BITMAP_HELVETICA_12, f"Light {i}")
+            
+            glPopMatrix()
+        
+        # Re-enable lighting
+        glEnable(GL_LIGHTING)
+        
+        # Restore previous state
+        glPopAttrib()
 
     
 
@@ -2012,6 +2121,16 @@ class MLBWeatherApp(QMainWindow):
         # Action buttons
         button_layout = QVBoxLayout()
         
+        # Lighting control button
+        self.lighting_btn = QPushButton("Lighting Controls")
+        self.lighting_btn.clicked.connect(self.show_lighting_controls)
+        button_layout.addWidget(self.lighting_btn)
+        
+        # Create lighting control widget (but don't show it yet)
+        self.lighting_control = LightingControlWidget()
+        self.lighting_control.lightChanged.connect(self.update_lighting)
+        
+        
         # Simulate button
         self.simulate_btn = QPushButton("Simulate Ball Flight")
         self.simulate_btn.setMinimumHeight(40)  # Make button taller for emphasis
@@ -2139,6 +2258,227 @@ class MLBWeatherApp(QMainWindow):
 
     def update_weather(self):
         self.stadium_widget.fetch_weather_data()
+    
+    
+    def show_lighting_controls(self):
+        """Show the lighting control dialog"""
+        self.lighting_control.show()
+
+    def update_lighting(self):
+        """Update 3D view lighting based on control widget settings"""
+        light_params = self.lighting_control.get_light_params()
+        self.stadium_widget.umpire_view.set_lighting(light_params)
+        # Make sure to set the show_lights attribute
+        self.stadium_widget.umpire_view.show_lights = self.lighting_control.show_lights()
+        self.stadium_widget.umpire_view.update()
+    
+
+
+class LightingControlWidget(QWidget):
+    """Widget to control 3D scene lighting parameters"""
+    
+    lightChanged = pyqtSignal()  # Signal emitted when light parameters change
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lighting Controls")
+        
+        # Initialize light parameters
+        self.lights = [
+            {
+                'position': [5.0, 5.0, 5.0, 1.0],
+                'diffuse': [1.0, 1.0, 1.0, 1.0],
+                'ambient': [0.6, 0.6, 0.6, 1.0],
+                'specular': [1.0, 1.0, 1.0, 1.0],
+                'enabled': True
+            },
+            {
+                'position': [-3.0, 2.0, 4.0, 1.0],
+                'diffuse': [0.7, 0.7, 0.8, 1.0],
+                'ambient': [0.3, 0.3, 0.3, 1.0],
+                'specular': [0.5, 0.5, 0.6, 1.0],
+                'enabled': True
+            }
+        ]
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        # Main layout
+        main_layout = QVBoxLayout(self)
+        
+        # Create tabs for each light source
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+        
+        # Add visualization checkbox
+        self.show_lights_check = QCheckBox("Show Light Sources")
+        self.show_lights_check.setChecked(True)
+        self.show_lights_check.stateChanged.connect(self.emit_light_changed)
+        main_layout.addWidget(self.show_lights_check)
+        
+        # Create tabs for lights
+        for i, light in enumerate(self.lights):
+            light_tab = QWidget()
+            tab_layout = QVBoxLayout(light_tab)
+            
+            # Enable/disable light
+            enable_check = QCheckBox(f"Enable Light {i}")
+            enable_check.setChecked(light['enabled'])
+            enable_check.stateChanged.connect(lambda state, idx=i: self.toggle_light(idx, state))
+            tab_layout.addWidget(enable_check)
+            
+            # Light position controls
+            pos_group = QGroupBox("Position")
+            pos_layout = QGridLayout()
+            
+            # Create sliders for X, Y, Z position
+            pos_sliders = []
+            pos_labels = []
+            
+            for j, axis in enumerate(['X', 'Y', 'Z', 'W']):
+                pos_layout.addWidget(QLabel(f"{axis}:"), j, 0)
+                
+                slider = QSlider(Qt.Orientation.Horizontal)
+                
+                # Special handling for W component which should be 0 or 1
+                if axis == 'W':
+                    slider.setRange(0, 1)  # W can be 0 (directional) or 1 (positional)
+                    slider.setValue(int(light['position'][3]))
+                    slider.valueChanged.connect(lambda val, idx=i, axis_idx=3: 
+                                              self.update_light_position(idx, axis_idx, float(val)))
+                else:
+                    # For X, Y, Z components
+                    slider.setRange(-1000, 1000)
+                    slider.setValue(int(light['position'][j] * 10))
+                    slider.valueChanged.connect(lambda val, idx=i, axis_idx=j: 
+                                              self.update_light_position(idx, axis_idx, val/10))
+                
+                label = QLabel(f"{light['position'][j]:.1f}" if axis != 'W' else f"{light['position'][3]:.0f}")
+                
+                # Different function for updating W label
+                if axis == 'W':
+                    slider.valueChanged.connect(lambda val, lbl=label: lbl.setText(f"{float(val):.0f}"))
+                else:
+                    slider.valueChanged.connect(lambda val, lbl=label: lbl.setText(f"{val/10:.1f}"))
+                
+                pos_layout.addWidget(slider, j, 1)
+                pos_layout.addWidget(label, j, 2)
+                
+                pos_sliders.append(slider)
+                pos_labels.append(label)
+            
+            pos_group.setLayout(pos_layout)
+            tab_layout.addWidget(pos_group)
+            
+            # Light intensity controls
+            intensity_group = QGroupBox("Intensity")
+            intensity_layout = QGridLayout()
+            
+            # Create sliders for ambient, diffuse, specular
+            for j, comp_name in enumerate(['Ambient', 'Diffuse', 'Specular']):
+                intensity_layout.addWidget(QLabel(f"{comp_name}:"), j, 0)
+                
+                comp_key = comp_name.lower()
+                
+                # Create RGB sliders for each component
+                rgb_layout = QHBoxLayout()
+                rgb_values = []
+                
+                for k, color in enumerate(['R', 'G', 'B']):
+                    color_value = light[comp_key][k]
+                    
+                    slider = QSlider(Qt.Orientation.Horizontal)
+                    slider.setRange(0, 100)
+                    slider.setValue(int(color_value * 100))
+                    
+                    # Connect color slider to update function
+                    slider.valueChanged.connect(
+                        lambda val, idx=i, comp=comp_key, color_idx=k: 
+                        self.update_light_component(idx, comp, color_idx, val/100)
+                    )
+                    
+                    rgb_layout.addWidget(QLabel(color))
+                    rgb_layout.addWidget(slider)
+                    rgb_values.append(color_value)
+                
+                # Add RGB value display
+                rgb_label = QLabel(f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})")
+                
+                intensity_layout.addLayout(rgb_layout, j, 1)
+                intensity_layout.addWidget(rgb_label, j, 2)
+            
+            intensity_group.setLayout(intensity_layout)
+            tab_layout.addWidget(intensity_group)
+            
+            # Add reset button
+            reset_button = QPushButton("Reset to Default")
+            reset_button.clicked.connect(lambda _, idx=i: self.reset_light(idx))
+            tab_layout.addWidget(reset_button)
+            
+            # Add the tab
+            self.tab_widget.addTab(light_tab, f"Light {i}")
+    
+    def toggle_light(self, light_idx, enabled):
+        """Enable or disable a light"""
+        self.lights[light_idx]['enabled'] = enabled
+        self.emit_light_changed()
+    
+    def update_light_position(self, light_idx, axis_idx, value):
+        """Update a light's position on a specific axis"""
+        self.lights[light_idx]['position'][axis_idx] = value
+        self.emit_light_changed()
+    
+    def update_light_component(self, light_idx, component, color_idx, value):
+        """Update a specific color component of a light's property"""
+        self.lights[light_idx][component][color_idx] = value
+        self.emit_light_changed()
+    
+    def reset_light(self, light_idx):
+        """Reset a light to its default values"""
+        if light_idx == 0:
+            self.lights[0] = {
+                'position': [5.0, 5.0, 5.0, 1.0],
+                'diffuse': [1.0, 1.0, 1.0, 1.0],
+                'ambient': [0.6, 0.6, 0.6, 1.0],
+                'specular': [1.0, 1.0, 1.0, 1.0],
+                'enabled': True
+            }
+        else:
+            self.lights[1] = {
+                'position': [-3.0, 2.0, 4.0, 1.0],
+                'diffuse': [0.7, 0.7, 0.8, 1.0],
+                'ambient': [0.3, 0.3, 0.3, 1.0],
+                'specular': [0.5, 0.5, 0.6, 1.0],
+                'enabled': True
+            }
+        
+        # Update UI to reflect changes
+        self.update_ui_from_light(light_idx)
+        self.emit_light_changed()
+    
+    def update_ui_from_light(self, light_idx):
+        """Update UI elements to reflect light settings"""
+        # This would update all sliders and labels based on current settings
+        # Implementation would require storing references to the UI controls
+        pass
+    
+    def emit_light_changed(self):
+        """Emit signal when light parameters change"""
+        self.lightChanged.emit()
+    
+    def show_lights(self):
+        """Return whether to show light source visualizations"""
+        return self.show_lights_check.isChecked()
+    
+    def get_light_params(self):
+        """Return current light parameters"""
+        return self.lights
+
+
+
+
+
 
 
 def main():
