@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem,
-    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget
+    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget,QDoubleSpinBox
 )
 # Import QOpenGLWidget from the correct module
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -53,30 +53,37 @@ class BallFlightSimulator:
         self.C_d = 0.3  # drag coefficient
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
-        OBJ_POSITION = [0,0,0]  
-        OBJ_SCALE = 0.1  # Initial scale factor
 
-    def calculate_trajectory(self, exit_velocity, launch_angle, wind_speed, wind_direction, temp, humidity, altitude):
-        """Calculate ball trajectory based on initial conditions and environment"""
+    def calculate_trajectory(self, exit_velocity, launch_angle, wind_speed, wind_direction, 
+                             temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0):
+        """Calculate ball trajectory based on initial conditions and environment
+        
+        Standard coordinate system:
+        - X axis: From home plate toward pitcher's mound/center field (positive)
+        - Y axis: Vertical (up is positive)
+        - Z axis: From home plate toward third base/left field (negative) or first base/right field (positive)
+        """
         # Convert inputs to SI units
         v0 = exit_velocity * 0.44704  # mph to m/s
         angle = np.radians(launch_angle)
         wind = wind_speed * 0.44704  # mph to m/s
         wind_rad = np.radians(wind_direction)
-
+    
         # Calculate air density based on temperature, humidity, altitude
         rho = self.calculate_air_density(temp, humidity, altitude)
-
+    
         # Initial conditions [x, y, z, vx, vy, vz]
-        # x is toward right field, y is toward center field, z is height
-        initial_state = [0, 0, 0.91,  # Starting at home plate, 3 feet off ground
-                         v0 * np.cos(angle) * np.cos(np.radians(0)),  # x component
-                         v0 * np.cos(angle) * np.sin(np.radians(0)),  # y component
-                         v0 * np.sin(angle)]  # z component
-
+        # Using the provided starting position parameters
+        initial_state = [
+            start_x, start_y, start_z,  # Starting position parameters
+            v0 * np.cos(angle),  # x component (toward center field)
+            v0 * np.sin(angle),  # y component (upward)
+            0  # z component (no initial sideways velocity)
+        ]
+    
         # Time span for simulation
         t_span = (0, 10)  # 10 seconds should be enough for any baseball flight
-
+    
         # Solve differential equations
         solution = solve_ivp(
             lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho),
@@ -85,40 +92,48 @@ class BallFlightSimulator:
             method='RK45',
             max_step=0.01
         )
-
-        # TODO: why the hell is this only using solution.y????
-        # Convert back to imperial units for display
-        x = solution.y[0] * 3.28084  # m to ft
-        y = solution.y[1] * 3.28084  # m to ft
-        z = solution.y[2] * 3.28084  # m to ft
-
-        # Find landing point (where z reaches field level)
-        landing_idx = np.argmax(z < 0.91 * 3.28084)
-        if landing_idx == 0 and z[-1] > 0.91 * 3.28084:
-            landing_idx = len(z) - 1
-
-        distance = np.sqrt(x[landing_idx]**2 + y[landing_idx]**2)
-
+    
+        # Convert to imperial units for display
+        x = solution.y[0] * 3.28084  # m to ft (distance toward center field)
+        y = solution.y[1] * 3.28084  # m to ft (height)
+        z = solution.y[2] * 3.28084  # m to ft (left/right field distance)
+        
+        # Find landing point (where y reaches field level)
+        field_level = start_y * 3.28084  # Convert the starting height to feet for comparison
+        landing_idx = np.argmax(y < field_level)
+        if landing_idx == 0 and y[-1] > field_level:
+            landing_idx = len(y) - 1
+    
+        # Calculate total horizontal distance
+        distance = np.sqrt(x[landing_idx]**2 + z[landing_idx]**2)
+    
         return {
             "time": solution.t[:landing_idx+1],
-            "x": x[:landing_idx+1],
-            "y": y[:landing_idx+1],
-            "z": z[:landing_idx+1],
-            "distance": distance
+            "x": x[:landing_idx+1],  # Center field direction
+            "y": y[:landing_idx+1],  # Height
+            "z": z[:landing_idx+1],  # Left/right field direction
+            "distance": distance,
+            "start_x": start_x * 3.28084,  # Store starting position in feet
+            "start_y": start_y * 3.28084,
+            "start_z": start_z * 3.28084
         }
 
     def baseball_ode(self, t, state, wind_speed, wind_direction, air_density):
-        """ODE system for baseball flight"""
+        """ODE system for baseball flight using the standard coordinate system"""
         x, y, z, vx, vy, vz = state
 
-        # Wind components
-        wind_x = wind_speed * np.cos(wind_direction)
-        wind_y = wind_speed * np.sin(wind_direction)
+        # Wind components (convert from meteorological to cartesian)
+        # In meteorological, 0° is North, 90° is East, 180° is South, 270° is West
+        # Transform to our coordinate system where:
+        # positive x is toward center field (roughly North)
+        # positive z is toward right field (roughly East)
+        wind_x = wind_speed * np.cos(wind_direction)  # North component (center field)
+        wind_z = wind_speed * np.sin(wind_direction)  # East component (right field)
 
         # Relative velocity (ball velocity - wind velocity)
         v_rel_x = vx - wind_x
-        v_rel_y = vy - wind_y
-        v_rel_z = vz
+        v_rel_y = vy  # No wind in vertical direction
+        v_rel_z = vz - wind_z
 
         v_rel = np.sqrt(v_rel_x**2 + v_rel_y**2 + v_rel_z**2)
 
@@ -145,12 +160,12 @@ class BallFlightSimulator:
 
         # Magnus acceleration (simplified - assuming backspin)
         # For backspin, the Magnus force is mostly upward
-        az_magnus = F_magnus / self.m
+        ay_magnus = F_magnus / self.m
 
         # Total acceleration
         ax = ax_drag
-        ay = ay_drag
-        az = az_drag + az_magnus - self.g
+        ay = ay_drag + ay_magnus - self.g  # Subtract gravity
+        az = az_drag
 
         return [vx, vy, vz, ax, ay, az]
 
@@ -319,7 +334,63 @@ class StadiumView(QGraphicsView):
             # Fall back to drawing method
     
     
-    
+    def draw_starting_position(self, start_x, start_y, start_z):
+        """Draw a visual indicator for the ball starting position"""
+        # Clear any previous starting position indicator
+        for item in self.ball_layer.childItems():
+            if hasattr(item, 'is_start_indicator') and item.is_start_indicator:
+                self.scene.removeItem(item)
+        
+        # Scale factor - must match the one used in load_stadium_svg
+        scale_factor = 2.0
+        
+        # Set a fixed home plate position - same as in start_ball_trajectory
+        fixed_home_x = 0
+        fixed_home_y = 255
+        
+        # Create the start position indicator (a larger circle with crosshairs)
+        indicator_size = 15
+        self.start_indicator = QGraphicsEllipseItem(-indicator_size/2, -indicator_size/2, indicator_size, indicator_size)
+        self.start_indicator.setBrush(QBrush(QColor(255, 140, 0, 180)))  # Semi-transparent orange
+        self.start_indicator.setPen(QPen(QColor(255, 140, 0), 2))
+        
+        # Add crosshairs
+        line_h = QGraphicsLineItem(-indicator_size/2, 0, indicator_size/2, 0)
+        line_v = QGraphicsLineItem(0, -indicator_size/2, 0, indicator_size/2)
+        line_h.setPen(QPen(QColor(255, 140, 0), 2))
+        line_v.setPen(QPen(QColor(255, 140, 0), 2))
+        
+        # Create a group to hold all indicators
+        self.start_position_group = QGraphicsItemGroup()
+        self.start_position_group.addToGroup(self.start_indicator)
+        self.start_position_group.addToGroup(line_h)
+        self.start_position_group.addToGroup(line_v)
+        
+        # Mark this as a start indicator for easier identification
+        self.start_position_group.is_start_indicator = True
+        
+        # In 2D top-down view:
+        # - Scene X increases toward right field (positive Z in our coordinate system)
+        # - Scene Y decreases toward center field (positive X in our coordinate system)
+        scene_x = fixed_home_x + start_z * scale_factor
+        scene_y = fixed_home_y - start_x * scale_factor
+        
+        # Position the indicator
+        self.start_position_group.setPos(scene_x, scene_y)
+        
+        # Add to the ball layer with high z-value to be on top
+        self.ball_layer.addToGroup(self.start_position_group)
+        self.start_position_group.setZValue(150)  # Above ball trajectory
+        
+        # Add a text label with the coordinates
+        text = f"Start: ({start_x:.1f}, {start_y:.1f}, {start_z:.1f})"
+        label = self.scene.addSimpleText(text)
+        label.setBrush(QBrush(QColor(255, 140, 0)))
+        label.setPos(scene_x + 15, scene_y - 15)
+        label.is_start_indicator = True
+        self.ball_layer.addToGroup(label)
+        
+        return self.start_position_group
 
     
     def draw_wind_indicators(self, speed, direction):
@@ -435,18 +506,18 @@ class StadiumView(QGraphicsView):
             item.setOpacity(opacity)
     
     def start_ball_trajectory(self, trajectory_data):
-        """Initialize the ball trajectory visualization"""
-        # Clear previous ball items
-        while self.ball_layer.childItems():
-            item = self.ball_layer.childItems()[0]
-            self.scene.removeItem(item)
+        """Initialize the ball trajectory visualization in the 2D view with custom starting position"""
+        # Clear previous ball items, but keep start indicator
+        for item in self.ball_layer.childItems():
+            if not (hasattr(item, 'is_start_indicator') and item.is_start_indicator):
+                self.scene.removeItem(item)
         
         # Scale factor - must match the one used in load_stadium_svg
         scale_factor = 2.0
         
-        # Set a fixed home plate position - this is the key change
+        # Set a fixed home plate position - this is the key point of alignment
         fixed_home_x = 0
-        fixed_home_y = 255  # Adjust this value to match your desired position
+        fixed_home_y = 255
         
         # Create the ball
         ball_size = 10 
@@ -460,12 +531,23 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setBrush(QBrush(QColor(0, 0, 0, 150)))
         self.shadow_item.setPen(QPen(Qt.PenStyle.NoPen))
         
+        # Get the starting position
+        start_x = trajectory_data.get('start_x', 0)
+        start_z = trajectory_data.get('start_z', 0)
+        
+        # Calculate scene coordinates for starting position
+        scene_start_x = fixed_home_x + start_z * scale_factor
+        scene_start_y = fixed_home_y - start_x * scale_factor
+        
         # Create trajectory path with fixed starting point
         path = QPainterPath()
-        path.moveTo(fixed_home_x, fixed_home_y)
+        path.moveTo(scene_start_x, scene_start_y)
         
+        # In 2D top-down view:
+        # - Scene X increases toward right field (positive Z in our coordinate system)
+        # - Scene Y decreases toward center field (positive X in our coordinate system)
         for i in range(0, len(trajectory_data["x"]), 5):
-            scene_x = fixed_home_x + trajectory_data["y"][i] * scale_factor
+            scene_x = fixed_home_x + trajectory_data["z"][i] * scale_factor
             scene_y = fixed_home_y - trajectory_data["x"][i] * scale_factor
             path.lineTo(scene_x, scene_y)
         
@@ -477,17 +559,17 @@ class StadiumView(QGraphicsView):
         self.ball_layer.addToGroup(self.trajectory_path)
         self.ball_layer.addToGroup(self.ball_item)
         
-        # Set the ball position DIRECTLY - not through setPos
-        self.ball_item.setX(fixed_home_x)
-        self.ball_item.setY(fixed_home_y)
-        
-        # Set the shadow position DIRECTLY
-        self.shadow_item.setX(fixed_home_x)
-        self.shadow_item.setY(fixed_home_y)
+        # Set the ball position to the starting point
+        self.ball_item.setPos(scene_start_x, scene_start_y)
+        self.shadow_item.setPos(scene_start_x, scene_start_y)
         
         # Store the home position for animation
         self.home_plate_x = fixed_home_x
         self.home_plate_y = fixed_home_y
+        
+        # Store the starting position for animation
+        self.start_x = scene_start_x
+        self.start_y = scene_start_y
         
         # Make visible
         self.ball_layer.setVisible(True)
@@ -504,9 +586,13 @@ class StadiumView(QGraphicsView):
         scale_factor = 2.0
         
         # Get coordinates with proper scaling from the home plate position
-        x = self.home_plate_x + trajectory_data["y"][frame] * scale_factor
+        # For top-down 2D view:
+        # - Scene X maps to Z (left/right field)
+        # - Scene Y maps to -X (center field, negated for screen coordinates)
+        # - Height (Y) is used for visual scaling effects
+        x = self.home_plate_x + trajectory_data["z"][frame] * scale_factor
         y = self.home_plate_y - trajectory_data["x"][frame] * scale_factor
-        z = trajectory_data["z"][frame]
+        height = trajectory_data["y"][frame]  # Use height for scaling
         
         # Set positions DIRECTLY
         self.ball_item.setX(x)
@@ -515,15 +601,15 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setY(y)
         
         # Scale ball based on height
-        height_factor = max(0.8, min(1.5, 1 + z/100))
+        height_factor = max(0.8, min(1.5, 1 + height/100))
         self.ball_item.setScale(height_factor)
         
         # Make shadow more transparent based on height
-        opacity = max(0.2, 1.0 - z/200)
+        opacity = max(0.2, 1.0 - height/200)
         self.shadow_item.setOpacity(opacity)
         
         # Scale shadow size inversely proportional to height
-        shadow_scale = max(0.5, 1.0 - z/300)
+        shadow_scale = max(0.5, 1.0 - height/300)
         self.shadow_item.setScale(shadow_scale)
         
         return True
@@ -615,18 +701,16 @@ class UmpireView3D(QOpenGLWidget):
         # Use a dark blue background for better contrast
         glClearColor(0.05, 0.05, 0.15, 1.0)
         
-        # CRITICAL: Disable color material mode completely
-        glDisable(GL_COLOR_MATERIAL)
         
         # Use stronger lighting with more ambient and proper positioning
-        glLightfv(GL_LIGHT0, GL_POSITION, [50.0, 50.0, 50.0, 0.0])  # Directional light
+        glLightfv(GL_LIGHT0, GL_POSITION, [5.0, 5.0, 5.0, 1.0])  # Directional light
         glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])      # Full white diffuse
         glLightfv(GL_LIGHT0, GL_AMBIENT, [0.6, 0.6, 0.6, 1.0])      # Strong ambient
         glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])     # Full specular
         
         # Add a second light source for better illumination
         glEnable(GL_LIGHT1)
-        glLightfv(GL_LIGHT1, GL_POSITION, [-30.0, 20.0, 40.0, 0.0]) # From another angle
+        glLightfv(GL_LIGHT1, GL_POSITION, [-3.0, 2.0, 4.0, 1.0]) # From another angle
         glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.7, 0.7, 0.8, 1.0])      # Slightly blue diffuse
         glLightfv(GL_LIGHT1, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])      # Some ambient
         glLightfv(GL_LIGHT1, GL_SPECULAR, [0.5, 0.5, 0.6, 1.0])     # Some specular
@@ -634,8 +718,6 @@ class UmpireView3D(QOpenGLWidget):
         # Ensure normal vectors are normalized for proper lighting
         glEnable(GL_NORMALIZE)
         
-        # IMPORTANT: Enable two-sided lighting so both sides of faces are lit
-        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)
         
         # REMOVE THE EXISTING DISPLAY LIST CODE HERE
         self.stadium_display_list = None
@@ -653,21 +735,6 @@ class UmpireView3D(QOpenGLWidget):
         self.ball_pos = None
         self.update()  # Request a redraw of the scene
     
-    
-    def update_ball_position(self, x, y, z):
-        """Update the position of the ball in the 3D view
-        
-        Args:
-            x: x-coordinate (lateral position)
-            y: y-coordinate (distance from home plate)
-            z: z-coordinate (height)
-        """
-        # Store the new ball position
-        self.ball_pos = (float(x), float(y), float(z))
-        
-        # Request a redraw of the scene
-        self.update()
-    
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -684,6 +751,28 @@ class UmpireView3D(QOpenGLWidget):
         if self.stadium_display_list:
             glCallList(self.stadium_display_list)
         
+        # Draw ball starting position indicator 
+        if hasattr(self, 'start_pos') and self.start_pos is not None:
+            start_x, start_y, start_z = self.start_pos
+            
+            # Draw a larger orange sphere for the starting position
+            glPushMatrix()
+            glTranslatef(start_x, start_y, start_z)
+            
+            # Set orange material for the start indicator
+            glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 0.5, 0.0, 0.7])  # Orange, semi-transparent
+            glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 0.8, 0.2, 0.7])
+            glMaterialf(GL_FRONT, GL_SHININESS, 50.0)
+            
+            # Draw a slightly larger sphere
+            indicator = gluNewQuadric()
+            gluQuadricDrawStyle(indicator, GLU_FILL)
+            gluQuadricNormals(indicator, GLU_SMOOTH)
+            gluSphere(indicator, 0.25, 16, 16)  # Slightly larger than the ball
+            gluDeleteQuadric(indicator)
+            glPopMatrix()
+        
+        
         # Ball rendering
         if self.ball_pos is not None:
             x, y, z = self.ball_pos
@@ -699,7 +788,7 @@ class UmpireView3D(QOpenGLWidget):
             sphere = gluNewQuadric()
             gluQuadricDrawStyle(sphere, GLU_FILL)
             gluQuadricNormals(sphere, GLU_SMOOTH)
-            gluSphere(sphere, 0.5, 16, 16)
+            gluSphere(sphere, 0.2, 16, 16)
             gluDeleteQuadric(sphere)
             glPopMatrix()
             
@@ -724,107 +813,6 @@ class UmpireView3D(QOpenGLWidget):
 
 
 
-    # Manually set mat values, dont use .mtl file
-    #def compile_stadium_display_list(self):
-    #    if not self.ballpark_model:
-    #        return
-    #    
-    #    self.stadium_display_list = glGenLists(1)
-    #    glNewList(self.stadium_display_list, GL_COMPILE)
-    #
-    #    glPushMatrix()
-    #    glTranslatef(0, 0, 0)
-    #    glScalef(0.1, 0.1, 0.1)
-    #    glRotatef(-90, 1, 0, 0)
-    #
-    #    # Disable color material so our manual material settings take effect
-    #    glDisable(GL_COLOR_MATERIAL)
-    #    
-    #    vertices = self.ballpark_model.vertices
-    #    for mesh in self.ballpark_model.mesh_list:
-    #        # Get material name
-    #        material_name = None
-    #        if hasattr(mesh, 'materials') and mesh.materials:
-    #            material = mesh.materials[0]
-    #            if isinstance(material, str):
-    #                material_name = material
-    #            elif hasattr(material, 'name'):
-    #                material_name = material.name
-    #        
-    #        # Force vibrant colors based on material name
-    #        if material_name == "grass":
-    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.15, 0.75, 0.2, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.2, 0.6, 0.3, 1.0])
-    #            glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
-    #        elif material_name == "dirt":
-    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
-    #            glMaterialf(GL_FRONT, GL_SHININESS, 16.0)
-    #        elif material_name == "bases":
-    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.98, 0.98, 0.98, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.9, 0.9, 0.9, 1.0])
-    #            glMaterialf(GL_FRONT, GL_SHININESS, 96.0)
-    #        elif material_name and "Cable" in material_name:
-    #            if "CableB" in material_name:
-    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.05, 0.2, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.35, 0.9, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.8, 1.0])
-    #            elif "CableG" in material_name:
-    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.8, 0.2, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.7, 0.5, 1.0])
-    #            elif "CableY" in material_name:
-    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.05, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.95, 0.8, 0.0, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.8, 0.7, 0.3, 1.0])
-    #            else:
-    #                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.1, 0.1, 0.1, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.2, 0.2, 0.25, 1.0])
-    #                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.4, 0.5, 1.0])
-    #        else:
-    #            # Default to light gray for unrecognized materials
-    #            glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.7, 0.7, 0.7, 1.0])
-    #            glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
-    #            glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
-    #            
-    #        # Draw the mesh with the selected material
-    #        glBegin(GL_TRIANGLES)
-    #        for face in mesh.faces:
-    #            for vertex_i in face:
-    #                glVertex3f(*vertices[vertex_i])
-    #        glEnd()
-    #
-    #    # Re-enable color material for other rendering
-    #    glEnable(GL_COLOR_MATERIAL)
-    #    
-    #    glPopMatrix()
-    #    glEndList()
-    #    print("✅ Stadium model compiled into display list")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
  # this function actually tries to load the mats from .mtl file
 
     def compile_stadium_display_list(self):
@@ -837,13 +825,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Basic model transformations
         glPushMatrix()
-        glTranslatef(0, 0, 0)
         glScalef(0.1, 0.1, 0.1)
-        glRotatef(0, 1, 0, 0)  # Add rotation for proper orientation
-        
-        # Make sure color material is disabled, will delete later
-        glDisable(GL_COLOR_MATERIAL)
-        
         vertices = self.ballpark_model.vertices
         
         # Process each mesh with its own material based on new names
@@ -867,75 +849,75 @@ class UmpireView3D(QOpenGLWidget):
             # Apply materials based on mesh name
             if "Infield" in mesh_name or mesh_name == "Infield":
                 # Dirt infield
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 64.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 64.0)
                 print(f"Applied dirt material to infield")
                 
             elif "outfield" in mesh_name or mesh_name == "outfield":
                 # Green grass outfield
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.05, 0.75, 0.05, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.1, 0.3, 0.1, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.05, 0.75, 0.05, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.1, 0.3, 0.1, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
                 print(f"Applied grass material to outfield")
                 
             elif "EffortText" in mesh_name or mesh_name == "EffortText":
                 # Nearly transparent material for EffortText
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, [0.15, 0.05, 0.05, 0.05])  # No emission
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 128.0)
-                glDisable(GL_BLEND)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 0.1])
+                glMaterialfv(GL_FRONT, GL_EMISSION, [0.15, 0.05, 0.05, 0.05])  # No emission
+                glMaterialf(GL_FRONT, GL_SHININESS, 128.0)
+                # glDisable(GL_BLEND)
                 
             elif "homeplate" in mesh_name:
                 # White for home plate
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.95, 0.95, 0.95, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.8, 0.8, 0.8, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 96.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.95, 0.95, 0.95, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.8, 0.8, 0.8, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 96.0)
                 print(f"Applied white material to homeplate")
                 
             elif "pitchersmound" in mesh_name:
                 # Slightly different dirt color for pitcher's mound
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.22, 0.17, 0.12, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.7, 0.4, 0.2, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.22, 0.17, 0.12, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.7, 0.4, 0.2, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
                 print(f"Applied mound material to pitchersmound")
                 
             elif "Dugout" in mesh_name or "dugout" in mesh_name:
                 # Gray concrete for dugouts
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.6, 0.6, 0.6, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 48.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.6, 0.6, 0.6, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 48.0)
                 print(f"Applied concrete material to dugout")
                 
             elif "Graffiti" in mesh_name:
                 # Graffiti wall - you could use a texture here in the future
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 8.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 8.0)
                 print(f"Applied wall material to Graffiti Wall")
                 
             elif "Cylinder" in mesh_name or "Box" in mesh_name:
                 # Stadium structures - light blue/gray
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.25, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.5, 0.5, 0.6, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.4, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.25, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.5, 0.5, 0.6, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.4, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
                 print(f"Applied structure material to {mesh_name}")
                 
             else:
                 # Default white material for unrecognized meshes
-                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
-                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
-                glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
                 print(f"Applied default material to {mesh_name}")
             
             # Draw the triangles for this mesh
@@ -948,6 +930,16 @@ class UmpireView3D(QOpenGLWidget):
         glPopMatrix()
         glEndList()
         print("✅ Stadium model compiled into display list with materials based on mesh names")
+        
+    def set_start_position(self, x, y, z):
+        """Set the starting position indicator for the 3D view"""
+        self.start_pos = (x, y, z)
+        self.update()  # Request a redraw of the scene
+
+    def clear_ball(self):
+        """Clear any displayed ball from the 3D view but keep the starting position"""
+        self.ball_pos = None
+        self.update()  # Request a redraw of the scene
 
     
 
@@ -1273,7 +1265,7 @@ class SplitView(QWidget):
         
         # 3D umpire view on the right
         self.umpire_view = UmpireView3D()
-        self.umpire_view.setMinimumSize(800, 600)
+        self.umpire_view.setMinimumSize(1280, 720)
         views_layout.addWidget(self.umpire_view)
         
         self.layout.addLayout(views_layout)
@@ -1283,7 +1275,25 @@ class SplitView(QWidget):
         self.layout.addWidget(self.weather_label)
     
     
-    
+    def update_starting_position(self):
+        """Update the visual indicator when position controls change"""
+        if hasattr(self, 'x_pos_spin') and hasattr(self, 'stadium_view'):
+            x = self.x_pos_spin.value()
+            y = self.y_pos_spin.value()
+            z = self.z_pos_spin.value()
+            
+            # Update the visual indicator in the stadium view
+            self.stadium_view.draw_starting_position(x, y, z)
+            
+            # Update the 3D view starting position
+            # Convert feet to the 3D view's units (approximately meters)
+            x_3d = x / 3.28084
+            y_3d = y / 3.28084
+            z_3d = z / 3.28084
+            
+            # Set the starting position in the 3D view
+            if hasattr(self, 'umpire_view'):
+                self.umpire_view.set_start_position(x_3d, y_3d, z_3d)
     
     
     def fetch_weather_data(self):
@@ -1337,15 +1347,20 @@ class SplitView(QWidget):
     
     # Modification for simulate_ball_flight method to update the flight stats list
     def simulate_ball_flight(self, exit_velocity, launch_angle, spin_rate=1800):
-        """Simulate ball flight with current weather conditions"""
+        """Simulate ball flight with current weather conditions and custom starting position"""
         if not self.weather_data:
             print("Weather data not available")
             return
             
         # Update spin rate
         self.ball_simulator.omega = spin_rate
+        
+        # Get starting position in meters (convert from feet)
+        start_x = self.x_pos_spin.value() / 3.28084
+        start_y = self.y_pos_spin.value() / 3.28084
+        start_z = self.z_pos_spin.value() / 3.28084
             
-        # Calculate trajectory
+        # Calculate trajectory with starting position
         self.trajectory_data = self.ball_simulator.calculate_trajectory(
             exit_velocity,
             launch_angle,
@@ -1353,11 +1368,14 @@ class SplitView(QWidget):
             self.weather_data["wind_direction"],
             self.weather_data["temperature"],
             self.weather_data["humidity"],
-            self.altitude
+            self.altitude,
+            start_x,
+            start_y,
+            start_z
         )
         
         # Log trajectory data for debugging
-        print(f"Trajectory starting point: ({self.trajectory_data['x'][0]}, {self.trajectory_data['y'][0]})")
+        print(f"Starting point: ({self.trajectory_data['start_x']:.1f}, {self.trajectory_data['start_y']:.1f}, {self.trajectory_data['start_z']:.1f})")
         print(f"Ball will travel: {self.trajectory_data['distance']:.1f} feet")
         
         # Initialize ball visualization in top-down view
@@ -1376,7 +1394,7 @@ class SplitView(QWidget):
         
         # Calculate stats
         distance = self.trajectory_data["distance"]
-        max_height = max(self.trajectory_data["z"])
+        max_height = max(self.trajectory_data["y"]) # make sure is y axis
         hr_text = "HOME RUN!" if is_home_run else ""
         
         # Create stats text
@@ -1414,52 +1432,60 @@ class SplitView(QWidget):
         )
         
         # Update ball position in 3D umpire view
-        # Convert ball coordinates for umpire view perspective
-        # Note: For 3D view, we can use the actual coordinates directly
-        x = self.trajectory_data["x"][self.current_frame]  # Side to side (left/right field)
-        y = self.trajectory_data["y"][self.current_frame]  # Distance from plate (negative is toward outfield)
-        z = self.trajectory_data["z"][self.current_frame]  # Height
+        # The 3D OpenGL world has a coordinate system:
+        # X - toward outfield (positive is outfield)
+        # Y - up (positive is up)
+        # Z - across field (positive is right field)
+        # Convert from feet to meters for the 3D view
+        x = self.trajectory_data["x"][self.current_frame] / 3.28084
+        y = self.trajectory_data["y"][self.current_frame] / 3.28084
+        z = self.trajectory_data["z"][self.current_frame] / 3.28084
         
-        self.umpire_view.update_ball_position(x, y, z)
-    
+        # Apply proper coordinate mapping for 3D view
+        self.umpire_view.ball_pos = (x, y, z)
+        self.umpire_view.update()
+        self.update()
+
     def check_if_home_run(self, trajectory_data):
         """Check if the trajectory results in a home run"""
         if not self.dimensions:
             return False
             
-        # Get the last point in the trajectory
-        final_x = trajectory_data["x"][-1]  # Distance straight out from home plate
-        final_y = trajectory_data["y"][-1]  # Distance side to side
+        # Get the final point in the trajectory
+        final_x = trajectory_data["x"][-1]  # Distance toward center field
+        final_z = trajectory_data["z"][-1]  # Distance toward right field (positive) or left field (negative)
         
-        # Calculate distance from home plate
-        distance = np.sqrt(final_x**2 + final_y**2)
+        # Calculate distance from home plate in the horizontal plane
+        distance = np.sqrt(final_x**2 + final_z**2)
         
         # Get the launch angle in the horizontal plane
-        horizontal_angle = np.degrees(np.arctan2(final_y, final_x))
+        # arctan2(z, x) gives angle from center field line
+        # Positive angles are toward right field, negative toward left field
+        horizontal_angle = np.degrees(np.arctan2(final_z, final_x))
         
         # Determine the wall distance based on the angle
         dimensions = self.dimensions
         wall_distance = None
         
-        # Left field (45° to 90° from center)
-        if -45 <= horizontal_angle < -15:
+        # Left field (negative z, positive x)
+        if horizontal_angle < -15:
             wall_distance = dimensions["left_field"]
-        # Left-center field (15° to 45° from center)
+        # Left-center field
         elif -15 <= horizontal_angle < 0:
             wall_distance = dimensions["left_center"]
-        # Center field (within 15° of center)
-        elif -15 <= horizontal_angle < 15:
+        # Center field
+        elif 0 <= horizontal_angle < 15:
             wall_distance = dimensions["center_field"]
-        # Right-center field (15° to 45° from center)
+        # Right-center field
         elif 15 <= horizontal_angle < 45:
             wall_distance = dimensions["right_center"]
-        # Right field (45° to 90° from center)
+        # Right field
         else:
             wall_distance = dimensions["right_field"]
         
-        # Check if the ball cleared the wall
-        # Also check if the ball was still above ~8 feet when it reached the wall
-        return distance >= wall_distance and trajectory_data["z"][-1] > 8
+        # Check if the ball cleared the wall and was high enough
+        # Ball must be above ~8 feet at the wall to be a home run
+        return distance >= wall_distance and trajectory_data["y"][-1] > 8
 
 
 class MLBWeatherApp(QMainWindow):
@@ -1577,6 +1603,56 @@ class MLBWeatherApp(QMainWindow):
         self.override_weather = QCheckBox("Override Weather Data")
         wind_layout.addWidget(self.override_weather, 2, 0, 1, 2)  # Span two columns
         
+        
+        # Ball position controls
+        position_group = QGroupBox("Ball Starting Position (feet)")
+        position_layout = QGridLayout()
+        
+        # X position (toward center field)
+        position_layout.addWidget(QLabel("X (center field):"), 0, 0)
+        self.x_pos_spin = QDoubleSpinBox()
+        self.x_pos_spin.setRange(-10, 50)  # Reasonable range for starting position
+        self.x_pos_spin.setValue(0)
+        self.x_pos_spin.setSingleStep(0.5)
+        self.x_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
+        position_layout.addWidget(self.x_pos_spin, 0, 1)
+        
+        # Y position (height)
+        position_layout.addWidget(QLabel("Y (height):"), 1, 0)
+        self.y_pos_spin = QDoubleSpinBox()
+        self.y_pos_spin.setRange(0, 10)  # Height range
+        self.y_pos_spin.setValue(3)  # 3 feet is approximately 0.91 meters
+        self.y_pos_spin.setSingleStep(0.5)
+        self.y_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
+        position_layout.addWidget(self.y_pos_spin, 1, 1)
+        
+        # Z position (left/right field)
+        position_layout.addWidget(QLabel("Z (left/right):"), 2, 0)
+        self.z_pos_spin = QDoubleSpinBox()
+        self.z_pos_spin.setRange(-10, 10)  # Reasonable range for side-to-side
+        self.z_pos_spin.setValue(0)
+        self.z_pos_spin.setSingleStep(0.5)
+        self.z_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
+        position_layout.addWidget(self.z_pos_spin, 2, 1)
+        
+        position_group.setLayout(position_layout)
+        bottom_controls.addWidget(position_group)
+        
+        # Store references in the stadium widget for easy access
+        self.stadium_widget.x_pos_spin = self.x_pos_spin
+        self.stadium_widget.y_pos_spin = self.y_pos_spin
+        self.stadium_widget.z_pos_spin = self.z_pos_spin
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         wind_group.setLayout(wind_layout)
         bottom_controls.addWidget(wind_group)
         
@@ -1603,18 +1679,43 @@ class MLBWeatherApp(QMainWindow):
         self.control_index = 2
         self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
     
-    def keyPrsEvent(self, event):
+    
+    # def keyPressEvent(self, a0):
+    #     self.clearFocus()
+    #     print(f"Keypress: {a0.key()}")
+    #     if (a0.key() == Qt.Key.Key_C):
+    #         print(self.stadium_widget.umpire_view.control_mode)
+    #     
+    #     if (a0.key() in (Qt.Key.Key_Comma, Qt.Key.Key_Period)):
+    #         if (a0.key() == Qt.Key.Key_Comma):  self.control_value -= 0.1;
+    #         if (a0.key() == Qt.Key.Key_Period): self.control_value += 0.1;
+    #         self.stadium_widget.umpire_view.camera[self.control_target][self.control_index] = self.control_value
+    #         print(f"control value: {self.control_value}")
+    #         self.stadium_widget.umpire_view.update()
+    #     
+    #     for I in range(3):
+    #         if (a0.key() == eval(f"Qt.Key.Key_{I+1}")):
+    #             print(f"control index: {I}")
+    #             self.control_index = I
+    #             self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
+    #             print(f"control value: {self.control_value}")
+    #             
+    #     super().keyPressEvent(a0) # delegate back to base keybind handling
+    #     return
+    
+    def keyPressEvent(self, event):
         step = 0.1  # Movement step size
-        
+        self.clearFocus()
+        print(event.key())
         # Position controls
         if event.key() == Qt.Key.Key_W:  # Move forward
-            self.stadium_widget.umpire_view.camera['pos'][2] += step
-        elif event.key() == Qt.Key.Key_S:  # Move backward
-            self.stadium_widget.umpire_view.camera['pos'][2] -= step
-        elif event.key() == Qt.Key.Key_A:  # Move left
-            self.stadium_widget.umpire_view.camera['pos'][0] -= step
-        elif event.key() == Qt.Key.Key_D:  # Move right
             self.stadium_widget.umpire_view.camera['pos'][0] += step
+        elif event.key() == Qt.Key.Key_S:  # Move backward
+            self.stadium_widget.umpire_view.camera['pos'][0] -= step
+        elif event.key() == Qt.Key.Key_A:  # Move left
+            self.stadium_widget.umpire_view.camera['pos'][2] -= step
+        elif event.key() == Qt.Key.Key_D:  # Move right
+            self.stadium_widget.umpire_view.camera['pos'][2] += step
         elif event.key() == Qt.Key.Key_Q:  # Move up
             self.stadium_widget.umpire_view.camera['pos'][1] += step
         elif event.key() == Qt.Key.Key_E:  # Move down
@@ -1622,13 +1723,13 @@ class MLBWeatherApp(QMainWindow):
         
         # Target controls (shift + key)
         elif event.key() == Qt.Key.Key_I:  # Target forward
-            self.stadium_widget.umpire_view.camera['target'][2] += step
-        elif event.key() == Qt.Key.Key_K:  # Target backward
-            self.stadium_widget.umpire_view.camera['target'][2] -= step
-        elif event.key() == Qt.Key.Key_J:  # Target left
-            self.stadium_widget.umpire_view.camera['target'][0] -= step
-        elif event.key() == Qt.Key.Key_L:  # Target right
             self.stadium_widget.umpire_view.camera['target'][0] += step
+        elif event.key() == Qt.Key.Key_K:  # Target backward
+            self.stadium_widget.umpire_view.camera['target'][0] -= step
+        elif event.key() == Qt.Key.Key_J:  # Target left
+            self.stadium_widget.umpire_view.camera['target'][2] -= step
+        elif event.key() == Qt.Key.Key_L:  # Target right
+            self.stadium_widget.umpire_view.camera['target'][2] += step
         elif event.key() == Qt.Key.Key_U:  # Target up
             self.stadium_widget.umpire_view.camera['target'][1] += step
         elif event.key() == Qt.Key.Key_O:  # Target down
