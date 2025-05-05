@@ -935,22 +935,95 @@ class UmpireView3D(QOpenGLWidget):
         self.control_mode = 'camera'
         
         self.light_params = [
-        {
-            'position': [20, 1.6, 5.0, 1.0],
-            'diffuse': [1.0, 1.0, 1.0, 1.0],
-            'ambient': [0.6, 0.6, 0.6, 1.0],
-            'specular': [1.0, 1.0, 1.0, 1.0],
-            'enabled': True
-        },
-        {
-            'position': [10.0, 8.0, 10.0, 1.0],
-            'diffuse': [0.7, 0.7, 0.8, 1.0],
-            'ambient': [0.3, 0.3, 0.3, 1.0],
-            'specular': [0.5, 0.5, 0.6, 1.0],
-            'enabled': True
+            {
+                'position': [20, 1.6, 5.0, 1.0],
+                'diffuse': [1.0, 1.0, 1.0, 1.0],
+                'ambient': [0.6, 0.6, 0.6, 1.0],
+                'specular': [1.0, 1.0, 1.0, 1.0],
+                'enabled': True
+            },
+            {
+                'position': [10.0, 8.0, 10.0, 1.0],
+                'diffuse': [0.7, 0.7, 0.8, 1.0],
+                'ambient': [0.3, 0.3, 0.3, 1.0],
+                'specular': [0.5, 0.5, 0.6, 1.0],
+                'enabled': True
+            }
+        ]
+    
+        # Store a second camera configuration that will follow the ball
+        self.tracking_camera = {
+            'enabled': True,
+            'pos': [-10.6, 2.6, -5],  # Same as default camera
+            'target': [13.9, -0.6, 14.5],  # Same as default camera
+            'up': [0, 1, 0],
+            'fov': 50
         }
-    ]
+        
+        # Store current camera to switch back and forth
+        self.main_camera = self.camera.copy()
+        
+        # Flag to track when to update camera
+        self.is_tracking_ball = False
+    
+    
+    def update_ball_tracking(self):
+        """Update the tracking camera to follow the ball"""
+        # Only update if tracking is enabled and we have a ball position
+        if not self.is_tracking_ball or self.ball_pos is None:
+            return
+        
+        # Get the ball position
+        x, y, z = self.ball_pos
+        
+        # Calculate camera position behind the ball
+        offset_distance = 5  # Distance behind the ball
+        height_offset = 1.5  # Position above the ball
+        
+        # If we have velocity information, position camera behind the ball's path
+        if self.ball_vel is not None:
+            vx, vy, vz = self.ball_vel
+            speed = (vx**2 + vy**2 + vz**2)**0.5
+            
+            if speed > 0.1:  # Only use velocity if the ball is moving
+                # Normalize velocity
+                vx, vy, vz = vx/speed, vy/speed, vz/speed
+                
+                # Position camera behind and above
+                self.camera['pos'] = [
+                    x - vx * offset_distance,
+                    y + height_offset,
+                    z - vz * offset_distance
+                ]
+                
+                # Update camera to point at ball
+                self.camera['target'] = [x, y, z]
+                return
+        
+        # Fallback if no velocity or ball not moving
+        # Just position camera behind ball relative to home plate
+        self.camera['pos'] = [x - offset_distance, y + height_offset, z]
+        self.camera['target'] = [x, y, z]
 
+    
+    def toggle_ball_tracking(self):
+        """Toggle between normal camera and ball tracking camera"""
+        # Toggle tracking state
+        self.is_tracking_ball = not self.is_tracking_ball
+        print(f"Ball tracking toggled to: {self.is_tracking_ball}")
+        
+        if self.is_tracking_ball:
+            # Save current camera settings to main_camera
+            self.main_camera = self.camera.copy()
+            print(f"Saved main camera: {self.main_camera}")
+        else:
+            # Restore main camera settings
+            print(f"Restoring camera from {self.main_camera}")
+            self.camera = self.main_camera.copy()
+        
+        self.update()
+        return self.is_tracking_ball
+    
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LEQUAL)
@@ -973,10 +1046,6 @@ class UmpireView3D(QOpenGLWidget):
         # Compile the proper display list with materials
         if self.ballpark_model:
             self.compile_stadium_display_list()
-        
-
-    
-
 
     def clear_ball(self):
         """Clear any displayed ball from the 3D view"""
@@ -987,6 +1056,9 @@ class UmpireView3D(QOpenGLWidget):
         self.update()  # Request a redraw of the scene
     
     def paintGL(self):
+        """Override paintGL to update ball tracking"""
+        if self.is_tracking_ball and self.ball_pos is not None: self.update_ball_tracking();
+        
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
         
@@ -2070,14 +2142,14 @@ class MLBWeatherApp(QMainWindow):
         # Wind speed
         wind_layout.addWidget(QLabel("Wind Speed (mph):"), 0, 0)
         self.wind_speed_spin = QSpinBox()
-        self.wind_speed_spin.setRange(0, 40)
+        self.wind_speed_spin.setRange(0, 100)
         self.wind_speed_spin.setValue(10)
         wind_layout.addWidget(self.wind_speed_spin, 0, 1)
         
         # Wind direction
         wind_layout.addWidget(QLabel("Wind Direction (°):"), 1, 0)
         self.wind_dir_spin = QSpinBox()
-        self.wind_dir_spin.setRange(0, 359)
+        self.wind_dir_spin.setRange(0, 360)
         self.wind_dir_spin.setValue(0)
         wind_layout.addWidget(self.wind_dir_spin, 1, 1)
         
@@ -2125,21 +2197,27 @@ class MLBWeatherApp(QMainWindow):
         self.stadium_widget.y_pos_spin = self.y_pos_spin
         self.stadium_widget.z_pos_spin = self.z_pos_spin
         
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
         wind_group.setLayout(wind_layout)
         bottom_controls.addWidget(wind_group)
         
         # Action buttons
         button_layout = QVBoxLayout()
+        
+        # Simulate button
+        self.simulate_btn = QPushButton("Simulate Ball Flight")
+        self.simulate_btn.setMinimumHeight(40)  # Make button taller for emphasis
+        self.simulate_btn.clicked.connect(self.simulate_flight)
+        button_layout.addWidget(self.simulate_btn)
+        
+        self.track_ball_btn = QPushButton("Track Ball")
+        def ToggleBallTracking():
+            enabled_css = """QPushButton { background-color: #00FF00; color: white; }"""
+            disabled_css = """QPushButton { background-color: #FF0000; color: white; }"""
+            isEnabled = self.stadium_widget.umpire_view.toggle_ball_tracking()
+            self.track_ball_btn.setStyleSheet(enabled_css if isEnabled else disabled_css)
+        self.track_ball_btn.clicked.connect(ToggleBallTracking)
+        button_layout.addWidget(self.track_ball_btn)
+        ToggleBallTracking(); ToggleBallTracking() # toggle twice to set initial css
         
         # Lighting control button
         self.lighting_btn = QPushButton("Lighting Controls")
@@ -2150,12 +2228,6 @@ class MLBWeatherApp(QMainWindow):
         self.lighting_control = LightingControlWidget(self.stadium_widget.umpire_view.light_params)
         self.lighting_control.lightChanged.connect(self.update_lighting)
         
-        
-        # Simulate button
-        self.simulate_btn = QPushButton("Simulate Ball Flight")
-        self.simulate_btn.setMinimumHeight(40)  # Make button taller for emphasis
-        self.simulate_btn.clicked.connect(self.simulate_flight)
-        button_layout.addWidget(self.simulate_btn)
         
         # Update weather button
         self.update_weather_btn = QPushButton("Update Weather Data")
@@ -2170,7 +2242,6 @@ class MLBWeatherApp(QMainWindow):
         self.control_target = 'pos'
         self.control_index = 2
         self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
-    
     
     # def keyPressEvent(self, a0):
     #     self.clearFocus()
@@ -2196,62 +2267,68 @@ class MLBWeatherApp(QMainWindow):
     #     return
     
     def keyPressEvent(self, event):
+        """Handle key press events for camera movement"""
         camera_step = 1
-        target_step = camera_step*5
-        # Movement step size
+        target_step = camera_step * 5
         self.clearFocus()
-        print(event.key())
+        
+        # Get the currently active camera
+        if self.stadium_widget.umpire_view.is_tracking_ball:
+            # When tracking is enabled, we still modify the main camera
+            # because we want manual camera controls to override tracking
+            self.stadium_widget.umpire_view.is_tracking_ball = False
+            active_camera = self.stadium_widget.umpire_view.camera
+        else:
+            active_camera = self.stadium_widget.umpire_view.camera
+        
         # Position controls
         if event.key() == Qt.Key.Key_W:  # Move forward
-            self.stadium_widget.umpire_view.camera['pos'][0] += camera_step
-            self.stadium_widget.umpire_view.camera['target'][0] += camera_step
+            active_camera['pos'][0] += camera_step
+            active_camera['target'][0] += camera_step
         elif event.key() == Qt.Key.Key_S:  # Move backward
-            self.stadium_widget.umpire_view.camera['pos'][0] -= camera_step
-            self.stadium_widget.umpire_view.camera['target'][0] -= camera_step
+            active_camera['pos'][0] -= camera_step
+            active_camera['target'][0] -= camera_step
         elif event.key() == Qt.Key.Key_A:  # Move left
-            self.stadium_widget.umpire_view.camera['pos'][2] -= camera_step
-            self.stadium_widget.umpire_view.camera['target'][2] -= camera_step
+            active_camera['pos'][2] -= camera_step
+            active_camera['target'][2] -= camera_step
         elif event.key() == Qt.Key.Key_D:  # Move right
-            self.stadium_widget.umpire_view.camera['pos'][2] += camera_step
-            self.stadium_widget.umpire_view.camera['target'][2] += camera_step
+            active_camera['pos'][2] += camera_step
+            active_camera['target'][2] += camera_step
         elif event.key() == Qt.Key.Key_E:  # Move up
-            self.stadium_widget.umpire_view.camera['pos'][1] += camera_step
-            self.stadium_widget.umpire_view.camera['target'][1] += camera_step
+            active_camera['pos'][1] += camera_step
+            active_camera['target'][1] += camera_step
         elif event.key() == Qt.Key.Key_Q:  # Move down
-            self.stadium_widget.umpire_view.camera['pos'][1] -= camera_step
-            self.stadium_widget.umpire_view.camera['target'][1] -= camera_step
+            active_camera['pos'][1] -= camera_step
+            active_camera['target'][1] -= camera_step
         
-        # Target controls (shift + key)
+        # Target controls
         elif event.key() == Qt.Key.Key_I:  # Target forward
-            self.stadium_widget.umpire_view.camera['target'][0] += target_step
+            active_camera['target'][0] += target_step
         elif event.key() == Qt.Key.Key_K:  # Target backward
-            self.stadium_widget.umpire_view.camera['target'][0] -= target_step
+            active_camera['target'][0] -= target_step
         elif event.key() == Qt.Key.Key_J:  # Target left
-            self.stadium_widget.umpire_view.camera['target'][2] -= target_step
+            active_camera['target'][2] -= target_step
         elif event.key() == Qt.Key.Key_L:  # Target right
-            self.stadium_widget.umpire_view.camera['target'][2] += target_step
+            active_camera['target'][2] += target_step
         elif event.key() == Qt.Key.Key_O:  # Target up
-            self.stadium_widget.umpire_view.camera['target'][1] += target_step
+            active_camera['target'][1] += target_step
         elif event.key() == Qt.Key.Key_U:  # Target down
-            self.stadium_widget.umpire_view.camera['target'][1] -= target_step
+            active_camera['target'][1] -= target_step
+        
         # Field of view controls
         elif event.key() == Qt.Key.Key_Plus:  # Zoom in
-            self.stadium_widget.umpire_view.camera['fov'] = max(20, self.stadium_widget.umpire_view.camera['fov'] - 5)
+            active_camera['fov'] = max(20, active_camera['fov'] - 5)
         elif event.key() == Qt.Key.Key_Minus:  # Zoom out
-            self.stadium_widget.umpire_view.camera['fov'] = min(120, self.stadium_widget.umpire_view.camera['fov'] + 5)
+            active_camera['fov'] = min(120, active_camera['fov'] + 5)
         
         # Print current camera settings
         elif event.key() == Qt.Key.Key_P:
             print("Camera settings:")
-            print(f"  Position: {self.stadium_widget.umpire_view.camera['pos']}")
-            print(f"  Target: {self.stadium_widget.umpire_view.camera['target']}")
-            print(f"  FOV: {self.stadium_widget.umpire_view.camera['fov']}")
+            print(f"  Position: {active_camera['pos']}")
+            print(f"  Target: {active_camera['target']}")
+            print(f"  FOV: {active_camera['fov']}")
         
-        # Update the view
         self.stadium_widget.umpire_view.update()
-        print(f"Camera position: {self.stadium_widget.umpire_view.camera['pos']}")
-        print(f"Camera target: {self.stadium_widget.umpire_view.camera['target']}")
-        
         super().keyPressEvent(event)
 
     def change_stadium(self, stadium_name):
