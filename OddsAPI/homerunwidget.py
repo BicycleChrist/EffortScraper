@@ -9,6 +9,7 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *
+from OpenGL.GLUT.fonts import *
 from svg.path import parse_path
 from xml.dom import minidom
 from PyQt6.QtSvg import QtSvg, QSvgRenderer
@@ -26,6 +27,7 @@ from svgpathtools import svg2paths
 from pywavefront import Wavefront
 import csv
 
+LOG_BALL_PHYSICS = False
 
 
 # Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
@@ -55,7 +57,7 @@ class BallFlightSimulator:
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
 
-    def calculate_trajectory(self, exit_velocity, launch_angle, wind_speed, wind_direction, 
+    def calculate_trajectory(self, exit_velocity, vlaunch_angle, hlaunch_angle, wind_speed, wind_direction, 
                              temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0):
         """Calculate ball trajectory based on initial conditions and environment
         
@@ -66,22 +68,21 @@ class BallFlightSimulator:
         """
         # Convert inputs to SI units
         v0 = exit_velocity * 0.44704  # mph to m/s
-        angle = np.radians(launch_angle)
+        vertical_angle = np.radians(vlaunch_angle)
+        horizontal_angle = np.radians(hlaunch_angle)
         wind = wind_speed * 0.44704  # mph to m/s
         wind_rad = np.radians(wind_direction)
-    
         # Calculate air density based on temperature, humidity, altitude
         rho = self.calculate_air_density(temp, humidity, altitude)
-    
+        
         # Initial conditions [x, y, z, vx, vy, vz]
         # Using the provided starting position parameters
         initial_state = [
             start_x, start_y, start_z,  # Starting position parameters
-            v0 * np.cos(angle),  # x component (toward center field)
-            v0 * np.sin(angle),  # y component (upward)
-            0  # z component (no initial sideways velocity)
+            v0 * np.cos(vertical_angle) * np.cos(horizontal_angle),  # x component
+            v0 * np.sin(vertical_angle),  # y component (upward) 
+            v0 * np.cos(vertical_angle) * np.sin(horizontal_angle)  # z component (sideways)
         ]
-    
         # Time span for simulation
         t_span = (0, 10)  # 10 seconds should be enough for any baseball flight
     
@@ -159,9 +160,9 @@ class BallFlightSimulator:
         wind_z = current_wind_speed * np.sin(current_wind_direction)
     
         # Relative velocity (ball velocity - wind velocity)
-        v_rel_x = vx - wind_x
+        v_rel_x = vx + wind_x
         v_rel_y = vy  # No wind in vertical direction
-        v_rel_z = vz - wind_z
+        v_rel_z = vz + wind_z
     
         v_rel = np.sqrt(v_rel_x**2 + v_rel_y**2 + v_rel_z**2)
     
@@ -244,6 +245,7 @@ class BallFlightSimulator:
         trajectory_data (dict): The trajectory data dictionary from calculate_trajectory
         filename (str): Output filename for the CSV log
         """
+        if not LOG_BALL_PHYSICS: return;
         # Open file for writing
         with open(filename, 'w', newline='') as csvfile:
             # Define CSV header
@@ -934,7 +936,7 @@ class UmpireView3D(QOpenGLWidget):
         
         self.light_params = [
         {
-            'position': [0.0, 15.0, 0.0, 1.0],
+            'position': [20, 1.6, 5.0, 1.0],
             'diffuse': [1.0, 1.0, 1.0, 1.0],
             'ambient': [0.6, 0.6, 0.6, 1.0],
             'specular': [1.0, 1.0, 1.0, 1.0],
@@ -1164,7 +1166,7 @@ class UmpireView3D(QOpenGLWidget):
         
         # Basic model transformations
         glPushMatrix()
-        glScalef(0.7, 0.7, 0.7)
+        glScalef(1.0, 1.0, 1.0)
         vertices = self.ballpark_model.vertices
         
         # Process each mesh with its own material based on new names
@@ -1374,8 +1376,10 @@ class UmpireView3D(QOpenGLWidget):
             
             # Draw text label with light number
             glRasterPos3f(0.6, 0.6, 0.6)
-            # Would need GLUT for text rendering
-            # glutBitmapString(GLUT_BITMAP_HELVETICA_12, f"Light {i}")
+            
+            glutInit()
+            for C in f"Light {i}":# noinspection PyUnresolvedReferences
+                glutBitmapCharacter(GLUT_BITMAP_TIMES_ROMAN_24, ord(C))
             
             glPopMatrix()
         
@@ -1794,7 +1798,7 @@ class SplitView(QWidget):
                 self.weather_data["wind_direction"]
             )
     
-    def simulate_ball_flight(self, exit_velocity, launch_angle, spin_rate=1800):
+    def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions and custom starting position"""
         if not self.weather_data:
             print("Weather data not available")
@@ -1811,7 +1815,8 @@ class SplitView(QWidget):
         # Calculate trajectory with starting position
         self.trajectory_data = self.ball_simulator.calculate_trajectory(
             exit_velocity,
-            launch_angle,
+            vlaunch_angle,
+            hlaunch_angle,
             self.weather_data["wind_speed"],
             self.weather_data["wind_direction"],
             self.weather_data["temperature"],
@@ -1822,19 +1827,19 @@ class SplitView(QWidget):
             start_z
         )
         
-        # Generate physics log
-        log_filename = f"ball_physics_ev{exit_velocity}_la{launch_angle}_sr{spin_rate}.csv"
-        self.ball_simulator.log_trajectory_physics(self.trajectory_data, log_filename)
-        
-        # Add log message to flight stats
-        self.flight_stats_list.addItem(f"Physics log written to: {log_filename}")
+        if LOG_BALL_PHYSICS:
+            # Generate physics log
+            log_filename = f"ball_physics_ev{exit_velocity}_vla{vlaunch_angle}_hla{hlaunch_angle}_sr{spin_rate}.csv"
+            self.ball_simulator.log_trajectory_physics(self.trajectory_data, log_filename)
+            
+            # Add log message to flight stats
+            self.flight_stats_list.addItem(f"Physics log written to: {log_filename}")
         
         # Log trajectory data for debugging
         print(f"Starting point: ({self.trajectory_data['start_x']:.1f}, {self.trajectory_data['start_y']:.1f}, {self.trajectory_data['start_z']:.1f})")
         print(f"Ball will travel: {self.trajectory_data['distance']:.1f} feet")
         
-        # Print physics summary
-        print_physics_summary(self.trajectory_data)
+        if LOG_BALL_PHYSICS: print_physics_summary(self.trajectory_data);
         
         # Initialize ball visualization in top-down view
         success = self.stadium_view.start_ball_trajectory(self.trajectory_data)
@@ -1856,7 +1861,7 @@ class SplitView(QWidget):
         hr_text = "HOME RUN!" if is_home_run else ""
         
         # Create stats text
-        stats_text = f"Exit Vel: {exit_velocity} mph | Launch: {launch_angle}° | Spin: {spin_rate} rpm | Dist: {distance:.1f} ft | Height: {max_height:.1f} ft {hr_text}"
+        stats_text = f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm | Dist: {distance:.1f} ft | Height: {max_height:.1f} ft {hr_text}"
         
         # Add to flight stats list
         self.flight_stats_list.addItem(stats_text)
@@ -2011,16 +2016,31 @@ class MLBWeatherApp(QMainWindow):
         top_controls.addWidget(ev_group)
 
         # Launch Angle control
-        la_group = QGroupBox("Launch Angle (degrees)")
-        la_layout = QVBoxLayout()
-        self.la_slider = QSlider(Qt.Orientation.Horizontal)
-        self.la_slider.setRange(0, 90)
-        self.la_slider.setValue(25)
-        self.la_value = QLabel("25")
-        self.la_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.la_slider.valueChanged.connect(lambda v: self.la_value.setText(str(v)))
-        la_layout.addWidget(self.la_slider)
-        la_layout.addWidget(self.la_value)
+        la_group = QGroupBox("Launch Angles")
+        la_layout = QGridLayout()
+        
+        self.vla_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vla_slider.setRange(0, 90)
+        self.vla_slider.setValue(25)
+        self.vla_value = QLabel(f"25°")
+        self.vla_label = QLabel('V')
+        self.vla_slider.valueChanged.connect(lambda v: self.vla_value.setText(f"{v}°"))
+        la_layout.addWidget(self.vla_label, 0, 0)
+        la_layout.addWidget(self.vla_slider, 0, 1, 3, 1, Qt.AlignmentFlag.AlignTop)
+        la_layout.addWidget(self.vla_value, 0, 2)
+        
+        self.hla_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hla_slider.setRange(0, 90)
+        self.hla_slider.setValue(45)
+        self.hla_value = QLabel("45°")
+        self.hla_label = QLabel('H')
+        self.hla_slider.valueChanged.connect(lambda v: self.hla_value.setText(f"{v}°"))
+        la_layout.addWidget(self.hla_label, 1, 0)
+        la_layout.addWidget(self.hla_slider, 1, 1, 3, 1, Qt.AlignmentFlag.AlignTop)
+        la_layout.addWidget(self.hla_value, 1, 2)
+        la_layout.setColumnStretch(1, 1)
+        la_layout.setRowStretch(0, 1)
+        
         la_group.setLayout(la_layout)
         top_controls.addWidget(la_group)
         
@@ -2127,7 +2147,7 @@ class MLBWeatherApp(QMainWindow):
         button_layout.addWidget(self.lighting_btn)
         
         # Create lighting control widget (but don't show it yet)
-        self.lighting_control = LightingControlWidget()
+        self.lighting_control = LightingControlWidget(self.stadium_widget.umpire_view.light_params)
         self.lighting_control.lightChanged.connect(self.update_lighting)
         
         
@@ -2245,7 +2265,8 @@ class MLBWeatherApp(QMainWindow):
 
     def simulate_flight(self):
         exit_velocity = self.ev_slider.value()
-        launch_angle = self.la_slider.value()
+        vlaunch_angle = self.vla_slider.value()
+        hlaunch_angle = self.hla_slider.value()
         spin_rate = self.spin_slider.value()
         
         # Check if we should override weather
@@ -2254,7 +2275,7 @@ class MLBWeatherApp(QMainWindow):
             wind_direction = self.wind_dir_spin.value()
             self.stadium_widget.set_custom_weather(wind_speed, wind_direction)
             
-        self.stadium_widget.simulate_ball_flight(exit_velocity, launch_angle, spin_rate)
+        self.stadium_widget.simulate_ball_flight(exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate)
 
     def update_weather(self):
         self.stadium_widget.fetch_weather_data()
@@ -2279,28 +2300,11 @@ class LightingControlWidget(QWidget):
     
     lightChanged = pyqtSignal()  # Signal emitted when light parameters change
     
-    def __init__(self, parent=None):
+    def __init__(self, lights, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Lighting Controls")
-        
-        # Initialize light parameters
-        self.lights = [
-            {
-                'position': [5.0, 5.0, 5.0, 1.0],
-                'diffuse': [1.0, 1.0, 1.0, 1.0],
-                'ambient': [0.6, 0.6, 0.6, 1.0],
-                'specular': [1.0, 1.0, 1.0, 1.0],
-                'enabled': True
-            },
-            {
-                'position': [-3.0, 2.0, 4.0, 1.0],
-                'diffuse': [0.7, 0.7, 0.8, 1.0],
-                'ambient': [0.3, 0.3, 0.3, 1.0],
-                'specular': [0.5, 0.5, 0.6, 1.0],
-                'enabled': True
-            }
-        ]
-        
+        self.lights = lights
+        self.default_lights = lights.copy()
         self.setup_ui()
     
     def setup_ui(self):
@@ -2412,7 +2416,7 @@ class LightingControlWidget(QWidget):
             tab_layout.addWidget(intensity_group)
             
             # Add reset button
-            reset_button = QPushButton("Reset to Default")
+            reset_button = QPushButton(f"Reset to Default ({i})")
             reset_button.clicked.connect(lambda _, idx=i: self.reset_light(idx))
             tab_layout.addWidget(reset_button)
             
@@ -2436,22 +2440,8 @@ class LightingControlWidget(QWidget):
     
     def reset_light(self, light_idx):
         """Reset a light to its default values"""
-        if light_idx == 0:
-            self.lights[0] = {
-                'position': [5.0, 5.0, 5.0, 1.0],
-                'diffuse': [1.0, 1.0, 1.0, 1.0],
-                'ambient': [0.6, 0.6, 0.6, 1.0],
-                'specular': [1.0, 1.0, 1.0, 1.0],
-                'enabled': True
-            }
-        else:
-            self.lights[1] = {
-                'position': [-3.0, 2.0, 4.0, 1.0],
-                'diffuse': [0.7, 0.7, 0.8, 1.0],
-                'ambient': [0.3, 0.3, 0.3, 1.0],
-                'specular': [0.5, 0.5, 0.6, 1.0],
-                'enabled': True
-            }
+        print(f'RESETTING LIGHT: {light_idx}')
+        self.lights[light_idx] = self.default_lights[light_idx]
         
         # Update UI to reflect changes
         self.update_ui_from_light(light_idx)
@@ -2459,10 +2449,95 @@ class LightingControlWidget(QWidget):
     
     def update_ui_from_light(self, light_idx):
         """Update UI elements to reflect light settings"""
-        # This would update all sliders and labels based on current settings
-        # Implementation would require storing references to the UI controls
-        pass
+        # Make sure the light index is valid and we have tabs
+        if light_idx not in range(len(self.lights)) or light_idx >= self.tab_widget.count():
+            print(f"Invalid light index: {light_idx}")
+            return
     
+        # Get the current light parameters
+        light = self.lights[light_idx]
+        
+        # Get the tab widget for this light
+        light_tab = self.tab_widget.widget(light_idx)
+        if not light_tab:
+            print(f"No tab found for light {light_idx}")
+            return
+        
+        try:
+            # First, find the enable checkbox and update it
+            enable_check = light_tab.findChild(QCheckBox)
+            if enable_check:
+                enable_check.setChecked(light['enabled'])
+            
+            # Find all sliders in the tab and update them based on their positions
+            sliders = light_tab.findChildren(QSlider)
+            
+            # Group sliders by their parent widget to identify their purpose
+            pos_sliders = []
+            ambient_sliders = []
+            diffuse_sliders = []
+            specular_sliders = []
+            
+            for slider in sliders:
+                parent_name = slider.parent().objectName() if slider.parent() else ""
+                
+                # Check parent's title if it's a QGroupBox
+                if isinstance(slider.parent(), QGroupBox):
+                    if slider.parent().title() == "Position":
+                        pos_sliders.append(slider)
+                    elif "Intensity" in slider.parent().title():
+                        # Need to determine which intensity component (ambient, diffuse, specular)
+                        # This is tricky without proper naming, so we'll just count positions
+                        layout = slider.parent().layout()
+                        if layout:
+                            for i in range(layout.count()):
+                                item = layout.itemAt(i)
+                                if item and item.widget() == slider:
+                                    row, col, _, _ = layout.getItemPosition(i)
+                                    if row == 0:  # First row is ambient
+                                        ambient_sliders.append(slider)
+                                    elif row == 1:  # Second row is diffuse
+                                        diffuse_sliders.append(slider)
+                                    elif row == 2:  # Third row is specular
+                                        specular_sliders.append(slider)
+            
+            # Update position sliders (should be X, Y, Z, W in that order)
+            if len(pos_sliders) >= 4:
+                # X position
+                pos_sliders[0].setValue(int(light['position'][0] * 10))
+                # Y position
+                pos_sliders[1].setValue(int(light['position'][1] * 10))
+                # Z position
+                pos_sliders[2].setValue(int(light['position'][2] * 10)) 
+                # W component (0=directional or 1=positional)
+                pos_sliders[3].setValue(int(light['position'][3]))
+            
+            # Update ambient sliders (R, G, B in that order)
+            if len(ambient_sliders) >= 3:
+                ambient_sliders[0].setValue(int(light['ambient'][0] * 100))
+                ambient_sliders[1].setValue(int(light['ambient'][1] * 100))
+                ambient_sliders[2].setValue(int(light['ambient'][2] * 100))
+            
+            # Update diffuse sliders (R, G, B in that order)
+            if len(diffuse_sliders) >= 3:
+                diffuse_sliders[0].setValue(int(light['diffuse'][0] * 100))
+                diffuse_sliders[1].setValue(int(light['diffuse'][1] * 100))
+                diffuse_sliders[2].setValue(int(light['diffuse'][2] * 100))
+            
+            # Update specular sliders (R, G, B in that order)
+            if len(specular_sliders) >= 3:
+                specular_sliders[0].setValue(int(light['specular'][0] * 100))
+                specular_sliders[1].setValue(int(light['specular'][1] * 100))
+                specular_sliders[2].setValue(int(light['specular'][2] * 100))
+            
+            # No need to emit signals - the sliders' valueChanged signals will handle that
+            
+        except Exception as e:
+            # Catch-all exception handler to prevent app crashes
+            print(f"Error updating UI from light {light_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+        
     def emit_light_changed(self):
         """Emit signal when light parameters change"""
         self.lightChanged.emit()
