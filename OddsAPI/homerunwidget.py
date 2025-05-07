@@ -1,3 +1,5 @@
+import pathlib
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
@@ -14,7 +16,7 @@ from svg.path import parse_path
 from xml.dom import minidom
 from PyQt6.QtSvg import QtSvg, QSvgRenderer
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat, QIcon
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal
 import sys
 import numpy as np
@@ -935,18 +937,52 @@ class UmpireView3D(QOpenGLWidget):
         self.control_mode = 'camera'
         
         self.light_params = [
+            # Main field light 1 (positioned high like a stadium light on first base side)
             {
-                'position': [20, 1.6, 5.0, 1.0],
-                'diffuse': [1.0, 1.0, 1.0, 1.0],
-                'ambient': [0.6, 0.6, 0.6, 1.0],
-                'specular': [1.0, 1.0, 1.0, 1.0],
+                'position': [15.0, 25.0, 20.0, 1.0],  # Higher position for stadium lights
+                'diffuse': [1.0, 0.98, 0.9, 1.0],     # Slightly warm white (stadium lights)
+                'ambient': [0.2, 0.2, 0.22, 1.0],     # Low ambient from this source
+                'specular': [0.8, 0.8, 0.7, 1.0],     # Slightly reduced blue in specular
                 'enabled': True
             },
+            # Main field light 2 (positioned high like a stadium light on third base side)
             {
-                'position': [10.0, 8.0, 10.0, 1.0],
-                'diffuse': [0.7, 0.7, 0.8, 1.0],
-                'ambient': [0.3, 0.3, 0.3, 1.0],
-                'specular': [0.5, 0.5, 0.6, 1.0],
+                'position': [15.0, 25.0, -20.0, 1.0],  # Opposite side of the field
+                'diffuse': [1.0, 0.98, 0.9, 1.0],      # Same warm white
+                'ambient': [0.2, 0.2, 0.22, 1.0],      # Low ambient
+                'specular': [0.8, 0.8, 0.7, 1.0],      # Consistent specular
+                'enabled': True
+            },
+            # Main field light 3 (positioned high behind home plate)
+            {
+                'position': [-10.0, 25.0, 0.0, 1.0],   # Behind home plate
+                'diffuse': [1.0, 0.98, 0.9, 1.0],      # Same warm white
+                'ambient': [0.2, 0.2, 0.22, 1.0],      # Low ambient
+                'specular': [0.8, 0.8, 0.7, 1.0],      # Consistent specular
+                'enabled': True
+            },
+            # Main field light 4 (positioned high in center field)
+            {
+                'position': [30.0, 25.0, 0.0, 1.0],    # Center field
+                'diffuse': [1.0, 0.98, 0.9, 1.0],      # Same warm white
+                'ambient': [0.2, 0.2, 0.22, 1.0],      # Low ambient
+                'specular': [0.8, 0.8, 0.7, 1.0],      # Consistent specular
+                'enabled': True
+            },
+            # Fill light (softer light from above to prevent harsh shadows)
+            {
+                'position': [0.0, 30.0, 0.0, 1.0],     # Directly above field
+                'diffuse': [0.5, 0.5, 0.6, 1.0],       # Slightly bluish fill light
+                'ambient': [0.1, 0.1, 0.15, 1.0],      # Very low ambient
+                'specular': [0.3, 0.3, 0.4, 1.0],      # Reduced specular
+                'enabled': True
+            },
+            # Ambient environment light (simulates bounce light)
+            {
+                'position': [0.0, 0.0, 0.0, 0.0],      # Set W=0 for directional light
+                'diffuse': [0.3, 0.3, 0.35, 1.0],      # Soft blue-tinted indirect light
+                'ambient': [0.15, 0.15, 0.2, 1.0],     # Global ambient
+                'specular': [0.0, 0.0, 0.0, 1.0],      # No specular for ambient light
                 'enabled': True
             }
         ]
@@ -1030,6 +1066,14 @@ class UmpireView3D(QOpenGLWidget):
         glEnable(GL_LIGHTING)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Add these two lines to set global ambient light
+        global_ambient = [0.15, 0.15, 0.2, 1.0]  # Bluish ambient for night stadium
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient)
+        
+        # Improve lighting model - but only if these won't interfere with controls
+        glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE)  # More accurate specular
+        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)      # Light both sides of polygons
         
         # Use a dark blue background for better contrast
         glClearColor(0.05, 0.05, 0.15, 1.0)
@@ -1220,9 +1264,13 @@ class UmpireView3D(QOpenGLWidget):
             gluQuadricDrawStyle(shadow, GLU_FILL)
             gluQuadricNormals(shadow, GLU_SMOOTH)
             gluDisk(shadow, 0, 0.5, 16, 1)
-            self.draw_light_sources(hasattr(self, 'show_lights') and self.show_lights)
             gluDeleteQuadric(shadow)
             glPopMatrix()
+        
+        # IMPORTANT: Draw light sources at the global level, outside of any object transformations
+        # This ensures lights are drawn in world space coordinates, not relative to any object
+        if hasattr(self, 'show_lights') and self.show_lights:
+            self.draw_light_sources(True)
 
 
 
@@ -1369,23 +1417,25 @@ class UmpireView3D(QOpenGLWidget):
                 print(f"Warning: Exceeded maximum number of OpenGL lights (8)")
                 break
                 
-            # Get the correct OpenGL light constant
-            if i == 0:
-                light_id = GL_LIGHT0
-            elif i == 1:
-                light_id = GL_LIGHT1
-            # Add more cases if needed
-            else:
-                light_constants = [GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3, GL_LIGHT4, GL_LIGHT5, GL_LIGHT6, GL_LIGHT7]
-                light_id = light_constants[i]  # This might work in some implementations
+            # Map light index to OpenGL light constant
+            light_constants = [GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3, 
+                               GL_LIGHT4, GL_LIGHT5, GL_LIGHT6, GL_LIGHT7]
             
             try:
+                light_id = light_constants[i]
                 if light['enabled']:
                     glEnable(light_id)
                     glLightfv(light_id, GL_POSITION, light['position'])
                     glLightfv(light_id, GL_AMBIENT, light['ambient'])
                     glLightfv(light_id, GL_DIFFUSE, light['diffuse'])
                     glLightfv(light_id, GL_SPECULAR, light['specular'])
+                    
+                    # Add light attenuation for more realism
+                    # Only apply to positional lights (w=1)
+                    if light['position'][3] == 1.0:
+                        glLightf(light_id, GL_CONSTANT_ATTENUATION, 1.0)
+                        glLightf(light_id, GL_LINEAR_ATTENUATION, 0.0)
+                        glLightf(light_id, GL_QUADRATIC_ATTENUATION, 0.0005)
                 else:
                     glDisable(light_id)
             except Exception as e:
@@ -1675,6 +1725,9 @@ class SplitView(QWidget):
         self.weather_data = None
         self.trajectory_data = None
         self.current_frame = 0
+        
+        
+        
         
         # Setup UI
         self.setup_ui()
@@ -2382,6 +2435,8 @@ class LightingControlWidget(QWidget):
         self.setWindowTitle("Lighting Controls")
         self.lights = lights
         self.default_lights = lights.copy()
+        # Dictionary to store RGB value labels for updates
+        self.rgb_labels = {}
         self.setup_ui()
     
     def setup_ui(self):
@@ -2456,11 +2511,19 @@ class LightingControlWidget(QWidget):
             intensity_group = QGroupBox("Intensity")
             intensity_layout = QGridLayout()
             
+            # Initialize RGB labels dictionary for this light if not exists
+            if i not in self.rgb_labels:
+                self.rgb_labels[i] = {}
+            
             # Create sliders for ambient, diffuse, specular
             for j, comp_name in enumerate(['Ambient', 'Diffuse', 'Specular']):
                 intensity_layout.addWidget(QLabel(f"{comp_name}:"), j, 0)
                 
                 comp_key = comp_name.lower()
+                
+                # Initialize component in RGB labels dictionary
+                if comp_key not in self.rgb_labels[i]:
+                    self.rgb_labels[i][comp_key] = None
                 
                 # Create RGB sliders for each component
                 rgb_layout = QHBoxLayout()
@@ -2483,8 +2546,9 @@ class LightingControlWidget(QWidget):
                     rgb_layout.addWidget(slider)
                     rgb_values.append(color_value)
                 
-                # Add RGB value display
+                # Add RGB value display and store reference
                 rgb_label = QLabel(f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})")
+                self.rgb_labels[i][comp_key] = rgb_label
                 
                 intensity_layout.addLayout(rgb_layout, j, 1)
                 intensity_layout.addWidget(rgb_label, j, 2)
@@ -2512,13 +2576,22 @@ class LightingControlWidget(QWidget):
     
     def update_light_component(self, light_idx, component, color_idx, value):
         """Update a specific color component of a light's property"""
+        # Update the light value
         self.lights[light_idx][component][color_idx] = value
+        
+        # Update the RGB label to show the new values
+        if light_idx in self.rgb_labels and component in self.rgb_labels[light_idx]:
+            rgb_values = self.lights[light_idx][component]
+            self.rgb_labels[light_idx][component].setText(
+                f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})"
+            )
+        
         self.emit_light_changed()
     
     def reset_light(self, light_idx):
         """Reset a light to its default values"""
         print(f'RESETTING LIGHT: {light_idx}')
-        self.lights[light_idx] = self.default_lights[light_idx]
+        self.lights[light_idx] = self.default_lights[light_idx].copy()  # Use copy to avoid reference issues
         
         # Update UI to reflect changes
         self.update_ui_from_light(light_idx)
@@ -2607,7 +2680,14 @@ class LightingControlWidget(QWidget):
                 specular_sliders[1].setValue(int(light['specular'][1] * 100))
                 specular_sliders[2].setValue(int(light['specular'][2] * 100))
             
-            # No need to emit signals - the sliders' valueChanged signals will handle that
+            # Update RGB labels directly with current values
+            if light_idx in self.rgb_labels:
+                for comp_key in ['ambient', 'diffuse', 'specular']:
+                    if comp_key in self.rgb_labels[light_idx] and self.rgb_labels[light_idx][comp_key]:
+                        rgb_values = light[comp_key]
+                        self.rgb_labels[light_idx][comp_key].setText(
+                            f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})"
+                        )
             
         except Exception as e:
             # Catch-all exception handler to prevent app crashes
