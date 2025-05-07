@@ -1067,16 +1067,16 @@ class UmpireView3D(QOpenGLWidget):
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         
-        # Add these two lines to set global ambient light
-        global_ambient = [0.15, 0.15, 0.2, 1.0]  # Bluish ambient for night stadium
+        # Updated global ambient light for more realistic outdoor lighting
+        global_ambient = [0.2, 0.2, 0.25, 1.0]  # Subtle bluish ambient for outdoor daylight
         glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient)
         
-        # Improve lighting model - but only if these won't interfere with controls
-        glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE)  # More accurate specular
-        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)      # Light both sides of polygons
+        # Better lighting model settings
+        glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE)
+        glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE)
         
-        # Use a dark blue background for better contrast
-        glClearColor(0.05, 0.05, 0.15, 1.0)
+        # Set a realistic sky blue background (instead of dark purple)
+        glClearColor(0.529, 0.808, 0.922, 1.0)  # Sky blue (#87CEEB)
         
         # Enable normal vectors normalization for proper lighting
         glEnable(GL_NORMALIZE)
@@ -1091,6 +1091,7 @@ class UmpireView3D(QOpenGLWidget):
         if self.ballpark_model:
             self.compile_stadium_display_list()
 
+
     def clear_ball(self):
         """Clear any displayed ball from the 3D view"""
         self.ball_pos = None
@@ -1098,6 +1099,125 @@ class UmpireView3D(QOpenGLWidget):
         self.prev_ball_pos = None
         # self.ball_trail = []
         self.update()  # Request a redraw of the scene
+    
+    def drawSkyGradient(self):
+        """Draw a distant sky dome that respects the depth buffer"""
+        # Save current states
+        glPushAttrib(GL_ALL_ATTRIB_BITS)
+        
+        # Disable lighting for the sky
+        glDisable(GL_LIGHTING)
+        
+        # Make sure depth testing is enabled but NEVER update the depth buffer for sky
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)  # Disable depth writing
+        
+        # Use a large radius dome
+        radius = 400  # Just under the far clip plane (500)
+        slices = 32
+        stacks = 16
+        
+        # Save and set up matrices for the sky dome
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        
+        # Position dome at camera target but at ground level
+        # This keeps the sky centered on the scene
+        target_x, target_y, target_z = self.camera['target']
+        glTranslatef(target_x, 0, target_z)
+        
+        # Create the dome using GLU functions - only drawing the upper hemisphere
+        dome = gluNewQuadric()
+        gluQuadricDrawStyle(dome, GLU_FILL)
+        
+        # Draw with a gradient
+        glShadeModel(GL_SMOOTH)
+        
+        # Clip the bottom half of the sphere to make a dome
+        glPushMatrix()
+        glClipPlane(GL_CLIP_PLANE0, [0, 1, 0, 0])  # Y >= 0
+        glEnable(GL_CLIP_PLANE0)
+        
+        # Gradient drawing function for the dome
+        def set_color_for_height(y_factor):
+            # Map y-factor (-1 to 1) to appropriate color
+            if y_factor > 0:
+                # Interpolate between horizon color and zenith color
+                # At horizon (y=0)
+                horizon_color = [0.392, 0.584, 0.929, 1.0]  # Deeper blue
+                # At zenith (y=1) 
+                zenith_color = [0.529, 0.808, 0.922, 1.0]   # Sky blue
+                
+                # Linear interpolation
+                factor = y_factor
+                r = horizon_color[0] + factor * (zenith_color[0] - horizon_color[0])
+                g = horizon_color[1] + factor * (zenith_color[1] - horizon_color[1])
+                b = horizon_color[2] + factor * (zenith_color[2] - horizon_color[2])
+                glColor4f(r, g, b, 1.0)
+        
+        # We use a callback to set the colors for the dome
+        def dome_callback(component, inner_radius, outer_radius, sweep, loops):
+            glBegin(GL_QUADS)
+            for i in range(loops):
+                angle1 = (i / loops) * sweep
+                angle2 = ((i + 1) / loops) * sweep
+                
+                y1 = math.sin(math.radians(angle1))
+                y2 = math.sin(math.radians(angle2))
+                
+                # Set colors based on height
+                set_color_for_height(y1)
+                glVertex3d(0, inner_radius * y1, 0)
+                glVertex3d(0, outer_radius * y1, 0)
+                
+                set_color_for_height(y2)
+                glVertex3d(0, outer_radius * y2, 0)
+                glVertex3d(0, inner_radius * y2, 0)
+            glEnd()
+        
+        # Drawing a partial sphere to represent the sky dome
+        # This is a simplified approach without a custom callback
+        for i in range(stacks):
+            y1 = math.cos(math.pi * i / stacks)
+            y2 = math.cos(math.pi * (i + 1) / stacks)
+            
+            # Skip lower hemisphere
+            if y1 < 0 and y2 < 0:
+                continue
+                
+            glBegin(GL_QUAD_STRIP)
+            for j in range(slices + 1):
+                angle = 2 * math.pi * j / slices
+                x = math.sin(angle)
+                z = math.cos(angle)
+                
+                # Set color for first vertex
+                set_color_for_height(y1)
+                glVertex3f(x * radius * math.sin(math.acos(y1)), 
+                          y1 * radius, 
+                          z * radius * math.sin(math.acos(y1)))
+                
+                # Set color for second vertex
+                set_color_for_height(y2)
+                glVertex3f(x * radius * math.sin(math.acos(y2)), 
+                          y2 * radius, 
+                          z * radius * math.sin(math.acos(y2)))
+            glEnd()
+        
+        # Clean up
+        glDisable(GL_CLIP_PLANE0)
+        glPopMatrix()
+        
+        gluDeleteQuadric(dome)
+        
+        # Restore matrix
+        glPopMatrix()
+        
+        # Restore state
+        glDepthMask(GL_TRUE)  # Re-enable depth writing
+        glPopAttrib()
+    
+    
     
     def paintGL(self):
         """Override paintGL to update ball tracking"""
@@ -1109,6 +1229,9 @@ class UmpireView3D(QOpenGLWidget):
         # Set up perspective
         gluPerspective(self.camera['fov'], self.width()/self.height(), 0.1, 500)
         gluLookAt(*self.camera['pos'], *self.camera['target'], *self.camera['up'])
+        
+        # Trying to draw the sky
+        self.drawSkyGradient()
         
         # Enable material properties
         glDisable(GL_COLOR_MATERIAL)
@@ -1319,9 +1442,9 @@ class UmpireView3D(QOpenGLWidget):
             elif "outfield" in mesh_name or mesh_name == "outfield":
                 # Green grass outfield
                 glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.05, 0.75, 0.05, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.1, 0.3, 0.1, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.6, 0.1, 1.0])
+                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.1, 0.4, 0.1, 1.0])
+                glMaterialf(GL_FRONT, GL_SHININESS, 12.0)
                 print(f"Applied grass material to outfield")
                 
             elif "EffortText" in mesh_name or mesh_name == "EffortText":
