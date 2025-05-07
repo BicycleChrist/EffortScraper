@@ -2433,11 +2433,33 @@ class LightingControlWidget(QWidget):
     def __init__(self, lights, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Lighting Controls")
+        
+        # Store the original lights with a deep copy to preserve all nested structures
         self.lights = lights
-        self.default_lights = lights.copy()
+        self.default_lights = self.create_deep_copy(lights)
+        
         # Dictionary to store RGB value labels for updates
         self.rgb_labels = {}
+        
+        # Store slider references for direct value updates
+        self.sliders = {}
+        
         self.setup_ui()
+    
+    def create_deep_copy(self, lights):
+        """Create a deep copy of the lights list with all nested structures"""
+        copied_lights = []
+        for light in lights:
+            # Create a new dictionary for each light
+            light_copy = {}
+            for key, value in light.items():
+                # For list values (position, colors), create new lists with copied values
+                if isinstance(value, list):
+                    light_copy[key] = value.copy()
+                else:
+                    light_copy[key] = value
+            copied_lights.append(light_copy)
+        return copied_lights
     
     def setup_ui(self):
         # Main layout
@@ -2458,6 +2480,10 @@ class LightingControlWidget(QWidget):
             light_tab = QWidget()
             tab_layout = QVBoxLayout(light_tab)
             
+            # Initialize slider dictionary for this light
+            if i not in self.sliders:
+                self.sliders[i] = {}
+            
             # Enable/disable light
             enable_check = QCheckBox(f"Enable Light {i}")
             enable_check.setChecked(light['enabled'])
@@ -2468,8 +2494,10 @@ class LightingControlWidget(QWidget):
             pos_group = QGroupBox("Position")
             pos_layout = QGridLayout()
             
+            # Initialize position sliders in dictionary
+            self.sliders[i]['position'] = []
+            
             # Create sliders for X, Y, Z position
-            pos_sliders = []
             pos_labels = []
             
             for j, axis in enumerate(['X', 'Y', 'Z', 'W']):
@@ -2490,6 +2518,9 @@ class LightingControlWidget(QWidget):
                     slider.valueChanged.connect(lambda val, idx=i, axis_idx=j: 
                                               self.update_light_position(idx, axis_idx, val/10))
                 
+                # Store slider reference for reset
+                self.sliders[i]['position'].append(slider)
+                
                 label = QLabel(f"{light['position'][j]:.1f}" if axis != 'W' else f"{light['position'][3]:.0f}")
                 
                 # Different function for updating W label
@@ -2501,7 +2532,6 @@ class LightingControlWidget(QWidget):
                 pos_layout.addWidget(slider, j, 1)
                 pos_layout.addWidget(label, j, 2)
                 
-                pos_sliders.append(slider)
                 pos_labels.append(label)
             
             pos_group.setLayout(pos_layout)
@@ -2525,6 +2555,10 @@ class LightingControlWidget(QWidget):
                 if comp_key not in self.rgb_labels[i]:
                     self.rgb_labels[i][comp_key] = None
                 
+                # Initialize component sliders in dictionary
+                if comp_key not in self.sliders[i]:
+                    self.sliders[i][comp_key] = []
+                
                 # Create RGB sliders for each component
                 rgb_layout = QHBoxLayout()
                 rgb_values = []
@@ -2535,6 +2569,9 @@ class LightingControlWidget(QWidget):
                     slider = QSlider(Qt.Orientation.Horizontal)
                     slider.setRange(0, 100)
                     slider.setValue(int(color_value * 100))
+                    
+                    # Store slider reference for reset
+                    self.sliders[i][comp_key].append(slider)
                     
                     # Connect color slider to update function
                     slider.valueChanged.connect(
@@ -2557,12 +2594,18 @@ class LightingControlWidget(QWidget):
             tab_layout.addWidget(intensity_group)
             
             # Add reset button
-            reset_button = QPushButton(f"Reset to Default ({i})")
-            reset_button.clicked.connect(lambda _, idx=i: self.reset_light(idx))
+            reset_button = QPushButton(f"Reset Light {i} to Default")
+            reset_button.clicked.connect(self.create_reset_function(i))
             tab_layout.addWidget(reset_button)
             
             # Add the tab
             self.tab_widget.addTab(light_tab, f"Light {i}")
+    
+    def create_reset_function(self, idx):
+        """Create a proper reset function for a specific light index"""
+        def reset_function():
+            self.reset_light(idx)
+        return reset_function
     
     def toggle_light(self, light_idx, enabled):
         """Enable or disable a light"""
@@ -2591,110 +2634,48 @@ class LightingControlWidget(QWidget):
     def reset_light(self, light_idx):
         """Reset a light to its default values"""
         print(f'RESETTING LIGHT: {light_idx}')
-        self.lights[light_idx] = self.default_lights[light_idx].copy()  # Use copy to avoid reference issues
         
-        # Update UI to reflect changes
-        self.update_ui_from_light(light_idx)
+        # Create a deep copy of default light values
+        default_light = self.default_lights[light_idx]
+        reset_light = {}
+        
+        # Proper deep copy of each component
+        for key, value in default_light.items():
+            if isinstance(value, list):
+                reset_light[key] = value.copy()
+            else:
+                reset_light[key] = value
+        
+        # Update light with reset values
+        self.lights[light_idx] = reset_light
+        
+        # Directly update slider positions to match the reset values
+        # Position sliders (X, Y, Z, W)
+        if 'position' in self.sliders[light_idx]:
+            for i, slider in enumerate(self.sliders[light_idx]['position']):
+                if i < 3:  # X, Y, Z components (scale by 10)
+                    slider.setValue(int(reset_light['position'][i] * 10))
+                else:  # W component (0 or 1 directly)
+                    slider.setValue(int(reset_light['position'][i]))
+        
+        # Color component sliders (ambient, diffuse, specular)
+        for comp in ['ambient', 'diffuse', 'specular']:
+            if comp in self.sliders[light_idx]:
+                for i, slider in enumerate(self.sliders[light_idx][comp]):
+                    slider.setValue(int(reset_light[comp][i] * 100))
+        
+        # Update RGB labels
+        if light_idx in self.rgb_labels:
+            for comp in ['ambient', 'diffuse', 'specular']:
+                if comp in self.rgb_labels[light_idx]:
+                    rgb_values = reset_light[comp]
+                    self.rgb_labels[light_idx][comp].setText(
+                        f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})"
+                    )
+        
+        print(f"Light {light_idx} reset complete")
         self.emit_light_changed()
     
-    def update_ui_from_light(self, light_idx):
-        """Update UI elements to reflect light settings"""
-        # Make sure the light index is valid and we have tabs
-        if light_idx not in range(len(self.lights)) or light_idx >= self.tab_widget.count():
-            print(f"Invalid light index: {light_idx}")
-            return
-    
-        # Get the current light parameters
-        light = self.lights[light_idx]
-        
-        # Get the tab widget for this light
-        light_tab = self.tab_widget.widget(light_idx)
-        if not light_tab:
-            print(f"No tab found for light {light_idx}")
-            return
-        
-        try:
-            # First, find the enable checkbox and update it
-            enable_check = light_tab.findChild(QCheckBox)
-            if enable_check:
-                enable_check.setChecked(light['enabled'])
-            
-            # Find all sliders in the tab and update them based on their positions
-            sliders = light_tab.findChildren(QSlider)
-            
-            # Group sliders by their parent widget to identify their purpose
-            pos_sliders = []
-            ambient_sliders = []
-            diffuse_sliders = []
-            specular_sliders = []
-            
-            for slider in sliders:
-                parent_name = slider.parent().objectName() if slider.parent() else ""
-                
-                # Check parent's title if it's a QGroupBox
-                if isinstance(slider.parent(), QGroupBox):
-                    if slider.parent().title() == "Position":
-                        pos_sliders.append(slider)
-                    elif "Intensity" in slider.parent().title():
-                        # Need to determine which intensity component (ambient, diffuse, specular)
-                        # This is tricky without proper naming, so we'll just count positions
-                        layout = slider.parent().layout()
-                        if layout:
-                            for i in range(layout.count()):
-                                item = layout.itemAt(i)
-                                if item and item.widget() == slider:
-                                    row, col, _, _ = layout.getItemPosition(i)
-                                    if row == 0:  # First row is ambient
-                                        ambient_sliders.append(slider)
-                                    elif row == 1:  # Second row is diffuse
-                                        diffuse_sliders.append(slider)
-                                    elif row == 2:  # Third row is specular
-                                        specular_sliders.append(slider)
-            
-            # Update position sliders (should be X, Y, Z, W in that order)
-            if len(pos_sliders) >= 4:
-                # X position
-                pos_sliders[0].setValue(int(light['position'][0] * 10))
-                # Y position
-                pos_sliders[1].setValue(int(light['position'][1] * 10))
-                # Z position
-                pos_sliders[2].setValue(int(light['position'][2] * 10)) 
-                # W component (0=directional or 1=positional)
-                pos_sliders[3].setValue(int(light['position'][3]))
-            
-            # Update ambient sliders (R, G, B in that order)
-            if len(ambient_sliders) >= 3:
-                ambient_sliders[0].setValue(int(light['ambient'][0] * 100))
-                ambient_sliders[1].setValue(int(light['ambient'][1] * 100))
-                ambient_sliders[2].setValue(int(light['ambient'][2] * 100))
-            
-            # Update diffuse sliders (R, G, B in that order)
-            if len(diffuse_sliders) >= 3:
-                diffuse_sliders[0].setValue(int(light['diffuse'][0] * 100))
-                diffuse_sliders[1].setValue(int(light['diffuse'][1] * 100))
-                diffuse_sliders[2].setValue(int(light['diffuse'][2] * 100))
-            
-            # Update specular sliders (R, G, B in that order)
-            if len(specular_sliders) >= 3:
-                specular_sliders[0].setValue(int(light['specular'][0] * 100))
-                specular_sliders[1].setValue(int(light['specular'][1] * 100))
-                specular_sliders[2].setValue(int(light['specular'][2] * 100))
-            
-            # Update RGB labels directly with current values
-            if light_idx in self.rgb_labels:
-                for comp_key in ['ambient', 'diffuse', 'specular']:
-                    if comp_key in self.rgb_labels[light_idx] and self.rgb_labels[light_idx][comp_key]:
-                        rgb_values = light[comp_key]
-                        self.rgb_labels[light_idx][comp_key].setText(
-                            f"({rgb_values[0]:.1f}, {rgb_values[1]:.1f}, {rgb_values[2]:.1f})"
-                        )
-            
-        except Exception as e:
-            # Catch-all exception handler to prevent app crashes
-            print(f"Error updating UI from light {light_idx}: {e}")
-            import traceback
-            traceback.print_exc()
-        
     def emit_light_changed(self):
         """Emit signal when light parameters change"""
         self.lightChanged.emit()
