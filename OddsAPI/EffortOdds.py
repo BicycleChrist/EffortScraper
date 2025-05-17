@@ -26,7 +26,6 @@ from TTwindow import TableTennisGUI
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
 #TODO: Toggeling news widget on, off, then on again causes sizing issues
-#TODO: best lines widget display is stuck on most reccent query when switching tabs
 
 
 
@@ -63,6 +62,7 @@ class LeagueTabData:
         self.current_color_index = 0
         self.bookmakers = []
         self.previous_data = {}
+        self.consolidated_odds_data = None
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -815,10 +815,16 @@ class ModernOddsWindow(QMainWindow):
         """Handle tab switching events"""
         if index >= 0:
             self.current_league = self.tab_widget.tabText(index)
-            # Extract the league name without the market info
+            # Update Best Lines with current tab's data
+            tab_id = self.tab_widget.tabText(index)
+            tab_data = self.league_tabs.get(tab_id)
+            
+            if tab_data and tab_data.consolidated_odds_data:
+                self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
+                
+            # Existing league selector update logic
             if "(" in self.current_league:
                 base_league = self.current_league.split(" (")[0]
-                # Optionally update league selector to match the tab
                 self.league_selector.setCurrentText(base_league)
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
@@ -837,7 +843,7 @@ class ModernOddsWindow(QMainWindow):
             self.tab_widget.addTab(table_widget, tab_id)
             self.league_tabs[tab_id] = tab_data
             self.current_league = tab_id
-            self.tab_widget.setCurrentIndex(self.tab_widget.count() - 1)
+            self.tab_widget.currentChanged.connect(self.handle_tab_change)
         return self.league_tabs[tab_id]
 
 
@@ -1364,7 +1370,7 @@ class ModernOddsWindow(QMainWindow):
                             new_table_data[unique_label][bm_title] = price
             
             # Store the consolidated data for the best lines widget
-            self.consolidated_odds_data = consolidated_odds_data
+            tab_data.consolidated_odds_data = consolidated_odds_data
             
             # Create a new DataFrame from the collected data
             new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
