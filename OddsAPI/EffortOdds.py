@@ -26,6 +26,7 @@ from TTwindow import TableTennisGUI
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
 #TODO: Toggeling news widget on, off, then on again causes sizing issues
+#TODO: Add in accsessibility for calculator 
 
 
 
