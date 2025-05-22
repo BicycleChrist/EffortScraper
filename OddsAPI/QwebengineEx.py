@@ -1,12 +1,13 @@
 import sys
 import os
-from PyQt5.QtCore import QUrl, Qt, QSize, QTimer
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QToolBar, QLineEdit,
+from PyQt6.QtCore import QUrl, Qt, QSize, QTimer
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QToolBar, QLineEdit,
                             QVBoxLayout, QHBoxLayout, QWidget, QGridLayout,
-                            QPushButton, QComboBox, QLabel, QAction, QSplitter,
-                            QShortcut, QMenu)
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile
-from PyQt5.QtGui import QIcon, QKeySequence
+                            QPushButton, QComboBox, QLabel, QSplitter,
+                             QMenu)
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEngineProfile
+from PyQt6.QtGui import QIcon, QKeySequence, QAction, QShortcut
 
 # Set environment variables for better media support
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
@@ -16,14 +17,11 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--enable-accelerated-video-decode "
     "--autoplay-policy=no-user-gesture-required "
     "--ignore-gpu-blocklist "
-    "--use-gl=desktop "
+    "--use-gl=angle "
+    "--use-angle=default "
+    "--enable-accelerated-2d-canvas "
+    "--disable-gpu-sandbox "
 )
-
-# os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-#     "--webEngineArgs "
-#     "--v=1 "
-#     "--disable-gpu "
-# )
 
 
 class BrowserPanel(QWidget):
@@ -84,38 +82,22 @@ class BrowserPanel(QWidget):
         # Configure profile for better compatibility
         profile = self.web_view.page().profile()
 
-        # Enhanced settings for media playback
+        # Enhanced settings for media playbook
         settings = self.web_view.settings()
-        settings.setAttribute(settings.PluginsEnabled, True)
-        settings.setAttribute(settings.JavascriptCanOpenWindows, True)
-        settings.setAttribute(settings.LocalStorageEnabled, True)
-        settings.setAttribute(settings.AllowWindowActivationFromJavaScript, True)
-        settings.setAttribute(settings.ShowScrollBars, False)
-        settings.setAttribute(settings.PlaybackRequiresUserGesture, False)
-        settings.setAttribute(settings.FullScreenSupportEnabled, True)
-        settings.setAttribute(settings.AllowRunningInsecureContent, True)
-        settings.setAttribute(settings.JavascriptEnabled, True)
-        settings.setAttribute(settings.AutoLoadImages, True)
-        settings.setAttribute(settings.WebGLEnabled, True)
-        settings.setAttribute(settings.Accelerated2dCanvasEnabled, True)
-        settings.setAttribute(settings.LocalContentCanAccessRemoteUrls, False)
-        settings.setAttribute(settings.AllowGeolocationOnInsecureOrigins, False)
-
-        # Apply settings globally as well
-        settings.globalSettings().setAttribute(settings.PluginsEnabled, True)
-        settings.globalSettings().setAttribute(settings.JavascriptCanOpenWindows, True)
-        settings.globalSettings().setAttribute(settings.LocalStorageEnabled, True)
-        settings.globalSettings().setAttribute(settings.AllowWindowActivationFromJavaScript, True)
-        settings.globalSettings().setAttribute(settings.ShowScrollBars, False)
-        settings.globalSettings().setAttribute(settings.PlaybackRequiresUserGesture, False)
-        settings.globalSettings().setAttribute(settings.FullScreenSupportEnabled, True)
-        settings.globalSettings().setAttribute(settings.AllowRunningInsecureContent, True)
-        settings.globalSettings().setAttribute(settings.JavascriptEnabled, True)
-        settings.globalSettings().setAttribute(settings.AutoLoadImages, True)
-        settings.globalSettings().setAttribute(settings.WebGLEnabled, True)
-        settings.globalSettings().setAttribute(settings.Accelerated2dCanvasEnabled, True)
-        settings.globalSettings().setAttribute(settings.LocalContentCanAccessRemoteUrls, False)
-        settings.globalSettings().setAttribute(settings.AllowGeolocationOnInsecureOrigins, False)
+        settings.setAttribute(settings.WebAttribute.PluginsEnabled, True)
+        settings.setAttribute(settings.WebAttribute.JavascriptCanOpenWindows, True)
+        settings.setAttribute(settings.WebAttribute.LocalStorageEnabled, True)
+        settings.setAttribute(settings.WebAttribute.AllowWindowActivationFromJavaScript, True)
+        settings.setAttribute(settings.WebAttribute.ShowScrollBars, False)
+        settings.setAttribute(settings.WebAttribute.PlaybackRequiresUserGesture, False)
+        settings.setAttribute(settings.WebAttribute.FullScreenSupportEnabled, True)
+        settings.setAttribute(settings.WebAttribute.AllowRunningInsecureContent, True)
+        settings.setAttribute(settings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(settings.WebAttribute.AutoLoadImages, True)
+        settings.setAttribute(settings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(settings.WebAttribute.Accelerated2dCanvasEnabled, True)
+        settings.setAttribute(settings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(settings.WebAttribute.AllowGeolocationOnInsecureOrigins, True)
 
         self.web_view.loadFinished.connect(self.update_url)
 
@@ -124,7 +106,6 @@ class BrowserPanel(QWidget):
         self.layout.addWidget(self.web_view, 1)
 
         # Set initial URL
-        # self.initial_url = "chrome://gpu"
         self.initial_url = "https://the.streameast.app"
         self.web_view.load(QUrl(self.initial_url))
         self.url_input.setText(self.initial_url)
@@ -371,20 +352,20 @@ class QuadBoxBrowser(QMainWindow):
 
         # Create fullscreen button
         self.fullscreen_action = QAction("Fullscreen", self)
-        self.fullscreen_action.setShortcut("F11")
+        self.fullscreen_action.setShortcut(QKeySequence("F11"))
         self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
         self.toolbar.addAction(self.fullscreen_action)
 
         # Create clean view toggle button
         self.clean_view_action = QAction("Clean View", self)
-        self.clean_view_action.setShortcut("F10")
+        self.clean_view_action.setShortcut(QKeySequence("F10"))
         self.clean_view_action.setCheckable(True)
         self.clean_view_action.toggled.connect(self.toggle_clean_view)
         self.toolbar.addAction(self.clean_view_action)
 
         # Video isolation for all streams
         self.video_isolate_all_action = QAction("Isolate All Videos", self)
-        self.video_isolate_all_action.setShortcut("F9")
+        self.video_isolate_all_action.setShortcut(QKeySequence("F9"))
         self.video_isolate_all_action.triggered.connect(self.toggle_all_video_isolation)
         self.toolbar.addAction(self.video_isolate_all_action)
 
@@ -683,7 +664,7 @@ class QuadBoxBrowser(QMainWindow):
 
     def keyPressEvent(self, event):
         """Handle key press events"""
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.handle_escape()
         else:
             super().keyPressEvent(event)
