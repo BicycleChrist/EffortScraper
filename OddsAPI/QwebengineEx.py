@@ -9,17 +9,14 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile
 from PyQt5.QtGui import QIcon, QKeySequence
 
 # Set environment variables for better media support
-# Add these additional flags to your environment variables
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--enable-gpu-rasterization "
     "--enable-features=WebRTC-H264WithOpenH264FFmpeg,MediaFoundationRendererEnabled,HardwareMediaKeyHandling "
     "--enable-native-gpu-memory-buffers "
     "--enable-accelerated-video-decode "
-    # "--disable-web-security "  # Helps with some cross-origin issues in streams
     "--autoplay-policy=no-user-gesture-required "
     "--ignore-gpu-blocklist "
-    "--use-gl=desktop "        # Force hardware acceleration
-    #"--register-pepper-plugins=\"/usr/lib/chromium/libffmpeg.so;application/x-ppapi-ffmpeg\""  # Point to your ffmpeg
+    "--use-gl=desktop "
 )
 
 # os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
@@ -62,6 +59,12 @@ class BrowserPanel(QWidget):
         self.refresh_btn.setFixedWidth(30)
         self.refresh_btn.clicked.connect(self.refresh)
 
+        # Video isolation button
+        self.video_isolate_btn = QPushButton("📹")
+        self.video_isolate_btn.setFixedWidth(30)
+        self.video_isolate_btn.setToolTip(f"Isolate Video for Stream {index+1}")
+        self.video_isolate_btn.clicked.connect(self.toggle_video_isolation)
+
         # Maximize button
         self.maximize_btn = QPushButton("⤢")
         self.maximize_btn.setFixedWidth(30)
@@ -71,6 +74,7 @@ class BrowserPanel(QWidget):
         nav_layout.addWidget(self.back_btn)
         nav_layout.addWidget(self.forward_btn)
         nav_layout.addWidget(self.refresh_btn)
+        nav_layout.addWidget(self.video_isolate_btn)
         nav_layout.addWidget(self.url_input)
         nav_layout.addWidget(self.maximize_btn)
 
@@ -79,12 +83,6 @@ class BrowserPanel(QWidget):
 
         # Configure profile for better compatibility
         profile = self.web_view.page().profile()
-        # profile.setHttpUserAgent(
-        #     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        # )
-        # profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-        # print("profile loaded: ")
-        # print(profile.__dict__)
 
         # Enhanced settings for media playback
         settings = self.web_view.settings()
@@ -100,12 +98,10 @@ class BrowserPanel(QWidget):
         settings.setAttribute(settings.AutoLoadImages, True)
         settings.setAttribute(settings.WebGLEnabled, True)
         settings.setAttribute(settings.Accelerated2dCanvasEnabled, True)
-        settings.setAttribute(settings.LocalContentCanAccessRemoteUrls, True)
-        settings.setAttribute(settings.AllowGeolocationOnInsecureOrigins, True)
-        print("settings loaded:")
-        print(settings)
+        settings.setAttribute(settings.LocalContentCanAccessRemoteUrls, False)
+        settings.setAttribute(settings.AllowGeolocationOnInsecureOrigins, False)
 
-
+        # Apply settings globally as well
         settings.globalSettings().setAttribute(settings.PluginsEnabled, True)
         settings.globalSettings().setAttribute(settings.JavascriptCanOpenWindows, True)
         settings.globalSettings().setAttribute(settings.LocalStorageEnabled, True)
@@ -118,23 +114,25 @@ class BrowserPanel(QWidget):
         settings.globalSettings().setAttribute(settings.AutoLoadImages, True)
         settings.globalSettings().setAttribute(settings.WebGLEnabled, True)
         settings.globalSettings().setAttribute(settings.Accelerated2dCanvasEnabled, True)
-        settings.globalSettings().setAttribute(settings.LocalContentCanAccessRemoteUrls, True)
-        settings.globalSettings().setAttribute(settings.AllowGeolocationOnInsecureOrigins, True)
+        settings.globalSettings().setAttribute(settings.LocalContentCanAccessRemoteUrls, False)
+        settings.globalSettings().setAttribute(settings.AllowGeolocationOnInsecureOrigins, False)
 
         self.web_view.loadFinished.connect(self.update_url)
 
         # Add to main layout
         self.layout.addWidget(self.nav_container)
-        self.layout.addWidget(self.web_view, 1)  # Give the web view a stretch factor of 1
+        self.layout.addWidget(self.web_view, 1)
 
-        # Set initial URL to YouTube as it has good compatibility
-        self.initial_url = "https://the.streameast.app"
+        # Set initial URL
         # self.initial_url = "chrome://gpu"
+        self.initial_url = "https://the.streameast.app"
         self.web_view.load(QUrl(self.initial_url))
         self.url_input.setText(self.initial_url)
 
-        # Track clean view state
+        # Track states
         self.clean_view_mode = False
+        self.video_isolated = False
+        self.original_page_style = None
 
     def toggle_clean_view(self, enable):
         """Toggle between clean view (no controls) and normal view"""
@@ -146,8 +144,167 @@ class BrowserPanel(QWidget):
             self.nav_container.show()
             self.layout.setContentsMargins(2, 2, 2, 2)
 
+    def toggle_video_isolation(self):
+        """Toggle video isolation mode - shows only the video element"""
+        if not self.video_isolated:
+            self.isolate_video()
+        else:
+            self.restore_page()
+
+    def isolate_video(self):
+        """Inject JavaScript to isolate and maximize the video element"""
+        js_code = """
+        (function() {
+            // Store original styles if not already stored
+            if (!window.originalPageStyles) {
+                window.originalPageStyles = {
+                    bodyStyle: document.body.style.cssText,
+                    htmlStyle: document.documentElement.style.cssText,
+                    hiddenElements: []
+                };
+            }
+            
+            // Find all video elements
+            const videos = document.querySelectorAll('video');
+            let targetVideo = null;
+            
+            // Find the largest or most likely main video
+            if (videos.length > 0) {
+                targetVideo = Array.from(videos).reduce((prev, current) => {
+                    const prevArea = prev.offsetWidth * prev.offsetHeight;
+                    const currentArea = current.offsetWidth * current.offsetHeight;
+                    return currentArea > prevArea ? current : prev;
+                });
+            }
+            
+            // If no video found, try to find iframe players
+            if (!targetVideo) {
+                const iframes = document.querySelectorAll('iframe');
+                for (let iframe of iframes) {
+                    if (iframe.src.includes('youtube') || 
+                        iframe.src.includes('twitch') || 
+                        iframe.src.includes('player') ||
+                        iframe.offsetWidth > 400) {
+                        targetVideo = iframe;
+                        break;
+                    }
+                }
+            }
+            
+            // If still no video, try to find video containers
+            if (!targetVideo) {
+                const selectors = [
+                    '[class*="video"]', '[id*="video"]',
+                    '[class*="player"]', '[id*="player"]',
+                    '[class*="stream"]', '[id*="stream"]',
+                    '.jwplayer', '.video-js', '.vjs-tech'
+                ];
+                
+                for (let selector of selectors) {
+                    const elements = document.querySelectorAll(selector);
+                    if (elements.length > 0) {
+                        targetVideo = elements[0];
+                        break;
+                    }
+                }
+            }
+            
+            if (targetVideo) {
+                // Hide all other elements
+                const allElements = document.querySelectorAll('*');
+                allElements.forEach(el => {
+                    if (!targetVideo.contains(el) && !el.contains(targetVideo)) {
+                        if (el.style.display !== 'none') {
+                            window.originalPageStyles.hiddenElements.push({
+                                element: el,
+                                originalDisplay: el.style.display
+                            });
+                            el.style.display = 'none';
+                        }
+                    }
+                });
+                
+                // Style the video container and parents
+                let current = targetVideo;
+                while (current && current !== document.body) {
+                    current.style.width = '100vw';
+                    current.style.height = '100vh';
+                    current.style.position = 'fixed';
+                    current.style.top = '0';
+                    current.style.left = '0';
+                    current.style.zIndex = '9999';
+                    current.style.margin = '0';
+                    current.style.padding = '0';
+                    current.style.border = 'none';
+                    current = current.parentElement;
+                }
+                
+                // Style the page
+                document.body.style.margin = '0';
+                document.body.style.padding = '0';
+                document.body.style.overflow = 'hidden';
+                document.body.style.backgroundColor = '#000';
+                document.documentElement.style.margin = '0';
+                document.documentElement.style.padding = '0';
+                document.documentElement.style.overflow = 'hidden';
+                
+                return 'Video isolated successfully';
+            }
+            
+            return 'No video element found';
+        })();
+        """
+        
+        self.web_view.page().runJavaScript(js_code, self._on_video_isolation_result)
+
+    def _on_video_isolation_result(self, result):
+        """Handle the result of video isolation JavaScript"""
+        if result and "successfully" in result:
+            self.video_isolated = True
+            self.video_isolate_btn.setText("🔄")
+            self.video_isolate_btn.setToolTip(f"Restore Page View for Stream {self.index+1}")
+            print(f"Stream {self.index+1}: {result}")
+        else:
+            print(f"Stream {self.index+1}: Failed to isolate video - {result}")
+
+    def restore_page(self):
+        """Restore the original page layout"""
+        js_code = """
+        (function() {
+            if (window.originalPageStyles) {
+                // Restore body and html styles
+                document.body.style.cssText = window.originalPageStyles.bodyStyle;
+                document.documentElement.style.cssText = window.originalPageStyles.htmlStyle;
+                
+                // Restore hidden elements
+                window.originalPageStyles.hiddenElements.forEach(item => {
+                    item.element.style.display = item.originalDisplay;
+                });
+                
+                // Clear stored styles
+                window.originalPageStyles = null;
+                
+                return 'Page restored successfully';
+            }
+            return 'No original styles found';
+        })();
+        """
+        
+        self.web_view.page().runJavaScript(js_code, self._on_page_restoration_result)
+
+    def _on_page_restoration_result(self, result):
+        """Handle the result of page restoration JavaScript"""
+        self.video_isolated = False
+        self.video_isolate_btn.setText("📹")
+        self.video_isolate_btn.setToolTip(f"Isolate Video for Stream {self.index+1}")
+        print(f"Stream {self.index+1}: {result}")
+
     def navigate_to_url(self):
         """Navigate to the URL entered in the input field"""
+        # If video is isolated, restore page first
+        if self.video_isolated:
+            self.restore_page()
+            
         url = self.url_input.text()
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -158,21 +315,34 @@ class BrowserPanel(QWidget):
         if success:
             current_url = self.web_view.url().toString()
             self.url_input.setText(current_url)
+            # Reset video isolation state on new page load
+            self.video_isolated = False
+            self.video_isolate_btn.setText("📹")
+            self.video_isolate_btn.setToolTip(f"Isolate Video for Stream {self.index+1}")
 
     def go_back(self):
         """Navigate backward in history"""
+        if self.video_isolated:
+            self.restore_page()
         self.web_view.back()
 
     def go_forward(self):
         """Navigate forward in history"""
+        if self.video_isolated:
+            self.restore_page()
         self.web_view.forward()
 
     def refresh(self):
         """Refresh the current page"""
+        if self.video_isolated:
+            self.restore_page()
         self.web_view.reload()
 
     def load_url(self, url):
         """Load a specified URL"""
+        if self.video_isolated:
+            self.restore_page()
+            
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         self.web_view.load(QUrl(url))
@@ -193,7 +363,7 @@ class QuadBoxBrowser(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Create top toolbar for global controls (can be hidden in fullscreen)
+        # Create top toolbar for global controls
         self.toolbar = QToolBar("Global Controls")
         self.toolbar.setIconSize(QSize(16, 16))
         self.toolbar.setMovable(False)
@@ -212,6 +382,12 @@ class QuadBoxBrowser(QMainWindow):
         self.clean_view_action.toggled.connect(self.toggle_clean_view)
         self.toolbar.addAction(self.clean_view_action)
 
+        # Video isolation for all streams
+        self.video_isolate_all_action = QAction("Isolate All Videos", self)
+        self.video_isolate_all_action.setShortcut("F9")
+        self.video_isolate_all_action.triggered.connect(self.toggle_all_video_isolation)
+        self.toolbar.addAction(self.video_isolate_all_action)
+
         # Stream layout dropdown
         self.layout_selector = QComboBox()
         self.layout_selector.addItems(["2x2 Grid", "1x2 Split", "2x1 Split", "Single"])
@@ -226,7 +402,7 @@ class QuadBoxBrowser(QMainWindow):
         self.stream_presets.addItems([
             "Select Stream Preset",
             "ESPN",
-            "NFL Network",
+            "NFL Network", 
             "CBS Sports",
             "NBC Sports",
             "Fox Sports",
@@ -282,12 +458,30 @@ class QuadBoxBrowser(QMainWindow):
         QShortcut(QKeySequence("Alt+2"), self, lambda: self.maximize_browser(1))
         QShortcut(QKeySequence("Alt+3"), self, lambda: self.maximize_browser(2))
         QShortcut(QKeySequence("Alt+4"), self, lambda: self.maximize_browser(3))
+        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self.browsers[0].toggle_video_isolation())
+        QShortcut(QKeySequence("Ctrl+2"), self, lambda: self.browsers[1].toggle_video_isolation())
+        QShortcut(QKeySequence("Ctrl+3"), self, lambda: self.browsers[2].toggle_video_isolation())
+        QShortcut(QKeySequence("Ctrl+4"), self, lambda: self.browsers[3].toggle_video_isolation())
         QShortcut(QKeySequence("Esc"), self, self.handle_escape)
 
         # Add mouseover visibility timer for clean view mode
         self.mouseover_timer = None
         self.setMouseTracking(True)
         self.content_container.setMouseTracking(True)
+
+    def toggle_all_video_isolation(self):
+        """Toggle video isolation for all visible browser panels"""
+        visible_browsers = [b for b in self.browsers if b.isVisible()]
+        if visible_browsers:
+            # Check if any video is currently isolated
+            any_isolated = any(b.video_isolated for b in visible_browsers)
+            
+            # If any are isolated, restore all; otherwise isolate all
+            for browser in visible_browsers:
+                if any_isolated and browser.video_isolated:
+                    browser.restore_page()
+                elif not any_isolated:
+                    browser.isolate_video()
 
     def toggle_fullscreen(self):
         """Toggle fullscreen mode for the entire application"""
@@ -308,7 +502,6 @@ class QuadBoxBrowser(QMainWindow):
                     self.toggle_clean_view(False)
         except Exception as e:
             print(f"Fullscreen toggle error: {e}")
-            # Attempt recovery
             self.showNormal()
             self.is_fullscreen = False
 
@@ -332,6 +525,13 @@ class QuadBoxBrowser(QMainWindow):
 
     def handle_escape(self):
         """Handle escape key press"""
+        # First priority: restore any isolated videos
+        isolated_browsers = [b for b in self.browsers if b.video_isolated]
+        if isolated_browsers:
+            for browser in isolated_browsers:
+                browser.restore_page()
+            return
+            
         if self.maximized_browser is not None:
             # If a browser is maximized, restore grid
             self.restore_grid()
@@ -483,9 +683,8 @@ class QuadBoxBrowser(QMainWindow):
 
     def keyPressEvent(self, event):
         """Handle key press events"""
-        if event.key() == Qt.Key_Escape and self.maximized_browser is not None:
-            # If Esc is pressed while a browser is maximized, restore grid
-            self.restore_grid()
+        if event.key() == Qt.Key_Escape:
+            self.handle_escape()
         else:
             super().keyPressEvent(event)
 
