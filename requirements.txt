@@ -11,4 +11,13 @@ lxml
 qasync
 aiohttp
 feedparser
-pywin32 # windows BS to create desktop shortcut
+pandas
+# pywin32 # windows BS to create desktop shortcut
+pyqt6
+pyqt6-webengine
+pyqtgraph
+scipy
+pywavefront
+svgpathtools
+qasync
+
