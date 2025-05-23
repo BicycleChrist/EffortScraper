@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter
 )
 from PropQuery import PropClient
-from OddsAPIQuery import league_query, odds_query
+from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
 from Creds import SUPER_KEY
 from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
@@ -21,6 +21,7 @@ from GUIteamnewswidget import TeamNewsWidget
 from GUIbestlineswidget import *
 from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
+from effortcalculator import OddsConverterWidget
 
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -63,7 +64,7 @@ class LeagueTabData:
         self.current_color_index = 0
         self.bookmakers = []
         self.previous_data = {}
-        self.consolidated_odds_data = None
+        self.game_status = {}
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -278,6 +279,9 @@ class ModernOddsWindow(QMainWindow):
         self.icon_timer.setSingleShot(False)
         self.icon_timer.timeout.connect(self.UpdateIcon)
         self.icon_timer.start(16)
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.update_game_statuses_async)
+        self.status_timer.start(60000)
     
     def UpdateIcon(self):
         framesdir = pathlib.Path(__file__).parent / "appicon_frames"
@@ -368,6 +372,7 @@ class ModernOddsWindow(QMainWindow):
             }
         """)
         
+        
         # Create a dedicated container for the right side elements
         right_side_container = QWidget()
         right_side_layout = QVBoxLayout(right_side_container)
@@ -380,6 +385,29 @@ class ModernOddsWindow(QMainWindow):
         buttons_layout.addWidget(self.news_toggle_button)
         buttons_layout.addWidget(self.history_toggle_button)  # Add historical odds toggle button
         buttons_layout.setSpacing(4)  # Small spacing between buttons
+        
+        
+        # ---- Calculator button ----
+        self.calc_button = QPushButton("Calculator   🧮🎲")# ⚙
+        self.calc_button.setFixedWidth(150)
+        self.calc_button.setCheckable(False)
+        self.calc_button.clicked.connect(self.handle_calc_button)
+        self.calc_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: none;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 9pt;
+            }
+            QPushButton:hover {
+                background-color: #34495E;
+            }
+        """)
+        buttons_layout.addWidget(self.calc_button)
+        
+        
         
         # Add the buttons layout to the right side layout
         right_side_layout.addLayout(buttons_layout)
@@ -726,13 +754,19 @@ class ModernOddsWindow(QMainWindow):
     # overriding inherited method for custom keybinds
     def keyPressEvent(self, a0):
         self.clearFocus()
-        print(f"Keypress: {a0.key()}")
-        if (a0.key() == Qt.Key.Key_1):
-            if not self.props_button.isEnabled(): return;
+        # “1” → Props (already existing)
+        if a0.key() == Qt.Key.Key_1:
+            if not self.props_button.isEnabled():
+                return
             self.handle_props_button()
             return
-        super().keyPressEvent(a0) # delegate back to base keybind handling
-        return
+
+        # “2” → Calculator
+        if a0.key() == Qt.Key.Key_2:
+            self.handle_calc_button()
+            return
+
+        super().keyPressEvent(a0)
 
     def connect_signals(self):
         """Connect UI signals to their respective slots"""
@@ -816,16 +850,10 @@ class ModernOddsWindow(QMainWindow):
         """Handle tab switching events"""
         if index >= 0:
             self.current_league = self.tab_widget.tabText(index)
-            # Update Best Lines with current tab's data
-            tab_id = self.tab_widget.tabText(index)
-            tab_data = self.league_tabs.get(tab_id)
-            
-            if tab_data and tab_data.consolidated_odds_data:
-                self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
-                
-            # Existing league selector update logic
+            # Extract the league name without the market info
             if "(" in self.current_league:
                 base_league = self.current_league.split(" (")[0]
+                # Optionally update league selector to match the tab
                 self.league_selector.setCurrentText(base_league)
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
@@ -844,7 +872,7 @@ class ModernOddsWindow(QMainWindow):
             self.tab_widget.addTab(table_widget, tab_id)
             self.league_tabs[tab_id] = tab_data
             self.current_league = tab_id
-            self.tab_widget.currentChanged.connect(self.handle_tab_change)
+            self.tab_widget.setCurrentIndex(self.tab_widget.count() - 1)
         return self.league_tabs[tab_id]
 
 
@@ -922,7 +950,7 @@ class ModernOddsWindow(QMainWindow):
 
 
     def update_table_display(self, tab_data: LeagueTabData):
-        """Update table display with improved price change highlighting"""
+        """Update table display with improved price change highlighting and live status"""
         table = tab_data.table_widget
         current_rows = table.rowCount()
         current_cols = table.columnCount()
@@ -942,7 +970,16 @@ class ModernOddsWindow(QMainWindow):
         for row_idx, row_label in enumerate(tab_data.table_rows):
             row_data = tab_data.table_data[row_label]
             game_id = row_data['game_id']
-            color = tab_data.get_game_color(game_id)
+            
+            # Check if this is a live game for special coloring
+            status_info = row_data.get('status_info', {})
+            is_live = status_info.get('is_live', False)
+            
+            # Choose color based on live status
+            if is_live:
+                color = QColor(220, 53, 69, 120)  # Semi-transparent red for live games
+            else:
+                color = tab_data.get_game_color(game_id)  # Normal game colors
             
             # Create or update row header if needed
             header_item = table.item(row_idx, 0)
@@ -951,13 +988,18 @@ class ModernOddsWindow(QMainWindow):
                 table.setItem(row_idx, 0, header_item)
                 needs_resize = True
             
-            # Apply header styling with black text
+            # Apply header styling with live game highlighting
             if row_data.get('is_header'):
                 font = QFont()
                 font.setBold(True)
                 header_item.setFont(font)
                 header_item.setBackground(color)
-                header_item.setForeground(QColor('black'))
+                
+                # Use white text for live games for better contrast, black for others
+                if is_live:
+                    header_item.setForeground(QColor('white'))
+                else:
+                    header_item.setForeground(QColor('black'))
             else:
                 market_color = QColor(color)
                 market_color.setAlpha(230)
@@ -1035,15 +1077,21 @@ class ModernOddsWindow(QMainWindow):
             print("timer stopped")
         # self.update_status_text() # crashes
     
-    async def refresh_splits_data(self):
-        """Refresh betting splits data for the current sport"""
+    # 
+    def refresh_splits_data(self):
+        """Wrapper method to handle the async refresh properly"""
+        # Create and schedule the coroutine as a task
+        asyncio.create_task(self._async_refresh_splits_data())
+
+    async def _async_refresh_splits_data(self):
+        """The actual async refresh method"""
         self.splits_refresh_button.setEnabled(False)
         self.splits_refresh_button.setText("⟳")
         
         try:
             result = await self.best_lines_widget.refresh_splits_data()
             if result:
-                # Show success indicator briefly
+                # Show success indicator briefly  
                 self.splits_refresh_button.setText("✓")
                 QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
             else:
@@ -1052,7 +1100,9 @@ class ModernOddsWindow(QMainWindow):
                 QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
         except Exception as e:
             print(f"Error refreshing splits data: {e}")
-            self.splits_refresh_button.setText("✗")
+            import traceback
+            traceback.print_exc()
+            self.splits_refresh_button.setText("✗") 
             QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
         
         self.splits_refresh_button.setEnabled(True)
@@ -1278,6 +1328,9 @@ class ModernOddsWindow(QMainWindow):
             self.data_manager.sport_key = sport_key
             self.data_manager.prop_client = PropClient(sport_key)
     
+            # Fetch scores data for live status detection
+            scores_data = await asyncio.to_thread(scores_query, sport_key)
+    
             # Create a new DataFrame for the updated data
             new_table_rows = []
             new_table_data = {}
@@ -1329,10 +1382,29 @@ class ModernOddsWindow(QMainWindow):
                 home_team = odds.get('home_team', 'Unknown')
                 away_team = odds.get('away_team', 'Unknown')
                 
-                # Add header row for the game
-                game_header = f"Game: {home_team} vs {away_team}"
+                # Get game status using the new function
+                status_text, is_live, scores_text = get_game_status(odds, scores_data)
+                
+                # Store status info in tab_data
+                if not hasattr(tab_data, 'game_status'):
+                    tab_data.game_status = {}
+                tab_data.game_status[game_id] = {
+                    'text': status_text,
+                    'is_live': is_live,
+                    'scores_text': scores_text
+                }
+                
+                # Create game header with status and scores
+                game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
+                if scores_text:
+                    game_header += f" - {scores_text}"
+                
                 new_table_rows.append(game_header)
-                new_table_data[game_header] = {'is_header': True, 'game_id': game_id}
+                new_table_data[game_header] = {
+                    'is_header': True, 
+                    'game_id': game_id,
+                    'status_info': tab_data.game_status[game_id]
+                }
                 
                 # Process all bookmakers and markets
                 for bm in odds.get('bookmakers', []):
@@ -1371,7 +1443,7 @@ class ModernOddsWindow(QMainWindow):
                             new_table_data[unique_label][bm_title] = price
             
             # Store the consolidated data for the best lines widget
-            tab_data.consolidated_odds_data = consolidated_odds_data
+            self.consolidated_odds_data = consolidated_odds_data
             
             # Create a new DataFrame from the collected data
             new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
@@ -1460,7 +1532,64 @@ class ModernOddsWindow(QMainWindow):
                 QTimer.singleShot(5000, lambda: self.update_status.setText(""))
     
     
-    # Update Odds table with changes
+    # These two functions are for live game indication
+    # This class if getting massive oh no
+    def update_game_statuses_async(self):
+        """Wrapper for async status updates"""
+        asyncio.create_task(self.update_game_statuses())
+
+    async def update_game_statuses(self):
+        """Update game statuses periodically"""
+        try:
+            for tab_id, tab_data in self.league_tabs.items():
+                if not tab_data.game_status:
+                    continue
+                
+                # Fetch fresh scores data
+                scores_data = await asyncio.to_thread(scores_query, tab_data.sport_key)
+                status_changed = False
+                
+                # Update each game's status
+                for game_id, current_status in tab_data.game_status.items():
+                    old_status = current_status.get('text', '')
+                    
+                    # Create game data for status check
+                    game_data = {'id': game_id, 'commence_time': ''}  # commence_time will be ignored with scores_data
+                    status_text, is_live, scores_text = get_game_status(game_data, scores_data)
+                    
+                    if status_text != old_status or scores_text != current_status.get('scores_text', ''):
+                        tab_data.game_status[game_id] = {
+                            'text': status_text,
+                            'is_live': is_live,
+                            'scores_text': scores_text
+                        }
+                        status_changed = True
+                
+                # Update table if statuses changed
+                if status_changed:
+                    # Update row labels with new status
+                    for i, row_label in enumerate(tab_data.table_rows):
+                        if 'Game:' in row_label and '[' in row_label:
+                            row_data = tab_data.table_data[row_label]
+                            game_id = row_data.get('game_id')
+                            if game_id in tab_data.game_status:
+                                # Rebuild header with new status
+                                teams_part = row_label.split('[')[0].strip()
+                                status_info = tab_data.game_status[game_id]
+                                
+                                new_row_label = f"{teams_part} [{status_info['text']}]"
+                                if status_info.get('scores_text'):
+                                    new_row_label += f" - {status_info['scores_text']}"
+                                
+                                # Update the data structures
+                                tab_data.table_rows[i] = new_row_label
+                                tab_data.table_data[new_row_label] = tab_data.table_data.pop(row_label)
+                                tab_data.table_data[new_row_label]['status_info'] = status_info
+                    
+                    self.update_table_display(tab_data)
+                    
+        except Exception as e:
+            print(f"Error updating game statuses: {e}")
     
     def update_table_with_changes(self, tab_data, changes):
          """Update the table with efficient display of odds changes"""
@@ -1567,6 +1696,21 @@ class ModernOddsWindow(QMainWindow):
          # Resize the table
          table.resizeColumnsToContents()
          table.resizeRowsToContents()
+    
+    def handle_calc_button(self):
+        """Show the odds-converter/calculator."""
+        # If it’s already open, close & re-open to reset state
+        if hasattr(self, "calc_window") and self.calc_window:
+            try:
+                self.calc_window.close()
+            except:
+                pass
+        self.calc_window = OddsConverterWidget()
+        self.calc_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.calc_window.show()
+    
+
+
     
 async def main():
     app = QApplication([])
