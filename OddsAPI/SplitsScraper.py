@@ -102,10 +102,14 @@ async def scrape_sport_async(sport: str, semaphore: asyncio.Semaphore, max_retri
             return False
 
 
-def build_url(sport_code, date_range="n30days", mode="0"):
+def build_url(sport_code, date_range="n30days", mode="0", page=1):
     """Build the URL for scraping based on sport code and parameters."""
     base_url = "https://dknetwork.draftkings.com/draftkings-sportsbook-betting-splits/"
-    return f"{base_url}?tb_eg={sport_code}&tb_edate={date_range}&tb_emt={mode}"
+    
+    if page == 1:
+        return f"{base_url}?tb_eg={sport_code}&tb_edate={date_range}&tb_emt={mode}"
+    else:
+        return f"{base_url}?tb_eg={sport_code}&tb_edate={date_range}&tb_page={page}"
 
 
 def scrape_betting_data(html_content: str) -> List[Dict[str, Any]]:
@@ -213,9 +217,118 @@ def save_data(data, sport="betting", output_dir="SplitsData", output_format="jso
         raise ValueError(f"Unsupported output format: {output_format}")
 
 
+
+
+async def scrape_all_pages(session, sport_code, sport_name, headers, max_retries, retry_delay):
+    """Scrape all pages for a given sport and return combined data."""
+    all_data = []
+    page = 1
+    seen_games = set()  # Track unique games to detect duplicates
+    
+    def create_game_id(game_dict):
+        """Create a unique identifier for a game"""
+        return f"{game_dict['away_team']}|{game_dict['home_team']}|{game_dict['game_time']}"
+    
+    while True:
+        url = build_url(sport_code, page=page)
+        print(f"Scraping {sport_name.upper()} page {page}...")
+        
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        raise aiohttp.ClientResponseError(
+                            response.request_info,
+                            response.history,
+                            status=response.status,
+                            message=f"HTTP Error {response.status}"
+                        )
+                    
+                    html_content = await response.text()
+                
+                # Check if we got actual content
+                if len(html_content) < 1000:
+                    print(f"Warning: Received unusually small response for page {page}.")
+                    if attempt < max_retries:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"Waiting {wait_time} seconds before retrying...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        # If this is page 1 and we can't get data, it's a failure
+                        # If this is page > 1, we might have reached the end
+                        return all_data if page > 1 else None
+                
+                # Process data
+                page_data = scrape_betting_data(html_content)
+                
+                # If no data found, we've likely reached the end of pages
+                if not page_data:
+                    if page == 1:
+                        print(f"Warning: No data found on page 1 for {sport_name}")
+                        if attempt < max_retries:
+                            wait_time = retry_delay * (attempt + 1)
+                            print(f"Waiting {wait_time} seconds before retrying...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            return None
+                    else:
+                        print(f"No more data found. Scraped {page - 1} pages total.")
+                        return all_data
+                
+                # Check for duplicate games (indicating we've hit repeated content)
+                new_games = []
+                duplicate_count = 0
+                
+                for game in page_data:
+                    game_id = create_game_id(game)
+                    if game_id not in seen_games:
+                        seen_games.add(game_id)
+                        new_games.append(game)
+                    else:
+                        duplicate_count += 1
+                
+                # If all games on this page are duplicates, we've reached the end
+                if duplicate_count > 0 and len(new_games) == 0:
+                    print(f"All {duplicate_count} games on page {page} are duplicates. Reached end of unique data.")
+                    print(f"Scraped {page - 1} pages total with {len(all_data)} unique games.")
+                    return all_data
+                
+                # If we have some new games, add them
+                if new_games:
+                    all_data.extend(new_games)
+                    print(f"Found {len(new_games)} new games on page {page} ({duplicate_count} duplicates)")
+                
+                # If we got mostly duplicates (>50%), we're probably at the end
+                if duplicate_count > 0 and duplicate_count >= len(page_data) * 0.5:
+                    print(f"High duplicate rate ({duplicate_count}/{len(page_data)}). Likely reached end of unique data.")
+                    print(f"Scraped {page} pages total with {len(all_data)} unique games.")
+                    return all_data
+                
+                # Move to next page
+                page += 1
+                break  # Break out of retry loop on success
+                
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"Request error for {sport_name} page {page}: {e}")
+                if attempt < max_retries:
+                    wait_time = retry_delay * (attempt + 1)
+                    print(f"Waiting {wait_time} seconds before retrying...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"Max retries reached for {sport_name} page {page}")
+                    return all_data if page > 1 else None
+        
+        # Add a small delay between pages to be respectful
+        await asyncio.sleep(0.5)
+    
+    return all_data
+
+
 async def main_async(sport="mlb", max_retries=0, retry_delay=1) -> bool:
     """
-    Main function to scrape betting data asynchronously.
+    Main function to scrape betting data asynchronously with pagination support.
     
     Args:
         sport: String identifier for the sport (nhl, mlb, etc.)
@@ -236,8 +349,6 @@ async def main_async(sport="mlb", max_retries=0, retry_delay=1) -> bool:
         # Find the sport name for the code
         sport_name = next((s for s, c in SPORT_CODES.items() if c == sport), "custom")
     
-    # Build the URL
-    url = build_url(sport_code)
     print(f"Scraping {sport_name.upper()} betting data...")
     
     # Set headers to mimic a browser request (Claude sure does love that Win 10 user agent LOL)
@@ -251,73 +362,25 @@ async def main_async(sport="mlb", max_retries=0, retry_delay=1) -> bool:
     }
     
     async with aiohttp.ClientSession(headers=headers) as session:
-        for attempt in range(max_retries):
-            try:
-                # Make the request
-                print(f"Scraping data from {url}... (Attempt {attempt+1}/{max_retries})")
-                async with session.get(url, timeout=10) as response:
-                    if response.status != 200:
-                        raise aiohttp.ClientResponseError(
-                            response.request_info,
-                            response.history,
-                            status=response.status,
-                            message=f"HTTP Error {response.status}"
-                        )
-                    
-                    html_content = await response.text()
-                
-                # Check if we got actual content
-                if len(html_content) < 1000:
-                    print("Warning: Received unusually small response. The site might be blocking scrapers.")
-                    # Save the response for debugging
-                    debug_dir = "debug"
-                    if not os.path.exists(debug_dir):
-                        os.makedirs(debug_dir)
-                    with open(f"{debug_dir}/response_{sport}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html", "w", encoding="utf-8") as f:
-                        f.write(html_content)
-                    print(f"Saved response to debug directory for inspection.")
-                    
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
-                        print(f"Waiting {wait_time} seconds before retrying...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                
-                # Process data
-                data = scrape_betting_data(html_content)
-                
-                if not data:
-                    print(f"Warning: No data extracted for {sport}. The page structure might have changed or there are no games.")
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
-                        print(f"Waiting {wait_time} seconds before retrying...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                
-                # Save data with sport identifier
-                output_file = save_data(data, sport=sport)
-                print(f"Successfully extracted data for {len(data)} {sport.upper()} games.")
-                print(f"Data saved to: {output_file}")
-                print(f"Latest data also available at: data/{sport}_betting_latest.json")
-                
-                
-                return True
-                
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"Request error for {sport}: {e}")
-                if attempt < max_retries - 1:
-                    wait_time = retry_delay * (attempt + 1)
-                    print(f"Waiting {wait_time} seconds before retrying...")
-                    await asyncio.sleep(wait_time)
-                else:
-                    print(f"Max retries reached for {sport}. Failed to scrape data.")
-                    return False
+        try:
+            # Scrape all pages for this sport
+            all_data = await scrape_all_pages(session, sport_code, sport_name, headers, max_retries, retry_delay)
             
-            except Exception as e:
-                print(f"Error scraping {sport}: {e}")
+            if not all_data:
+                print(f"Failed to scrape any data for {sport_name}")
                 return False
-        
-        return False
+            
+            # Save combined data from all pages
+            output_file = save_data(all_data, sport=sport)
+            print(f"Successfully extracted data for {len(all_data)} {sport_name.upper()} games across all pages.")
+            print(f"Data saved to: {output_file}")
+            print(f"Latest data also available at: SplitsData/{sport}_betting_latest.json")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error scraping {sport}: {e}")
+            return False
 
 
 def main_sync(sport="mlb", max_retries=2, retry_delay=1):
