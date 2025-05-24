@@ -1,6 +1,9 @@
 import requests
 from Creds import ODDS_API_KEY
-
+import json
+import datetime
+from datetime import datetime, timezone
+import dateutil.parser
 # credit info can be checked in 'response.headers' dict
 # 'x-requests-last':   The usage cost of the last API call
 # 'x-requests-used':    total usage credits used since the last quota reset
@@ -51,10 +54,6 @@ def league_query():
     return sports_by_group
 
 
-
-
-
-
 def odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT):
     response = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds",
@@ -75,8 +74,18 @@ def odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT):
         print(f"Error: {response.status_code}\n{response.text}")
         return None
     
+    # Save the raw response to a JSON file
+    raw_response = response.json()
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"odds_response_{SPORT}_{timestamp}.json"
+    
+    with open(filename, 'w') as f:
+        json.dump(raw_response, f, indent=4)
+    
+    print(f"Raw JSON response saved to {filename}")
+    
     # Process the odds data to ensure 3-way moneylines are handled
-    odds_data = response.json()
+    odds_data = raw_response
     for game in odds_data:
         for bookmaker in game['bookmakers']:
             for market in bookmaker['markets']:
@@ -202,18 +211,97 @@ def ParseOdds(odds):
     return results
 
 
+def scores_query(sport_key, days_from=None):
+    """
+    Fetch scores data for live game status detection
+    Returns list of games with scores, completion status, and commence times
+    """
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "dateFormat": "iso"
+    }
+    if days_from:
+        params["daysFrom"] = days_from
+    
+    try:
+        response = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores",
+            params=params
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Error fetching scores: {response.status_code}")
+            return []
+            
+    except Exception as e:
+        print(f"Exception fetching scores: {e}")
+        return []
+
+def get_game_status(game_data, scores_data=None):
+    """
+    Determine game status from odds and optional scores data
+    Args:
+        game_data: dict with 'id' and 'commence_time' 
+        scores_data: optional dict from scores API
+    Returns:
+        tuple: (status_text, is_live_bool, scores_text)
+    """
+    game_id = game_data.get('id')
+    commence_time_str = game_data.get('commence_time', '')
+    
+    # Try to find this game in scores data first
+    if scores_data:
+        for score_game in scores_data:
+            if score_game.get('id') == game_id:
+                completed = score_game.get('completed', False)
+                scores = score_game.get('scores')
+                
+                if completed:
+                    return "Finished", False, ""
+                elif scores and len(scores) > 0:
+                    # Live game with scores
+                    scores_text = " | ".join([f"{s['name']}: {s['score']}" for s in scores])
+                    return "🔴 LIVE", True, scores_text
+                else:
+                    # Game exists in scores but no scores yet (pre-game)
+                    break
+    
+    # Fallback to time-based detection
+    try:
+        commence_time = dateutil.parser.parse(commence_time_str)
+        current_time = datetime.now(timezone.utc)
+        time_diff = (current_time - commence_time).total_seconds()
+        
+        if time_diff < -1800:  # More than 30 min before
+            return "Pre-Game", False, ""
+        elif time_diff < 0:  # Less than 30 min before
+            return "Starting Soon", False, ""
+        elif time_diff < 14400:  # Less than 4 hours after (likely live)
+            return "🔴 LIVE", True, ""
+        else:  # More than 4 hours after (likely finished)
+            return "Finished", False, ""
+            
+    except Exception as e:
+        print(f"Error parsing commence time: {e}")
+        return "Unknown", False, ""
+
+
+
 if __name__ == "__main__":
     league_query()
     
-    # SPORT = "soccer_uefa_champs_league"
-    # BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
-    # REGIONS = "us,eu"  # Ensure 'eu' is included for Pinnacle. Regions: us,us2,uk,au,eu
-    # MARKETS = "spreads"
-    # ODDS_FORMAT = "american"
-    # DATE_FORMAT = "iso"
-    # 
-    # response = odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT)
-    # if response is None: exit(1);
-    # odds = response.json()
-    # parsed_results = ParseOdds(odds)
+    SPORT = "baseball_mlb"
+    BOOKMAKERS = "draftkings,fanduel,pinnacle,bovada,betonline,betus,betrivers,lowvig"  # Optional filter
+    REGIONS = "us,eu"  # Ensure 'eu' is included for Pinnacle. Regions: us,us2,uk,au,eu
+    MARKETS = "h2h"
+    ODDS_FORMAT = "american"
+    DATE_FORMAT = "iso"
+     
+    odds_data = odds_query(SPORT, REGIONS, MARKETS, ODDS_FORMAT, DATE_FORMAT)
     
+    if odds_data:
+        parsed_results = ParseOdds(odds_data)
+    else:
+        print("Failed to retrieve odds data.")

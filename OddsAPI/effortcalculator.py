@@ -98,7 +98,7 @@ class OddsLine(QWidget):
 class OddsConverterWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Odds Converter with Devigging")
+        self.setWindowTitle("Odds Calculator")
 
         icon_path = pathlib.Path(__file__).parent / "AppIcon.png"
         self.setWindowIcon(QIcon(str(icon_path)))
