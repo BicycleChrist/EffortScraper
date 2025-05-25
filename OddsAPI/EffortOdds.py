@@ -1,7 +1,5 @@
 import pathlib
-import qasync
-import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import aiohttp
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
@@ -202,13 +200,13 @@ class DataManager(QObject):
         self.prop_client = None
         self.league_map = {}
 
-    async def fetch_leagues(self):
+    async def fetch_leagues(self, session=None):
         """Fetch available leagues from the API"""
-        return await asyncio.to_thread(league_query)
+        return await league_query(session)
 
-    async def fetch_odds(self, sport, region, markets, odds_format, date_format):
+    async def fetch_odds(self, sport, region, markets, odds_format, date_format, session):
         """Fetch odds for a specific sport, region, and markets"""
-        return await asyncio.to_thread(odds_query, sport, region, markets, odds_format, date_format)
+        return await odds_query(sport, region, markets, odds_format, date_format, session)
 
 
 class ModernOddsWindow(QMainWindow):
@@ -280,8 +278,8 @@ class ModernOddsWindow(QMainWindow):
         self.icon_timer.timeout.connect(self.UpdateIcon)
         self.icon_timer.start(16)
         self.status_timer = QTimer()
-        self.status_timer.timeout.connect(self.update_game_statuses_async)
-        self.status_timer.start(60000)
+        self.status_timer.timeout.connect(self._update_game_statuses)
+        self.status_timer.start(600000) # 10 minutes - makes a request to fetch scores
     
     def UpdateIcon(self):
         framesdir = pathlib.Path(__file__).parent / "appicon_frames"
@@ -765,7 +763,13 @@ class ModernOddsWindow(QMainWindow):
         if a0.key() == Qt.Key.Key_2:
             self.handle_calc_button()
             return
-
+        
+        if a0.key() == Qt.Key.Key_R:
+            print("refreshing")
+            self.status_timer.setSingleShot(True)
+            self.status_timer.setInterval(0)
+            return
+        
         super().keyPressEvent(a0)
 
     def connect_signals(self):
@@ -830,7 +834,10 @@ class ModernOddsWindow(QMainWindow):
 
     async def populate_leagues(self, default_league="MLB"):
         """Fetch and populate leagues in the dropdown"""
-        leagues = await self.data_manager.fetch_leagues()
+        # Create a single session for the league fetch
+        async with aiohttp.ClientSession() as session:
+            leagues = await self.data_manager.fetch_leagues(session)
+            
         print("Fetched leagues:", leagues)
         self.league_selector.clear()
         self.data_manager.league_map.clear()
@@ -1076,14 +1083,9 @@ class ModernOddsWindow(QMainWindow):
             self.timer.stop()
             print("timer stopped")
         # self.update_status_text() # crashes
-    
-    # 
-    def refresh_splits_data(self):
-        """Wrapper method to handle the async refresh properly"""
-        # Create and schedule the coroutine as a task
-        asyncio.create_task(self._async_refresh_splits_data())
 
-    async def _async_refresh_splits_data(self):
+    @qasync.asyncSlot()
+    async def refresh_splits_data(self):
         """The actual async refresh method"""
         self.splits_refresh_button.setEnabled(False)
         self.splits_refresh_button.setText("⟳")
@@ -1328,45 +1330,46 @@ class ModernOddsWindow(QMainWindow):
             self.data_manager.sport_key = sport_key
             self.data_manager.prop_client = PropClient(sport_key)
     
-            # Fetch scores data for live status detection
-            scores_data = await asyncio.to_thread(scores_query, sport_key)
-    
-            # Create a new DataFrame for the updated data
-            new_table_rows = []
-            new_table_data = {}
-            
+            # Create a single aiohttp session for all API calls
             async with aiohttp.ClientSession() as session:
+                # Fetch scores data for live status detection - now uses session
+                scores_data = await scores_query(sport_key, session=session)
+        
+                # Create a new DataFrame for the updated data
+                new_table_rows = []
+                new_table_data = {}
+                
                 games = await self.data_manager.prop_client.get_games(session)
-            print(f"Fetched games response: {games}")
-    
-            if not isinstance(games, list):
-                print(f"Unexpected response from get_games(): {games}")
-                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-                self.update_status.setText("Error: Invalid response format")
-                return
-    
-            # Process odds data for each game
-            total_games = len(games)
-            bookmakers_seen = set()
-            game_odds_data = {}
-            
-            # Create a consolidated odds data structure for the best lines widget
-            consolidated_odds_data = {
-                'bookmakers': []
-            }
-            bookmakers_map = {}  # To track and merge bookmakers across games
-            
-            for index, game in enumerate(games):
-                game_id = game.get('id', '')
-                if not game_id:
-                    print("No game ID found in the response.")
-                    continue
-    
-                # Update progress based on game processing
-                progress_value = int((index + 1) / total_games * 100)
-                self.progress.setValue(progress_value)
-    
-                async with aiohttp.ClientSession() as session:
+                print(f"Fetched games response: {games}")
+        
+                if not isinstance(games, list):
+                    print(f"Unexpected response from get_games(): {games}")
+                    self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
+                    self.update_status.setText("Error: Invalid response format")
+                    return
+        
+                # Process odds data for each game
+                total_games = len(games)
+                bookmakers_seen = set()
+                game_odds_data = {}
+                
+                # Create a consolidated odds data structure for the best lines widget
+                consolidated_odds_data = {
+                    'bookmakers': []
+                }
+                bookmakers_map = {}  # To track and merge bookmakers across games
+                
+                for index, game in enumerate(games):
+                    game_id = game.get('id', '')
+                    if not game_id:
+                        print("No game ID found in the response.")
+                        continue
+        
+                    # Update progress based on game processing
+                    progress_value = int((index + 1) / total_games * 100)
+                    self.progress.setValue(progress_value)
+        
+                    # Reuse the same session for prop client calls
                     available_markets = current_markets.copy()  # Use the current_markets variable
                     selected_region = self.selected_region
                     odds = await self.data_manager.prop_client.get_event_odds(
@@ -1376,143 +1379,147 @@ class ModernOddsWindow(QMainWindow):
                         region=selected_region
                     )
                     
-                game_odds_data[game_id] = odds
-                
-                # Extract key info from this game
-                home_team = odds.get('home_team', 'Unknown')
-                away_team = odds.get('away_team', 'Unknown')
-                
-                # Get game status using the new function
-                status_text, is_live, scores_text = get_game_status(odds, scores_data)
-                
-                # Store status info in tab_data
-                if not hasattr(tab_data, 'game_status'):
-                    tab_data.game_status = {}
-                tab_data.game_status[game_id] = {
-                    'text': status_text,
-                    'is_live': is_live,
-                    'scores_text': scores_text
-                }
-                
-                # Create game header with status and scores
-                game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
-                if scores_text:
-                    game_header += f" - {scores_text}"
-                
-                new_table_rows.append(game_header)
-                new_table_data[game_header] = {
-                    'is_header': True, 
-                    'game_id': game_id,
-                    'status_info': tab_data.game_status[game_id]
-                }
-                
-                # Process all bookmakers and markets
-                for bm in odds.get('bookmakers', []):
-                    bm_title = bm['title']
-                    bookmakers_seen.add(bm_title)
+                    if odds is None:
+                        print("you're out of credits - no odds returned (probably)")
+                        return
                     
-                    # Add to consolidated data for best lines widget
-                    if bm_title not in bookmakers_map:
-                        bookmakers_map[bm_title] = {
-                            'title': bm_title,
-                            'markets': []
-                        }
-                        consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
+                    game_odds_data[game_id] = odds
                     
-                    for market in bm.get('markets', []):
-                        market_key = market['key']
+                    # Extract key info from this game
+                    home_team = odds.get('home_team', 'Unknown')
+                    away_team = odds.get('away_team', 'Unknown')
+                    
+                    # Get game status using the new function
+                    status_text, is_live, scores_text = get_game_status(odds, scores_data)
+                    
+                    # Store status info in tab_data
+                    if not hasattr(tab_data, 'game_status'):
+                        tab_data.game_status = {}
+                    tab_data.game_status[game_id] = {
+                        'text': status_text,
+                        'is_live': is_live,
+                        'scores_text': scores_text
+                    }
+                    
+                    # Create game header with status and scores
+                    game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
+                    if scores_text:
+                        game_header += f" - {scores_text}"
+                    
+                    new_table_rows.append(game_header)
+                    new_table_data[game_header] = {
+                        'is_header': True, 
+                        'game_id': game_id,
+                        'status_info': tab_data.game_status[game_id]
+                    }
+                    
+                    # Process all bookmakers and markets
+                    for bm in odds.get('bookmakers', []):
+                        bm_title = bm['title']
+                        bookmakers_seen.add(bm_title)
                         
-                        # Add game_id to each outcome for reference (needed for best lines)
-                        for outcome in market.get('outcomes', []):
-                            outcome['game_id'] = game_id
+                        # Add to consolidated data for best lines widget
+                        if bm_title not in bookmakers_map:
+                            bookmakers_map[bm_title] = {
+                                'title': bm_title,
+                                'markets': []
+                            }
+                            consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
                         
-                        # Add to consolidated data
-                        bookmakers_map[bm_title]['markets'].append(market)
-                        
-                        for outcome in market.get('outcomes', []):
-                            # Create the row label
-                            unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
+                        for market in bm.get('markets', []):
+                            market_key = market['key']
                             
-                            # Add row if not already present
-                            if unique_label not in new_table_rows:
-                                new_table_rows.append(unique_label)
-                                new_table_data[unique_label] = {'game_id': game_id}
+                            # Add game_id to each outcome for reference (needed for best lines)
+                            for outcome in market.get('outcomes', []):
+                                outcome['game_id'] = game_id
+                            
+                            # Add to consolidated data
+                            bookmakers_map[bm_title]['markets'].append(market)
+                            
+                            for outcome in market.get('outcomes', []):
+                                # Create the row label
+                                unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
                                 
-                            # Update price
-                            price = self.format_price(outcome)
-                            new_table_data[unique_label][bm_title] = price
-            
-            # Store the consolidated data for the best lines widget
-            self.consolidated_odds_data = consolidated_odds_data
-            
-            # Create a new DataFrame from the collected data
-            new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
-            
-            # Fill the new DataFrame
-            for row_label in new_table_rows:
-                row_data = new_table_data.get(row_label, {})
-                for bm in bookmakers_seen:
-                    new_df.at[row_label, bm] = row_data.get(bm, "")
+                                # Add row if not already present
+                                if unique_label not in new_table_rows:
+                                    new_table_rows.append(unique_label)
+                                    new_table_data[unique_label] = {'game_id': game_id}
+                                    
+                                # Update price
+                                price = self.format_price(outcome)
+                                new_table_data[unique_label][bm_title] = price
+                
+                # Store the consolidated data for the best lines widget
+                self.consolidated_odds_data = consolidated_odds_data
+                
+                # Create a new DataFrame from the collected data
+                new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
+                
+                # Fill the new DataFrame
+                for row_label in new_table_rows:
+                    row_data = new_table_data.get(row_label, {})
+                    for bm in bookmakers_seen:
+                        new_df.at[row_label, bm] = row_data.get(bm, "")
+                        
+                # Add game_id and is_header columns
+                new_df['game_id'] = [new_table_data.get(row, {}).get('game_id', '') for row in new_table_rows]
+                new_df['is_header'] = [new_table_data.get(row, {}).get('is_header', False) for row in new_table_rows]
+                
+                # Identify changes between current and new data
+                changes = {}
+                if current_df is not None:
+                    # Look for changed odds
+                    for row in new_df.index:
+                        if row in current_df.index:
+                            for bm in bookmakers_seen:
+                                if bm in current_df.columns:
+                                    old_val = current_df.at[row, bm]
+                                    new_val = new_df.at[row, bm]
+                                    if old_val != new_val and old_val != "" and new_val != "":
+                                        if row not in changes:
+                                            changes[row] = {}
+                                        changes[row][bm] = (old_val, new_val)
+                
+                # Update tab_data with the new data
+                tab_data.bookmakers = list(bookmakers_seen)
+                tab_data.table_rows = new_table_rows
+                tab_data.table_data = new_table_data
+                
+                # Update the table display with highlighting changes
+                self.update_table_with_changes(tab_data, changes)
+                
+                # Print a debug message before updating best lines widget
+                print("About to update best lines widget with consolidated data")
+                print(f"Number of bookmakers in consolidated data: {len(consolidated_odds_data['bookmakers'])}")
+                
+                # Update best lines widget with the consolidated data
+                if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
+                    print("Updating best lines widget...")
+                    try:
+                        self.best_lines = self.best_lines_widget.update_display(consolidated_odds_data)
+                        print("Best lines widget updated successfully")
+                    except Exception as e:
+                        print(f"Error updating best lines widget: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print("Best lines widget not available")
+                
+                self.progress.setValue(100)
+                
+                # Reset status text if auto-update is enabled
+                if self.auto_update_check.isChecked():
+                    self.update_status_text()
+                    self.RestartTimer()
+                else:
+                    self.update_status.setStyleSheet("background-color: #28a745; color: white;")
+                    self.update_status.setText("Update complete")
                     
-            # Add game_id and is_header columns
-            new_df['game_id'] = [new_table_data.get(row, {}).get('game_id', '') for row in new_table_rows]
-            new_df['is_header'] = [new_table_data.get(row, {}).get('is_header', False) for row in new_table_rows]
-            
-            # Identify changes between current and new data
-            changes = {}
-            if current_df is not None:
-                # Look for changed odds
-                for row in new_df.index:
-                    if row in current_df.index:
-                        for bm in bookmakers_seen:
-                            if bm in current_df.columns:
-                                old_val = current_df.at[row, bm]
-                                new_val = new_df.at[row, bm]
-                                if old_val != new_val and old_val != "" and new_val != "":
-                                    if row not in changes:
-                                        changes[row] = {}
-                                    changes[row][bm] = (old_val, new_val)
-            
-            # Update tab_data with the new data
-            tab_data.bookmakers = list(bookmakers_seen)
-            tab_data.table_rows = new_table_rows
-            tab_data.table_data = new_table_data
-            
-            # Update the table display with highlighting changes
-            self.update_table_with_changes(tab_data, changes)
-            
-            # Print a debug message before updating best lines widget
-            print("About to update best lines widget with consolidated data")
-            print(f"Number of bookmakers in consolidated data: {len(consolidated_odds_data['bookmakers'])}")
-            
-            # Update best lines widget with the consolidated data
-            if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
-                print("Updating best lines widget...")
-                try:
-                    self.best_lines = self.best_lines_widget.update_display(consolidated_odds_data)
-                    print("Best lines widget updated successfully")
-                except Exception as e:
-                    print(f"Error updating best lines widget: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print("Best lines widget not available")
-            
-            self.progress.setValue(100)
-            
-            # Reset status text if auto-update is enabled
-            if self.auto_update_check.isChecked():
-                self.update_status_text()
-                self.RestartTimer()
-            else:
-                self.update_status.setStyleSheet("background-color: #28a745; color: white;")
-                self.update_status.setText("Update complete")
-                
-            # Log the number of changed lines
-            if changes:
-                total_changes = sum(len(changes_dict) for changes_dict in changes.values())
-                print(f"Total lines changed: {total_changes}")
-                
+                # Log the number of changed lines
+                if changes:
+                    total_changes = sum(len(changes_dict) for changes_dict in changes.values())
+                    print(f"Total lines changed: {total_changes}")
+                    
         except aiohttp.ClientError as e:
             print(f"Network error: {e}")
             self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
@@ -1534,60 +1541,80 @@ class ModernOddsWindow(QMainWindow):
     
     # These two functions are for live game indication
     # This class if getting massive oh no
-    def update_game_statuses_async(self):
+    def _update_game_statuses(self):
         """Wrapper for async status updates"""
         asyncio.create_task(self.update_game_statuses())
 
     async def update_game_statuses(self):
         """Update game statuses periodically"""
         try:
-            for tab_id, tab_data in self.league_tabs.items():
-                if not tab_data.game_status:
-                    continue
-                
-                # Fetch fresh scores data
-                scores_data = await asyncio.to_thread(scores_query, tab_data.sport_key)
-                status_changed = False
-                
-                # Update each game's status
-                for game_id, current_status in tab_data.game_status.items():
-                    old_status = current_status.get('text', '')
+            # Create a single session for all status updates
+            async with aiohttp.ClientSession() as session:
+                for tab_id, tab_data in self.league_tabs.items():
+                    if not tab_data.game_status:
+                        continue
                     
-                    # Create game data for status check
-                    game_data = {'id': game_id, 'commence_time': ''}  # commence_time will be ignored with scores_data
-                    status_text, is_live, scores_text = get_game_status(game_data, scores_data)
+                    # Fetch fresh scores data - only retrieve live/upcoming games
+                    scores_data = await scores_query(tab_data.sport_key, days_from=None, session=session)
+                    status_changed = False
+                    print("-1 credit")
                     
-                    if status_text != old_status or scores_text != current_status.get('scores_text', ''):
-                        tab_data.game_status[game_id] = {
-                            'text': status_text,
-                            'is_live': is_live,
-                            'scores_text': scores_text
-                        }
-                        status_changed = True
-                
-                # Update table if statuses changed
-                if status_changed:
-                    # Update row labels with new status
-                    for i, row_label in enumerate(tab_data.table_rows):
-                        if 'Game:' in row_label and '[' in row_label:
-                            row_data = tab_data.table_data[row_label]
-                            game_id = row_data.get('game_id')
-                            if game_id in tab_data.game_status:
-                                # Rebuild header with new status
-                                teams_part = row_label.split('[')[0].strip()
-                                status_info = tab_data.game_status[game_id]
-                                
-                                new_row_label = f"{teams_part} [{status_info['text']}]"
-                                if status_info.get('scores_text'):
-                                    new_row_label += f" - {status_info['scores_text']}"
-                                
-                                # Update the data structures
-                                tab_data.table_rows[i] = new_row_label
-                                tab_data.table_data[new_row_label] = tab_data.table_data.pop(row_label)
-                                tab_data.table_data[new_row_label]['status_info'] = status_info
+                    # Update each game's status
+                    for game_id, current_status in tab_data.game_status.items():
+                        matching_games = [score_game for score_game in scores_data if score_game.get('id') == game_id]
+                        if len(matching_games) == 0: continue;
+                        game_data = matching_games[0]
+                        
+                        old_status = current_status.get('text', '')
+                        old_scores = current_status.get('scores_text', '')
+                        
+                        # Create game data for status check
+                        #game_data = {'id': game_id, 'commence_time': ''}  # commence_time will be ignored with scores_data
+                        #status_text, is_live, scores_text = get_game_status(game_data, scores_data)
+                        
+                        # always do time-based calc because most leagues won't return scores for live games
+                        time_diff = (datetime.now(timezone.utc) - datetime.fromisoformat(game_data["commence_time"])).total_seconds()
+                        
+                        if time_diff < -1800:  # More than 30 min before
+                            status_text, is_live, scores_text = "Pre-Game", False, "";
+                        elif time_diff < 0:  # Less than 30 min before
+                            status_text, is_live, scores_text = "Starting Soon", False, "";
+                        elif time_diff < 14400:  # Less than 4 hours after (likely live)
+                            status_text, is_live, scores_text = "🔴LIVE", True, "";
+                        else:  # More than 4 hours after (likely finished)
+                            status_text, is_live, scores_text = "Finished", False, "";
+                        
+                        if status_text != old_status or scores_text != old_scores:
+                            tab_data.game_status[game_id] = {
+                                'text': status_text,
+                                'is_live': is_live,
+                                'scores_text': scores_text
+                            }
+                            status_changed = True
                     
-                    self.update_table_display(tab_data)
-                    
+                    # Update table if statuses changed
+                    if status_changed:
+                        # Update row labels with new status
+                        for i, row_label in enumerate(tab_data.table_rows):
+                            if 'Game:' in row_label and '[' in row_label:
+                                row_data = tab_data.table_data[row_label]
+                                game_id = row_data.get('game_id')
+                                if game_id in tab_data.game_status:
+                                    # Rebuild header with new status
+                                    teams_part = row_label.split('[')[0].strip()
+                                    status_info = tab_data.game_status[game_id]
+                                    
+                                    new_row_label = f"{teams_part} [{status_info['text']}]"
+                                    if status_info.get('scores_text'):
+                                        new_row_label += f" - {status_info['scores_text']}"
+                                    
+                                    # Update the data structures
+                                    tab_data.table_rows[i] = new_row_label
+                                    tab_data.table_data[new_row_label] = tab_data.table_data.pop(row_label)
+                                    tab_data.table_data[new_row_label]['status_info'] = status_info
+                        
+                        self.update_table_display(tab_data)
+                        
         except Exception as e:
             print(f"Error updating game statuses: {e}")
     

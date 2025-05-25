@@ -274,6 +274,7 @@ class PropsWindow(BaseTableWindow):
         self.icon_timer.timeout.connect(self.UpdateIcon)
         self.icon_timer.start(16)
         
+        
         # Line highlighting colors
         self.best_over_color = QColor(0, 100, 0)  # Dark Green
         self.best_under_color = QColor(0, 70, 140)  # Dark Blue
@@ -334,6 +335,10 @@ class PropsWindow(BaseTableWindow):
         game_selection_width = 600
         game_selection_height = 250
         
+        
+        self.tab_data_map = {}  # Maps tab index to LeagueTabData
+        self.tab_market_map = {}  # Maps tab index to market key
+        
         # Add the game selection box to the left
         game_group = QGroupBox()
         game_group_layout = QVBoxLayout(game_group)
@@ -388,19 +393,53 @@ class PropsWindow(BaseTableWindow):
         """Handle tab switching events to update best lines display"""
         print("HANDLE TAB CHANGE")
         if 0 <= index < self.props_tab_widget.count():
-            tab_id = self.props_tab_widget.tabText(index)
-            print(f"Tab changed to: {tab_id}")
-            self.current_market = tab_id
+            tab_display_name = self.props_tab_widget.tabText(index)
+            print(f"Tab changed to: {tab_display_name}")
             
-            # Add debug print to verify current market is set correctly
-            print(f"Current market set to: {self.current_market}")
-            
-            # Update best lines display based on the selected tab
-            self.update_best_lines_display()
-            self.highlight_best_lines()
+            # Update current tab data and market from stored mappings
+            if index in self.tab_data_map:
+                self.current_tab_data = self.tab_data_map[index]
+                self.current_market = self.tab_market_map[index]
+                
+                # Sync tab_data with current_tab_data
+                self.tab_data = self.current_tab_data
+                
+                print(f"Current market set to: {self.current_market}")
+                print(f"Current tab data updated for index: {index}")
+                
+                # Update best lines display based on the selected tab
+                self.update_best_lines_for_current_tab()
+                self.highlight_best_lines()
+            else:
+                print(f"Warning: No data found for tab index: {index}")
         else:
             print(f"Warning: Invalid tab index: {index}")
-
+    
+    
+    def update_best_lines_for_current_tab(self):
+        """Update best lines display using only the current tab's data"""
+        if not self.current_tab_data or not self.current_tab_data.table_data:
+            print("No current tab data available for best lines calculation")
+            return
+        
+        print(f"Updating best lines for market: {self.current_market}")
+        
+        # Use only the current tab's data
+        table_data = self.current_tab_data.table_data
+        bookmakers = self.current_tab_data.bookmakers
+        
+        if not table_data or not bookmakers:
+            print("No table data or bookmakers for current tab")
+            return
+        
+        # Calculate best lines using current tab data
+        self.best_lines = LineCalculator.calculate_best_lines(table_data, bookmakers)
+        print(f"Calculated best lines for {len(self.best_lines)} markets")
+        
+        # Populate the best lines widget
+        self._populate_best_lines_widget(self.best_lines)
+    
+    
     def load_prop_markets(self):
         """Load available prop markets into the dropdown"""
         prop_markets = MAJOR_PROP_MARKETS.get(self.sport_key, {})
@@ -593,11 +632,17 @@ class PropsWindow(BaseTableWindow):
         """Create a new tab for a prop market"""
         display_name = self.key_to_display.get(market_type, market_type)
         print(f"Creating new tab: {display_name} for market_type: {market_type}")
+        
         tab_data = LeagueTabData(self.league_name, self.sport_key)
         self.tab_data = tab_data
         self.current_tab_data = tab_data
         self.create_table_widget()
-        self.props_tab_widget.addTab(self.table_widget, display_name)
+        
+        # Add the tab and store the data association
+        tab_index = self.props_tab_widget.addTab(self.table_widget, display_name)
+        self.tab_data_map[tab_index] = tab_data
+        self.tab_market_map[tab_index] = market_type
+        
         return tab_data
 
     @qasync.asyncSlot()
@@ -708,8 +753,9 @@ class PropsWindow(BaseTableWindow):
 
     def find_best_lines(self):
         """Find the best lines for each market group"""
-        # Group table rows by player and market type
-        market_groups = self.market_groups
+        # Clear and rebuild market groups for current tab data
+        market_groups = {}  # Use local variable instead of class variable
+        
         for row_label in self.current_tab_data.table_rows:
             # Parse player name and market type from row label
             parts = row_label.split(' - ')
@@ -719,6 +765,9 @@ class PropsWindow(BaseTableWindow):
                 # Create a unique key for this market group
                 market_key = f"{player_name}:{market_type}"
                 market_groups.setdefault(market_key, []).append(row_label)
+        
+        # Update the class variable with current data
+        self.market_groups = market_groups
         
         # Find best lines for each market group using the helper function
         for market_key, rows in market_groups.items():
