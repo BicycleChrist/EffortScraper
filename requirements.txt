@@ -16,8 +16,8 @@ pandas
 pyqt6
 pyqt6-webengine
 pyqtgraph
+python-dateutil
 scipy
 pywavefront
 svgpathtools
 qasync
-
