@@ -52,7 +52,8 @@ def Main():
     bottom_level_classes = [
         'lineup is-mlb has-started not-in-slate', 
         'lineup is-mlb has-started', 
-        'lineup is-mlb', 
+        'lineup is-mlb',
+        'lineup is-mlb not-in-slate',
         'lineup is-mlb is-postponed has-started not-in-slate'
     ]
     bottom_level_divs = [soup.find_all('div', class_=class_name) for class_name in bottom_level_classes]
