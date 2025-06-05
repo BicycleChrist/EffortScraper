@@ -1,10 +1,3 @@
-"""
-ESPN Schedule Scraper for MLB Team Schedules - Updated with Database Integration
-
-This module scrapes ESPN team schedule pages and stores data in SQLite database
-for efficient access and to prevent unnecessary re-scraping.
-"""
-
 import requests
 import json
 import time
@@ -12,15 +5,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread, QDateTime
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    print("Error: BeautifulSoup4 is required for ESPN schedule scraping")
-    print("Please install it with: pip install beautifulsoup4")
-    raise ImportError("BeautifulSoup4 not found - install with 'pip install beautifulsoup4'")
-
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread, QDateTime, QMutex
+from bs4 import BeautifulSoup
 import re
 
 
@@ -108,6 +94,7 @@ class ESPNScheduleScraper:
         self.mlb_teams = self.get_mlb_team_mappings()
         self.team_mappings = self.get_team_data()
         self.city_coordinates = self.load_city_coordinates()
+        self.espn_url_mappings = self.get_espn_url_mappings()
         
     def get_mlb_team_mappings(self) -> Dict[str, Dict[str, str]]:
         """Get MLB team abbreviations and info for ESPN URLs"""
@@ -120,7 +107,7 @@ class ESPNScheduleScraper:
             "tor": {"name": "Toronto Blue Jays", "city": "Toronto", "division": "AL East"},
             
             # American League Central
-            "chw": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central"},
+            "cws": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central"},
             "cle": {"name": "Cleveland Guardians", "city": "Cleveland", "division": "AL Central"},
             "det": {"name": "Detroit Tigers", "city": "Detroit", "division": "AL Central"},
             "kc": {"name": "Kansas City Royals", "city": "Kansas City", "division": "AL Central"},
@@ -129,7 +116,7 @@ class ESPNScheduleScraper:
             # American League West
             "hou": {"name": "Houston Astros", "city": "Houston", "division": "AL West"},
             "laa": {"name": "Los Angeles Angels", "city": "Los Angeles", "division": "AL West"},
-            "ath": {"name": "Athletics", "city": "Oakland", "division": "AL West"},
+            "ath": {"name": "Oakland Athletics", "city": "Oakland", "division": "AL West"},
             "sea": {"name": "Seattle Mariners", "city": "Seattle", "division": "AL West"},
             "tex": {"name": "Texas Rangers", "city": "Dallas", "division": "AL West"},
             
@@ -153,6 +140,52 @@ class ESPNScheduleScraper:
             "lad": {"name": "Los Angeles Dodgers", "city": "Los Angeles", "division": "NL West"},
             "sd": {"name": "San Diego Padres", "city": "San Diego", "division": "NL West"},
             "sf": {"name": "San Francisco Giants", "city": "San Francisco", "division": "NL West"},
+        }
+
+    def get_espn_url_mappings(self) -> Dict[str, str]:
+        """Get mapping from our team IDs to ESPN URL team codes"""
+        return {
+            # American League East
+            "bal": "bal",
+            "bos": "bos", 
+            "nyy": "nyy",
+            "tb": "tb",
+            "tor": "tor",
+            
+            # American League Central
+            "cws": "chw",  # Chicago White Sox: our ID "cws" -> ESPN URL "chw"
+            "cle": "cle",
+            "det": "det", 
+            "kc": "kc",
+            "min": "min",
+            
+            # American League West
+            "hou": "hou",
+            "laa": "laa",
+            "ath": "ath",
+            "sea": "sea", 
+            "tex": "tex",
+            
+            # National League East
+            "atl": "atl",
+            "mia": "mia",
+            "nym": "nym",
+            "phi": "phi",
+            "wsh": "wsh",
+            
+            # National League Central
+            "chc": "chc",
+            "cin": "cin",
+            "mil": "mil",
+            "pit": "pit",
+            "stl": "stl",
+            
+            # National League West
+            "ari": "ari",
+            "col": "col",
+            "lad": "lad",
+            "sd": "sd",
+            "sf": "sf",
         }
         
     def load_team_airports(self) -> Dict[str, str]:
@@ -245,10 +278,13 @@ class ESPNScheduleScraper:
         """Scrape full season schedule for a team"""
         all_games = []
         
+        # Get the ESPN URL team code (handles cases like cws -> chw)
+        espn_team_code = self.espn_url_mappings.get(team_abbrev, team_abbrev)
+        
         for half in [1, 2]:  # First and second half
             try:
-                url = self.base_url.format(team=team_abbrev, half=half)
-                print(f"Scraping {team_abbrev} schedule (half {half}): {url}")
+                url = self.base_url.format(team=espn_team_code, half=half)
+                print(f"Scraping {team_abbrev} (ESPN code: {espn_team_code}) schedule (half {half}): {url}")
                 
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
@@ -897,32 +933,6 @@ class ESPNSportsDataAggregator(QObject):
             print(f"Error clearing season cache: {e}")
 
 
-def database_integration():
-    """Test function to verify database integration works"""
-    print("Testing Database Integration...")
-    
-    # Initialize aggregator with database
-    config = {}  # Empty config for ESPN scraping
-    aggregator = ESPNSportsDataAggregator(config, "test_sports.db")
-    
-    # Get database stats
-    stats = aggregator.get_database_stats()
-    print(f"Database stats: {stats}")
-    
-    # Get cached seasons
-    seasons = aggregator.get_cached_seasons()
-    print(f"Cached seasons: {seasons}")
-    
-    # Check if current season is cached
-    current_season = str(datetime.now().year)
-    is_cached, last_updated = aggregator.db.is_season_cached(current_season)
-    print(f"Current season ({current_season}) cached: {is_cached}, last updated: {last_updated}")
-    
-    if not is_cached:
-        print("Would normally scrape data here (skipping for test)")
-    else:
-        print("Data available in cache")
+#############################AMADEUS FLIGH########################################################################
 
 
-if __name__ == "__main__":
-    database_integration()

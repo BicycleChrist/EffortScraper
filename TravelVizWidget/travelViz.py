@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                            QWidget, QSplitter, QStatusBar, QMenuBar, QMenu, 
-                            QMessageBox, QProgressBar, QLabel, QFileDialog,
-                            QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+                             QWidget, QSplitter, QStatusBar, QMenuBar, QMenu,
+                             QMessageBox, QProgressBar, QLabel, QFileDialog,
+                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton, QInputDialog)
 from PyQt6.QtCore import (Qt, QTimer, QThread, QObject, pyqtSignal, QSettings)
 from PyQt6.QtGui import QAction, QIcon, QFont
 
@@ -91,9 +91,7 @@ class SportsTrackerMainWindow(QMainWindow):
         # Load settings
         self.settings = QSettings("SportsTracker", "TeamTravel")
         self.load_window_settings()
-        
-        # Start with demo data, then load real data
-        self.load_demo_data()
+         
         self.start_sports_monitoring()
     
     def setup_ui(self):
@@ -222,6 +220,11 @@ class SportsTrackerMainWindow(QMainWindow):
         # Globe widget signals
         self.globe_widget.performanceUpdate.connect(self.on_performance_update)
         self.globe_widget.locationSelected.connect(self.on_location_selected)
+        
+        #Animation Signals
+        self.globe_widget.animationStatusChanged.connect(self.on_animation_status_changed)
+        self.globe_widget.animationProgressChanged.connect(self.on_animation_progress_changed)
+
     
     def start_sports_monitoring(self):
         """Start sports data monitoring"""
@@ -319,6 +322,20 @@ class SportsTrackerMainWindow(QMainWindow):
         elif not team_id and self.current_travel_data:
             # Show all teams again
             self.globe_widget.load_flight_data(self.current_travel_data)
+    
+    def on_animation_status_changed(self, active: bool, team_id: str):
+        """Handle animation status changes"""
+        if active:
+            self.status_bar.showMessage(f"Animating {team_id} travel sequence...")
+        else:
+            self.status_bar.showMessage("Animation stopped")
+
+    def on_animation_progress_changed(self, progress: float, segment_info: dict):
+        """Handle animation progress updates"""
+        if segment_info:
+            current_segment = segment_info.get('departure_city', '') + " → " + segment_info.get('arrival_city', '')
+            self.status_bar.showMessage(f"Animation: {progress*100:.1f}% - {current_segment}")
+    
     
     def on_season_data_loaded(self, season: str, game_count: int):
         """Handle season data loaded successfully"""
@@ -475,6 +492,17 @@ class SportsTrackerMainWindow(QMainWindow):
         
         # Data menu
         data_menu = menubar.addMenu("Data")
+        animation_menu = menubar.addMenu("Animation")
+    
+        start_animation_action = QAction("Start Team Animation", self)
+        start_animation_action.setShortcut("Ctrl+A")
+        start_animation_action.triggered.connect(self.start_team_animation_dialog)
+        animation_menu.addAction(start_animation_action)
+        
+        stop_animation_action = QAction("Stop Animation", self)
+        stop_animation_action.setShortcut("Esc")
+        stop_animation_action.triggered.connect(self.globe_widget.stop_team_animation)
+        animation_menu.addAction(stop_animation_action)
         
         # Season data actions
         load_season_action = QAction("Load Full Season", self)
@@ -570,6 +598,22 @@ class SportsTrackerMainWindow(QMainWindow):
         self.connection_status.setText("Connected")
         self.connection_status.setStyleSheet("color: #00FF00;")
         self.control_panel.set_connection_status(True)
+    
+    def start_team_animation_dialog(self):
+        """Show dialog to select team for animation"""
+        available_teams = self.globe_widget.get_available_teams()
+        if not available_teams:
+            QMessageBox.information(self, "No Teams", "No teams available for animation. Load season data first.")
+            return
+        
+        team_id, ok = QInputDialog.getItem(self, "Select Team", "Choose team to animate:", 
+                                           available_teams, 0, False)
+        if ok and team_id:
+            success = self.globe_widget.start_team_animation(team_id)
+            if success:
+                self.status_bar.showMessage(f"Started animation for {team_id}", 3000)
+            else:
+                QMessageBox.warning(self, "Animation Failed", f"Could not start animation for {team_id}")
     
     def on_progress_updated(self, progress: int):
         """Handle progress updates"""
