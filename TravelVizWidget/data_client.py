@@ -1,20 +1,33 @@
+"""
+ESPN Schedule Scraper for MLB Team Schedules - Updated with Database Integration
+
+This module scrapes ESPN team schedule pages and stores data in SQLite database
+for efficient access and to prevent unnecessary re-scraping.
+"""
+
 import requests
 import json
-import sqlite3
-import threading
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread, QDateTime
-from PyQt6.QtSql import QSqlDatabase, QSqlQuery
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Error: BeautifulSoup4 is required for ESPN schedule scraping")
+    print("Please install it with: pip install beautifulsoup4")
+    raise ImportError("BeautifulSoup4 not found - install with 'pip install beautifulsoup4'")
+
+import re
 
 
 class GameStatus(Enum):
     """Game status enumeration"""
     SCHEDULED = "scheduled"
-    IN_PROGRESS = "in_progress"
+    IN_PROGRESS = "in_progress" 
     FINAL = "final"
     POSTPONED = "postponed"
     CANCELLED = "cancelled"
@@ -30,6 +43,8 @@ class TeamInfo:
     color: str
     alternate_color: str
     logo_url: Optional[str] = None
+    division: Optional[str] = None
+    league: Optional[str] = None
 
 
 @dataclass
@@ -43,6 +58,7 @@ class Venue:
     latitude: float
     longitude: float
     capacity: Optional[int] = None
+    timezone: Optional[str] = None
 
 
 @dataclass
@@ -57,6 +73,8 @@ class GameData:
     week: Optional[int] = None
     season_type: Optional[str] = None
     league: str = "MLB"
+    season: Optional[str] = None
+    series_description: Optional[str] = None
 
 
 @dataclass
@@ -73,317 +91,449 @@ class TeamTravelData:
     confidence: str = "schedule_inferred"
     game_id: Optional[str] = None
     opponent: Optional[str] = None
+    series_game_number: Optional[int] = None
+    homestand_game_number: Optional[int] = None
 
 
-class ESPNScheduleClient:
-    """ESPN API client for sports schedule data"""
+class ESPNScheduleScraper:
+    """Scraper for ESPN team schedule pages"""
     
     def __init__(self):
-        self.base_url = "https://site.api.espn.com/apis/site/v2/sports"
+        self.base_url = "https://www.espn.com/mlb/team/schedule/_/name/{team}/seasontype/2/half/{half}"
         self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
         self.team_airports = self.load_team_airports()
+        self.mlb_teams = self.get_mlb_team_mappings()
+        self.team_mappings = self.get_team_data()
+        self.city_coordinates = self.load_city_coordinates()
+        
+    def get_mlb_team_mappings(self) -> Dict[str, Dict[str, str]]:
+        """Get MLB team abbreviations and info for ESPN URLs"""
+        return {
+            # American League East
+            "bal": {"name": "Baltimore Orioles", "city": "Baltimore", "division": "AL East"},
+            "bos": {"name": "Boston Red Sox", "city": "Boston", "division": "AL East"},
+            "nyy": {"name": "New York Yankees", "city": "New York", "division": "AL East"},
+            "tb": {"name": "Tampa Bay Rays", "city": "Tampa", "division": "AL East"},
+            "tor": {"name": "Toronto Blue Jays", "city": "Toronto", "division": "AL East"},
+            
+            # American League Central
+            "chw": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central"},
+            "cle": {"name": "Cleveland Guardians", "city": "Cleveland", "division": "AL Central"},
+            "det": {"name": "Detroit Tigers", "city": "Detroit", "division": "AL Central"},
+            "kc": {"name": "Kansas City Royals", "city": "Kansas City", "division": "AL Central"},
+            "min": {"name": "Minnesota Twins", "city": "Minneapolis", "division": "AL Central"},
+            
+            # American League West
+            "hou": {"name": "Houston Astros", "city": "Houston", "division": "AL West"},
+            "laa": {"name": "Los Angeles Angels", "city": "Los Angeles", "division": "AL West"},
+            "ath": {"name": "Athletics", "city": "Oakland", "division": "AL West"},
+            "sea": {"name": "Seattle Mariners", "city": "Seattle", "division": "AL West"},
+            "tex": {"name": "Texas Rangers", "city": "Dallas", "division": "AL West"},
+            
+            # National League East
+            "atl": {"name": "Atlanta Braves", "city": "Atlanta", "division": "NL East"},
+            "mia": {"name": "Miami Marlins", "city": "Miami", "division": "NL East"},
+            "nym": {"name": "New York Mets", "city": "New York", "division": "NL East"},
+            "phi": {"name": "Philadelphia Phillies", "city": "Philadelphia", "division": "NL East"},
+            "wsh": {"name": "Washington Nationals", "city": "Washington", "division": "NL East"},
+            
+            # National League Central
+            "chc": {"name": "Chicago Cubs", "city": "Chicago", "division": "NL Central"},
+            "cin": {"name": "Cincinnati Reds", "city": "Cincinnati", "division": "NL Central"},
+            "mil": {"name": "Milwaukee Brewers", "city": "Milwaukee", "division": "NL Central"},
+            "pit": {"name": "Pittsburgh Pirates", "city": "Pittsburgh", "division": "NL Central"},
+            "stl": {"name": "St. Louis Cardinals", "city": "St. Louis", "division": "NL Central"},
+            
+            # National League West
+            "ari": {"name": "Arizona Diamondbacks", "city": "Phoenix", "division": "NL West"},
+            "col": {"name": "Colorado Rockies", "city": "Denver", "division": "NL West"},
+            "lad": {"name": "Los Angeles Dodgers", "city": "Los Angeles", "division": "NL West"},
+            "sd": {"name": "San Diego Padres", "city": "San Diego", "division": "NL West"},
+            "sf": {"name": "San Francisco Giants", "city": "San Francisco", "division": "NL West"},
+        }
         
     def load_team_airports(self) -> Dict[str, str]:
         """Load mapping of team cities to airport codes"""
-        # Major team city to airport mappings
         return {
-            # MLB Teams
+            "New York": "LGA",
             "Los Angeles": "LAX",
-            "New York": "JFK", 
-            "Boston": "BOS",
             "Chicago": "ORD",
-            "Houston": "IAH",
-            "Philadelphia": "PHL",
-            "Phoenix": "PHX",
-            "San Antonio": "SAT",
-            "San Diego": "SAN",
-            "Dallas": "DFW",
-            "San Jose": "SJC",
-            "Austin": "AUS",
-            "Jacksonville": "JAX",
             "San Francisco": "SFO",
-            "Columbus": "CMH",
-            "Fort Worth": "DFW",
-            "Charlotte": "CLT",
-            "Detroit": "DTW",
-            "El Paso": "ELP",
-            "Memphis": "MEM",
-            "Baltimore": "BWI",
-            "Louisville": "SDF",
-            "Milwaukee": "MKE",
-            "Las Vegas": "LAS",
-            "Albuquerque": "ABQ",
-            "Tucson": "TUS",
-            "Fresno": "FAT",
-            "Sacramento": "SMF",
-            "Mesa": "PHX",
-            "Kansas City": "MCI",
+            "Boston": "BOS",
+            "Philadelphia": "PHL",
             "Atlanta": "ATL",
-            "Virginia Beach": "ORF",
-            "Omaha": "OMA",
-            "Colorado Springs": "COS",
-            "Raleigh": "RDU",
+            "Houston": "IAH",
             "Miami": "MIA",
-            "Oakland": "OAK",
-            "Minneapolis": "MSP",
-            "Tulsa": "TUL",
-            "Arlington": "DFW",
-            "Tampa": "TPA",
-            "New Orleans": "MSY",
-            "Wichita": "ICT",
-            "Cleveland": "CLE",
-            "Anaheim": "LAX",
-            "Honolulu": "HNL",
-            "Henderson": "LAS",
-            "Stockton": "SCK",
-            "Corpus Christi": "CRP",
-            "Lexington": "LEX",
-            "Anchorage": "ANC",
-            "Plano": "DFW",
-            "Newark": "EWR",
-            "Greensboro": "GSO",
-            "Lincoln": "LNK",
-            "Buffalo": "BUF",
-            "Fort Wayne": "FWA",
-            "Jersey City": "EWR",
-            "Chula Vista": "SAN",
-            "Orlando": "MCO",
-            "St. Paul": "MSP",
-            "Norfolk": "ORF",
-            "Chandler": "PHX",
-            "Laredo": "LRD",
-            "Madison": "MSN",
-            "Durham": "RDU",
-            "Lubbock": "LBB",
-            "Baton Rouge": "BTR",
-            "Garland": "DFW",
-            "Hialeah": "MIA",
-            "Reno": "RNO",
-            "Chesapeake": "ORF",
-            "Gilbert": "PHX",
-            "Boise": "BOI",
-            "Austin": "AUS",
-            # Add more mappings as needed
-            "Toronto": "YYZ",
-            "Montreal": "YUL",
-            "Vancouver": "YVR",
-            "Calgary": "YYC",
-            "Edmonton": "YEG",
-            "Ottawa": "YOW",
-            "Winnipeg": "YWG",
-            "Seattle": "SEA",
-            "Portland": "PDX",
-            "Denver": "DEN",
-            "Salt Lake City": "SLC",
-            "Nashville": "BNA",
-            "Cincinnati": "CVG",
-            "Pittsburgh": "PIT",
             "Washington": "DCA",
             "St. Louis": "STL",
-            "Indianapolis": "IND"
+            "Milwaukee": "MKE",
+            "Denver": "DEN",
+            "Phoenix": "PHX",
+            "San Diego": "SAN",
+            "Baltimore": "BWI",
+            "Tampa": "TPA",
+            "Toronto": "YYZ",
+            "Cleveland": "CLE",
+            "Detroit": "DTW",
+            "Minneapolis": "MSP",
+            "Kansas City": "MCI",
+            "Seattle": "SEA",
+            "Oakland": "OAK",
+            "Dallas": "DFW",
+            "Cincinnati": "CVG",
+            "Pittsburgh": "PIT",
         }
     
-    def get_mlb_schedule(self, date_range: Optional[str] = None) -> List[GameData]:
-        """Get MLB schedule data"""
-        url = f"{self.base_url}/baseball/mlb/scoreboard"
-        if date_range:
-            url += f"?dates={date_range}"
-            
-        try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            games = []
-            for event in data.get('events', []):
-                game = self._parse_game_data(event, "MLB")
-                if game:
-                    games.append(game)
-            
-            return games
-            
-        except Exception as e:
-            print(f"ESPN MLB API error: {e}")
-            return []
+    def get_team_data(self) -> Dict[str, Dict[str, str]]:
+        """Get team data for parsing"""
+        return {
+            "ari": {"name": "Arizona Diamondbacks", "city": "Phoenix", "division": "NL West"},
+            "atl": {"name": "Atlanta Braves", "city": "Atlanta", "division": "NL East"},
+            "bal": {"name": "Baltimore Orioles", "city": "Baltimore", "division": "AL East"},
+            "bos": {"name": "Boston Red Sox", "city": "Boston", "division": "AL East"},
+            "chc": {"name": "Chicago Cubs", "city": "Chicago", "division": "NL Central"},
+            "cws": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central"},
+            "cin": {"name": "Cincinnati Reds", "city": "Cincinnati", "division": "NL Central"},
+            "cle": {"name": "Cleveland Guardians", "city": "Cleveland", "division": "AL Central"},
+            "col": {"name": "Colorado Rockies", "city": "Denver", "division": "NL West"},
+            "det": {"name": "Detroit Tigers", "city": "Detroit", "division": "AL Central"},
+            "hou": {"name": "Houston Astros", "city": "Houston", "division": "AL West"},
+            "kc": {"name": "Kansas City Royals", "city": "Kansas City", "division": "AL Central"},
+            "laa": {"name": "Los Angeles Angels", "city": "Los Angeles", "division": "AL West"},
+            "lad": {"name": "Los Angeles Dodgers", "city": "Los Angeles", "division": "NL West"},
+            "mia": {"name": "Miami Marlins", "city": "Miami", "division": "NL East"},
+            "mil": {"name": "Milwaukee Brewers", "city": "Milwaukee", "division": "NL Central"},
+            "min": {"name": "Minnesota Twins", "city": "Minneapolis", "division": "AL Central"},
+            "nym": {"name": "New York Mets", "city": "New York", "division": "NL East"},
+            "nyy": {"name": "New York Yankees", "city": "New York", "division": "AL East"},
+            "oak": {"name": "Oakland Athletics", "city": "Oakland", "division": "AL West"},
+            "phi": {"name": "Philadelphia Phillies", "city": "Philadelphia", "division": "NL East"},
+            "pit": {"name": "Pittsburgh Pirates", "city": "Pittsburgh", "division": "NL Central"},
+            "sd": {"name": "San Diego Padres", "city": "San Diego", "division": "NL West"},
+            "sf": {"name": "San Francisco Giants", "city": "San Francisco", "division": "NL West"},
+            "sea": {"name": "Seattle Mariners", "city": "Seattle", "division": "AL West"},
+            "stl": {"name": "St. Louis Cardinals", "city": "St. Louis", "division": "NL Central"},
+            "tb": {"name": "Tampa Bay Rays", "city": "Tampa", "division": "AL East"},
+            "tex": {"name": "Texas Rangers", "city": "Dallas", "division": "AL West"},
+            "tor": {"name": "Toronto Blue Jays", "city": "Toronto", "division": "AL East"},
+            "wsh": {"name": "Washington Nationals", "city": "Washington", "division": "NL East"},
+        }
     
-    def get_nfl_schedule(self, week: Optional[int] = None, season_type: int = 2) -> List[GameData]:
-        """Get NFL schedule data"""
-        url = f"{self.base_url}/football/nfl/scoreboard"
-        params = {"seasontype": season_type}
-        if week:
-            params["week"] = week
-            
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            games = []
-            for event in data.get('events', []):
-                game = self._parse_game_data(event, "NFL")
-                if game:
-                    games.append(game)
-            
-            return games
-            
-        except Exception as e:
-            print(f"ESPN NFL API error: {e}")
-            return []
+    def load_city_coordinates(self) -> Dict[str, Tuple[float, float]]:
+        """City coordinates for venue locations"""
+        return {
+            "Phoenix": (33.4484, -112.0740), "Atlanta": (33.7490, -84.3880),
+            "Baltimore": (39.2904, -76.6122), "Boston": (42.3601, -71.0589),
+            "Chicago": (41.8781, -87.6298), "Cincinnati": (39.1031, -84.5120),
+            "Cleveland": (41.4993, -81.6944), "Denver": (39.7392, -104.9903),
+            "Detroit": (42.3314, -83.0458), "Houston": (29.7604, -95.3698),
+            "Kansas City": (39.0997, -94.5786), "Los Angeles": (34.0522, -118.2437),
+            "Miami": (25.7617, -80.1918), "Milwaukee": (43.0389, -87.9065),
+            "Minneapolis": (44.9778, -93.2650), "New York": (40.7128, -74.0060),
+            "Oakland": (37.8044, -122.2712), "Philadelphia": (39.9526, -75.1652),
+            "Pittsburgh": (40.4406, -79.9959), "San Diego": (32.7157, -117.1611),
+            "San Francisco": (37.7749, -122.4194), "Seattle": (47.6062, -122.3321),
+            "St. Louis": (38.6270, -90.1994), "Tampa": (27.9506, -82.4572),
+            "Dallas": (32.7767, -96.7970), "Toronto": (43.6532, -79.3832),
+            "Washington": (38.9072, -77.0369),
+        }
     
-    def get_nba_schedule(self, date_range: Optional[str] = None) -> List[GameData]:
-        """Get NBA schedule data"""
-        url = f"{self.base_url}/basketball/nba/scoreboard"
-        if date_range:
-            url += f"?dates={date_range}"
-            
-        try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            games = []
-            for event in data.get('events', []):
-                game = self._parse_game_data(event, "NBA")
-                if game:
-                    games.append(game)
-            
-            return games
-            
-        except Exception as e:
-            print(f"ESPN NBA API error: {e}")
-            return []
-    
-    def get_nhl_schedule(self, date_range: Optional[str] = None) -> List[GameData]:
-        """Get NHL schedule data"""
-        url = f"{self.base_url}/hockey/nhl/scoreboard"
-        if date_range:
-            url += f"?dates={date_range}"
-            
-        try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            games = []
-            for event in data.get('events', []):
-                game = self._parse_game_data(event, "NHL")
-                if game:
-                    games.append(game)
-            
-            return games
-            
-        except Exception as e:
-            print(f"ESPN NHL API error: {e}")
-            return []
-    
-    def _parse_game_data(self, event_data: Dict[str, Any], league: str) -> Optional[GameData]:
-        """Parse ESPN event data into GameData"""
-        try:
-            # Basic event info
-            game_id = event_data.get('id', '')
-            date_str = event_data.get('date', '')
-            
-            # Parse date - ensure timezone-naive datetime
-            game_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            # Convert to naive datetime to avoid timezone comparison issues
-            if game_date.tzinfo is not None:
-                game_date = game_date.replace(tzinfo=None)
-            
-            # Get competition data
-            competition = event_data.get('competitions', [{}])[0]
-            competitors = competition.get('competitors', [])
-            
-            if len(competitors) != 2:
-                return None
-            
-            # Parse teams
-            home_team_data = None
-            away_team_data = None
-            
-            for comp in competitors:
-                team_data = comp.get('team', {})
-                if comp.get('homeAway') == 'home':
-                    home_team_data = team_data
+    def scrape_team_schedule(self, team_abbrev: str, season: str = "2025") -> List[GameData]:
+        """Scrape full season schedule for a team"""
+        all_games = []
+        
+        for half in [1, 2]:  # First and second half
+            try:
+                url = self.base_url.format(team=team_abbrev, half=half)
+                print(f"Scraping {team_abbrev} schedule (half {half}): {url}")
+                
+                response = self.session.get(url, timeout=10)
+                response.raise_for_status()
+                
+                # Parse the HTML and extract table data
+                table_rows = self._parse_schedule_page(response.text, team_abbrev, season)
+                
+                if table_rows and len(table_rows) > 1:
+                    print(f"Got {len(table_rows)} rows, parsing to GameData objects...")
+                    games = self.parse_table_to_games(table_rows, team_abbrev, season)
+                    all_games.extend(games)
+                    print(f"Converted to {len(games)} GameData objects")
                 else:
-                    away_team_data = team_data
+                    print(f"No table data found for {team_abbrev} half {half}")
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error scraping {team_abbrev} half {half}: {e}")
+                continue
+        
+        print(f"Scraped {len(all_games)} games for {team_abbrev}")
+        return all_games
+    
+    def scrape_all_teams_schedule(self, season: str = "2025") -> List[GameData]:
+        """Scrape schedules for all MLB teams"""
+        all_games = []
+        seen_games = set()  # To avoid duplicates since each game appears on 2 team schedules
+        
+        for team_abbrev, team_info in self.mlb_teams.items():
+            try:
+                print(f"Scraping schedule for {team_info['name']} ({team_abbrev})...")
+                team_games = self.scrape_team_schedule(team_abbrev, season)
+                
+                # Add unique games only
+                for game in team_games:
+                    game_key = f"{game.date.strftime('%Y-%m-%d')}_{game.home_team.abbreviation}_{game.away_team.abbreviation}"
+                    if game_key not in seen_games:
+                        all_games.append(game)
+                        seen_games.add(game_key)
+                
+                # Longer delay between teams to be respectful
+                time.sleep(1.0)
+                
+            except Exception as e:
+                print(f"Error scraping team {team_abbrev}: {e}")
+                continue
+        
+        print(f"Total unique games scraped: {len(all_games)}")
+        return all_games
+    
+    def _parse_schedule_page(self, html_content: str, team_abbrev: str, season: str) -> List[List[str]]:
+        """Parse ESPN schedule page HTML to extract table data"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            if not home_team_data or not away_team_data:
+            # Find schedule table
+            tables = soup.find_all('table')
+            
+            schedule_table = None
+            for table in tables:
+                rows = table.find_all('tr')
+                if len(rows) > 5:  # Should have header + multiple game rows
+                    # Check if this looks like a schedule table
+                    first_few_rows_text = ' '.join([row.get_text().lower() for row in rows[:3]])
+                    if any(keyword in first_few_rows_text for keyword in ['date', 'opponent', 'result', 'vs', '@']):
+                        schedule_table = table
+                        break
+            
+            if not schedule_table:
+                all_rows = soup.find_all('tr')
+                if len(all_rows) > 5:
+                    rows = all_rows
+                else:
+                    print(f"No schedule data found for {team_abbrev}")
+                    return []
+            else:
+                rows = schedule_table.find_all('tr')
+            
+            # Extract table data
+            table_data = []
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if cells:
+                    cell_texts = [cell.get_text(strip=True) for cell in cells]
+                    if cell_texts and len(cell_texts) >= 3:  # Need at least date, opponent, result
+                        table_data.append(cell_texts)
+            
+            print(f"Extracted {len(table_data)} rows for {team_abbrev}")
+            return table_data
+            
+        except Exception as e:
+            print(f"Error parsing schedule page for {team_abbrev}: {e}")
+            return []
+    
+    def parse_table_to_games(self, table_rows: List[List[str]], team_abbrev: str, season: str = "2025") -> List[GameData]:
+        """Convert table rows to GameData objects"""
+        games = []
+        
+        if not table_rows or len(table_rows) < 2:
+            return games
+            
+        print(f"Processing {len(table_rows)-1} games for {team_abbrev}...")
+        
+        # Skip header row (row 0), process data rows
+        for i, row in enumerate(table_rows[1:], 1):
+            try:
+                game = self.parse_game_row(row, team_abbrev, season)
+                if game:
+                    games.append(game)
+                    print(f"  ✓ Game {i}: {game.away_team.abbreviation} @ {game.home_team.abbreviation} on {game.date.strftime('%m/%d')}")
+            except Exception as e:
+                print(f"  ✗ Error parsing row {i}: {e}")
+                continue
+                
+        print(f"Successfully parsed {len(games)} games for {team_abbrev}")
+        return games
+    
+    def parse_game_row(self, row: List[str], team_abbrev: str, season: str) -> Optional[GameData]:
+        """Parse individual game row into GameData"""
+        if len(row) < 3:  # Need at least DATE, OPPONENT, RESULT
+            return None
+            
+        date_str = row[0].strip()
+        opponent_str = row[1].strip()
+        result_str = row[2].strip() if len(row) > 2 else ""
+        
+        # Parse date
+        game_date = self.parse_date(date_str, season)
+        if not game_date:
+            return None
+            
+        # Parse opponent and determine home/away
+        is_home, opponent_abbrev = self.parse_opponent(opponent_str)
+        if not opponent_abbrev:
+            return None
+            
+        # Create team info objects
+        home_team_abbrev = team_abbrev if is_home else opponent_abbrev
+        away_team_abbrev = opponent_abbrev if is_home else team_abbrev
+        
+        home_team = self.create_team_info(home_team_abbrev)
+        away_team = self.create_team_info(away_team_abbrev)
+        venue = self.create_venue_info(home_team_abbrev)
+        
+        # Determine game status from result
+        status = GameStatus.SCHEDULED if not result_str else GameStatus.FINAL
+        
+        # Create game ID
+        game_id = f"{season}_{game_date.strftime('%Y%m%d')}_{away_team_abbrev}_{home_team_abbrev}"
+        
+        return GameData(
+            game_id=game_id,
+            date=game_date,
+            home_team=home_team,
+            away_team=away_team,
+            venue=venue,
+            status=status,
+            league="MLB",
+            season=season
+        )
+    
+    def parse_date(self, date_str: str, season: str) -> Optional[datetime]:
+        """Parse ESPN date format: 'Thu, Mar 27'"""
+        try:
+            # Remove day of week if present
+            if ',' in date_str:
+                date_part = date_str.split(',', 1)[1].strip()
+            else:
+                date_part = date_str.strip()
+                
+            # Parse "Mar 27" format
+            parts = date_part.split()
+            if len(parts) != 2:
                 return None
+                
+            month_str, day_str = parts[0], parts[1]
             
-            # Create team objects
-            home_team = TeamInfo(
-                team_id=home_team_data.get('id', ''),
-                abbreviation=home_team_data.get('abbreviation', ''),
-                display_name=home_team_data.get('displayName', ''),
-                location=home_team_data.get('location', ''),
-                color=home_team_data.get('color', '#000000'),
-                alternate_color=home_team_data.get('alternateColor', '#FFFFFF'),
-                logo_url=home_team_data.get('logo', '')
-            )
-            
-            away_team = TeamInfo(
-                team_id=away_team_data.get('id', ''),
-                abbreviation=away_team_data.get('abbreviation', ''),
-                display_name=away_team_data.get('displayName', ''),
-                location=away_team_data.get('location', ''),
-                color=away_team_data.get('color', '#000000'),
-                alternate_color=away_team_data.get('alternateColor', '#FFFFFF'),
-                logo_url=away_team_data.get('logo', '')
-            )
-            
-            # Parse venue
-            venue_data = competition.get('venue', {})
-            venue = Venue(
-                venue_id=venue_data.get('id', ''),
-                name=venue_data.get('fullName', ''),
-                city=venue_data.get('address', {}).get('city', ''),
-                state=venue_data.get('address', {}).get('state', ''),
-                country=venue_data.get('address', {}).get('country', ''),
-                latitude=float(venue_data.get('address', {}).get('latitude', 0)),
-                longitude=float(venue_data.get('address', {}).get('longitude', 0)),
-                capacity=venue_data.get('capacity')
-            )
-            
-            # Parse status
-            status_data = competition.get('status', {}).get('type', {})
-            status_name = status_data.get('name', 'scheduled').lower()
-            
-            status_map = {
-                'pre': GameStatus.SCHEDULED,
-                'in': GameStatus.IN_PROGRESS,
-                'final': GameStatus.FINAL,
-                'postponed': GameStatus.POSTPONED,
-                'cancelled': GameStatus.CANCELLED
+            # Month mapping
+            month_map = {
+                'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
             }
             
-            status = GameStatus.SCHEDULED
-            for key, value in status_map.items():
-                if key in status_name:
-                    status = value
-                    break
+            month = month_map.get(month_str)
+            if not month:
+                return None
+                
+            day = int(day_str)
+            year = int(season)
             
-            # Additional info for NFL
-            week = None
-            season_type = None
-            if league == "NFL":
-                week = event_data.get('week', {}).get('number')
-                season_type = event_data.get('season', {}).get('type', {}).get('name')
-            
-            return GameData(
-                game_id=game_id,
-                date=game_date,
-                home_team=home_team,
-                away_team=away_team,
-                venue=venue,
-                status=status,
-                week=week,
-                season_type=season_type,
-                league=league
-            )
+            # Handle year rollover for spring training / early season
+            current_date = datetime.now()
+            if month <= 3 and current_date.month >= 10:  # Spring training next year
+                year += 1
+                
+            return datetime(year, month, day, 19, 0)  # Default 7 PM game time
             
         except Exception as e:
-            print(f"Error parsing game data: {e}")
             return None
+    
+    def parse_opponent(self, opponent_str: str) -> Tuple[bool, Optional[str]]:
+        """Parse opponent string: 'vsChicago' or '@Chicago'"""
+        if not opponent_str:
+            return False, None
+            
+        # Determine home/away
+        if opponent_str.startswith('vs'):
+            is_home = True
+            opponent_name = opponent_str[2:].strip()
+        elif opponent_str.startswith('@'):
+            is_home = False
+            opponent_name = opponent_str[1:].strip()
+        else:
+            # Fallback: assume opponent name without prefix
+            is_home = True  # Default to home
+            opponent_name = opponent_str.strip()
+            
+        # Convert opponent name to abbreviation
+        opponent_abbrev = self.get_team_abbrev_from_name(opponent_name)
+        
+        return is_home, opponent_abbrev
+    
+    def get_team_abbrev_from_name(self, team_name: str) -> Optional[str]:
+        """Convert team city/name to MLB abbreviation"""
+        # Clean the team name
+        team_name = team_name.strip().lower()
+        
+        # Direct city/team name to abbreviation mapping
+        name_to_abbrev = {
+            # By city name
+            'arizona': 'ari', 'atlanta': 'atl', 'baltimore': 'bal', 'boston': 'bos',
+            'chicago': 'chc',  # Default to Cubs, will need context for White Sox
+            'cincinnati': 'cin', 'cleveland': 'cle', 'colorado': 'col', 'detroit': 'det',
+            'houston': 'hou', 'kansas': 'kc', 'losangeles': 'lad',  # Default to Dodgers
+            'miami': 'mia', 'milwaukee': 'mil', 'minnesota': 'min', 'newyork': 'nyy',  # Default to Yankees
+            'oakland': 'oak', 'philadelphia': 'phi', 'pittsburgh': 'pit', 'sandiego': 'sd',
+            'sanfrancisco': 'sf', 'seattle': 'sea', 'stlouis': 'stl', 'tampabay': 'tb',
+            'texas': 'tex', 'toronto': 'tor', 'washington': 'wsh',
+            
+            # By team name
+            'diamondbacks': 'ari', 'braves': 'atl', 'orioles': 'bal', 'redsox': 'bos',
+            'cubs': 'chc', 'whitesox': 'cws', 'reds': 'cin', 'guardians': 'cle',
+            'rockies': 'col', 'tigers': 'det', 'astros': 'hou', 'royals': 'kc',
+            'angels': 'laa', 'dodgers': 'lad', 'marlins': 'mia', 'brewers': 'mil',
+            'twins': 'min', 'mets': 'nym', 'yankees': 'nyy', 'athletics': 'oak',
+            'phillies': 'phi', 'pirates': 'pit', 'padres': 'sd', 'giants': 'sf',
+            'mariners': 'sea', 'cardinals': 'stl', 'rays': 'tb', 'rangers': 'tex',
+            'bluejays': 'tor', 'nationals': 'wsh'
+        }
+        
+        # Remove spaces and special characters
+        clean_name = re.sub(r'[^a-z]', '', team_name)
+        
+        return name_to_abbrev.get(clean_name)
+    
+    def create_team_info(self, team_abbrev: str) -> TeamInfo:
+        """Create TeamInfo object from abbreviation"""
+        team_data = self.team_mappings.get(team_abbrev.lower(), {})
+        
+        return TeamInfo(
+            team_id=team_abbrev.lower(),
+            abbreviation=team_abbrev.upper(),
+            display_name=team_data.get('name', f'Team {team_abbrev.upper()}'),
+            location=team_data.get('city', ''),
+            color='#000000',
+            alternate_color='#FFFFFF',
+            division=team_data.get('division', '')
+        )
+    
+    def create_venue_info(self, home_team_abbrev: str) -> Venue:
+        """Create Venue object"""
+        team_data = self.team_mappings.get(home_team_abbrev.lower(), {})
+        city = team_data.get('city', '')
+        coords = self.city_coordinates.get(city, (0.0, 0.0))
+        
+        return Venue(
+            venue_id=f"{home_team_abbrev}_stadium",
+            name=f"{city} Stadium",
+            city=city,
+            state='',
+            country='USA',
+            latitude=coords[0],
+            longitude=coords[1]
+        )
 
 
 class TravelInferenceEngine:
@@ -428,10 +578,18 @@ class TravelInferenceEngine:
             if home_away == 'away':
                 # Team is traveling to an away game
                 team_info = game.away_team
-                departure_city = team_info.location
-                arrival_city = game.venue.city
+                departure_city = self._get_clean_city_name(team_info.location)
+                arrival_city = self._get_clean_city_name(game.venue.city)
                 
-                # Estimate travel date (typically 1 day before game) - ensure naive datetime
+                # Skip if we don't have valid city names
+                if not departure_city or not arrival_city:
+                    continue
+                
+                # Skip if departure and arrival are the same
+                if departure_city == arrival_city:
+                    continue
+                
+                # Estimate travel date (typically 1 day before game)
                 game_date = game.date
                 if hasattr(game_date, 'tzinfo') and game_date.tzinfo is not None:
                     game_date = game_date.replace(tzinfo=None)
@@ -475,262 +633,296 @@ class TravelInferenceEngine:
                 travel_data.append(return_travel)
         
         return travel_data
-
-
-class SportsDataCache:
-    """SQLite cache for sports schedule data"""
     
-    def __init__(self, cache_file: str = "sports_cache.db"):
-        self.cache_file = cache_file
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize cache database"""
-        self.db = QSqlDatabase.addDatabase("QSQLITE", "sports_cache")
-        self.db.setDatabaseName(self.cache_file)
+    def _get_clean_city_name(self, city_name: str) -> str:
+        """Clean and validate city name"""
+        if not city_name or not isinstance(city_name, str):
+            return ""
         
-        if not self.db.open():
-            print(f"Failed to open sports cache database: {self.db.lastError().text()}")
-            return
+        clean_name = city_name.strip()
+        if not clean_name:
+            return ""
         
-        query = QSqlQuery(self.db)
-        
-        # Games cache
-        query.exec("""
-        CREATE TABLE IF NOT EXISTS games_cache (
-            id INTEGER PRIMARY KEY,
-            game_id TEXT UNIQUE,
-            league TEXT,
-            game_date TIMESTAMP,
-            home_team TEXT,
-            away_team TEXT,
-            venue_city TEXT,
-            game_data TEXT,
-            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )
-        """)
-        
-        # Travel data cache
-        query.exec("""
-        CREATE TABLE IF NOT EXISTS travel_cache (
-            id INTEGER PRIMARY KEY,
-            team_id TEXT,
-            departure_city TEXT,
-            arrival_city TEXT,
-            travel_date TIMESTAMP,
-            travel_data TEXT,
-            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )
-        """)
-    
-    def cache_games(self, games: List[GameData], cache_duration_hours: int = 24):
-        """Cache game data"""
-        query = QSqlQuery(self.db)
-        expires_at = datetime.now() + timedelta(hours=cache_duration_hours)
-        
-        query.prepare("""
-        INSERT OR REPLACE INTO games_cache 
-        (game_id, league, game_date, home_team, away_team, venue_city, game_data, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """)
-        
-        for game in games:
-            query.addBindValue(game.game_id)
-            query.addBindValue(game.league)
-            query.addBindValue(game.date)
-            query.addBindValue(game.home_team.display_name)
-            query.addBindValue(game.away_team.display_name)
-            query.addBindValue(game.venue.city)
-            query.addBindValue(json.dumps(self._serialize_game(game), default=str))
-            query.addBindValue(expires_at)
-            query.exec()
-    
-    def get_cached_games(self, league: Optional[str] = None) -> List[GameData]:
-        """Retrieve cached game data"""
-        query = QSqlQuery(self.db)
-        
-        if league:
-            query.prepare("""
-            SELECT game_data FROM games_cache 
-            WHERE league = ? AND expires_at > ?
-            """)
-            query.addBindValue(league)
-            query.addBindValue(datetime.now())
-        else:
-            query.prepare("""
-            SELECT game_data FROM games_cache 
-            WHERE expires_at > ?
-            """)
-            query.addBindValue(datetime.now())
-        
-        games = []
-        if query.exec():
-            while query.next():
-                try:
-                    game_data = json.loads(query.value(0))
-                    game = self._deserialize_game(game_data)
-                    if game:
-                        games.append(game)
-                except Exception as e:
-                    print(f"Error deserializing cached game: {e}")
-        
-        return games
-    
-    def _serialize_game(self, game: GameData) -> Dict:
-        """Serialize game data for caching"""
-        return {
-            'game_id': game.game_id,
-            'date': game.date.isoformat(),
-            'home_team': {
-                'team_id': game.home_team.team_id,
-                'abbreviation': game.home_team.abbreviation,
-                'display_name': game.home_team.display_name,
-                'location': game.home_team.location,
-                'color': game.home_team.color,
-                'alternate_color': game.home_team.alternate_color,
-                'logo_url': game.home_team.logo_url
-            },
-            'away_team': {
-                'team_id': game.away_team.team_id,
-                'abbreviation': game.away_team.abbreviation,
-                'display_name': game.away_team.display_name,
-                'location': game.away_team.location,
-                'color': game.away_team.color,
-                'alternate_color': game.away_team.alternate_color,
-                'logo_url': game.away_team.logo_url
-            },
-            'venue': {
-                'venue_id': game.venue.venue_id,
-                'name': game.venue.name,
-                'city': game.venue.city,
-                'state': game.venue.state,
-                'country': game.venue.country,
-                'latitude': game.venue.latitude,
-                'longitude': game.venue.longitude,
-                'capacity': game.venue.capacity
-            },
-            'status': game.status.value,
-            'week': game.week,
-            'season_type': game.season_type,
-            'league': game.league
+        # Handle common city name issues
+        city_mappings = {
+            "St. Petersburg": "Tampa",
+            "Anaheim": "Los Angeles",
+            "Arlington": "Dallas",
+            "Queens": "New York",
+            "Bronx": "New York",
         }
-    
-    def _deserialize_game(self, data: Dict) -> Optional[GameData]:
-        """Deserialize game data from cache"""
-        try:
-            home_team = TeamInfo(**data['home_team'])
-            away_team = TeamInfo(**data['away_team'])
-            venue = Venue(**data['venue'])
-            
-            return GameData(
-                game_id=data['game_id'],
-                date=datetime.fromisoformat(data['date']),
-                home_team=home_team,
-                away_team=away_team,
-                venue=venue,
-                status=GameStatus(data['status']),
-                week=data.get('week'),
-                season_type=data.get('season_type'),
-                league=data['league']
-            )
-        except Exception as e:
-            print(f"Error deserializing game data: {e}")
-            return None
+        
+        return city_mappings.get(clean_name, clean_name)
 
 
-class SportsDataAggregator(QObject):
-    """Sports data aggregator with ESPN API integration"""
+class ESPNSportsDataAggregator(QObject):
+    """ESPN sports data aggregator with database integration"""
     
-    dataUpdated = pyqtSignal(list)  # Emits List[TeamTravelData]
+    dataUpdated = pyqtSignal(list)
     progressUpdated = pyqtSignal(int)
     errorOccurred = pyqtSignal(str)
+    seasonDataLoaded = pyqtSignal(str, int)
     
-    def __init__(self, config: Dict[str, str]):
+    def __init__(self, config: Dict[str, str], db_path: str = "sports_data.db"):
         super().__init__()
         
-        # Initialize ESPN client and travel inference engine
-        self.espn_client = ESPNScheduleClient()
-        self.inference_engine = TravelInferenceEngine(self.espn_client.team_airports)
+        # Import DatabaseManager here to avoid circular imports
+        try:
+            from database_manager import DatabaseManager
+            self.db = DatabaseManager(db_path)
+        except ImportError:
+            print("Error: DatabaseManager not found. Please ensure database_manager.py is available.")
+            raise
         
-        # Initialize cache
-        self.cache = SportsDataCache()
+        # Initialize scraper and inference engine
+        self.espn_scraper = ESPNScheduleScraper()
+        self.inference_engine = TravelInferenceEngine(self.espn_scraper.team_airports)
         
-        # Current data
-        self.current_games = []
-        self.current_travel_data = []
+        # Current state
+        self.current_season = str(datetime.now().year)
         self.current_league = "MLB"
+        self.all_season_games = []
+        self.current_travel_data = []
+        self.teams_cache = {}
         
-        # Update timer
-        self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self.update_data)
+        # Load teams from database or initialize
+        self.load_teams()
     
-    def load_league_schedule(self, league: str):
-        """Load schedule for specified league"""
-        self.current_league = league
-        self.progressUpdated.emit(20)
+    def load_teams(self):
+        """Load team information from database or initialize from scraper"""
+        # Try to load from database first
+        teams = self.db.load_teams()
+        
+        if not teams:
+            # No teams in database, load from scraper and save
+            print("No teams found in database, initializing from scraper...")
+            teams = []
+            for abbrev, info in self.espn_scraper.mlb_teams.items():
+                team = TeamInfo(
+                    team_id=abbrev,
+                    abbreviation=abbrev.upper(),
+                    display_name=info['name'],
+                    location=info['city'],
+                    color='#000000',
+                    alternate_color='#FFFFFF',
+                    division=info['division'],
+                    league="MLB"
+                )
+                teams.append(team)
+            
+            # Save teams to database
+            self.db.save_teams(teams)
+        
+        self.teams_cache = {team.team_id: team for team in teams}
+        print(f"Loaded {len(teams)} MLB teams from database")
+    
+    def load_full_season_schedule(self, season: str = None, force_refresh: bool = False):
+        """Load complete season schedule - from database if available, otherwise scrape"""
+        if season is None:
+            season = self.current_season
         
         try:
-            # Try cache first
-            cached_games = self.cache.get_cached_games(league)
-            
-            if cached_games:
-                print(f"Using cached {league} data")
-                self.current_games = cached_games
-                self.progressUpdated.emit(60)
-            else:
-                # Fetch from ESPN API
-                print(f"Fetching {league} schedule from ESPN API")
+            # Check if we should use cached data
+            if not self.db.should_refresh_season(season, force_refresh):
+                print(f"Loading {season} season from database cache...")
+                self.progressUpdated.emit(20)
                 
-                if league == "MLB":
-                    games = self.espn_client.get_mlb_schedule()
-                elif league == "NFL":
-                    games = self.espn_client.get_nfl_schedule()
-                elif league == "NBA":
-                    games = self.espn_client.get_nba_schedule()
-                elif league == "NHL":
-                    games = self.espn_client.get_nhl_schedule()
-                else:
-                    raise ValueError(f"Unsupported league: {league}")
+                # Load from database
+                games = self.db.load_games(season, self.current_league)
+                travel_data = self.db.load_travel_data(season)
                 
-                if games:
-                    self.current_games = games
-                    self.cache.cache_games(games)
-                    self.progressUpdated.emit(70)
-                else:
-                    self.errorOccurred.emit(f"No {league} games found")
+                if games and travel_data:
+                    self.all_season_games = games
+                    self.current_travel_data = travel_data
+                    self.dataUpdated.emit(travel_data)
+                    self.seasonDataLoaded.emit(season, len(games))
+                    self.progressUpdated.emit(100)
+                    print(f"Loaded {len(games)} games and {len(travel_data)} travel records from database")
                     return
+                else:
+                    print(f"No cached data found for {season}, will scrape...")
             
-            # Infer travel patterns
-            travel_data = self.inference_engine.infer_travel_from_games(self.current_games)
-            self.current_travel_data = travel_data
+            # Need to scrape new data
+            print(f"Scraping {season} season schedule from ESPN...")
+            self.progressUpdated.emit(10)
             
-            self.progressUpdated.emit(90)
-            self.dataUpdated.emit(travel_data)
-            self.progressUpdated.emit(100)
+            # Clear existing data for this season
+            self.db.clear_season_data(season, self.current_league)
             
+            # Scrape all teams
+            season_games = self.espn_scraper.scrape_all_teams_schedule(season)
+            
+            if season_games:
+                self.progressUpdated.emit(60)
+                
+                # Save games to database
+                self.db.save_games(season_games, season, self.current_league)
+                self.progressUpdated.emit(70)
+                
+                # Generate and save travel patterns
+                travel_data = self.inference_engine.infer_travel_from_games(season_games)
+                self.db.save_travel_data(travel_data, season)
+                self.progressUpdated.emit(90)
+                
+                # Update current state
+                self.all_season_games = season_games
+                self.current_travel_data = travel_data
+                
+                # Emit signals
+                self.dataUpdated.emit(travel_data)
+                self.seasonDataLoaded.emit(season, len(season_games))
+                
+                print(f"Scraped and saved {len(season_games)} games and {len(travel_data)} travel records")
+                self.progressUpdated.emit(100)
+            else:
+                self.errorOccurred.emit(f"No games found for {season} season")
+                
         except Exception as e:
-            self.errorOccurred.emit(f"Failed to load {league} schedule: {str(e)}")
+            error_msg = f"Failed to load {season} season: {str(e)}"
+            print(error_msg)
+            self.errorOccurred.emit(error_msg)
             self.progressUpdated.emit(0)
     
-    def refresh_current_data(self):
-        """Refresh current league data from API"""
-        if self.current_league:
-            # Force refresh by clearing cache
-            # Implementation would clear relevant cache entries
-            self.load_league_schedule(self.current_league)
+    def load_team_season_schedule(self, team_id: str, season: str = None):
+        """Load schedule for specific team from database or scrape if needed"""
+        if season is None:
+            season = self.current_season
+        
+        try:
+            self.progressUpdated.emit(20)
+            
+            # Try to load from database first
+            team_travel = self.db.load_travel_data(season, team_id)
+            
+            if team_travel:
+                print(f"Loaded {len(team_travel)} travel records for {team_id} from database")
+                self.dataUpdated.emit(team_travel)
+                self.progressUpdated.emit(100)
+                return
+            
+            # No cached data, scrape if needed
+            print(f"No cached data for {team_id}, checking full season data...")
+            
+            # Check if we have any season data
+            is_cached, _ = self.db.is_season_cached(season)
+            if not is_cached:
+                # Need to load full season first
+                self.load_full_season_schedule(season)
+                return
+            
+            # Load team-specific data from existing season data
+            team_travel = self.db.load_travel_data(season, team_id)
+            if team_travel:
+                self.dataUpdated.emit(team_travel)
+                self.progressUpdated.emit(100)
+            else:
+                self.errorOccurred.emit(f"No travel data found for team {team_id} in {season}")
+                
+        except Exception as e:
+            self.errorOccurred.emit(f"Failed to load team schedule: {str(e)}")
     
-    def update_data(self):
-        """Periodic data update"""
-        if self.current_league:
-            self.load_league_schedule(self.current_league)
+    def get_current_week_schedule(self):
+        """Get current week games from database or load season if needed"""
+        try:
+            # Check if we have current season data
+            is_cached, _ = self.db.is_season_cached(self.current_season)
+            
+            if not is_cached:
+                # Load full season first
+                print("No current season data found, loading full season...")
+                self.load_full_season_schedule(self.current_season)
+                return
+            
+            # Load current week from database
+            today = datetime.now()
+            week_start = today - timedelta(days=3)
+            week_end = today + timedelta(days=4)
+            
+            # Load all travel data and filter for current week
+            all_travel = self.db.load_travel_data(self.current_season)
+            current_week_travel = [
+                travel for travel in all_travel
+                if week_start <= travel.travel_date <= week_end
+            ]
+            
+            if current_week_travel:
+                self.dataUpdated.emit(current_week_travel)
+                print(f"Loaded {len(current_week_travel)} travel records for current week")
+            else:
+                self.errorOccurred.emit("No current week travel found")
+                
+        except Exception as e:
+            self.errorOccurred.emit(f"Failed to load current week: {str(e)}")
     
-    def get_travel_by_team(self, team_id: str) -> List[TeamTravelData]:
-        """Get travel data for specific team"""
-        return [t for t in self.current_travel_data if t.team_id == team_id]
+    def get_travel_by_date_range(self, start_date: datetime, end_date: datetime) -> List[TeamTravelData]:
+        """Filter travel data by date range from database"""
+        try:
+            # Load travel data for current season
+            all_travel = self.db.load_travel_data(self.current_season)
+            
+            # Filter by date range
+            filtered_travel = [
+                travel for travel in all_travel
+                if start_date <= travel.travel_date <= end_date
+            ]
+            
+            return filtered_travel
+            
+        except Exception as e:
+            print(f"Error filtering travel by date range: {e}")
+            return []
     
-    def get_travel_by_route(self, departure: str, arrival: str) -> List[TeamTravelData]:
-        """Get travel data for specific route"""
-        return [t for t in self.current_travel_data 
-                if t.departure_city == departure and t.arrival_city == arrival]
+    def get_team_info(self, team_id: str) -> Optional[TeamInfo]:
+        """Get team information by ID"""
+        return self.teams_cache.get(team_id)
+    
+    def get_all_teams(self) -> List[TeamInfo]:
+        """Get all cached teams"""
+        return list(self.teams_cache.values())
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """Get database statistics"""
+        return self.db.get_database_stats()
+    
+    def get_cached_seasons(self) -> List[Dict[str, Any]]:
+        """Get information about cached seasons"""
+        return self.db.get_cached_seasons(self.current_league)
+    
+    def clear_season_cache(self, season: str):
+        """Clear cache for specific season"""
+        try:
+            self.db.clear_season_data(season, self.current_league)
+            print(f"Cleared cache for {season} season")
+        except Exception as e:
+            print(f"Error clearing season cache: {e}")
+
+
+def database_integration():
+    """Test function to verify database integration works"""
+    print("Testing Database Integration...")
+    
+    # Initialize aggregator with database
+    config = {}  # Empty config for ESPN scraping
+    aggregator = ESPNSportsDataAggregator(config, "test_sports.db")
+    
+    # Get database stats
+    stats = aggregator.get_database_stats()
+    print(f"Database stats: {stats}")
+    
+    # Get cached seasons
+    seasons = aggregator.get_cached_seasons()
+    print(f"Cached seasons: {seasons}")
+    
+    # Check if current season is cached
+    current_season = str(datetime.now().year)
+    is_cached, last_updated = aggregator.db.is_season_cached(current_season)
+    print(f"Current season ({current_season}) cached: {is_cached}, last updated: {last_updated}")
+    
+    if not is_cached:
+        print("Would normally scrape data here (skipping for test)")
+    else:
+        print("Data available in cache")
+
+
+if __name__ == "__main__":
+    database_integration()

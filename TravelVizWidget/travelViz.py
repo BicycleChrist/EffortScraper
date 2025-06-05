@@ -7,12 +7,13 @@ from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                             QWidget, QSplitter, QStatusBar, QMenuBar, QMenu, 
-                            QMessageBox, QProgressBar, QLabel, QFileDialog)
+                            QMessageBox, QProgressBar, QLabel, QFileDialog,
+                            QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton)
 from PyQt6.QtCore import (Qt, QTimer, QThread, QObject, pyqtSignal, QSettings)
 from PyQt6.QtGui import QAction, QIcon, QFont
 
-# Import our enhanced components
-from data_client import SportsDataAggregator, TeamTravelData
+# Import components
+from data_client import ESPNSportsDataAggregator, TeamTravelData, TeamInfo
 from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
 
@@ -42,8 +43,10 @@ class ConfigLoader:
     def create_default_config(self):
         """Create default configuration file"""
         default_config = {
+            "espn_scraping_note": "ESPN scraping requires no API key",
             "amadeus": "",
-            "amadeus_secret": ""
+            "amadeus_secret": "",
+            "backup_apis_note": "Additional APIs for future expansion"
         }
         
         try:
@@ -58,12 +61,12 @@ class ConfigLoader:
         return self.config
     
     def is_configured(self) -> bool:
-        """Check if APIs are configured - ESPN is always available"""
-        return True  # ESPN API is free and requires no authentication
+        """Check if APIs are configured - ESPN scraping is always available"""
+        return True
 
 
 class SportsTrackerMainWindow(QMainWindow):
-    """Main window for the sports team travel tracker application"""
+    """Main window with ESPN schedule scraping support"""
     
     def __init__(self):
         super().__init__()
@@ -75,6 +78,8 @@ class SportsTrackerMainWindow(QMainWindow):
         self.sports_aggregator = None
         self.data_update_timer = None
         self.current_travel_data = []
+        self.all_teams = []
+        self.current_season = str(datetime.now().year)
         
         # Setup UI
         self.setup_ui()
@@ -93,8 +98,8 @@ class SportsTrackerMainWindow(QMainWindow):
     
     def setup_ui(self):
         """Setup the main window UI"""
-        self.setWindowTitle("Sports Team Travel Tracker - Real-time Team Movement Analysis")
-        self.setGeometry(100, 100, 1800, 1000)
+        self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_season} Season")
+        self.setGeometry(100, 100, 1900, 1100)
         
         # Central widget with splitter
         central_widget = QWidget()
@@ -108,20 +113,228 @@ class SportsTrackerMainWindow(QMainWindow):
         main_layout.addWidget(splitter)
         
         # Control panel (left side)
+        control_widget = QWidget()
+        control_layout = QVBoxLayout(control_widget)
+        
+        # Season controls
+        season_group = self.create_season_controls()
+        control_layout.addWidget(season_group)
+        
+        # Original control panel
         self.control_panel = FlightControlPanel()
-        self.control_panel.setMinimumWidth(350)
-        self.control_panel.setMaximumWidth(500)
-        splitter.addWidget(self.control_panel)
+        control_layout.addWidget(self.control_panel)
+        
+        control_widget.setMinimumWidth(350)
+        control_widget.setMaximumWidth(500)
+        splitter.addWidget(control_widget)
         
         # Globe widget (right side)
         self.globe_widget = FlightGlobeWidget()
         splitter.addWidget(self.globe_widget)
         
         # Set splitter proportions (30% control panel, 70% globe)
-        splitter.setSizes([400, 1400])
+        splitter.setSizes([400, 1500])
         
         # Apply dark sports theme
         self.apply_sports_theme()
+    
+    def create_season_controls(self) -> QGroupBox:
+        """Create season and data management controls"""
+        group = QGroupBox("SEASON DATA")
+        layout = QVBoxLayout(group)
+        
+        # Season selection
+        season_layout = QHBoxLayout()
+        season_layout.addWidget(QLabel("Season:"))
+        self.season_combo = QComboBox()
+        
+        # Add recent seasons
+        current_year = datetime.now().year
+        for year in range(current_year, current_year - 5, -1):
+            self.season_combo.addItem(str(year), year)
+        
+        self.season_combo.setCurrentText(self.current_season)
+        season_layout.addWidget(self.season_combo)
+        layout.addLayout(season_layout)
+        
+        # Data loading controls
+        load_layout = QHBoxLayout()
+        
+        self.load_full_season_btn = QPushButton("Load Full Season")
+        self.load_full_season_btn.setToolTip("Load complete season schedule (recommended)")
+        load_layout.addWidget(self.load_full_season_btn)
+        
+        self.load_current_week_btn = QPushButton("Current Week")
+        self.load_current_week_btn.setToolTip("Load just current week for quick preview")
+        load_layout.addWidget(self.load_current_week_btn)
+        
+        layout.addLayout(load_layout)
+        
+        # Team selection for focused view
+        team_layout = QHBoxLayout()
+        team_layout.addWidget(QLabel("Focus Team:"))
+        self.focus_team_combo = QComboBox()
+        self.focus_team_combo.addItem("All Teams", "")
+        team_layout.addWidget(self.focus_team_combo)
+        layout.addLayout(team_layout)
+        
+        # Data status and statistics
+        self.season_status_label = QLabel("No season data loaded")
+        self.season_status_label.setStyleSheet("font-style: italic; color: #888;")
+        layout.addWidget(self.season_status_label)
+        
+        # Progress bar for season loading
+        self.season_progress = QProgressBar()
+        self.season_progress.setVisible(False)
+        layout.addWidget(self.season_progress)
+        
+        return group
+    
+    def setup_sports_system(self):
+        """Setup sports data system with ESPN scraping"""
+        api_keys = self.config_loader.get_api_keys()
+        
+        # Initialize sports data aggregator with config dict
+        self.sports_aggregator = ESPNSportsDataAggregator(api_keys)
+        
+        # Connect aggregator signals
+        self.sports_aggregator.dataUpdated.connect(self.on_travel_data_updated)
+        self.sports_aggregator.progressUpdated.connect(self.on_progress_updated)
+        self.sports_aggregator.errorOccurred.connect(self.on_data_error)
+        self.sports_aggregator.seasonDataLoaded.connect(self.on_season_data_loaded)
+    
+    def connect_signals(self):
+        """Connect UI signals"""
+        # Season controls
+        self.season_combo.currentTextChanged.connect(self.on_season_changed)
+        self.load_full_season_btn.clicked.connect(self.load_full_season)
+        self.load_current_week_btn.clicked.connect(self.load_current_week)
+        self.focus_team_combo.currentTextChanged.connect(self.on_focus_team_changed)
+        
+        # Control panel signals
+        self.control_panel.refreshRequested.connect(self.force_refresh_season_data)
+        self.control_panel.modeChanged.connect(self.on_mode_changed)
+        self.control_panel.airlineFilterChanged.connect(self.on_team_filter_changed)
+        self.control_panel.statusFilterChanged.connect(self.on_schedule_filter_changed)
+        self.control_panel.routeFilterChanged.connect(self.on_route_filter_changed)
+        self.control_panel.flightSelected.connect(self.on_game_selected)
+        
+        # Globe widget signals
+        self.globe_widget.performanceUpdate.connect(self.on_performance_update)
+        self.globe_widget.locationSelected.connect(self.on_location_selected)
+    
+    def start_sports_monitoring(self):
+        """Start sports data monitoring"""
+        if self.sports_aggregator:
+            # Load teams first
+            self.populate_team_combo()
+            # Start with current week for quick preview
+            self.load_current_week()
+            self.connection_status.setText("Connected to ESPN")
+            self.connection_status.setStyleSheet("color: #00FF00;")
+    
+    def populate_team_combo(self):
+        """Populate team selection combo with all MLB teams"""
+        try:
+            teams = self.sports_aggregator.get_all_teams()
+            self.all_teams = teams
+            
+            # Clear and repopulate
+            current_selection = self.focus_team_combo.currentData()
+            self.focus_team_combo.clear()
+            self.focus_team_combo.addItem("All Teams", "")
+            
+            # Add teams sorted by name
+            for team in sorted(teams, key=lambda t: t.display_name):
+                display_text = f"{team.display_name} ({team.abbreviation})"
+                self.focus_team_combo.addItem(display_text, team.team_id)
+            
+            # Restore selection if possible
+            if current_selection:
+                index = self.focus_team_combo.findData(current_selection)
+                if index >= 0:
+                    self.focus_team_combo.setCurrentIndex(index)
+            
+            print(f"Populated team combo with {len(teams)} teams")
+            
+        except Exception as e:
+            print(f"Error populating team combo: {e}")
+    
+    def on_season_changed(self, season_text: str):
+        """Handle season change"""
+        if season_text and season_text != self.current_season:
+            self.current_season = season_text
+            self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_season} Season")
+            self.season_status_label.setText(f"Season {season_text} - No data loaded")
+            # Clear current data
+            self.current_travel_data = []
+            self.globe_widget.load_flight_data([])
+    
+    def load_full_season(self):
+        """Load complete season schedule"""
+        if not self.sports_aggregator:
+            return
+        
+        season = self.season_combo.currentText()
+        if not season:
+            return
+        
+        self.load_full_season_btn.setEnabled(False)
+        self.load_full_season_btn.setText("Loading Season...")
+        self.season_status_label.setText(f"Loading {season} season schedule...")
+        
+        try:
+            # Force refresh if it's the current season
+            force_refresh = (season == str(datetime.now().year))
+            self.sports_aggregator.load_full_season_schedule(season, force_refresh)
+            
+        except Exception as e:
+            self.on_data_error(f"Failed to load {season} season: {str(e)}")
+            self.load_full_season_btn.setEnabled(True)
+            self.load_full_season_btn.setText("Load Full Season")
+    
+    def load_current_week(self):
+        """Load current week schedule for quick preview"""
+        if not self.sports_aggregator:
+            return
+        
+        self.load_current_week_btn.setEnabled(False)
+        self.load_current_week_btn.setText("Loading...")
+        
+        try:
+            self.sports_aggregator.get_current_week_schedule()
+        except Exception as e:
+            self.on_data_error(f"Failed to load current week: {str(e)}")
+            self.load_current_week_btn.setEnabled(True)
+            self.load_current_week_btn.setText("Current Week")
+    
+    def on_focus_team_changed(self):
+        """Handle focus team selection change"""
+        team_id = self.focus_team_combo.currentData()
+        season = self.season_combo.currentText()
+        
+        if team_id and self.sports_aggregator:
+            # Load specific team schedule
+            self.sports_aggregator.load_team_season_schedule(team_id, season)
+        elif not team_id and self.current_travel_data:
+            # Show all teams again
+            self.globe_widget.load_flight_data(self.current_travel_data)
+    
+    def on_season_data_loaded(self, season: str, game_count: int):
+        """Handle season data loaded successfully"""
+        self.season_status_label.setText(
+            f"Season {season}: {game_count:,} games, {len(self.current_travel_data):,} travel records"
+        )
+        self.load_full_season_btn.setEnabled(True)
+        self.load_full_season_btn.setText("Load Full Season")
+        self.load_current_week_btn.setEnabled(True)
+        self.load_current_week_btn.setText("Current Week")
+    
+    def force_refresh_season_data(self):
+        """Force refresh current season data"""
+        season = self.season_combo.currentText()
+        if season and self.sports_aggregator:
+            self.sports_aggregator.load_full_season_schedule(season, force_refresh=True)
     
     def apply_sports_theme(self):
         """Apply sports-themed dark styling"""
@@ -130,6 +343,95 @@ class SportsTrackerMainWindow(QMainWindow):
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                 stop:0 #0A1428, stop:0.5 #051225, stop:1 #020815);
             color: #E0E0E0;
+        }
+        
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid rgba(100, 150, 200, 150);
+            border-radius: 8px;
+            margin-top: 1ex;
+            padding-top: 15px;
+            background-color: rgba(10, 25, 50, 180);
+        }
+        
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 15px;
+            padding: 0 10px 0 10px;
+            color: rgba(200, 220, 255, 255);
+            font-size: 12px;
+        }
+        
+        QPushButton {
+            background-color: rgba(0, 100, 180, 160);
+            border: 1px solid rgba(100, 150, 200, 150);
+            border-radius: 6px;
+            padding: 10px 15px;
+            font-weight: bold;
+            font-size: 11px;
+            min-height: 25px;
+            color: white;
+        }
+        
+        QPushButton:hover {
+            background-color: rgba(0, 120, 200, 180);
+            border: 1px solid rgba(120, 170, 220, 180);
+        }
+        
+        QPushButton:pressed {
+            background-color: rgba(0, 80, 160, 200);
+        }
+        
+        QPushButton:disabled {
+            background-color: rgba(60, 60, 60, 100);
+            color: rgba(150, 150, 150, 150);
+            border: 1px solid rgba(80, 80, 80, 100);
+        }
+        
+        QComboBox, QSpinBox {
+            background-color: rgba(20, 40, 70, 200);
+            border: 1px solid rgba(100, 150, 200, 150);
+            border-radius: 4px;
+            padding: 6px 10px;
+            color: white;
+            font-size: 11px;
+            min-height: 20px;
+        }
+        
+        QComboBox::drop-down {
+            border: none;
+            width: 25px;
+        }
+        
+        QComboBox::down-arrow {
+            color: white;
+            width: 12px;
+            height: 12px;
+        }
+        
+        QComboBox QAbstractItemView {
+            background-color: rgba(15, 30, 55, 250);
+            color: white;
+            border: 1px solid rgba(100, 150, 200, 150);
+            selection-background-color: rgba(0, 120, 200, 180);
+        }
+        
+        QLabel {
+            color: rgba(220, 220, 220, 255);
+            font-size: 11px;
+        }
+        
+        QProgressBar {
+            border: 1px solid rgba(100, 150, 200, 150);
+            border-radius: 4px;
+            text-align: center;
+            font-size: 10px;
+            background-color: rgba(20, 40, 70, 150);
+        }
+        
+        QProgressBar::chunk {
+            background-color: rgba(0, 150, 250, 200);
+            border-radius: 3px;
         }
         
         QMenuBar {
@@ -149,22 +451,6 @@ class SportsTrackerMainWindow(QMainWindow):
             background-color: rgba(0, 100, 180, 150);
         }
         
-        QMenu {
-            background-color: rgba(15, 30, 55, 240);
-            color: #E0E0E0;
-            border: 1px solid rgba(100, 150, 200, 150);
-            border-radius: 6px;
-        }
-        
-        QMenu::item {
-            padding: 8px 20px;
-            border-radius: 4px;
-        }
-        
-        QMenu::item:selected {
-            background-color: rgba(0, 120, 200, 150);
-        }
-        
         QStatusBar {
             background-color: rgba(10, 25, 50, 200);
             color: #B0B0B0;
@@ -173,8 +459,8 @@ class SportsTrackerMainWindow(QMainWindow):
         }
         
         QSplitter::handle {
-            background-color: rgba(100, 150, 200, 100);
-            width: 2px;
+            background-color: rgba(100, 150, 200, 120);
+            width: 3px;
         }
         
         QSplitter::handle:hover {
@@ -190,31 +476,23 @@ class SportsTrackerMainWindow(QMainWindow):
         # Data menu
         data_menu = menubar.addMenu("Data")
         
-        # Refresh actions
-        refresh_action = QAction("Refresh Schedule Data", self)
+        # Season data actions
+        load_season_action = QAction("Load Full Season", self)
+        load_season_action.setShortcut("Ctrl+L")
+        load_season_action.triggered.connect(self.load_full_season)
+        data_menu.addAction(load_season_action)
+        
+        refresh_action = QAction("Refresh Season Data", self)
         refresh_action.setShortcut("F5")
-        refresh_action.triggered.connect(self.force_refresh_schedule_data)
+        refresh_action.triggered.connect(self.force_refresh_season_data)
         data_menu.addAction(refresh_action)
+        
+        data_menu.addSeparator()
         
         export_action = QAction("Export Travel Data...", self)
         export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self.export_travel_data)
         data_menu.addAction(export_action)
-        
-        data_menu.addSeparator()
-        
-        # League selection
-        mlb_action = QAction("Load MLB Schedule", self)
-        mlb_action.triggered.connect(lambda: self.load_league_schedule("MLB"))
-        data_menu.addAction(mlb_action)
-        
-        nfl_action = QAction("Load NFL Schedule", self)
-        nfl_action.triggered.connect(lambda: self.load_league_schedule("NFL"))
-        data_menu.addAction(nfl_action)
-        
-        nba_action = QAction("Load NBA Schedule", self)
-        nba_action.triggered.connect(lambda: self.load_league_schedule("NBA"))
-        data_menu.addAction(nba_action)
         
         data_menu.addSeparator()
         
@@ -226,7 +504,6 @@ class SportsTrackerMainWindow(QMainWindow):
         # View menu
         view_menu = menubar.addMenu("View")
         
-        # Display options
         paths_action = QAction("Team Travel Paths", self)
         paths_action.setCheckable(True)
         paths_action.setChecked(True)
@@ -238,17 +515,6 @@ class SportsTrackerMainWindow(QMainWindow):
         cities_action.setChecked(True)
         cities_action.triggered.connect(self.toggle_team_cities)
         view_menu.addAction(cities_action)
-        
-        schedule_action = QAction("Current Schedule", self)
-        schedule_action.setCheckable(True)
-        schedule_action.setChecked(True)
-        schedule_action.triggered.connect(self.toggle_schedule_display)
-        view_menu.addAction(schedule_action)
-        
-        view_menu.addSeparator()
-        
-        debug_action = QAction("Debug Markers", self)
-        view_menu.addAction(debug_action)
         
         reset_view_action = QAction("Reset View", self)
         reset_view_action.setShortcut("R")
@@ -269,7 +535,7 @@ class SportsTrackerMainWindow(QMainWindow):
         # Status widgets
         self.connection_status = QLabel("Loading...")
         self.schedule_count_label = QLabel("Games: 0")
-        self.data_age_label = QLabel("Last Update: Never")
+        self.data_age_label = QLabel("Data: Never")
         self.performance_label = QLabel("FPS: --")
         
         # Progress bar for data loading
@@ -286,134 +552,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.performance_label)
         self.status_bar.addPermanentWidget(self.progress_bar)
         
-        # Update timer for data age
-        self.status_timer = QTimer()
-        self.status_timer.timeout.connect(self.update_status)
-        self.status_timer.start(30000)  # Update every 30 seconds
-        
         self.last_update_time = None
-    
-    def setup_sports_system(self):
-        """Setup sports data system"""
-        api_keys = self.config_loader.get_api_keys()
-        
-        # Initialize sports data aggregator
-        self.sports_aggregator = SportsDataAggregator(api_keys)
-        
-        # Use QTimer for periodic updates
-        self.data_update_timer = QTimer()
-        self.data_update_timer.timeout.connect(self.update_schedule_data_periodic)
-        
-        # Connect aggregator signals
-        self.sports_aggregator.dataUpdated.connect(self.on_travel_data_updated)
-        self.sports_aggregator.progressUpdated.connect(self.on_progress_updated)
-        self.sports_aggregator.errorOccurred.connect(self.on_data_error)
-    
-    def connect_signals(self):
-        """Connect UI signals"""
-        # Control panel signals
-        self.control_panel.refreshRequested.connect(self.force_refresh_schedule_data)
-        self.control_panel.modeChanged.connect(self.on_mode_changed)
-        self.control_panel.airlineFilterChanged.connect(self.on_team_filter_changed)
-        self.control_panel.statusFilterChanged.connect(self.on_schedule_filter_changed)
-        self.control_panel.routeFilterChanged.connect(self.on_route_filter_changed)
-        self.control_panel.flightSelected.connect(self.on_game_selected)
-        
-        # Globe widget signals
-        self.globe_widget.performanceUpdate.connect(self.on_performance_update)
-        self.globe_widget.locationSelected.connect(self.on_location_selected)
-    
-    def start_sports_monitoring(self):
-        """Start sports data monitoring"""
-        if self.sports_aggregator:
-            # Start with MLB by default
-            self.load_league_schedule("MLB")
-            # Update every hour
-            self.data_update_timer.start(3600000)
-            self.connection_status.setText("Connecting to ESPN...")
-            self.connection_status.setStyleSheet("color: orange;")
-    
-    def load_league_schedule(self, league: str):
-        """Load schedule for specified league"""
-        if not self.sports_aggregator:
-            return
-            
-        self.on_progress_updated(10)
-        self.connection_status.setText(f"Loading {league} schedule...")
-        
-        try:
-            # Load current week's schedule
-            self.sports_aggregator.load_league_schedule(league)
-        except Exception as e:
-            self.on_data_error(f"Failed to load {league} schedule: {str(e)}")
-    
-    
-    def force_refresh_schedule_data(self):
-        """Force refresh schedule data from ESPN API"""
-        if not self.sports_aggregator:
-            return
-            
-        self.on_progress_updated(10)
-        print("Force refreshing schedule data from ESPN...")
-        
-        try:
-            # Refresh current league data
-            self.sports_aggregator.refresh_current_data()
-            self.on_progress_updated(100)
-            
-        except Exception as e:
-            self.on_data_error(f"Refresh failed: {str(e)}")
-            self.on_progress_updated(0)
-    
-    def update_schedule_data_periodic(self):
-        """Periodic update of schedule data"""
-        if self.sports_aggregator:
-            self.sports_aggregator.update_data()
-    
-    def load_demo_data(self):
-        """Load demo travel data for demonstration"""
-        demo_travel_data = [
-            TeamTravelData(
-                team_name="Los Angeles Dodgers",
-                team_id="LAD",
-                departure_city="Los Angeles",
-                arrival_city="New York", 
-                game_date=datetime.now() + timedelta(days=2),
-                travel_date=datetime.now() + timedelta(days=1),
-                departure_airport="LAX",
-                arrival_airport="JFK",
-                confidence="demo"
-            ),
-            TeamTravelData(
-                team_name="New York Yankees",
-                team_id="NYY", 
-                departure_city="New York",
-                arrival_city="Boston",
-                game_date=datetime.now() + timedelta(days=3),
-                travel_date=datetime.now() + timedelta(days=2),
-                departure_airport="JFK",
-                arrival_airport="BOS",
-                confidence="demo"
-            ),
-            TeamTravelData(
-                team_name="Boston Red Sox",
-                team_id="BOS",
-                departure_city="Boston", 
-                arrival_city="Chicago",
-                game_date=datetime.now() + timedelta(days=5),
-                travel_date=datetime.now() + timedelta(days=4),
-                departure_airport="BOS",
-                arrival_airport="ORD",
-                confidence="demo"
-            )
-        ]
-        
-        # Load demo data into the interface
-        self.on_travel_data_updated(demo_travel_data)
-        self.connection_status.setText("Demo Mode")
-        self.connection_status.setStyleSheet("color: orange;")
-        
-        
     
     def on_travel_data_updated(self, travel_data: List[TeamTravelData]):
         """Handle updated travel data"""
@@ -427,8 +566,8 @@ class SportsTrackerMainWindow(QMainWindow):
         self.globe_widget.load_flight_data(travel_data)
         
         # Update status
-        self.schedule_count_label.setText(f"Games: {len(travel_data)}")
-        self.connection_status.setText("Connected to ESPN")
+        self.schedule_count_label.setText(f"Travel: {len(travel_data)}")
+        self.connection_status.setText("Connected")
         self.connection_status.setStyleSheet("color: #00FF00;")
         self.control_panel.set_connection_status(True)
     
@@ -437,9 +576,12 @@ class SportsTrackerMainWindow(QMainWindow):
         if progress > 0 and progress < 100:
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(progress)
+            self.season_progress.setVisible(True)
+            self.season_progress.setValue(progress)
             self.control_panel.set_loading_progress(progress)
         else:
             self.progress_bar.setVisible(False)
+            self.season_progress.setVisible(False)
             self.control_panel.set_loading_progress(0)
     
     def on_data_error(self, error_message: str):
@@ -447,9 +589,44 @@ class SportsTrackerMainWindow(QMainWindow):
         self.connection_status.setText("Error")
         self.connection_status.setStyleSheet("color: red;")
         self.control_panel.set_connection_status(False)
-        
-        # Show error message in status bar
         self.status_bar.showMessage(f"Error: {error_message}", 10000)
+        
+        # Re-enable buttons
+        self.load_full_season_btn.setEnabled(True)
+        self.load_full_season_btn.setText("Load Full Season")
+        self.load_current_week_btn.setEnabled(True)
+        self.load_current_week_btn.setText("Current Week")
+    
+    def load_demo_data(self):
+        """Load demo travel data for demonstration"""
+        demo_travel_data = [
+            TeamTravelData(
+                team_name="Los Angeles Dodgers",
+                team_id="lad",  # Use correct lowercase abbreviation
+                departure_city="Los Angeles",
+                arrival_city="New York", 
+                game_date=datetime.now() + timedelta(days=2),
+                travel_date=datetime.now() + timedelta(days=1),
+                departure_airport="LAX",
+                arrival_airport="JFK",
+                confidence="demo"
+            ),
+            TeamTravelData(
+                team_name="New York Yankees",
+                team_id="nyy",  # Use correct lowercase abbreviation
+                departure_city="New York",
+                arrival_city="Boston",
+                game_date=datetime.now() + timedelta(days=3),
+                travel_date=datetime.now() + timedelta(days=2),
+                departure_airport="JFK",
+                arrival_airport="BOS",
+                confidence="demo"
+            )
+        ]
+        
+        # Load demo data into the interface
+        self.on_travel_data_updated(demo_travel_data)
+        self.season_status_label.setText("Demo Mode - Load season data for real schedules")
     
     def on_performance_update(self, fps: float):
         """Handle performance updates"""
@@ -458,17 +635,17 @@ class SportsTrackerMainWindow(QMainWindow):
     
     def on_mode_changed(self, mode: str):
         """Handle mode changes"""
-        if mode == "historical":
-            # Could implement historical schedule loading here
+        if mode in ["MLB", "NFL", "NBA", "NHL"]:
+            # Could extend to other leagues in the future
             pass
     
     def on_team_filter_changed(self, teams: List[str]):
         """Handle team filter changes"""
-        if teams and self.sports_aggregator:
-            filtered_travel = []
-            for team in teams:
-                filtered_travel.extend(self.sports_aggregator.get_travel_by_team(team))
+        if teams and self.current_travel_data:
+            filtered_travel = [t for t in self.current_travel_data if t.team_id in teams]
             self.globe_widget.filter_flights(filtered_travel)
+        elif not teams:
+            self.globe_widget.filter_flights(self.current_travel_data)
     
     def on_schedule_filter_changed(self, statuses: List[str]):
         """Handle schedule filter changes"""
@@ -479,8 +656,9 @@ class SportsTrackerMainWindow(QMainWindow):
     
     def on_route_filter_changed(self, departure: str, arrival: str):
         """Handle route filter changes"""
-        if self.sports_aggregator:
-            route_travel = self.sports_aggregator.get_travel_by_route(departure, arrival)
+        if self.current_travel_data:
+            route_travel = [t for t in self.current_travel_data
+                           if t.departure_city == departure and t.arrival_city == arrival]
             self.globe_widget.filter_flights(route_travel)
     
     def on_game_selected(self, game_id: str):
@@ -501,20 +679,16 @@ class SportsTrackerMainWindow(QMainWindow):
         current_options = (True, checked, True, True)
         self.globe_widget.set_display_options(*current_options)
     
-    def toggle_schedule_display(self, checked: bool):
-        """Toggle schedule display"""
-        current_options = (True, True, checked, True)
-        self.globe_widget.set_display_options(*current_options)
-    
     def export_travel_data(self):
         """Export current travel data"""
         if not self.current_travel_data:
             QMessageBox.information(self, "No Data", "No travel data to export.")
             return
         
+        season = self.season_combo.currentText()
         filename, _ = QFileDialog.getSaveFileName(
             self, "Export Travel Data", 
-            f"team_travel_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            f"team_travel_{season}_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             "JSON Files (*.json);;CSV Files (*.csv)"
         )
         
@@ -529,7 +703,8 @@ class SportsTrackerMainWindow(QMainWindow):
                         'arrival_city': travel.arrival_city,
                         'game_date': travel.game_date.isoformat() if travel.game_date else None,
                         'travel_date': travel.travel_date.isoformat() if travel.travel_date else None,
-                        'confidence': travel.confidence
+                        'confidence': travel.confidence,
+                        'season': season
                     })
                 
                 with open(filename, 'w') as f:
@@ -540,34 +715,6 @@ class SportsTrackerMainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export data: {str(e)}")
     
-    def update_status(self):
-        """Update status bar information"""
-        if self.last_update_time:
-            age = datetime.now() - self.last_update_time
-            minutes = int(age.total_seconds() / 60)
-            if minutes < 1:
-                age_text = "Just now"
-            elif minutes < 60:
-                age_text = f"{minutes}m ago"
-            else:
-                hours = minutes // 60
-                age_text = f"{hours}h ago"
-            
-            self.data_age_label.setText(f"Last Update: {age_text}")
-    
-    def show_about(self):
-        """Show about dialog"""
-        QMessageBox.about(self, "About Sports Team Travel Tracker", 
-                         "Sports Team Travel Tracker v3.0\n\n"
-                         "Real-time sports team movement visualization\n\n"
-                         "Features:\n"
-                         "• Live team schedules from ESPN API\n"
-                         "• Interactive 3D globe with travel paths\n"
-                         "• Team movement inference from game schedules\n"
-                         "• Multiple league support (MLB, NFL, NBA, NHL)\n"
-                         "• Team city highlighting and route visualization\n\n"
-                         "Built with PyQt6, OpenGL, and ESPN API")
-    
     def load_window_settings(self):
         """Load window settings"""
         geometry = self.settings.value("geometry")
@@ -577,47 +724,44 @@ class SportsTrackerMainWindow(QMainWindow):
         state = self.settings.value("windowState")
         if state:
             self.restoreState(state)
+        
+        # Load last selected season
+        last_season = self.settings.value("lastSeason")
+        if last_season:
+            index = self.season_combo.findText(last_season)
+            if index >= 0:
+                self.season_combo.setCurrentIndex(index)
+                self.current_season = last_season
     
     def save_window_settings(self):
         """Save window settings"""
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
+        self.settings.setValue("lastSeason", self.current_season)
     
     def closeEvent(self, event):
         """Handle application close"""
-        # Stop data monitoring
-        if self.data_update_timer:
-            self.data_update_timer.stop()
-        
         # Save settings
         self.save_window_settings()
         
         # Accept close event
         event.accept()
     
-    
-    def setup_debug_menu(self):
-        """Add debug menu for marker testing"""
-        # Add to your existing menu setup
-        debug_menu = self.menuBar().addMenu("Debug")
-        
-        # Marker debug actions
-        debug_markers_action = QAction("Debug Marker Pipeline", self)
-        debug_markers_action.triggered.connect(self.debug_marker_visibility)
-        debug_menu.addAction(debug_markers_action)
-        
-        create_test_marker_action = QAction("Create Test Marker", self)
-        create_test_marker_action.triggered.connect(self.create_test_marker)
-        debug_menu.addAction(create_test_marker_action)
-        
-        massive_marker_action = QAction("Create MASSIVE Marker", self)
-        massive_marker_action.triggered.connect(self.create_massive_marker)
-        debug_menu.addAction(massive_marker_action)
-
-
-    
-
-
+    def show_about(self):
+        """Show about dialog"""
+        QMessageBox.about(self, "About Sports Team Travel Tracker", 
+                         "Sports Team Travel Tracker v4.0\n\n"
+                         "Real-time sports team movement visualization\n\n"
+                         "Features:\n"
+                         "• Full season schedule loading via ESPN scraping\n"
+                         "• Team management and filtering\n"
+                         "• Multi-season support\n"
+                         "• Team-focused schedule views\n\n"
+                         "Data Sources:\n"
+                         "• ESPN Schedule Pages (primary)\n"
+                         "• Interactive 3D globe with travel paths\n"
+                         "• Team city highlighting and route visualization\n\n"
+                         "Built with PyQt6, OpenGL, and ESPN Schedule Data")
 
 
 def main():
@@ -627,7 +771,7 @@ def main():
     
     # Set application properties
     app.setApplicationName("Sports Team Travel Tracker")
-    app.setApplicationVersion("3.0")
+    app.setApplicationVersion("4.0")
     app.setOrganizationName("SportsTracker")
     app.setOrganizationDomain("sportstracker.dev")
     
@@ -638,9 +782,6 @@ def main():
     # Create and show main window
     window = SportsTrackerMainWindow()
     window.show()
-    
-    
-    
     
     # Run application
     return app.exec()

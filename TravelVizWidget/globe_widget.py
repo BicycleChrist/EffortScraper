@@ -1061,10 +1061,14 @@ class FlightGlobeWidget(QOpenGLWidget):
                 print(f"Travel record {i} missing departure_city")
                 continue
             
-            # Debug travel data
+            # Get team info directly from travel data
             team_id = getattr(travel, 'team_id', 'NO_TEAM_ID')
             team_name = getattr(travel, 'team_name', 'NO_TEAM_NAME')
-            print(f"Travel {i}: {team_name} ({team_id}) from {travel.departure_city} to {travel.arrival_city}")
+            
+            # Convert team_id to uppercase abbreviation for logo lookup
+            team_abbrev = team_id.upper() if isinstance(team_id, str) else ''
+            
+            print(f"Travel {i}: {team_name} ({team_abbrev}) from {travel.departure_city} to {travel.arrival_city}")
             
             dep_coords = self.get_city_coordinates(travel.departure_city)
             arr_coords = self.get_city_coordinates(travel.arrival_city)
@@ -1078,14 +1082,12 @@ class FlightGlobeWidget(QOpenGLWidget):
             
             path_points = self.generate_great_circle_path(dep_lat, dep_lon, arr_lat, arr_lon)
             if path_points and len(path_points) > 0:
-                # FIXED: Use team abbreviation for colors
-                espn_team_id = getattr(travel, 'team_id', '')
-                team_abbrev = self.get_team_abbreviation_from_espn_id(espn_team_id) if espn_team_id else ''
+                # Use team abbreviation directly for colors
                 team_color = self.get_team_color(team_abbrev) if team_abbrev else (1.0, 0.6, 0.2)
                 
                 path_data = {
                     'points': path_points,
-                    'team_name': getattr(travel, 'team_name', 'Unknown'),
+                    'team_name': team_name,
                     'route': f"{travel.departure_city} → {travel.arrival_city}",
                     'color': team_color,
                     'alpha': 0.85,
@@ -1093,26 +1095,24 @@ class FlightGlobeWidget(QOpenGLWidget):
                 }
                 self.travel_paths.append(path_data)
                 
-                # FIXED: Create team logo markers at departure cities with much smaller sizing
+                # Create team logo markers at departure cities
                 if travel.departure_city not in cities_seen:
                     cities_seen.add(travel.departure_city)
                     dep_3d = self.lat_lon_to_3d(dep_lat, dep_lon, 1.05)
-                    espn_team_id = getattr(travel, 'team_id', '')
-                    # FIXED: Convert ESPN numeric ID to team abbreviation
-                    team_abbrev = self.get_team_abbreviation_from_espn_id(espn_team_id)
-                    print(f"Creating DEPARTURE marker for team '{espn_team_id}' -> '{team_abbrev}' at {travel.departure_city}")
+                    
+                    print(f"Creating DEPARTURE marker for team '{team_abbrev}' at {travel.departure_city}")
                     print(f"Team abbreviation available in logo textures: {team_abbrev in self.team_logo_textures}")
+                    
                     city_marker = {
                         'position': dep_3d,
-                        'team_id': team_abbrev,  # Use abbreviation instead of ESPN ID
-                        'espn_id': espn_team_id,  # Keep original for reference
-                        'size': 4.0,  # Much smaller size
+                        'team_id': team_abbrev,  # Use uppercase abbreviation for logo lookup
+                        'size': 4.0,
                         'city_name': travel.departure_city,
                         'type': 'departure'
                     }
                     self.team_city_markers.append(city_marker)
                 
-                # FIXED: Create generic markers at arrival venues with smallest sizing
+                # Create generic markers at arrival venues
                 if travel.arrival_city not in venues_seen:
                     venues_seen.add(travel.arrival_city)
                     arr_3d = self.lat_lon_to_3d(arr_lat, arr_lon, 1.03)
@@ -1120,7 +1120,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                     venue_marker = {
                         'position': arr_3d,
                         'team_id': '',  # No team logo for venues
-                        'size': 3.0,  # Very small for venues
+                        'size': 3.0,
                         'venue_name': travel.arrival_city,
                         'type': 'arrival'
                     }
