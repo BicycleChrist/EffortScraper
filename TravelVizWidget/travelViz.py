@@ -17,6 +17,8 @@ from data_client import ESPNSportsDataAggregator, TeamTravelData, TeamInfo
 from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
 
+#TODO: Fix FUCKING royals travel data not loading for who the fuck knows why
+
 
 class ConfigLoader:
     """Load API configuration from files"""
