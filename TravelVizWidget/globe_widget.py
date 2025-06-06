@@ -17,11 +17,12 @@ from pathlib import Path
 class TeamTravelAnimation:
     """Manages animated team travel sequences"""
     
-    def __init__(self):
-        self.team_sequences = {}  # team_id -> chronological travel list
+    def __init__(self, parent_widget=None):
+        self.parent_widget = parent_widget
+        self.team_sequences = {}
         self.current_team = None
         self.animation_active = True
-        self.animation_progress = 0.0  # 0.0 to 1.0
+        self.animation_progress = 0.0
         self.animation_speed = 1.0
         self.current_segment = 0
         self.segment_progress = 0.0
@@ -30,7 +31,7 @@ class TeamTravelAnimation:
     def build_team_sequence(self, team_id: str, travel_data: List, season_start: datetime = None) -> Dict:
         """Build chronological travel sequence for a team"""
         if season_start is None:
-            season_start = datetime(datetime.now().year, 3, 1)  # Start of baseball season
+            season_start = datetime(datetime.now().year, 3, 1)
         
         today = datetime.now()
         
@@ -49,14 +50,13 @@ class TeamTravelAnimation:
         total_distance = 0
         total_duration = 0
         
-        for i, travel in enumerate(team_travel):
+        for travel in team_travel:
             dep_coords = self.get_city_coordinates(travel.departure_city)
             arr_coords = self.get_city_coordinates(travel.arrival_city)
             
             if not dep_coords or not arr_coords:
                 continue
                 
-            # Calculate segment data
             distance = self.haversine_distance(dep_coords[0], dep_coords[1], 
                                              arr_coords[0], arr_coords[1])
             duration = self.estimate_flight_duration(distance)
@@ -122,11 +122,9 @@ class TeamTravelAnimation:
         segments = sequence['segments']
         total_segments = len(segments)
         
-        # Update animation progress
         progress_delta = (frame_time * self.animation_speed) / total_segments
         self.animation_progress += progress_delta
         
-        # Handle animation completion/looping
         if self.animation_progress >= 1.0:
             if self.loop_animation:
                 self.animation_progress = 0.0
@@ -136,19 +134,16 @@ class TeamTravelAnimation:
                 self.animation_active = False
                 return None
         
-        # Calculate current segment and position within segment
         segment_float = self.animation_progress * total_segments
         self.current_segment = int(segment_float)
         self.segment_progress = segment_float - self.current_segment
         
-        # Ensure we don't exceed array bounds
         if self.current_segment >= total_segments:
             self.current_segment = total_segments - 1
             self.segment_progress = 1.0
         
         current_seg = segments[self.current_segment]
         
-        # Interpolate position along current path
         if current_seg['path_3d'] and len(current_seg['path_3d']) > 1:
             path_points = current_seg['path_3d']
             point_float = self.segment_progress * (len(path_points) - 1)
@@ -158,7 +153,6 @@ class TeamTravelAnimation:
             if point_index >= len(path_points) - 1:
                 current_position = path_points[-1]
             else:
-                # Linear interpolation between path points
                 p1 = path_points[point_index]
                 p2 = path_points[point_index + 1]
                 current_position = (
@@ -167,7 +161,6 @@ class TeamTravelAnimation:
                     p1[2] + (p2[2] - p1[2]) * point_progress
                 )
         else:
-            # Fallback to start position
             dep_coords = current_seg['departure_coords']
             current_position = self.lat_lon_to_3d(dep_coords[0], dep_coords[1], 1.05)
         
@@ -181,40 +174,14 @@ class TeamTravelAnimation:
         }
     
     def get_city_coordinates(self, city_name: str) -> Optional[Tuple[float, float]]:
-        """Get latitude/longitude for a city (duplicate of globe method for now)"""
-        city_coords = {
-            "Los Angeles": (34.0522, -118.2437), "New York": (40.7128, -74.0060),
-            "Chicago": (41.8781, -87.6298), "Houston": (29.7604, -95.3698),
-            "Phoenix": (33.4484, -112.0740), "Philadelphia": (39.9526, -75.1652),
-            "San Antonio": (29.4241, -98.4936), "San Diego": (32.7157, -117.1611),
-            "Dallas": (32.7767, -96.7970), "San Jose": (37.3382, -121.8863),
-            "Austin": (30.2672, -97.7431), "Jacksonville": (30.3322, -81.6557),
-            "San Francisco": (37.7749, -122.4194), "Columbus": (39.9612, -82.9988),
-            "Charlotte": (35.2271, -80.8431), "Fort Worth": (32.7555, -97.3308),
-            "Detroit": (42.3314, -83.0458), "El Paso": (31.7619, -106.4850),
-            "Memphis": (35.1495, -90.0490), "Baltimore": (39.2904, -76.6122),
-            "Boston": (42.3601, -71.0589), "Seattle": (47.6062, -122.3321),
-            "Denver": (39.7392, -104.9903), "Washington": (38.9072, -77.0369),
-            "Nashville": (36.1627, -86.7816), "Louisville": (38.2527, -85.7585),
-            "Portland": (45.5152, -122.6784), "Las Vegas": (36.1699, -115.1398),
-            "Milwaukee": (43.0389, -87.9065), "Atlanta": (33.7490, -84.3880),
-            "Miami": (25.7617, -80.1918), "Tampa": (27.9506, -82.4572),
-            "Pittsburgh": (40.4406, -79.9959), "Cincinnati": (39.1031, -84.5120),
-            "St. Louis": (38.6270, -90.1994), "Minneapolis": (44.9778, -93.2650),
-            "Toronto": (43.6532, -79.3832), "Montreal": (45.5017, -73.5673),
-            "Vancouver": (49.2827, -123.1207), "Calgary": (51.0447, -114.0719),
-            "Edmonton": (53.5461, -113.4938), "Ottawa": (45.4215, -75.6972),
-            "Winnipeg": (49.8951, -97.1384), "London": (51.5074, -0.1278),
-            "Paris": (48.8566, 2.3522), "Tokyo": (35.6762, 139.6503),
-            "Sydney": (-33.8688, 151.2093), "Berlin": (52.5200, 13.4050),
-            "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964),
-        }
-        return city_coords.get(city_name)
+        """Get coordinates from parent widget"""
+        if self.parent_widget and hasattr(self.parent_widget, 'get_city_coordinates'):
+            return self.parent_widget.get_city_coordinates(city_name)
+        return None
     
     def haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate great circle distance in miles"""
-        R = 3959  # Earth radius in miles
-        
+        R = 3959
         lat1_rad = math.radians(lat1)
         lat2_rad = math.radians(lat2)
         delta_lat = math.radians(lat2 - lat1)
@@ -229,11 +196,11 @@ class TeamTravelAnimation:
     def estimate_flight_duration(self, distance_miles: float) -> float:
         """Estimate flight duration in hours based on distance"""
         if distance_miles < 300:
-            return 1.0  # Minimum flight time
+            return 1.0
         elif distance_miles < 1000:
-            return distance_miles / 400  # ~400 mph average for short flights
+            return distance_miles / 400
         else:
-            return distance_miles / 500  # ~500 mph average for longer flights
+            return distance_miles / 500
     
     def lat_lon_to_3d(self, lat: float, lon: float, radius: float = 1.0) -> Tuple[float, float, float]:
         """Convert latitude/longitude to 3D coordinates"""
@@ -252,32 +219,25 @@ class TeamTravelAnimation:
         if abs(start_lat - end_lat) < 0.001 and abs(start_lon - end_lon) < 0.001:
             return []
         
-        try:
-            delta_lon = end_lon - start_lon
-            if delta_lon > 180:
-                end_lon -= 360
-            elif delta_lon < -180:
-                end_lon += 360
-            
-            path_points = []
-            base_altitude = 1.02
-            max_altitude = 1.08
-            
-            for i in range(num_points + 1):
-                t = i / num_points
-                
-                lat = start_lat + t * (end_lat - start_lat)
-                lon = start_lon + t * (end_lon - start_lon)
-                
-                altitude_factor = math.sin(t * math.pi) * (max_altitude - base_altitude) + base_altitude
-                point_3d = self.lat_lon_to_3d(lat, lon, altitude_factor)
-                path_points.append(point_3d)
-            
-            return path_points
-            
-        except Exception as e:
-            print(f"Error generating great circle path: {e}")
-            return []
+        delta_lon = end_lon - start_lon
+        if delta_lon > 180:
+            end_lon -= 360
+        elif delta_lon < -180:
+            end_lon += 360
+        
+        path_points = []
+        base_altitude = 1.02
+        max_altitude = 1.08
+        
+        for i in range(num_points + 1):
+            t = i / num_points
+            lat = start_lat + t * (end_lat - start_lat)
+            lon = start_lon + t * (end_lon - start_lon)
+            altitude_factor = math.sin(t * math.pi) * (max_altitude - base_altitude) + base_altitude
+            point_3d = self.lat_lon_to_3d(lat, lon, altitude_factor)
+            path_points.append(point_3d)
+        
+        return path_points
 
 
 class FlightGlobeWidget(QOpenGLWidget):
@@ -288,10 +248,8 @@ class FlightGlobeWidget(QOpenGLWidget):
     flightSelected = pyqtSignal(str)
     dataLoadingProgress = pyqtSignal(int)
     performanceUpdate = pyqtSignal(float)
-    
-    # New animation signals
-    animationStatusChanged = pyqtSignal(bool, str)  # active, team_id
-    animationProgressChanged = pyqtSignal(float, dict)  # progress, segment_info
+    animationStatusChanged = pyqtSignal(bool, str)
+    animationProgressChanged = pyqtSignal(float, dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -305,7 +263,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.ebo = None
         self.earth_texture = None
         
-        # FIXED: Reusable marker VAO/VBO to prevent GL errors
+        # Reusable marker VAO/VBO
         self.marker_vao = None
         self.marker_vbo = None
         self.marker_geometry = None
@@ -348,13 +306,11 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.team_city_markers = []
         self.venue_markers = []
         
-        # NEW: Team travel animation system
-        self.travel_animation = TeamTravelAnimation()
+        # Team travel animation system
+        self.travel_animation = TeamTravelAnimation(self)
         self.animated_marker_position = None
         self.show_travel_animation = False
-        
-        # FIXED: Animation control for spinning
-        self.disable_spinning_during_animation = True  # Option to disable spinning during animation
+        self.disable_spinning_during_animation = True
         
         # Display options
         self.show_travel_paths = True
@@ -386,100 +342,60 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.rotation_matrix.rotate(-50, 0, 1, 0)
     
     def initializeGL(self):
-        """Initialize OpenGL resources - ENHANCED"""
-        try:
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            gl.glEnable(gl.GL_CULL_FACE)
-            gl.glCullFace(gl.GL_BACK)
-            gl.glEnable(gl.GL_BLEND)
-            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-            gl.glClearColor(0.01, 0.02, 0.08, 1.0)
-            
-            # Initialize in proper order
-            self.generate_sphere_geometry()
-            self.setup_shaders()
-            self.setup_vertex_buffers()
-            self.setup_earth_texture()
-            self.load_team_logo_textures()
-            
-            # CRITICAL: Create reusable marker VAO after all other GL setup
-            self.setup_marker_vao()
-            
-            # Verify marker VAO was created successfully
-            if self.marker_vao:
-                print("✅ Globe OpenGL initialized successfully with animation support")
-                self.gl_initialized = True
-            else:
-                print("❌ Globe OpenGL initialization failed - no marker VAO")
-                self.gl_initialized = False
-            
-        except Exception as e:
-            print(f"❌ OpenGL initialization error: {e}")
-            self.gl_initialized = False
+        """Initialize OpenGL resources"""
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_CULL_FACE)
+        gl.glCullFace(gl.GL_BACK)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glClearColor(0.01, 0.02, 0.08, 1.0)
+        
+        self.generate_sphere_geometry()
+        self.setup_shaders()
+        self.setup_vertex_buffers()
+        self.setup_earth_texture()
+        self.load_team_logo_textures()
+        self.setup_marker_vao()
+        
+        self.gl_initialized = bool(self.marker_vao)
+        if self.gl_initialized:
+            print("✅ Globe OpenGL initialized successfully")
+        else:
+            print("❌ Globe OpenGL initialization failed")
     
     def setup_marker_vao(self):
-        """Create reusable marker VAO and VBO (called once) - ENHANCED ERROR CHECKING"""
-        try:
-            # Make sure we have an active OpenGL context
-            if not self.context():
-                print("❌ No OpenGL context available for marker VAO setup")
-                return
+        """Create reusable marker VAO and VBO"""
+        if not self.context():
+            return
                 
-            # Generate cube geometry once
-            self.marker_geometry = self.create_marker_cube_geometry()
-            
-            if self.marker_geometry is None:
-                print("❌ Failed to create marker geometry")
-                return
-            
-            # Create VAO and VBO once
-            try:
-                self.marker_vao = gl.glGenVertexArrays(1)
-                self.marker_vbo = gl.glGenBuffers(1)
-            except Exception as e:
-                print(f"❌ Error generating VAO/VBO: {e}")
-                return
-            
-            if self.marker_vao == 0 or self.marker_vbo == 0:
-                print("❌ Failed to generate valid VAO/VBO")
-                return
-            
-            gl.glBindVertexArray(self.marker_vao)
-            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.marker_vbo)
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, self.marker_geometry.nbytes, 
-                           self.marker_geometry, gl.GL_STATIC_DRAW)
-            
-            # Setup vertex attributes (position + normal + texCoord)
-            stride = 8 * 4  # 8 floats * 4 bytes per float
-            
-            # Position attribute (location 0)
-            gl.glEnableVertexAttribArray(0)
-            gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
-            
-            # Normal attribute (location 1) 
-            gl.glEnableVertexAttribArray(1)
-            gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
-            
-            # Texture coordinate attribute (location 2)
-            gl.glEnableVertexAttribArray(2)
-            gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(24))
-            
-            # Unbind to prevent accidental modification
-            gl.glBindVertexArray(0)
-            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
-            
-            # Check for OpenGL errors
-            error = gl.glGetError()
-            if error != gl.GL_NO_ERROR:
-                print(f"❌ OpenGL error during marker VAO setup: {error}")
-                return
-            
-            print("✅ Marker VAO created successfully")
-            
-        except Exception as e:
-            print(f"❌ Marker VAO setup error: {e}")
-            self.marker_vao = None
-            self.marker_vbo = None
+        self.marker_geometry = self.create_marker_cube_geometry()
+        if self.marker_geometry is None:
+            return
+        
+        self.marker_vao = gl.glGenVertexArrays(1)
+        self.marker_vbo = gl.glGenBuffers(1)
+        
+        if self.marker_vao == 0 or self.marker_vbo == 0:
+            return
+        
+        gl.glBindVertexArray(self.marker_vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.marker_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.marker_geometry.nbytes, 
+                       self.marker_geometry, gl.GL_STATIC_DRAW)
+        
+        stride = 8 * 4
+        
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
+        
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
+        
+        gl.glEnableVertexAttribArray(2)
+        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(24))
+        
+        gl.glBindVertexArray(0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
     
     def generate_sphere_geometry(self):
         """Generate sphere geometry with correct UV mapping for Earth textures"""
@@ -524,416 +440,373 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.normals = np.array(normals, dtype=np.float32)
     
     def setup_shaders(self):
-        """Setup OpenGL shaders with enhanced animation support"""
-        try:
-            # Earth shader (unchanged from original)
-            earth_vertex = """
-            #version 330 core
-            layout (location = 0) in vec3 position;
-            layout (location = 1) in vec2 texCoord;
-            layout (location = 2) in vec3 normal;
+        """Setup OpenGL shaders"""
+        # Earth shader
+        earth_vertex = """
+        #version 330 core
+        layout (location = 0) in vec3 position;
+        layout (location = 1) in vec2 texCoord;
+        layout (location = 2) in vec3 normal;
+        
+        uniform mat4 mvp;
+        uniform mat4 model;
+        uniform mat3 normalMatrix;
+        uniform vec3 lightDir;
+        uniform vec3 viewPos;
+        
+        out vec2 TexCoord;
+        out vec3 Normal;
+        out vec3 FragPos;
+        out vec3 ViewDir;
+        out float LightIntensity;
+        
+        void main() {
+            vec4 worldPos = model * vec4(position, 1.0);
+            gl_Position = mvp * vec4(position, 1.0);
             
-            uniform mat4 mvp;
-            uniform mat4 model;
-            uniform mat3 normalMatrix;
-            uniform vec3 lightDir;
-            uniform vec3 viewPos;
+            TexCoord = texCoord;
+            Normal = normalize(normalMatrix * normal);
+            FragPos = worldPos.xyz;
+            ViewDir = normalize(viewPos - FragPos);
+            LightIntensity = max(dot(Normal, normalize(lightDir)), 0.0);
+        }
+        """
+        
+        earth_fragment = """
+        #version 330 core
+        in vec2 TexCoord;
+        in vec3 Normal;
+        in vec3 FragPos;
+        in vec3 ViewDir;
+        in float LightIntensity;
+        
+        out vec4 FragColor;
+        
+        uniform sampler2D earthTexture;
+        uniform vec3 lightDir;
+        uniform bool showAtmosphere;
+        
+        void main() {
+            vec3 earthColor = texture(earthTexture, TexCoord).rgb;
+            float ambient = 0.15;
+            float diffuse = LightIntensity * 0.85;
+            vec3 litColor = earthColor * (ambient + diffuse);
             
-            out vec2 TexCoord;
-            out vec3 Normal;
-            out vec3 FragPos;
-            out vec3 ViewDir;
-            out float LightIntensity;
-            
-            void main() {
-                vec4 worldPos = model * vec4(position, 1.0);
-                gl_Position = mvp * vec4(position, 1.0);
-                
-                TexCoord = texCoord;
-                Normal = normalize(normalMatrix * normal);
-                FragPos = worldPos.xyz;
-                ViewDir = normalize(viewPos - FragPos);
-                LightIntensity = max(dot(Normal, normalize(lightDir)), 0.0);
+            if (LightIntensity < 0.3) {
+                vec2 cityCoord = TexCoord * 50.0;
+                float cityNoise = sin(cityCoord.x) * cos(cityCoord.y);
+                float cityLights = smoothstep(0.7, 1.0, cityNoise) * (0.3 - LightIntensity);
+                litColor += vec3(1.0, 0.8, 0.4) * cityLights * 0.3;
             }
-            """
             
-            earth_fragment = """
-            #version 330 core
-            in vec2 TexCoord;
-            in vec3 Normal;
-            in vec3 FragPos;
-            in vec3 ViewDir;
-            in float LightIntensity;
+            vec3 finalColor = litColor;
             
-            out vec4 FragColor;
-            
-            uniform sampler2D earthTexture;
-            uniform vec3 lightDir;
-            uniform bool showAtmosphere;
-            
-            void main() {
-                vec3 earthColor = texture(earthTexture, TexCoord).rgb;
-                float ambient = 0.15;
-                float diffuse = LightIntensity * 0.85;
-                vec3 litColor = earthColor * (ambient + diffuse);
-                
-                if (LightIntensity < 0.3) {
-                    vec2 cityCoord = TexCoord * 50.0;
-                    float cityNoise = sin(cityCoord.x) * cos(cityCoord.y);
-                    float cityLights = smoothstep(0.7, 1.0, cityNoise) * (0.3 - LightIntensity);
-                    litColor += vec3(1.0, 0.8, 0.4) * cityLights * 0.3;
-                }
-                
-                vec3 finalColor = litColor;
-                
-                if (showAtmosphere) {
-                    float rim = 1.0 - max(dot(ViewDir, Normal), 0.0);
-                    rim = pow(rim, 1.5);
-                    vec3 atmosphereColor = vec3(0.4, 0.7, 1.0) * rim * 0.6;
-                    finalColor += atmosphereColor;
-                }
-                
-                FragColor = vec4(finalColor, 1.0);
+            if (showAtmosphere) {
+                float rim = 1.0 - max(dot(ViewDir, Normal), 0.0);
+                rim = pow(rim, 1.5);
+                vec3 atmosphereColor = vec3(0.4, 0.7, 1.0) * rim * 0.6;
+                finalColor += atmosphereColor;
             }
-            """
             
-            self.shader_program = QOpenGLShaderProgram()
-            self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
-            self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
-            self.shader_program.link()
+            FragColor = vec4(finalColor, 1.0);
+        }
+        """
+        
+        self.shader_program = QOpenGLShaderProgram()
+        self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
+        self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
+        self.shader_program.link()
+        
+        # Travel path shader
+        travel_vertex = """
+        #version 330 core
+        layout (location = 0) in vec3 position;
+        
+        uniform mat4 mvp;
+        uniform float time;
+        uniform vec3 pathColor;
+        uniform float pathAlpha;
+        
+        out vec3 Color;
+        out float Alpha;
+        
+        void main() {
+            gl_Position = mvp * vec4(position, 1.0);
+            Color = pathColor;
+            Alpha = pathAlpha;
+        }
+        """
+        
+        travel_fragment = """
+        #version 330 core
+        in vec3 Color;
+        in float Alpha;
+        
+        out vec4 FragColor;
+        
+        uniform float time;
+        
+        void main() {
+            float pulse = sin(time * 2.0) * 0.3 + 0.7;
+            vec3 glowColor = Color * pulse;
+            vec3 finalColor = glowColor + Color * 0.2;
+            FragColor = vec4(finalColor, Alpha);
+        }
+        """
+        
+        self.travel_shader = QOpenGLShaderProgram()
+        self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
+        self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
+        self.travel_shader.link()
+        
+        # Marker shader
+        marker_vertex = """
+        #version 330 core
+        layout (location = 0) in vec3 position;
+        layout (location = 1) in vec3 normal;
+        layout (location = 2) in vec2 texCoord;
+        
+        uniform mat4 mvp;
+        uniform mat4 modelMatrix;
+        uniform vec3 markerCenter;
+        uniform float markerSize;
+        uniform float time;
+        uniform float rotationSpeed;
+        uniform bool isAnimated;
+        
+        out vec2 MarkerTexCoord;
+        out vec3 MarkerNormal;
+        out float LightIntensity;
+        
+        void main() {
+            float rotY = time * rotationSpeed;
+            float rotX = time * rotationSpeed * 0.7;
             
-            # Travel path shader (unchanged)
-            travel_vertex = """
-            #version 330 core
-            layout (location = 0) in vec3 position;
-            
-            uniform mat4 mvp;
-            uniform float time;
-            uniform vec3 pathColor;
-            uniform float pathAlpha;
-            
-            out vec3 Color;
-            out float Alpha;
-            
-            void main() {
-                gl_Position = mvp * vec4(position, 1.0);
-                Color = pathColor;
-                Alpha = pathAlpha;
+            if (isAnimated) {
+                rotY *= 2.0;
+                rotX *= 1.5;
             }
-            """
             
-            travel_fragment = """
-            #version 330 core
-            in vec3 Color;
-            in float Alpha;
+            mat3 rotationY = mat3(
+                cos(rotY), 0.0, sin(rotY),
+                0.0, 1.0, 0.0,
+                -sin(rotY), 0.0, cos(rotY)
+            );
             
-            out vec4 FragColor;
+            mat3 rotationX = mat3(
+                1.0, 0.0, 0.0,
+                0.0, cos(rotX), -sin(rotX),
+                0.0, sin(rotX), cos(rotX)
+            );
             
-            uniform float time;
+            mat3 rotation = rotationY * rotationX;
             
-            void main() {
-                float pulse = sin(time * 2.0) * 0.3 + 0.7;
-                vec3 glowColor = Color * pulse;
-                vec3 finalColor = glowColor + Color * 0.2;
-                FragColor = vec4(finalColor, Alpha);
+            float animatedSize = markerSize;
+            if (isAnimated) {
+                float pulse = sin(time * 4.0) * 0.3 + 1.0;
+                animatedSize *= pulse * 0.012;
+            } else {
+                animatedSize *= 0.008;
             }
-            """
             
-            self.travel_shader = QOpenGLShaderProgram()
-            self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
-            self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
-            self.travel_shader.link()
+            vec3 rotatedPos = rotation * (position * animatedSize);
+            vec3 worldPos = markerCenter + rotatedPos;
             
-            # Enhanced marker shader with better animation effects
-            marker_vertex = """
-            #version 330 core
-            layout (location = 0) in vec3 position;
-            layout (location = 1) in vec3 normal;
-            layout (location = 2) in vec2 texCoord;
+            gl_Position = mvp * vec4(worldPos, 1.0);
             
-            uniform mat4 mvp;
-            uniform mat4 modelMatrix;
-            uniform vec3 markerCenter;
-            uniform float markerSize;
-            uniform float time;
-            uniform float rotationSpeed;
-            uniform bool isAnimated;
+            MarkerNormal = rotation * normal;
+            vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
+            LightIntensity = max(dot(MarkerNormal, lightDir), 0.6);
             
-            out vec2 MarkerTexCoord;
-            out vec3 MarkerNormal;
-            out float LightIntensity;
+            MarkerTexCoord = texCoord;
+        }
+        """
+        
+        marker_fragment = """
+        #version 330 core
+        in vec2 MarkerTexCoord;
+        in vec3 MarkerNormal;
+        in float LightIntensity;
+        
+        out vec4 FragColor;
+        
+        uniform sampler2D markerTexture;
+        uniform float time;
+        uniform vec3 teamColor;
+        uniform bool useTexture;
+        uniform float markerAlpha;
+        uniform bool isAnimated;
+        
+        void main() {
+            vec3 finalColor;
+            float finalAlpha = markerAlpha;
             
-            void main() {
-                float rotY = time * rotationSpeed;
-                float rotX = time * rotationSpeed * 0.7;
-                
-                if (isAnimated) {
-                    // Enhanced rotation for animated markers
-                    rotY *= 2.0;
-                    rotX *= 1.5;
-                }
-                
-                mat3 rotationY = mat3(
-                    cos(rotY), 0.0, sin(rotY),
-                    0.0, 1.0, 0.0,
-                    -sin(rotY), 0.0, cos(rotY)
-                );
-                
-                mat3 rotationX = mat3(
-                    1.0, 0.0, 0.0,
-                    0.0, cos(rotX), -sin(rotX),
-                    0.0, sin(rotX), cos(rotX)
-                );
-                
-                mat3 rotation = rotationY * rotationX;
-                
-                float animatedSize = markerSize;
-                if (isAnimated) {
-                    // Pulsing effect for animated marker
-                    float pulse = sin(time * 4.0) * 0.3 + 1.0;
-                    animatedSize *= pulse * 0.012; // Slightly larger animated cubes
-                } else {
-                    animatedSize *= 0.008;
-                }
-                
-                vec3 rotatedPos = rotation * (position * animatedSize);
-                vec3 worldPos = markerCenter + rotatedPos;
-                
-                gl_Position = mvp * vec4(worldPos, 1.0);
-                
-                MarkerNormal = rotation * normal;
-                vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
-                LightIntensity = max(dot(MarkerNormal, lightDir), 0.6);
-                
-                MarkerTexCoord = texCoord;
-            }
-            """
-            
-            marker_fragment = """
-            #version 330 core
-            in vec2 MarkerTexCoord;
-            in vec3 MarkerNormal;
-            in float LightIntensity;
-            
-            out vec4 FragColor;
-            
-            uniform sampler2D markerTexture;
-            uniform float time;
-            uniform vec3 teamColor;
-            uniform bool useTexture;
-            uniform float markerAlpha;
-            uniform bool isAnimated;
-            
-            void main() {
-                vec3 finalColor;
-                float finalAlpha = markerAlpha;
-                
-                if (useTexture) {
-                    vec4 texColor = texture(markerTexture, MarkerTexCoord);
-                    if (texColor.a > 0.01) {
-                        finalColor = texColor.rgb * LightIntensity;
-                        finalAlpha *= texColor.a;
-                    } else {
-                        finalColor = teamColor * LightIntensity;
-                    }
+            if (useTexture) {
+                vec4 texColor = texture(markerTexture, MarkerTexCoord);
+                if (texColor.a > 0.01) {
+                    finalColor = texColor.rgb * LightIntensity;
+                    finalAlpha *= texColor.a;
                 } else {
                     finalColor = teamColor * LightIntensity;
                 }
-                
-                if (isAnimated) {
-                    // Add glowing effect for animated marker
-                    float glow = sin(time * 3.0) * 0.4 + 0.6;
-                    finalColor *= glow;
-                    finalColor += vec3(1.0, 0.8, 0.2) * 0.3; // Golden glow
-                }
-                
-                FragColor = vec4(finalColor, finalAlpha);
+            } else {
+                finalColor = teamColor * LightIntensity;
             }
-            """
             
-            self.marker_shader = QOpenGLShaderProgram()
-            self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
-            self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
-            self.marker_shader.link()
+            if (isAnimated) {
+                float glow = sin(time * 3.0) * 0.4 + 0.6;
+                finalColor *= glow;
+                finalColor += vec3(1.0, 0.8, 0.2) * 0.3;
+            }
             
-            print("Shaders compiled successfully with enhanced animation support")
-            
-        except Exception as e:
-            print(f"Shader setup error: {e}")
-    
-    # [Include all the existing methods from the original class: load_team_logo_textures, setup_vertex_buffers, 
-    # setup_earth_texture, create_fallback_earth_texture, create_marker_cube_geometry, etc.]
+            FragColor = vec4(finalColor, finalAlpha);
+        }
+        """
+        
+        self.marker_shader = QOpenGLShaderProgram()
+        self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
+        self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
+        self.marker_shader.link()
     
     def load_team_logo_textures(self):
-        """Load MLB team logo textures from PNG files with proper alpha handling"""
-        try:
-            logos_path = Path(self.logos_folder)
-            if not logos_path.exists():
-                print(f"Warning: MLB logos folder '{self.logos_folder}' not found")
-                self.create_default_marker_texture()
-                return
-            
-            # MLB team ID to filename mapping
-            team_logo_files = {
-                "LAD": "Dodgers.png", "NYY": "Yankees.png", "BOS": "Redsox.png",
-                "CHC": "Cubs.png", "SF": "Giants.png", "ATL": "Braves.png",
-                "HOU": "Astros.png", "LAA": "Angels.png", "NYM": "Mets.png",
-                "PHI": "Phillies.png", "STL": "Cardinals.png", "WSH": "Nationals.png",
-                "MIL": "Brewers.png", "COL": "Rockies.png", "ARI": "Diamondbacks.png",
-                "SD": "Padres.png", "MIA": "Marlins.png", "TEX": "Rangers.png",
-                "CIN": "Reds.png", "PIT": "Pirates.png", "BAL": "Orioles.png",
-                "CLE": "Guardians.png", "DET": "Tigers.png", "MIN": "Twins.png",
-                "CWS": "WhiteSox.png", "KC": "Royals.png", "OAK": "Athletics.png",
-                "SEA": "Mariners.png", "TB": "Rays.png", "TOR": "BlueJays.png"
-            }
-            
-            logos_loaded = 0
-            for team_id, filename in team_logo_files.items():
-                logo_path = logos_path / filename
-                if logo_path.exists():
-                    try:
-                        image = QImage(str(logo_path))
-                        if not image.isNull():
-                            image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                              Qt.TransformationMode.SmoothTransformation)
-                            image = self.process_logo_image(image, team_id)
-                            
-                            texture = QOpenGLTexture(image)
-                            texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
-                            texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-                            texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-                            
-                            self.team_logo_textures[team_id] = texture
-                            logos_loaded += 1
-                    except Exception as e:
-                        print(f"Error loading logo {filename}: {e}")
-            
-            print(f"Loaded {logos_loaded} team logo textures")
+        """Load MLB team logo textures from PNG files"""
+        logos_path = Path(self.logos_folder)
+        if not logos_path.exists():
             self.create_default_marker_texture()
-            
-        except Exception as e:
-            print(f"Error loading team logo textures: {e}")
-            self.create_default_marker_texture()
+            return
+        
+        team_logo_files = {
+            "LAD": "Dodgers.png", "NYY": "Yankees.png", "BOS": "Redsox.png",
+            "CHC": "Cubs.png", "SF": "Giants.png", "ATL": "Braves.png",
+            "HOU": "Astros.png", "LAA": "Angels.png", "NYM": "Mets.png",
+            "PHI": "Phillies.png", "STL": "Cardinals.png", "WSH": "Nationals.png",
+            "MIL": "Brewers.png", "COL": "Rockies.png", "ARI": "Diamondbacks.png",
+            "SD": "Padres.png", "MIA": "Marlins.png", "TEX": "Rangers.png",
+            "CIN": "Reds.png", "PIT": "Pirates.png", "BAL": "Orioles.png",
+            "CLE": "Guardians.png", "DET": "Tigers.png", "MIN": "Twins.png",
+            "CWS": "WhiteSox.png", "KC": "Royals.png", "OAK": "Athletics.png",
+            "SEA": "Mariners.png", "TB": "Rays.png", "TOR": "BlueJays.png"
+        }
+        
+        logos_loaded = 0
+        for team_id, filename in team_logo_files.items():
+            logo_path = logos_path / filename
+            if logo_path.exists():
+                image = QImage(str(logo_path))
+                if not image.isNull():
+                    image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
+                                      Qt.TransformationMode.SmoothTransformation)
+                    image = self.process_logo_image(image, team_id)
+                    
+                    texture = QOpenGLTexture(image)
+                    texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
+                    texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+                    texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+                    
+                    self.team_logo_textures[team_id] = texture
+                    logos_loaded += 1
+        
+        print(f"Loaded {logos_loaded} team logo textures")
+        self.create_default_marker_texture()
     
     def process_logo_image(self, image: QImage, team_id: str) -> QImage:
         """Process logo image to ensure proper visibility"""
-        try:
-            if image.format() != QImage.Format.Format_RGBA8888:
-                image = image.convertToFormat(QImage.Format.Format_RGBA8888)
-            return image
-        except Exception as e:
-            print(f"Error processing logo image for {team_id}: {e}")
-            return image
+        if image.format() != QImage.Format.Format_RGBA8888:
+            image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        return image
     
     def create_default_marker_texture(self):
         """Create a default solid marker texture"""
-        try:
-            size = 128
-            image = QImage(size, size, QImage.Format.Format_RGBA8888)
-            
-            center = size // 2
-            for y in range(size):
-                for x in range(size):
-                    dx = x - center
-                    dy = y - center
-                    dist = math.sqrt(dx*dx + dy*dy) / center
-                    
-                    intensity = max(0.6, min(1.0, 1.0 - dist * 0.3))
-                    color = QColor(int(180 * intensity), int(180 * intensity), int(200 * intensity), 220)
-                    image.setPixelColor(x, y, color)
-            
-            self.default_marker_texture = QOpenGLTexture(image)
-            self.default_marker_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
-            self.default_marker_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-            self.default_marker_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-            
-        except Exception as e:
-            print(f"Default marker texture creation error: {e}")
+        size = 128
+        image = QImage(size, size, QImage.Format.Format_RGBA8888)
+        
+        center = size // 2
+        for y in range(size):
+            for x in range(size):
+                dx = x - center
+                dy = y - center
+                dist = math.sqrt(dx*dx + dy*dy) / center
+                
+                intensity = max(0.6, min(1.0, 1.0 - dist * 0.3))
+                color = QColor(int(180 * intensity), int(180 * intensity), int(200 * intensity), 220)
+                image.setPixelColor(x, y, color)
+        
+        self.default_marker_texture = QOpenGLTexture(image)
+        self.default_marker_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        self.default_marker_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+        self.default_marker_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
     
     def setup_vertex_buffers(self):
         """Setup vertex buffer objects"""
         if self.vertices is None:
             return
         
-        try:
-            vertex_count = len(self.vertices) // 3
-            vertex_data = []
-            
-            for i in range(vertex_count):
-                vertex_data.extend([
-                    self.vertices[i*3], self.vertices[i*3+1], self.vertices[i*3+2],
-                    self.texcoords[i*2], self.texcoords[i*2+1],
-                    self.normals[i*3], self.normals[i*3+1], self.normals[i*3+2]
-                ])
-            
-            vertex_array = np.array(vertex_data, dtype=np.float32)
-            
-            self.vao = gl.glGenVertexArrays(1)
-            gl.glBindVertexArray(self.vao)
-            
-            self.vbo = gl.glGenBuffers(1)
-            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, vertex_array.nbytes, vertex_array, gl.GL_STATIC_DRAW)
-            
-            self.ebo = gl.glGenBuffers(1)
-            gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
-            gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, self.indices.nbytes, self.indices, gl.GL_STATIC_DRAW)
-            
-            stride = 8 * 4
-            gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
-            gl.glEnableVertexAttribArray(0)
-            gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
-            gl.glEnableVertexAttribArray(1)
-            gl.glVertexAttribPointer(2, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(20))
-            gl.glEnableVertexAttribArray(2)
-            
-        except Exception as e:
-            print(f"Vertex buffer setup error: {e}")
+        vertex_count = len(self.vertices) // 3
+        vertex_data = []
+        
+        for i in range(vertex_count):
+            vertex_data.extend([
+                self.vertices[i*3], self.vertices[i*3+1], self.vertices[i*3+2],
+                self.texcoords[i*2], self.texcoords[i*2+1],
+                self.normals[i*3], self.normals[i*3+1], self.normals[i*3+2]
+            ])
+        
+        vertex_array = np.array(vertex_data, dtype=np.float32)
+        
+        self.vao = gl.glGenVertexArrays(1)
+        gl.glBindVertexArray(self.vao)
+        
+        self.vbo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, vertex_array.nbytes, vertex_array, gl.GL_STATIC_DRAW)
+        
+        self.ebo = gl.glGenBuffers(1)
+        gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, self.indices.nbytes, self.indices, gl.GL_STATIC_DRAW)
+        
+        stride = 8 * 4
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(2, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(20))
+        gl.glEnableVertexAttribArray(2)
     
     def setup_earth_texture(self):
         """Load Earth texture"""
-        try:
-            texture_files = ["no_ice_clouds_8k.jpg", "earth.jpg"]
-            
-            image = None
-            for texture_file in texture_files:
-                image = QImage(texture_file)
-                if not image.isNull():
-                    break
-            
-            if image is None or image.isNull():
-                self.create_fallback_earth_texture()
-                return
-            
-            image = image.convertToFormat(QImage.Format.Format_RGB888)
-            self.earth_texture = QOpenGLTexture(image)
-            self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
-            self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-            
-        except Exception as e:
-            print(f"Earth texture loading error: {e}")
+        texture_files = ["no_ice_clouds_8k.jpg", "earth.jpg"]
+        
+        image = None
+        for texture_file in texture_files:
+            image = QImage(texture_file)
+            if not image.isNull():
+                break
+        
+        if image is None or image.isNull():
             self.create_fallback_earth_texture()
+            return
+        
+        image = image.convertToFormat(QImage.Format.Format_RGB888)
+        self.earth_texture = QOpenGLTexture(image)
+        self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
+        self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
     
     def create_fallback_earth_texture(self):
         """Create a fallback Earth texture"""
-        try:
-            width, height = 512, 256
-            image = QImage(width, height, QImage.Format.Format_RGB888)
-            
-            for y in range(height):
-                for x in range(width):
-                    blue = int(100 + (y / height) * 155)
-                    green = int(50 + (x / width) * 100)
-                    red = int(30)
-                    color = QColor(red, green, blue)
-                    image.setPixelColor(x, y, color)
-            
-            self.earth_texture = QOpenGLTexture(image)
-            self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
-            self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-            
-        except Exception as e:
-            print(f"Fallback Earth texture creation error: {e}")
+        width, height = 512, 256
+        image = QImage(width, height, QImage.Format.Format_RGB888)
+        
+        for y in range(height):
+            for x in range(width):
+                blue = int(100 + (y / height) * 155)
+                green = int(50 + (x / width) * 100)
+                red = int(30)
+                color = QColor(red, green, blue)
+                image.setPixelColor(x, y, color)
+        
+        self.earth_texture = QOpenGLTexture(image)
+        self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
     
     def create_marker_cube_geometry(self):
         """Create geometry for a spinning 3D cube marker"""
@@ -984,25 +857,18 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         return np.array(vertices, dtype=np.float32)
     
-    # NEW ANIMATION METHODS
+    # Animation methods
     
     def start_team_animation(self, team_id: str) -> bool:
         """Start travel animation for a specific team"""
         if not self.travel_data:
-            print(f"No travel data available for animation")
             return False
         
-        # Build team travel sequence
         sequence = self.travel_animation.build_team_sequence(team_id, self.travel_data)
         
         if not sequence or not sequence['segments']:
-            print(f"No travel sequence found for team {team_id}")
             return False
         
-        print(f"Starting animation for {team_id}: {len(sequence['segments'])} segments, "
-              f"{sequence['total_distance']:.0f} miles, {sequence['total_duration']:.1f} hours")
-        
-        # Start the animation
         success = self.travel_animation.start_animation(team_id)
         if success:
             self.show_travel_animation = True
@@ -1057,7 +923,15 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         return sorted(list(teams))
     
-    # [Include coordinate conversion and path generation methods from original]
+    def set_spinning_during_animation(self, enabled: bool):
+        """Control whether markers spin during animation"""
+        self.disable_spinning_during_animation = not enabled
+        
+    def get_spinning_during_animation(self) -> bool:
+        """Check if markers spin during animation"""
+        return not self.disable_spinning_during_animation
+    
+    # Coordinate conversion methods
     
     def lat_lon_to_3d(self, lat: float, lon: float, radius: float = 1.0) -> Tuple[float, float, float]:
         """Convert latitude/longitude to 3D coordinates"""
@@ -1065,20 +939,16 @@ class FlightGlobeWidget(QOpenGLWidget):
         if cache_key in self.coordinate_cache:
             return self.coordinate_cache[cache_key]
         
-        try:
-            lat_rad = math.radians(lat)
-            lon_rad = math.radians(lon)
-            
-            x = radius * math.cos(lat_rad) * math.cos(lon_rad)
-            y = radius * math.sin(lat_rad)
-            z = -radius * math.cos(lat_rad) * math.sin(lon_rad)
-            
-            result = (float(x), float(y), float(z))
-            self.coordinate_cache[cache_key] = result
-            return result
-        except Exception as e:
-            print(f"Error converting lat/lon to 3D: {e}")
-            return (0, 0, 0)
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        
+        x = radius * math.cos(lat_rad) * math.cos(lon_rad)
+        y = radius * math.sin(lat_rad)
+        z = -radius * math.cos(lat_rad) * math.sin(lon_rad)
+        
+        result = (float(x), float(y), float(z))
+        self.coordinate_cache[cache_key] = result
+        return result
     
     def generate_great_circle_path(self, start_lat: float, start_lon: float, 
                                  end_lat: float, end_lon: float, num_points: int = 50) -> List[Tuple[float, float, float]]:
@@ -1086,32 +956,25 @@ class FlightGlobeWidget(QOpenGLWidget):
         if abs(start_lat - end_lat) < 0.001 and abs(start_lon - end_lon) < 0.001:
             return []
         
-        try:
-            delta_lon = end_lon - start_lon
-            if delta_lon > 180:
-                end_lon -= 360
-            elif delta_lon < -180:
-                end_lon += 360
-            
-            path_points = []
-            base_altitude = 1.02
-            max_altitude = 1.08
-            
-            for i in range(num_points + 1):
-                t = i / num_points
-                
-                lat = start_lat + t * (end_lat - start_lat)
-                lon = start_lon + t * (end_lon - start_lon)
-                
-                altitude_factor = math.sin(t * math.pi) * (max_altitude - base_altitude) + base_altitude
-                point_3d = self.lat_lon_to_3d(lat, lon, altitude_factor)
-                path_points.append(point_3d)
-            
-            return path_points
-            
-        except Exception as e:
-            print(f"Error generating great circle path: {e}")
-            return []
+        delta_lon = end_lon - start_lon
+        if delta_lon > 180:
+            end_lon -= 360
+        elif delta_lon < -180:
+            end_lon += 360
+        
+        path_points = []
+        base_altitude = 1.02
+        max_altitude = 1.08
+        
+        for i in range(num_points + 1):
+            t = i / num_points
+            lat = start_lat + t * (end_lat - start_lat)
+            lon = start_lon + t * (end_lon - start_lon)
+            altitude_factor = math.sin(t * math.pi) * (max_altitude - base_altitude) + base_altitude
+            point_3d = self.lat_lon_to_3d(lat, lon, altitude_factor)
+            path_points.append(point_3d)
+        
+        return path_points
     
     def get_city_coordinates(self, city_name: str) -> Optional[Tuple[float, float]]:
         """Get latitude/longitude for a city"""
@@ -1141,6 +1004,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             "Paris": (48.8566, 2.3522), "Tokyo": (35.6762, 139.6503),
             "Sydney": (-33.8688, 151.2093), "Berlin": (52.5200, 13.4050),
             "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964),
+            "Kansas City": (39.0997, -94.5786)
         }
         return city_coords.get(city_name)
     
@@ -1149,183 +1013,153 @@ class FlightGlobeWidget(QOpenGLWidget):
         if not self.gl_initialized:
             return
         
-        try:
-            current_time = time.time()
-            frame_time = current_time - self.last_frame_time
-            self.last_frame_time = current_time
-            self.animation_time += frame_time
-            
-            # Update travel animation
-            if self.show_travel_animation:
-                animation_state = self.travel_animation.update_animation(frame_time)
-                if animation_state:
-                    self.animated_marker_position = animation_state
-                    self.animationProgressChanged.emit(animation_state['progress'], animation_state['segment'])
-                else:
-                    self.animated_marker_position = None
-            
-            # Handle rotation momentum
-            if not self.is_rotating and self.rotation_momentum.length() > 0.01:
-                momentum_rotation = QMatrix4x4()
-                momentum_rotation.rotate(self.rotation_momentum.length(), 
-                                       self.rotation_momentum.normalized())
-                self.rotation_matrix = momentum_rotation * self.rotation_matrix
-                self.rotation_momentum *= self.momentum_decay
-            
-            self.record_frame_time(frame_time)
-            
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-            
-            model = self.rotation_matrix
-            view = QMatrix4x4()
-            view.lookAt(QVector3D(0, 0, 3 / self.zoom_level), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
-            projection = QMatrix4x4()
-            aspect_ratio = self.width() / max(self.height(), 1)
-            projection.perspective(45.0, aspect_ratio, 0.1, 100.0)
-            mvp = projection * view * model
-            
-            normal_matrix = model.normalMatrix()
-            
-            self.render_earth(mvp, model, normal_matrix, view)
-            
-            if self.show_travel_paths:
-                self.render_travel_paths(mvp)
-            
-            self.render_textured_markers(mvp, view, model)
-            
-            # Render animated traveling marker
-            if self.show_travel_animation and self.animated_marker_position:
-                self.render_animated_marker(mvp, view, model)
-                
-        except Exception as e:
-            print(f"Rendering error: {e}")
+        current_time = time.time()
+        frame_time = current_time - self.last_frame_time
+        self.last_frame_time = current_time
+        self.animation_time += frame_time
+        
+        # Update travel animation
+        if self.show_travel_animation:
+            animation_state = self.travel_animation.update_animation(frame_time)
+            if animation_state:
+                self.animated_marker_position = animation_state
+                self.animationProgressChanged.emit(animation_state['progress'], animation_state['segment'])
+            else:
+                self.animated_marker_position = None
+        
+        # Handle rotation momentum
+        if not self.is_rotating and self.rotation_momentum.length() > 0.01:
+            momentum_rotation = QMatrix4x4()
+            momentum_rotation.rotate(self.rotation_momentum.length(), 
+                                   self.rotation_momentum.normalized())
+            self.rotation_matrix = momentum_rotation * self.rotation_matrix
+            self.rotation_momentum *= self.momentum_decay
+        
+        self.record_frame_time(frame_time)
+        
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        
+        model = self.rotation_matrix
+        view = QMatrix4x4()
+        view.lookAt(QVector3D(0, 0, 3 / self.zoom_level), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
+        projection = QMatrix4x4()
+        aspect_ratio = self.width() / max(self.height(), 1)
+        projection.perspective(45.0, aspect_ratio, 0.1, 100.0)
+        mvp = projection * view * model
+        
+        normal_matrix = model.normalMatrix()
+        
+        self.render_earth(mvp, model, normal_matrix, view)
+        
+        if self.show_travel_paths:
+            self.render_travel_paths(mvp)
+        
+        self.render_textured_markers(mvp, view, model)
+        
+        # Render animated traveling marker
+        if self.show_travel_animation and self.animated_marker_position:
+            self.render_animated_marker(mvp, view, model)
     
     def render_animated_marker(self, mvp, view, model):
-        """Render the animated traveling marker (FIXED: uses reusable VAO)"""
+        """Render the animated traveling marker"""
         if not self.animated_marker_position or not self.marker_vao:
             return
         
-        try:
-            position = self.animated_marker_position['position']
-            team_id = self.animated_marker_position['team_id']
-            
-            animated_marker = {
-                'position': position,
-                'team_id': team_id.upper(),
-                'size': 6.0,  # Larger for visibility
-                'type': 'animated',
-                'color': (1.0, 0.8, 0.2)  # Golden color
-            }
-            
-            # FIXED: Use the existing shader and VAO system properly
-            gl.glEnable(gl.GL_BLEND)
-            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            
-            self.marker_shader.bind()
-            self.marker_shader.setUniformValue("mvp", mvp)
-            self.marker_shader.setUniformValue("modelMatrix", model)
-            self.marker_shader.setUniformValue("time", self.animation_time)
-            
-            # Render the animated marker
-            self.render_spinning_cube_marker(animated_marker, None, 2.5, is_animated=True)
-            
-            self.marker_shader.release()
-            
-        except Exception as e:
-            print(f"Animated marker rendering error: {e}")
-    
-    # NEW: Control methods for animation behavior
-    
-    def set_spinning_during_animation(self, enabled: bool):
-        """Control whether markers spin during animation"""
-        self.disable_spinning_during_animation = not enabled
+        position = self.animated_marker_position['position']
+        team_id = self.animated_marker_position['team_id']
         
-    def get_spinning_during_animation(self) -> bool:
-        """Check if markers spin during animation"""
-        return not self.disable_spinning_during_animation
-    
-    # [Include all other rendering methods from original - render_earth, render_travel_paths, etc.]
+        animated_marker = {
+            'position': position,
+            'team_id': team_id.upper(),
+            'size': 6.0,
+            'type': 'animated',
+            'color': (1.0, 0.8, 0.2)
+        }
+        
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        
+        self.marker_shader.bind()
+        self.marker_shader.setUniformValue("mvp", mvp)
+        self.marker_shader.setUniformValue("modelMatrix", model)
+        self.marker_shader.setUniformValue("time", self.animation_time)
+        
+        self.render_spinning_cube_marker(animated_marker, None, 2.5, is_animated=True)
+        
+        self.marker_shader.release()
     
     def render_earth(self, mvp, model, normal_matrix, view):
         """Render Earth sphere"""
         if not self.shader_program or not self.vao:
             return
         
-        try:
-            self.shader_program.bind()
-            
-            self.shader_program.setUniformValue("mvp", mvp)
-            self.shader_program.setUniformValue("model", model)
-            self.shader_program.setUniformValue("normalMatrix", normal_matrix)
-            
-            light_direction = QVector3D(1.0, 0.3, 0.5).normalized()
-            self.shader_program.setUniformValue("lightDir", light_direction)
-            self.shader_program.setUniformValue("viewPos", QVector3D(0, 0, 3 / self.zoom_level))
-            self.shader_program.setUniformValue("showAtmosphere", self.show_atmosphere)
-            
-            if self.earth_texture:
-                self.earth_texture.bind(0)
-                self.shader_program.setUniformValue("earthTexture", 0)
-            
-            gl.glBindVertexArray(self.vao)
-            gl.glDrawElements(gl.GL_TRIANGLES, len(self.indices), gl.GL_UNSIGNED_INT, None)
-            
-            self.shader_program.release()
-            
-        except Exception as e:
-            print(f"Earth rendering error: {e}")
+        self.shader_program.bind()
+        
+        self.shader_program.setUniformValue("mvp", mvp)
+        self.shader_program.setUniformValue("model", model)
+        self.shader_program.setUniformValue("normalMatrix", normal_matrix)
+        
+        light_direction = QVector3D(1.0, 0.3, 0.5).normalized()
+        self.shader_program.setUniformValue("lightDir", light_direction)
+        self.shader_program.setUniformValue("viewPos", QVector3D(0, 0, 3 / self.zoom_level))
+        self.shader_program.setUniformValue("showAtmosphere", self.show_atmosphere)
+        
+        if self.earth_texture:
+            self.earth_texture.bind(0)
+            self.shader_program.setUniformValue("earthTexture", 0)
+        
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawElements(gl.GL_TRIANGLES, len(self.indices), gl.GL_UNSIGNED_INT, None)
+        
+        self.shader_program.release()
     
     def render_travel_paths(self, mvp):
         """Render travel paths"""
         if not self.travel_paths or not self.travel_shader:
             return
         
-        try:
-            gl.glEnable(gl.GL_LINE_SMOOTH)
-            gl.glHint(gl.GL_LINE_SMOOTH_HINT, gl.GL_NICEST)
-            gl.glLineWidth(2.5)
+        gl.glEnable(gl.GL_LINE_SMOOTH)
+        gl.glHint(gl.GL_LINE_SMOOTH_HINT, gl.GL_NICEST)
+        gl.glLineWidth(2.5)
+        
+        self.travel_shader.bind()
+        self.travel_shader.setUniformValue("mvp", mvp)
+        self.travel_shader.setUniformValue("time", self.animation_time)
+        
+        for path_data in self.travel_paths:
+            points = path_data.get('points', [])
+            color = path_data.get('color', (1.0, 0.8, 0.2))
+            alpha = path_data.get('alpha', 0.9)
             
-            self.travel_shader.bind()
-            self.travel_shader.setUniformValue("mvp", mvp)
-            self.travel_shader.setUniformValue("time", self.animation_time)
+            if len(points) < 2:
+                continue
             
-            for path_data in self.travel_paths:
-                points = path_data.get('points', [])
-                color = path_data.get('color', (1.0, 0.8, 0.2))
-                alpha = path_data.get('alpha', 0.9)
-                
-                if len(points) < 2:
-                    continue
-                
-                self.travel_shader.setUniformValue("pathColor", QVector3D(*color))
-                self.travel_shader.setUniformValue("pathAlpha", alpha)
-                
-                path_array = np.array(points, dtype=np.float32).flatten()
-                
-                path_vao = gl.glGenVertexArrays(1)
-                path_vbo = gl.glGenBuffers(1)
-                
-                gl.glBindVertexArray(path_vao)
-                gl.glBindBuffer(gl.GL_ARRAY_BUFFER, path_vbo)
-                gl.glBufferData(gl.GL_ARRAY_BUFFER, path_array.nbytes, path_array, gl.GL_DYNAMIC_DRAW)
-                
-                gl.glEnableVertexAttribArray(0)
-                gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, None)
-                
-                gl.glDrawArrays(gl.GL_LINE_STRIP, 0, len(points))
-                
-                gl.glDeleteBuffers(1, [path_vbo])
-                gl.glDeleteVertexArrays(1, [path_vao])
+            self.travel_shader.setUniformValue("pathColor", QVector3D(*color))
+            self.travel_shader.setUniformValue("pathAlpha", alpha)
             
-            self.travel_shader.release()
-            gl.glDisable(gl.GL_LINE_SMOOTH)
+            path_array = np.array(points, dtype=np.float32).flatten()
             
-        except Exception as e:
-            print(f"Travel path rendering error: {e}")
+            path_vao = gl.glGenVertexArrays(1)
+            path_vbo = gl.glGenBuffers(1)
+            
+            gl.glBindVertexArray(path_vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, path_vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, path_array.nbytes, path_array, gl.GL_DYNAMIC_DRAW)
+            
+            gl.glEnableVertexAttribArray(0)
+            gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, None)
+            
+            gl.glDrawArrays(gl.GL_LINE_STRIP, 0, len(points))
+            
+            gl.glDeleteBuffers(1, [path_vbo])
+            gl.glDeleteVertexArrays(1, [path_vao])
+        
+        self.travel_shader.release()
+        gl.glDisable(gl.GL_LINE_SMOOTH)
     
     def render_textured_markers(self, mvp, view, model):
-        """Render spinning 3D cube markers with team logos (FIXED: uses reusable VAO)"""
+        """Render spinning 3D cube markers with team logos"""
         if not self.marker_shader or not self.marker_vao:
             return
         
@@ -1333,94 +1167,80 @@ class FlightGlobeWidget(QOpenGLWidget):
         if total_markers == 0:
             return
         
-        try:
-            gl.glEnable(gl.GL_BLEND)
-            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-            gl.glEnable(gl.GL_DEPTH_TEST)
-            
-            self.marker_shader.bind()
-            self.marker_shader.setUniformValue("mvp", mvp)
-            self.marker_shader.setUniformValue("modelMatrix", model)
-            self.marker_shader.setUniformValue("time", self.animation_time)
-            
-            # FIXED: No need to create cube_geometry every frame since we use reusable VAO
-            
-            if self.show_team_cities:
-                for marker in self.team_city_markers:
-                    self.render_spinning_cube_marker(marker, None, 1.5)
-            
-            if self.show_venues:
-                for marker in self.venue_markers:
-                    self.render_spinning_cube_marker(marker, None, 1.0)
-            
-            self.marker_shader.release()
-            
-        except Exception as e:
-            print(f"3D cube marker rendering error: {e}")
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        
+        self.marker_shader.bind()
+        self.marker_shader.setUniformValue("mvp", mvp)
+        self.marker_shader.setUniformValue("modelMatrix", model)
+        self.marker_shader.setUniformValue("time", self.animation_time)
+        
+        if self.show_team_cities:
+            for marker in self.team_city_markers:
+                self.render_spinning_cube_marker(marker, None, 1.5)
+        
+        if self.show_venues:
+            for marker in self.venue_markers:
+                self.render_spinning_cube_marker(marker, None, 1.0)
+        
+        self.marker_shader.release()
     
     def render_spinning_cube_marker(self, marker, cube_geometry, rotation_speed, is_animated=False):
-        """Render a single spinning 3D cube marker with team logo texture (FIXED: uses reusable VAO)"""
-        try:
-            # Check if reusable VAO is available
-            if not self.marker_vao:
-                print("Warning: Marker VAO not initialized, skipping marker render")
-                return False
-                
-            pos = marker['position']
-            team_id = marker.get('team_id', '')
-            marker_type = marker.get('type', 'generic')
-            size = marker.get('size', 4.0)
-            
-            if not pos or len(pos) != 3:
-                return False
-            
-            # Texture selection
-            texture = None
-            use_texture = False
-            team_color = (1.0, 1.0, 1.0)
-            
-            if team_id and team_id in self.team_logo_textures:
-                texture = self.team_logo_textures[team_id]
-                use_texture = True
-                team_color = self.get_team_color(team_id)
-            elif self.default_marker_texture:
-                texture = self.default_marker_texture
-                use_texture = True
-                if marker_type == 'departure':
-                    team_color = (0.2, 0.8, 0.3)  # Green
-                elif marker_type == 'animated':
-                    team_color = (1.0, 0.8, 0.2)  # Gold
-                else:
-                    team_color = (1.0, 0.4, 0.1)  # Orange
-            else:
-                use_texture = False
-                team_color = marker.get('color', (1.0, 1.0, 1.0))
-            
-            # Bind texture
-            if texture and use_texture:
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                texture.bind()
-                self.marker_shader.setUniformValue("markerTexture", 0)
-            
-            # Set uniforms
-            self.marker_shader.setUniformValue("markerCenter", QVector3D(*pos))
-            self.marker_shader.setUniformValue("markerSize", size)
-            self.marker_shader.setUniformValue("rotationSpeed", rotation_speed)
-            self.marker_shader.setUniformValue("teamColor", QVector3D(*team_color))
-            self.marker_shader.setUniformValue("useTexture", use_texture)
-            self.marker_shader.setUniformValue("markerAlpha", 0.9)
-            self.marker_shader.setUniformValue("isAnimated", is_animated)
-            
-            # FIXED: Use the pre-created reusable VAO instead of creating new ones
-            gl.glBindVertexArray(self.marker_vao)
-            gl.glDrawArrays(gl.GL_TRIANGLES, 0, 36)  # 36 vertices for a cube (6 faces * 6 vertices)
-            gl.glBindVertexArray(0)  # Unbind VAO
-            
-            return True
-            
-        except Exception as e:
-            print(f"Spinning cube marker rendering error: {e}")
+        """Render a single spinning 3D cube marker with team logo texture"""
+        if not self.marker_vao:
             return False
+            
+        pos = marker['position']
+        team_id = marker.get('team_id', '')
+        marker_type = marker.get('type', 'generic')
+        size = marker.get('size', 4.0)
+        
+        if not pos or len(pos) != 3:
+            return False
+        
+        # Texture selection
+        texture = None
+        use_texture = False
+        team_color = (1.0, 1.0, 1.0)
+        
+        if team_id and team_id in self.team_logo_textures:
+            texture = self.team_logo_textures[team_id]
+            use_texture = True
+            team_color = self.get_team_color(team_id)
+        elif self.default_marker_texture:
+            texture = self.default_marker_texture
+            use_texture = True
+            if marker_type == 'departure':
+                team_color = (0.2, 0.8, 0.3)
+            elif marker_type == 'animated':
+                team_color = (1.0, 0.8, 0.2)
+            else:
+                team_color = (1.0, 0.4, 0.1)
+        else:
+            use_texture = False
+            team_color = marker.get('color', (1.0, 1.0, 1.0))
+        
+        # Bind texture
+        if texture and use_texture:
+            gl.glActiveTexture(gl.GL_TEXTURE0)
+            texture.bind()
+            self.marker_shader.setUniformValue("markerTexture", 0)
+        
+        # Set uniforms
+        self.marker_shader.setUniformValue("markerCenter", QVector3D(*pos))
+        self.marker_shader.setUniformValue("markerSize", size)
+        self.marker_shader.setUniformValue("rotationSpeed", rotation_speed)
+        self.marker_shader.setUniformValue("teamColor", QVector3D(*team_color))
+        self.marker_shader.setUniformValue("useTexture", use_texture)
+        self.marker_shader.setUniformValue("markerAlpha", 0.9)
+        self.marker_shader.setUniformValue("isAnimated", is_animated)
+        
+        gl.glBindVertexArray(self.marker_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 36)
+        gl.glBindVertexArray(0)
+        
+        return True
     
     def load_flight_data(self, travel_data: List):
         """Load sports team travel data"""
@@ -1437,7 +1257,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         cities_seen = set()
         venues_seen = set()
         
-        for i, travel in enumerate(self.travel_data):
+        for travel in self.travel_data:
             if not hasattr(travel, 'departure_city'):
                 continue
             
@@ -1468,7 +1288,6 @@ class FlightGlobeWidget(QOpenGLWidget):
                 }
                 self.travel_paths.append(path_data)
                 
-                # Create team logo markers
                 if travel.departure_city not in cities_seen:
                     cities_seen.add(travel.departure_city)
                     dep_3d = self.lat_lon_to_3d(dep_lat, dep_lon, 1.05)
@@ -1482,7 +1301,6 @@ class FlightGlobeWidget(QOpenGLWidget):
                     }
                     self.team_city_markers.append(city_marker)
                 
-                # Create venue markers
                 if travel.arrival_city not in venues_seen:
                     venues_seen.add(travel.arrival_city)
                     arr_3d = self.lat_lon_to_3d(arr_lat, arr_lon, 1.03)
@@ -1511,7 +1329,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         }
         return team_colors.get(team_id, (1.0, 0.6, 0.2))
     
-    # MISSING METHODS FROM ORIGINAL - Adding back for compatibility
+    # Utility methods
     
     def filter_flights(self, filtered_travel: List):
         """Update display with filtered travel data"""
@@ -1543,8 +1361,6 @@ class FlightGlobeWidget(QOpenGLWidget):
         if self.gl_initialized:
             self.load_team_logo_textures()
     
-    # [Include other methods - mouse interaction, utilities, etc.]
-    
     def record_frame_time(self, frame_time: float):
         """Record frame rendering time for performance monitoring"""
         self.frame_times.append(frame_time)
@@ -1555,6 +1371,8 @@ class FlightGlobeWidget(QOpenGLWidget):
             avg_time = sum(self.frame_times) / len(self.frame_times)
             fps = 1.0 / avg_time if avg_time > 0 else 0.0
             self.performanceUpdate.emit(fps)
+    
+    # Mouse interaction methods
     
     def mousePressEvent(self, event):
         """Handle mouse press for rotation"""
@@ -1577,36 +1395,30 @@ class FlightGlobeWidget(QOpenGLWidget):
     
     def update_rotation_with_momentum(self, delta):
         """Update rotation with momentum calculation"""
-        try:
-            sensitivity = 0.5 * self.rotation_speed
-            
-            x_rotation = delta.y() * sensitivity
-            y_rotation = delta.x() * sensitivity
-            
-            self.rotation_momentum = QVector3D(x_rotation, y_rotation, 0) * 0.1
-            
-            x_quat = QQuaternion.fromAxisAndAngle(QVector3D(1, 0, 0), x_rotation)
-            y_quat = QQuaternion.fromAxisAndAngle(QVector3D(0, 1, 0), y_rotation)
-            
-            rotation_quat = y_quat * x_quat
-            rotation_matrix = QMatrix4x4()
-            rotation_matrix.rotate(rotation_quat)
-            
-            self.rotation_matrix = rotation_matrix * self.rotation_matrix
-            self.update()
-        except Exception as e:
-            print(f"Rotation error: {e}")
+        sensitivity = 0.5 * self.rotation_speed
+        
+        x_rotation = delta.y() * sensitivity
+        y_rotation = delta.x() * sensitivity
+        
+        self.rotation_momentum = QVector3D(x_rotation, y_rotation, 0) * 0.1
+        
+        x_quat = QQuaternion.fromAxisAndAngle(QVector3D(1, 0, 0), x_rotation)
+        y_quat = QQuaternion.fromAxisAndAngle(QVector3D(0, 1, 0), y_rotation)
+        
+        rotation_quat = y_quat * x_quat
+        rotation_matrix = QMatrix4x4()
+        rotation_matrix.rotate(rotation_quat)
+        
+        self.rotation_matrix = rotation_matrix * self.rotation_matrix
+        self.update()
     
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming"""
-        try:
-            delta = event.angleDelta().y()
-            zoom_factor = 1.1 if delta > 0 else 0.9
-            new_zoom = self.zoom_level * zoom_factor
-            self.zoom_level = max(self.min_zoom, min(self.max_zoom, new_zoom))
-            self.update()
-        except Exception as e:
-            print(f"Zoom error: {e}")
+        delta = event.angleDelta().y()
+        zoom_factor = 1.1 if delta > 0 else 0.9
+        new_zoom = self.zoom_level * zoom_factor
+        self.zoom_level = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        self.update()
     
     def reset_view(self):
         """Reset view to default"""
@@ -1622,43 +1434,39 @@ class FlightGlobeWidget(QOpenGLWidget):
         gl.glViewport(0, 0, width, height)
     
     def closeEvent(self, event):
-        """Clean up OpenGL resources - ENHANCED"""
-        try:
-            if self.gl_initialized:
-                self.makeCurrent()
-                
-                # Clean up marker resources
-                if self.marker_vao:
-                    gl.glDeleteVertexArrays(1, [self.marker_vao])
-                    self.marker_vao = None
-                if self.marker_vbo:
-                    gl.glDeleteBuffers(1, [self.marker_vbo])
-                    self.marker_vbo = None
-                
-                # Clean up main sphere resources
-                if self.vao:
-                    gl.glDeleteVertexArrays(1, [self.vao])
-                if self.vbo:
-                    gl.glDeleteBuffers(1, [self.vbo])
-                if self.ebo:
-                    gl.glDeleteBuffers(1, [self.ebo])
-                
-                # Clean up textures
-                if hasattr(self, 'team_logo_textures'):
-                    for texture in self.team_logo_textures.values():
-                        if texture:
-                            texture.destroy()
-                
-                if self.default_marker_texture:
-                    self.default_marker_texture.destroy()
-                
-                if self.earth_texture:
-                    self.earth_texture.destroy()
-                
-                self.doneCurrent()
-                print("✅ OpenGL resources cleaned up successfully")
+        """Clean up OpenGL resources"""
+        if self.gl_initialized:
+            self.makeCurrent()
             
-        except Exception as e:
-            print(f"❌ Cleanup error: {e}")
+            # Clean up marker resources
+            if self.marker_vao:
+                gl.glDeleteVertexArrays(1, [self.marker_vao])
+                self.marker_vao = None
+            if self.marker_vbo:
+                gl.glDeleteBuffers(1, [self.marker_vbo])
+                self.marker_vbo = None
+            
+            # Clean up main sphere resources
+            if self.vao:
+                gl.glDeleteVertexArrays(1, [self.vao])
+            if self.vbo:
+                gl.glDeleteBuffers(1, [self.vbo])
+            if self.ebo:
+                gl.glDeleteBuffers(1, [self.ebo])
+            
+            # Clean up textures
+            if hasattr(self, 'team_logo_textures'):
+                for texture in self.team_logo_textures.values():
+                    if texture:
+                        texture.destroy()
+            
+            if self.default_marker_texture:
+                self.default_marker_texture.destroy()
+            
+            if self.earth_texture:
+                self.earth_texture.destroy()
+            
+            self.doneCurrent()
+            print("✅ OpenGL resources cleaned up successfully")
         
         super().closeEvent(event)
