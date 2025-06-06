@@ -79,7 +79,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.data_update_timer = None
         self.current_travel_data = []
         self.all_teams = []
-        self.current_league = "NHL"  # Default league
+        self.current_league = "MLB"  # Default league
         self.current_season = str(datetime.now().year)
         
         # Setup UI
@@ -89,9 +89,11 @@ class SportsTrackerMainWindow(QMainWindow):
         self.setup_sports_system()
         self.connect_signals()
         
+        # Sync dropdown and Default league FUCKING H
+        self.synchronize_league_state()
+        
         # Load settings
         self.settings = QSettings("SportsTracker", "TeamTravel")
-        self.load_window_settings()
          
         self.start_sports_monitoring()
     
@@ -253,6 +255,9 @@ class SportsTrackerMainWindow(QMainWindow):
         # Initialize sports data aggregator with config dict
         self.sports_aggregator = ESPNSportsDataAggregator(api_keys)
         
+        # Sync drop down to League button select
+        self.sports_aggregator.set_league(self.current_league)
+        
         # Connect aggregator signals
         self.sports_aggregator.dataUpdated.connect(self.on_travel_data_updated)
         self.sports_aggregator.progressUpdated.connect(self.on_progress_updated)
@@ -326,18 +331,191 @@ class SportsTrackerMainWindow(QMainWindow):
         print(f"Successfully switched to {league}")
     
     def start_sports_monitoring(self):
-        """Start sports data monitoring"""
+        """Modified startup - display today's games instead of demo mode"""
+        if not self.sports_aggregator:
+            self.setup_sports_system()
+        
         if self.sports_aggregator:
-            # Load teams first
-            self.populate_team_combo()
-            # Start with current week for quick preview
-            self.load_current_week()
-            self.connection_status.setText(f"Connected to ESPN ({self.current_league})")
-            self.connection_status.setStyleSheet("color: #00FF00;")
+            self.sports_aggregator.set_league(self.current_league)
+        
+        # Populate dropdowns first
+        self.populate_team_combo()
+        
+        # Load today's games as the new default startup view
+        self.display_todays_games_startup()
+        
+        # Logic for refresh if needed
+        #if not self.data_update_timer:
+        #    self.data_update_timer = QTimer()
+        #    self.data_update_timer.timeout.connect(self.display_todays_games_startup)
+        #    self.data_update_timer.start(300000)  # Refresh every 5 minutes
+    
+    
+    
+    
+    def get_todays_games(self) -> List[Dict]:
+        """Get all games scheduled for today across all leagues"""
+        if not self.sports_aggregator:
+            return []
+        
+        today = datetime.now().date()
+        todays_games = []
+        
+        # Check all leagues for today's games
+        for league in ["MLB", "NBA", "NHL"]:
+            try:
+                season = self.sports_aggregator.espn_scraper.get_current_season_for_league(league)
+                games = self.sports_aggregator.db.load_games(season, league)
+                
+                # Filter for today's games
+                for game in games:
+                    game_date = game.date.date() if hasattr(game.date, 'date') else game.date
+                    if game_date == today:
+                        todays_games.append({
+                            'game': game,
+                            'league': league,
+                            'home_team': game.home_team,
+                            'away_team': game.away_team,
+                            'venue_city': game.venue.city
+                        })
+            except Exception as e:
+                print(f"Error loading {league} games for today: {e}")
+                continue
+        
+        return todays_games
+    
+    
+    # Properly stacked the two team cubes one of top of the other
+    def display_todays_games_startup(self):
+        """Display today's games as stacked spinning boxes - new startup view"""
+        todays_games = self.get_todays_games()
+        
+        if not todays_games:
+            print("No games today - displaying empty globe")
+            self.globe_widget.team_city_markers = []
+            return
+        
+        stacked_markers = []
+        
+        # Group games by venue city to handle multiple games in same city
+        games_by_city = {}
+        for game_info in todays_games:
+            venue_city = game_info['venue_city']
+            if venue_city not in games_by_city:
+                games_by_city[venue_city] = []
+            games_by_city[venue_city].append(game_info)
+        
+        for venue_city, city_games in games_by_city.items():
+            # Get base coordinates for the city
+            coords = self.globe_widget.get_city_coordinates(venue_city)
+            if not coords:
+                continue
+            
+            lat, lon = coords[0], coords[1]
+            
+            # For multiple games in same city, spread them out slightly
+            for i, game_info in enumerate(city_games):
+                home_team = game_info['home_team']
+                away_team = game_info['away_team']
+                
+                # Add small angular offset for multiple games in same city
+                lat_offset = (i * 0.2)  # 0.2 degrees per game
+                lon_offset = (i * 0.2)
+                
+                adjusted_lat = lat + lat_offset
+                adjusted_lon = lon + lon_offset
+                
+                # Home team marker (on surface) - smaller size
+                home_3d = self.globe_widget.lat_lon_to_3d(adjusted_lat, adjusted_lon, 1.01)
+                
+                # Calculate surface normal for proper vertical stacking
+                surface_normal = self.calculate_surface_normal(adjusted_lat, adjusted_lon)
+                stack_offset = 0.04  # Reduced stacking distance
+                
+                # Away team marker (stacked above home team along surface normal)
+                away_3d = (
+                    home_3d[0] + surface_normal[0] * stack_offset,
+                    home_3d[1] + surface_normal[1] * stack_offset,
+                    home_3d[2] + surface_normal[2] * stack_offset
+                )
+                
+                # Home team marker (bottom) - much smaller cubes
+                home_marker = {
+                    'position': home_3d,
+                    'team_id': home_team.team_id,
+                    'size': 3.0,  # Reduced from 4.5
+                    'type': 'home_today',
+                    'city_name': venue_city,
+                    'game_info': game_info
+                }
+                
+                # Away team marker (stacked on top)
+                away_marker = {
+                    'position': away_3d,
+                    'team_id': away_team.team_id,
+                    'size': 3.0,  # Reduced from 4.5
+                    'type': 'away_today',
+                    'city_name': venue_city,
+                    'game_info': game_info
+                }
+                
+                stacked_markers.extend([home_marker, away_marker])
+        
+        # Set the markers on the globe widget
+        self.globe_widget.team_city_markers = stacked_markers
+        
+        # Update status
+        game_count = len(todays_games)
+        leagues_today = set(g['league'] for g in todays_games)
+        leagues_str = ", ".join(sorted(leagues_today))
+        
+        self.season_status_label.setText(f"Today: {game_count} games ({leagues_str})")
+        print(f"Displaying {game_count} games today across {leagues_str}")
+    
+    def calculate_surface_normal(self, lat: float, lon: float):
+        """Calculate the surface normal vector at a given lat/lon for proper stacking"""
+        import math
+        
+        # Convert to radians
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        
+        # Surface normal on a sphere points radially outward
+        x = math.cos(lat_rad) * math.cos(lon_rad)
+        y = math.sin(lat_rad)
+        z = -math.cos(lat_rad) * math.sin(lon_rad)
+        
+        # Normalize the vector (should already be unit length, but ensure it)
+        length = math.sqrt(x*x + y*y + z*z)
+        if length > 0:
+            x /= length
+            y /= length
+            z /= length
+        
+        return (x, y, z)
+
+    
+    def synchronize_league_state(self):
+        """Ensure main window and control panel are using the same league"""
+        # Set control panel to match main window's league
+        self.control_panel.set_current_league(self.current_league)
+        
+        # Update main window components for the current league
+        self.league_status_label.setText(self.current_league)
+        self.update_season_combo_for_league(self.current_league)
+        
+        # Update window title
+        self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_league} {self.current_season} Season")
+    
     
     def populate_team_combo(self):
         """Populate team selection combo with teams from current league"""
         try:
+            
+            if self.sports_aggregator and self.sports_aggregator.current_league != self.current_league:
+                print(f"🐛 DEBUG - League mismatch detected! Aggregator: {self.sports_aggregator.current_league}, Window: {self.current_league}")
+                self.sports_aggregator.set_league(self.current_league)
+        
             teams = self.sports_aggregator.get_all_teams(self.current_league)
             self.all_teams = teams
             
@@ -361,7 +539,10 @@ class SportsTrackerMainWindow(QMainWindow):
             
         except Exception as e:
             print(f"Error populating team combo: {e}")
+            self.focus_team_combo.clear()
+            self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
     
+
     def on_season_changed(self, season_text: str):
         """Handle season change"""
         if season_text and season_text != self.current_season:
@@ -880,35 +1061,10 @@ class SportsTrackerMainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export data: {str(e)}")
     
-    def load_window_settings(self):
-        """Load window settings"""
-        geometry = self.settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
-        
-        state = self.settings.value("windowState")
-        if state:
-            self.restoreState(state)
-        
-        # Load last selected league and season
-        last_league = self.settings.value("lastLeague", "MLB")
-        if last_league in ["MLB", "NBA", "NHL"]:
-            self.current_league = last_league
-            # This will trigger league change when control panel loads
-        
-        last_season = self.settings.value("lastSeason")
-        if last_season:
-            index = self.season_combo.findText(last_season)
-            if index >= 0:
-                self.season_combo.setCurrentIndex(index)
-                self.current_season = last_season
-    
     def save_window_settings(self):
         """Save window settings"""
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
-        self.settings.setValue("lastLeague", self.current_league)
-        self.settings.setValue("lastSeason", self.current_season)
     
     
     

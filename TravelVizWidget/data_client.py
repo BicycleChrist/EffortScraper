@@ -9,6 +9,8 @@ from bs4 import BeautifulSoup
 import re
 
 
+# Update mapping for LA kings (schedule url uses la not lak)
+
 class GameStatus(Enum):
     """Game status enumeration"""
     SCHEDULED = "scheduled"
@@ -226,7 +228,7 @@ class ESPNScheduleScraper:
             "wsh": {"name": "Washington Capitals", "city": "Washington", "division": "Metropolitan", "conference": "Eastern"},
             
             # Western Conference - Central Division
-            "ari": {"name": "Arizona Coyotes", "city": "Phoenix", "division": "Central", "conference": "Western"},
+            "utah": {"name": "Utah Hockey Club", "city": "Utah", "division": "Central", "conference": "Western"},
             "chi": {"name": "Chicago Blackhawks", "city": "Chicago", "division": "Central", "conference": "Western"},
             "col": {"name": "Colorado Avalanche", "city": "Denver", "division": "Central", "conference": "Western"},
             "dal": {"name": "Dallas Stars", "city": "Dallas", "division": "Central", "conference": "Western"},
@@ -761,12 +763,12 @@ class ESPNScheduleScraper:
             })
         elif league == 'NHL':
             name_to_abbrev.update({
-                'losangeles': 'lak',
+                'losangeles': 'la',
                 'newyork': 'nyr',
                 'vegasgoldenknights': 'vgk',
                 'vegas': 'vgk',
                 'goldenknights': 'vgk',
-                'kings': 'lak',
+                'kings': 'la',
                 'rangers': 'nyr',
             })
         

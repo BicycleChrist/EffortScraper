@@ -9,10 +9,10 @@ from PyQt6.QtGui import QFont, QPixmap, QIcon
 
 
 class FlightControlPanel(QWidget):
-    """Enhanced control panel for sports team travel tracking"""
+    """Enhanced control panel for multi-league sports team travel tracking"""
 
     # Signals
-    modeChanged = pyqtSignal(str)  # "live" or "historical"
+    modeChanged = pyqtSignal(str)  # League changed: "MLB", "NBA", "NHL"
     airlineFilterChanged = pyqtSignal(list)  # List of team IDs
     statusFilterChanged = pyqtSignal(list)  # List of confidence levels
     routeFilterChanged = pyqtSignal(str, str)  # departure, arrival
@@ -23,7 +23,11 @@ class FlightControlPanel(QWidget):
         super().__init__(parent)
         self.travel_data = []
         self.filtered_travel = []
+        self.current_league = "MLB"  # Track current league
         self.setup_ui()
+        
+        self.update_ui_for_league(self.current_league)
+        
         self.apply_styles()
         self.connect_signals()
 
@@ -86,21 +90,28 @@ class FlightControlPanel(QWidget):
         frame = QFrame()
         layout = QHBoxLayout(frame)
 
+        # League buttons with proper naming and functionality
         self.mlb_btn = QPushButton("MLB")
-        self.nfl_btn = QPushButton("NFL")
         self.nba_btn = QPushButton("NBA")
         self.nhl_btn = QPushButton("NHL")
+        self.nfl_btn = QPushButton("NFL")  # Keep for future expansion
 
         self.mlb_btn.setCheckable(True)
-        self.nfl_btn.setCheckable(True)
         self.nba_btn.setCheckable(True)
         self.nhl_btn.setCheckable(True)
-        self.mlb_btn.setChecked(True)  # Default to MLB
+        self.nfl_btn.setCheckable(True)
+        
+        # Set MLB as default
+        self.mlb_btn.setChecked(True)
+        
+        # Disable NFL for now since it's not implemented
+        self.nfl_btn.setEnabled(False)
+        self.nfl_btn.setToolTip("NFL support coming soon")
 
         layout.addWidget(self.mlb_btn)
-        layout.addWidget(self.nfl_btn)
         layout.addWidget(self.nba_btn)
         layout.addWidget(self.nhl_btn)
+        layout.addWidget(self.nfl_btn)
 
         return frame
 
@@ -113,12 +124,11 @@ class FlightControlPanel(QWidget):
         team_layout = QHBoxLayout()
         team_layout.addWidget(QLabel("Teams:"))
         self.team_combo = QComboBox()
-        self.team_combo.addItem("All Teams", "")
         self.team_combo.setEditable(False)
         team_layout.addWidget(self.team_combo)
         layout.addLayout(team_layout)
 
-        # Confidence filter
+        # Confidence filter - updated for multi-league
         confidence_layout = QVBoxLayout()
         confidence_layout.addWidget(QLabel("Travel Confidence:"))
 
@@ -152,7 +162,7 @@ class FlightControlPanel(QWidget):
         return group
 
     def create_statistics_section(self) -> QGroupBox:
-        """Create live travel statistics"""
+        """Create live travel statistics with league-aware labeling"""
         group = QGroupBox("TRAVEL STATISTICS")
         layout = QVBoxLayout(group)
 
@@ -187,7 +197,7 @@ class FlightControlPanel(QWidget):
         return group
 
     def create_travel_section(self) -> QGroupBox:
-        """Create active travel list"""
+        """Create active travel list with league-aware labeling"""
         group = QGroupBox("TEAM TRAVEL")
         layout = QVBoxLayout(group)
 
@@ -258,9 +268,9 @@ class FlightControlPanel(QWidget):
         """Connect UI signals"""
         # League buttons
         self.mlb_btn.clicked.connect(lambda: self.on_league_changed("MLB"))
-        self.nfl_btn.clicked.connect(lambda: self.on_league_changed("NFL"))
         self.nba_btn.clicked.connect(lambda: self.on_league_changed("NBA"))
         self.nhl_btn.clicked.connect(lambda: self.on_league_changed("NHL"))
+        self.nfl_btn.clicked.connect(lambda: self.on_league_changed("NFL"))
 
         # Refresh button
         self.refresh_btn.clicked.connect(self.refreshRequested.emit)
@@ -279,8 +289,54 @@ class FlightControlPanel(QWidget):
         # Route explorer
         self.find_route_btn.clicked.connect(self.find_route)
 
+    def on_league_changed(self, league: str):
+        """Handle league change with proper button management"""
+        if not self.sender().isChecked():
+            # Prevent unchecking the current league
+            self.sender().setChecked(True)
+            return
+        
+        # Update current league
+        self.current_league = league
+        
+        # Uncheck other league buttons
+        for btn in [self.mlb_btn, self.nba_btn, self.nhl_btn, self.nfl_btn]:
+            if btn != self.sender():
+                btn.setChecked(False)
+        
+        # Update UI for new league
+        self.update_ui_for_league(league)
+        
+        # Emit signal
+        self.modeChanged.emit(league)
+
+    def update_ui_for_league(self, league: str):
+        """Update UI elements for the selected league"""
+        # Update labels to be league-specific
+        league_info = {
+            "MLB": {"season_length": 162, "teams": 30},
+            "NBA": {"season_length": 82, "teams": 30},
+            "NHL": {"season_length": 82, "teams": 32},
+            "NFL": {"season_length": 17, "teams": 32}
+        }
+        
+        info = league_info.get(league, {"season_length": 0, "teams": 0})
+        
+        # Update team combo placeholder
+        self.team_combo.clear()
+        self.team_combo.addItem(f"All {league} Teams", "")
+        
+        # Update search placeholder
+        self.travel_search.setPlaceholderText(f"{league} team, city, or route...")
+        
+        # Update statistics labels if no data
+        if not self.travel_data:
+            self.total_travel_label.setText("Total Travel: 0")
+            self.active_travel_label.setText("This Week: 0") 
+            self.teams_traveling_label.setText(f"{league} Teams: 0")
+
     def apply_styles(self):
-        """Apply enhanced styles for sports theme"""
+        """Apply enhanced styles for sports theme with multi-league support"""
         style = """
         QWidget {
             background-color: rgba(5, 25, 45, 220);
@@ -306,6 +362,28 @@ class FlightControlPanel(QWidget):
 
         QPushButton:hover {
             background-color: rgba(0, 120, 200, 160);
+        }
+
+        QPushButton:disabled {
+            background-color: rgba(60, 60, 60, 100);
+            color: rgba(150, 150, 150, 150);
+            border: 1px solid rgba(80, 80, 80, 100);
+        }
+
+        /* League-specific button colors */
+        QPushButton[objectName="mlb_btn"]:checked {
+            background-color: rgba(0, 150, 0, 200);
+            border: 2px solid rgba(100, 255, 100, 220);
+        }
+
+        QPushButton[objectName="nba_btn"]:checked {
+            background-color: rgba(255, 100, 0, 200);
+            border: 2px solid rgba(255, 150, 100, 220);
+        }
+
+        QPushButton[objectName="nhl_btn"]:checked {
+            background-color: rgba(150, 0, 150, 200);
+            border: 2px solid rgba(200, 100, 200, 220);
         }
 
         QGroupBox {
@@ -346,6 +424,13 @@ class FlightControlPanel(QWidget):
         QComboBox::down-arrow {
             border: none;
             color: white;
+        }
+
+        QComboBox QAbstractItemView {
+            background-color: rgba(15, 30, 55, 250);
+            color: white;
+            border: 1px solid rgba(100, 150, 200, 150);
+            selection-background-color: rgba(0, 120, 200, 180);
         }
 
         QCheckBox {
@@ -403,28 +488,11 @@ class FlightControlPanel(QWidget):
         }
         """
         self.setStyleSheet(style)
-
-    def on_league_changed(self, league: str):
-        """Handle league change"""
-        # Uncheck other league buttons
-        if league == "MLB":
-            self.nfl_btn.setChecked(False)
-            self.nba_btn.setChecked(False)
-            self.nhl_btn.setChecked(False)
-        elif league == "NFL":
-            self.mlb_btn.setChecked(False)
-            self.nba_btn.setChecked(False)
-            self.nhl_btn.setChecked(False)
-        elif league == "NBA":
-            self.mlb_btn.setChecked(False)
-            self.nfl_btn.setChecked(False)
-            self.nhl_btn.setChecked(False)
-        elif league == "NHL":
-            self.mlb_btn.setChecked(False)
-            self.nfl_btn.setChecked(False)
-            self.nba_btn.setChecked(False)
-
-        self.modeChanged.emit(league)
+        
+        # Set object names for league-specific styling
+        self.mlb_btn.setObjectName("mlb_btn")
+        self.nba_btn.setObjectName("nba_btn")
+        self.nhl_btn.setObjectName("nhl_btn")
 
     def update_flight_data(self, travel_data: List):
         """Update the panel with new travel data"""
@@ -435,11 +503,11 @@ class FlightControlPanel(QWidget):
         self.filter_travel()
 
     def update_statistics(self):
-        """Update travel statistics"""
+        """Update travel statistics with league awareness"""
         if not self.travel_data:
             self.total_travel_label.setText("Total Travel: 0")
             self.active_travel_label.setText("This Week: 0")
-            self.teams_traveling_label.setText("Teams: 0")
+            self.teams_traveling_label.setText(f"{self.current_league} Teams: 0")
             self.avg_distance_label.setText("Avg Distance: 0 mi")
             self.longest_trip_label.setText("Longest: N/A")
             self.busiest_route_label.setText("Busiest: N/A")
@@ -448,18 +516,6 @@ class FlightControlPanel(QWidget):
         from datetime import datetime, timedelta
 
         total = len(self.travel_data)
-
-        # Count travel this week - handle timezone aware/naive datetime comparison
-        week_start = datetime.now()
-        week_end = week_start + timedelta(days=7)
-
-        this_week = 0
-        for t in self.travel_data:
-            if hasattr(t, 'travel_date') and t.travel_date:
-                # Convert to naive datetime if timezone-aware
-                travel_date = t.travel_date
-                if hasattr(travel_date, 'tzinfo') and travel_date.tzinfo is not None:
-                    travel_date = travel_date.replace(tzinfo=None)
 
         # Count travel this week - handle timezone aware/naive datetime comparison
         week_start = datetime.now()
@@ -508,18 +564,19 @@ class FlightControlPanel(QWidget):
         if routes:
             busiest_route = max(routes.items(), key=lambda x: x[1])[0]
 
-        # Update labels
+        # Update labels with league context
         self.total_travel_label.setText(f"Total Travel: {total}")
         self.active_travel_label.setText(f"This Week: {this_week}")
-        self.teams_traveling_label.setText(f"Teams: {len(teams)}")
+        self.teams_traveling_label.setText(f"{self.current_league} Teams: {len(teams)}")
         self.avg_distance_label.setText(f"Avg Distance: {avg_distance:,} mi")
         self.longest_trip_label.setText(f"Longest: {longest_route}")
         self.busiest_route_label.setText(f"Busiest: {busiest_route}")
 
     def estimate_distance(self, city1: str, city2: str) -> int:
-        """Estimate distance between cities (very simplified)"""
-        # Simple distance estimates for major city pairs
+        """Estimate distance between cities (enhanced for multi-league)"""
+        # Enhanced distance map including NBA/NHL cities
         distance_map = {
+            # MLB distances (existing)
             ("Los Angeles", "New York"): 2445,
             ("New York", "Los Angeles"): 2445,
             ("Chicago", "Los Angeles"): 1745,
@@ -532,6 +589,25 @@ class FlightControlPanel(QWidget):
             ("Seattle", "Miami"): 2724,
             ("Dallas", "Boston"): 1551,
             ("Boston", "Dallas"): 1551,
+            
+            # NBA/NHL specific distances
+            ("San Francisco", "Miami"): 2590,
+            ("Denver", "Orlando"): 1530,
+            ("Portland", "Charlotte"): 2350,
+            ("Sacramento", "Brooklyn"): 2440,
+            ("Salt Lake City", "Atlanta"): 1590,
+            ("Oklahoma City", "Boston"): 1405,
+            ("Memphis", "Los Angeles"): 1535,
+            ("New Orleans", "Seattle"): 2080,
+            ("San Antonio", "Detroit"): 1145,
+            
+            # Canadian cities
+            ("Toronto", "Los Angeles"): 2176,
+            ("Montreal", "Vancouver"): 2303,
+            ("Calgary", "Boston"): 2091,
+            ("Edmonton", "New York"): 2045,
+            ("Ottawa", "Los Angeles"): 2243,
+            ("Winnipeg", "Miami"): 1544,
         }
 
         key1 = (city1, city2)
@@ -542,14 +618,20 @@ class FlightControlPanel(QWidget):
         elif key2 in distance_map:
             return distance_map[key2]
         else:
-            # Default estimate based on city names
-            return 1000  # Default 1000 miles
+            # League-specific default estimates
+            league_defaults = {
+                "MLB": 1200,  # Average MLB travel distance
+                "NBA": 1100,  # Average NBA travel distance  
+                "NHL": 1000,  # Average NHL travel distance
+                "NFL": 900    # Average NFL travel distance
+            }
+            return league_defaults.get(self.current_league, 1000)
 
     def update_team_filter(self):
-        """Update team filter dropdown"""
+        """Update team filter dropdown with league awareness"""
         current_text = self.team_combo.currentText()
         self.team_combo.clear()
-        self.team_combo.addItem("All Teams", "")
+        self.team_combo.addItem(f"All {self.current_league} Teams", "")
 
         teams = set()
         for travel in self.travel_data:
@@ -560,7 +642,7 @@ class FlightControlPanel(QWidget):
                     teams.add((team_name, team_id))
 
         for team_name, team_id in sorted(teams):
-            self.team_combo.addItem(f"{team_name} ({team_id})", team_id)
+            self.team_combo.addItem(f"{team_name} ({team_id.upper()})", team_id)
 
         # Restore selection if possible
         index = self.team_combo.findText(current_text)
@@ -653,15 +735,15 @@ class FlightControlPanel(QWidget):
             if selected_confidence and getattr(travel, 'confidence', '') not in selected_confidence:
                 continue
 
-        # Date filter - handle timezone aware/naive datetime comparison
-        if hasattr(travel, 'travel_date') and travel.travel_date:
-            # Convert to naive datetime if timezone-aware for comparison
-            travel_date = travel.travel_date
-            if hasattr(travel_date, 'tzinfo') and travel_date.tzinfo is not None:
-                travel_date = travel_date.replace(tzinfo=None)
+            # Date filter - handle timezone aware/naive datetime comparison
+            if hasattr(travel, 'travel_date') and travel.travel_date:
+                # Convert to naive datetime if timezone-aware for comparison
+                travel_date = travel.travel_date
+                if hasattr(travel_date, 'tzinfo') and travel_date.tzinfo is not None:
+                    travel_date = travel_date.replace(tzinfo=None)
 
-            if travel_date > cutoff_date:
-                pass
+                if travel_date > cutoff_date:
+                    continue
 
             filtered.append(travel)
 
@@ -669,20 +751,39 @@ class FlightControlPanel(QWidget):
         self.update_travel_list()
 
     def update_travel_list(self):
-        """Update the travel list widget"""
+        """Update the travel list widget with league-aware icons"""
         self.travel_list.clear()
+
+        # League-specific confidence icons
+        league_icons = {
+            "MLB": {
+                'schedule_inferred': '⚾',
+                'confirmed': '✅',
+                'demo': '🎭',
+                'historical': '📚'
+            },
+            "NBA": {
+                'schedule_inferred': '🏀',
+                'confirmed': '✅',
+                'demo': '🎭',
+                'historical': '📚'
+            },
+            "NHL": {
+                'schedule_inferred': '🏒',
+                'confirmed': '✅',
+                'demo': '🎭',
+                'historical': '📚'
+            }
+        }
+
+        icons = league_icons.get(self.current_league, league_icons["MLB"])
 
         for travel in self.filtered_travel[:50]:  # Limit to 50 for performance
             if not hasattr(travel, 'team_name'):
                 continue
 
-            # Create list item text
-            confidence_icon = {
-                'schedule_inferred': '📅',
-                'confirmed': '✅',
-                'demo': '🎭',
-                'historical': '📚'
-            }.get(getattr(travel, 'confidence', ''), '❓')
+            # Create list item text with league-specific icon
+            confidence_icon = icons.get(getattr(travel, 'confidence', ''), '❓')
 
             travel_date = getattr(travel, 'travel_date', None)
             date_text = ""
@@ -702,7 +803,7 @@ class FlightControlPanel(QWidget):
             self.travel_list.addItem(item)
 
     def on_travel_selected(self, current_item, previous_item):
-        """Handle travel selection"""
+        """Handle travel selection with league-aware details"""
         if not current_item:
             self.travel_details.clear()
             return
@@ -711,10 +812,11 @@ class FlightControlPanel(QWidget):
         if not travel or not hasattr(travel, 'team_name'):
             return
 
-        # Format travel details
+        # Format travel details with league context
         details = []
+        details.append(f"League: {self.current_league}")
         details.append(f"Team: {travel.team_name}")
-        details.append(f"Team ID: {getattr(travel, 'team_id', 'Unknown')}")
+        details.append(f"Team ID: {getattr(travel, 'team_id', 'Unknown').upper()}")
         details.append(f"Route: {travel.departure_city} → {travel.arrival_city}")
         details.append(f"Confidence: {getattr(travel, 'confidence', 'Unknown')}")
 
@@ -741,7 +843,7 @@ class FlightControlPanel(QWidget):
             self.flightSelected.emit(travel_id)
 
     def find_route(self):
-        """Find travel for specified route"""
+        """Find travel for specified route with league context"""
         departure = self.departure_input.currentText()
         arrival = self.arrival_input.currentText()
 
@@ -758,11 +860,11 @@ class FlightControlPanel(QWidget):
             count = len(route_travel)
             teams = set(getattr(t, 'team_name', 'Unknown') for t in route_travel)
             self.route_results.setText(
-                f"Found {count} travel record(s) for {departure}→{arrival}\n"
+                f"Found {count} {self.current_league} travel record(s) for {departure}→{arrival}\n"
                 f"Teams: {', '.join(sorted(teams))}"
             )
         else:
-            self.route_results.setText(f"No travel found for {departure}→{arrival}")
+            self.route_results.setText(f"No {self.current_league} travel found for {departure}→{arrival}")
 
         self.routeFilterChanged.emit(departure, arrival)
 
@@ -780,10 +882,26 @@ class FlightControlPanel(QWidget):
             self.data_progress.setVisible(False)
 
     def set_connection_status(self, connected: bool):
-        """Update connection status"""
+        """Update connection status with league context"""
         if connected:
-            self.status_label.setText("● CONNECTED")
+            self.status_label.setText(f"● {self.current_league} CONNECTED")
             self.status_label.setStyleSheet("color: #00FF00;")
         else:
-            self.status_label.setText("● DISCONNECTED")
+            self.status_label.setText(f"● {self.current_league} DISCONNECTED")
             self.status_label.setStyleSheet("color: #FF0000;")
+
+    def set_current_league(self, league: str):
+        """Set current league and update UI accordingly"""
+        if league not in ["MLB", "NBA", "NHL", "NFL"]:
+            return
+        
+        self.current_league = league
+        
+        # Update button states
+        self.mlb_btn.setChecked(league == "MLB")
+        self.nba_btn.setChecked(league == "NBA") 
+        self.nhl_btn.setChecked(league == "NHL")
+        self.nfl_btn.setChecked(league == "NFL")
+        
+        # Update UI for new league
+        self.update_ui_for_league(league)

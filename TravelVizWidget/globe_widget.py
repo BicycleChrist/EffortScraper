@@ -13,7 +13,7 @@ from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
 import os
 from pathlib import Path
 
-#TODO: Mapping for Guardinans travel paths not working, likely a similar issue to Royals 
+ 
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences"""
@@ -304,7 +304,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.filtered_travel = []
         self.travel_paths = []
         self.team_city_markers = []
-        self.venue_markers = []
+
         
         # Team travel animation system
         self.travel_animation = TeamTravelAnimation(self)
@@ -669,28 +669,22 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.link()
     
     def load_team_logo_textures(self):
-        """Load team logo textures from PNG files for MLB, NBA, and NHL"""
-        # Clear existing textures
-        for texture in self.team_logo_textures.values():
-            if texture:
-                texture.destroy()
-        self.team_logo_textures.clear()
+        """Load team logo textures with league-aware conflict resolution"""
         
-        # League-specific logo mappings and folders
         league_configs = {
             "MLB": {
-                "folder": "mlb_logos",
+                "folder": "mlb_logos", 
                 "teams": {
-                    "lad": "Dodgers.png", "nyy": "Yankees.png", "bos": "Redsox.png",
-                    "chc": "Cubs.png", "sf": "Giants.png", "atl": "Braves.png",
-                    "hou": "Astros.png", "laa": "Angels.png", "nym": "Mets.png",
-                    "phi": "Phillies.png", "stl": "Cardinals.png", "wsh": "Nationals.png",
-                    "mil": "Brewers.png", "col": "Rockies.png", "ari": "Diamondbacks.png",
-                    "sd": "Padres.png", "mia": "Marlins.png", "tex": "Rangers.png",
-                    "cin": "Reds.png", "pit": "Pirates.png", "bal": "Orioles.png",
-                    "cle": "Guardians.png", "det": "Tigers.png", "min": "Twins.png",
-                    "chw": "WhiteSox.png", "kc": "Royals.png", "ath": "Athletics.png",
-                    "sea": "Mariners.png", "tb": "Rays.png", "tor": "BlueJays.png"
+                    "phi": "Phillies.png", "mil": "Brewers.png", "chc": "Cubs.png",
+                    "cin": "Reds.png", "pit": "Pirates.png", "stl": "Cardinals.png",
+                    "lad": "Dodgers.png", "sd": "Padres.png", "sf": "Giants.png",
+                    "nyy": "Yankees.png", "bos": "Redsox.png", "tb": "Rays.png",
+                    "tor": "BlueJays.png", "bal": "Orioles.png", "cle": "Guardians.png",
+                    "chw": "WhiteSox.png", "det": "Tigers.png", "kc": "Royals.png",
+                    "min": "Twins.png", "hou": "Astros.png", "sea": "Mariners.png",
+                    "tex": "Rangers.png", "laa": "Angels.png", "ath": "Athletics.png",
+                    "atl": "Braves.png", "mia": "Marlins.png", "nym": "Mets.png",
+                    "wsh": "Nationals.png", "col": "Rockies.png", "ari": "Diamondbacks.png"
                 }
             },
             "NBA": {
@@ -703,7 +697,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                     "lal": "Lakers.png", "orl": "Magic.png", "dal": "Mavericks.png",
                     "bkn": "Nets.png", "den": "Nuggets.png", "ind": "Pacers.png",
                     "no": "Pelicans.png", "det": "Pistons.png", "por": "TrailBlazers.png",
-                    "sac": "Kings.png", "sa": "Spurs.png", "phx": "Suns.png",
+                    "sac": "SACKings.png", "sa": "Spurs.png", "phx": "Suns.png",
                     "okc": "Thunder.png", "min": "Timberwolves.png", "tor": "Raptors.png",
                     "gs": "Warriors.png", "wsh": "Wizards.png", "hou": "Rockets.png"
                 }
@@ -715,7 +709,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                     "buf": "Sabres.png", "cgy": "Flames.png", "car": "Hurricanes.png",
                     "chi": "Blackhawks.png", "col": "Avalanche.png", "cbj": "BlueJackets.png",
                     "dal": "Stars.png", "det": "RedWings.png", "edm": "Oilers.png",
-                    "fla": "Panthers.png", "lak": "Kings.png", "min": "Wild.png",
+                    "fla": "Panthers.png", "la": "LAKings.png", "min": "Wild.png",
                     "mtl": "Canadiens.png", "nsh": "Predators.png", "njd": "Devils.png",
                     "nyi": "Islanders.png", "nyr": "Rangers.png", "ott": "Senators.png",
                     "phi": "Flyers.png", "pit": "Penguins.png", "sj": "Sharks.png",
@@ -728,37 +722,56 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         total_loaded = 0
         
-        # Load logos for all leagues
+        # Load logos for all leagues with unique keys
         for league, config in league_configs.items():
             logos_path = Path(config["folder"])
+            print(f"Checking {league} logos in: {logos_path}")
+            
             if not logos_path.exists():
+                print(f"❌ Logo folder not found: {logos_path}")
                 continue
             
             league_loaded = 0
+            print(f"Found {league} folder, loading {len(config['teams'])} potential logos...")
+            
             for team_id, filename in config["teams"].items():
                 logo_path = logos_path / filename
                 if logo_path.exists():
-                    image = QImage(str(logo_path))
-                    if not image.isNull():
-                        image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                          Qt.TransformationMode.SmoothTransformation)
-                        image = self.process_logo_image(image, team_id)
-                        
-                        texture = QOpenGLTexture(image)
-                        texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
-                        texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-                        texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-                        
-                        # Store with uppercase key for consistency
-                        self.team_logo_textures[team_id.upper()] = texture
-                        league_loaded += 1
+                    try:
+                        image = QImage(str(logo_path))
+                        if not image.isNull():
+                            image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
+                                               Qt.TransformationMode.SmoothTransformation)
+                            
+                            # Create league-specific key to avoid conflicts
+                            texture_key = f"{league}_{team_id}".lower()
+                            
+                            # Create OpenGL texture directly (PyQt6 pattern)
+                            texture = QOpenGLTexture(image)
+                            texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
+                            texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+                            texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+                            
+                            self.team_logo_textures[texture_key] = texture
+                            league_loaded += 1
+                            
+                    except Exception as e:
+                        print(f"❌ Error loading {league} logo {filename}: {e}")
+                else:
+                    print(f"❌ Logo file not found: {logo_path}")
             
-            if league_loaded > 0:
-                print(f"Loaded {league_loaded} {league} team logos")
-                total_loaded += league_loaded
+            print(f"✅ Loaded {league_loaded}/{len(config['teams'])} {league} logos")
+            total_loaded += league_loaded
         
         print(f"Total logos loaded: {total_loaded}")
-        self.create_default_marker_texture()
+        
+        # Set default marker to None - will be handled elsewhere
+        self.default_marker_texture = None
+
+    def get_team_logo_texture(self, team_abbrev: str, league: str):
+        """Get team logo texture using league-aware key"""
+        texture_key = f"{league}_{team_abbrev}".lower()
+        return self.team_logo_textures.get(texture_key, self.default_marker_texture)
     
     def process_logo_image(self, image: QImage, team_id: str) -> QImage:
         """Process logo image to ensure proper visibility"""
@@ -1232,7 +1245,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         if not self.marker_shader or not self.marker_vao:
             return
         
-        total_markers = len(self.team_city_markers) + len(self.venue_markers)
+        total_markers = len(self.team_city_markers)
         if total_markers == 0:
             return
         
@@ -1249,10 +1262,6 @@ class FlightGlobeWidget(QOpenGLWidget):
             for marker in self.team_city_markers:
                 self.render_spinning_cube_marker(marker, None, 1.5)
         
-        if self.show_venues:
-            for marker in self.venue_markers:
-                self.render_spinning_cube_marker(marker, None, 1.0)
-        
         self.marker_shader.release()
     
     def render_spinning_cube_marker(self, marker, cube_geometry, rotation_speed, is_animated=False):
@@ -1262,25 +1271,38 @@ class FlightGlobeWidget(QOpenGLWidget):
             
         pos = marker['position']
         team_id = marker.get('team_id', '')
+        league = marker.get('league', '')  # GET LEAGUE FROM MARKER
         marker_type = marker.get('type', 'generic')
         size = marker.get('size', 4.0)
         
         if not pos or len(pos) != 3:
             return False
         
-        # Texture selection - normalize team_id for lookup
+        # LEAGUE-AWARE TEXTURE LOOKUP
         texture = None
         use_texture = False
         team_color = (1.0, 1.0, 1.0)
         
-        # Normalize team_id to uppercase for consistent lookup
-        normalized_team_id = team_id.upper() if team_id else ''
+        # Try all leagues for this team_id since league context might be missing
+        if team_id:
+            team_id_lower = team_id.lower()
+            found_logo = False
+            
+            # Try each league prefix
+            for league_prefix in ['mlb', 'nba', 'nhl', 'nfl']:
+                league_team_key = f"{league_prefix}_{team_id_lower}"
+                if league_team_key in self.team_logo_textures:
+                    texture = self.team_logo_textures[league_team_key]
+                    use_texture = True
+                    team_color = self.get_team_color(team_id.upper())
+                    found_logo = True
+                    break
+            
+            if not found_logo:
+                print(f"❌ No logo found for team {team_id} in any league")
         
-        if normalized_team_id and normalized_team_id in self.team_logo_textures:
-            texture = self.team_logo_textures[normalized_team_id]
-            use_texture = True
-            team_color = self.get_team_color(normalized_team_id)
-        elif self.default_marker_texture:
+        # Fallback to default marker
+        if not texture and self.default_marker_texture:
             texture = self.default_marker_texture
             use_texture = True
             if marker_type == 'departure':
@@ -1289,7 +1311,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                 team_color = (1.0, 0.8, 0.2)
             else:
                 team_color = (1.0, 0.4, 0.1)
-        else:
+        elif not texture:
             use_texture = False
             team_color = marker.get('color', (1.0, 1.0, 1.0))
         
@@ -1324,10 +1346,10 @@ class FlightGlobeWidget(QOpenGLWidget):
         """Generate travel paths and markers from sports data"""
         self.travel_paths = []
         self.team_city_markers = []
-        self.venue_markers = []
+
         
         cities_seen = set()
-        venues_seen = set()
+
         
         print(f"Generating visualizations for {len(self.travel_data)} travel records...")
         
@@ -1338,6 +1360,9 @@ class FlightGlobeWidget(QOpenGLWidget):
             team_id = getattr(travel, 'team_id', 'NO_TEAM_ID')
             team_name = getattr(travel, 'team_name', 'NO_TEAM_NAME')
             team_abbrev = team_id.upper() if isinstance(team_id, str) else ''
+            
+            # GET LEAGUE CONTEXT
+            league = getattr(travel, 'league', '').upper()
             
             dep_coords = self.get_city_coordinates(travel.departure_city)
             arr_coords = self.get_city_coordinates(travel.arrival_city)
@@ -1370,25 +1395,15 @@ class FlightGlobeWidget(QOpenGLWidget):
                     city_marker = {
                         'position': dep_3d,
                         'team_id': team_abbrev,
+                        'league': league,
                         'size': 4.0,
                         'city_name': travel.departure_city,
                         'type': 'departure'
                     }
                     self.team_city_markers.append(city_marker)
                 
-                if travel.arrival_city not in venues_seen:
-                    venues_seen.add(travel.arrival_city)
-                    arr_3d = self.lat_lon_to_3d(arr_lat, arr_lon, 1.03)
-                    venue_marker = {
-                        'position': arr_3d,
-                        'team_id': '',
-                        'size': 3.0,
-                        'venue_name': travel.arrival_city,
-                        'type': 'arrival'
-                    }
-                    self.venue_markers.append(venue_marker)
         
-        print(f"Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers, {len(self.venue_markers)} venue markers")
+        print(f"Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers")
         
         # Debug: Print a few examples of what was created
         if self.travel_paths:
@@ -1396,9 +1411,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         if self.team_city_markers:
             sample_marker = self.team_city_markers[0]
             print(f"Sample city marker: {sample_marker['city_name']} (team: {sample_marker['team_id']})")
-        if self.venue_markers:
-            sample_venue = self.venue_markers[0]
-            print(f"Sample venue marker: {sample_venue['venue_name']}")
+
         
         # Debug: Print logo texture status
         print(f"Available team logos: {list(self.team_logo_textures.keys())}")
@@ -1462,13 +1475,12 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.travel_data = temp_data
         self.update()
     
+    """Set display options"""
     def set_display_options(self, show_paths: bool = True, show_cities: bool = True, 
-                          show_venues: bool = True, show_labels: bool = True, 
-                          show_atmosphere: bool = True):
-        """Set display options"""
+                          show_labels: bool = True, show_atmosphere: bool = True):
+
         self.show_travel_paths = show_paths
         self.show_team_cities = show_cities
-        self.show_venues = show_venues
         self.show_labels = show_labels
         self.show_atmosphere = show_atmosphere
         self.update()
