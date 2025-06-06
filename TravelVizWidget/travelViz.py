@@ -17,8 +17,6 @@ from data_client import ESPNSportsDataAggregator, TeamTravelData, TeamInfo
 from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
 
-#TODO: Fix FUCKING royals travel data not loading for who the fuck knows why
-
 
 class ConfigLoader:
     """Load API configuration from files"""
@@ -68,7 +66,7 @@ class ConfigLoader:
 
 
 class SportsTrackerMainWindow(QMainWindow):
-    """Main window with ESPN schedule scraping support"""
+    """Main window with multi-league ESPN schedule scraping support"""
     
     def __init__(self):
         super().__init__()
@@ -81,6 +79,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.data_update_timer = None
         self.current_travel_data = []
         self.all_teams = []
+        self.current_league = "NHL"  # Default league
         self.current_season = str(datetime.now().year)
         
         # Setup UI
@@ -98,7 +97,7 @@ class SportsTrackerMainWindow(QMainWindow):
     
     def setup_ui(self):
         """Setup the main window UI"""
-        self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_season} Season")
+        self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_league} {self.current_season} Season")
         self.setGeometry(100, 100, 1900, 1100)
         
         # Central widget with splitter
@@ -143,17 +142,25 @@ class SportsTrackerMainWindow(QMainWindow):
         group = QGroupBox("SEASON DATA")
         layout = QVBoxLayout(group)
         
+        # League selection section
+        league_layout = QHBoxLayout()
+        league_layout.addWidget(QLabel("League:"))
+        
+        self.league_status_label = QLabel("MLB")
+        self.league_status_label.setStyleSheet("font-weight: bold; color: #00AA00;")
+        league_layout.addWidget(self.league_status_label)
+        
+        league_layout.addStretch()
+        layout.addLayout(league_layout)
+        
         # Season selection
         season_layout = QHBoxLayout()
         season_layout.addWidget(QLabel("Season:"))
         self.season_combo = QComboBox()
         
-        # Add recent seasons
-        current_year = datetime.now().year
-        for year in range(current_year, current_year - 5, -1):
-            self.season_combo.addItem(str(year), year)
+        # Add recent seasons (will be updated when league changes)
+        self.update_season_combo_for_league("MLB")
         
-        self.season_combo.setCurrentText(self.current_season)
         season_layout.addWidget(self.season_combo)
         layout.addLayout(season_layout)
         
@@ -190,6 +197,55 @@ class SportsTrackerMainWindow(QMainWindow):
         
         return group
     
+    def update_season_combo_for_league(self, league: str):
+        """Update season combo box based on selected league"""
+        self.season_combo.clear()
+        
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        
+        if league in ['NBA', 'NHL']:
+            # NBA/NHL seasons span two years (e.g., 2024-25)
+            # The season runs from October to June of the next year
+            
+            # Determine the current season's start year
+            if current_month >= 10:  # October or later - new season has started
+                current_season_start = current_year
+            else:  # Before October - still in previous season
+                current_season_start = current_year - 1
+            
+            # Generate seasons starting from current season, going back 5 years
+            for i in range(6):  # Current + 5 previous seasons
+                start_year = current_season_start - i
+                season_str = f"{start_year}-{str(start_year + 1)[2:]}"
+                self.season_combo.addItem(season_str, season_str)
+                
+        else:  # MLB
+            # MLB seasons are single years and run calendar year
+            for year in range(current_year, current_year - 5, -1):
+                season_str = str(year)
+                self.season_combo.addItem(season_str, season_str)
+        
+        # Set current season as default (this should now work correctly)
+        if self.sports_aggregator:
+            current_season = self.sports_aggregator.espn_scraper.get_current_season_for_league(league)
+            print(f"🐛 DEBUG - Setting default season for {league}: '{current_season}'")
+            print(f"🐛 DEBUG - Available seasons in combo: {[self.season_combo.itemText(i) for i in range(self.season_combo.count())]}")
+            
+            index = self.season_combo.findText(current_season)
+            if index >= 0:
+                self.season_combo.setCurrentIndex(index)
+                self.current_season = current_season
+                print(f"🐛 DEBUG - Successfully set season to '{current_season}' at index {index}")
+            else:
+                print(f"🐛 DEBUG - WARNING: Could not find season '{current_season}' in combo box!")
+                # Fallback to first item
+                if self.season_combo.count() > 0:
+                    fallback_season = self.season_combo.itemText(0)
+                    self.season_combo.setCurrentIndex(0)
+                    self.current_season = fallback_season
+                    print(f"🐛 DEBUG - Fallback: Using first season '{fallback_season}'")
+    
     def setup_sports_system(self):
         """Setup sports data system with ESPN scraping"""
         api_keys = self.config_loader.get_api_keys()
@@ -213,7 +269,7 @@ class SportsTrackerMainWindow(QMainWindow):
         
         # Control panel signals
         self.control_panel.refreshRequested.connect(self.force_refresh_season_data)
-        self.control_panel.modeChanged.connect(self.on_mode_changed)
+        self.control_panel.modeChanged.connect(self.on_league_changed)  # Updated connection
         self.control_panel.airlineFilterChanged.connect(self.on_team_filter_changed)
         self.control_panel.statusFilterChanged.connect(self.on_schedule_filter_changed)
         self.control_panel.routeFilterChanged.connect(self.on_route_filter_changed)
@@ -223,10 +279,51 @@ class SportsTrackerMainWindow(QMainWindow):
         self.globe_widget.performanceUpdate.connect(self.on_performance_update)
         self.globe_widget.locationSelected.connect(self.on_location_selected)
         
-        #Animation Signals
+        # Animation Signals
         self.globe_widget.animationStatusChanged.connect(self.on_animation_status_changed)
         self.globe_widget.animationProgressChanged.connect(self.on_animation_progress_changed)
-
+    
+    def on_league_changed(self, league: str):
+        """Handle league change from control panel"""
+        if league not in ["MLB", "NBA", "NHL"]:
+            print(f"Unsupported league: {league}")
+            return
+        
+        if league == self.current_league:
+            return  # No change needed
+        
+        print(f"Switching from {self.current_league} to {league}")
+        
+        # Update current league
+        self.current_league = league
+        
+        # Update sports aggregator
+        if self.sports_aggregator:
+            self.sports_aggregator.set_league(league)
+        
+        # Update UI elements
+        self.league_status_label.setText(league)
+        self.update_season_combo_for_league(league)
+        
+        # Update window title
+        current_season = self.season_combo.currentText() or self.current_season
+        self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {league} {current_season} Season")
+        
+        # Clear current data
+        self.current_travel_data = []
+        self.globe_widget.load_flight_data([])
+        
+        # Update team combo
+        self.populate_team_combo()
+        
+        # Update status
+        self.season_status_label.setText(f"{league} - No data loaded")
+        self.connection_status.setText(f"Connected to ESPN ({league})")
+        
+        # Auto-load current week for the new league
+        self.load_current_week()
+        
+        print(f"Successfully switched to {league}")
     
     def start_sports_monitoring(self):
         """Start sports data monitoring"""
@@ -235,19 +332,19 @@ class SportsTrackerMainWindow(QMainWindow):
             self.populate_team_combo()
             # Start with current week for quick preview
             self.load_current_week()
-            self.connection_status.setText("Connected to ESPN")
+            self.connection_status.setText(f"Connected to ESPN ({self.current_league})")
             self.connection_status.setStyleSheet("color: #00FF00;")
     
     def populate_team_combo(self):
-        """Populate team selection combo with all MLB teams"""
+        """Populate team selection combo with teams from current league"""
         try:
-            teams = self.sports_aggregator.get_all_teams()
+            teams = self.sports_aggregator.get_all_teams(self.current_league)
             self.all_teams = teams
             
             # Clear and repopulate
             current_selection = self.focus_team_combo.currentData()
             self.focus_team_combo.clear()
-            self.focus_team_combo.addItem("All Teams", "")
+            self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
             
             # Add teams sorted by name
             for team in sorted(teams, key=lambda t: t.display_name):
@@ -260,7 +357,7 @@ class SportsTrackerMainWindow(QMainWindow):
                 if index >= 0:
                     self.focus_team_combo.setCurrentIndex(index)
             
-            print(f"Populated team combo with {len(teams)} teams")
+            print(f"Populated team combo with {len(teams)} {self.current_league} teams")
             
         except Exception as e:
             print(f"Error populating team combo: {e}")
@@ -269,8 +366,8 @@ class SportsTrackerMainWindow(QMainWindow):
         """Handle season change"""
         if season_text and season_text != self.current_season:
             self.current_season = season_text
-            self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_season} Season")
-            self.season_status_label.setText(f"Season {season_text} - No data loaded")
+            self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_league} {self.current_season} Season")
+            self.season_status_label.setText(f"{self.current_league} {season_text} - No data loaded")
             # Clear current data
             self.current_travel_data = []
             self.globe_widget.load_flight_data([])
@@ -286,15 +383,17 @@ class SportsTrackerMainWindow(QMainWindow):
         
         self.load_full_season_btn.setEnabled(False)
         self.load_full_season_btn.setText("Loading Season...")
-        self.season_status_label.setText(f"Loading {season} season schedule...")
+        self.season_status_label.setText(f"Loading {self.current_league} {season} season schedule...")
         
         try:
             # Force refresh if it's the current season
-            force_refresh = (season == str(datetime.now().year))
-            self.sports_aggregator.load_full_season_schedule(season, force_refresh)
+            current_season = self.sports_aggregator.espn_scraper.get_current_season_for_league(self.current_league)
+            force_refresh = (season == current_season)
+            
+            self.sports_aggregator.load_full_season_schedule(season, self.current_league, force_refresh)
             
         except Exception as e:
-            self.on_data_error(f"Failed to load {season} season: {str(e)}")
+            self.on_data_error(f"Failed to load {self.current_league} {season} season: {str(e)}")
             self.load_full_season_btn.setEnabled(True)
             self.load_full_season_btn.setText("Load Full Season")
     
@@ -307,7 +406,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.load_current_week_btn.setText("Loading...")
         
         try:
-            self.sports_aggregator.get_current_week_schedule()
+            self.sports_aggregator.get_current_week_schedule(self.current_league)
         except Exception as e:
             self.on_data_error(f"Failed to load current week: {str(e)}")
             self.load_current_week_btn.setEnabled(True)
@@ -320,7 +419,7 @@ class SportsTrackerMainWindow(QMainWindow):
         
         if team_id and self.sports_aggregator:
             # Load specific team schedule
-            self.sports_aggregator.load_team_season_schedule(team_id, season)
+            self.sports_aggregator.load_team_season_schedule(team_id, season, self.current_league)
         elif not team_id and self.current_travel_data:
             # Show all teams again
             self.globe_widget.load_flight_data(self.current_travel_data)
@@ -338,12 +437,13 @@ class SportsTrackerMainWindow(QMainWindow):
             current_segment = segment_info.get('departure_city', '') + " → " + segment_info.get('arrival_city', '')
             self.status_bar.showMessage(f"Animation: {progress*100:.1f}% - {current_segment}")
     
-    
-    def on_season_data_loaded(self, season: str, game_count: int):
+    def on_season_data_loaded(self, season: str, league: str, game_count: int):
         """Handle season data loaded successfully"""
-        self.season_status_label.setText(
-            f"Season {season}: {game_count:,} games, {len(self.current_travel_data):,} travel records"
-        )
+        if league == self.current_league:  # Only update if it's for current league
+            self.season_status_label.setText(
+                f"{league} {season}: {game_count:,} games, {len(self.current_travel_data):,} travel records"
+            )
+        
         self.load_full_season_btn.setEnabled(True)
         self.load_full_season_btn.setText("Load Full Season")
         self.load_current_week_btn.setEnabled(True)
@@ -353,7 +453,7 @@ class SportsTrackerMainWindow(QMainWindow):
         """Force refresh current season data"""
         season = self.season_combo.currentText()
         if season and self.sports_aggregator:
-            self.sports_aggregator.load_full_season_schedule(season, force_refresh=True)
+            self.sports_aggregator.load_full_season_schedule(season, self.current_league, force_refresh=True)
     
     def apply_sports_theme(self):
         """Apply sports-themed dark styling"""
@@ -495,7 +595,27 @@ class SportsTrackerMainWindow(QMainWindow):
         # Data menu
         data_menu = menubar.addMenu("Data")
         animation_menu = menubar.addMenu("Animation")
+        league_menu = menubar.addMenu("League")  # New league menu
     
+        # League selection actions
+        mlb_action = QAction("Switch to MLB", self)
+        mlb_action.triggered.connect(lambda: self.on_league_changed("MLB"))
+        league_menu.addAction(mlb_action)
+        
+        nba_action = QAction("Switch to NBA", self)
+        nba_action.triggered.connect(lambda: self.on_league_changed("NBA"))
+        league_menu.addAction(nba_action)
+        
+        nhl_action = QAction("Switch to NHL", self)
+        nhl_action.triggered.connect(lambda: self.on_league_changed("NHL"))
+        league_menu.addAction(nhl_action)
+        
+        league_menu.addSeparator()
+        
+        league_stats_action = QAction("League Statistics", self)
+        league_stats_action.triggered.connect(self.show_league_statistics)
+        league_menu.addAction(league_stats_action)
+        
         start_animation_action = QAction("Start Team Animation", self)
         start_animation_action.setShortcut("Ctrl+A")
         start_animation_action.triggered.connect(self.start_team_animation_dialog)
@@ -558,6 +678,39 @@ class SportsTrackerMainWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
     
+    def show_league_statistics(self):
+        """Show statistics for all leagues"""
+        try:
+            stats_text = "Multi-League Statistics:\n\n"
+            
+            for league in ["MLB", "NBA", "NHL"]:
+                teams = self.sports_aggregator.get_all_teams(league)
+                cached_seasons = self.sports_aggregator.get_cached_seasons(league)
+                
+                stats_text += f"{league}:\n"
+                stats_text += f"  Teams: {len(teams)}\n"
+                stats_text += f"  Cached Seasons: {len(cached_seasons)}\n"
+                
+                if cached_seasons:
+                    latest_season = cached_seasons[0]
+                    stats_text += f"  Latest Season: {latest_season['season']}\n"
+                    stats_text += f"  Games: {latest_season['games_count']}\n"
+                    stats_text += f"  Travel Records: {latest_season['travel_count']}\n"
+                
+                stats_text += "\n"
+            
+            db_stats = self.sports_aggregator.get_database_stats()
+            stats_text += f"Database:\n"
+            stats_text += f"  Total Teams: {db_stats.get('teams_count', 0)}\n"
+            stats_text += f"  Total Games: {db_stats.get('games_count', 0)}\n"
+            stats_text += f"  Total Travel Records: {db_stats.get('travel_count', 0)}\n"
+            stats_text += f"  Database Size: {db_stats.get('db_size_mb', 0):.1f} MB\n"
+            
+            QMessageBox.information(self, "League Statistics", stats_text)
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to get league statistics: {str(e)}")
+    
     def setup_status_bar(self):
         """Setup status bar"""
         self.status_bar = self.statusBar()
@@ -597,7 +750,7 @@ class SportsTrackerMainWindow(QMainWindow):
         
         # Update status
         self.schedule_count_label.setText(f"Travel: {len(travel_data)}")
-        self.connection_status.setText("Connected")
+        self.connection_status.setText(f"Connected ({self.current_league})")
         self.connection_status.setStyleSheet("color: #00FF00;")
         self.control_panel.set_connection_status(True)
     
@@ -605,10 +758,10 @@ class SportsTrackerMainWindow(QMainWindow):
         """Show dialog to select team for animation"""
         available_teams = self.globe_widget.get_available_teams()
         if not available_teams:
-            QMessageBox.information(self, "No Teams", "No teams available for animation. Load season data first.")
+            QMessageBox.information(self, "No Teams", f"No {self.current_league} teams available for animation. Load season data first.")
             return
         
-        team_id, ok = QInputDialog.getItem(self, "Select Team", "Choose team to animate:", 
+        team_id, ok = QInputDialog.getItem(self, "Select Team", f"Choose {self.current_league} team to animate:", 
                                            available_teams, 0, False)
         if ok and team_id:
             success = self.globe_widget.start_team_animation(team_id)
@@ -643,47 +796,12 @@ class SportsTrackerMainWindow(QMainWindow):
         self.load_current_week_btn.setEnabled(True)
         self.load_current_week_btn.setText("Current Week")
     
-    def load_demo_data(self):
-        """Load demo travel data for demonstration"""
-        demo_travel_data = [
-            TeamTravelData(
-                team_name="Los Angeles Dodgers",
-                team_id="lad",  # Use correct lowercase abbreviation
-                departure_city="Los Angeles",
-                arrival_city="New York", 
-                game_date=datetime.now() + timedelta(days=2),
-                travel_date=datetime.now() + timedelta(days=1),
-                departure_airport="LAX",
-                arrival_airport="JFK",
-                confidence="demo"
-            ),
-            TeamTravelData(
-                team_name="New York Yankees",
-                team_id="nyy",  # Use correct lowercase abbreviation
-                departure_city="New York",
-                arrival_city="Boston",
-                game_date=datetime.now() + timedelta(days=3),
-                travel_date=datetime.now() + timedelta(days=2),
-                departure_airport="JFK",
-                arrival_airport="BOS",
-                confidence="demo"
-            )
-        ]
-        
-        # Load demo data into the interface
-        self.on_travel_data_updated(demo_travel_data)
-        self.season_status_label.setText("Demo Mode - Load season data for real schedules")
+    
     
     def on_performance_update(self, fps: float):
         """Handle performance updates"""
         self.performance_label.setText(f"FPS: {fps:.1f}")
         self.control_panel.update_fps(fps)
-    
-    def on_mode_changed(self, mode: str):
-        """Handle mode changes"""
-        if mode in ["MLB", "NFL", "NBA", "NHL"]:
-            # Could extend to other leagues in the future
-            pass
     
     def on_team_filter_changed(self, teams: List[str]):
         """Handle team filter changes"""
@@ -728,13 +846,13 @@ class SportsTrackerMainWindow(QMainWindow):
     def export_travel_data(self):
         """Export current travel data"""
         if not self.current_travel_data:
-            QMessageBox.information(self, "No Data", "No travel data to export.")
+            QMessageBox.information(self, "No Data", f"No {self.current_league} travel data to export.")
             return
         
         season = self.season_combo.currentText()
         filename, _ = QFileDialog.getSaveFileName(
             self, "Export Travel Data", 
-            f"team_travel_{season}_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            f"{self.current_league.lower()}_travel_{season}_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             "JSON Files (*.json);;CSV Files (*.csv)"
         )
         
@@ -743,6 +861,7 @@ class SportsTrackerMainWindow(QMainWindow):
                 export_data = []
                 for travel in self.current_travel_data:
                     export_data.append({
+                        'league': self.current_league,
                         'team_name': travel.team_name,
                         'team_id': travel.team_id,
                         'departure_city': travel.departure_city,
@@ -756,7 +875,7 @@ class SportsTrackerMainWindow(QMainWindow):
                 with open(filename, 'w') as f:
                     json.dump(export_data, f, indent=2)
                 
-                self.status_bar.showMessage(f"Exported {len(export_data)} travel records to {filename}", 5000)
+                self.status_bar.showMessage(f"Exported {len(export_data)} {self.current_league} travel records to {filename}", 5000)
                 
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export data: {str(e)}")
@@ -771,7 +890,12 @@ class SportsTrackerMainWindow(QMainWindow):
         if state:
             self.restoreState(state)
         
-        # Load last selected season
+        # Load last selected league and season
+        last_league = self.settings.value("lastLeague", "MLB")
+        if last_league in ["MLB", "NBA", "NHL"]:
+            self.current_league = last_league
+            # This will trigger league change when control panel loads
+        
         last_season = self.settings.value("lastSeason")
         if last_season:
             index = self.season_combo.findText(last_season)
@@ -783,23 +907,19 @@ class SportsTrackerMainWindow(QMainWindow):
         """Save window settings"""
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("windowState", self.saveState())
+        self.settings.setValue("lastLeague", self.current_league)
         self.settings.setValue("lastSeason", self.current_season)
     
-    def closeEvent(self, event):
-        """Handle application close"""
-        # Save settings
-        self.save_window_settings()
-        
-        # Accept close event
-        event.accept()
+    
     
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(self, "About Sports Team Travel Tracker", 
                          "Sports Team Travel Tracker v4.0\n\n"
-                         "Real-time sports team movement visualization\n\n"
+                         "Multi-league sports team movement visualization\n\n"
                          "Features:\n"
                          "• Full season schedule loading via ESPN scraping\n"
+                         "• Multi-league support (MLB, NBA, NHL)\n"
                          "• Team management and filtering\n"
                          "• Multi-season support\n"
                          "• Team-focused schedule views\n\n"

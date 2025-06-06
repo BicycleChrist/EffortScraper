@@ -13,6 +13,7 @@ from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
 import os
 from pathlib import Path
 
+#TODO: Mapping for Guardinans travel paths not working, likely a similar issue to Royals 
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences"""
@@ -271,7 +272,6 @@ class FlightGlobeWidget(QOpenGLWidget):
         # Team logo textures
         self.team_logo_textures = {}
         self.default_marker_texture = None
-        self.logos_folder = "mlb_logos"
         
         # Sphere geometry
         self.vertices = None
@@ -669,44 +669,95 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.link()
     
     def load_team_logo_textures(self):
-        """Load MLB team logo textures from PNG files"""
-        logos_path = Path(self.logos_folder)
-        if not logos_path.exists():
-            self.create_default_marker_texture()
-            return
+        """Load team logo textures from PNG files for MLB, NBA, and NHL"""
+        # Clear existing textures
+        for texture in self.team_logo_textures.values():
+            if texture:
+                texture.destroy()
+        self.team_logo_textures.clear()
         
-        team_logo_files = {
-            "LAD": "Dodgers.png", "NYY": "Yankees.png", "BOS": "Redsox.png",
-            "CHC": "Cubs.png", "SF": "Giants.png", "ATL": "Braves.png",
-            "HOU": "Astros.png", "LAA": "Angels.png", "NYM": "Mets.png",
-            "PHI": "Phillies.png", "STL": "Cardinals.png", "WSH": "Nationals.png",
-            "MIL": "Brewers.png", "COL": "Rockies.png", "ARI": "Diamondbacks.png",
-            "SD": "Padres.png", "MIA": "Marlins.png", "TEX": "Rangers.png",
-            "CIN": "Reds.png", "PIT": "Pirates.png", "BAL": "Orioles.png",
-            "CLE": "Guardians.png", "DET": "Tigers.png", "MIN": "Twins.png",
-            "CWS": "WhiteSox.png", "KC": "Royals.png", "OAK": "Athletics.png",
-            "SEA": "Mariners.png", "TB": "Rays.png", "TOR": "BlueJays.png"
+        # League-specific logo mappings and folders
+        league_configs = {
+            "MLB": {
+                "folder": "mlb_logos",
+                "teams": {
+                    "lad": "Dodgers.png", "nyy": "Yankees.png", "bos": "Redsox.png",
+                    "chc": "Cubs.png", "sf": "Giants.png", "atl": "Braves.png",
+                    "hou": "Astros.png", "laa": "Angels.png", "nym": "Mets.png",
+                    "phi": "Phillies.png", "stl": "Cardinals.png", "wsh": "Nationals.png",
+                    "mil": "Brewers.png", "col": "Rockies.png", "ari": "Diamondbacks.png",
+                    "sd": "Padres.png", "mia": "Marlins.png", "tex": "Rangers.png",
+                    "cin": "Reds.png", "pit": "Pirates.png", "bal": "Orioles.png",
+                    "cle": "Guardians.png", "det": "Tigers.png", "min": "Twins.png",
+                    "chw": "WhiteSox.png", "kc": "Royals.png", "ath": "Athletics.png",
+                    "sea": "Mariners.png", "tb": "Rays.png", "tor": "BlueJays.png"
+                }
+            },
+            "NBA": {
+                "folder": "nba_logos", 
+                "teams": {
+                    "phi": "76ers.png", "mil": "Bucks.png", "chi": "Bulls.png",
+                    "cle": "Cavaliers.png", "bos": "Celtics.png", "lac": "Clippers.png",
+                    "mem": "Grizzlies.png", "atl": "Hawks.png", "mia": "Heat.png",
+                    "cha": "Hornets.png", "utah": "Jazz.png", "ny": "Knicks.png",
+                    "lal": "Lakers.png", "orl": "Magic.png", "dal": "Mavericks.png",
+                    "bkn": "Nets.png", "den": "Nuggets.png", "ind": "Pacers.png",
+                    "no": "Pelicans.png", "det": "Pistons.png", "por": "TrailBlazers.png",
+                    "sac": "Kings.png", "sa": "Spurs.png", "phx": "Suns.png",
+                    "okc": "Thunder.png", "min": "Timberwolves.png", "tor": "Raptors.png",
+                    "gs": "Warriors.png", "wsh": "Wizards.png", "hou": "Rockets.png"
+                }
+            },
+            "NHL": {
+                "folder": "nhl_logos",
+                "teams": {
+                    "ana": "Ducks.png", "ari": "Coyotes.png", "bos": "Bruins.png",
+                    "buf": "Sabres.png", "cgy": "Flames.png", "car": "Hurricanes.png",
+                    "chi": "Blackhawks.png", "col": "Avalanche.png", "cbj": "BlueJackets.png",
+                    "dal": "Stars.png", "det": "RedWings.png", "edm": "Oilers.png",
+                    "fla": "Panthers.png", "lak": "Kings.png", "min": "Wild.png",
+                    "mtl": "Canadiens.png", "nsh": "Predators.png", "njd": "Devils.png",
+                    "nyi": "Islanders.png", "nyr": "Rangers.png", "ott": "Senators.png",
+                    "phi": "Flyers.png", "pit": "Penguins.png", "sj": "Sharks.png",
+                    "stl": "Blues.png", "tb": "Lightning.png", "tor": "MapleLeafs.png",
+                    "van": "Canucks.png", "vgk": "GoldenKnights.png", "wsh": "Capitals.png",
+                    "wpg": "Jets.png", "sea": "Kraken.png"
+                }
+            }
         }
         
-        logos_loaded = 0
-        for team_id, filename in team_logo_files.items():
-            logo_path = logos_path / filename
-            if logo_path.exists():
-                image = QImage(str(logo_path))
-                if not image.isNull():
-                    image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                      Qt.TransformationMode.SmoothTransformation)
-                    image = self.process_logo_image(image, team_id)
-                    
-                    texture = QOpenGLTexture(image)
-                    texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
-                    texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
-                    texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-                    
-                    self.team_logo_textures[team_id] = texture
-                    logos_loaded += 1
+        total_loaded = 0
         
-        print(f"Loaded {logos_loaded} team logo textures")
+        # Load logos for all leagues
+        for league, config in league_configs.items():
+            logos_path = Path(config["folder"])
+            if not logos_path.exists():
+                continue
+            
+            league_loaded = 0
+            for team_id, filename in config["teams"].items():
+                logo_path = logos_path / filename
+                if logo_path.exists():
+                    image = QImage(str(logo_path))
+                    if not image.isNull():
+                        image = image.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
+                                          Qt.TransformationMode.SmoothTransformation)
+                        image = self.process_logo_image(image, team_id)
+                        
+                        texture = QOpenGLTexture(image)
+                        texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
+                        texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+                        texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+                        
+                        # Store with uppercase key for consistency
+                        self.team_logo_textures[team_id.upper()] = texture
+                        league_loaded += 1
+            
+            if league_loaded > 0:
+                print(f"Loaded {league_loaded} {league} team logos")
+                total_loaded += league_loaded
+        
+        print(f"Total logos loaded: {total_loaded}")
         self.create_default_marker_texture()
     
     def process_logo_image(self, image: QImage, team_id: str) -> QImage:
@@ -735,6 +786,8 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.default_marker_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
         self.default_marker_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
         self.default_marker_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+        
+        print("✅ Default marker texture created successfully")
     
     def setup_vertex_buffers(self):
         """Setup vertex buffer objects"""
@@ -977,8 +1030,9 @@ class FlightGlobeWidget(QOpenGLWidget):
         return path_points
     
     def get_city_coordinates(self, city_name: str) -> Optional[Tuple[float, float]]:
-        """Get latitude/longitude for a city"""
+        """Get latitude/longitude for a city (comprehensive NBA/NHL/MLB coverage)"""
         city_coords = {
+            # Major US Cities (MLB/NBA/NHL coverage)
             "Los Angeles": (34.0522, -118.2437), "New York": (40.7128, -74.0060),
             "Chicago": (41.8781, -87.6298), "Houston": (29.7604, -95.3698),
             "Phoenix": (33.4484, -112.0740), "Philadelphia": (39.9526, -75.1652),
@@ -997,14 +1051,29 @@ class FlightGlobeWidget(QOpenGLWidget):
             "Miami": (25.7617, -80.1918), "Tampa": (27.9506, -82.4572),
             "Pittsburgh": (40.4406, -79.9959), "Cincinnati": (39.1031, -84.5120),
             "St. Louis": (38.6270, -90.1994), "Minneapolis": (44.9778, -93.2650),
+            "Kansas City": (39.0997, -94.5786), "Cleveland": (41.4993, -81.6944),
+            
+            # NBA-specific cities (missing from above)
+            "Salt Lake City": (40.7608, -111.8910), "Orlando": (28.5383, -81.3792),
+            "Indianapolis": (39.7684, -86.1581), "New Orleans": (29.9511, -90.0715),
+            "Sacramento": (38.5816, -121.4944), "Oklahoma City": (35.4676, -97.5164),
+            
+            # NHL-specific cities (missing from above)
+            "Anaheim": (33.8366, -117.9143), "Buffalo": (42.8864, -78.8784),
+            "Raleigh": (35.7796, -78.6382), "Sunrise": (26.1354, -80.2373),
+            "Newark": (40.7357, -74.1724),
+            
+            # Canadian cities (MLB/NBA/NHL)
             "Toronto": (43.6532, -79.3832), "Montreal": (45.5017, -73.5673),
             "Vancouver": (49.2827, -123.1207), "Calgary": (51.0447, -114.0719),
             "Edmonton": (53.5461, -113.4938), "Ottawa": (45.4215, -75.6972),
-            "Winnipeg": (49.8951, -97.1384), "London": (51.5074, -0.1278),
-            "Paris": (48.8566, 2.3522), "Tokyo": (35.6762, 139.6503),
-            "Sydney": (-33.8688, 151.2093), "Berlin": (52.5200, 13.4050),
-            "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964),
-            "Kansas City": (39.0997, -94.5786)
+            "Winnipeg": (49.8951, -97.1384),
+            
+            # International cities (for reference)
+            "London": (51.5074, -0.1278), "Paris": (48.8566, 2.3522),
+            "Tokyo": (35.6762, 139.6503), "Sydney": (-33.8688, 151.2093),
+            "Berlin": (52.5200, 13.4050), "Madrid": (40.4168, -3.7038),
+            "Rome": (41.9028, 12.4964)
         }
         return city_coords.get(city_name)
     
@@ -1199,15 +1268,18 @@ class FlightGlobeWidget(QOpenGLWidget):
         if not pos or len(pos) != 3:
             return False
         
-        # Texture selection
+        # Texture selection - normalize team_id for lookup
         texture = None
         use_texture = False
         team_color = (1.0, 1.0, 1.0)
         
-        if team_id and team_id in self.team_logo_textures:
-            texture = self.team_logo_textures[team_id]
+        # Normalize team_id to uppercase for consistent lookup
+        normalized_team_id = team_id.upper() if team_id else ''
+        
+        if normalized_team_id and normalized_team_id in self.team_logo_textures:
+            texture = self.team_logo_textures[normalized_team_id]
             use_texture = True
-            team_color = self.get_team_color(team_id)
+            team_color = self.get_team_color(normalized_team_id)
         elif self.default_marker_texture:
             texture = self.default_marker_texture
             use_texture = True
@@ -1257,6 +1329,8 @@ class FlightGlobeWidget(QOpenGLWidget):
         cities_seen = set()
         venues_seen = set()
         
+        print(f"Generating visualizations for {len(self.travel_data)} travel records...")
+        
         for travel in self.travel_data:
             if not hasattr(travel, 'departure_city'):
                 continue
@@ -1269,6 +1343,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             arr_coords = self.get_city_coordinates(travel.arrival_city)
             
             if not dep_coords or not arr_coords:
+                print(f"Missing coordinates for {travel.departure_city} -> {travel.arrival_city}")
                 continue
             
             dep_lat, dep_lon = dep_coords
@@ -1312,22 +1387,69 @@ class FlightGlobeWidget(QOpenGLWidget):
                         'type': 'arrival'
                     }
                     self.venue_markers.append(venue_marker)
+        
+        print(f"Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers, {len(self.venue_markers)} venue markers")
+        
+        # Debug: Print a few examples of what was created
+        if self.travel_paths:
+            print(f"Sample path: {self.travel_paths[0]['route']}")
+        if self.team_city_markers:
+            sample_marker = self.team_city_markers[0]
+            print(f"Sample city marker: {sample_marker['city_name']} (team: {sample_marker['team_id']})")
+        if self.venue_markers:
+            sample_venue = self.venue_markers[0]
+            print(f"Sample venue marker: {sample_venue['venue_name']}")
+        
+        # Debug: Print logo texture status
+        print(f"Available team logos: {list(self.team_logo_textures.keys())}")
+        print(f"Default marker texture: {'Available' if self.default_marker_texture else 'Missing'}")
     
     def get_team_color(self, team_id: str) -> Tuple[float, float, float]:
-        """Get team color based on team ID"""
+        """Get team color based on team ID (supports all leagues)"""
+        # Normalize to uppercase for consistent lookup
+        normalized_id = team_id.upper()
+        
+        # Combined team colors for all leagues
         team_colors = {
+            # MLB teams
             "NYY": (0.1, 0.2, 0.5), "BOS": (0.8, 0.1, 0.2), "TB": (0.0, 0.3, 0.6), 
             "TOR": (0.0, 0.4, 0.8), "BAL": (1.0, 0.3, 0.0), "CLE": (0.8, 0.1, 0.2), 
-            "CWS": (0.1, 0.1, 0.1), "DET": (0.0, 0.2, 0.5), "KC": (0.0, 0.3, 0.6), 
+            "CHW": (0.1, 0.1, 0.1), "DET": (0.0, 0.2, 0.5), "KC": (0.0, 0.3, 0.6), 
             "MIN": (0.0, 0.2, 0.5), "HOU": (1.0, 0.4, 0.0), "SEA": (0.0, 0.4, 0.6), 
-            "TEX": (0.8, 0.1, 0.2), "LAA": (0.8, 0.0, 0.2), "OAK": (0.0, 0.5, 0.2), 
+            "TEX": (0.8, 0.1, 0.2), "LAA": (0.8, 0.0, 0.2), "ATH": (0.0, 0.5, 0.2), 
             "ATL": (0.7, 0.0, 0.2), "PHI": (0.9, 0.1, 0.2), "NYM": (0.0, 0.3, 0.8), 
             "WSH": (0.7, 0.0, 0.2), "MIA": (0.0, 0.6, 0.8), "STL": (0.8, 0.0, 0.2), 
             "MIL": (0.0, 0.2, 0.5), "CHC": (0.0, 0.2, 0.6), "CIN": (0.8, 0.1, 0.2), 
             "PIT": (1.0, 0.8, 0.0), "LAD": (0.0, 0.4, 0.8), "SF": (1.0, 0.3, 0.0), 
             "SD": (1.0, 0.4, 0.0), "COL": (0.2, 0.1, 0.4), "ARI": (0.6, 0.0, 0.2),
+            
+            # NBA teams
+            "BOS": (0.0, 0.4, 0.2), "BKN": (0.1, 0.1, 0.1), "NY": (0.0, 0.3, 0.8), 
+            "PHI": (0.8, 0.1, 0.2), "TOR": (0.8, 0.0, 0.2), "CHI": (0.8, 0.0, 0.0), 
+            "CLE": (0.5, 0.0, 0.2), "DET": (0.8, 0.1, 0.2), "IND": (1.0, 0.8, 0.0), 
+            "MIL": (0.0, 0.3, 0.2), "ATL": (0.8, 0.1, 0.2), "CHA": (0.0, 0.5, 0.6), 
+            "MIA": (0.6, 0.0, 0.2), "ORL": (0.0, 0.3, 0.8), "WSH": (0.8, 0.1, 0.2), 
+            "DEN": (1.0, 0.6, 0.0), "MIN": (0.0, 0.2, 0.5), "OKC": (0.0, 0.3, 0.8), 
+            "POR": (0.8, 0.1, 0.2), "UTAH": (0.0, 0.2, 0.4), "GS": (1.0, 0.8, 0.0), 
+            "LAC": (0.8, 0.1, 0.2), "LAL": (0.3, 0.0, 0.5), "PHX": (1.0, 0.4, 0.0), 
+            "SAC": (0.3, 0.0, 0.5), "DAL": (0.0, 0.3, 0.8), "HOU": (0.8, 0.0, 0.0), 
+            "MEM": (0.0, 0.3, 0.6), "NO": (1.0, 0.6, 0.0), "SA": (0.1, 0.1, 0.1),
+            
+            # NHL teams
+            "ANA": (1.0, 0.4, 0.0), "ARI": (0.6, 0.0, 0.2), "BOS": (1.0, 0.8, 0.0), 
+            "BUF": (0.0, 0.3, 0.8), "CGY": (0.8, 0.0, 0.0), "CAR": (0.8, 0.1, 0.2), 
+            "CHI": (0.8, 0.0, 0.0), "COL": (0.5, 0.0, 0.3), "CBJ": (0.0, 0.2, 0.5), 
+            "DAL": (0.0, 0.4, 0.2), "DET": (0.8, 0.0, 0.0), "EDM": (0.0, 0.3, 0.8), 
+            "FLA": (0.8, 0.1, 0.2), "LAK": (0.1, 0.1, 0.1), "MIN": (0.0, 0.4, 0.2), 
+            "MTL": (0.8, 0.1, 0.2), "NSH": (1.0, 0.8, 0.0), "NJD": (0.8, 0.0, 0.0), 
+            "NYI": (0.0, 0.3, 0.8), "NYR": (0.0, 0.3, 0.8), "OTT": (0.8, 0.0, 0.0), 
+            "PHI": (1.0, 0.4, 0.0), "PIT": (1.0, 0.8, 0.0), "SJ": (0.0, 0.4, 0.4), 
+            "STL": (0.0, 0.3, 0.8), "TB": (0.0, 0.3, 0.8), "TOR": (0.0, 0.3, 0.8), 
+            "VAN": (0.0, 0.3, 0.8), "VGK": (1.0, 0.6, 0.0), "WSH": (0.8, 0.0, 0.0), 
+            "WPG": (0.0, 0.2, 0.5), "SEA": (0.0, 0.4, 0.5)
         }
-        return team_colors.get(team_id, (1.0, 0.6, 0.2))
+        
+        return team_colors.get(normalized_id, (1.0, 0.6, 0.2))
     
     # Utility methods
     
@@ -1355,9 +1477,8 @@ class FlightGlobeWidget(QOpenGLWidget):
         """Set travel path animation speed"""
         self.path_animation_speed = max(0.1, min(2.0, speed))
     
-    def set_logos_folder(self, folder_path: str):
-        """Set the folder path for MLB logo images"""
-        self.logos_folder = folder_path
+    def reload_team_logos(self):
+        """Reload team logo textures for all leagues"""
         if self.gl_initialized:
             self.load_team_logo_textures()
     

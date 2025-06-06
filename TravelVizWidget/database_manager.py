@@ -11,11 +11,11 @@ from data_client import GameData, TeamTravelData, TeamInfo, Venue, GameStatus
 
 
 class DatabaseManager:
-    """Manages SQLite database for sports schedule and travel data"""
+    """Manages SQLite database for multi-league sports schedule and travel data"""
     
     def __init__(self, db_path: str = "sports_data.db"):
         self.db_path = Path(db_path)
-        self.db_version = "1.0"
+        self.db_version = "2.0"  # Updated for multi-league support
         self.setup_logging()
         self.init_database()
     
@@ -40,10 +40,11 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Teams table
+                # Teams table - updated with league support
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS teams (
-                        team_id TEXT PRIMARY KEY,
+                        team_id TEXT NOT NULL,
+                        league TEXT NOT NULL,
                         abbreviation TEXT NOT NULL,
                         display_name TEXT NOT NULL,
                         location TEXT,
@@ -51,8 +52,9 @@ class DatabaseManager:
                         alternate_color TEXT,
                         logo_url TEXT,
                         division TEXT,
-                        league TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        conference TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (team_id, league)
                     )
                 """)
                 
@@ -72,7 +74,7 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Games table - main schedule data
+                # Games table - main schedule data with league support
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS games (
                         game_id TEXT PRIMARY KEY,
@@ -83,23 +85,24 @@ class DatabaseManager:
                         status TEXT NOT NULL,
                         week INTEGER,
                         season_type TEXT,
-                        league TEXT DEFAULT 'MLB',
+                        league TEXT NOT NULL,
                         season TEXT NOT NULL,
                         series_description TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (home_team_id) REFERENCES teams (team_id),
-                        FOREIGN KEY (away_team_id) REFERENCES teams (team_id),
+                        FOREIGN KEY (home_team_id, league) REFERENCES teams (team_id, league),
+                        FOREIGN KEY (away_team_id, league) REFERENCES teams (team_id, league),
                         FOREIGN KEY (venue_id) REFERENCES venues (venue_id)
                     )
                 """)
                 
-                # Travel data table - inferred travel patterns
+                # Travel data table - inferred travel patterns with league support
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS travel_data (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         team_name TEXT NOT NULL,
                         team_id TEXT NOT NULL,
+                        league TEXT NOT NULL,
                         departure_city TEXT NOT NULL,
                         arrival_city TEXT NOT NULL,
                         game_date TIMESTAMP NOT NULL,
@@ -113,7 +116,7 @@ class DatabaseManager:
                         homestand_game_number INTEGER,
                         season TEXT NOT NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (team_id) REFERENCES teams (team_id),
+                        FOREIGN KEY (team_id, league) REFERENCES teams (team_id, league),
                         FOREIGN KEY (game_id) REFERENCES games (game_id)
                     )
                 """)
@@ -121,14 +124,15 @@ class DatabaseManager:
                 # Season cache table - tracks what seasons have been scraped
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS season_cache (
-                        season TEXT PRIMARY KEY,
+                        season TEXT NOT NULL,
                         league TEXT NOT NULL,
                         games_count INTEGER DEFAULT 0,
                         travel_count INTEGER DEFAULT 0,
                         last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         is_complete BOOLEAN DEFAULT FALSE,
-                        scrape_hash TEXT
+                        scrape_hash TEXT,
+                        PRIMARY KEY (season, league)
                     )
                 """)
                 
@@ -142,7 +146,7 @@ class DatabaseManager:
                 """, ("db_version", self.db_version, datetime.now().isoformat()))
                 
                 conn.commit()
-                self.logger.info(f"Database initialized at {self.db_path}")
+                self.logger.info(f"Multi-league database initialized at {self.db_path}")
                 
         except Exception as e:
             self.logger.error(f"Database initialization error: {e}")
@@ -152,21 +156,34 @@ class DatabaseManager:
         """Create database indexes for optimal query performance"""
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_games_date ON games (date)",
-            "CREATE INDEX IF NOT EXISTS idx_games_season ON games (season)",
+            "CREATE INDEX IF NOT EXISTS idx_games_season_league ON games (season, league)",
             "CREATE INDEX IF NOT EXISTS idx_games_teams ON games (home_team_id, away_team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_games_league ON games (league)",
             "CREATE INDEX IF NOT EXISTS idx_travel_date ON travel_data (travel_date)",
-            "CREATE INDEX IF NOT EXISTS idx_travel_team ON travel_data (team_id)",
-            "CREATE INDEX IF NOT EXISTS idx_travel_season ON travel_data (season)",
+            "CREATE INDEX IF NOT EXISTS idx_travel_team_league ON travel_data (team_id, league)",
+            "CREATE INDEX IF NOT EXISTS idx_travel_season_league ON travel_data (season, league)",
             "CREATE INDEX IF NOT EXISTS idx_travel_game ON travel_data (game_id)",
+            "CREATE INDEX IF NOT EXISTS idx_teams_league ON teams (league)",
+            "CREATE INDEX IF NOT EXISTS idx_season_cache_league ON season_cache (league)",
         ]
         
         for index_sql in indexes:
             conn.execute(index_sql)
     
-    def is_season_cached(self, season: str, league: str = "MLB") -> Tuple[bool, Optional[datetime]]:
-        """Check if season data is already cached and when it was last updated"""
+    def is_season_cached(self, season: str, league: str) -> Tuple[bool, Optional[datetime]]:
+        """Check if season data is cached and get last update time"""
         try:
+            # SAME FIX HERE TOO
+            if league in ['NBA', 'NHL'] and season and '-' not in season:
+                year = int(season)
+                if year >= 2024:
+                    start_year = year - 1
+                    season = f"{start_year}-{str(year)[2:]}"
+                    print(f"🔧 FIXED: Converted {league} season '{year}' to '{season}' in cache check")
+            
             with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
                 cursor = conn.execute("""
                     SELECT is_complete, last_updated, games_count 
                     FROM season_cache 
@@ -187,43 +204,56 @@ class DatabaseManager:
             self.logger.error(f"Error checking season cache: {e}")
             return False, None
     
-    def should_refresh_season(self, season: str, force_refresh: bool = False) -> bool:
+    def should_refresh_season(self, season: str, league: str, force_refresh: bool = False) -> bool:
         """Determine if season data should be refreshed"""
         if force_refresh:
             return True
         
-        is_cached, last_updated = self.is_season_cached(season)
+        is_cached, last_updated = self.is_season_cached(season, league)
         
         if not is_cached:
             return True
         
         # For current season, refresh if data is older than 1 day
-        current_year = str(datetime.now().year)
-        if season == current_year and last_updated:
-            time_since_update = datetime.now() - last_updated
-            return time_since_update > timedelta(days=1)
+        current_date = datetime.now()
+        
+        # League-specific current season logic
+        if league in ['NBA', 'NHL']:
+            # NBA/NHL seasons span two years, check if we're in the current season
+            if '-' in season:
+                start_year = int(season.split('-')[0])
+                if current_date.year == start_year or current_date.year == start_year + 1:
+                    # This is the current season
+                    if last_updated and (current_date - last_updated) > timedelta(days=1):
+                        return True
+        else:  # MLB
+            current_year = str(current_date.year)
+            if season == current_year and last_updated:
+                time_since_update = current_date - last_updated
+                return time_since_update > timedelta(days=1)
         
         # For past seasons, don't refresh unless forced
         return False
     
-    def save_teams(self, teams: List[TeamInfo]):
-        """Save team information to database"""
+    def save_teams(self, teams: List[TeamInfo], league: str = None):
+        """Save team information to database with league support"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 for team in teams:
+                    team_league = league or getattr(team, 'league', 'MLB')
                     conn.execute("""
                         INSERT OR REPLACE INTO teams 
-                        (team_id, abbreviation, display_name, location, color, 
-                         alternate_color, logo_url, division, league)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (team_id, league, abbreviation, display_name, location, color, 
+                         alternate_color, logo_url, division, conference)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        team.team_id, team.abbreviation, team.display_name,
+                        team.team_id, team_league, team.abbreviation, team.display_name,
                         team.location, team.color, team.alternate_color,
-                        team.logo_url, team.division, team.league
+                        team.logo_url, team.division, team.conference
                     ))
                 
                 conn.commit()
-                self.logger.info(f"Saved {len(teams)} teams to database")
+                self.logger.info(f"Saved {len(teams)} {team_league} teams to database")
                 
         except Exception as e:
             self.logger.error(f"Error saving teams: {e}")
@@ -251,7 +281,7 @@ class DatabaseManager:
             self.logger.error(f"Error saving venues: {e}")
             raise
     
-    def save_games(self, games: List[GameData], season: str, league: str = "MLB"):
+    def save_games(self, games: List[GameData], season: str, league: str):
         """Save game data to database and update season cache"""
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -266,7 +296,7 @@ class DatabaseManager:
                 
                 # Save teams and venues
                 if unique_teams:
-                    self.save_teams(list(unique_teams.values()))
+                    self.save_teams(list(unique_teams.values()), league)
                 if unique_venues:
                     self.save_venues(list(unique_venues.values()))
                 
@@ -302,23 +332,23 @@ class DatabaseManager:
             self.logger.error(f"Error saving games: {e}")
             raise
     
-    def save_travel_data(self, travel_data: List[TeamTravelData], season: str):
-        """Save travel data to database"""
+    def save_travel_data(self, travel_data: List[TeamTravelData], season: str, league: str):
+        """Save travel data to database with league support"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                # Clear existing travel data for this season
-                conn.execute("DELETE FROM travel_data WHERE season = ?", (season,))
+                # Clear existing travel data for this season and league
+                conn.execute("DELETE FROM travel_data WHERE season = ? AND league = ?", (season, league))
                 
                 # Insert new travel data
                 for travel in travel_data:
                     conn.execute("""
                         INSERT INTO travel_data 
-                        (team_name, team_id, departure_city, arrival_city, game_date,
+                        (team_name, team_id, league, departure_city, arrival_city, game_date,
                          travel_date, departure_airport, arrival_airport, confidence,
                          game_id, opponent, series_game_number, homestand_game_number, season)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        travel.team_name, travel.team_id, travel.departure_city,
+                        travel.team_name, travel.team_id, league, travel.departure_city,
                         travel.arrival_city, travel.game_date.isoformat(),
                         travel.travel_date.isoformat(), travel.departure_airport,
                         travel.arrival_airport, travel.confidence, travel.game_id,
@@ -330,18 +360,18 @@ class DatabaseManager:
                 conn.execute("""
                     UPDATE season_cache 
                     SET travel_count = ?, last_updated = ?
-                    WHERE season = ?
-                """, (len(travel_data), datetime.now().isoformat(), season))
+                    WHERE season = ? AND league = ?
+                """, (len(travel_data), datetime.now().isoformat(), season, league))
                 
                 conn.commit()
-                self.logger.info(f"Saved {len(travel_data)} travel records for {season} season")
+                self.logger.info(f"Saved {len(travel_data)} travel records for {season} {league} season")
                 
         except Exception as e:
             self.logger.error(f"Error saving travel data: {e}")
             raise
     
-    def load_games(self, season: str, league: str = "MLB") -> List[GameData]:
-        """Load games from database for a specific season"""
+    def load_games(self, season: str, league: str) -> List[GameData]:
+        """Load games from database for a specific season and league"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -352,16 +382,18 @@ class DatabaseManager:
                            ht.location as home_location, ht.color as home_color,
                            ht.alternate_color as home_alt_color, ht.logo_url as home_logo,
                            ht.division as home_division, ht.league as home_league,
+                           ht.conference as home_conference,
                            at.abbreviation as away_abbrev, at.display_name as away_name,
                            at.location as away_location, at.color as away_color,
                            at.alternate_color as away_alt_color, at.logo_url as away_logo,
                            at.division as away_division, at.league as away_league,
+                           at.conference as away_conference,
                            v.name as venue_name, v.city as venue_city, v.state as venue_state,
                            v.country as venue_country, v.latitude, v.longitude,
                            v.capacity, v.timezone
                     FROM games g
-                    JOIN teams ht ON g.home_team_id = ht.team_id
-                    JOIN teams at ON g.away_team_id = at.team_id
+                    JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
+                    JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league
                     JOIN venues v ON g.venue_id = v.venue_id
                     WHERE g.season = ? AND g.league = ?
                     ORDER BY g.date
@@ -379,7 +411,8 @@ class DatabaseManager:
                         alternate_color=row['home_alt_color'],
                         logo_url=row['home_logo'],
                         division=row['home_division'],
-                        league=row['home_league']
+                        league=row['home_league'],
+                        conference=row['home_conference']
                     )
                     
                     away_team = TeamInfo(
@@ -391,7 +424,8 @@ class DatabaseManager:
                         alternate_color=row['away_alt_color'],
                         logo_url=row['away_logo'],
                         division=row['away_division'],
-                        league=row['away_league']
+                        league=row['away_league'],
+                        conference=row['away_conference']
                     )
                     
                     venue = Venue(
@@ -428,24 +462,37 @@ class DatabaseManager:
             self.logger.error(f"Error loading games: {e}")
             return []
     
-    def load_travel_data(self, season: str, team_id: Optional[str] = None) -> List[TeamTravelData]:
-        """Load travel data from database"""
+    def load_travel_data(self, season: str, league: str, team_id: Optional[str] = None) -> List[TeamTravelData]:
+        """Load travel data from database with league support"""
         try:
+            if league in ['NBA', 'NHL'] and season and '-' not in season:
+                year = int(season)
+                if year >= 2024:  # Assuming this is meant to be the end year of the season
+                    # Convert 2025 -> 2024-25, 2024 -> 2023-24, etc.
+                    start_year = year - 1
+                    season = f"{start_year}-{str(year)[2:]}"
+                    print(f"🔧 FIXED: Converted {league} season '{year}' to '{season}'")
+                
+            print(f"🐛 DEBUG - load_travel_data called:")
+            print(f"  season: '{season}' (type: {type(season)})")
+            print(f"  league: '{league}'")
+            print(f"  team_id: '{team_id}'")
+            
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 
                 if team_id:
                     cursor = conn.execute("""
                         SELECT * FROM travel_data 
-                        WHERE season = ? AND team_id = ?
+                        WHERE season = ? AND league = ? AND team_id = ?
                         ORDER BY travel_date
-                    """, (season, team_id))
+                    """, (season, league, team_id))
                 else:
                     cursor = conn.execute("""
                         SELECT * FROM travel_data 
-                        WHERE season = ?
+                        WHERE season = ? AND league = ?
                         ORDER BY travel_date
-                    """, (season,))
+                    """, (season, league))
                 
                 travel_data = []
                 for row in cursor.fetchall():
@@ -467,20 +514,27 @@ class DatabaseManager:
                     travel_data.append(travel)
                 
                 filter_desc = f" for team {team_id}" if team_id else ""
-                self.logger.info(f"Loaded {len(travel_data)} travel records for {season}{filter_desc}")
+                self.logger.info(f"Loaded {len(travel_data)} travel records for {season} {league}{filter_desc}")
                 return travel_data
                 
         except Exception as e:
             self.logger.error(f"Error loading travel data: {e}")
             return []
     
-    def load_teams(self) -> List[TeamInfo]:
-        """Load all teams from database"""
+    def load_teams(self, league: str = None) -> List[TeamInfo]:
+        """Load teams from database for specific league or all leagues"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 
-                cursor = conn.execute("SELECT * FROM teams ORDER BY display_name")
+                if league:
+                    cursor = conn.execute("""
+                        SELECT * FROM teams 
+                        WHERE league = ?
+                        ORDER BY display_name
+                    """, (league,))
+                else:
+                    cursor = conn.execute("SELECT * FROM teams ORDER BY league, display_name")
                 
                 teams = []
                 for row in cursor.fetchall():
@@ -493,7 +547,8 @@ class DatabaseManager:
                         alternate_color=row['alternate_color'],
                         logo_url=row['logo_url'],
                         division=row['division'],
-                        league=row['league']
+                        league=row['league'],
+                        conference=row['conference']
                     )
                     teams.append(team)
                 
@@ -503,8 +558,8 @@ class DatabaseManager:
             self.logger.error(f"Error loading teams: {e}")
             return []
     
-    def get_cached_seasons(self, league: str = "MLB") -> List[Dict[str, Any]]:
-        """Get information about cached seasons"""
+    def get_cached_seasons(self, league: str) -> List[Dict[str, Any]]:
+        """Get information about cached seasons for a specific league"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -532,11 +587,11 @@ class DatabaseManager:
             self.logger.error(f"Error getting cached seasons: {e}")
             return []
     
-    def clear_season_data(self, season: str, league: str = "MLB"):
-        """Clear all data for a specific season"""
+    def clear_season_data(self, season: str, league: str):
+        """Clear all data for a specific season and league"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute("DELETE FROM travel_data WHERE season = ?", (season,))
+                conn.execute("DELETE FROM travel_data WHERE season = ? AND league = ?", (season, league))
                 conn.execute("DELETE FROM games WHERE season = ? AND league = ?", (season, league))
                 conn.execute("DELETE FROM season_cache WHERE season = ? AND league = ?", (season, league))
                 
@@ -548,7 +603,7 @@ class DatabaseManager:
             raise
     
     def get_database_stats(self) -> Dict[str, Any]:
-        """Get database statistics"""
+        """Get database statistics with league breakdown"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 stats = {}
@@ -569,6 +624,31 @@ class DatabaseManager:
                 cursor = conn.execute("SELECT COUNT(*) FROM season_cache")
                 stats['cached_seasons'] = cursor.fetchone()[0]
                 
+                # League breakdown
+                cursor = conn.execute("""
+                    SELECT league, COUNT(*) as team_count 
+                    FROM teams 
+                    GROUP BY league
+                """)
+                league_teams = {row[0]: row[1] for row in cursor.fetchall()}
+                stats['teams_by_league'] = league_teams
+                
+                cursor = conn.execute("""
+                    SELECT league, COUNT(*) as game_count 
+                    FROM games 
+                    GROUP BY league
+                """)
+                league_games = {row[0]: row[1] for row in cursor.fetchall()}
+                stats['games_by_league'] = league_games
+                
+                cursor = conn.execute("""
+                    SELECT league, COUNT(*) as travel_count 
+                    FROM travel_data 
+                    GROUP BY league
+                """)
+                league_travel = {row[0]: row[1] for row in cursor.fetchall()}
+                stats['travel_by_league'] = league_travel
+                
                 # Database size
                 stats['db_size_mb'] = self.db_path.stat().st_size / (1024 * 1024)
                 
@@ -584,6 +664,23 @@ class DatabaseManager:
             self.logger.error(f"Error getting database stats: {e}")
             return {}
     
+    def get_current_season_for_league(self, league: str) -> str:
+        """Get current season string for a league based on current date"""
+        now = datetime.now()
+        current_year = now.year
+        
+        if league in ['NBA', 'NHL']:
+            # NBA/NHL seasons start in October and end in June of next year
+            if now.month >= 10:  # October or later
+                next_year = str(current_year + 1)[2:]  # Get last 2 digits
+                return f"{current_year}-{next_year}"   # e.g., "2024-25"
+            else:  # Before October
+                next_year = str(current_year)[2:]  # Get last 2 digits
+                return f"{current_year - 1}-{next_year}"  # e.g., "2023-24"
+        else:  # MLB
+            # MLB season is calendar year
+            return str(current_year)
+    
     def _generate_scrape_hash(self, games: List[GameData]) -> str:
         """Generate hash for tracking data changes"""
         game_ids = sorted([game.game_id for game in games])
@@ -597,21 +694,60 @@ class DatabaseManager:
                 self.logger.info("Database vacuumed successfully")
         except Exception as e:
             self.logger.error(f"Error vacuuming database: {e}")
+    
+    def get_league_statistics(self) -> Dict[str, Dict[str, Any]]:
+        """Get detailed statistics for each league"""
+        try:
+            stats = {}
+            leagues = ['MLB', 'NBA', 'NHL']
+            
+            for league in leagues:
+                league_stats = {}
+                
+                # Team count
+                teams = self.load_teams(league)
+                league_stats['teams'] = len(teams)
+                
+                # Seasons cached
+                seasons = self.get_cached_seasons(league)
+                league_stats['cached_seasons'] = len(seasons)
+                
+                if seasons:
+                    latest_season = seasons[0]
+                    league_stats['latest_season'] = latest_season['season']
+                    league_stats['latest_games'] = latest_season['games_count']
+                    league_stats['latest_travel'] = latest_season['travel_count']
+                    league_stats['last_updated'] = latest_season['last_updated']
+                
+                stats[league] = league_stats
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error getting league statistics: {e}")
+            return {}
 
 
 # Usage example and testing
 if __name__ == "__main__":
     # Initialize database manager
-    db = DatabaseManager("test_sports.db")
+    db = DatabaseManager("test_multi_sports.db")
     
     # Get database stats
     stats = db.get_database_stats()
     print("Database Stats:", stats)
     
-    # Check if season is cached
-    is_cached, last_updated = db.is_season_cached("2025")
-    print(f"2025 season cached: {is_cached}, last updated: {last_updated}")
+    # Check if season is cached for different leagues
+    for league in ['MLB', 'NBA', 'NHL']:
+        current_season = db.get_current_season_for_league(league)
+        is_cached, last_updated = db.is_season_cached(current_season, league)
+        print(f"{league} {current_season} season cached: {is_cached}, last updated: {last_updated}")
     
-    # Get cached seasons
-    seasons = db.get_cached_seasons()
-    print("Cached seasons:", seasons)
+    # Get cached seasons for each league
+    for league in ['MLB', 'NBA', 'NHL']:
+        seasons = db.get_cached_seasons(league)
+        print(f"{league} cached seasons: {len(seasons)}")
+    
+    # Get league statistics
+    league_stats = db.get_league_statistics()
+    print("League Statistics:", league_stats)
