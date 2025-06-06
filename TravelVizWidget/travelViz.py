@@ -1,3 +1,4 @@
+import math
 import sys
 import json
 import os
@@ -9,7 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                              QWidget, QSplitter, QStatusBar, QMenuBar, QMenu,
                              QMessageBox, QProgressBar, QLabel, QFileDialog,
                              QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton, QInputDialog)
-from PyQt6.QtCore import (Qt, QTimer, QThread, QObject, pyqtSignal, QSettings)
+from PyQt6.QtCore import (Qt, QSettings)
 from PyQt6.QtGui import QAction, QIcon, QFont
 
 # Import components
@@ -360,6 +361,8 @@ class SportsTrackerMainWindow(QMainWindow):
         
         today = datetime.now().date()
         todays_games = []
+        seen_games = set()  # Track seen games to prevent duplicates
+        seen_teams = set()  # ✅ Track teams to prevent multiple games per team
         
         # Check all leagues for today's games
         for league in ["MLB", "NBA", "NHL"]:
@@ -371,21 +374,37 @@ class SportsTrackerMainWindow(QMainWindow):
                 for game in games:
                     game_date = game.date.date() if hasattr(game.date, 'date') else game.date
                     if game_date == today:
-                        todays_games.append({
-                            'game': game,
-                            'league': league,
-                            'home_team': game.home_team,
-                            'away_team': game.away_team,
-                            'venue_city': game.venue.city
-                        })
+                        # Create unique key to prevent duplicates
+                        game_key = f"{game.home_team.team_id}_{game.away_team.team_id}_{game.date.strftime('%Y%m%d_%H%M')}"
+                        
+                        # ✅ Check if either team already has a game today
+                        home_key = f"{league}_{game.home_team.team_id}"
+                        away_key = f"{league}_{game.away_team.team_id}"
+                        
+                        if game_key not in seen_games and home_key not in seen_teams and away_key not in seen_teams:
+                            seen_games.add(game_key)
+                            seen_teams.add(home_key)
+                            seen_teams.add(away_key)
+                            
+                            todays_games.append({
+                                'game': game,
+                                'league': league,
+                                'home_team': game.home_team,
+                                'away_team': game.away_team,
+                                'venue_city': game.venue.city
+                            })
+                            print(f"✅ Added game: {game.away_team.abbreviation} @ {game.home_team.abbreviation}")
+                        else:
+                            print(f"🔄 Skipped: {game.away_team.abbreviation} @ {game.home_team.abbreviation} (team already playing)")
             except Exception as e:
                 print(f"Error loading {league} games for today: {e}")
                 continue
         
+        print(f"📊 Total unique games today: {len(todays_games)}")
         return todays_games
     
     
-    # Properly stacked the two team cubes one of top of the other
+    
     def display_todays_games_startup(self):
         """Display today's games as stacked spinning boxes - new startup view"""
         todays_games = self.get_todays_games()
@@ -417,49 +436,39 @@ class SportsTrackerMainWindow(QMainWindow):
             for i, game_info in enumerate(city_games):
                 home_team = game_info['home_team']
                 away_team = game_info['away_team']
+                league = game_info['league']  # ✅ Extract league from game_info
                 
-                # Add small angular offset for multiple games in same city
-                lat_offset = (i * 0.2)  # 0.2 degrees per game
-                lon_offset = (i * 0.2)
-                
+                if len(city_games) > 1:
+                    angle = (2 * 3.14159 * i)/ len(city_games) # postion markers in circle 
+                    radius = 0.8 + (len(city_games)* 0.2)
+                    lat_offset = radius * math.cos(angle)
+                    lon_offset = radius * math.sin(angle)
+                else:
+                    lat_offset = 0
+                    lon_offset = 0
+                    
                 adjusted_lat = lat + lat_offset
                 adjusted_lon = lon + lon_offset
                 
-                # Home team marker (on surface) - smaller size
-                home_3d = self.globe_widget.lat_lon_to_3d(adjusted_lat, adjusted_lon, 1.01)
+                # Single cube position (no stacking needed)
+                cube_3d = self.globe_widget.lat_lon_to_3d(adjusted_lat, adjusted_lon, 1.05)
                 
-                # Calculate surface normal for proper vertical stacking
-                surface_normal = self.calculate_surface_normal(adjusted_lat, adjusted_lon)
-                stack_offset = 0.04  # Reduced stacking distance
-                
-                # Away team marker (stacked above home team along surface normal)
-                away_3d = (
-                    home_3d[0] + surface_normal[0] * stack_offset,
-                    home_3d[1] + surface_normal[1] * stack_offset,
-                    home_3d[2] + surface_normal[2] * stack_offset
-                )
-                
-                # Home team marker (bottom) - much smaller cubes
-                home_marker = {
-                    'position': home_3d,
-                    'team_id': home_team.team_id,
-                    'size': 3.0,  # Reduced from 4.5
-                    'type': 'home_today',
+                # ✅ FIXED: Single split cube marker for both teams
+                split_cube_marker = {
+                    'position': cube_3d,  # Use single cube position
+                    'team_id': home_team.team_id,  # Primary team for fallback
+                    'league': league,
+                    'size': 1.5,  # Slightly larger for split cube
+                    'type': 'split_cube_today',
                     'city_name': venue_city,
-                    'game_info': game_info
+                    'game_info': game_info,
+                    # Split cube specific data
+                    'home_team_id': home_team.team_id,
+                    'away_team_id': away_team.team_id,
+                    'is_split_cube': True
                 }
                 
-                # Away team marker (stacked on top)
-                away_marker = {
-                    'position': away_3d,
-                    'team_id': away_team.team_id,
-                    'size': 3.0,  # Reduced from 4.5
-                    'type': 'away_today',
-                    'city_name': venue_city,
-                    'game_info': game_info
-                }
-                
-                stacked_markers.extend([home_marker, away_marker])
+                stacked_markers.append(split_cube_marker)
         
         # Set the markers on the globe widget
         self.globe_widget.team_city_markers = stacked_markers
@@ -471,6 +480,7 @@ class SportsTrackerMainWindow(QMainWindow):
         
         self.season_status_label.setText(f"Today: {game_count} games ({leagues_str})")
         print(f"Displaying {game_count} games today across {leagues_str}")
+        print(f"Created {len(stacked_markers)} markers with league context")
     
     def calculate_surface_normal(self, lat: float, lon: float):
         """Calculate the surface normal vector at a given lat/lon for proper stacking"""

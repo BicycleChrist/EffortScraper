@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
  
+#TODO: Simplify current retard logic for league specific logo loading (No league context)
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences"""
@@ -440,7 +441,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.normals = np.array(normals, dtype=np.float32)
     
     def setup_shaders(self):
-        """Setup OpenGL shaders"""
+        """Setup OpenGL shaders including split cube support"""
         # Earth shader
         earth_vertex = """
         #version 330 core
@@ -559,7 +560,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
         self.travel_shader.link()
         
-        # Marker shader
+        # ✅ UPDATED: Marker shader with split cube support
         marker_vertex = """
         #version 330 core
         layout (location = 0) in vec3 position;
@@ -573,10 +574,12 @@ class FlightGlobeWidget(QOpenGLWidget):
         uniform float time;
         uniform float rotationSpeed;
         uniform bool isAnimated;
+        uniform bool isSplitCube;
         
         out vec2 MarkerTexCoord;
         out vec3 MarkerNormal;
         out float LightIntensity;
+        out vec3 WorldPosition;  // ✅ NEW: For split cube detection
         
         void main() {
             float rotY = time * rotationSpeed;
@@ -605,6 +608,8 @@ class FlightGlobeWidget(QOpenGLWidget):
             if (isAnimated) {
                 float pulse = sin(time * 4.0) * 0.3 + 1.0;
                 animatedSize *= pulse * 0.012;
+            } else if (isSplitCube) {
+                animatedSize *= 0.010;  // ✅ Slightly larger for split cubes
             } else {
                 animatedSize *= 0.008;
             }
@@ -619,6 +624,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             LightIntensity = max(dot(MarkerNormal, lightDir), 0.6);
             
             MarkerTexCoord = texCoord;
+            WorldPosition = rotatedPos;  // ✅ NEW: Local position for split detection
         }
         """
         
@@ -627,13 +633,21 @@ class FlightGlobeWidget(QOpenGLWidget):
         in vec2 MarkerTexCoord;
         in vec3 MarkerNormal;
         in float LightIntensity;
+        in vec3 WorldPosition;  // ✅ NEW: For split cube detection
         
         out vec4 FragColor;
         
-        uniform sampler2D markerTexture;
+        uniform sampler2D homeTeamTexture;   // ✅ NEW: Home team texture
+        uniform sampler2D awayTeamTexture;   // ✅ NEW: Away team texture
+        uniform sampler2D markerTexture;     // Existing single texture
         uniform float time;
-        uniform vec3 teamColor;
-        uniform bool useTexture;
+        uniform vec3 homeTeamColor;          // ✅ NEW: Home team color
+        uniform vec3 awayTeamColor;          // ✅ NEW: Away team color
+        uniform vec3 teamColor;              // Existing single color
+        uniform bool useTexture;             // Existing
+        uniform bool useHomeTexture;         // ✅ NEW: Use home texture
+        uniform bool useAwayTexture;         // ✅ NEW: Use away texture
+        uniform bool isSplitCube;            // ✅ NEW: Split cube flag
         uniform float markerAlpha;
         uniform bool isAnimated;
         
@@ -641,16 +655,56 @@ class FlightGlobeWidget(QOpenGLWidget):
             vec3 finalColor;
             float finalAlpha = markerAlpha;
             
-            if (useTexture) {
-                vec4 texColor = texture(markerTexture, MarkerTexCoord);
-                if (texColor.a > 0.01) {
-                    finalColor = texColor.rgb * LightIntensity;
-                    finalAlpha *= texColor.a;
+            if (isSplitCube) {
+                // ✅ NEW: Split cube logic
+                // Top half = away team, bottom half = home team
+                bool isTopHalf = WorldPosition.y > 0.0;
+                
+                if (isTopHalf) {
+                    // Away team (top half)
+                    if (useAwayTexture) {
+                        vec4 texColor = texture(awayTeamTexture, MarkerTexCoord);
+                        if (texColor.a > 0.01) {
+                            finalColor = texColor.rgb * LightIntensity;
+                            finalAlpha *= texColor.a;
+                        } else {
+                            finalColor = awayTeamColor * LightIntensity;
+                        }
+                    } else {
+                        finalColor = awayTeamColor * LightIntensity;
+                    }
+                } else {
+                    // Home team (bottom half)
+                    if (useHomeTexture) {
+                        vec4 texColor = texture(homeTeamTexture, MarkerTexCoord);
+                        if (texColor.a > 0.01) {
+                            finalColor = texColor.rgb * LightIntensity;
+                            finalAlpha *= texColor.a;
+                        } else {
+                            finalColor = homeTeamColor * LightIntensity;
+                        }
+                    } else {
+                        finalColor = homeTeamColor * LightIntensity;
+                    }
+                }
+                
+                // ✅ Add white border at split line
+                if (abs(WorldPosition.y) < 0.02) {
+                    finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), 0.15);
+                }
+            } else {
+                // Existing single-team cube logic
+                if (useTexture) {
+                    vec4 texColor = texture(markerTexture, MarkerTexCoord);
+                    if (texColor.a > 0.01) {
+                        finalColor = texColor.rgb * LightIntensity;
+                        finalAlpha *= texColor.a;
+                    } else {
+                        finalColor = teamColor * LightIntensity;
+                    }
                 } else {
                     finalColor = teamColor * LightIntensity;
                 }
-            } else {
-                finalColor = teamColor * LightIntensity;
             }
             
             if (isAnimated) {
@@ -669,7 +723,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.link()
     
     def load_team_logo_textures(self):
-        """Load team logo textures with league-aware conflict resolution"""
+        """Load team logo textures with league-aware conflict resolution and better debugging"""
         
         league_configs = {
             "MLB": {
@@ -705,11 +759,11 @@ class FlightGlobeWidget(QOpenGLWidget):
             "NHL": {
                 "folder": "nhl_logos",
                 "teams": {
-                    "ana": "Ducks.png", "ari": "Coyotes.png", "bos": "Bruins.png",
+                    "ana": "Ducks.png", "utah": "Coyotes.png", "bos": "Bruins.png",  # Fixed: utah for Utah Hockey Club (formerly Arizona)
                     "buf": "Sabres.png", "cgy": "Flames.png", "car": "Hurricanes.png",
                     "chi": "Blackhawks.png", "col": "Avalanche.png", "cbj": "BlueJackets.png",
                     "dal": "Stars.png", "det": "RedWings.png", "edm": "Oilers.png",
-                    "fla": "Panthers.png", "la": "LAKings.png", "min": "Wild.png",
+                    "fla": "Panthers.png", "la": "LAKings.png", "min": "Wild.png",  # Fixed: 'la' not 'lak'
                     "mtl": "Canadiens.png", "nsh": "Predators.png", "njd": "Devils.png",
                     "nyi": "Islanders.png", "nyr": "Rangers.png", "ott": "Senators.png",
                     "phi": "Flyers.png", "pit": "Penguins.png", "sj": "Sharks.png",
@@ -722,20 +776,24 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         total_loaded = 0
         
+        print("=== LOGO LOADING DEBUG ===")
+        
         # Load logos for all leagues with unique keys
         for league, config in league_configs.items():
             logos_path = Path(config["folder"])
-            print(f"Checking {league} logos in: {logos_path}")
+            print(f"\n🔍 Checking {league} logos in: {logos_path.absolute()}")
             
             if not logos_path.exists():
-                print(f"❌ Logo folder not found: {logos_path}")
+                print(f"❌ Logo folder not found: {logos_path.absolute()}")
                 continue
             
             league_loaded = 0
-            print(f"Found {league} folder, loading {len(config['teams'])} potential logos...")
+            print(f"📁 Found {league} folder, loading {len(config['teams'])} potential logos...")
             
             for team_id, filename in config["teams"].items():
                 logo_path = logos_path / filename
+                print(f"  🔎 Looking for {team_id}: {logo_path}")
+                
                 if logo_path.exists():
                     try:
                         image = QImage(str(logo_path))
@@ -754,19 +812,40 @@ class FlightGlobeWidget(QOpenGLWidget):
                             
                             self.team_logo_textures[texture_key] = texture
                             league_loaded += 1
+                            print(f"    ✅ Loaded: {texture_key}")
                             
+                            # Special debug for LA Kings
+                            if team_id == "la" and league == "NHL":
+                                print(f"    🏒 LA KINGS LOGO LOADED SUCCESSFULLY: {texture_key}")
+                                
                     except Exception as e:
-                        print(f"❌ Error loading {league} logo {filename}: {e}")
+                        print(f"    ❌ Error loading {league} logo {filename}: {e}")
                 else:
-                    print(f"❌ Logo file not found: {logo_path}")
+                    print(f"    ❌ Logo file not found: {logo_path}")
+                    
+                    # Special debug for LA Kings
+                    if team_id == "la" and league == "NHL":
+                        print(f"    🚨 LA KINGS LOGO MISSING: Expected at {logo_path}")
+                        # Check for alternative names
+                        alt_paths = [
+                            logos_path / "Kings.png",
+                            logos_path / "LosAngelesKings.png", 
+                            logos_path / "LAK.png",
+                            logos_path / "lakings.png"
+                        ]
+                        for alt_path in alt_paths:
+                            if alt_path.exists():
+                                print(f"    💡 Found alternative: {alt_path}")
             
             print(f"✅ Loaded {league_loaded}/{len(config['teams'])} {league} logos")
             total_loaded += league_loaded
         
-        print(f"Total logos loaded: {total_loaded}")
+        print(f"\n📊 Total logos loaded: {total_loaded}")
+        print(f"🔑 All loaded texture keys: {sorted(self.team_logo_textures.keys())}")
         
-        # Set default marker to None - will be handled elsewhere
-        self.default_marker_texture = None
+        # Create default marker texture if none exists
+        if not self.default_marker_texture:
+            self.create_default_marker_texture()
 
     def get_team_logo_texture(self, team_abbrev: str, league: str):
         """Get team logo texture using league-aware key"""
@@ -848,31 +927,13 @@ class FlightGlobeWidget(QOpenGLWidget):
             if not image.isNull():
                 break
         
-        if image is None or image.isNull():
-            self.create_fallback_earth_texture()
-            return
         
         image = image.convertToFormat(QImage.Format.Format_RGB888)
         self.earth_texture = QOpenGLTexture(image)
         self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
         self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
     
-    def create_fallback_earth_texture(self):
-        """Create a fallback Earth texture"""
-        width, height = 512, 256
-        image = QImage(width, height, QImage.Format.Format_RGB888)
-        
-        for y in range(height):
-            for x in range(width):
-                blue = int(100 + (y / height) * 155)
-                green = int(50 + (x / width) * 100)
-                red = int(30)
-                color = QColor(red, green, blue)
-                image.setPixelColor(x, y, color)
-        
-        self.earth_texture = QOpenGLTexture(image)
-        self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.Linear)
-        self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+    
     
     def create_marker_cube_geometry(self):
         """Create geometry for a spinning 3D cube marker"""
@@ -1260,73 +1321,122 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         if self.show_team_cities:
             for marker in self.team_city_markers:
-                self.render_spinning_cube_marker(marker, None, 1.5)
-        
+                # Determine rotation speed based on marker type
+                marker_type = marker.get('type', 'generic')
+                
+                if marker_type in ['home_today', 'away_today']:
+                    # Slower rotation for today's games - easier viewing
+                    rotation_speed = 0.3  # Much slower than default
+                else:
+                    # Normal rotation speed for regular markers
+                    rotation_speed = 1.0
+                self.render_spinning_cube_marker(marker, None, rotation_speed)
         self.marker_shader.release()
     
     def render_spinning_cube_marker(self, marker, cube_geometry, rotation_speed, is_animated=False):
-        """Render a single spinning 3D cube marker with team logo texture"""
+       # Marker rendering settings
+       
         if not self.marker_vao:
             return False
             
         pos = marker['position']
         team_id = marker.get('team_id', '')
-        league = marker.get('league', '')  # GET LEAGUE FROM MARKER
+        marker_league = marker.get('league', '').upper()
         marker_type = marker.get('type', 'generic')
         size = marker.get('size', 4.0)
+        is_split_cube = marker.get('is_split_cube', False)
         
         if not pos or len(pos) != 3:
             return False
         
-        # LEAGUE-AWARE TEXTURE LOOKUP
-        texture = None
-        use_texture = False
-        team_color = (1.0, 1.0, 1.0)
+        if not marker_league:
+            marker_league = self.infer_league_from_team_id(team_id)
         
-        # Try all leagues for this team_id since league context might be missing
-        if team_id:
-            team_id_lower = team_id.lower()
-            found_logo = False
-            
-            # Try each league prefix
-            for league_prefix in ['mlb', 'nba', 'nhl', 'nfl']:
-                league_team_key = f"{league_prefix}_{team_id_lower}"
-                if league_team_key in self.team_logo_textures:
-                    texture = self.team_logo_textures[league_team_key]
-                    use_texture = True
-                    team_color = self.get_team_color(team_id.upper())
-                    found_logo = True
-                    break
-            
-            if not found_logo:
-                print(f"❌ No logo found for team {team_id} in any league")
+        # Set uniforms for split cube
+        self.marker_shader.setUniformValue("isSplitCube", is_split_cube)
         
-        # Fallback to default marker
-        if not texture and self.default_marker_texture:
-            texture = self.default_marker_texture
-            use_texture = True
-            if marker_type == 'departure':
-                team_color = (0.2, 0.8, 0.3)
-            elif marker_type == 'animated':
-                team_color = (1.0, 0.8, 0.2)
+        if is_split_cube:
+            # ✅ Handle split cube with both home and away teams
+            home_team_id = marker.get('home_team_id', '')
+            away_team_id = marker.get('away_team_id', '')
+            
+            # Load home team texture
+            home_texture = self.get_team_logo_texture(home_team_id, marker_league)
+            home_color = self.get_team_color(home_team_id.upper())
+            
+            # Load away team texture  
+            away_texture = self.get_team_logo_texture(away_team_id, marker_league)
+            away_color = self.get_team_color(away_team_id.upper())
+            
+            # Bind textures
+            if home_texture:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                home_texture.bind()
+                self.marker_shader.setUniformValue("homeTeamTexture", 0)
+                self.marker_shader.setUniformValue("useHomeTexture", True)
             else:
-                team_color = (1.0, 0.4, 0.1)
-        elif not texture:
+                self.marker_shader.setUniformValue("useHomeTexture", False)
+                
+            if away_texture:
+                gl.glActiveTexture(gl.GL_TEXTURE1)
+                away_texture.bind()
+                self.marker_shader.setUniformValue("awayTeamTexture", 1)
+                self.marker_shader.setUniformValue("useAwayTexture", True)
+            else:
+                self.marker_shader.setUniformValue("useAwayTexture", False)
+            
+            # Set team colors
+            self.marker_shader.setUniformValue("homeTeamColor", QVector3D(*home_color))
+            self.marker_shader.setUniformValue("awayTeamColor", QVector3D(*away_color))
+            
+            # Use default texture/color settings (not used in split cube mode)
+            self.marker_shader.setUniformValue("useTexture", False)
+            self.marker_shader.setUniformValue("teamColor", QVector3D(1.0, 1.0, 1.0))
+            
+        else:
+            # ✅ Regular single-team cube logic 
+            texture = None
             use_texture = False
-            team_color = marker.get('color', (1.0, 1.0, 1.0))
+            team_color = (1.0, 1.0, 1.0)
+            
+            if team_id:
+                team_id_lower = team_id.lower()
+                
+                if marker_league:
+                    league_team_key = f"{marker_league.lower()}_{team_id_lower}"
+                    if league_team_key in self.team_logo_textures:
+                        texture = self.team_logo_textures[league_team_key]
+                        use_texture = True
+                        team_color = self.get_team_color(team_id.upper())
+            
+            # Fallback to default marker
+            if not texture and self.default_marker_texture:
+                texture = self.default_marker_texture
+                use_texture = True
+                if marker_type == 'home_today':
+                    team_color = (0.2, 0.8, 0.3)  # Green for home team
+                elif marker_type == 'away_today':
+                    team_color = (0.8, 0.2, 0.3)  # Red for away team
+                else:
+                    team_color = (1.0, 0.4, 0.1)
+            
+            # Bind single texture
+            if texture and use_texture:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                texture.bind()
+                self.marker_shader.setUniformValue("markerTexture", 0)
+            
+            self.marker_shader.setUniformValue("useTexture", use_texture)
+            self.marker_shader.setUniformValue("teamColor", QVector3D(*team_color))
+            
+            # Clear split cube uniforms
+            self.marker_shader.setUniformValue("useHomeTexture", False)
+            self.marker_shader.setUniformValue("useAwayTexture", False)
         
-        # Bind texture
-        if texture and use_texture:
-            gl.glActiveTexture(gl.GL_TEXTURE0)
-            texture.bind()
-            self.marker_shader.setUniformValue("markerTexture", 0)
-        
-        # Set uniforms
+        # Set common uniforms
         self.marker_shader.setUniformValue("markerCenter", QVector3D(*pos))
         self.marker_shader.setUniformValue("markerSize", size)
         self.marker_shader.setUniformValue("rotationSpeed", rotation_speed)
-        self.marker_shader.setUniformValue("teamColor", QVector3D(*team_color))
-        self.marker_shader.setUniformValue("useTexture", use_texture)
         self.marker_shader.setUniformValue("markerAlpha", 0.9)
         self.marker_shader.setUniformValue("isAnimated", is_animated)
         
@@ -1343,13 +1453,11 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.update()
     
     def generate_enhanced_visualizations(self):
-        """Generate travel paths and markers from sports data"""
+        """Generate travel paths and markers from sports data with proper league context"""
         self.travel_paths = []
         self.team_city_markers = []
-
         
         cities_seen = set()
-
         
         print(f"Generating visualizations for {len(self.travel_data)} travel records...")
         
@@ -1361,8 +1469,16 @@ class FlightGlobeWidget(QOpenGLWidget):
             team_name = getattr(travel, 'team_name', 'NO_TEAM_NAME')
             team_abbrev = team_id.upper() if isinstance(team_id, str) else ''
             
-            # GET LEAGUE CONTEXT
+            # FIXED: Better league context extraction
             league = getattr(travel, 'league', '').upper()
+            
+            if not league:
+                # Infer from team_id if possible (e.g., "MLB_2025_20250511_det_xx")
+                league = self.infer_league_from_team_id(getattr(travel, 'game_id', '')) or ''
+            
+            # Debug league context
+            if not league:
+                print(f"⚠️  No league context for {team_name} ({team_id})")
             
             dep_coords = self.get_city_coordinates(travel.departure_city)
             arr_coords = self.get_city_coordinates(travel.arrival_city)
@@ -1388,34 +1504,34 @@ class FlightGlobeWidget(QOpenGLWidget):
                 }
                 self.travel_paths.append(path_data)
                 
-                if travel.departure_city not in cities_seen:
-                    cities_seen.add(travel.departure_city)
+                # Create unique city key with league context to avoid conflicts
+                city_key = f"{travel.departure_city}_{league}_{team_abbrev}"
+                if city_key not in cities_seen:
+                    cities_seen.add(city_key)
                     dep_3d = self.lat_lon_to_3d(dep_lat, dep_lon, 1.05)
                     
                     city_marker = {
                         'position': dep_3d,
                         'team_id': team_abbrev,
-                        'league': league,
+                        'league': league,  # FIXED: Ensure league context is preserved
                         'size': 4.0,
                         'city_name': travel.departure_city,
                         'type': 'departure'
                     }
                     self.team_city_markers.append(city_marker)
-                
+                    
+                    # Debug marker creation
+                    print(f"🎯 Created marker: {team_name} ({team_abbrev}) in {travel.departure_city} - League: {league}")
         
         print(f"Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers")
         
-        # Debug: Print a few examples of what was created
-        if self.travel_paths:
-            print(f"Sample path: {self.travel_paths[0]['route']}")
-        if self.team_city_markers:
-            sample_marker = self.team_city_markers[0]
-            print(f"Sample city marker: {sample_marker['city_name']} (team: {sample_marker['team_id']})")
+        # Debug: Print marker leagues
+        league_counts = {}
+        for marker in self.team_city_markers:
+            league = marker.get('league', 'UNKNOWN')
+            league_counts[league] = league_counts.get(league, 0) + 1
+        print(f"📊 Markers by league: {league_counts}")
 
-        
-        # Debug: Print logo texture status
-        print(f"Available team logos: {list(self.team_logo_textures.keys())}")
-        print(f"Default marker texture: {'Available' if self.default_marker_texture else 'Missing'}")
     
     def get_team_color(self, team_id: str) -> Tuple[float, float, float]:
         """Get team color based on team ID (supports all leagues)"""
@@ -1489,10 +1605,12 @@ class FlightGlobeWidget(QOpenGLWidget):
         """Set travel path animation speed"""
         self.path_animation_speed = max(0.1, min(2.0, speed))
     
-    def reload_team_logos(self):
-        """Reload team logo textures for all leagues"""
-        if self.gl_initialized:
-            self.load_team_logo_textures()
+    def infer_league_from_team_id(self, team_id: str) -> Optional[str]:
+        """Infer league from team_id pattern like MLB_2025_20250511_bos_kc"""
+        parts = team_id.split('_')
+        if len(parts) >= 1 and parts[0].upper() in ["MLB", "NBA", "NHL"]:
+            return parts[0].upper()
+        return None
     
     def record_frame_time(self, frame_time: float):
         """Record frame rendering time for performance monitoring"""
