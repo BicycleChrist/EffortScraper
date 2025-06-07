@@ -7,7 +7,7 @@ from enum import Enum
 from PyQt6.QtCore import QObject, pyqtSignal
 from bs4 import BeautifulSoup
 import re
-
+from pathlib import Path
 
 # Update mapping for LA kings (schedule url uses la not lak)
 
@@ -123,6 +123,7 @@ class ESPNScheduleScraper:
             "tor": {"name": "Toronto Blue Jays", "city": "Toronto", "division": "AL East", "conference": "American League"},
             
             # American League Central
+            # White Sox are chw not cws
             "chw": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central", "conference": "American League"},
             "cle": {"name": "Cleveland Guardians", "city": "Cleveland", "division": "AL Central", "conference": "American League"},
             "det": {"name": "Detroit Tigers", "city": "Detroit", "division": "AL Central", "conference": "American League"},
@@ -130,6 +131,7 @@ class ESPNScheduleScraper:
             "min": {"name": "Minnesota Twins", "city": "Minneapolis", "division": "AL Central", "conference": "American League"},
             
             # American League West
+            # Athletics go by ath not oak
             "hou": {"name": "Houston Astros", "city": "Houston", "division": "AL West", "conference": "American League"},
             "laa": {"name": "Los Angeles Angels", "city": "Los Angeles", "division": "AL West", "conference": "American League"},
             "ath": {"name": "Athletics", "city": "Sacramento", "division": "AL West", "conference": "American League"},
@@ -220,7 +222,7 @@ class ESPNScheduleScraper:
             # Eastern Conference - Metropolitan Division
             "car": {"name": "Carolina Hurricanes", "city": "Raleigh", "division": "Metropolitan", "conference": "Eastern"},
             "cbj": {"name": "Columbus Blue Jackets", "city": "Columbus", "division": "Metropolitan", "conference": "Eastern"},
-            "njd": {"name": "New Jersey Devils", "city": "Newark", "division": "Metropolitan", "conference": "Eastern"},
+            "njd": {"name": "New Jersey Devils", "city": "New Jersey", "division": "Metropolitan", "conference": "Eastern"},
             "nyi": {"name": "New York Islanders", "city": "New York", "division": "Metropolitan", "conference": "Eastern"},
             "nyr": {"name": "New York Rangers", "city": "New York", "division": "Metropolitan", "conference": "Eastern"},
             "phi": {"name": "Philadelphia Flyers", "city": "Philadelphia", "division": "Metropolitan", "conference": "Eastern"},
@@ -447,7 +449,7 @@ class ESPNScheduleScraper:
         return all_games
     
     def _parse_schedule_page(self, html_content: str, team_abbrev: str, league: str, season: str) -> List[List[str]]:
-        """Parse ESPN schedule page HTML to extract table data"""
+        """Parse ESPN schedule page HTML to extract table data - FIXED href parsing logic"""
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
             
@@ -478,7 +480,44 @@ class ESPNScheduleScraper:
             for row in rows:
                 cells = row.find_all(['td', 'th'])
                 if cells:
-                    cell_texts = [cell.get_text(strip=True) for cell in cells]
+                    cell_texts = []
+                    for cell in cells:
+                        # 🔧 FIXED: Proper team name extraction from ESPN href
+                        team_link = cell.find('a', href=True)
+                        if team_link and 'team/_/name/' in team_link['href']:
+                            # Extract team abbrev from href like "/mlb/team/_/name/laa/los-angeles-angels"
+                            href_parts = team_link['href'].split('/')
+                            if len(href_parts) >= 6 and href_parts[4] == 'name':
+                                team_abbrev_from_href = href_parts[5].upper()
+                                cell_text = cell.get_text(strip=True)
+                                
+                                # 🔧 FIXED: Proper replacement logic for ambiguous cities
+                                # Instead of replacing just the last word, replace the entire team name
+                                
+                                if any(ambiguous in cell_text.lower() for ambiguous in ['new york', 'los angeles', 'chicago']):
+                                    # Extract the vs/@ prefix if present
+                                    prefix = ""
+                                    team_part = cell_text
+                                    
+                                    if cell_text.startswith('vs'):
+                                        prefix = "vs"
+                                        team_part = cell_text[2:].strip()
+                                    elif cell_text.startswith('@'):
+                                        prefix = "@"
+                                        team_part = cell_text[1:].strip()
+                                    
+                                    # Replace the entire team name with just the abbreviation
+                                    if prefix:
+                                        cell_text = prefix + team_abbrev_from_href
+                                    else:
+                                        cell_text = team_abbrev_from_href
+                                
+                                cell_texts.append(cell_text)
+                            else:
+                                cell_texts.append(cell.get_text(strip=True))
+                        else:
+                            cell_texts.append(cell.get_text(strip=True))
+                    
                     if cell_texts and len(cell_texts) >= 3:
                         table_data.append(cell_texts)
             
@@ -525,7 +564,7 @@ class ESPNScheduleScraper:
         return games
     
     def parse_game_row(self, row: List[str], team_abbrev: str, league: str, season: str) -> Optional[GameData]:
-        """Parse individual game row into GameData"""
+        """Parse individual game row into GameData - simplified with debugging and filtering"""
         if len(row) < 3:
             return None
             
@@ -533,37 +572,58 @@ class ESPNScheduleScraper:
         opponent_str = row[1].strip()
         result_str = row[2].strip() if len(row) > 2 else ""
         
+        # ✅ Skip header rows
+        if date_str.upper() in ['DATE', 'DAY'] or opponent_str.upper() in ['OPPONENT', 'OPP']:
+            return None
+        
+        # ✅ Skip postponed games  
+        if 'postponed' in result_str.lower():
+            if league == 'MLB':
+                print(f"    📅 Skipped postponed: '{opponent_str}'")
+            return None
+        
+        # ✅ Skip live games - they're already happening
+        if 'live' in result_str.lower() or 'live' in date_str.lower():
+            if league == 'MLB':
+                print(f"    ⏰ Skipped live game: '{opponent_str}'")
+            return None
+        
         if not date_str or not opponent_str:
             return None
         
-        skip_entries = [
-            'all-star', 'break', 'tbd', 'postponed', 'cancelled',
-            'spring training', 'exhibition', 'world baseball classic'
-        ]
+        # ✅ DEBUG: Show what we're trying to parse
+        if league in ['NHL', 'MLB']:
+            print(f"    🔍 Parsing: '{date_str}' | '{opponent_str}' | '{result_str}'")
         
-        if any(skip_word in opponent_str.lower() for skip_word in skip_entries):
-            return None
-        
-        if any(skip_word in date_str.lower() for skip_word in skip_entries):
-            return None
-        
+        # Parse game date
         try:
             game_date = self.parse_date_for_league(date_str, league, season)
             if not game_date:
+                if league in ['NHL', 'MLB']:
+                    print(f"    ❌ Date parse failed: '{date_str}'")
                 return None
-        except Exception:
+        except Exception as e:
+            if league in ['NHL', 'MLB']:
+                print(f"    ❌ Date parse exception: '{date_str}' - {e}")
             return None
             
+        # Parse opponent
         try:
             is_home, opponent_abbrev = self.parse_opponent(opponent_str, league)
             if not opponent_abbrev:
+                if league in ['NHL', 'MLB']:
+                    print(f"    ❌ Opponent parse failed: '{opponent_str}'")
                 return None
-        except Exception:
+        except Exception as e:
+            if league in ['NHL', 'MLB']:
+                print(f"    ❌ Opponent parse exception: '{opponent_str}' - {e}")
             return None
             
+        # Determine home/away teams
         home_team_abbrev = team_abbrev if is_home else opponent_abbrev
         away_team_abbrev = opponent_abbrev if is_home else team_abbrev
         
+        # Create team and venue objects
         try:
             home_team = self.create_team_info(home_team_abbrev, league)
             away_team = self.create_team_info(away_team_abbrev, league)
@@ -571,6 +631,7 @@ class ESPNScheduleScraper:
         except Exception:
             return None
         
+        # Set game status
         status = GameStatus.SCHEDULED if not result_str or result_str == '-' else GameStatus.FINAL
         game_id = f"{league}_{season}_{game_date.strftime('%Y%m%d')}_{away_team_abbrev}_{home_team_abbrev}"
         
@@ -589,8 +650,12 @@ class ESPNScheduleScraper:
         """Parse ESPN date format with league-specific logic"""
         if not date_str or not isinstance(date_str, str):
             return None
-            
+        
         try:
+            
+            if 'live' in date_str.lower() or date_str.strip() == '':
+                return datetime.now().replace(hour=19, minute=0, second=0, microsecond=0)
+            
             if ',' in date_str:
                 date_part = date_str.split(',', 1)[1].strip()
             else:
@@ -672,7 +737,7 @@ class ESPNScheduleScraper:
         return month_names.get(month_num)
     
     def parse_opponent(self, opponent_str: str, league: str) -> Tuple[bool, Optional[str]]:
-        """Parse opponent string with league-specific team name resolution"""
+        """Parse opponent string with league-specific team name resolution - FIXED with href parsing"""
         if not opponent_str:
             return False, None
             
@@ -685,13 +750,16 @@ class ESPNScheduleScraper:
         else:
             is_home = True
             opponent_name = opponent_str.strip()
+        
+        # Strip special characters like asterisks
+        opponent_name = re.sub(r'[*#^&]', '', opponent_name).strip()
             
         opponent_abbrev = self.get_team_abbrev_from_name(opponent_name, league)
         
         return is_home, opponent_abbrev
     
     def get_team_abbrev_from_name(self, team_name: str, league: str) -> Optional[str]:
-        """Convert team city/name to abbreviation for specific league"""
+        """Convert team city/name to abbreviation for specific league - FIXED for ESPN edge cases"""
         if not team_name:
             return None
             
@@ -700,94 +768,83 @@ class ESPNScheduleScraper:
         
         name_to_abbrev = {}
         
+        # Build comprehensive mapping
         for abbrev, team_info in league_teams.items():
             city = team_info['city'].lower()
-            name_to_abbrev[city] = abbrev
-            
             full_name = team_info['name'].lower()
+            
+            # Add full team name (highest priority)
             name_to_abbrev[full_name] = abbrev
             
+            # Add nickname (second priority)
             name_parts = full_name.split()
             if len(name_parts) > 1:
                 nickname = name_parts[-1]
-                name_to_abbrev[nickname] = abbrev
+                if nickname not in name_to_abbrev or full_name in team_name:
+                    name_to_abbrev[nickname] = abbrev
             
+            # Add city ONLY if it's unique within the league
+            city_count = sum(1 for t in league_teams.values() if t['city'].lower() == city)
+            if city_count == 1:
+                name_to_abbrev[city] = abbrev
+            
+            # Add abbreviation
             name_to_abbrev[abbrev.lower()] = abbrev
         
-        # League-specific mappings
+        # FIXED: Enhanced mapping for problematic cases
         if league == 'MLB':
-            name_to_abbrev.update({
-                'losangeles': 'lad',  
-                'newyork': 'nyy',
-                'chicago': 'chc',
-                'angels': 'laa',
-                'athletics': 'ath',
-                'whitesox': 'chw',
-                'redsox': 'bos',
-                'bluejays': 'tor',
-                'diamondbacks': 'ari',
-                'rockies': 'col',
-                'royals': 'kc',
-                'twins': 'min',
-                'rangers': 'tex',
-                'mariners': 'sea',
-                'rays': 'tb',
-                'orioles': 'bal',
-                'guardians': 'cle',
-                'tigers': 'det',
-                'astros': 'hou',
-                'braves': 'atl',
-                'marlins': 'mia',
-                'mets': 'nym',
-                'phillies': 'phi',
-                'nationals': 'wsh',
-                'cubs': 'chc',
-                'reds': 'cin',
-                'brewers': 'mil',
-                'pirates': 'pit',
-                'cardinals': 'stl',
-                'dodgers': 'lad',
-                'padres': 'sd',
-                'giants': 'sf',
-                'yankees': 'nyy',
-            })
+            specific_mappings = {
+                # Standard team mappings
+                'mets': 'nym', 'new york mets': 'nym', 'yankees': 'nyy', 'new york yankees': 'nyy',
+                'dodgers': 'lad', 'los angeles dodgers': 'lad', 'angels': 'laa', 'los angeles angels': 'laa',
+                'cubs': 'chc', 'chicago cubs': 'chc', 'white sox': 'chw', 'chicago white sox': 'chw',
+                
+                # 🔧 ESPN MALFORMED STRING FIXES - these are the core problem strings
+                'new nyy': 'nyy', 'new nym': 'nym',  # "New NYY" -> Yankees, "New NYM" -> Mets
+                'los laa': 'laa', 'los lad': 'lad',  # "Los LAA" -> Angels, "Los LAD" -> Dodgers  
+                'chi chc': 'chc', 'chi chw': 'chw',  # Chicago teams (potential)
+                
+                # Handle concatenated versions too
+                'newnyy': 'nyy', 'newnym': 'nym', 'loslaa': 'laa', 'loslad': 'lad',
+                
+                # Handle spacing variations
+                'vsnew nyy': 'nyy', 'vsnew nym': 'nym', 'vslos laa': 'laa', 'vslos lad': 'lad',
+                '@new nyy': 'nyy', '@new nym': 'nym', '@los laa': 'laa', '@los lad': 'lad',
+            }
+            name_to_abbrev.update(specific_mappings)
+            
         elif league == 'NBA':
-            name_to_abbrev.update({
-                'losangeles': 'lal',
-                'newyork': 'ny',
-                'goldenstatewarriors': 'gs',
-                'goldenstate': 'gs',
-                'clippers': 'lac',
-                'lakers': 'lal',
-                'warriors': 'gs',
-            })
+            specific_mappings = {
+                'lakers': 'lal', 'clippers': 'lac', 'knicks': 'ny', 'nets': 'bkn', 'bulls': 'chi',
+                # NBA malformed fixes (if they occur)
+                'new ny': 'ny', 'los lal': 'lal', 'los lac': 'lac',
+            }
+            name_to_abbrev.update(specific_mappings)
+            
         elif league == 'NHL':
-            name_to_abbrev.update({
-                'losangeles': 'la',
-                'newyork': 'nyr',
-                'vegasgoldenknights': 'vgk',
-                'vegas': 'vgk',
-                'goldenknights': 'vgk',
-                'kings': 'la',
-                'rangers': 'nyr',
-            })
+            specific_mappings = {
+                'kings': 'la', 'rangers': 'nyr', 'islanders': 'nyi', 'blackhawks': 'chi',
+                # NHL malformed fixes (if they occur)  
+                'new nyr': 'nyr', 'new nyi': 'nyi', 'los la': 'la',
+            }
+            name_to_abbrev.update(specific_mappings)
         
+        # Try exact match first
         if team_name in name_to_abbrev:
             return name_to_abbrev[team_name]
         
+        # Try cleaned name (remove non-alphabetic characters)
         clean_name = re.sub(r'[^a-z]', '', team_name)
         if clean_name in name_to_abbrev:
             return name_to_abbrev[clean_name]
         
+        # Try partial matching
         for name_key, abbrev in name_to_abbrev.items():
             if clean_name in name_key or name_key in clean_name:
                 return abbrev
         
-        if len(clean_name) >= 3:
-            potential_abbrev = clean_name[:3]
-            if potential_abbrev in league_teams:
-                return potential_abbrev
-        
+        # Debug output for still-unmatched teams
+        print(f"⚠️  Could not match '{team_name}' to any {league} team")
         return None
     
     def create_team_info(self, team_abbrev: str, league: str) -> TeamInfo:
@@ -948,6 +1005,7 @@ class TravelInferenceEngine:
 class ESPNSportsDataAggregator(QObject):
     """Multi-league ESPN sports data aggregator with database integration"""
     
+    
     dataUpdated = pyqtSignal(list)
     progressUpdated = pyqtSignal(int)
     errorOccurred = pyqtSignal(str)
@@ -955,6 +1013,9 @@ class ESPNSportsDataAggregator(QObject):
     
     def __init__(self, config: Dict[str, str], db_path: str = "sports_data.db"):
         super().__init__()
+        
+        # Check if DB file exists; if not, scrape it all
+        db_exists = Path(db_path).exists()    
         
         try:
             from database_manager import DatabaseManager
@@ -1208,32 +1269,22 @@ class ESPNSportsDataAggregator(QObject):
             print(f"Error clearing {league} season cache: {e}")
 
 
-def test_multi_league_integration():
-    """Test function to verify multi-league integration works"""
-    print("Testing Multi-League Integration...")
+def run_scraper():
+    """Run scraper for all leagues - concise multi-league version"""
+    print("🏃‍♂️ Running ESPN Sports Scraper for All Leagues...")
     
     config = {}
-    aggregator = ESPNSportsDataAggregator(config, "test_multi_sports.db")
+    aggregator = ESPNSportsDataAggregator(config)
     
-    leagues = ['MLB', 'NBA', 'NHL']
-    
-    for league in leagues:
-        print(f"\n=== Testing {league} ===")
-        
+    # Scrape all supported leagues
+    for league in ["MLB", "NBA", "NHL"]:
+        print(f"\n📊 Scraping {league}...")
         aggregator.set_league(league)
-        
-        current_season = aggregator.espn_scraper.get_current_season_for_league(league)
-        print(f"{league} current season: {current_season}")
-        
-        teams = aggregator.get_all_teams(league)
-        print(f"{league} teams: {len(teams)}")
-        
-        is_cached, last_updated = aggregator.db.is_season_cached(current_season, league)
-        print(f"{league} season cached: {is_cached}, last updated: {last_updated}")
+        aggregator.load_full_season_schedule(force_refresh=True)
     
     stats = aggregator.get_database_stats()
-    print(f"\nDatabase stats: {stats}")
+    print(f"\n✅ Multi-league scraping complete. Database stats: {stats}")
 
 
 if __name__ == "__main__":
-    test_multi_league_integration()
+    run_scraper()
