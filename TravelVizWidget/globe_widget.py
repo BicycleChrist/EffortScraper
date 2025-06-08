@@ -11,7 +11,7 @@ from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal
 from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
                          QWheelEvent, QColor, QImage, QVector4D)
 from pathlib import Path
-
+import math
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences - Essential for UI"""
@@ -22,7 +22,7 @@ class TeamTravelAnimation:
         self.current_team = None
         self.animation_active = True
         self.animation_progress = 0.0
-        self.animation_speed = 1.0
+        self.animation_speed = 0.15
         self.current_segment = 0
         self.segment_progress = 0.0
         self.loop_animation = True
@@ -1723,7 +1723,7 @@ class PlaneModel:
     def setup_airplane_model(self):
         """Load and setup airplane model geometry"""
         # Try multiple possible filenames
-        possible_files = ["pj_airplane.obj", "paper_airplane.obj" ]
+        possible_files = ["pj_airplane.obj", "paper_airplane.obj"]
         model_path = None
         
         for filename in possible_files:
@@ -1881,36 +1881,39 @@ class PlaneModel:
             print(f"❌ Failed to load .obj model: {e}")
             return None
     
-    def calculate_airplane_orientation(self, current_pos: Tuple[float, float, float], 
-                                     next_pos: Tuple[float, float, float]) -> QMatrix4x4:
-        """Calculate airplane orientation matrix to face travel direction"""
-        # Calculate direction vector
-        direction = QVector3D(
-            next_pos[0] - current_pos[0],
-            next_pos[1] - current_pos[1], 
-            next_pos[2] - current_pos[2]
-        ).normalized()
+    def calculate_airplane_orientation(self, current_pos: Tuple[float, float, float],
+                                       next_pos: Tuple[float, float, float]) -> QMatrix4x4:
+        """Calculate airplane orientation - ONLY heading rotation, no banking/pitching"""
+        current = QVector3D(*current_pos)
+        next_point = QVector3D(*next_pos)
         
-        # Calculate up vector (towards globe center)
-        up = QVector3D(current_pos[0], current_pos[1], current_pos[2]).normalized()
+        # Globe normal (up direction) at current position
+        up = current.normalized()
         
-        # Calculate right vector
-        right = QVector3D.crossProduct(direction, up).normalized()
+        # Travel direction projected onto tangent plane (no vertical component)
+        travel_direction = (next_point - current).normalized()
+        forward_tangent = travel_direction - QVector3D.dotProduct(travel_direction, up) * up
+        forward_tangent = forward_tangent.normalized()
         
-        # Recalculate up vector to ensure orthogonal
-        up = QVector3D.crossProduct(right, direction).normalized()
+        # Right direction (perpendicular to forward and up)
+        right = QVector3D.crossProduct(forward_tangent, up).normalized()
         
-        # Create rotation matrix
-        rotation = QMatrix4x4()
-        rotation.setRow(0, QVector4D(right.x(), right.y(), right.z(), 0.0))
-        rotation.setRow(1, QVector4D(up.x(), up.y(), up.z(), 0.0)) 
-        rotation.setRow(2, QVector4D(-direction.x(), -direction.y(), -direction.z(), 0.0))
-        rotation.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
+        # Create rotation matrix where airplane:
+        # - Nose (+X in model) points in travel direction  <- FIXED THIS
+        # - Up (+Z in model) points away from globe center  
+        # - Forward (+Y in model) is perpendicular to both
+        # NO banking, NO pitching - just heading changes
         
-        return rotation
-    
+        matrix = QMatrix4x4()
+        matrix.setRow(0, QVector4D(forward_tangent.x(), forward_tangent.y(), forward_tangent.z(), 0.0))  # Model X = nose direction
+        matrix.setRow(1, QVector4D(right.x(), right.y(), right.z(), 0.0))           # Model Y = right
+        matrix.setRow(2, QVector4D(up.x(), up.y(), up.z(), 0.0))                   # Model Z = up from globe
+        matrix.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
+        
+        return matrix
+
     def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4, shader_program):
-        """Render paper airplane for travel animation"""
+        """Render paper airplane with simple heading-only orientation"""
         if not self.is_loaded or not self.airplane_vao or self.airplane_geometry is None:
             return False
             
@@ -1928,12 +1931,14 @@ class PlaneModel:
             arr_coords = segment['arrival_coords']
             next_pos = self.parent_widget.lat_lon_to_3d(arr_coords[0], arr_coords[1], 1.05)
         
-        # Calculate transformation
+        # Get simple orientation - no smoothing to avoid unwanted rotations
         orientation = self.calculate_airplane_orientation(current_pos, next_pos)
+        
+        # Setup transformation matrix
         model = QMatrix4x4()
         model.translate(current_pos[0], current_pos[1], current_pos[2])
         model *= orientation
-        model.scale(0.045)  # Larger scale
+        model.scale(0.045)  # Appropriate scale
         
         final_mvp = mvp * model
         normal_matrix = model.normalMatrix()
