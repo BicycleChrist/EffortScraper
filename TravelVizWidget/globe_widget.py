@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture
 from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal
-from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent, 
-                        QWheelEvent, QColor, QImage)
+from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
+                         QWheelEvent, QColor, QImage, QVector4D)
 from pathlib import Path
 
 
@@ -306,6 +306,10 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.show_travel_animation = False
         self.disable_spinning_during_animation = True
         
+        
+        # Plane Model
+        self.plane_model = PlaneModel(self) 
+        
         # Display options
         self.show_travel_paths = True
         self.show_team_cities = True
@@ -341,6 +345,8 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.setup_earth_texture()
         self.load_team_logo_textures()
         self.setup_marker_vao()
+        self.setup_marker_vao()
+        self.plane_model.setup_airplane_model()
         
         self.gl_initialized = bool(self.marker_vao)
         print("✅ Globe OpenGL initialized" if self.gl_initialized else "❌ Globe OpenGL failed")
@@ -1316,10 +1322,6 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         if self.show_team_cities:
             self.render_markers(mvp, model)
-        
-        # Render animated traveling marker
-        if self.show_travel_animation and self.animated_marker_position:
-            self.render_animated_marker(mvp, model)
     
     def render_earth(self, mvp, model, normal_matrix):
         """Render Earth sphere"""
@@ -1388,8 +1390,15 @@ class FlightGlobeWidget(QOpenGLWidget):
         gl.glDisable(gl.GL_LINE_SMOOTH)
     
     def render_markers(self, mvp, model):
-        """Render team markers"""
-        if not self.marker_shader or not self.marker_vao or not self.team_city_markers:
+        """Render team markers with airplane for animation"""
+        
+        # Render animated airplane FIRST, separate from marker shader
+        if self.show_travel_animation and self.animated_marker_position:
+            if self.plane_model.is_ready():
+                self.plane_model.render_animated_airplane(self.animated_marker_position, mvp, None)
+        
+        # Now render cube markers with their own shader
+        if not self.marker_shader:
             return
         
         gl.glEnable(gl.GL_BLEND)
@@ -1400,18 +1409,17 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.setUniformValue("mvp", mvp)
         self.marker_shader.setUniformValue("time", self.animation_time)
         
-        for marker in self.team_city_markers:
-            # Determine rotation speed based on marker type
-            marker_type = marker.get('type', 'generic')
-            
-            if marker_type in ['home_today', 'away_today']:
-                # Slower rotation for today's games - easier viewing
-                rotation_speed = 0.3
-            else:
-                # Normal rotation speed for regular markers
-                rotation_speed = 1.0
-            
-            self.render_single_marker(marker, rotation_speed)
+        # Render static cube markers only when NOT showing travel animation
+        if self.team_city_markers and not self.show_travel_animation:
+            for marker in self.team_city_markers:
+                marker_type = marker.get('type', 'generic')
+                
+                if marker_type in ['home_today', 'away_today']:
+                    rotation_speed = 0.3
+                else:
+                    rotation_speed = 1.0
+                
+                self.render_single_marker(marker, rotation_speed)
         
         self.marker_shader.release()
     
@@ -1555,6 +1563,22 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         self.marker_shader.release()
     
+    
+    
+    
+    # Airplane model logic
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     # Utility Methods
     def infer_league_from_team_id(self, team_id: str) -> Optional[str]:
         """Infer league from team_id pattern like MLB_2025_20250511_bos_kc"""
@@ -1641,6 +1665,17 @@ class FlightGlobeWidget(QOpenGLWidget):
             height = 1
         gl.glViewport(0, 0, width, height)
     
+    
+    def cleanup_airplane_resources(self):
+        """Clean up airplane OpenGL resources"""
+        if hasattr(self, 'airplane_vao') and self.airplane_vao:
+            gl.glDeleteVertexArrays(1, [self.airplane_vao])
+            self.airplane_vao = 0
+        
+        if hasattr(self, 'airplane_vbo') and self.airplane_vbo:
+            gl.glDeleteBuffers(1, [self.airplane_vbo])
+            self.airplane_vbo = 0
+    
     def closeEvent(self, event):
         """Clean up OpenGL resources"""
         if self.gl_initialized:
@@ -1669,6 +1704,275 @@ class FlightGlobeWidget(QOpenGLWidget):
             if self.earth_texture:
                 self.earth_texture.destroy()
             
+            self.plane_model.cleanup_resources()
             self.doneCurrent()
         
         super().closeEvent(event)
+                
+
+class PlaneModel:
+    """Handles loading, rendering, and management of 3D airplane models for travel animation"""
+    
+    def __init__(self, parent_widget=None):
+        self.parent_widget = parent_widget
+        self.airplane_vao = None
+        self.airplane_vbo = None
+        self.airplane_geometry = None
+        self.is_loaded = False
+        
+    def setup_airplane_model(self):
+        """Load and setup airplane model geometry"""
+        # Try multiple possible filenames
+        possible_files = ["pj_airplane.obj", "paper_airplane.obj" ]
+        model_path = None
+        
+        for filename in possible_files:
+            test_path = Path("plane_model") / filename
+            if test_path.exists():
+                model_path = test_path
+                print(f"✅ Found airplane model: {model_path}")
+                break
+        
+        if not model_path:
+            print(f"⚠️ No airplane model found in plane_model/ directory")
+            print(f"   Looked for: {possible_files}")
+            self.airplane_geometry = None
+            self.airplane_vao = 0
+            self.airplane_vbo = 0
+            self.is_loaded = False
+            return False
+        
+        # Load model geometry
+        self.airplane_geometry = self.load_obj_model(str(model_path))
+        if self.airplane_geometry is None:
+            self.airplane_vao = 0
+            self.airplane_vbo = 0
+            self.is_loaded = False
+            return False
+        
+        # Create OpenGL buffers
+        self.airplane_vao = gl.glGenVertexArrays(1)
+        self.airplane_vbo = gl.glGenBuffers(1)
+        
+        if self.airplane_vao == 0 or self.airplane_vbo == 0:
+            print("❌ Failed to create airplane OpenGL buffers")
+            self.is_loaded = False
+            return False
+        
+        gl.glBindVertexArray(self.airplane_vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.airplane_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.airplane_geometry.nbytes, 
+                       self.airplane_geometry, gl.GL_STATIC_DRAW)
+        
+        stride = 8 * 4  # 3 pos + 3 normal + 2 texcoord = 8 floats
+        
+        # Position attribute
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
+        
+        # Normal attribute
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
+        
+        # Texture coordinate attribute
+        gl.glEnableVertexAttribArray(2)
+        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(24))
+        
+        gl.glBindVertexArray(0)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+        
+        self.is_loaded = True
+        print("✅ Airplane model VAO/VBO setup complete")
+        return True
+    
+    def load_obj_model(self, filepath: str) -> Optional[np.ndarray]:
+        """Load .obj file and return vertex array for OpenGL - Simplified version"""
+        try:
+            vertices = []
+            normals = []
+            faces = []
+            
+            print(f"📁 Loading .obj file: {filepath}")
+            
+            with open(filepath, 'r') as file:
+                for line_num, line in enumerate(file, 1):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                        
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    
+                    try:
+                        if parts[0] == 'v':  # Vertex
+                            if len(parts) >= 4:
+                                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                                vertices.append([x, y, z])
+                        
+                        elif parts[0] == 'vn':  # Normal
+                            if len(parts) >= 4:
+                                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                                normals.append([x, y, z])
+                        
+                        elif parts[0] == 'f':  # Face
+                            # Handle various face formats: f v1 v2 v3 or f v1/vt1 v2/vt2 v3/vt3 or f v1//vn1 v2//vn2 v3//vn3
+                            face_vertices = []
+                            for vertex_data in parts[1:]:
+                                # Extract just the vertex index (first number before any slash)
+                                vertex_idx = vertex_data.split('/')[0]
+                                if vertex_idx:
+                                    face_vertices.append(int(vertex_idx) - 1)  # OBJ is 1-indexed
+                            
+                            if len(face_vertices) >= 3:
+                                faces.append(face_vertices)
+                    
+                    except (ValueError, IndexError) as e:
+                        print(f"⚠️ Skipping invalid line {line_num}: {line} ({e})")
+                        continue
+            
+            print(f"📊 Loaded: {len(vertices)} vertices, {len(normals)} normals, {len(faces)} faces")
+            
+            if not vertices or not faces:
+                print(f"❌ Invalid .obj file: no vertices or faces found")
+                return None
+            
+            # Create default normals if none provided
+            if not normals:
+                print("🔧 Generating default normals")
+                normals = [[0.0, 1.0, 0.0] for _ in vertices]  # Default up normals
+            
+            # Convert faces to triangle array for OpenGL
+            opengl_vertices = []
+            triangle_count = 0
+            
+            for face in faces:
+                # Triangulate faces (simple fan triangulation for polygons)
+                for i in range(len(face) - 2):
+                    triangle_indices = [face[0], face[i + 1], face[i + 2]]
+                    
+                    for v_idx in triangle_indices:
+                        if 0 <= v_idx < len(vertices):
+                            # Position
+                            opengl_vertices.extend(vertices[v_idx])
+                            
+                            # Normal (use corresponding normal or default)
+                            if v_idx < len(normals):
+                                opengl_vertices.extend(normals[v_idx])
+                            else:
+                                opengl_vertices.extend([0.0, 1.0, 0.0])
+                            
+                            # Texture coordinates (placeholder)
+                            opengl_vertices.extend([0.0, 0.0])
+                        else:
+                            print(f"⚠️ Invalid vertex index: {v_idx}")
+                            return None
+                    
+                    triangle_count += 1
+            
+            vertex_array = np.array(opengl_vertices, dtype=np.float32)
+            print(f"✅ Generated {triangle_count} triangles for OpenGL")
+            return vertex_array
+            
+        except FileNotFoundError:
+            print(f"❌ .obj file not found: {filepath}")
+            return None
+        except Exception as e:
+            print(f"❌ Failed to load .obj model: {e}")
+            return None
+    
+    def calculate_airplane_orientation(self, current_pos: Tuple[float, float, float], 
+                                     next_pos: Tuple[float, float, float]) -> QMatrix4x4:
+        """Calculate airplane orientation matrix to face travel direction"""
+        # Calculate direction vector
+        direction = QVector3D(
+            next_pos[0] - current_pos[0],
+            next_pos[1] - current_pos[1], 
+            next_pos[2] - current_pos[2]
+        ).normalized()
+        
+        # Calculate up vector (towards globe center)
+        up = QVector3D(current_pos[0], current_pos[1], current_pos[2]).normalized()
+        
+        # Calculate right vector
+        right = QVector3D.crossProduct(direction, up).normalized()
+        
+        # Recalculate up vector to ensure orthogonal
+        up = QVector3D.crossProduct(right, direction).normalized()
+        
+        # Create rotation matrix
+        rotation = QMatrix4x4()
+        rotation.setRow(0, QVector4D(right.x(), right.y(), right.z(), 0.0))
+        rotation.setRow(1, QVector4D(up.x(), up.y(), up.z(), 0.0)) 
+        rotation.setRow(2, QVector4D(-direction.x(), -direction.y(), -direction.z(), 0.0))
+        rotation.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
+        
+        return rotation
+    
+    def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4, shader_program):
+        """Render paper airplane for travel animation"""
+        if not self.is_loaded or not self.airplane_vao or self.airplane_geometry is None:
+            return False
+            
+        current_pos = animation_state['position']
+        segment = animation_state['segment']
+        
+        # Get next position for orientation
+        if segment['path_3d'] and len(segment['path_3d']) > 1:
+            path_points = segment['path_3d']
+            current_segment_progress = animation_state.get('segment_progress', 0.0)
+            point_float = current_segment_progress * (len(path_points) - 1)
+            next_point_idx = min(int(point_float) + 1, len(path_points) - 1)
+            next_pos = path_points[next_point_idx]
+        else:
+            arr_coords = segment['arrival_coords']
+            next_pos = self.parent_widget.lat_lon_to_3d(arr_coords[0], arr_coords[1], 1.05)
+        
+        # Calculate transformation
+        orientation = self.calculate_airplane_orientation(current_pos, next_pos)
+        model = QMatrix4x4()
+        model.translate(current_pos[0], current_pos[1], current_pos[2])
+        model *= orientation
+        model.scale(0.045)  # Larger scale
+        
+        final_mvp = mvp * model
+        normal_matrix = model.normalMatrix()
+        
+        # Use Earth shader with proper uniforms
+        earth_shader = self.parent_widget.shader_program
+        earth_shader.bind()
+        earth_shader.setUniformValue("mvp", final_mvp)
+        earth_shader.setUniformValue("model", model)
+        earth_shader.setUniformValue("normalMatrix", normal_matrix)
+        earth_shader.setUniformValue("lightDir", QVector3D(1.0, 0.3, 0.5).normalized())
+        earth_shader.setUniformValue("showAtmosphere", False)
+        
+        gl.glBindVertexArray(self.airplane_vao)
+        triangle_count = len(self.airplane_geometry) // 8
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, triangle_count)
+        gl.glBindVertexArray(0)
+        
+        earth_shader.release()
+        return True
+    
+    def cleanup_resources(self):
+        """Clean up airplane OpenGL resources"""
+        if self.airplane_vao and self.airplane_vao != 0:
+            gl.glDeleteVertexArrays(1, [self.airplane_vao])
+            self.airplane_vao = None
+        
+        if self.airplane_vbo and self.airplane_vbo != 0:
+            gl.glDeleteBuffers(1, [self.airplane_vbo])
+            self.airplane_vbo = None
+        
+        self.airplane_geometry = None
+        self.is_loaded = False
+        print("🧹 Cleaned up airplane model resources")
+    
+    def is_ready(self) -> bool:
+        """Check if airplane model is ready for rendering"""
+        return (self.is_loaded and 
+                self.airplane_vao is not None and 
+                self.airplane_vao != 0 and
+                self.airplane_geometry is not None and 
+                len(self.airplane_geometry) > 0)
