@@ -12,7 +12,7 @@ from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
                          QWheelEvent, QColor, QImage, QVector4D)
 from pathlib import Path
 import math
-
+import os
 #TODO: plane looks like its being flown by Denzel off the sauce. 
 
 class TeamTravelAnimation:
@@ -415,322 +415,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.texcoords = np.array(texcoords, dtype=np.float32)
         self.normals = np.array(normals, dtype=np.float32)
     
-    def setup_shaders(self):
-        """Setup all OpenGL shaders including new dedicated airplane shader"""
-        
-        # Earth shader (existing)
-        earth_vertex = """
-        #version 330 core
-        layout (location = 0) in vec3 position;
-        layout (location = 1) in vec2 texCoord;
-        layout (location = 2) in vec3 normal;
-        
-        uniform mat4 mvp;
-        uniform mat4 model;
-        uniform mat3 normalMatrix;
-        uniform vec3 lightDir;
-        
-        out vec2 TexCoord;
-        out float LightIntensity;
-        
-        void main() {
-            gl_Position = mvp * vec4(position, 1.0);
-            TexCoord = texCoord;
-            vec3 Normal = normalize(normalMatrix * normal);
-            LightIntensity = max(dot(Normal, normalize(lightDir)), 0.0);
-        }
-        """
-        
-        earth_fragment = """
-        #version 330 core
-        in vec2 TexCoord;
-        in float LightIntensity;
-        
-        out vec4 FragColor;
-        
-        uniform sampler2D earthTexture;
-        uniform bool showAtmosphere;
-        
-        void main() {
-            vec3 earthColor = texture(earthTexture, TexCoord).rgb;
-            float ambient = 0.15;
-            float diffuse = LightIntensity * 0.85;
-            vec3 litColor = earthColor * (ambient + diffuse);
-            
-            FragColor = vec4(litColor, 1.0);
-        }
-        """
-        
-        self.shader_program = QOpenGLShaderProgram()
-        self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
-        self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
-        if not self.shader_program.link():
-            print("❌ Failed to link Earth shader")
-        else:
-            print("✅ Earth shader linked successfully")
-        
-        # Travel path shader (existing)
-        travel_vertex = """
-        #version 330 core
-        layout (location = 0) in vec3 position;
-        
-        uniform mat4 mvp;
-        uniform vec3 pathColor;
-        uniform float pathAlpha;
-        
-        out vec3 Color;
-        out float Alpha;
-        
-        void main() {
-            gl_Position = mvp * vec4(position, 1.0);
-            Color = pathColor;
-            Alpha = pathAlpha;
-        }
-        """
-        
-        travel_fragment = """
-        #version 330 core
-        in vec3 Color;
-        in float Alpha;
-        
-        out vec4 FragColor;
-        
-        void main() {
-            FragColor = vec4(Color, Alpha);
-        }
-        """
-        
-        self.travel_shader = QOpenGLShaderProgram()
-        self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
-        self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
-        if not self.travel_shader.link():
-            print("❌ Failed to link Travel shader")
-        else:
-            print("✅ Travel shader linked successfully")
-        
-        # Enhanced marker shader (existing)
-        marker_vertex = """
-        #version 330 core
-        layout (location = 0) in vec3 position;
-        layout (location = 1) in vec3 normal;
-        layout (location = 2) in vec2 texCoord;
-        
-        uniform mat4 mvp;
-        uniform vec3 markerCenter;
-        uniform float markerSize;
-        uniform float time;
-        uniform float rotationSpeed;
-        uniform bool isAnimated;
-        uniform bool isSplitCube;
-        
-        out vec2 MarkerTexCoord;
-        out float LightIntensity;
-        out vec3 WorldPosition;  // For split cube detection
-        
-        void main() {
-            float rotY = time * rotationSpeed;
-            float rotX = time * rotationSpeed * 0.7;
-            
-            if (isAnimated) {
-                rotY *= 2.0;
-                rotX *= 1.5;
-            }
-            
-            mat3 rotationY = mat3(
-                cos(rotY), 0.0, sin(rotY),
-                0.0, 1.0, 0.0,
-                -sin(rotY), 0.0, cos(rotY)
-            );
-            
-            mat3 rotationX = mat3(
-                1.0, 0.0, 0.0,
-                0.0, cos(rotX), -sin(rotX),
-                0.0, sin(rotX), cos(rotX)
-            );
-            
-            mat3 rotation = rotationY * rotationX;
-            
-            float animatedSize = markerSize;
-            if (isAnimated) {
-                float pulse = sin(time * 4.0) * 0.3 + 1.0;
-                animatedSize *= pulse * 0.012;
-            } else if (isSplitCube) {
-                animatedSize *= 0.010;  // Slightly larger for split cubes
-            } else {
-                animatedSize *= 0.008;
-            }
-            
-            vec3 rotatedPos = rotation * (position * animatedSize);
-            vec3 worldPos = markerCenter + rotatedPos;
-            
-            gl_Position = mvp * vec4(worldPos, 1.0);
-            
-            vec3 MarkerNormal = rotation * normal;
-            vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
-            LightIntensity = max(dot(MarkerNormal, lightDir), 0.6);
-            
-            MarkerTexCoord = texCoord;
-            WorldPosition = rotatedPos;  // Local position for split cube logic
-        }
-        """
-        
-        marker_fragment = """
-        #version 330 core
-        in vec2 MarkerTexCoord;
-        in float LightIntensity;
-        in vec3 WorldPosition;
-        
-        out vec4 FragColor;
-        
-        uniform vec3 teamColor;
-        uniform vec3 homeTeamColor;
-        uniform vec3 awayTeamColor;
-        uniform float markerAlpha;
-        uniform float time;
-        uniform bool useTexture;
-        uniform bool useHomeTexture;
-        uniform bool useAwayTexture;
-        uniform bool isSplitCube;
-        uniform bool isAnimated;
-        uniform sampler2D markerTexture;
-        uniform sampler2D homeTeamTexture;
-        uniform sampler2D awayTeamTexture;
-        
-        void main() {
-            vec3 finalColor = teamColor;
-            float finalAlpha = markerAlpha;
-            
-            if (isSplitCube) {
-                // Split cube logic - top half vs bottom half
-                if (WorldPosition.y > 0.0) {
-                    // Top half - home team
-                    if (useHomeTexture) {
-                        vec4 texColor = texture(homeTeamTexture, MarkerTexCoord);
-                        if (texColor.a > 0.01) {
-                            finalColor = texColor.rgb * LightIntensity;
-                            finalAlpha *= texColor.a;
-                        } else {
-                            finalColor = homeTeamColor * LightIntensity;
-                        }
-                    } else {
-                        finalColor = homeTeamColor * LightIntensity;
-                    }
-                } else {
-                    // Bottom half - away team  
-                    if (useAwayTexture) {
-                        vec4 texColor = texture(awayTeamTexture, MarkerTexCoord);
-                        if (texColor.a > 0.01) {
-                            finalColor = texColor.rgb * LightIntensity;
-                            finalAlpha *= texColor.a;
-                        } else {
-                            finalColor = awayTeamColor * LightIntensity;
-                        }
-                    } else {
-                        finalColor = awayTeamColor * LightIntensity;
-                    }
-                }
-                
-                // Add white border at split line
-                if (abs(WorldPosition.y) < 0.02) {
-                    finalColor = mix(finalColor, vec3(1.0, 1.0, 1.0), 0.15);
-                }
-            } else {
-                // Single-team cube logic
-                if (useTexture) {
-                    vec4 texColor = texture(markerTexture, MarkerTexCoord);
-                    if (texColor.a > 0.01) {
-                        finalColor = texColor.rgb * LightIntensity;
-                        finalAlpha *= texColor.a;
-                    } else {
-                        finalColor = teamColor * LightIntensity;
-                    }
-                } else {
-                    finalColor = teamColor * LightIntensity;
-                }
-            }
-            
-            if (isAnimated) {
-                float glow = sin(time * 3.0) * 0.4 + 0.6;
-                finalColor *= glow;
-                finalColor += vec3(1.0, 0.8, 0.2) * 0.3;
-            }
-            
-            FragColor = vec4(finalColor, finalAlpha);
-        }
-        """
-        
-        self.marker_shader = QOpenGLShaderProgram()
-        self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
-        self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
-        if not self.marker_shader.link():
-            print("❌ Failed to link Marker shader")
-        else:
-            print("✅ Marker shader linked successfully")
-        
-        # NEW: Dedicated airplane shader
-        airplane_vertex = """
-        #version 330 core
-        layout (location = 0) in vec3 position;
-        layout (location = 1) in vec3 normal;
-        
-        uniform mat4 mvp;
-        uniform mat4 model;
-        uniform mat3 normalMatrix;
-        uniform vec3 lightDir;
-        
-        out float LightIntensity;
-        out vec3 FragNormal;
-        
-        void main() {
-            gl_Position = mvp * vec4(position, 1.0);
-            
-            // Transform normal to world space
-            vec3 worldNormal = normalize(normalMatrix * normal);
-            FragNormal = worldNormal;
-            
-            // Calculate diffuse lighting
-            LightIntensity = max(dot(worldNormal, normalize(lightDir)), 0.0);
-        }
-        """
-        
-        airplane_fragment = """
-        #version 330 core
-        in float LightIntensity;
-        in vec3 FragNormal;
-        
-        out vec4 FragColor;
-        
-        uniform vec3 airplaneColor;
-        
-        void main() {
-            // Ambient lighting component
-            float ambient = 0.3;
-            
-            // Diffuse lighting component  
-            float diffuse = LightIntensity * 0.7;
-            
-            // Combine lighting
-            float totalLight = ambient + diffuse;
-            
-            // Apply lighting to airplane color
-            vec3 litColor = airplaneColor * totalLight;
-            
-            // Add slight specular highlight based on normal
-            float specular = pow(max(dot(FragNormal, normalize(vec3(0.0, 1.0, 0.5))), 0.0), 16.0) * 0.2;
-            litColor += vec3(specular);
-            
-            FragColor = vec4(litColor, 1.0);
-        }
-        """
-        
-        self.airplane_shader = QOpenGLShaderProgram()
-        self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, airplane_vertex)
-        self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, airplane_fragment)
-        if not self.airplane_shader.link():
-            print("❌ Failed to link Airplane shader")
-            self.airplane_shader = None
-        else:
-            print("✅ Airplane shader linked successfully")
+    
     
     def setup_vertex_buffers(self):
         """Setup vertex buffer objects"""
@@ -767,7 +452,92 @@ class FlightGlobeWidget(QOpenGLWidget):
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(2, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(20))
         gl.glEnableVertexAttribArray(2)
+
     
+    def load_shader_from_file(self, filepath):
+        """Load shader source code from a file"""
+        try:
+            shader_path = Path(filepath)
+            return shader_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            print(f"❌ Shader file not found: {filepath}")
+            return None
+        except Exception as e:
+            print(f"❌ Error loading shader file {filepath}: {e}")
+            return None
+
+    def setup_shaders(self):
+        """Setup all OpenGL shaders - now loading from separate files"""
+        
+        # Define shader directory path (adjust as needed for your project structure)
+        shader_dir = Path("shaders")
+        
+        # Earth shader
+        earth_vertex = self.load_shader_from_file(shader_dir / "earth.vert")
+        earth_fragment = self.load_shader_from_file(shader_dir / "earth.frag")
+        
+        if earth_vertex and earth_fragment:
+            self.shader_program = QOpenGLShaderProgram()
+            self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
+            self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
+            if not self.shader_program.link():
+                print("❌ Failed to link Earth shader")
+            else:
+                print("✅ Earth shader linked successfully")
+        else:
+            print("❌ Failed to load Earth shader files")
+        
+        # Travel path shader
+        travel_vertex = self.load_shader_from_file(shader_dir / "travel_path.vert")
+        travel_fragment = self.load_shader_from_file(shader_dir / "travel_path.frag")
+        
+        if travel_vertex and travel_fragment:
+            self.travel_shader = QOpenGLShaderProgram()
+            self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
+            self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
+            if not self.travel_shader.link():
+                print("❌ Failed to link Travel shader")
+            else:
+                print("✅ Travel shader linked successfully")
+        else:
+            print("❌ Failed to load Travel shader files")
+        
+        # Marker shader
+        marker_vertex = self.load_shader_from_file(shader_dir / "marker.vert")
+        marker_fragment = self.load_shader_from_file(shader_dir / "marker.frag")
+        
+        if marker_vertex and marker_fragment:
+            self.marker_shader = QOpenGLShaderProgram()
+            self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
+            self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
+            if not self.marker_shader.link():
+                print("❌ Failed to link Marker shader")
+            else:
+                print("✅ Marker shader linked successfully")
+        else:
+            print("❌ Failed to load Marker shader files")
+        
+        # Airplane shader
+        airplane_vertex = self.load_shader_from_file(shader_dir / "airplane.vert")
+        airplane_fragment = self.load_shader_from_file(shader_dir / "airplane.frag")
+        
+        if airplane_vertex and airplane_fragment:
+            self.airplane_shader = QOpenGLShaderProgram()
+            self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, airplane_vertex)
+            self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, airplane_fragment)
+            if not self.airplane_shader.link():
+                print("❌ Failed to link Airplane shader")
+                self.airplane_shader = None
+            else:
+                print("✅ Airplane shader linked successfully")
+        else:
+            print("❌ Failed to load Airplane shader files")
+            self.airplane_shader = None
+        
+
+
+
+
     def setup_earth_texture(self):
         """Load Earth texture"""
         texture_files = ["no_ice_clouds_8k.jpg", "earth.jpg"]
@@ -1225,6 +995,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             
             team_color = self.get_team_color(team_abbrev) if team_abbrev else (1.0, 0.6, 0.2)
             
+            # *** FIXED: Create ONE CONNECTED PATH per team instead of individual segments ***
             self._create_sequential_team_path(travel_records, team_name, team_abbrev, 
                                             league, team_color, cities_seen)
         
@@ -1280,7 +1051,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                     segment_points = segment_points[1:]  # Skip first point to avoid duplication
                 all_path_points.extend(segment_points)
         
-        # Create one path per
+        # Create ONE path for the entire team journey
         if all_path_points and len(all_path_points) > 1:
             path_data = {
                 'points': all_path_points,
