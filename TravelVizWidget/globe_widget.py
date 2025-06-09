@@ -13,6 +13,8 @@ from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
 from pathlib import Path
 import math
 
+#TODO: plane looks like its being flown by Denzel off the sauce. 
+
 class TeamTravelAnimation:
     """Manages animated team travel sequences - Essential for UI"""
     
@@ -110,7 +112,7 @@ class TeamTravelAnimation:
         self.current_team = None
     
     def update_animation(self, frame_time: float) -> Optional[Dict]:
-        """Update animation state and return current position"""
+        """Update animation state and return current position WITH orientation"""
         if not self.animation_active or not self.current_team:
             return None
             
@@ -143,6 +145,7 @@ class TeamTravelAnimation:
         
         current_seg = segments[self.current_segment]
         
+        # Calculate position (existing logic)
         if current_seg['path_3d'] and len(current_seg['path_3d']) > 1:
             path_points = current_seg['path_3d']
             point_float = self.segment_progress * (len(path_points) - 1)
@@ -163,10 +166,29 @@ class TeamTravelAnimation:
             dep_coords = current_seg['departure_coords']
             current_position = self.lat_lon_to_3d(dep_coords[0], dep_coords[1], 1.05)
         
+        # NEW: Calculate orientation using the plane model
+        orientation = None
+        if (hasattr(self.parent_widget, 'plane_model') and 
+            self.parent_widget.plane_model and 
+            self.parent_widget.plane_model.is_ready() and 
+            current_seg['path_3d'] and len(current_seg['path_3d']) > 1):
+            
+            try:
+                orientation = self.parent_widget.plane_model.calculate_smooth_orientation_from_path(
+                    current_seg['path_3d'], 
+                    self.segment_progress
+                )
+                print(f"🛩️ Calculated orientation at progress {self.segment_progress:.3f}")  # Debug
+            except Exception as e:
+                print(f"⚠️ Failed to calculate airplane orientation: {e}")
+                orientation = None
+        
         return {
             'position': current_position,
+            'orientation': orientation,  # NOW INCLUDED!
             'segment': current_seg,
             'segment_index': self.current_segment,
+            'segment_progress': self.segment_progress,  # Added for debugging
             'total_segments': total_segments,
             'progress': self.animation_progress,
             'team_id': self.current_team
@@ -394,8 +416,9 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.normals = np.array(normals, dtype=np.float32)
     
     def setup_shaders(self):
-        """Setup simplified OpenGL shaders"""
-        # Earth shader
+        """Setup all OpenGL shaders including new dedicated airplane shader"""
+        
+        # Earth shader (existing)
         earth_vertex = """
         #version 330 core
         layout (location = 0) in vec3 position;
@@ -441,9 +464,12 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.shader_program = QOpenGLShaderProgram()
         self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
         self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
-        self.shader_program.link()
+        if not self.shader_program.link():
+            print("❌ Failed to link Earth shader")
+        else:
+            print("✅ Earth shader linked successfully")
         
-        # Travel path shader
+        # Travel path shader (existing)
         travel_vertex = """
         #version 330 core
         layout (location = 0) in vec3 position;
@@ -477,9 +503,12 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.travel_shader = QOpenGLShaderProgram()
         self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
         self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
-        self.travel_shader.link()
+        if not self.travel_shader.link():
+            print("❌ Failed to link Travel shader")
+        else:
+            print("✅ Travel shader linked successfully")
         
-        # Enhanced marker shader with split cube support
+        # Enhanced marker shader (existing)
         marker_vertex = """
         #version 330 core
         layout (location = 0) in vec3 position;
@@ -541,7 +570,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             LightIntensity = max(dot(MarkerNormal, lightDir), 0.6);
             
             MarkerTexCoord = texCoord;
-            WorldPosition = rotatedPos;  // Local position for split detection
+            WorldPosition = rotatedPos;  // Local position for split cube logic
         }
         """
         
@@ -549,47 +578,32 @@ class FlightGlobeWidget(QOpenGLWidget):
         #version 330 core
         in vec2 MarkerTexCoord;
         in float LightIntensity;
-        in vec3 WorldPosition;  // For split cube detection
+        in vec3 WorldPosition;
         
         out vec4 FragColor;
         
-        uniform sampler2D homeTeamTexture;   // Home team texture
-        uniform sampler2D awayTeamTexture;   // Away team texture
-        uniform sampler2D markerTexture;     // Single texture
-        uniform vec3 homeTeamColor;          // Home team color
-        uniform vec3 awayTeamColor;          // Away team color
-        uniform vec3 teamColor;              // Single color
-        uniform bool useTexture;             // Single texture mode
-        uniform bool useHomeTexture;         // Use home texture
-        uniform bool useAwayTexture;         // Use away texture
-        uniform bool isSplitCube;            // Split cube flag
+        uniform vec3 teamColor;
+        uniform vec3 homeTeamColor;
+        uniform vec3 awayTeamColor;
         uniform float markerAlpha;
-        uniform bool isAnimated;
         uniform float time;
+        uniform bool useTexture;
+        uniform bool useHomeTexture;
+        uniform bool useAwayTexture;
+        uniform bool isSplitCube;
+        uniform bool isAnimated;
+        uniform sampler2D markerTexture;
+        uniform sampler2D homeTeamTexture;
+        uniform sampler2D awayTeamTexture;
         
         void main() {
-            vec3 finalColor;
+            vec3 finalColor = teamColor;
             float finalAlpha = markerAlpha;
             
             if (isSplitCube) {
-                // Split cube logic - Top half = away team, bottom half = home team
-                bool isTopHalf = WorldPosition.y > 0.0;
-                
-                if (isTopHalf) {
-                    // Away team (top half)
-                    if (useAwayTexture) {
-                        vec4 texColor = texture(awayTeamTexture, MarkerTexCoord);
-                        if (texColor.a > 0.01) {
-                            finalColor = texColor.rgb * LightIntensity;
-                            finalAlpha *= texColor.a;
-                        } else {
-                            finalColor = awayTeamColor * LightIntensity;
-                        }
-                    } else {
-                        finalColor = awayTeamColor * LightIntensity;
-                    }
-                } else {
-                    // Home team (bottom half)
+                // Split cube logic - top half vs bottom half
+                if (WorldPosition.y > 0.0) {
+                    // Top half - home team
                     if (useHomeTexture) {
                         vec4 texColor = texture(homeTeamTexture, MarkerTexCoord);
                         if (texColor.a > 0.01) {
@@ -600,6 +614,19 @@ class FlightGlobeWidget(QOpenGLWidget):
                         }
                     } else {
                         finalColor = homeTeamColor * LightIntensity;
+                    }
+                } else {
+                    // Bottom half - away team  
+                    if (useAwayTexture) {
+                        vec4 texColor = texture(awayTeamTexture, MarkerTexCoord);
+                        if (texColor.a > 0.01) {
+                            finalColor = texColor.rgb * LightIntensity;
+                            finalAlpha *= texColor.a;
+                        } else {
+                            finalColor = awayTeamColor * LightIntensity;
+                        }
+                    } else {
+                        finalColor = awayTeamColor * LightIntensity;
                     }
                 }
                 
@@ -635,7 +662,75 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader = QOpenGLShaderProgram()
         self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
         self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
-        self.marker_shader.link()
+        if not self.marker_shader.link():
+            print("❌ Failed to link Marker shader")
+        else:
+            print("✅ Marker shader linked successfully")
+        
+        # NEW: Dedicated airplane shader
+        airplane_vertex = """
+        #version 330 core
+        layout (location = 0) in vec3 position;
+        layout (location = 1) in vec3 normal;
+        
+        uniform mat4 mvp;
+        uniform mat4 model;
+        uniform mat3 normalMatrix;
+        uniform vec3 lightDir;
+        
+        out float LightIntensity;
+        out vec3 FragNormal;
+        
+        void main() {
+            gl_Position = mvp * vec4(position, 1.0);
+            
+            // Transform normal to world space
+            vec3 worldNormal = normalize(normalMatrix * normal);
+            FragNormal = worldNormal;
+            
+            // Calculate diffuse lighting
+            LightIntensity = max(dot(worldNormal, normalize(lightDir)), 0.0);
+        }
+        """
+        
+        airplane_fragment = """
+        #version 330 core
+        in float LightIntensity;
+        in vec3 FragNormal;
+        
+        out vec4 FragColor;
+        
+        uniform vec3 airplaneColor;
+        
+        void main() {
+            // Ambient lighting component
+            float ambient = 0.3;
+            
+            // Diffuse lighting component  
+            float diffuse = LightIntensity * 0.7;
+            
+            // Combine lighting
+            float totalLight = ambient + diffuse;
+            
+            // Apply lighting to airplane color
+            vec3 litColor = airplaneColor * totalLight;
+            
+            // Add slight specular highlight based on normal
+            float specular = pow(max(dot(FragNormal, normalize(vec3(0.0, 1.0, 0.5))), 0.0), 16.0) * 0.2;
+            litColor += vec3(specular);
+            
+            FragColor = vec4(litColor, 1.0);
+        }
+        """
+        
+        self.airplane_shader = QOpenGLShaderProgram()
+        self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, airplane_vertex)
+        self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, airplane_fragment)
+        if not self.airplane_shader.link():
+            print("❌ Failed to link Airplane shader")
+            self.airplane_shader = None
+        else:
+            print("✅ Airplane shader linked successfully")
     
     def setup_vertex_buffers(self):
         """Setup vertex buffer objects"""
@@ -1710,20 +1805,226 @@ class FlightGlobeWidget(QOpenGLWidget):
         super().closeEvent(event)
                 
 
-class PlaneModel:
-    """Handles loading, rendering, and management of 3D airplane models for travel animation"""
+
+
+
+class AirplaneGeometry:
+    """Optimized geometry loading and data management - no OpenGL dependencies"""
     
-    def __init__(self, parent_widget=None):
-        self.parent_widget = parent_widget
-        self.airplane_vao = None
-        self.airplane_vbo = None
-        self.airplane_geometry = None
+    def __init__(self):
+        self.vertices = None
+        self.vertex_count = 0
+        self.geometry_data = None
+        self.bounding_box = None
         self.is_loaded = False
         
-    def setup_airplane_model(self):
-        """Load and setup airplane model geometry"""
-        # Try multiple possible filenames
-        possible_files = ["pj_airplane.obj", "paper_airplane.obj"]
+        # Performance caches
+        self._normals_cache = {}
+        self._face_cache = {}
+    
+    def load_obj_model(self, filepath: str) -> bool:
+        """Load .obj file with optimized parsing and validation"""
+        try:
+            vertices = []
+            normals = []
+            faces = []
+            
+            print(f"📁 Loading airplane model: {filepath}")
+            
+            with open(filepath, 'r') as file:
+                lines = file.readlines()
+                
+            # Parse in chunks for better performance
+            for line_num, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                    
+                parts = line.split()
+                if not parts:
+                    continue
+                    
+                try:
+                    command = parts[0]
+                    
+                    if command == 'v' and len(parts) >= 4:  # Vertex position
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        vertices.append([x, y, z])
+                    
+                    elif command == 'vn' and len(parts) >= 4:  # Vertex normal
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        normals.append([x, y, z])
+                    
+                    elif command == 'f':  # Face - optimized parsing
+                        face_vertices = []
+                        for vertex_data in parts[1:]:
+                            vertex_idx = vertex_data.split('/')[0]
+                            if vertex_idx:
+                                face_vertices.append(int(vertex_idx) - 1)  # OBJ is 1-indexed
+                        
+                        if len(face_vertices) >= 3:
+                            faces.append(face_vertices)
+                
+                except (ValueError, IndexError) as e:
+                    print(f"⚠️ Skipping invalid line {line_num}: {line} ({e})")
+                    continue
+            
+            # Validation
+            if not vertices or not faces:
+                print(f"❌ Invalid .obj file: no vertices or faces found")
+                return False
+            
+            print(f"📊 Loaded: {len(vertices)} vertices, {len(normals)} normals, {len(faces)} faces")
+            
+            # Generate normals if none provided
+            if not normals:
+                normals = self._generate_face_normals_vectorized(vertices, faces)
+                print("🔧 Generated face normals (vectorized)")
+            
+            # Convert to OpenGL-ready format with optimization
+            self.geometry_data = self._create_vertex_array_optimized(vertices, normals, faces)
+            if self.geometry_data is None:
+                return False
+                
+            self.vertex_count = len(self.geometry_data) // 6  # 3 position + 3 normal per vertex
+            self.bounding_box = self._calculate_bounding_box_fast(vertices)
+            self.is_loaded = True
+            
+            print(f"✅ Airplane geometry loaded: {self.vertex_count} vertices")
+            return True
+            
+        except FileNotFoundError:
+            print(f"❌ Airplane model file not found: {filepath}")
+            return False
+        except Exception as e:
+            print(f"❌ Failed to load airplane model: {e}")
+            return False
+    
+    def _generate_face_normals_vectorized(self, vertices, faces):
+        """Generate normals using vectorized operations for better performance"""
+        import numpy as np
+        
+        vertex_array = np.array(vertices, dtype=np.float32)
+        vertex_normals = np.zeros_like(vertex_array)
+        
+        # Process faces in batches for efficiency
+        for face in faces:
+            if len(face) >= 3:
+                # Get triangle vertices
+                v0, v1, v2 = vertex_array[face[0]], vertex_array[face[1]], vertex_array[face[2]]
+                
+                # Calculate face normal using cross product
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                face_normal = np.cross(edge1, edge2)
+                
+                # Normalize
+                norm = np.linalg.norm(face_normal)
+                if norm > 0:
+                    face_normal /= norm
+                
+                # Add to vertex normals (average for shared vertices)
+                for vertex_idx in face:
+                    vertex_normals[vertex_idx] += face_normal
+        
+        # Normalize all vertex normals
+        norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # Prevent division by zero
+        vertex_normals /= norms
+        
+        return vertex_normals.tolist()
+    
+    def _create_vertex_array_optimized(self, vertices, normals, faces):
+        """Create optimized vertex array with proper memory layout"""
+        import numpy as np
+        
+        try:
+            vertex_data = []
+            
+            # Pre-allocate for efficiency
+            total_vertices = sum(len(face) - 2 for face in faces) * 3  # Triangulated
+            vertex_data = np.zeros((total_vertices, 6), dtype=np.float32)
+            
+            vertex_idx = 0
+            
+            for face in faces:
+                if len(face) < 3:
+                    continue
+                
+                # Triangulate face (simple fan triangulation)
+                for i in range(1, len(face) - 1):
+                    for j, vertex_index in enumerate([face[0], face[i], face[i + 1]]):
+                        if vertex_index < len(vertices) and vertex_index < len(normals):
+                            # Position
+                            vertex_data[vertex_idx, 0:3] = vertices[vertex_index]
+                            # Normal
+                            vertex_data[vertex_idx, 3:6] = normals[vertex_index]
+                            vertex_idx += 1
+            
+            # Trim to actual size
+            return vertex_data[:vertex_idx].flatten()
+            
+        except Exception as e:
+            print(f"❌ Failed to create vertex array: {e}")
+            return None
+    
+    def _calculate_bounding_box_fast(self, vertices):
+        """Fast bounding box calculation using numpy"""
+        import numpy as np
+        
+        if not vertices:
+            return None
+            
+        vertices_array = np.array(vertices, dtype=np.float32)
+        min_coords = np.min(vertices_array, axis=0)
+        max_coords = np.max(vertices_array, axis=0)
+        
+        return {
+            'min': min_coords,
+            'max': max_coords,
+            'size': max_coords - min_coords,
+            'center': (max_coords + min_coords) / 2
+        }
+
+
+class PlaneModel:
+    """Optimized airplane model with proper curve following and orientation"""
+    
+    def __init__(self, parent_widget):
+        self.parent_widget = parent_widget
+        
+        # Geometry management
+        self.geometry = AirplaneGeometry()
+        
+        # OpenGL resources
+        self.vao = None
+        self.vbo = None
+        
+        # Configuration
+        self.airplane_scale = 0.05
+        self.airplane_color = (1.0, 0.0, 0.0)
+        
+        # Performance caches
+        self._orientation_cache = {}
+        self._transform_cache = None
+        self._last_animation_state = None
+        
+        # Flight dynamics
+        self.banking_factor = 0.5  # How much to bank in turns
+        self.max_bank_angle = 25.0  # Maximum bank angle in degrees
+        self.orientation_smoothing = 0.85  # Smoothing factor for orientation changes
+        self._previous_orientation = None
+        
+        # State
+        self.is_loaded = False
+    
+    def setup_airplane_model(self) -> bool:
+        """
+        NOTE, THE AIRPLANE MODEL IS EXPORTED FROM BLENDER WITH A 90
+        DEGREE ROTATION ON BOTH THE X AND Z AXES TO ACCOUNT FOR CORDINATE SYSTEM MISMATCH WOOPTY 
+        """
+        # Find airplane model file
+        possible_files = ["pj_airplane_0degx.obj", "paper_airplane.obj"]
         model_path = None
         
         for filename in possible_files:
@@ -1736,248 +2037,354 @@ class PlaneModel:
         if not model_path:
             print(f"⚠️ No airplane model found in plane_model/ directory")
             print(f"   Looked for: {possible_files}")
-            self.airplane_geometry = None
-            self.airplane_vao = 0
-            self.airplane_vbo = 0
-            self.is_loaded = False
             return False
         
-        # Load model geometry
-        self.airplane_geometry = self.load_obj_model(str(model_path))
-        if self.airplane_geometry is None:
-            self.airplane_vao = 0
-            self.airplane_vbo = 0
-            self.is_loaded = False
+        # Load geometry
+        if not self.geometry.load_obj_model(str(model_path)):
             return False
         
         # Create OpenGL buffers
-        self.airplane_vao = gl.glGenVertexArrays(1)
-        self.airplane_vbo = gl.glGenBuffers(1)
-        
-        if self.airplane_vao == 0 or self.airplane_vbo == 0:
-            print("❌ Failed to create airplane OpenGL buffers")
-            self.is_loaded = False
+        if not self._create_opengl_buffers():
             return False
         
-        gl.glBindVertexArray(self.airplane_vao)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.airplane_vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.airplane_geometry.nbytes, 
-                       self.airplane_geometry, gl.GL_STATIC_DRAW)
+        self.is_loaded = True
+        print("✅ Airplane model setup complete")
+        return True
+    
+    def is_ready(self) -> bool:
+        """Check if model is ready for rendering"""
+        return (self.is_loaded and 
+                self.vao is not None and 
+                self.vbo is not None and 
+                self.geometry.geometry_data is not None)
+    
+    def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4, 
+                               shader_program=None) -> bool:
+        """Optimized rendering method - uses pre-calculated orientation"""
+        if not self.is_ready() or not animation_state:
+            return False
         
-        stride = 8 * 4  # 3 pos + 3 normal + 2 texcoord = 8 floats
+        # Get pre-calculated position and orientation
+        position = animation_state.get('position')
+        orientation = animation_state.get('orientation')
         
-        # Position attribute
+        if not position:
+            return False
+        
+        # Use identity matrix if no orientation provided (fallback)
+        if orientation is None:
+            orientation = QMatrix4x4()
+        
+        # Create transformation matrix (cached if state unchanged)
+        model_matrix = self._get_cached_transform_matrix(position, orientation)
+        final_mvp = mvp * model_matrix
+        
+        # Render airplane
+        return self._render_airplane(final_mvp, model_matrix)
+    
+    def calculate_smooth_orientation_from_path(self, path_points: List, segment_progress: float) -> QMatrix4x4:
+        """Calculate smooth orientation using curve tangent (called from animation)"""
+        if not path_points or len(path_points) < 2:
+            return QMatrix4x4()
+        
+        # Create cache key for this calculation
+        cache_key = (id(path_points), round(segment_progress, 3))
+        if cache_key in self._orientation_cache:
+            return self._orientation_cache[cache_key]
+        
+        # Calculate curve tangent direction (not next point!)
+        tangent_vector = self._calculate_curve_tangent(path_points, segment_progress)
+        
+        # Get current position for up vector calculation
+        current_pos = self._interpolate_position_on_path(path_points, segment_progress)
+        
+        # Calculate banking for realistic flight dynamics
+        curvature = self._estimate_path_curvature(path_points, segment_progress)
+        bank_angle = min(self.max_bank_angle, curvature * self.banking_factor)
+        
+        # Create orientation matrix with banking
+        orientation = self._create_flight_orientation(tangent_vector, current_pos, bank_angle)
+        
+        # Apply smoothing to prevent jerky rotations
+        if self._previous_orientation is not None:
+            orientation = self._smooth_orientation_transition(self._previous_orientation, orientation)
+        
+        self._previous_orientation = orientation
+        
+        # Cache result
+        self._orientation_cache[cache_key] = orientation
+        
+        return orientation
+    
+    def _calculate_curve_tangent(self, path_points: List, t: float) -> QVector3D:
+        """Calculate tangent vector from curve, not discrete points"""
+        if len(path_points) < 2:
+            return QVector3D(-1, 0, 0)  # Default forward direction
+        
+        # Convert to parameter space
+        point_float = t * (len(path_points) - 1)
+        point_idx = int(point_float)
+        local_t = point_float - point_idx
+        
+        if point_idx >= len(path_points) - 1:
+            # At end of path - use direction of last segment
+            p1, p2 = path_points[-2], path_points[-1]
+            tangent = np.array(p2) - np.array(p1)
+        elif point_idx == 0 and len(path_points) > 2:
+            # At start - use weighted combination for smoother start
+            p0, p1, p2 = path_points[0], path_points[1], path_points[2]
+            tangent = np.array(p1) - np.array(p0) + 0.5 * (np.array(p2) - np.array(p1))
+        else:
+            # In middle - interpolate between adjacent segments for smooth curves
+            p1, p2 = path_points[point_idx], path_points[point_idx + 1]
+            tangent = np.array(p2) - np.array(p1)
+            
+            # Add curvature information if available
+            if point_idx > 0 and point_idx < len(path_points) - 1:
+                prev_tangent = np.array(path_points[point_idx]) - np.array(path_points[point_idx - 1])
+                # Blend with previous tangent for smoother curves
+                tangent = (1 - local_t) * prev_tangent + local_t * tangent
+        
+        # Normalize and convert to Qt
+        norm = np.linalg.norm(tangent)
+        if norm > 0:
+            tangent = tangent / norm
+        
+        return QVector3D(float(tangent[0]), float(tangent[1]), float(tangent[2]))
+    
+    def _interpolate_position_on_path(self, path_points: List, t: float) -> tuple:
+        """Get current position on path for up vector calculation"""
+        if not path_points:
+            return (0, 0, 0)
+        
+        if t <= 0:
+            return path_points[0]
+        if t >= 1:
+            return path_points[-1]
+        
+        point_float = t * (len(path_points) - 1)
+        point_idx = int(point_float)
+        local_t = point_float - point_idx
+        
+        if point_idx >= len(path_points) - 1:
+            return path_points[-1]
+        
+        # Linear interpolation between points
+        p1, p2 = path_points[point_idx], path_points[point_idx + 1]
+        return (
+            p1[0] + (p2[0] - p1[0]) * local_t,
+            p1[1] + (p2[1] - p1[1]) * local_t,
+            p1[2] + (p2[2] - p1[2]) * local_t
+        )
+    
+    
+    def _estimate_path_curvature(self, path_points: List, t: float) -> float:
+        """Estimate curvature at current position for banking calculation"""
+        if len(path_points) < 3:
+            return 0.0
+        
+        point_float = t * (len(path_points) - 1)
+        point_idx = int(point_float)
+        
+        # Get three points for curvature calculation
+        if point_idx == 0:
+            p1, p2, p3 = path_points[0], path_points[1], path_points[2]
+        elif point_idx >= len(path_points) - 2:
+            p1, p2, p3 = path_points[-3], path_points[-2], path_points[-1]
+        else:
+            p1, p2, p3 = path_points[point_idx], path_points[point_idx + 1], path_points[point_idx + 2]
+        
+        # Calculate curvature using three points
+        a = np.array(p1, dtype=np.float64)  # FIXED: Explicit float type
+        b = np.array(p2, dtype=np.float64)
+        c = np.array(p3, dtype=np.float64)
+        
+        # Vectors
+        ab = b - a
+        bc = c - b
+        
+        # Cross product magnitude gives curvature indication
+        cross = np.cross(ab, bc)
+        if hasattr(cross, '__len__'):
+            curvature = float(np.linalg.norm(cross))  # FIXED: Explicit float conversion
+        else:
+            curvature = float(abs(cross))
+        
+        # Normalize by segment length
+        ab_length = float(np.linalg.norm(ab))  # FIXED: Explicit float conversion
+        bc_length = float(np.linalg.norm(bc))  # FIXED: Explicit float conversion
+        
+        if ab_length > 0 and bc_length > 0:
+            curvature /= (ab_length * bc_length)
+        
+        return float(curvature * 10.0)  # Scale factor for banking
+    
+    def _create_flight_orientation(self, forward: QVector3D, position: tuple, bank_angle: float) -> QMatrix4x4:
+        """Create realistic flight orientation with banking - FIXED VERSION"""
+        
+        # Ensure forward vector is normalized
+        forward = forward.normalized()
+        
+        # Get up vector for globe surface (points away from center)
+        position_vec = QVector3D(*position)
+        globe_up = position_vec.normalized()
+        
+        # Calculate right vector (perpendicular to both forward and globe_up)
+        right = QVector3D.crossProduct(forward, globe_up)
+        if right.length() < 0.001:  # Handle edge case where forward is parallel to globe_up
+            # Use a different reference vector
+            alt_up = QVector3D(0, 1, 0) if abs(forward.y()) < 0.9 else QVector3D(1, 0, 0)
+            right = QVector3D.crossProduct(forward, alt_up)
+        right = right.normalized()
+        
+        # Recalculate up to ensure perfect orthogonality
+        up = QVector3D.crossProduct(right, forward).normalized()
+        
+        # Create rotation matrix manually
+        # This matrix will transform from airplane space to world space
+        # Airplane default: +X forward, +Y up, +Z right
+        
+        orientation = QMatrix4x4()
+        
+        # Set the rotation matrix columns
+        # Column 0: where airplane's +X axis (forward) points in world space
+        # Column 1: where airplane's +Y axis (up) points in world space  
+        # Column 2: where airplane's +Z axis (right) points in world space
+        
+        # METHOD 1: Use setRow to build the matrix
+        orientation.setRow(0, QVector4D(forward.x(), up.x(), right.x(), 0.0))
+        orientation.setRow(1, QVector4D(forward.y(), up.y(), right.y(), 0.0))
+        orientation.setRow(2, QVector4D(forward.z(), up.z(), right.z(), 0.0))
+        orientation.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
+        
+        # Apply banking rotation around forward axis
+        if abs(bank_angle) > 0.1:
+            bank_rotation = QMatrix4x4()
+            bank_rotation.rotate(bank_angle, forward)
+            orientation = bank_rotation * orientation
+        
+        return orientation
+    
+    def _smooth_orientation_transition(self, previous: QMatrix4x4, current: QMatrix4x4) -> QMatrix4x4:
+        """Apply smoothing to orientation changes to prevent jerky motion"""
+        # FIXED: PyQt6 QMatrix4x4 doesn't support () access
+        # Instead, use proper matrix interpolation
+        
+        # Simple approach: just return current orientation for now
+        # TODO: Implement proper quaternion SLERP for smooth transitions
+        return current
+    
+    def _get_cached_transform_matrix(self, position: tuple, orientation: QMatrix4x4) -> QMatrix4x4:
+        """Get cached transformation matrix if state unchanged"""
+        current_state = (position, orientation)
+        
+        # Simple cache check - in production you'd use better hashing
+        if (self._last_animation_state == current_state and 
+            self._transform_cache is not None):
+            return self._transform_cache
+        
+        # Create new transformation matrix
+        transform = QMatrix4x4()
+        
+        # 1. Translate to world position
+        transform.translate(*position)
+        
+        # 2. Apply orientation
+        transform *= orientation
+        
+        # 3. Scale
+        transform.scale(self.airplane_scale)
+        
+        # Cache for next frame
+        self._transform_cache = transform
+        self._last_animation_state = current_state
+        
+        return transform
+    
+    def _create_opengl_buffers(self) -> bool:
+        """Create VAO/VBO for airplane geometry"""
+        if self.geometry.geometry_data is None or len(self.geometry.geometry_data) == 0:
+            print("❌ No geometry data for airplane buffers")
+            return False
+        
+        # Generate VAO and VBO
+        self.vao = gl.glGenVertexArrays(1)
+        self.vbo = gl.glGenBuffers(1)
+        
+        if self.vao == 0 or self.vbo == 0:
+            print("❌ Failed to create airplane OpenGL buffers")
+            return False
+        
+        # Bind and upload data
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, self.geometry.geometry_data.nbytes, 
+                       self.geometry.geometry_data, gl.GL_STATIC_DRAW)
+        
+        stride = 6 * 4  # 3 position + 3 normal = 6 floats * 4 bytes
+        
+        # Position attribute (location 0)
         gl.glEnableVertexAttribArray(0)
         gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
         
-        # Normal attribute
+        # Normal attribute (location 1)  
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
         
-        # Texture coordinate attribute
-        gl.glEnableVertexAttribArray(2)
-        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(24))
-        
+        # Unbind
         gl.glBindVertexArray(0)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
         
-        self.is_loaded = True
-        print("✅ Airplane model VAO/VBO setup complete")
+        print("✅ Airplane OpenGL buffers created")
         return True
     
-    def load_obj_model(self, filepath: str) -> Optional[np.ndarray]:
-        """Load .obj file and return vertex array for OpenGL - Simplified version"""
-        try:
-            vertices = []
-            normals = []
-            faces = []
-            
-            print(f"📁 Loading .obj file: {filepath}")
-            
-            with open(filepath, 'r') as file:
-                for line_num, line in enumerate(file, 1):
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                        
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    
-                    try:
-                        if parts[0] == 'v':  # Vertex
-                            if len(parts) >= 4:
-                                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                                vertices.append([x, y, z])
-                        
-                        elif parts[0] == 'vn':  # Normal
-                            if len(parts) >= 4:
-                                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                                normals.append([x, y, z])
-                        
-                        elif parts[0] == 'f':  # Face
-                            # Handle various face formats: f v1 v2 v3 or f v1/vt1 v2/vt2 v3/vt3 or f v1//vn1 v2//vn2 v3//vn3
-                            face_vertices = []
-                            for vertex_data in parts[1:]:
-                                # Extract just the vertex index (first number before any slash)
-                                vertex_idx = vertex_data.split('/')[0]
-                                if vertex_idx:
-                                    face_vertices.append(int(vertex_idx) - 1)  # OBJ is 1-indexed
-                            
-                            if len(face_vertices) >= 3:
-                                faces.append(face_vertices)
-                    
-                    except (ValueError, IndexError) as e:
-                        print(f"⚠️ Skipping invalid line {line_num}: {line} ({e})")
-                        continue
-            
-            print(f"📊 Loaded: {len(vertices)} vertices, {len(normals)} normals, {len(faces)} faces")
-            
-            if not vertices or not faces:
-                print(f"❌ Invalid .obj file: no vertices or faces found")
-                return None
-            
-            # Create default normals if none provided
-            if not normals:
-                print("🔧 Generating default normals")
-                normals = [[0.0, 1.0, 0.0] for _ in vertices]  # Default up normals
-            
-            # Convert faces to triangle array for OpenGL
-            opengl_vertices = []
-            triangle_count = 0
-            
-            for face in faces:
-                # Triangulate faces (simple fan triangulation for polygons)
-                for i in range(len(face) - 2):
-                    triangle_indices = [face[0], face[i + 1], face[i + 2]]
-                    
-                    for v_idx in triangle_indices:
-                        if 0 <= v_idx < len(vertices):
-                            # Position
-                            opengl_vertices.extend(vertices[v_idx])
-                            
-                            # Normal (use corresponding normal or default)
-                            if v_idx < len(normals):
-                                opengl_vertices.extend(normals[v_idx])
-                            else:
-                                opengl_vertices.extend([0.0, 1.0, 0.0])
-                            
-                            # Texture coordinates (placeholder)
-                            opengl_vertices.extend([0.0, 0.0])
-                        else:
-                            print(f"⚠️ Invalid vertex index: {v_idx}")
-                            return None
-                    
-                    triangle_count += 1
-            
-            vertex_array = np.array(opengl_vertices, dtype=np.float32)
-            print(f"✅ Generated {triangle_count} triangles for OpenGL")
-            return vertex_array
-            
-        except FileNotFoundError:
-            print(f"❌ .obj file not found: {filepath}")
-            return None
-        except Exception as e:
-            print(f"❌ Failed to load .obj model: {e}")
-            return None
-    
-    def calculate_airplane_orientation(self, current_pos: Tuple[float, float, float],
-                                       next_pos: Tuple[float, float, float]) -> QMatrix4x4:
-        """Calculate airplane orientation - ONLY heading rotation, no banking/pitching"""
-        current = QVector3D(*current_pos)
-        next_point = QVector3D(*next_pos)
-        
-        # Globe normal (up direction) at current position
-        up = current.normalized()
-        
-        # Travel direction projected onto tangent plane (no vertical component)
-        travel_direction = (next_point - current).normalized()
-        forward_tangent = travel_direction - QVector3D.dotProduct(travel_direction, up) * up
-        forward_tangent = forward_tangent.normalized()
-        
-        # Right direction (perpendicular to forward and up)
-        right = QVector3D.crossProduct(forward_tangent, up).normalized()
-        
-        # Create rotation matrix where airplane:
-        # - Nose (+X in model) points in travel direction  <- FIXED THIS
-        # - Up (+Z in model) points away from globe center  
-        # - Forward (+Y in model) is perpendicular to both
-        # NO banking, NO pitching - just heading changes
-        
-        matrix = QMatrix4x4()
-        matrix.setRow(0, QVector4D(forward_tangent.x(), forward_tangent.y(), forward_tangent.z(), 0.0))  # Model X = nose direction
-        matrix.setRow(1, QVector4D(right.x(), right.y(), right.z(), 0.0))           # Model Y = right
-        matrix.setRow(2, QVector4D(up.x(), up.y(), up.z(), 0.0))                   # Model Z = up from globe
-        matrix.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
-        
-        return matrix
-
-    def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4, shader_program):
-        """Render paper airplane with simple heading-only orientation"""
-        if not self.is_loaded or not self.airplane_vao or self.airplane_geometry is None:
+    def _render_airplane(self, mvp: QMatrix4x4, model: QMatrix4x4) -> bool:
+        """Internal rendering method"""
+        shader = self.parent_widget.airplane_shader
+        if not shader:
             return False
+        
+        # Temporarily disable face culling for debugging
+        gl.glDisable(gl.GL_CULL_FACE)
+        
+        shader.bind()
+        
+        try:
+            shader.setUniformValue("mvp", mvp)
+            shader.setUniformValue("model", model)
+            shader.setUniformValue("normalMatrix", model.normalMatrix())
+            shader.setUniformValue("lightDir", QVector3D(1.0, 0.3, 0.5).normalized())
+            shader.setUniformValue("airplaneColor", QVector3D(*self.airplane_color))
             
-        current_pos = animation_state['position']
-        segment = animation_state['segment']
-        
-        # Get next position for orientation
-        if segment['path_3d'] and len(segment['path_3d']) > 1:
-            path_points = segment['path_3d']
-            current_segment_progress = animation_state.get('segment_progress', 0.0)
-            point_float = current_segment_progress * (len(path_points) - 1)
-            next_point_idx = min(int(point_float) + 1, len(path_points) - 1)
-            next_pos = path_points[next_point_idx]
-        else:
-            arr_coords = segment['arrival_coords']
-            next_pos = self.parent_widget.lat_lon_to_3d(arr_coords[0], arr_coords[1], 1.05)
-        
-        # Get simple orientation - no smoothing to avoid unwanted rotations
-        orientation = self.calculate_airplane_orientation(current_pos, next_pos)
-        
-        # Setup transformation matrix
-        model = QMatrix4x4()
-        model.translate(current_pos[0], current_pos[1], current_pos[2])
-        model *= orientation
-        model.scale(0.045)  # Appropriate scale
-        
-        final_mvp = mvp * model
-        normal_matrix = model.normalMatrix()
-        
-        # Use Earth shader with proper uniforms
-        earth_shader = self.parent_widget.shader_program
-        earth_shader.bind()
-        earth_shader.setUniformValue("mvp", final_mvp)
-        earth_shader.setUniformValue("model", model)
-        earth_shader.setUniformValue("normalMatrix", normal_matrix)
-        earth_shader.setUniformValue("lightDir", QVector3D(1.0, 0.3, 0.5).normalized())
-        earth_shader.setUniformValue("showAtmosphere", False)
-        
-        gl.glBindVertexArray(self.airplane_vao)
-        triangle_count = len(self.airplane_geometry) // 8
-        gl.glDrawArrays(gl.GL_TRIANGLES, 0, triangle_count)
-        gl.glBindVertexArray(0)
-        
-        earth_shader.release()
-        return True
+            # Render
+            gl.glBindVertexArray(self.vao)
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, self.geometry.vertex_count)
+            gl.glBindVertexArray(0)
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to render airplane: {e}")
+            return False
+        finally:
+            shader.release()
+            gl.glEnable(gl.GL_CULL_FACE)  # Re-enable face culling
     
     def cleanup_resources(self):
-        """Clean up airplane OpenGL resources"""
-        if self.airplane_vao and self.airplane_vao != 0:
-            gl.glDeleteVertexArrays(1, [self.airplane_vao])
-            self.airplane_vao = None
+        """Clean up OpenGL resources"""
+        if self.vao:
+            gl.glDeleteVertexArrays(1, [self.vao])
+            self.vao = None
         
-        if self.airplane_vbo and self.airplane_vbo != 0:
-            gl.glDeleteBuffers(1, [self.airplane_vbo])
-            self.airplane_vbo = None
+        if self.vbo:
+            gl.glDeleteBuffers(1, [self.vbo])
+            self.vbo = None
         
-        self.airplane_geometry = None
-        self.is_loaded = False
-        print("🧹 Cleaned up airplane model resources")
-    
-    def is_ready(self) -> bool:
-        """Check if airplane model is ready for rendering"""
-        return (self.is_loaded and 
-                self.airplane_vao is not None and 
-                self.airplane_vao != 0 and
-                self.airplane_geometry is not None and 
-                len(self.airplane_geometry) > 0)
+        # Clear caches
+        self._orientation_cache.clear()
+        self._transform_cache = None
+        self._last_animation_state = None
+        
+        print("✅ Airplane resources cleaned up")
+
+
