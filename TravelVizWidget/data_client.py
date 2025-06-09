@@ -367,7 +367,7 @@ class ESPNScheduleScraper:
                     else:
                         print(f"  ✗ Half {half}: No schedule data found")
                     
-                    time.sleep(0.75)
+                    time.sleep(0.25)
                     
                 except requests.exceptions.RequestException as e:
                     print(f"  ✗ Network error scraping MLB {team_abbrev} half {half}: {e}")
@@ -891,115 +891,104 @@ class ESPNScheduleScraper:
 
 
 class TravelInferenceEngine:
-    """Engine to infer team travel patterns from game schedules"""
+    """Engine to infer team travel patterns from game schedules - VENUE_ID CHANGES ONLY"""
     
     def __init__(self, airport_mappings: Dict[str, str]):
         self.airport_mappings = airport_mappings
     
-    def infer_travel_from_games(self, games: List[GameData], league: str) -> List[TeamTravelData]:
-        """Infer team travel patterns from game schedule"""
-        travel_data = []
+    def infer_travel_from_games(self, games: List[GameData], focus_team_id: str, league: str) -> List[TeamTravelData]:
+        """Process ONLY the focus team - not all 30 teams"""
         
-        team_schedules = {}
+        print(f"🐛 DEBUG: focus_team_id = '{focus_team_id}', league = '{league}'")
+        print(f"🐛 DEBUG: Total games passed in = {len(games)}")
+        
+        # Get only games where the focus team plays
+        team_games = []
         for game in games:
-            home_team_id = game.home_team.team_id
-            away_team_id = game.away_team.team_id
-            
-            if home_team_id not in team_schedules:
-                team_schedules[home_team_id] = []
-            if away_team_id not in team_schedules:
-                team_schedules[away_team_id] = []
-            
-            team_schedules[home_team_id].append((game, 'home'))
-            team_schedules[away_team_id].append((game, 'away'))
+            if game.home_team.team_id == focus_team_id or game.away_team.team_id == focus_team_id:
+                team_games.append(game)
         
-        for team_id, schedule in team_schedules.items():
-            schedule.sort(key=lambda x: x[0].date)
-            team_travel = self._infer_team_travel(schedule, league)
-            travel_data.extend(team_travel)
+        print(f"🐛 DEBUG: Games for team '{focus_team_id}' = {len(team_games)}")
         
-        return travel_data
+        # Sort by date
+        team_games.sort(key=lambda x: x.date)
+        
+        # Process venue changes for JUST this team
+        travel_results = self._infer_venue_changes(focus_team_id, team_games, league)
+        print(f"🐛 DEBUG: Travel records generated = {len(travel_results)}")
+        
+        return travel_results
+
     
-    def _infer_team_travel(self, team_schedule: List[Tuple[GameData, str]], league: str) -> List[TeamTravelData]:
-        """Infer travel for a specific team's schedule"""
+    def _infer_venue_changes(self, team_id: str, games_list: List[GameData], league: str) -> List[TeamTravelData]:
+        """Generate travel records ONLY when venue_id changes between consecutive games"""
         travel_data = []
         
-        travel_patterns = {
-            'MLB': {'advance_days': 1, 'return_days': 1},
-            'NBA': {'advance_days': 1, 'return_days': 0},
-            'NHL': {'advance_days': 1, 'return_days': 0}
-        }
+        if len(games_list) < 2:
+            return travel_data
         
+        # Travel patterns for timing
+        travel_patterns = {
+            'MLB': {'advance_days': 1},
+            'NBA': {'advance_days': 1}, 
+            'NHL': {'advance_days': 1}
+        }
         pattern = travel_patterns.get(league, travel_patterns['MLB'])
         
-        for i, (game, home_away) in enumerate(team_schedule):
-            if home_away == 'away':
-                team_info = game.away_team
-                departure_city = self._get_clean_city_name(team_info.location)
-                arrival_city = self._get_clean_city_name(game.venue.city)
+        print(f"🔍 Processing {len(games_list)} games for team {team_id}")
+        
+        # Compare consecutive games
+        venue_changes = 0
+        for i in range(len(games_list) - 1):
+            current_game = games_list[i]
+            next_game = games_list[i + 1]
+            
+            # ONLY create travel record if venue_id changes
+            if current_game.venue.venue_id != next_game.venue.venue_id:
+                venue_changes += 1
                 
-                if not departure_city or not arrival_city or departure_city == arrival_city:
-                    continue
+                # Get team info (consistent across all games for this team)
+                team_info = current_game.home_team if current_game.home_team.team_id == team_id else current_game.away_team
                 
-                game_date = game.date
-                if hasattr(game_date, 'tzinfo') and game_date.tzinfo is not None:
-                    game_date = game_date.replace(tzinfo=None)
+                # Travel FROM current game venue TO next game venue
+                departure_city = current_game.venue.city
+                arrival_city = next_game.venue.city
                 
-                travel_date = game_date - timedelta(days=pattern['advance_days'])
-                
-                dep_airport = self.airport_mappings.get(departure_city, departure_city[:3].upper())
-                arr_airport = self.airport_mappings.get(arrival_city, arrival_city[:3].upper())
-                
-                travel = TeamTravelData(
-                    team_name=team_info.display_name,
-                    team_id=team_info.team_id,
-                    departure_city=departure_city,
-                    arrival_city=arrival_city,
-                    game_date=game_date,
-                    travel_date=travel_date,
-                    departure_airport=dep_airport,
-                    arrival_airport=arr_airport,
-                    confidence="schedule_inferred",
-                    game_id=game.game_id,
-                    opponent=game.home_team.display_name
-                )
-                travel_data.append(travel)
-                
-                if pattern['return_days'] >= 0:
-                    return_date = game_date + timedelta(days=pattern['return_days'])
-                    return_travel = TeamTravelData(
+                if departure_city and arrival_city and departure_city != arrival_city:
+                    # Travel date = next game date minus advance days
+                    travel_date = next_game.date - timedelta(days=pattern['advance_days'])
+                    
+                    # Clean game date
+                    game_date = next_game.date
+                    if hasattr(game_date, 'tzinfo') and game_date.tzinfo is not None:
+                        game_date = game_date.replace(tzinfo=None)
+                    
+                    # Get airports
+                    dep_airport = self.airport_mappings.get(departure_city, departure_city[:3].upper())
+                    arr_airport = self.airport_mappings.get(arrival_city, arrival_city[:3].upper())
+                    
+                    # Determine opponent for next game
+                    opponent = next_game.home_team.display_name if team_info.team_id != next_game.home_team.team_id else next_game.away_team.display_name
+                    
+                    travel_record = TeamTravelData(
                         team_name=team_info.display_name,
                         team_id=team_info.team_id,
-                        departure_city=arrival_city,
-                        arrival_city=departure_city,
+                        departure_city=departure_city,
+                        arrival_city=arrival_city,
                         game_date=game_date,
-                        travel_date=return_date,
-                        departure_airport=arr_airport,
-                        arrival_airport=dep_airport,
-                        confidence="schedule_inferred",
-                        game_id=game.game_id,
-                        opponent=game.home_team.display_name
+                        travel_date=travel_date,
+                        departure_airport=dep_airport,
+                        arrival_airport=arr_airport,
+                        confidence="venue_change_inferred",
+                        game_id=next_game.game_id,
+                        opponent=opponent
                     )
-                    travel_data.append(return_travel)
+                    
+                    travel_data.append(travel_record)
+                    print(f"   ✈️  {departure_city} → {arrival_city} (venue changed)")
         
+        print(f"   📊 Team {team_id}: {venue_changes} venue changes = {len(travel_data)} travel records")
         return travel_data
-    
-    def _get_clean_city_name(self, city_name: str) -> str:
-        """Clean and validate city name"""
-        if not city_name or not isinstance(city_name, str):
-            return ""
-        
-        clean_name = city_name.strip()
-        if not clean_name:
-            return ""
-        
-        city_mappings = {
-            "St. Petersburg": "Tampa", "Anaheim": "Los Angeles", "Arlington": "Dallas",
-            "Queens": "New York", "Bronx": "New York", "Brooklyn": "New York",
-            "Sunrise": "Miami", "Newark": "New York", "Raleigh": "Charlotte"
-        }
-        
-        return city_mappings.get(clean_name, clean_name)
 
 
 class ESPNSportsDataAggregator(QObject):
@@ -1117,7 +1106,23 @@ class ESPNSportsDataAggregator(QObject):
                 self.db.save_games(season_games, season, league)
                 self.progressUpdated.emit(70)
                 
-                travel_data = self.inference_engine.infer_travel_from_games(season_games, league)
+                
+                travel_data = []
+                all_teams = self.get_all_teams(league)  # Get all teams for this league
+                
+                print(f"🔄 Processing travel data for all {len(all_teams)} {league} teams...")
+                
+                for i, team in enumerate(all_teams, 1):
+                    team_travel = self.inference_engine.infer_travel_from_games(season_games, team.team_id, league)
+                    travel_data.extend(team_travel)
+                    print(f"  [{i}/{len(all_teams)}] ✅ {team.display_name}: {len(team_travel)} travel records")
+                    
+                    # Update progress during team processing
+                    team_progress = 70 + int((i / len(all_teams)) * 15)  # Progress from 70% to 85%
+                    self.progressUpdated.emit(team_progress)
+                
+                print(f"🏆 TOTAL: Generated {len(travel_data)} travel records for ALL {league} teams")
+                
                 self.db.save_travel_data(travel_data, season, league)
                 self.progressUpdated.emit(90)
                 
@@ -1277,7 +1282,7 @@ def run_scraper():
     aggregator = ESPNSportsDataAggregator(config)
     
     # Scrape all supported leagues
-    for league in ["MLB", "NBA", "NHL"]:
+    for league in ["NBA", "NHL"]:#"MLB" 
         print(f"\n📊 Scraping {league}...")
         aggregator.set_league(league)
         aggregator.load_full_season_schedule(force_refresh=True)

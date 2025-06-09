@@ -1191,7 +1191,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.update()
     
     def generate_enhanced_visualizations(self):
-        """Generate travel paths and markers from sports data"""
+        """Generate travel paths and markers from sports data - FIXED for sequential paths"""
         self.travel_paths = []
         self.team_city_markers = []
         cities_seen = set()
@@ -1225,19 +1225,90 @@ class FlightGlobeWidget(QOpenGLWidget):
             
             team_color = self.get_team_color(team_abbrev) if team_abbrev else (1.0, 0.6, 0.2)
             
-            # Create paths and markers for each venue change
-            for travel in travel_records:
-                departure_city = getattr(travel, 'departure_city', '')
-                arrival_city = getattr(travel, 'arrival_city', '')
-                
-                if not departure_city or not arrival_city or departure_city == arrival_city:
-                    continue
-                
-                self._create_path_and_markers(departure_city, arrival_city, team_name, 
-                                            team_abbrev, league, team_color, travel, 
-                                            cities_seen, alpha=0.85)
+            self._create_sequential_team_path(travel_records, team_name, team_abbrev, 
+                                            league, team_color, cities_seen)
         
         print(f"✅ Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers")
+
+    def _create_sequential_team_path(self, travel_records, team_name, team_abbrev, 
+                                   league, team_color, cities_seen):
+        """Create a single connected path for a team's sequential travel"""
+        if not travel_records:
+            return
+        
+        # Collect all cities in order for this team
+        team_cities = []
+        for travel in travel_records:
+            departure_city = getattr(travel, 'departure_city', '')
+            arrival_city = getattr(travel, 'arrival_city', '')
+            
+            if departure_city and arrival_city and departure_city != arrival_city:
+                # Add departure city if it's the first segment or different from last city
+                if not team_cities or team_cities[-1] != departure_city:
+                    team_cities.append(departure_city)
+                team_cities.append(arrival_city)
+        
+        # Remove consecutive duplicates (shouldn't happen with venue_id logic, but just in case)
+        team_cities = [city for i, city in enumerate(team_cities) 
+                      if i == 0 or city != team_cities[i-1]]
+        
+        if len(team_cities) < 2:
+            return
+        
+        # Create sequential path segments
+        all_path_points = []
+        
+        for i in range(len(team_cities) - 1):
+            from_city = team_cities[i]
+            to_city = team_cities[i + 1]
+            
+            # Get coordinates
+            dep_coords = self.get_city_coordinates(from_city)
+            arr_coords = self.get_city_coordinates(to_city)
+            
+            if not dep_coords or not arr_coords:
+                continue
+            
+            # Generate path segment
+            segment_points = self.generate_great_circle_path(
+                dep_coords[0], dep_coords[1], arr_coords[0], arr_coords[1]
+            )
+            
+            if segment_points:
+                # Connect segments smoothly (avoid duplicate points at connections)
+                if all_path_points and segment_points:
+                    segment_points = segment_points[1:]  # Skip first point to avoid duplication
+                all_path_points.extend(segment_points)
+        
+        # Create one path per
+        if all_path_points and len(all_path_points) > 1:
+            path_data = {
+                'points': all_path_points,
+                'team_name': team_name,
+                'route': f"{team_name} Season Path ({len(team_cities)} cities)",
+                'color': team_color,
+                'alpha': 0.85,
+                'travel_date': getattr(travel_records[0], 'travel_date', None)
+            }
+            self.travel_paths.append(path_data)
+        
+        # Add city markers for all cities visited by this team
+        for city in set(team_cities):  # Use set to avoid duplicates
+            coords = self.get_city_coordinates(city)
+            if coords:
+                city_key = f"{city}_{league}_{team_abbrev}"
+                if city_key not in cities_seen:
+                    cities_seen.add(city_key)
+                    city_3d = self.lat_lon_to_3d(coords[0], coords[1], 1.05)
+                    
+                    self.team_city_markers.append({
+                        'position': city_3d,
+                        'team_id': team_abbrev,
+                        'league': league,
+                        'size': 4.0,
+                        'city_name': city,
+                        'type': 'travel_point'
+                    })
     
     # Today's Games Methods (for split cube markers)
     def get_todays_games(self):
@@ -2386,5 +2457,3 @@ class PlaneModel:
         self._last_animation_state = None
         
         print("✅ Airplane resources cleaned up")
-
-

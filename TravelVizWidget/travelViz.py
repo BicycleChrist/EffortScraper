@@ -281,8 +281,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.control_panel.routeFilterChanged.connect(self.on_route_filter_changed)
         self.control_panel.flightSelected.connect(self.on_game_selected)
         
-        # Globe widget signals
-        self.globe_widget.performanceUpdate.connect(self.on_performance_update)
+        
         self.globe_widget.locationSelected.connect(self.on_location_selected)
         
         # Animation Signals
@@ -508,7 +507,6 @@ class SportsTrackerMainWindow(QMainWindow):
     def synchronize_league_state(self):
         """Ensure main window and control panel are using the same league"""
         # Set control panel to match main window's league
-        self.control_panel.set_current_league(self.current_league)
         
         # Update main window components for the current league
         self.league_status_label.setText(self.current_league)
@@ -581,7 +579,8 @@ class SportsTrackerMainWindow(QMainWindow):
             current_season = self.sports_aggregator.espn_scraper.get_current_season_for_league(self.current_league)
             force_refresh = (season == current_season)
             
-            self.sports_aggregator.load_full_season_schedule(season, self.current_league, force_refresh)
+            focus_team_id = self.focus_team_combo.currentData() or None
+            self.sports_aggregator.load_full_season_schedule(season, self.current_league, force_refresh, focus_team_id)
             
         except Exception as e:
             self.on_data_error(f"Failed to load {self.current_league} {season} season: {str(e)}")
