@@ -1844,7 +1844,7 @@ class PlaneModel:
         
         # Configuration
         self.airplane_scale = 0.05
-        self.airplane_color = (1.0, 0.0, 0.0)
+        self.airplane_color = (0.8,0.85,0.9)
         
         # Performance caches
         self._orientation_cache = {}

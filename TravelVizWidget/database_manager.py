@@ -4,10 +4,84 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
-from dataclasses import asdict
+import dataclasses
+from dataclasses import dataclass
 import logging
+from enum import Enum
 
-from data_client import GameData, TeamTravelData, TeamInfo, Venue, GameStatus
+
+
+class GameStatus(Enum):
+    """Game status enumeration"""
+    SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress" 
+    FINAL = "final"
+    POSTPONED = "postponed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class TeamInfo:
+    """Team information"""
+    team_id: str
+    abbreviation: str
+    display_name: str
+    location: str
+    color: str
+    alternate_color: str
+    logo_url: Optional[str] = None
+    division: Optional[str] = None
+    league: Optional[str] = None
+    conference: Optional[str] = None
+
+
+@dataclass
+class Venue:
+    """Venue information"""
+    venue_id: str
+    name: str
+    city: str
+    state: str
+    country: str
+    latitude: float
+    longitude: float
+    capacity: Optional[int] = None
+    timezone: Optional[str] = None
+
+
+@dataclass
+class GameData:
+    """Individual game data"""
+    game_id: str
+    date: datetime
+    home_team: TeamInfo
+    away_team: TeamInfo
+    venue: Venue
+    status: GameStatus
+    week: Optional[int] = None
+    season_type: Optional[str] = None
+    league: str = "MLB"
+    season: Optional[str] = None
+    series_description: Optional[str] = None
+
+
+@dataclass
+class TeamTravelData:
+    """Team travel data inferred from schedule"""
+    team_name: str
+    team_id: str
+    departure_city: str
+    arrival_city: str
+    game_date: datetime
+    travel_date: datetime
+    departure_airport: str
+    arrival_airport: str
+    confidence: str = "schedule_inferred"
+    game_id: Optional[str] = None
+    opponent: Optional[str] = None
+    series_game_number: Optional[int] = None
+    homestand_game_number: Optional[int] = None
+
 
 
 class DatabaseManager:

@@ -3,84 +3,666 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
-from enum import Enum
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from bs4 import BeautifulSoup
 import re
+import math
+import logging
+import time
 from pathlib import Path
+import amadeus
+from database_manager import DatabaseManager, GameStatus, TeamInfo, Venue, GameData, TeamTravelData
+# from amadeus import analytics, airline, airport
 
 # Update mapping for LA kings (schedule url uses la not lak)
+#TODO: Add in relavant flight/airport data from amadeus API
+# Endpoints to consider: Airport Routes, Airport Nearest Relevant, Airport & City Search, Hotel List, 
+# Hotel Search, Hotel Ratings, Points of Interest, Location Score, Flight Delay Prediction,
+# Airport On Time Performance,On Demand Flight Status,Flight Busiest Traveling Period
 
-class GameStatus(Enum):
-    """Game status enumeration"""
-    SCHEDULED = "scheduled"
-    IN_PROGRESS = "in_progress" 
-    FINAL = "final"
-    POSTPONED = "postponed"
-    CANCELLED = "cancelled"
+# Teams that own their own planes: Detroit Tigers, Los Angeles Lakers, Dallas Mavericks, 
+# Boston Celtics, Houston Rockets, Golden State Warriors, and Cleveland Cavaliers
 
-
-@dataclass
-class TeamInfo:
-    """Team information"""
-    team_id: str
-    abbreviation: str
-    display_name: str
-    location: str
-    color: str
-    alternate_color: str
-    logo_url: Optional[str] = None
-    division: Optional[str] = None
-    league: Optional[str] = None
-    conference: Optional[str] = None
 
 
 @dataclass
-class Venue:
-    """Venue information"""
-    venue_id: str
+class AirportInfo:
+    """Airport information with performance metrics"""
+    iata_code: str
     name: str
     city: str
-    state: str
-    country: str
-    latitude: float
-    longitude: float
-    capacity: Optional[int] = None
-    timezone: Optional[str] = None
-
+    distance_from_venue: float  # km
+    on_time_probability: float  # 0-1
+    traveler_score: int
+    coordinates: Tuple[float, float]
+    timezone_offset: str
 
 @dataclass
-class GameData:
-    """Individual game data"""
-    game_id: str
-    date: datetime
-    home_team: TeamInfo
-    away_team: TeamInfo
-    venue: Venue
-    status: GameStatus
-    week: Optional[int] = None
-    season_type: Optional[str] = None
-    league: str = "MLB"
-    season: Optional[str] = None
-    series_description: Optional[str] = None
-
+class HotelOption:
+    """Hotel near venue with quality metrics"""
+    hotel_id: str
+    name: str
+    distance_from_venue: float  # km
+    overall_rating: int  # 0-100
+    price_tier: str  # "LUXURY", "UPSCALE", "MIDSCALE"
+    amenities: List[str]
+    location_score: int  # 0-100
+    coordinates: Tuple[float, float]
 
 @dataclass
-class TeamTravelData:
-    """Team travel data inferred from schedule"""
-    team_name: str
-    team_id: str
-    departure_city: str
-    arrival_city: str
-    game_date: datetime
-    travel_date: datetime
-    departure_airport: str
-    arrival_airport: str
-    confidence: str = "schedule_inferred"
-    game_id: Optional[str] = None
-    opponent: Optional[str] = None
-    series_game_number: Optional[int] = None
-    homestand_game_number: Optional[int] = None
+class RouteInsights:
+    """Travel intelligence between two cities"""
+    game_data: 'GameData'
+    primary_airport: AirportInfo
+    alternate_airports: List[AirportInfo]
+    destination_hotels: List[HotelOption]
+    travel_distance: float  # miles
+    travel_confidence: str  # "HIGH", "MEDIUM", "LOW"
+    risk_factors: List[str]
+    travel_data: Optional['TeamTravelData'] = None
+
+@dataclass
+class TeamTravelIntelligence:
+    """Complete travel intelligence for a team's upcoming schedule"""
+    team_info: 'TeamInfo'
+    upcoming_routes: List[RouteInsights]
+    total_travel_distance: float
+    highest_risk_route: Optional[RouteInsights]
+    travel_complexity_score: float  # 0-100
+    recommendations: List[str]
+    analysis_timestamp: datetime
+
+
+
+
+class AmadeusAnalyzer:
+    #TODO: Fix only 1 route appearing in panel textbox despite more 
+    # than 1 upcoming period of travel in 7 day window 
+    
+    def __init__(self, api_key: str, api_secret: str, aggregator=None):
+        self.amadeus = amadeus.Client(client_id=api_key, client_secret=api_secret)
+        self._airport_cache: Dict[str, List[AirportInfo]] = {}
+        self._hotel_cache: Dict[str, List[HotelOption]] = {}
+        self.logger = logging.getLogger(__name__)
+        # Store reference to aggregator for accessing city coordinates
+        self.aggregator = aggregator
+    
+    def analyze_team_travel(self, team_info: TeamInfo, upcoming_games: List[GameData], days_ahead: int = 7) -> TeamTravelIntelligence:
+        """Main method: Takes team info and games list, returns enriched travel intelligence (FIXED VERSION)"""
+        cutoff_date = datetime.now() + timedelta(days=days_ahead)
+        
+        # *** FIXED: Use venue change logic instead of away game logic ***
+        # Filter games within date range for this team
+        relevant_games = [
+            game for game in upcoming_games 
+            if game.date <= cutoff_date and (
+                game.home_team.team_id == team_info.team_id or 
+                game.away_team.team_id == team_info.team_id
+            )
+        ]
+        
+        # Sort by date
+        relevant_games.sort(key=lambda x: x.date)
+        
+        route_insights = []
+        total_distance = 0
+        
+        
+        for i in range(len(relevant_games) - 1):
+            current_game = relevant_games[i]
+            next_game = relevant_games[i + 1]
+            
+            # Only analyze travel if venue changes between games
+            if current_game.venue.venue_id != next_game.venue.venue_id:
+                try:
+                    # Travel from current game venue to next game venue
+                    route = self._analyze_route_between_venues(
+                        current_game.venue, 
+                        next_game.venue, 
+                        next_game
+                    )
+                    route_insights.append(route)
+                    total_distance += route.travel_distance
+                    
+                    print(f"📊 Amadeus analyzing: {current_game.venue.city} → {next_game.venue.city}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"Failed to analyze route for venue change {current_game.venue.city} → {next_game.venue.city}: {e}")
+        
+        return TeamTravelIntelligence(
+            team_info=team_info,
+            upcoming_routes=route_insights,
+            total_travel_distance=total_distance,
+            highest_risk_route=self._identify_highest_risk_route(route_insights),
+            travel_complexity_score=self._calculate_complexity_score(route_insights),
+            recommendations=self._generate_recommendations(route_insights),
+            analysis_timestamp=datetime.now()
+        )
+    
+    def _analyze_route_between_venues(self, origin_venue: 'Venue', destination_venue: 'Venue', game: 'GameData') -> RouteInsights:
+        """Analyze a specific travel route between two venues (UPDATED METHOD)"""
+        
+        # Get airports near both venues
+        destination_airports = self._get_venue_airports(destination_venue, game.date)
+        
+        primary_airport = destination_airports[0] if destination_airports else None
+        alternate_airports = destination_airports[1:3] if len(destination_airports) > 1 else []
+        
+        # Get hotels near destination venue
+        hotels = self._get_destination_hotels(destination_venue, game.date)
+        
+        # Calculate travel metrics between the two cities
+        distance = self._calculate_distance(origin_venue.city, destination_venue.city)
+        confidence = self._assess_travel_confidence(primary_airport, hotels)
+        risks = self._identify_risk_factors(primary_airport, game.date)
+        
+        return RouteInsights(
+            game_data=game,
+            primary_airport=primary_airport,
+            alternate_airports=alternate_airports,
+            destination_hotels=hotels[:5],  # Top 5 hotels
+            travel_distance=distance,
+            travel_confidence=confidence,
+            risk_factors=risks
+        )
+    
+    def _get_venue_airports(self, venue: 'Venue', travel_date: datetime) -> List[AirportInfo]:
+        """Get airports near venue with performance data"""
+        cache_key = f"{venue.city}_{venue.state}"
+        
+        if cache_key in self._airport_cache:
+            airports = self._airport_cache[cache_key]
+        else:
+            airports = self._fetch_airports_for_venue(venue)
+            self._airport_cache[cache_key] = airports
+        
+        # Enrich with real-time performance data
+        for airport in airports:
+            airport.on_time_probability = self._get_airport_performance(airport.iata_code, travel_date)
+        
+        return sorted(airports, key=lambda x: x.distance_from_venue)
+    
+    def _fetch_airports_for_venue(self, venue: 'Venue') -> List[AirportInfo]:
+        """Fetch airports from Amadeus API"""
+        try:
+            # Search for nearest airports
+            response = self.amadeus.reference_data.locations.airports.get(
+                latitude=venue.latitude,
+                longitude=venue.longitude,
+                radius=200  # 200km radius
+            )
+            
+            airports = []
+            for airport_data in response.data[:5]:  # Top 5 airports
+                distance = self._haversine_distance(
+                    venue.latitude, venue.longitude,
+                    airport_data['geoCode']['latitude'], 
+                    airport_data['geoCode']['longitude']
+                )
+                
+                airports.append(AirportInfo(
+                    iata_code=airport_data['iataCode'],
+                    name=airport_data['name'],
+                    city=airport_data['address']['cityName'],
+                    distance_from_venue=distance,
+                    on_time_probability=0.85,  # Default, will be updated
+                    traveler_score=airport_data.get('analytics', {}).get('travelers', {}).get('score', 0),
+                    coordinates=(airport_data['geoCode']['latitude'], airport_data['geoCode']['longitude']),
+                    timezone_offset=airport_data.get('timeZoneOffset', '')
+                ))
+            
+            return airports
+            
+        except Exception as e:
+            self.logger.error(f"Failed to fetch airports for {venue.city}: {e}")
+            return []
+    
+    def _get_destination_hotels(self, venue: 'Venue', check_in_date: datetime) -> List[HotelOption]:
+        """Get hotel options near venue"""
+        cache_key = f"{venue.latitude}_{venue.longitude}"
+        
+        if cache_key in self._hotel_cache:
+            return self._hotel_cache[cache_key]
+        
+        try:
+            # Get hotels by geocode
+            hotels_response = self.amadeus.reference_data.locations.hotels.by_geocode.get(
+                latitude=venue.latitude,
+                longitude=venue.longitude,
+                radius=25,  # 25km radius
+                radiusUnit='KM'
+            )
+            
+            hotels = []
+            hotel_ids = [hotel['hotelId'] for hotel in hotels_response.data[:10]]
+            
+            # Get hotel ratings
+            if hotel_ids:
+                try:
+                    ratings_response = self.amadeus.e_reputation.hotel_sentiments.get(
+                        hotelIds=','.join(hotel_ids)
+                    )
+                    ratings_map = {r['hotelId']: r for r in ratings_response.data}
+                except:
+                    ratings_map = {}
+            else:
+                ratings_map = {}
+            
+            for hotel_data in hotels_response.data[:10]:
+                distance = self._haversine_distance(
+                    venue.latitude, venue.longitude,
+                    hotel_data['geoCode']['latitude'],
+                    hotel_data['geoCode']['longitude']
+                )
+                
+                hotel_id = hotel_data['hotelId']
+                rating_data = ratings_map.get(hotel_id, {})
+                
+                hotels.append(HotelOption(
+                    hotel_id=hotel_id,
+                    name=hotel_data['name'],
+                    distance_from_venue=distance,
+                    overall_rating=rating_data.get('overallRating', 75),
+                    price_tier=self._determine_price_tier(hotel_data),
+                    amenities=self._extract_amenities(hotel_data),
+                    location_score=rating_data.get('sentiments', {}).get('location', 80),
+                    coordinates=(hotel_data['geoCode']['latitude'], hotel_data['geoCode']['longitude'])
+                ))
+            
+            # Sort by distance and rating
+            hotels.sort(key=lambda h: (h.distance_from_venue, -h.overall_rating))
+            self._hotel_cache[cache_key] = hotels
+            return hotels
+            
+        except Exception as e:
+            self.logger.error(f"Failed to fetch hotels for venue: {e}")
+            return []
+    
+    def _get_airport_performance(self, airport_code: str, date: datetime) -> float:
+        """Get airport on-time performance probability"""
+        try:
+            response = self.amadeus.airport.predictions.on_time.get(
+                airportCode=airport_code,
+                date=date.strftime('%Y-%m-%d')
+            )
+            return float(response.data['probability'])
+        except:
+            return 0.85  # Default assumption
+    
+    def _calculate_distance(self, origin_city: str, destination_city: str) -> float:
+        """Calculate real distance between cities using existing coordinates"""
+        try:
+            # *** Use existing city coordinates from scraper ***
+            if self.aggregator and hasattr(self.aggregator, 'espn_scraper'):
+                city_coords = self.aggregator.espn_scraper.city_coordinates
+            else:
+                
+                scraper = ESPNScheduleScraper()
+                city_coords = scraper.load_city_coordinates()
+            
+            origin_coords = city_coords.get(origin_city)
+            dest_coords = city_coords.get(destination_city)
+            
+            if not origin_coords or not dest_coords:
+                self.logger.warning(f"Coordinates not found for {origin_city} or {destination_city}, using estimated distance")
+                return 800.0  # Reasonable default for cross-country travel
+            
+            # Calculate distance using Haversine formula
+            distance_km = self._haversine_distance(
+                origin_coords[0], origin_coords[1], 
+                dest_coords[0], dest_coords[1]
+            )
+            
+            # Convert km to miles
+            distance_miles = distance_km * 0.621371
+            
+            print(f"📏 Distance {origin_city} → {destination_city}: {distance_miles:.0f} miles")
+            return distance_miles
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating distance between {origin_city} and {destination_city}: {e}")
+            return 800.0  # Fallback distance
+    
+    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two coordinates in km"""
+        R = 6371  # Earth's radius in km
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat/2) * math.sin(dlat/2) + 
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * 
+             math.sin(dlon/2) * math.sin(dlon/2))
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return R * c
+    
+    def _assess_travel_confidence(self, airport: AirportInfo, hotels: List[HotelOption]) -> str:
+        """Assess overall travel confidence"""
+        if not airport or not hotels:
+            return "LOW"
+        
+        airport_score = airport.on_time_probability
+        hotel_score = max(h.overall_rating for h in hotels) / 100 if hotels else 0
+        
+        combined_score = (airport_score + hotel_score) / 2
+        
+        if combined_score > 0.8:
+            return "HIGH"
+        elif combined_score > 0.6:
+            return "MEDIUM"
+        else:
+            return "LOW"
+    
+    def _identify_risk_factors(self, airport: AirportInfo, date: datetime) -> List[str]:
+        """Identify potential travel risk factors"""
+        risks = []
+        
+        if airport and airport.on_time_probability < 0.7:
+            risks.append("Poor airport on-time performance")
+        
+        # Maybe more idk
+        
+        return risks
+    
+    def _identify_highest_risk_route(self, routes: List[RouteInsights]) -> Optional[RouteInsights]:
+        """Find the route with highest travel risk"""
+        if not routes:
+            return None
+        
+        return min(routes, key=lambda r: r.primary_airport.on_time_probability if r.primary_airport else 0)
+    
+    def _calculate_complexity_score(self, routes: List[RouteInsights]) -> float:
+        """Calculate overall travel complexity score (0-100)"""
+        if not routes:
+            return 0
+        
+        # Factor in distances, airport performance, etc.
+        total_distance = sum(r.travel_distance for r in routes)
+        avg_airport_performance = sum(
+            r.primary_airport.on_time_probability for r in routes if r.primary_airport
+        ) / len(routes) if routes else 0.85
+        
+        # Simplified scoring
+        distance_score = min(total_distance / 100, 100)  # Normalize
+        performance_score = (1 - avg_airport_performance) * 100
+        
+        return (distance_score + performance_score) / 2
+    
+    def _generate_recommendations(self, routes: List[RouteInsights]) -> List[str]:
+        """Generate travel recommendations"""
+        recommendations = []
+        
+        high_risk_routes = [r for r in routes if r.travel_confidence == "LOW"]
+        if high_risk_routes:
+            recommendations.append(f"Monitor {len(high_risk_routes)} high-risk routes closely")
+        
+        # Add more recommendation logic
+        
+        return recommendations
+    
+    def _determine_price_tier(self, hotel_data: dict) -> str:
+        """Determine hotel price tier based on available data"""
+        try:
+            # Look for chain code to classify hotel tier
+            chain_code = hotel_data.get('chainCode', '').upper()
+            
+            # Luxury hotel chains
+            luxury_chains = {
+                'RT', 'RC', 'LX', 'BU', 'SL', 'WR', 'PH', 'FS', 'JW', 
+                'W', 'ED', 'LH', 'PK', 'SH', 'SO', 'ST', 'AL', 'GR'
+            }
+            
+            # Upscale hotel chains
+            upscale_chains = {
+                'HI', 'HL', 'DT', 'MP', 'HW', 'IC', 'IN', 'AC', 'BW', 
+                'CY', 'ES', 'HY', 'NH', 'NO', 'RA', 'RP', 'SG', 'WE'
+            }
+            
+            if chain_code in luxury_chains:
+                return "LUXURY"
+            elif chain_code in upscale_chains:
+                return "UPSCALE"
+            else:
+                # Fallback: try to infer from hotel name
+                hotel_name = hotel_data.get('name', '').upper()
+                
+                # Luxury keywords
+                luxury_keywords = ['RITZ', 'FOUR SEASONS', 'MANDARIN', 'PENINSULA', 
+                                 'ST. REGIS', 'WALDORF', 'BULGARI', 'AMAN', 'ROSEWOOD']
+                
+                # Upscale keywords
+                upscale_keywords = ['HILTON', 'MARRIOTT', 'HYATT', 'INTERCONTINENTAL', 
+                                  'WESTIN', 'SHERATON', 'DOUBLETREE', 'RENAISSANCE']
+                
+                for keyword in luxury_keywords:
+                    if keyword in hotel_name:
+                        return "LUXURY"
+                
+                for keyword in upscale_keywords:
+                    if keyword in hotel_name:
+                        return "UPSCALE"
+                
+                # Default to midscale if we can't determine
+                return "MIDSCALE"
+                
+        except Exception as e:
+            self.logger.warning(f"Error determining price tier: {e}")
+            return "MIDSCALE"
+
+    def _extract_amenities(self, hotel_data: dict) -> List[str]:
+        """Extract hotel amenities from hotel data"""
+        amenities = []
+        
+        try:
+            # Standard amenities based on typical hotel data
+            # Note: Amadeus Hotel List API doesn't always provide detailed amenities
+            # These would typically come from the Hotel Search API or other endpoints
+            
+            # We can infer some amenities from the hotel name/description
+            hotel_name = hotel_data.get('name', '').upper()
+            
+            # Common amenities to look for in hotel names/descriptions
+            if any(keyword in hotel_name for keyword in ['RESORT', 'SPA']):
+                amenities.append('SPA')
+            
+            if any(keyword in hotel_name for keyword in ['SUITES', 'SUITE']):
+                amenities.append('SUITES')
+            
+            if any(keyword in hotel_name for keyword in ['CONFERENCE', 'CONVENTION']):
+                amenities.append('BUSINESS CENTER')
+            
+            if any(keyword in hotel_name for keyword in ['AIRPORT']):
+                amenities.append('AIRPORT SHUTTLE')
+            
+            # Default amenities for most hotels
+            standard_amenities = ['WIFI', 'PARKING', 'CONCIERGE']
+            amenities.extend(standard_amenities)
+            
+            # Remove duplicates and limit to reasonable number
+            amenities = list(set(amenities))[:6]
+            
+        except Exception as e:
+            self.logger.warning(f"Error extracting amenities: {e}")
+            amenities = ['WIFI', 'PARKING']  # Fallback basic amenities
+        
+        return amenities
+
+class AmadeusWorker(QThread):
+    """Amadeus analysis worker thread that uses existing travel_data table (SIMPLIFIED VERSION)"""
+    intelligenceReady = pyqtSignal(object)
+    errorOccurred = pyqtSignal(str)
+    
+    def __init__(self, aggregator, team_abbr: str, days_ahead: int):
+        super().__init__()
+        self.aggregator = aggregator
+        self.team_abbr = team_abbr
+        self.days_ahead = days_ahead
+        self.cancelled = False
+    
+    def cancel(self):
+        """Cancel the analysis"""
+        self.cancelled = True
+    
+    def run(self):
+        """Run Amadeus analysis using existing travel_data table (MUCH SIMPLER!)"""
+        try:
+            print(f"🔍 AmadeusWorker starting analysis for team {self.team_abbr}")
+            
+            if self.cancelled:
+                return
+            
+            # *** SIMPLIFIED: Just query the existing travel_data table ***
+            season = self.aggregator.current_season or "2024"
+            league = self.aggregator.current_league
+            
+            # Get upcoming travel data for this team from the travel_data table
+            from datetime import datetime, timedelta
+            now = datetime.now()
+            cutoff = now + timedelta(days=self.days_ahead)
+            
+            # Query travel_data table directly (this already has venue changes calculated!)
+            # Get all travel data for this team, then filter by date
+            all_travel = self.aggregator.db.load_travel_data(season, league, self.team_abbr)
+            
+            # Filter for upcoming travel within the specified timeframe
+            upcoming_travel = [
+                travel for travel in all_travel
+                if travel.travel_date and now <= travel.travel_date <= cutoff
+            ]
+            
+            print(f"📊 Found {len(upcoming_travel)} upcoming travel segments from travel_data table")
+            
+            if self.cancelled:
+                return
+            
+            if not upcoming_travel:
+                # Create team info and return empty intelligence
+                team_info = self.aggregator.espn_scraper.create_team_info(self.team_abbr, league)
+                intelligence = self._create_empty_intelligence(team_info)
+                self.intelligenceReady.emit(intelligence)
+                return
+            
+            # *** Convert travel data to games for Amadeus analyzer ***
+            # We need GameData objects for the Amadeus analyzer
+            upcoming_games = []
+            
+            for travel in upcoming_travel:
+                if self.cancelled:
+                    return
+                
+                # Find the actual game this travel record references
+                if travel.game_id:
+                    # Try to load the specific game by ID
+                    game = self._find_game_by_id(travel.game_id, season, league)
+                    if game:
+                        upcoming_games.append(game)
+                else:
+                    # Fallback: create a mock game based on travel data
+                    game = self._create_mock_game_from_travel(travel, league, season)
+                    if game:
+                        upcoming_games.append(game)
+            
+            if self.cancelled:
+                return
+            
+            # Remove duplicates (in case travel data references same game multiple times)
+            seen_games = set()
+            unique_games = []
+            for game in upcoming_games:
+                if game.game_id not in seen_games:
+                    unique_games.append(game)
+                    seen_games.add(game.game_id)
+            
+            print(f"📊 Created {len(unique_games)} game objects for Amadeus analysis")
+            
+            # Create team info
+            team_info = self.aggregator.espn_scraper.create_team_info(self.team_abbr, league)
+            
+            # *** Run Amadeus analysis ***
+            intelligence = self.aggregator.amadeus_analyzer.analyze_team_travel(
+                team_info, unique_games, self.days_ahead
+            )
+            
+            if not self.cancelled:
+                self.intelligenceReady.emit(intelligence)
+                print(f"✅ Amadeus analysis complete for {self.team_abbr}")
+            
+        except Exception as e:
+            if not self.cancelled:
+                error_msg = f"Amadeus analysis failed: {str(e)}"
+                print(f"❌ {error_msg}")
+                self.errorOccurred.emit(error_msg)
+    
+    def _find_game_by_id(self, game_id: str, season: str, league: str):
+        """Find a specific game by ID from the games table"""
+        try:
+            all_games = self.aggregator.db.load_games(season, league)
+            for game in all_games:
+                if game.game_id == game_id:
+                    return game
+            return None
+        except Exception as e:
+            print(f"⚠️ Could not find game {game_id}: {e}")
+            return None
+    
+    def _create_mock_game_from_travel(self, travel: 'TeamTravelData', league: str, season: str):
+        """Create a mock GameData object from travel data as fallback"""
+        try:
+            # Create team objects
+            team_info = self.aggregator.espn_scraper.create_team_info(travel.team_id, league)
+            
+            # Determine opponent team (this is tricky without more data)
+            # For now, create a placeholder opponent
+            opponent_abbrev = "UNK"  # Unknown opponent
+            if hasattr(travel, 'opponent') and travel.opponent:
+                # Try to extract opponent abbreviation
+                opponent_name = travel.opponent
+                opponent_abbrev = self.aggregator.espn_scraper.get_team_abbrev_from_name(opponent_name, league)
+                if not opponent_abbrev:
+                    opponent_abbrev = "UNK"
+            
+            opponent_team = self.aggregator.espn_scraper.create_team_info(opponent_abbrev, league)
+            
+            # Determine home/away based on arrival city
+            # If we're traveling TO a city, we're probably playing away there
+            home_team = opponent_team
+            away_team = team_info
+            
+            # Create venue for the destination city
+            venue = self.aggregator.espn_scraper.create_venue_info(opponent_abbrev, league)
+            venue.city = travel.arrival_city  # Override with actual destination
+            
+            # Create mock game
+            mock_game_id = f"MOCK_{league}_{season}_{travel.game_date.strftime('%Y%m%d')}_{away_team.team_id}_{home_team.team_id}"
+            
+            from database_manager import GameData, GameStatus
+            mock_game = GameData(
+                game_id=mock_game_id,
+                date=travel.game_date,
+                home_team=home_team,
+                away_team=away_team,
+                venue=venue,
+                status=GameStatus.SCHEDULED,
+                league=league,
+                season=season
+            )
+            
+            return mock_game
+            
+        except Exception as e:
+            print(f"⚠️ Could not create mock game from travel data: {e}")
+            return None
+    
+    def _create_empty_intelligence(self, team_info):
+        """Create empty intelligence for teams with no travel"""
+        from datetime import datetime
+        return TeamTravelIntelligence(
+            team_info=team_info,
+            upcoming_routes=[],
+            total_travel_distance=0,
+            highest_risk_route=None,
+            travel_complexity_score=0,
+            recommendations=["No upcoming travel required"],
+            analysis_timestamp=datetime.now()
+        )
 
 
 class ESPNScheduleScraper:
@@ -124,7 +706,7 @@ class ESPNScheduleScraper:
             
             # American League Central
             # White Sox are chw not cws
-            "chw": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central", "conference": "American League"},
+            "cws": {"name": "Chicago White Sox", "city": "Chicago", "division": "AL Central", "conference": "American League"},
             "cle": {"name": "Cleveland Guardians", "city": "Cleveland", "division": "AL Central", "conference": "American League"},
             "det": {"name": "Detroit Tigers", "city": "Detroit", "division": "AL Central", "conference": "American League"},
             "kc": {"name": "Kansas City Royals", "city": "Kansas City", "division": "AL Central", "conference": "American League"},
@@ -797,9 +1379,9 @@ class ESPNScheduleScraper:
                 # Standard team mappings
                 'mets': 'nym', 'new york mets': 'nym', 'yankees': 'nyy', 'new york yankees': 'nyy',
                 'dodgers': 'lad', 'los angeles dodgers': 'lad', 'angels': 'laa', 'los angeles angels': 'laa',
-                'cubs': 'chc', 'chicago cubs': 'chc', 'white sox': 'chw', 'chicago white sox': 'chw',
+                'cubs': 'chc', 'chicago cubs': 'chc', 'white sox': 'cws', 'chicago white sox': 'cws',
                 
-                # 🔧 ESPN MALFORMED STRING FIXES - these are the core problem strings
+                
                 'new nyy': 'nyy', 'new nym': 'nym',  # "New NYY" -> Yankees, "New NYM" -> Mets
                 'los laa': 'laa', 'los lad': 'lad',  # "Los LAA" -> Angels, "Los LAD" -> Dodgers  
                 'chi chc': 'chc', 'chi chw': 'chw',  # Chicago teams (potential)
@@ -999,20 +1581,16 @@ class ESPNSportsDataAggregator(QObject):
     progressUpdated = pyqtSignal(int)
     errorOccurred = pyqtSignal(str)
     seasonDataLoaded = pyqtSignal(str, str, int)  # season, league, game_count
+    amadeusIntelligenceReady = pyqtSignal(object)  # Flight/Airport/Hotel data
     
     def __init__(self, config: Dict[str, str], db_path: str = "sports_data.db"):
         super().__init__()
         
         # Check if DB file exists; if not, scrape it all
+        self.amadeus_worker = None
         db_exists = Path(db_path).exists()    
         
-        try:
-            from database_manager import DatabaseManager
-            self.db = DatabaseManager(db_path)
-        except ImportError:
-            print("Error: DatabaseManager not found. Please ensure database_manager.py is available.")
-            raise
-        
+        self.db = DatabaseManager(db_path)
         self.espn_scraper = ESPNScheduleScraper()
         self.inference_engine = TravelInferenceEngine(self.espn_scraper.team_airports)
         
@@ -1033,6 +1611,18 @@ class ESPNSportsDataAggregator(QObject):
         self.current_league = league
         self.current_season = self.espn_scraper.get_current_season_for_league(league)
         print(f"Set league to {league}, current season: {self.current_season}")
+    
+    
+    def set_amadeus_credentials(self, api_key: str, api_secret: str):
+        """Set up Amadeus integration with aggregator reference"""
+        try:
+            # Pass self (aggregator) to AmadeusAnalyzer for access to city coordinates
+            self.amadeus_analyzer = AmadeusAnalyzer(api_key, api_secret, aggregator=self)
+            return True
+        except Exception as e:
+            print(f"Failed to initialize Amadeus: {e}")
+            return False
+    
     
     def load_teams_for_all_leagues(self):
         """Load team information for all leagues"""
@@ -1231,6 +1821,29 @@ class ESPNSportsDataAggregator(QObject):
             print(f"Error filtering {league} travel by date range: {e}")
             return []
     
+     
+    def get_team_travel_intelligence_async(self, team_abbr: str, days_ahead: int = 7) -> None:
+        """Get enhanced travel data with Amadeus intelligence - TRULY ASYNC"""
+        if not hasattr(self, 'amadeus_analyzer') or not self.amadeus_analyzer:
+            self.errorOccurred.emit("Amadeus not configured")
+            return
+        
+        # Cancel existing worker if running
+        if hasattr(self, 'amadeus_worker') and self.amadeus_worker is not None and self.amadeus_worker.isRunning():
+            self.amadeus_worker.cancel()
+            self.amadeus_worker.wait()
+        
+        # Create worker
+        self.amadeus_worker = AmadeusWorker(self, team_abbr, days_ahead)
+        self.amadeus_worker.start()
+        
+        
+        # Connect worker signals to main window through aggregator signals
+        # This is the key fix - connect the worker's progressUpdated to a relay method
+        self.amadeus_worker.intelligenceReady.connect(self.amadeusIntelligenceReady.emit)
+        self.amadeus_worker.errorOccurred.connect(self.errorOccurred.emit)
+        
+        
     def get_team_info(self, team_id: str, league: str = None) -> Optional[TeamInfo]:
         """Get team information by ID and league"""
         if league is None:
@@ -1282,13 +1895,16 @@ def run_scraper():
     aggregator = ESPNSportsDataAggregator(config)
     
     # Scrape all supported leagues
-    for league in ["NBA", "NHL"]:#"MLB" 
+    for league in ["NBA", "NHL", "MLB"]:# "NBA", "NHL", "MLB" 
         print(f"\n📊 Scraping {league}...")
         aggregator.set_league(league)
         aggregator.load_full_season_schedule(force_refresh=True)
     
     stats = aggregator.get_database_stats()
     print(f"\n✅ Multi-league scraping complete. Database stats: {stats}")
+
+
+
 
 
 if __name__ == "__main__":

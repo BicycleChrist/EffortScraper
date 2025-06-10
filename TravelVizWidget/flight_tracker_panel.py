@@ -3,905 +3,646 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
                             QWidget, QPushButton, QLabel, QFrame, QDateTimeEdit,
                             QCheckBox, QSlider, QGroupBox, QProgressBar, QComboBox,
                             QListWidget, QListWidgetItem, QSpinBox, QLineEdit,
-                            QTextEdit, QScrollArea, QSplitter)
-from PyQt6.QtCore import (Qt, QTimer, QDateTime, pyqtSignal, QThread)
-from PyQt6.QtGui import QFont, QPixmap, QIcon
+                            QTextEdit, QScrollArea, QSplitter, QGridLayout)
+from PyQt6.QtCore import (Qt, QTimer, QDateTime, pyqtSignal, QPropertyAnimation, QEasingCurve)
+from PyQt6.QtGui import QFont, QPixmap, QIcon, QPalette, QColor
 
 
 class FlightControlPanel(QWidget):
-    """Enhanced control panel for multi-league sports team travel tracking"""
+    """Bloomberg Terminal-style control panel for sports team travel intelligence"""
 
     # Signals
     modeChanged = pyqtSignal(str)  # League changed: "MLB", "NBA", "NHL"
-    airlineFilterChanged = pyqtSignal(list)  # List of team IDs
-    statusFilterChanged = pyqtSignal(list)  # List of confidence levels
-    routeFilterChanged = pyqtSignal(str, str)  # departure, arrival
+    teamChanged = pyqtSignal(str)  # Team selection changed
     refreshRequested = pyqtSignal()
-    flightSelected = pyqtSignal(str)  # team or game ID
+    amadeusAnalysisRequested = pyqtSignal(str, int)  # team_abbr, days_ahead
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.travel_data = []
         self.filtered_travel = []
-        self.current_league = "MLB"  # Track current league
+        self.current_league = "MLB"
+        self.current_intelligence = None
+        
         self.setup_ui()
-        
-        self.update_ui_for_league(self.current_league)
-        
-        self.apply_styles()
+        self.apply_bloomberg_styles()
         self.connect_signals()
+        self.update_ui_for_league(self.current_league)
 
     def setup_ui(self):
-        """Setup the enhanced sports control panel UI"""
+        """Setup Bloomberg Terminal-style UI"""
         layout = QVBoxLayout()
-        layout.setSpacing(10)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
 
-        # Header with refresh button
+        # Header
         header_frame = self.create_header_section()
         layout.addWidget(header_frame)
 
-        # League selection
-        league_frame = self.create_league_section()
-        layout.addWidget(league_frame)
+        # League and Team Selection
+        selection_frame = self.create_selection_section()
+        layout.addWidget(selection_frame)
 
-        # Travel filters
-        filter_frame = self.create_filter_section()
-        layout.addWidget(filter_frame)
+        # AMADEUS TRAVEL INTELLIGENCE (replaces basic travel stats)
+        intelligence_frame = self.create_intelligence_section()
+        layout.addWidget(intelligence_frame)
 
-        # Live travel statistics
-        stats_frame = self.create_statistics_section()
-        layout.addWidget(stats_frame)
+        # Live Analysis Status
+        status_frame = self.create_analysis_status_section()
+        layout.addWidget(status_frame)
 
-        # Active travel list
-        travel_frame = self.create_travel_section()
-        layout.addWidget(travel_frame)
+        # Travel Schedule List
+        schedule_frame = self.create_schedule_section()
+        layout.addWidget(schedule_frame)
 
-        # Route builder
-        route_frame = self.create_route_section()
-        layout.addWidget(route_frame)
+        # Route Analysis Tools
+        tools_frame = self.create_tools_section()
+        layout.addWidget(tools_frame)
 
         layout.addStretch()
         self.setLayout(layout)
 
     def create_header_section(self) -> QFrame:
-        """Create header with title and refresh button"""
+        """Create Bloomberg-style header"""
         frame = QFrame()
+        frame.setFixedHeight(45)
         layout = QHBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
 
-        title_label = QLabel("SPORTS TRACKER")
-        title_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        # Terminal-style title
+        title_label = QLabel("SPORTS TRAVEL INTELLIGENCE")
+        title_label.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #00FF88; letter-spacing: 1px;")
         layout.addWidget(title_label)
 
         layout.addStretch()
 
-        self.refresh_btn = QPushButton("⟲ REFRESH")
-        self.refresh_btn.setMinimumHeight(30)
+        # Live indicator
+        self.live_indicator = QLabel("● LIVE")
+        self.live_indicator.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.live_indicator.setStyleSheet("color: #FF6B00;")
+        layout.addWidget(self.live_indicator)
+
+        # Refresh button
+        self.refresh_btn = QPushButton("REFRESH")
+        self.refresh_btn.setFixedSize(80, 30)
+        self.refresh_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         layout.addWidget(self.refresh_btn)
 
-        # Status indicator
-        self.status_label = QLabel("● LOADING")
-        self.status_label.setStyleSheet("color: #FFA500;")
-        layout.addWidget(self.status_label)
-
         return frame
 
-    def create_league_section(self) -> QFrame:
-        """Create league selection section"""
+    def create_selection_section(self) -> QFrame:
+        """Create league and team selection"""
         frame = QFrame()
-        layout = QHBoxLayout(frame)
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(8)
 
-        # League buttons with proper naming and functionality
+        # League Selection
+        league_layout = QHBoxLayout()
+        league_label = QLabel("LEAGUE:")
+        league_label.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        league_label.setFixedWidth(60)
+        league_layout.addWidget(league_label)
+
         self.mlb_btn = QPushButton("MLB")
-        self.nba_btn = QPushButton("NBA")
+        self.nba_btn = QPushButton("NBA") 
         self.nhl_btn = QPushButton("NHL")
-        self.nfl_btn = QPushButton("NFL")  # Keep for future expansion
-
-        self.mlb_btn.setCheckable(True)
-        self.nba_btn.setCheckable(True)
-        self.nhl_btn.setCheckable(True)
-        self.nfl_btn.setCheckable(True)
         
-        # Set MLB as default
+        for btn in [self.mlb_btn, self.nba_btn, self.nhl_btn]:
+            btn.setCheckable(True)
+            btn.setFixedSize(50, 25)
+            btn.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            league_layout.addWidget(btn)
+        
         self.mlb_btn.setChecked(True)
-        
-        # Disable NFL for now since it's not implemented
-        self.nfl_btn.setEnabled(False)
-        self.nfl_btn.setToolTip("NFL support coming soon")
+        league_layout.addStretch()
+        layout.addLayout(league_layout)
 
-        layout.addWidget(self.mlb_btn)
-        layout.addWidget(self.nba_btn)
-        layout.addWidget(self.nhl_btn)
-        layout.addWidget(self.nfl_btn)
+        # Team Selection
+        team_layout = QHBoxLayout()
+        team_label = QLabel("FOCUS:")
+        team_label.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        team_label.setFixedWidth(60)
+        team_layout.addWidget(team_label)
 
+        self.team_combo = QComboBox()
+        self.team_combo.setFixedHeight(25)
+        self.team_combo.setFont(QFont("Consolas", 9))
+        team_layout.addWidget(self.team_combo)
+
+        # Analysis trigger
+        self.analyze_btn = QPushButton("ANALYZE")
+        self.analyze_btn.setFixedSize(80, 25)
+        self.analyze_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        team_layout.addWidget(self.analyze_btn)
+
+        layout.addLayout(team_layout)
         return frame
 
-    def create_filter_section(self) -> QGroupBox:
-        """Create travel filter controls"""
-        group = QGroupBox("FILTERS")
+    def create_intelligence_section(self) -> QGroupBox:
+        """Create Amadeus travel intelligence display (REPLACES basic travel stats)"""
+        group = QGroupBox("AMADEUS TRAVEL INTELLIGENCE")
+        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         layout = QVBoxLayout(group)
 
-        # Team filter
-        team_layout = QHBoxLayout()
-        team_layout.addWidget(QLabel("Teams:"))
-        self.team_combo = QComboBox()
-        self.team_combo.setEditable(False)
-        team_layout.addWidget(self.team_combo)
-        layout.addLayout(team_layout)
+        # Key Metrics Grid
+        metrics_grid = QGridLayout()
+        
+        # Row 1: Complexity and Risk
+        self.complexity_label = QLabel("COMPLEXITY: --")
+        self.complexity_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        metrics_grid.addWidget(self.complexity_label, 0, 0)
+        
+        self.risk_label = QLabel("RISK LEVEL: --")
+        self.risk_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        metrics_grid.addWidget(self.risk_label, 0, 1)
 
-        # Confidence filter - updated for multi-league
-        confidence_layout = QVBoxLayout()
-        confidence_layout.addWidget(QLabel("Travel Confidence:"))
+        # Row 2: Distance and Routes  
+        self.distance_label = QLabel("TOTAL DISTANCE: --")
+        self.distance_label.setFont(QFont("Consolas", 9))
+        metrics_grid.addWidget(self.distance_label, 1, 0)
+        
+        self.routes_label = QLabel("ROUTES: --")
+        self.routes_label.setFont(QFont("Consolas", 9))
+        metrics_grid.addWidget(self.routes_label, 1, 1)
 
-        self.confidence_checkboxes = {}
-        confidence_levels = [
-            ("Schedule Inferred", "schedule_inferred", True),
-            ("Confirmed", "confirmed", True),
-            ("Demo Data", "demo", False),
-            ("Historical", "historical", False)
-        ]
+        # Row 3: Airport Performance
+        self.airport_perf_label = QLabel("AIRPORT PERF: --")
+        self.airport_perf_label.setFont(QFont("Consolas", 9))
+        metrics_grid.addWidget(self.airport_perf_label, 2, 0)
+        
+        self.hotel_quality_label = QLabel("HOTEL QUALITY: --")
+        self.hotel_quality_label.setFont(QFont("Consolas", 9))
+        metrics_grid.addWidget(self.hotel_quality_label, 2, 1)
 
-        for display_name, confidence_code, default_checked in confidence_levels:
-            checkbox = QCheckBox(display_name)
-            checkbox.setChecked(default_checked)
-            checkbox.setProperty("confidence_code", confidence_code)
-            self.confidence_checkboxes[confidence_code] = checkbox
-            confidence_layout.addWidget(checkbox)
+        layout.addLayout(metrics_grid)
 
-        layout.addLayout(confidence_layout)
+        # Risk Alerts
+        self.alerts_label = QLabel("ALERTS: No active alerts")
+        self.alerts_label.setFont(QFont("Consolas", 8))
+        self.alerts_label.setWordWrap(True)
+        self.alerts_label.setStyleSheet("color: #888; background: rgba(20, 20, 20, 50); padding: 4px; border-radius: 3px;")
+        layout.addWidget(self.alerts_label)
 
-        # Date range filter
-        date_layout = QHBoxLayout()
-        date_layout.addWidget(QLabel("Days ahead:"))
+        # Route Breakdown
+        self.route_breakdown = QTextEdit()
+        self.route_breakdown.setFont(QFont("Consolas", 8))
+        self.route_breakdown.setMaximumHeight(80)
+        self.route_breakdown.setPlaceholderText("Route analysis will appear here...")
+        layout.addWidget(self.route_breakdown)
+
+        return group
+
+    def create_analysis_status_section(self) -> QFrame:
+        """Create real-time analysis status"""
+        frame = QFrame()
+        layout = QVBoxLayout(frame)
+        layout.setSpacing(4)
+
+        # Progress bar
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setVisible(False)
+        self.analysis_progress.setFixedHeight(6)
+        layout.addWidget(self.analysis_progress)
+
+        # Status message
+        self.status_message = QLabel("Ready for analysis")
+        self.status_message.setFont(QFont("Consolas", 8))
+        self.status_message.setStyleSheet("color: #888;")
+        layout.addWidget(self.status_message)
+
+        return frame
+
+    def create_schedule_section(self) -> QGroupBox:
+        """Create upcoming schedule display"""
+        group = QGroupBox("UPCOMING SCHEDULE")
+        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        layout = QVBoxLayout(group)
+
+        # Filters
+        filter_layout = QHBoxLayout()
+        
+        days_label = QLabel("DAYS:")
+        days_label.setFont(QFont("Consolas", 8))
+        filter_layout.addWidget(days_label)
+        
         self.days_spin = QSpinBox()
         self.days_spin.setRange(1, 30)
-        self.days_spin.setValue(7)
-        self.days_spin.setSuffix(" days")
-        date_layout.addWidget(self.days_spin)
-        layout.addLayout(date_layout)
+        self.days_spin.setValue(14)
+        self.days_spin.setFixedSize(50, 20)
+        self.days_spin.setFont(QFont("Consolas", 8))
+        filter_layout.addWidget(self.days_spin)
+        
+        filter_layout.addStretch()
+        
+        # Away games only checkbox
+        self.away_only_check = QCheckBox("Away Games Only")
+        self.away_only_check.setChecked(True)
+        self.away_only_check.setFont(QFont("Consolas", 8))
+        filter_layout.addWidget(self.away_only_check)
+        
+        layout.addLayout(filter_layout)
+
+        # Schedule list
+        self.schedule_list = QListWidget()
+        self.schedule_list.setFont(QFont("Consolas", 8))
+        self.schedule_list.setMaximumHeight(120)
+        layout.addWidget(self.schedule_list)
 
         return group
 
-    def create_statistics_section(self) -> QGroupBox:
-        """Create live travel statistics with league-aware labeling"""
-        group = QGroupBox("TRAVEL STATISTICS")
+    def create_tools_section(self) -> QGroupBox:
+        """Create analysis tools"""
+        group = QGroupBox("ANALYSIS TOOLS")
+        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         layout = QVBoxLayout(group)
 
-        # Statistics labels
-        stats_layout = QHBoxLayout()
+        # Quick analysis buttons
+        tools_layout = QHBoxLayout()
+        
+        self.season_analysis_btn = QPushButton("SEASON ANALYSIS")
+        self.season_analysis_btn.setFixedHeight(25)
+        self.season_analysis_btn.setFont(QFont("Consolas", 8))
+        tools_layout.addWidget(self.season_analysis_btn)
+        
+        self.compare_btn = QPushButton("COMPARE TEAMS")
+        self.compare_btn.setFixedHeight(25)
+        self.compare_btn.setFont(QFont("Consolas", 8))
+        tools_layout.addWidget(self.compare_btn)
+        
+        layout.addLayout(tools_layout)
 
-        left_stats = QVBoxLayout()
-        self.total_travel_label = QLabel("Total Travel: 0")
-        self.active_travel_label = QLabel("This Week: 0")
-        self.teams_traveling_label = QLabel("Teams: 0")
-        left_stats.addWidget(self.total_travel_label)
-        left_stats.addWidget(self.active_travel_label)
-        left_stats.addWidget(self.teams_traveling_label)
-
-        right_stats = QVBoxLayout()
-        self.avg_distance_label = QLabel("Avg Distance: 0 mi")
-        self.longest_trip_label = QLabel("Longest: N/A")
-        self.busiest_route_label = QLabel("Busiest: N/A")
-        right_stats.addWidget(self.avg_distance_label)
-        right_stats.addWidget(self.longest_trip_label)
-        right_stats.addWidget(self.busiest_route_label)
-
-        stats_layout.addLayout(left_stats)
-        stats_layout.addLayout(right_stats)
-        layout.addLayout(stats_layout)
-
-        # Progress bar for data updates
-        self.data_progress = QProgressBar()
-        self.data_progress.setVisible(False)
-        layout.addWidget(self.data_progress)
-
-        return group
-
-    def create_travel_section(self) -> QGroupBox:
-        """Create active travel list with league-aware labeling"""
-        group = QGroupBox("TEAM TRAVEL")
-        layout = QVBoxLayout(group)
-
-        # Search box
-        search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("Search:"))
-        self.travel_search = QLineEdit()
-        self.travel_search.setPlaceholderText("Team, city, or route...")
-        search_layout.addWidget(self.travel_search)
-        layout.addLayout(search_layout)
-
-        # Travel list
-        self.travel_list = QListWidget()
-        self.travel_list.setMaximumHeight(200)
-        layout.addWidget(self.travel_list)
-
-        # Travel details
-        self.travel_details = QTextEdit()
-        self.travel_details.setMaximumHeight(100)
-        self.travel_details.setReadOnly(True)
-        self.travel_details.setPlaceholderText("Select travel to see details...")
-        layout.addWidget(self.travel_details)
-
-        return group
-
-    def create_route_section(self) -> QGroupBox:
-        """Create route explorer section"""
-        group = QGroupBox("ROUTE EXPLORER")
-        layout = QVBoxLayout(group)
-
-        # Route inputs
-        route_layout = QHBoxLayout()
-
-        # Departure
-        dep_layout = QVBoxLayout()
-        dep_layout.addWidget(QLabel("From:"))
-        self.departure_input = QComboBox()
-        self.departure_input.setEditable(True)
-        self.departure_input.setPlaceholderText("City name")
-        dep_layout.addWidget(self.departure_input)
-
-        # Arrival
-        arr_layout = QVBoxLayout()
-        arr_layout.addWidget(QLabel("To:"))
-        self.arrival_input = QComboBox()
-        self.arrival_input.setEditable(True)
-        self.arrival_input.setPlaceholderText("City name")
-        arr_layout.addWidget(self.arrival_input)
-
-        route_layout.addLayout(dep_layout)
-        route_layout.addLayout(arr_layout)
-
-        # Find route button
-        self.find_route_btn = QPushButton("FIND TRAVEL")
-        route_layout.addWidget(self.find_route_btn)
-
-        layout.addLayout(route_layout)
-
-        # Route results
-        self.route_results = QLabel("Enter departure and arrival cities")
-        self.route_results.setWordWrap(True)
-        self.route_results.setStyleSheet("color: #888; font-style: italic;")
-        layout.addWidget(self.route_results)
+        # Export/Settings
+        export_layout = QHBoxLayout()
+        
+        self.export_btn = QPushButton("EXPORT DATA")
+        self.export_btn.setFixedHeight(20)
+        self.export_btn.setFont(QFont("Consolas", 7))
+        export_layout.addWidget(self.export_btn)
+        
+        self.settings_btn = QPushButton("⚙ SETTINGS")
+        self.settings_btn.setFixedHeight(20)
+        self.settings_btn.setFont(QFont("Consolas", 7))
+        export_layout.addWidget(self.settings_btn)
+        
+        layout.addLayout(export_layout)
 
         return group
 
     def connect_signals(self):
-        """Connect UI signals"""
+        """Connect all UI signals"""
         # League buttons
         self.mlb_btn.clicked.connect(lambda: self.on_league_changed("MLB"))
         self.nba_btn.clicked.connect(lambda: self.on_league_changed("NBA"))
         self.nhl_btn.clicked.connect(lambda: self.on_league_changed("NHL"))
-        self.nfl_btn.clicked.connect(lambda: self.on_league_changed("NFL"))
 
-        # Refresh button
+        # Team selection
+        self.team_combo.currentTextChanged.connect(self.on_team_changed)
+        
+        # Analysis trigger
+        self.analyze_btn.clicked.connect(self.trigger_amadeus_analysis)
+        
+        # Refresh
         self.refresh_btn.clicked.connect(self.refreshRequested.emit)
+        
+        # Schedule filters
+        self.days_spin.valueChanged.connect(self.update_schedule_display)
+        self.away_only_check.stateChanged.connect(self.update_schedule_display)
 
-        # Filter controls
-        self.team_combo.currentTextChanged.connect(self.update_filters)
-        self.travel_search.textChanged.connect(self.filter_travel)
-
-        # Confidence checkboxes
-        for checkbox in self.confidence_checkboxes.values():
-            checkbox.stateChanged.connect(self.update_filters)
-
-        # Travel selection
-        self.travel_list.currentItemChanged.connect(self.on_travel_selected)
-
-        # Route explorer
-        self.find_route_btn.clicked.connect(self.find_route)
+    def apply_bloomberg_styles(self):
+        """Apply Bloomberg Terminal-inspired styling"""
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #0A0E1A;
+                color: #E0E6ED;
+                font-family: 'Consolas', 'Courier New', monospace;
+            }
+            
+            QFrame {
+                border: 1px solid #1E2A3A;
+                border-radius: 4px;
+                background-color: #0F1419;
+            }
+            
+            QPushButton {
+                background-color: #1A2332;
+                border: 1px solid #2A3441;
+                border-radius: 3px;
+                padding: 4px 8px;
+                color: #E0E6ED;
+                font-weight: bold;
+            }
+            
+            QPushButton:hover {
+                background-color: #243040;
+                border-color: #3A4651;
+            }
+            
+            QPushButton:checked {
+                background-color: #FF6B00;
+                color: white;
+                border-color: #FF8533;
+            }
+            
+            QPushButton:pressed {
+                background-color: #0F1824;
+            }
+            
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #2A3441;
+                border-radius: 6px;
+                margin-top: 1ex;
+                padding-top: 12px;
+                background-color: #111922;
+            }
+            
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 8px 0 8px;
+                color: #00FF88;
+                font-size: 9px;
+                letter-spacing: 1px;
+            }
+            
+            QLabel {
+                background: transparent;
+                border: none;
+            }
+            
+            QComboBox {
+                background-color: #1A2332;
+                border: 1px solid #2A3441;
+                border-radius: 3px;
+                padding: 2px 6px;
+                color: #E0E6ED;
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border: none;
+                color: #E0E6ED;
+            }
+            
+            QComboBox QAbstractItemView {
+                background-color: #1A2332;
+                color: #E0E6ED;
+                border: 1px solid #2A3441;
+                selection-background-color: #FF6B00;
+            }
+            
+            QSpinBox {
+                background-color: #1A2332;
+                border: 1px solid #2A3441;
+                border-radius: 3px;
+                padding: 2px;
+                color: #E0E6ED;
+            }
+            
+            QCheckBox {
+                color: #E0E6ED;
+                spacing: 5px;
+            }
+            
+            QCheckBox::indicator {
+                width: 12px;
+                height: 12px;
+                border: 1px solid #2A3441;
+                border-radius: 2px;
+                background-color: #1A2332;
+            }
+            
+            QCheckBox::indicator:checked {
+                background-color: #00FF88;
+            }
+            
+            QListWidget {
+                background-color: #0F1419;
+                border: 1px solid #2A3441;
+                border-radius: 4px;
+                alternate-background-color: #111922;
+            }
+            
+            QListWidget::item {
+                padding: 3px;
+                border-bottom: 1px solid #1E2A3A;
+            }
+            
+            QListWidget::item:selected {
+                background-color: #FF6B00;
+                color: white;
+            }
+            
+            QTextEdit {
+                background-color: #0F1419;
+                border: 1px solid #2A3441;
+                border-radius: 4px;
+                font-family: 'Consolas', monospace;
+            }
+            
+            QProgressBar {
+                border: 1px solid #2A3441;
+                border-radius: 3px;
+                text-align: center;
+                background-color: #1A2332;
+            }
+            
+            QProgressBar::chunk {
+                background-color: #00FF88;
+                border-radius: 2px;
+            }
+        """)
 
     def on_league_changed(self, league: str):
-        """Handle league change with proper button management"""
+        """Handle league change"""
         if not self.sender().isChecked():
-            # Prevent unchecking the current league
             self.sender().setChecked(True)
-            return
-        
-        # Update current league
-        self.current_league = league
-        
-        # Uncheck other league buttons
-        for btn in [self.mlb_btn, self.nba_btn, self.nhl_btn, self.nfl_btn]:
-            if btn != self.sender():
-                btn.setChecked(False)
-        
-        # Update UI for new league
-        self.update_ui_for_league(league)
-        
-        # Emit signal
-        self.modeChanged.emit(league)
-
-    def update_ui_for_league(self, league: str):
-        """Update UI elements for the selected league"""
-        # Update labels to be league-specific
-        league_info = {
-            "MLB": {"season_length": 162, "teams": 30},
-            "NBA": {"season_length": 82, "teams": 30},
-            "NHL": {"season_length": 82, "teams": 32},
-            "NFL": {"season_length": 17, "teams": 32}
-        }
-        
-        info = league_info.get(league, {"season_length": 0, "teams": 0})
-        
-        # Update team combo placeholder
-        self.team_combo.clear()
-        self.team_combo.addItem(f"All {league} Teams", "")
-        
-        # Update search placeholder
-        self.travel_search.setPlaceholderText(f"{league} team, city, or route...")
-        
-        # Update statistics labels if no data
-        if not self.travel_data:
-            self.total_travel_label.setText("Total Travel: 0")
-            self.active_travel_label.setText("This Week: 0") 
-            self.teams_traveling_label.setText(f"{league} Teams: 0")
-
-    def apply_styles(self):
-        """Apply enhanced styles for sports theme with multi-league support"""
-        style = """
-        QWidget {
-            background-color: rgba(5, 25, 45, 220);
-            color: white;
-            font-family: 'Consolas', 'Monaco', monospace;
-            border-radius: 6px;
-        }
-
-        QPushButton {
-            background-color: rgba(0, 100, 180, 140);
-            border: 1px solid rgba(100, 150, 200, 150);
-            border-radius: 4px;
-            padding: 8px 16px;
-            font-weight: bold;
-            font-size: 11px;
-            min-height: 20px;
-        }
-
-        QPushButton:checked {
-            background-color: rgba(0, 150, 250, 200);
-            border: 2px solid rgba(100, 200, 255, 220);
-        }
-
-        QPushButton:hover {
-            background-color: rgba(0, 120, 200, 160);
-        }
-
-        QPushButton:disabled {
-            background-color: rgba(60, 60, 60, 100);
-            color: rgba(150, 150, 150, 150);
-            border: 1px solid rgba(80, 80, 80, 100);
-        }
-
-        /* League-specific button colors */
-        QPushButton[objectName="mlb_btn"]:checked {
-            background-color: rgba(0, 150, 0, 200);
-            border: 2px solid rgba(100, 255, 100, 220);
-        }
-
-        QPushButton[objectName="nba_btn"]:checked {
-            background-color: rgba(255, 100, 0, 200);
-            border: 2px solid rgba(255, 150, 100, 220);
-        }
-
-        QPushButton[objectName="nhl_btn"]:checked {
-            background-color: rgba(150, 0, 150, 200);
-            border: 2px solid rgba(200, 100, 200, 220);
-        }
-
-        QGroupBox {
-            font-weight: bold;
-            border: 1px solid rgba(100, 150, 200, 120);
-            border-radius: 6px;
-            margin-top: 1ex;
-            padding-top: 12px;
-            font-size: 11px;
-        }
-
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 12px;
-            padding: 0 8px 0 8px;
-            color: rgba(200, 220, 255, 255);
-        }
-
-        QLabel {
-            color: rgba(220, 220, 220, 255);
-            font-size: 11px;
-        }
-
-        QComboBox, QLineEdit, QSpinBox {
-            background-color: rgba(20, 40, 70, 180);
-            border: 1px solid rgba(100, 150, 200, 120);
-            border-radius: 3px;
-            padding: 4px 8px;
-            color: white;
-            font-size: 10px;
-        }
-
-        QComboBox::drop-down {
-            border: none;
-            width: 20px;
-        }
-
-        QComboBox::down-arrow {
-            border: none;
-            color: white;
-        }
-
-        QComboBox QAbstractItemView {
-            background-color: rgba(15, 30, 55, 250);
-            color: white;
-            border: 1px solid rgba(100, 150, 200, 150);
-            selection-background-color: rgba(0, 120, 200, 180);
-        }
-
-        QCheckBox {
-            color: rgba(200, 200, 200, 255);
-            spacing: 5px;
-            font-size: 10px;
-        }
-
-        QCheckBox::indicator {
-            width: 14px;
-            height: 14px;
-            border: 1px solid rgba(100, 150, 200, 150);
-            border-radius: 2px;
-            background-color: rgba(20, 40, 70, 150);
-        }
-
-        QCheckBox::indicator:checked {
-            background-color: rgba(0, 150, 250, 200);
-        }
-
-        QListWidget {
-            background-color: rgba(10, 25, 45, 200);
-            border: 1px solid rgba(100, 150, 200, 100);
-            border-radius: 4px;
-            font-size: 10px;
-        }
-
-        QListWidget::item {
-            padding: 4px;
-            border-bottom: 1px solid rgba(100, 150, 200, 50);
-        }
-
-        QListWidget::item:selected {
-            background-color: rgba(0, 120, 200, 150);
-        }
-
-        QTextEdit {
-            background-color: rgba(10, 25, 45, 200);
-            border: 1px solid rgba(100, 150, 200, 100);
-            border-radius: 4px;
-            font-size: 10px;
-            font-family: 'Consolas', monospace;
-        }
-
-        QProgressBar {
-            border: 1px solid rgba(100, 150, 200, 100);
-            border-radius: 3px;
-            text-align: center;
-            font-size: 10px;
-        }
-
-        QProgressBar::chunk {
-            background-color: rgba(0, 150, 250, 180);
-            border-radius: 2px;
-        }
-        """
-        self.setStyleSheet(style)
-        
-        # Set object names for league-specific styling
-        self.mlb_btn.setObjectName("mlb_btn")
-        self.nba_btn.setObjectName("nba_btn")
-        self.nhl_btn.setObjectName("nhl_btn")
-
-    def update_flight_data(self, travel_data: List):
-        """Update the panel with new travel data"""
-        self.travel_data = travel_data
-        self.update_statistics()
-        self.update_team_filter()
-        self.update_city_filters()
-        self.filter_travel()
-
-    def update_statistics(self):
-        """Update travel statistics with league awareness"""
-        if not self.travel_data:
-            self.total_travel_label.setText("Total Travel: 0")
-            self.active_travel_label.setText("This Week: 0")
-            self.teams_traveling_label.setText(f"{self.current_league} Teams: 0")
-            self.avg_distance_label.setText("Avg Distance: 0 mi")
-            self.longest_trip_label.setText("Longest: N/A")
-            self.busiest_route_label.setText("Busiest: N/A")
-            return
-
-        from datetime import datetime, timedelta
-
-        total = len(self.travel_data)
-
-        # Count travel this week - handle timezone aware/naive datetime comparison
-        week_start = datetime.now()
-        week_end = week_start + timedelta(days=7)
-
-        this_week = 0
-        for t in self.travel_data:
-            if hasattr(t, 'travel_date') and t.travel_date:
-                # Convert to naive datetime if timezone-aware
-                travel_date = t.travel_date
-                if hasattr(travel_date, 'tzinfo') and travel_date.tzinfo is not None:
-                    travel_date = travel_date.replace(tzinfo=None)
-
-                if week_start <= travel_date <= week_end:
-                    this_week += 1
-
-        # Count unique teams
-        teams = set()
-        for travel in self.travel_data:
-            if hasattr(travel, 'team_id') and travel.team_id:
-                teams.add(travel.team_id)
-
-        # Calculate distance statistics (simplified)
-        distances = []
-        routes = {}
-        longest_distance = 0
-        longest_route = "N/A"
-
-        for travel in self.travel_data:
-            if hasattr(travel, 'departure_city') and hasattr(travel, 'arrival_city'):
-                route = f"{travel.departure_city}-{travel.arrival_city}"
-                routes[route] = routes.get(route, 0) + 1
-
-                # Estimate distance (very simplified)
-                dist = self.estimate_distance(travel.departure_city, travel.arrival_city)
-                if dist > 0:
-                    distances.append(dist)
-                    if dist > longest_distance:
-                        longest_distance = dist
-                        longest_route = route
-
-        avg_distance = int(sum(distances) / len(distances)) if distances else 0
-
-        # Find busiest route
-        busiest_route = "N/A"
-        if routes:
-            busiest_route = max(routes.items(), key=lambda x: x[1])[0]
-
-        # Update labels with league context
-        self.total_travel_label.setText(f"Total Travel: {total}")
-        self.active_travel_label.setText(f"This Week: {this_week}")
-        self.teams_traveling_label.setText(f"{self.current_league} Teams: {len(teams)}")
-        self.avg_distance_label.setText(f"Avg Distance: {avg_distance:,} mi")
-        self.longest_trip_label.setText(f"Longest: {longest_route}")
-        self.busiest_route_label.setText(f"Busiest: {busiest_route}")
-
-    def estimate_distance(self, city1: str, city2: str) -> int:
-        """Estimate distance between cities (enhanced for multi-league)"""
-        # Enhanced distance map including NBA/NHL cities
-        distance_map = {
-            # MLB distances (existing)
-            ("Los Angeles", "New York"): 2445,
-            ("New York", "Los Angeles"): 2445,
-            ("Chicago", "Los Angeles"): 1745,
-            ("Los Angeles", "Chicago"): 1745,
-            ("Boston", "Los Angeles"): 2596,
-            ("Los Angeles", "Boston"): 2596,
-            ("New York", "Chicago"): 790,
-            ("Chicago", "New York"): 790,
-            ("Miami", "Seattle"): 2724,
-            ("Seattle", "Miami"): 2724,
-            ("Dallas", "Boston"): 1551,
-            ("Boston", "Dallas"): 1551,
-            
-            # NBA/NHL specific distances
-            ("San Francisco", "Miami"): 2590,
-            ("Denver", "Orlando"): 1530,
-            ("Portland", "Charlotte"): 2350,
-            ("Sacramento", "Brooklyn"): 2440,
-            ("Salt Lake City", "Atlanta"): 1590,
-            ("Oklahoma City", "Boston"): 1405,
-            ("Memphis", "Los Angeles"): 1535,
-            ("New Orleans", "Seattle"): 2080,
-            ("San Antonio", "Detroit"): 1145,
-            
-            # Canadian cities
-            ("Toronto", "Los Angeles"): 2176,
-            ("Montreal", "Vancouver"): 2303,
-            ("Calgary", "Boston"): 2091,
-            ("Edmonton", "New York"): 2045,
-            ("Ottawa", "Los Angeles"): 2243,
-            ("Winnipeg", "Miami"): 1544,
-        }
-
-        key1 = (city1, city2)
-        key2 = (city2, city1)
-
-        if key1 in distance_map:
-            return distance_map[key1]
-        elif key2 in distance_map:
-            return distance_map[key2]
-        else:
-            # League-specific default estimates
-            league_defaults = {
-                "MLB": 1200,  # Average MLB travel distance
-                "NBA": 1100,  # Average NBA travel distance  
-                "NHL": 1000,  # Average NHL travel distance
-                "NFL": 900    # Average NFL travel distance
-            }
-            return league_defaults.get(self.current_league, 1000)
-
-    def update_team_filter(self):
-        """Update team filter dropdown with league awareness"""
-        current_text = self.team_combo.currentText()
-        self.team_combo.clear()
-        self.team_combo.addItem(f"All {self.current_league} Teams", "")
-
-        teams = set()
-        for travel in self.travel_data:
-            if hasattr(travel, 'team_name') and hasattr(travel, 'team_id'):
-                team_name = travel.team_name
-                team_id = travel.team_id
-                if team_name and team_id:
-                    teams.add((team_name, team_id))
-
-        for team_name, team_id in sorted(teams):
-            self.team_combo.addItem(f"{team_name} ({team_id.upper()})", team_id)
-
-        # Restore selection if possible
-        index = self.team_combo.findText(current_text)
-        if index >= 0:
-            self.team_combo.setCurrentIndex(index)
-
-    def update_city_filters(self):
-        """Update city filter dropdowns"""
-        cities = set()
-        for travel in self.travel_data:
-            if hasattr(travel, 'departure_city') and hasattr(travel, 'arrival_city'):
-                dep_city = travel.departure_city
-                arr_city = travel.arrival_city
-                if dep_city:
-                    cities.add(dep_city)
-                if arr_city:
-                    cities.add(arr_city)
-
-        # Update departure combo
-        current_dep = self.departure_input.currentText()
-        self.departure_input.clear()
-        for city in sorted(cities):
-            self.departure_input.addItem(city)
-
-        # Update arrival combo
-        current_arr = self.arrival_input.currentText()
-        self.arrival_input.clear()
-        for city in sorted(cities):
-            self.arrival_input.addItem(city)
-
-        # Restore selections
-        dep_index = self.departure_input.findText(current_dep)
-        if dep_index >= 0:
-            self.departure_input.setCurrentIndex(dep_index)
-
-        arr_index = self.arrival_input.findText(current_arr)
-        if arr_index >= 0:
-            self.arrival_input.setCurrentIndex(arr_index)
-
-    def update_filters(self):
-        """Update filters and emit signals"""
-        # Get selected team
-        selected_team = self.team_combo.currentData()
-        if selected_team:
-            self.airlineFilterChanged.emit([selected_team])
-        else:
-            self.airlineFilterChanged.emit([])
-
-        # Get selected confidence levels
-        selected_confidence = []
-        for confidence_code, checkbox in self.confidence_checkboxes.items():
-            if checkbox.isChecked():
-                selected_confidence.append(confidence_code)
-
-        self.statusFilterChanged.emit(selected_confidence)
-        self.filter_travel()
-
-    def filter_travel(self):
-        """Filter travel based on current criteria"""
-        search_text = self.travel_search.text().lower()
-        selected_team = self.team_combo.currentData()
-        selected_confidence = [code for code, cb in self.confidence_checkboxes.items() if cb.isChecked()]
-        days_ahead = self.days_spin.value()
-
-        from datetime import datetime, timedelta
-        cutoff_date = datetime.now() + timedelta(days=days_ahead)
-
-        filtered = []
-        for travel in self.travel_data:
-            if not hasattr(travel, 'team_name'):
-                continue
-
-            # Text search
-            if search_text:
-                searchable_text = (
-                    f"{getattr(travel, 'team_name', '')} "
-                    f"{getattr(travel, 'departure_city', '')} "
-                    f"{getattr(travel, 'arrival_city', '')} "
-                    f"{getattr(travel, 'team_id', '')}"
-                ).lower()
-
-                if search_text not in searchable_text:
-                    continue
-
-            # Team filter
-            if selected_team and getattr(travel, 'team_id', '') != selected_team:
-                continue
-
-            # Confidence filter
-            if selected_confidence and getattr(travel, 'confidence', '') not in selected_confidence:
-                continue
-
-            # Date filter - handle timezone aware/naive datetime comparison
-            if hasattr(travel, 'travel_date') and travel.travel_date:
-                # Convert to naive datetime if timezone-aware for comparison
-                travel_date = travel.travel_date
-                if hasattr(travel_date, 'tzinfo') and travel_date.tzinfo is not None:
-                    travel_date = travel_date.replace(tzinfo=None)
-
-                if travel_date > cutoff_date:
-                    continue
-
-            filtered.append(travel)
-
-        self.filtered_travel = filtered
-        self.update_travel_list()
-
-    def update_travel_list(self):
-        """Update the travel list widget with league-aware icons"""
-        self.travel_list.clear()
-
-        # League-specific confidence icons
-        league_icons = {
-            "MLB": {
-                'schedule_inferred': '⚾',
-                'confirmed': '✅',
-                'demo': '🎭',
-                'historical': '📚'
-            },
-            "NBA": {
-                'schedule_inferred': '🏀',
-                'confirmed': '✅',
-                'demo': '🎭',
-                'historical': '📚'
-            },
-            "NHL": {
-                'schedule_inferred': '🏒',
-                'confirmed': '✅',
-                'demo': '🎭',
-                'historical': '📚'
-            }
-        }
-
-        icons = league_icons.get(self.current_league, league_icons["MLB"])
-
-        for travel in self.filtered_travel[:50]:  # Limit to 50 for performance
-            if not hasattr(travel, 'team_name'):
-                continue
-
-            # Create list item text with league-specific icon
-            confidence_icon = icons.get(getattr(travel, 'confidence', ''), '❓')
-
-            travel_date = getattr(travel, 'travel_date', None)
-            date_text = ""
-            if travel_date:
-                date_text = f" ({travel_date.strftime('%m/%d')})"
-
-            opponent_text = ""
-            if hasattr(travel, 'opponent') and travel.opponent:
-                opponent_text = f" vs {travel.opponent}"
-
-            item_text = (f"{confidence_icon} {travel.team_name} "
-                        f"{travel.departure_city}→{travel.arrival_city}"
-                        f"{date_text}{opponent_text}")
-
-            item = QListWidgetItem(item_text)
-            item.setData(Qt.ItemDataRole.UserRole, travel)
-            self.travel_list.addItem(item)
-
-    def on_travel_selected(self, current_item, previous_item):
-        """Handle travel selection with league-aware details"""
-        if not current_item:
-            self.travel_details.clear()
-            return
-
-        travel = current_item.data(Qt.ItemDataRole.UserRole)
-        if not travel or not hasattr(travel, 'team_name'):
-            return
-
-        # Format travel details with league context
-        details = []
-        details.append(f"League: {self.current_league}")
-        details.append(f"Team: {travel.team_name}")
-        details.append(f"Team ID: {getattr(travel, 'team_id', 'Unknown').upper()}")
-        details.append(f"Route: {travel.departure_city} → {travel.arrival_city}")
-        details.append(f"Confidence: {getattr(travel, 'confidence', 'Unknown')}")
-
-        if hasattr(travel, 'travel_date') and travel.travel_date:
-            details.append(f"Travel Date: {travel.travel_date.strftime('%Y-%m-%d %H:%M')}")
-
-        if hasattr(travel, 'game_date') and travel.game_date:
-            details.append(f"Game Date: {travel.game_date.strftime('%Y-%m-%d %H:%M')}")
-
-        if hasattr(travel, 'opponent') and travel.opponent:
-            details.append(f"Opponent: {travel.opponent}")
-
-        if hasattr(travel, 'departure_airport') and travel.departure_airport:
-            details.append(f"Departure Airport: {travel.departure_airport}")
-
-        if hasattr(travel, 'arrival_airport') and travel.arrival_airport:
-            details.append(f"Arrival Airport: {travel.arrival_airport}")
-
-        self.travel_details.setText('\n'.join(details))
-
-        # Emit signal with team ID or game ID
-        travel_id = getattr(travel, 'team_id', '') or getattr(travel, 'game_id', '')
-        if travel_id:
-            self.flightSelected.emit(travel_id)
-
-    def find_route(self):
-        """Find travel for specified route with league context"""
-        departure = self.departure_input.currentText()
-        arrival = self.arrival_input.currentText()
-
-        if not departure or not arrival:
-            self.route_results.setText("Please enter both departure and arrival cities")
-            return
-
-        # Find matching travel
-        route_travel = [t for t in self.travel_data
-                       if (hasattr(t, 'departure_city') and hasattr(t, 'arrival_city') and
-                           t.departure_city == departure and t.arrival_city == arrival)]
-
-        if route_travel:
-            count = len(route_travel)
-            teams = set(getattr(t, 'team_name', 'Unknown') for t in route_travel)
-            self.route_results.setText(
-                f"Found {count} {self.current_league} travel record(s) for {departure}→{arrival}\n"
-                f"Teams: {', '.join(sorted(teams))}"
-            )
-        else:
-            self.route_results.setText(f"No {self.current_league} travel found for {departure}→{arrival}")
-
-        self.routeFilterChanged.emit(departure, arrival)
-
-    def update_fps(self, fps: float):
-        """Update FPS display"""
-        # This method exists for compatibility but FPS display is in main window
-        pass
-
-    def set_loading_progress(self, progress: int):
-        """Set loading progress"""
-        if progress > 0 and progress < 100:
-            self.data_progress.setVisible(True)
-            self.data_progress.setValue(progress)
-        else:
-            self.data_progress.setVisible(False)
-
-    def set_connection_status(self, connected: bool):
-        """Update connection status with league context"""
-        if connected:
-            self.status_label.setText(f"● {self.current_league} CONNECTED")
-            self.status_label.setStyleSheet("color: #00FF00;")
-        else:
-            self.status_label.setText(f"● {self.current_league} DISCONNECTED")
-            self.status_label.setStyleSheet("color: #FF0000;")
-
-    def set_current_league(self, league: str):
-        """Set current league and update UI accordingly"""
-        if league not in ["MLB", "NBA", "NHL", "NFL"]:
             return
         
         self.current_league = league
         
         # Update button states
-        self.mlb_btn.setChecked(league == "MLB")
-        self.nba_btn.setChecked(league == "NBA") 
-        self.nhl_btn.setChecked(league == "NHL")
-        self.nfl_btn.setChecked(league == "NFL")
+        for btn in [self.mlb_btn, self.nba_btn, self.nhl_btn]:
+            if btn != self.sender():
+                btn.setChecked(False)
         
-        # Update UI for new league
         self.update_ui_for_league(league)
+        self.modeChanged.emit(league)
+
+    def on_team_changed(self, team_abbr: str):
+        """Handle team selection change"""
+        if team_abbr:
+            self.teamChanged.emit(team_abbr)
+
+    def trigger_amadeus_analysis(self):
+        """Trigger Amadeus analysis for selected team"""
+        team_abbr = self.team_combo.currentData()
+        if team_abbr:
+            days_ahead = self.days_spin.value()
+            self.amadeusAnalysisRequested.emit(team_abbr, days_ahead)
+            
+            # Show that analysis is starting
+            self.analysis_progress.setVisible(True)
+            self.analysis_progress.setValue(0)
+            self.analyze_btn.setEnabled(False)
+            self.status_message.setText("Starting analysis...")
+
+    def on_analysis_progress(self, percentage: int, message: str):
+        """Handle analysis progress updates"""
+        self.analysis_progress.setValue(percentage)
+        self.status_message.setText(message)
+
+    def on_amadeus_complete(self, intelligence):
+        """Handle completed Amadeus analysis"""
+        self.analysis_progress.setVisible(False)
+        self.analyze_btn.setEnabled(True)
+        self.status_message.setText("Analysis complete")
+        
+        self.current_intelligence = intelligence
+        self.update_intelligence_display(intelligence)
+
+    def on_analysis_error(self, error_message: str):
+        """Handle analysis errors"""
+        self.analysis_progress.setVisible(False)
+        self.analyze_btn.setEnabled(True)
+        self.status_message.setText(f"Error: {error_message}")
+
+    def update_intelligence_display(self, intelligence):
+        """Update the intelligence display with Amadeus data (FIXED ROUTE FORMAT)"""
+        if not intelligence:
+            return
+    
+        # Update key metrics
+        complexity = intelligence.travel_complexity_score
+        self.complexity_label.setText(f"COMPLEXITY: {complexity:.1f}/100")
+        
+        if complexity > 75:
+            self.complexity_label.setStyleSheet("color: #FF4444; font-weight: bold;")
+        elif complexity > 50:
+            self.complexity_label.setStyleSheet("color: #FF8800; font-weight: bold;")
+        else:
+            self.complexity_label.setStyleSheet("color: #00FF88; font-weight: bold;")
+    
+        # Risk level
+        if intelligence.highest_risk_route:
+            risk_confidence = intelligence.highest_risk_route.travel_confidence
+            self.risk_label.setText(f"RISK LEVEL: {risk_confidence}")
+            
+            if risk_confidence == "LOW":
+                self.risk_label.setStyleSheet("color: #FF4444; font-weight: bold;")
+            elif risk_confidence == "MEDIUM":
+                self.risk_label.setStyleSheet("color: #FF8800; font-weight: bold;")
+            else:
+                self.risk_label.setStyleSheet("color: #00FF88; font-weight: bold;")
+        else:
+            self.risk_label.setText("RISK LEVEL: MINIMAL")
+            self.risk_label.setStyleSheet("color: #00FF88; font-weight: bold;")
+    
+        # Distance and routes
+        total_distance = intelligence.total_travel_distance
+        self.distance_label.setText(f"TOTAL DISTANCE: {total_distance:.0f} MI")
+        
+        route_count = len(intelligence.upcoming_routes)
+        self.routes_label.setText(f"ROUTES: {route_count}")
+    
+        # Airport Performance (average of all routes)
+        if intelligence.upcoming_routes:
+            avg_airport_perf = sum(
+                r.primary_airport.on_time_probability for r in intelligence.upcoming_routes 
+                if r.primary_airport
+            ) / len(intelligence.upcoming_routes)
+            self.airport_perf_label.setText(f"AIRPORT PERF: {avg_airport_perf*100:.0f}%")
+            
+            # Hotel Quality (average of best hotels per route)
+            avg_hotel_quality = sum(
+                max(h.overall_rating for h in r.destination_hotels) if r.destination_hotels else 75
+                for r in intelligence.upcoming_routes
+            ) / len(intelligence.upcoming_routes)
+            self.hotel_quality_label.setText(f"HOTEL QUALITY: {avg_hotel_quality:.0f}%")
+        else:
+            self.airport_perf_label.setText("AIRPORT PERF: --")
+            self.hotel_quality_label.setText("HOTEL QUALITY: --")
+    
+        # *** FIXED: Route Breakdown with proper departure → arrival airport codes ***
+        route_breakdown_text = ""
+        for i, route in enumerate(intelligence.upcoming_routes, 1):
+            try:
+                # Get airport codes from linked travel data
+                if route.travel_data:
+                    departure_airport = route.travel_data.departure_airport or "UNK"
+                    arrival_airport = route.travel_data.arrival_airport or "UNK"
+                    game_date = route.travel_data.game_date.strftime("%m/%d") if route.travel_data.game_date else "TBD"
+                    opponent = route.travel_data.opponent or "UNK"
+                else:
+                    # Fallback to RouteInsights data
+                    departure_airport = "UNK"
+                    arrival_airport = route.primary_airport.iata_code if route.primary_airport else "UNK"
+                    game_date = route.game_data.date.strftime("%m/%d") if route.game_data.date else "TBD"
+                    
+                    # Determine opponent from game data
+                    if route.game_data.home_team.team_id == intelligence.team_info.team_id:
+                        opponent = route.game_data.away_team.abbreviation
+                    else:
+                        opponent = route.game_data.home_team.abbreviation
+                
+                confidence = route.travel_confidence
+                distance = route.travel_distance
+                
+                # *** PERFECT FORMAT: departure_airport → arrival_airport vs opponent [CONFIDENCE] DATE (distance) ***
+                route_breakdown_text += f"{i}. {departure_airport} → {arrival_airport} vs {opponent} [{confidence}] {game_date} ({distance:.0f}mi)\n"
+                
+            except Exception as e:
+                print(f"Error formatting route {i}: {e}")
+                route_breakdown_text += f"{i}. Route formatting error\n"
+        
+        self.route_breakdown.setPlainText(route_breakdown_text.strip())
+    
+        # Update alerts based on risk factors
+        all_risk_factors = []
+        for route in intelligence.upcoming_routes:
+            all_risk_factors.extend(route.risk_factors)
+        
+        if all_risk_factors:
+            alerts_text = "ALERTS: " + "; ".join(all_risk_factors[:3])  # Show top 3 alerts
+            self.alerts_label.setStyleSheet("color: #FF8800; background: rgba(40, 20, 20, 100); padding: 4px; border-radius: 3px;")
+        else:
+            alerts_text = "ALERTS: No active alerts"
+            self.alerts_label.setStyleSheet("color: #00FF88; background: rgba(20, 40, 20, 100); padding: 4px; border-radius: 3px;")
+        
+        self.alerts_label.setText(alerts_text)
+
+    def update_ui_for_league(self, league: str):
+        """Update UI elements for specific league"""
+        # This would be connected to your data aggregator to populate teams
+        pass
+
+    def update_schedule_display(self):
+        """Update the schedule display based on current filters"""
+        # This would show upcoming games for the selected team
+        pass
+
+    def load_teams_for_league(self, teams: List):
+        """Load teams into the combo box"""
+        self.team_combo.clear()
+        for team in teams:
+            self.team_combo.addItem(f"{team.abbreviation} - {team.display_name}", team.team_id)
+
+    def set_status(self, status: str, color: str = "#888"):
+        """Set status message with color"""
+        self.status_message.setText(status)
+        self.status_message.setStyleSheet(f"color: {color};")
+
+    def set_live_indicator(self, is_live: bool):
+        """Update live indicator"""
+        if is_live:
+            self.live_indicator.setText("● LIVE")
+            self.live_indicator.setStyleSheet("color: #00FF88; font-weight: bold;")
+        else:
+            self.live_indicator.setText("● OFFLINE")
+            self.live_indicator.setStyleSheet("color: #FF4444; font-weight: bold;")
