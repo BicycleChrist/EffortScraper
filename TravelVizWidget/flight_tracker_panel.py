@@ -504,11 +504,15 @@ class FlightControlPanel(QWidget):
 
 
     def on_team_selection_changed(self, text: str):
-        """Handle team selection change"""
+        """Handle team selection change - FIXED version"""
+        print(f"🎯 Team selection changed, text: '{text}'")
+        
         if self.team_combo.count() > 0:
             team_abbr = self.team_combo.currentData()
+            print(f"🎯 Current team data: '{team_abbr}'")
+            
             if team_abbr and team_abbr != "":  # Check for valid team
-                print(f"🎯 Team selection changed to: {team_abbr}")
+                print(f"✅ Valid team selected: {team_abbr}")
                 
                 # Emit signal for main window
                 self.teamChanged.emit(team_abbr)
@@ -516,28 +520,49 @@ class FlightControlPanel(QWidget):
                 # Update games for upcoming schedule display
                 self.update_upcoming_games()
                 
-                # Enable analyze button
+                # FIXED: Ensure analyze button is enabled
                 self.analyze_btn.setEnabled(True)
+                self.analyze_btn.setToolTip(f"Analyze travel for {team_abbr}")
+                print(f"✅ Analyze button enabled for {team_abbr}")
             else:
                 print("🚫 No valid team selected")
                 self.analyze_btn.setEnabled(False)
+                self.analyze_btn.setToolTip("Select a team to analyze")
         else:
             print("🚫 No teams available in combo box")
             self.analyze_btn.setEnabled(False)
+            self.analyze_btn.setToolTip("No teams available")
 
     def trigger_amadeus_analysis(self):
-        """Trigger Amadeus analysis for selected team"""
+        """Trigger Amadeus analysis for selected team - FIXED with debugging"""
+        print("🚀 Analyze button clicked!")
+        
         if self.team_combo.count() > 0:
             team_abbr = self.team_combo.currentData()
+            print(f"🎯 Selected team for analysis: '{team_abbr}'")
+            
             if team_abbr:
                 days_ahead = self.days_spin.value()
+                print(f"🔄 Requesting analysis for {team_abbr}, {days_ahead} days ahead")
+                
+                # Emit the signal
                 self.amadeusAnalysisRequested.emit(team_abbr, days_ahead)
                 
                 # Show that analysis is starting
                 self.analysis_progress.setVisible(True)
                 self.analysis_progress.setValue(0)
                 self.analyze_btn.setEnabled(False)
-                self.status_message.setText("Starting analysis...")
+                self.analyze_btn.setText("Analyzing...")
+                self.status_message.setText("Starting Amadeus analysis...")
+                
+                print("✅ Analysis request emitted successfully")
+            else:
+                print("❌ No team selected for analysis")
+                self.status_message.setText("Please select a team first")
+        else:
+            print("❌ No teams available for analysis")
+            self.status_message.setText("No teams available")
+
 
     def on_analysis_progress(self, percentage: int, message: str):
         """Handle analysis progress updates"""

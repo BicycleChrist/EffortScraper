@@ -341,8 +341,11 @@ class SportsTrackerMainWindow(QMainWindow):
 
 
     def start_amadeus_analysis(self, team_abbr: str, days_ahead: int):
-        """Start Amadeus analysis for selected team"""
+        """Start Amadeus analysis for selected team - FIXED with debugging"""
+        print(f"🚀 Main window received analysis request for {team_abbr}, {days_ahead} days")
+        
         if not self.sports_aggregator:
+            print("❌ No sports aggregator available")
             return
         
         config = self.config_loader.get_api_keys()
@@ -350,10 +353,15 @@ class SportsTrackerMainWindow(QMainWindow):
         amadeus_secret = config.get("amadeus_secret")
         
         if amadeus_key and amadeus_secret:
+            print("✅ Amadeus credentials found, setting up analyzer")
             success = self.sports_aggregator.set_amadeus_credentials(amadeus_key, amadeus_secret)
             if success:
+                print("✅ Amadeus credentials set successfully")
+                
                 # ESSENTIAL SIGNALS - Connect these first
                 if not hasattr(self, '_amadeus_signals_connected'):
+                    print("🔗 Connecting Amadeus signals...")
+                    
                     # When analysis completes successfully
                     self.sports_aggregator.amadeusIntelligenceReady.connect(
                         self.control_panel.on_analysis_complete  # ← NO PARENTHESES!
@@ -370,6 +378,7 @@ class SportsTrackerMainWindow(QMainWindow):
                     )
                     
                     self._amadeus_signals_connected = True 
+                    print("✅ Amadeus signals connected")
                 
                 # Show analysis starting in UI
                 self.control_panel.analysis_progress.setVisible(True)
@@ -377,8 +386,15 @@ class SportsTrackerMainWindow(QMainWindow):
                 self.control_panel.analyze_btn.setEnabled(False)
                 self.control_panel.status_message.setText("Starting Amadeus analysis...")
                 
+                print(f"🔄 Starting analysis for {team_abbr}...")
+                
                 # Start analysis
                 self.sports_aggregator.get_team_travel_intelligence_async(team_abbr, days_ahead)
+            else:
+                print("❌ Failed to set Amadeus credentials")
+        else:
+            print("❌ Amadeus credentials not found in config")
+            self.control_panel.status_message.setText("Amadeus API keys not configured")
     
     
 
@@ -676,38 +692,51 @@ class SportsTrackerMainWindow(QMainWindow):
             self.load_current_week_btn.setText("Current Week")
     
     def on_focus_team_changed(self):
-        """Handle focus team selection change from main window"""
+        """Handle focus team selection change from main window - FIXED"""
         team_id = self.focus_team_combo.currentData()
         season = self.season_combo.currentText()
         
         print(f"🔄 Main window focus team changed to: {team_id}")
         
-        # Sync the control panel's team combo (prevent signal loops)
-        if hasattr(self.control_panel, 'team_combo') and self.control_panel.team_combo:
-            # Temporarily disconnect signal to prevent loops
-            try:
-                self.control_panel.team_combo.currentTextChanged.disconnect()
-            except:
-                pass  # Signal might not be connected
-            
-            # Find and set the matching team in control panel
-            control_panel_index = -1
-            for i in range(self.control_panel.team_combo.count()):
-                if self.control_panel.team_combo.itemData(i) == team_id:
-                    control_panel_index = i
-                    break
-            
-            if control_panel_index >= 0:
-                self.control_panel.team_combo.setCurrentIndex(control_panel_index)
-                print(f"✅ Synced control panel to team: {team_id}")
-            else:
-                print(f"⚠️ Could not find team {team_id} in control panel combo")
-            
-            # Reconnect the signal
-            self.control_panel.update_upcoming_games()
-            self.control_panel.team_combo.currentTextChanged.connect(
-                self.control_panel.on_team_selection_changed
-            )
+        # Sync the control panel's team combo using the new programmatic method
+        if hasattr(self.control_panel, 'update_team_selection_programmatically'):
+            self.control_panel.update_team_selection_programmatically(team_id or "")
+        else:
+            # Fallback to old method if new method not available
+            if hasattr(self.control_panel, 'team_combo') and self.control_panel.team_combo:
+                # Temporarily disconnect signal to prevent loops
+                try:
+                    self.control_panel.team_combo.currentTextChanged.disconnect()
+                except:
+                    pass
+                
+                # Find and set the matching team in control panel
+                control_panel_index = -1
+                for i in range(self.control_panel.team_combo.count()):
+                    if self.control_panel.team_combo.itemData(i) == team_id:
+                        control_panel_index = i
+                        break
+                
+                if control_panel_index >= 0:
+                    self.control_panel.team_combo.setCurrentIndex(control_panel_index)
+                    print(f"✅ Synced control panel to team: {team_id}")
+                    
+                    # FIXED: Manually enable analyze button since signal won't fire
+                    if team_id and team_id != "":
+                        self.control_panel.analyze_btn.setEnabled(True)
+                        self.control_panel.analyze_btn.setToolTip(f"Analyze travel for {team_id}")
+                        print(f"✅ Analyze button enabled for {team_id} (main window sync)")
+                else:
+                    print(f"⚠️ Could not find team {team_id} in control panel combo")
+                
+                # Reconnect the signal
+                self.control_panel.team_combo.currentTextChanged.connect(
+                    self.control_panel.on_team_selection_changed
+                )
+                
+                # Update upcoming games
+                if hasattr(self.control_panel, 'update_upcoming_games'):
+                    self.control_panel.update_upcoming_games()
         
         # Load team data if needed
         if team_id and self.sports_aggregator:
