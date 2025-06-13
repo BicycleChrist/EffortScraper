@@ -54,21 +54,23 @@ class OddsLine(QWidget):
         title_font.setBold(True)
         title_label.setFont(title_font)
         self.layout.addWidget(title_label, 0, 0, 1, 2)
-        
-        # Small info label above American field
+
+        # Small info label above American field - now spans both columns
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("""
             QLabel {
                 font-size: 12px;
                 font-weight: bold;
                 color: #2e7d32;
-                padding: 2px 4px;
+                padding: 4px 8px;
                 background-color: rgba(46, 125, 50, 0.1);
                 border-radius: 4px;
                 border: 1px solid rgba(46, 125, 50, 0.3);
+                text-align: center;
             }
         """)
-        self.layout.addWidget(self.info_label, 1, 1)
+        # Span both columns (0 and 1) to take full width
+        self.layout.addWidget(self.info_label, 1, 0, 1, 2)
 
         # Input fields
         self.american = QLineEdit()
@@ -106,11 +108,11 @@ class OddsConverterWidget(QWidget):
         self.resize(500, 400)
 
         main_layout = QVBoxLayout(self)
-        
+
         # Bet amount - centered and larger
         bet_layout = QHBoxLayout()
         bet_layout.addStretch()
-        
+
         bet_label = QLabel("Bet Amount:")
         bet_label.setStyleSheet("""
             QLabel {
@@ -120,7 +122,7 @@ class OddsConverterWidget(QWidget):
                 margin-right: 10px;
             }
         """)
-        
+
         self.bet_amount = QDoubleSpinBox()
         self.bet_amount.setPrefix("$")
         self.bet_amount.setValue(100)
@@ -140,7 +142,7 @@ class OddsConverterWidget(QWidget):
                 border-color: #4CAF50;
             }
         """)
-        
+
         bet_layout.addWidget(bet_label)
         bet_layout.addWidget(self.bet_amount)
         bet_layout.addStretch()
@@ -148,7 +150,7 @@ class OddsConverterWidget(QWidget):
 
         # Lines side by side
         lines_layout = QHBoxLayout()
-        
+
         self.line1 = OddsLine("Line 1")
         self.line2 = OddsLine("Line 2")
 
@@ -163,7 +165,7 @@ class OddsConverterWidget(QWidget):
             }
         """)
         group1.setLayout(self.line1.layout)
-        
+
         group2 = QGroupBox()
         group2.setStyleSheet("""
             QGroupBox {
@@ -192,7 +194,7 @@ class OddsConverterWidget(QWidget):
         """)
         vig_layout = QHBoxLayout()
         vig_layout.setContentsMargins(10, 10, 10, 10)
-        
+
         vig_title = QLabel("Vigorish:")
         vig_title.setStyleSheet("""
             QLabel {
@@ -203,7 +205,7 @@ class OddsConverterWidget(QWidget):
                 min-width: 80px;
             }
         """)
-        
+
         # Container for the progress bar effect
         self.vig_bar_container = QWidget()
         self.vig_bar_container.setFixedHeight(40)
@@ -214,7 +216,7 @@ class OddsConverterWidget(QWidget):
                 border: 1px solid #666;
             }
         """)
-        
+
         # The actual vig display label that will act as the "bar"
         self.vig_display = QLabel("")
         vig_font = QFont()
@@ -232,13 +234,13 @@ class OddsConverterWidget(QWidget):
                 border: none;
             }
         """)
-        
+
         # Layout for the bar container
         bar_layout = QHBoxLayout(self.vig_bar_container)
         bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.addWidget(self.vig_display)
         bar_layout.addStretch()
-        
+
         vig_layout.addWidget(vig_title)
         vig_layout.addWidget(self.vig_bar_container, 1)  # Give it stretch factor
         vig_container.setLayout(vig_layout)
@@ -302,16 +304,20 @@ class OddsConverterWidget(QWidget):
             prob1 = float(self.line1.implied.text().strip('%')) / 100
             prob2 = float(self.line2.implied.text().strip('%')) / 100
             vig = (prob1 + prob2 - 1) * 100
-            
+
             # Calculate fair odds
             devigged_prob1, devigged_prob2 = devigger(prob1, prob2)
             fair_odds1 = prob_to_american_odds(devigged_prob1)
             fair_odds2 = prob_to_american_odds(devigged_prob2)
-            
+
+            # Calculate implied probabilities of the fair odds
+            fair_prob1 = implied_prob_american(fair_odds1)
+            fair_prob2 = implied_prob_american(fair_odds2)
+
             # Calculate progress bar width (0% = 0 width, 15% = 100% width)
             max_vig = 15.0
             vig_percentage = max(0, min(abs(vig), max_vig)) / max_vig  # Normalize to 0-1
-            
+
             # Get color based on vig level - smooth gradient
             if vig_percentage <= 0.133:  # 0-2%
                 color = "#4CAF50"  # Green
@@ -323,18 +329,18 @@ class OddsConverterWidget(QWidget):
                 color = "#FF9800"  # Orange
             else:  # 11%+
                 color = "#F44336"  # Red
-            
+
             # Calculate the width as percentage of container
             bar_width_percent = int(vig_percentage * 100)
-            
+
             # Update the vig display with progress bar effect
             self.vig_display.setText(f"{vig:.1f}%")
-            
+
             # Create gradient effect by adjusting the width
             self.vig_bar_container.setStyleSheet(f"""
                 QWidget {{
                     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                        stop:0 {color}, 
+                        stop:0 {color},
                         stop:{vig_percentage:.3f} {color},
                         stop:{vig_percentage:.3f} rgba(255, 255, 255, 0.1),
                         stop:1 rgba(255, 255, 255, 0.1));
@@ -342,7 +348,7 @@ class OddsConverterWidget(QWidget):
                     border: 1px solid #666;
                 }}
             """)
-            
+
             self.vig_display.setStyleSheet(f"""
                 QLabel {{
                     color: white;
@@ -354,15 +360,15 @@ class OddsConverterWidget(QWidget):
                     border: none;
                 }}
             """)
-            
-            # Update Line 1 - show its fair odds with enhanced styling
+
+            # Update Line 1 - show fair odds and implied probability
             fair1_text = f"{int(fair_odds1):+d}" if fair_odds1 > 0 else f"{int(fair_odds1)}"
-            self.line1.info_label.setText(f"Fair: {fair1_text}")
-            
-            # Update Line 2 - show its fair odds with enhanced styling
+            self.line1.info_label.setText(f"NV Fair Odds: {fair1_text}  •  NV Imp Prob: {fair_prob1*100:.1f}%")
+
+            # Update Line 2 - show fair odds and implied probability
             fair2_text = f"{int(fair_odds2):+d}" if fair_odds2 > 0 else f"{int(fair_odds2)}"
-            self.line2.info_label.setText(f"Fair: {fair2_text}")
-            
+            self.line2.info_label.setText(f"NV Fair Odds: {fair2_text}  •  NV Imp Prob: {fair_prob2*100:.1f}%")
+
         except:
             # Clear labels if calculation fails
             self.vig_display.clear()
