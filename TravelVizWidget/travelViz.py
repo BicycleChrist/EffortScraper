@@ -250,6 +250,9 @@ class SportsTrackerMainWindow(QMainWindow):
                     self.current_season = fallback_season
                     print(f"🐛 DEBUG - Fallback: Using first season '{fallback_season}'")
     
+    
+    
+    
     def setup_sports_system(self):
         """Setup sports data system with ESPN scraping and Amadeus integration"""
         api_keys = self.config_loader.get_api_keys()
@@ -278,6 +281,9 @@ class SportsTrackerMainWindow(QMainWindow):
         self.sports_aggregator.progressUpdated.connect(self.on_progress_updated)
         self.sports_aggregator.errorOccurred.connect(self.on_data_error)
         self.sports_aggregator.seasonDataLoaded.connect(self.on_season_data_loaded)
+        
+        # Give control panel access to aggregator for distance calculations
+        self.control_panel.aggregator = self.sports_aggregator
     
     def connect_signals(self):
         """Connect UI signals"""
@@ -287,7 +293,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.load_current_week_btn.clicked.connect(self.load_current_week)
         self.focus_team_combo.currentTextChanged.connect(self.on_focus_team_changed)
         
-        # UPDATED Control panel signals (new Bloomberg-style panel)
+        # Control panel signals
         self.control_panel.refreshRequested.connect(self.force_refresh_season_data)
         self.control_panel.modeChanged.connect(self.on_league_changed)
         self.control_panel.teamChanged.connect(self.on_control_panel_team_changed)
@@ -302,11 +308,30 @@ class SportsTrackerMainWindow(QMainWindow):
         self.globe_widget.animationProgressChanged.connect(self.on_animation_progress_changed)
     
     def on_control_panel_team_changed(self, team_abbr: str):
-        """Handle team selection from control panel"""
-        # Update the main window's focus team combo to match
-        index = self.focus_team_combo.findData(team_abbr)
-        if index >= 0:
-            self.focus_team_combo.setCurrentIndex(index)
+        
+        print(f"🔄 Control panel team changed to: {team_abbr}")
+        
+        # Update the main window's focus team combo to match (prevent signal loops)
+        try:
+            self.focus_team_combo.currentTextChanged.disconnect()
+        except:
+            pass  # Signal might not be connected
+        
+        # Find and set matching team in main window
+        main_window_index = -1
+        for i in range(self.focus_team_combo.count()):
+            if self.focus_team_combo.itemData(i) == team_abbr:
+                main_window_index = i
+                break
+        
+        if main_window_index >= 0:
+            self.focus_team_combo.setCurrentIndex(main_window_index)
+            print(f"✅ Synced main window to team: {team_abbr}")
+        else:
+            print(f"⚠️ Could not find team {team_abbr} in main window combo")
+        
+        # Reconnect the signal
+        self.focus_team_combo.currentTextChanged.connect(self.on_focus_team_changed)
         
         # Load specific team data if needed
         if team_abbr:
@@ -314,59 +339,49 @@ class SportsTrackerMainWindow(QMainWindow):
             if self.sports_aggregator:
                 self.sports_aggregator.load_team_season_schedule(team_abbr, season, self.current_league)
 
-    # In travelViz.py, update the start_amadeus_analysis method
 
     def start_amadeus_analysis(self, team_abbr: str, days_ahead: int):
-        """Start Amadeus analysis for selected team (FIXED VERSION)"""
+        """Start Amadeus analysis for selected team"""
         if not self.sports_aggregator:
-            self.status_bar.showMessage("Sports aggregator not available", 5000)
             return
         
         config = self.config_loader.get_api_keys()
         amadeus_key = config.get("amadeus")
         amadeus_secret = config.get("amadeus_secret")
         
-        if not amadeus_key or not amadeus_secret:
-            self.status_bar.showMessage("Amadeus API keys not configured", 5000)
-            return
-        
-        print(f"🚀 Starting Amadeus analysis for {team_abbr}, {days_ahead} days ahead")
-        
-        # Set credentials
-        success = self.sports_aggregator.set_amadeus_credentials(amadeus_key, amadeus_secret)
-        if not success:
-            self.status_bar.showMessage("Failed to initialize Amadeus API", 5000)
-            return
-        
-        # *** ESSENTIAL FIX: Connect signals BEFORE starting analysis ***
-        if not hasattr(self, '_amadeus_signals_connected') or not self._amadeus_signals_connected:
-            # Connect success signal
-            self.sports_aggregator.amadeusIntelligenceReady.connect(
-                self.control_panel.on_amadeus_complete
-            )
-            
-            # Connect error signal  
-            self.sports_aggregator.errorOccurred.connect(
-                self.control_panel.on_analysis_error
-            )
-            
-            self._amadeus_signals_connected = True
-            print("🔗 Connected Amadeus signals")
-        
-        # Update UI to show analysis starting
-        self.control_panel.analysis_progress.setVisible(True)
-        self.control_panel.analysis_progress.setValue(0)
-        self.control_panel.analyze_btn.setEnabled(False)
-        self.control_panel.status_message.setText("Starting Amadeus analysis...")
-        
-        # *** CRITICAL: Start the actual analysis ***
-        try:
-            self.sports_aggregator.get_team_travel_intelligence_async(team_abbr, days_ahead)
-            print(f"✅ Amadeus analysis request submitted for {team_abbr}")
-        except Exception as e:
-            print(f"❌ Failed to start Amadeus analysis: {e}")
-            self.control_panel.on_analysis_error(str(e))
+        if amadeus_key and amadeus_secret:
+            success = self.sports_aggregator.set_amadeus_credentials(amadeus_key, amadeus_secret)
+            if success:
+                # ESSENTIAL SIGNALS - Connect these first
+                if not hasattr(self, '_amadeus_signals_connected'):
+                    # When analysis completes successfully
+                    self.sports_aggregator.amadeusIntelligenceReady.connect(
+                        self.control_panel.on_analysis_complete  # ← NO PARENTHESES!
+                    )
+                    
+                    # When analysis fails
+                    self.sports_aggregator.errorOccurred.connect(
+                        self.control_panel.on_analysis_error  # ← NO PARENTHESES!
+                    )
+                    
+                    # When progress updates occur
+                    self.sports_aggregator.amadeusProgressUpdated.connect(
+                        self.control_panel.on_analysis_progress  # ← NO PARENTHESES!
+                    )
+                    
+                    self._amadeus_signals_connected = True 
+                
+                # Show analysis starting in UI
+                self.control_panel.analysis_progress.setVisible(True)
+                self.control_panel.analysis_progress.setValue(0)
+                self.control_panel.analyze_btn.setEnabled(False)
+                self.control_panel.status_message.setText("Starting Amadeus analysis...")
+                
+                # Start analysis
+                self.sports_aggregator.get_team_travel_intelligence_async(team_abbr, days_ahead)
     
+    
+
     def on_league_changed(self, league: str):
         """Handle league change from control panel"""
         if league not in ["MLB", "NBA", "NHL"]:
@@ -409,25 +424,22 @@ class SportsTrackerMainWindow(QMainWindow):
         
         print(f"Successfully switched to {league}")
     
+    
     def start_sports_monitoring(self):
-        """Modified startup - display today's games instead of demo mode"""
+        """Modified startup - ensure clean state"""
         if not self.sports_aggregator:
             self.setup_sports_system()
         
         if self.sports_aggregator:
+            # Set league first
             self.sports_aggregator.set_league(self.current_league)
+            
+            # Populate team dropdowns
+            print("🔄 Populating team dropdowns on startup...")
+            self.populate_team_combo()
         
-        # Populate dropdowns first
-        self.populate_team_combo()
-        
-        # Load today's games as the new default startup view
+        # Display today's games
         self.display_todays_games_startup()
-        
-        # Logic for refresh if needed
-        #if not self.data_update_timer:
-        #    self.data_update_timer = QTimer()
-        #    self.data_update_timer.timeout.connect(self.display_todays_games_startup)
-        #    self.data_update_timer.start(300000)  # Refresh every 5 minutes
     
     def get_todays_games(self) -> List[Dict]:
         """Get all games scheduled for today across all leagues"""
@@ -555,27 +567,6 @@ class SportsTrackerMainWindow(QMainWindow):
         print(f"Displaying {game_count} games today across {leagues_str}")
         print(f"Created {len(stacked_markers)} markers with league context")
     
-    def calculate_surface_normal(self, lat: float, lon: float):
-        """Calculate the surface normal vector at a given lat/lon for proper stacking"""
-        import math
-        
-        # Convert to radians
-        lat_rad = math.radians(lat)
-        lon_rad = math.radians(lon)
-        
-        # Surface normal on a sphere points radially outward
-        x = math.cos(lat_rad) * math.cos(lon_rad)
-        y = math.sin(lat_rad)
-        z = -math.cos(lat_rad) * math.sin(lon_rad)
-        
-        # Normalize the vector (should already be unit length, but ensure it)
-        length = math.sqrt(x*x + y*y + z*z)
-        if length > 0:
-            x /= length
-            y /= length
-            z /= length
-        
-        return (x, y, z)
 
     def synchronize_league_state(self):
         """Ensure main window and control panel are using the same league"""
@@ -589,7 +580,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.setWindowTitle(f"Sports Team Travel Tracker v4.0 - {self.current_league} {self.current_season} Season")
     
     def populate_team_combo(self):
-        """Populate team selection combo with teams from current league"""
+        """Populate team selection combo with teams from current league - FIXED VERSION"""
         try:
             if self.sports_aggregator and self.sports_aggregator.current_league != self.current_league:
                 print(f"🐛 DEBUG - League mismatch detected! Aggregator: {self.sports_aggregator.current_league}, Window: {self.current_league}")
@@ -598,14 +589,17 @@ class SportsTrackerMainWindow(QMainWindow):
             teams = self.sports_aggregator.get_all_teams(self.current_league)
             self.all_teams = teams
             
+            print(f"🔄 Populating main window combo with {len(teams)} {self.current_league} teams")
+            
             # Clear and repopulate main window combo
             current_selection = self.focus_team_combo.currentData()
             self.focus_team_combo.clear()
             self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
             
-            # Add teams sorted by name
+            # Add teams sorted by name - USE SAME DATA FORMAT AS CONTROL PANEL
             for team in sorted(teams, key=lambda t: t.display_name):
                 display_text = f"{team.display_name} ({team.abbreviation})"
+                # CRITICAL: Use team.team_id to match control panel
                 self.focus_team_combo.addItem(display_text, team.team_id)
             
             # Restore selection if possible
@@ -614,15 +608,23 @@ class SportsTrackerMainWindow(QMainWindow):
                 if index >= 0:
                     self.focus_team_combo.setCurrentIndex(index)
             
-            # ALSO populate the control panel's team combo
+            # ALSO populate the control panel's team combo with consistent data
             self.control_panel.load_teams_for_league(teams)
             
-            print(f"Populated team combo with {len(teams)} {self.current_league} teams")
+            print(f"✅ Populated both combo boxes with {len(teams)} {self.current_league} teams")
             
         except Exception as e:
-            print(f"Error populating team combo: {e}")
+            print(f"❌ Error populating team combo: {e}")
+            import traceback
+            traceback.print_exc()
+            
             self.focus_team_combo.clear()
             self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
+            
+            # Also clear control panel combo on error
+            if hasattr(self.control_panel, 'team_combo'):
+                self.control_panel.team_combo.clear()
+                self.control_panel.team_combo.addItem("Error loading teams", "")
 
     def on_season_changed(self, season_text: str):
         """Handle season change"""
@@ -674,12 +676,41 @@ class SportsTrackerMainWindow(QMainWindow):
             self.load_current_week_btn.setText("Current Week")
     
     def on_focus_team_changed(self):
-        """Handle focus team selection change"""
+        """Handle focus team selection change from main window"""
         team_id = self.focus_team_combo.currentData()
         season = self.season_combo.currentText()
         
+        print(f"🔄 Main window focus team changed to: {team_id}")
+        
+        # Sync the control panel's team combo (prevent signal loops)
+        if hasattr(self.control_panel, 'team_combo') and self.control_panel.team_combo:
+            # Temporarily disconnect signal to prevent loops
+            try:
+                self.control_panel.team_combo.currentTextChanged.disconnect()
+            except:
+                pass  # Signal might not be connected
+            
+            # Find and set the matching team in control panel
+            control_panel_index = -1
+            for i in range(self.control_panel.team_combo.count()):
+                if self.control_panel.team_combo.itemData(i) == team_id:
+                    control_panel_index = i
+                    break
+            
+            if control_panel_index >= 0:
+                self.control_panel.team_combo.setCurrentIndex(control_panel_index)
+                print(f"✅ Synced control panel to team: {team_id}")
+            else:
+                print(f"⚠️ Could not find team {team_id} in control panel combo")
+            
+            # Reconnect the signal
+            self.control_panel.update_upcoming_games()
+            self.control_panel.team_combo.currentTextChanged.connect(
+                self.control_panel.on_team_selection_changed
+            )
+        
+        # Load team data if needed
         if team_id and self.sports_aggregator:
-            # Load specific team schedule
             self.sports_aggregator.load_team_season_schedule(team_id, season, self.current_league)
         elif not team_id and self.current_travel_data:
             # Show all teams again
@@ -998,6 +1029,8 @@ class SportsTrackerMainWindow(QMainWindow):
         
         self.last_update_time = None
     
+    
+    
     def on_travel_data_updated(self, travel_data: List[TeamTravelData]):
         """Handle updated travel data"""
         self.current_travel_data = travel_data
@@ -1005,6 +1038,9 @@ class SportsTrackerMainWindow(QMainWindow):
         
         # Update globe widget
         self.globe_widget.load_flight_data(travel_data)
+        
+        # NEW: Update control panel with travel data
+        self.control_panel.update_travel_data(travel_data)
         
         # Update status
         self.schedule_count_label.setText(f"Travel: {len(travel_data)}")
@@ -1050,9 +1086,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.load_current_week_btn.setEnabled(True)
         self.load_current_week_btn.setText("Current Week")
     
-    def on_performance_update(self, fps: float):
-        """Handle performance updates"""
-        self.performance_label.setText(f"FPS: {fps:.1f}")
+   
     
     def on_location_selected(self, lat: float, lon: float, location_name: str):
         """Handle location selection on globe"""
@@ -1104,11 +1138,6 @@ class SportsTrackerMainWindow(QMainWindow):
                 
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export data: {str(e)}")
-    
-    def save_window_settings(self):
-        """Save window settings"""
-        self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("windowState", self.saveState())
     
     def show_about(self):
         """Show about dialog"""

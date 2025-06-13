@@ -546,7 +546,18 @@ class DatabaseManager:
                     start_year = year - 1
                     season = f"{start_year}-{str(year)[2:]}"
                     print(f"🔧 FIXED: Converted {league} season '{year}' to '{season}'")
-                
+            
+            # FIX: Convert team_id to lowercase for database query
+            if team_id:
+                team_id = team_id.lower()
+            
+            # Figure out where in the fuck cws abbreviation is being passed in
+            # Not hope for this franchise
+            TEAM_ID_FIXES = {
+                "cws": "chw"
+            }
+            team_id = TEAM_ID_FIXES.get(team_id, team_id)
+            
             print(f"🐛 DEBUG - load_travel_data called:")
             print(f"  season: '{season}' (type: {type(season)})")
             print(f"  league: '{league}'")
@@ -800,7 +811,125 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Error getting league statistics: {e}")
             return {}
+    
 
+    def get_upcoming_games(self, team_id: str, league: str, season: str = None, limit: int = 10) -> List[GameData]:
+        """Get upcoming games for a specific team"""
+        try:
+            # Convert team_id to lowercase for consistency
+            if team_id:
+                team_id = team_id.lower()
+            
+            # Auto-detect current season if not provided
+            if season is None:
+                season = self.get_current_season_for_league(league)
+            
+            # Handle NBA/NHL season format conversion
+            if league in ['NBA', 'NHL'] and season and '-' not in season:
+                year = int(season)
+                if year >= 2024:
+                    start_year = year - 1
+                    season = f"{start_year}-{str(year)[2:]}"
+            
+            current_datetime = datetime.now()
+            
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                cursor = conn.execute("""
+                    SELECT g.*, 
+                           ht.abbreviation as home_abbrev, ht.display_name as home_name, 
+                           ht.location as home_location, ht.color as home_color,
+                           ht.alternate_color as home_alt_color, ht.logo_url as home_logo,
+                           ht.division as home_division, ht.league as home_league,
+                           ht.conference as home_conference,
+                           at.abbreviation as away_abbrev, at.display_name as away_name,
+                           at.location as away_location, at.color as away_color,
+                           at.alternate_color as away_alt_color, at.logo_url as away_logo,
+                           at.division as away_division, at.league as away_league,
+                           at.conference as away_conference,
+                           v.name as venue_name, v.city as venue_city, v.state as venue_state,
+                           v.country as venue_country, v.latitude, v.longitude,
+                           v.capacity, v.timezone
+                    FROM games g
+                    JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
+                    JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league
+                    JOIN venues v ON g.venue_id = v.venue_id
+                    WHERE g.season = ? AND g.league = ? 
+                    AND (g.home_team_id = ? OR g.away_team_id = ?)
+                    AND datetime(g.date) >= datetime(?)
+                    AND g.status IN ('scheduled', 'postponed')
+                    ORDER BY g.date ASC
+                    LIMIT ?
+                """, (season, league, team_id, team_id, current_datetime.isoformat(), limit))
+                
+                games = []
+                for row in cursor.fetchall():
+                    # Reconstruct team objects
+                    home_team = TeamInfo(
+                        team_id=row['home_team_id'],
+                        abbreviation=row['home_abbrev'],
+                        display_name=row['home_name'],
+                        location=row['home_location'],
+                        color=row['home_color'],
+                        alternate_color=row['home_alt_color'],
+                        logo_url=row['home_logo'],
+                        division=row['home_division'],
+                        league=row['home_league'],
+                        conference=row['home_conference']
+                    )
+                    
+                    away_team = TeamInfo(
+                        team_id=row['away_team_id'],
+                        abbreviation=row['away_abbrev'],
+                        display_name=row['away_name'],
+                        location=row['away_location'],
+                        color=row['away_color'],
+                        alternate_color=row['away_alt_color'],
+                        logo_url=row['away_logo'],
+                        division=row['away_division'],
+                        league=row['away_league'],
+                        conference=row['away_conference']
+                    )
+                    
+                    venue = Venue(
+                        venue_id=row['venue_id'],
+                        name=row['venue_name'],
+                        city=row['venue_city'],
+                        state=row['venue_state'],
+                        country=row['venue_country'],
+                        latitude=row['latitude'],
+                        longitude=row['longitude'],
+                        capacity=row['capacity'],
+                        timezone=row['timezone']
+                    )
+                    
+                    game = GameData(
+                        game_id=row['game_id'],
+                        date=datetime.fromisoformat(row['date']),
+                        home_team=home_team,
+                        away_team=away_team,
+                        venue=venue,
+                        status=GameStatus(row['status']),
+                        week=row['week'],
+                        season_type=row['season_type'],
+                        league=row['league'],
+                        season=row['season'],
+                        series_description=row['series_description']
+                    )
+                    games.append(game)
+                
+                self.logger.info(f"Found {len(games)} upcoming games for team {team_id} in {league}")
+                return games
+                
+        except Exception as e:
+            self.logger.error(f"Error getting upcoming games for team {team_id}: {e}")
+            return []
+    
+    def get_team_next_game(self, team_id: str, league: str, season: str = None) -> Optional[GameData]:
+        """Get the very next game for a specific team"""
+        upcoming_games = self.get_upcoming_games(team_id, league, season, limit=1)
+        return upcoming_games[0] if upcoming_games else None
 
 # Usage example and testing
 if __name__ == "__main__":
