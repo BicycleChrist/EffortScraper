@@ -80,7 +80,7 @@ class OddsLine(QWidget):
         self.to_win = QLineEdit()
         self.payout = QLineEdit()
 
-        self.implied.setReadOnly(True)
+        # Remove read-only from implied field
         self.to_win.setReadOnly(True)
         self.payout.setReadOnly(True)
 
@@ -246,11 +246,12 @@ class OddsConverterWidget(QWidget):
         vig_container.setLayout(vig_layout)
         main_layout.addWidget(vig_container)
 
-        # Connect signals
+        # Connect signals - add implied field to connections
         for line in [self.line1, self.line2]:
             line.american.editingFinished.connect(self.handle)
             line.decimal.editingFinished.connect(self.handle)
             line.fractional.editingFinished.connect(self.handle)
+            line.implied.editingFinished.connect(self.handle)
 
         self.bet_amount.valueChanged.connect(self.handle)
 
@@ -265,29 +266,71 @@ class OddsConverterWidget(QWidget):
             return "#F44336", "white"  # Red background, white text
 
     def handle(self):
+        sender = self.sender()
+
         for line in [self.line1, self.line2]:
-            try:
-                ao = float(line.american.text())
-            except ValueError:
+            ao = None
+
+            # Determine which field was edited for this line
+            if sender == line.american:
+                # American field was edited - try to parse it first
+                try:
+                    ao = float(line.american.text())
+                except ValueError:
+                    continue
+            elif sender == line.decimal:
+                # Decimal field was edited
                 try:
                     dec = float(line.decimal.text())
                     ao = decimal_to_american(dec)
-                    line.american.setText(f"{int(ao)}")
+                except ValueError:
+                    continue
+            elif sender == line.fractional:
+                # Fractional field was edited
+                try:
+                    num, den = map(int, line.fractional.text().split('/'))
+                    dec = num / den + 1
+                    ao = decimal_to_american(dec)
+                except ValueError:
+                    continue
+            elif sender == line.implied:
+                # Implied probability field was edited
+                try:
+                    prob = float(line.implied.text().strip('%')) / 100
+                    ao = prob_to_american_odds(prob)
+                except ValueError:
+                    continue
+            else:
+                # No field was edited (bet amount changed), use existing parsing logic
+                try:
+                    ao = float(line.american.text())
                 except ValueError:
                     try:
-                        num, den = map(int, line.fractional.text().split('/'))
-                        dec = num / den + 1
+                        dec = float(line.decimal.text())
                         ao = decimal_to_american(dec)
-                        line.american.setText(f"{int(ao)}")
-                    except:
-                        continue
+                    except ValueError:
+                        try:
+                            num, den = map(int, line.fractional.text().split('/'))
+                            dec = num / den + 1
+                            ao = decimal_to_american(dec)
+                        except ValueError:
+                            try:
+                                prob = float(line.implied.text().strip('%')) / 100
+                                ao = prob_to_american_odds(prob)
+                            except:
+                                continue
 
+            if ao is None:
+                continue
+
+            # Update all fields based on the parsed American odds
             dec = american_to_decimal(ao)
             line.decimal.setText(f"{dec:.2f}")
             frac = decimal_to_fractional(dec)
             line.fractional.setText(f"{frac.numerator}/{frac.denominator}")
             prob = implied_prob_american(ao)
             line.implied.setText(f"{prob*100:.2f}%")
+            line.american.setText(f"{int(ao)}")
 
             amt = self.bet_amount.value()
             if ao > 0:
