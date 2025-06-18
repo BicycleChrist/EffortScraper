@@ -854,7 +854,7 @@ class ModernOddsWindow(QMainWindow):
             self.handle_league_change()
 
     def handle_tab_change(self, index):
-        """Handle tab switching events"""
+        """Handle tab switching events, properly sync best lines data and main table data"""
         if index >= 0:
             self.current_league = self.tab_widget.tabText(index)
             # Extract the league name without the market info
@@ -862,6 +862,12 @@ class ModernOddsWindow(QMainWindow):
                 base_league = self.current_league.split(" (")[0]
                 # Optionally update league selector to match the tab
                 self.league_selector.setCurrentText(base_league)
+            
+            # UPDATE BEST LINES FOR CURRENT TAB
+            if hasattr(self, 'best_lines_widget') and self.current_league in self.league_tabs:
+                tab_data = self.league_tabs[self.current_league]
+                if hasattr(tab_data, 'consolidated_odds_data'):
+                    self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
         """Create a new tab for a league with specific markets"""
@@ -1452,6 +1458,7 @@ class ModernOddsWindow(QMainWindow):
                 # Store the consolidated data for the best lines widget
                 self.consolidated_odds_data = consolidated_odds_data
                 
+                tab_data.consolidated_odds_data = consolidated_odds_data  # Update bestlines when tab switched
                 # Create a new DataFrame from the collected data
                 new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
                 
