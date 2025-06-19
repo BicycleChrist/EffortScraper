@@ -1,10 +1,11 @@
 import concurrent
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 from dataclasses import dataclass
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from bs4 import BeautifulSoup
@@ -30,16 +31,22 @@ from database_manager import DatabaseManager, GameStatus, TeamInfo, Venue, GameD
 
 
 @dataclass
-class AirportInfo:
-    """Airport information with performance metrics"""
-    iata_code: str
-    name: str
-    city: str
-    distance_from_venue: float  # km
-    on_time_probability: float  # 0-1
-    traveler_score: int
-    coordinates: Tuple[float, float]
-    timezone_offset: str
+class ForbesHotel:
+    """Forbes hotel data from database"""
+    hotel_name: str
+    destination: str
+    star_rating: str
+    
+    def get_numeric_rating(self) -> int:
+        """Convert Forbes rating to numeric scale"""
+        numeric_star_rating = {
+            "Z-NOT_RATED": 0,
+            "SOON_TO_BE_RATED": 2,
+            "RECOMMENDED": 3,
+            "FOUR_STAR": 4,
+            "FIVE_STAR": 5,
+        }
+        return numeric_star_rating.get(self.star_rating, 0)
 
 @dataclass
 class HotelOption:
@@ -52,6 +59,19 @@ class HotelOption:
     amenities: List[str]
     location_score: int  # 0-100
     coordinates: Tuple[float, float]
+    forbes_rating: Optional[ForbesHotel] = None
+
+@dataclass
+class AirportInfo:
+    """Airport information with performance metrics"""
+    iata_code: str
+    name: str
+    city: str
+    distance_from_venue: float  # km
+    on_time_probability: float  # 0-1
+    traveler_score: int
+    coordinates: Tuple[float, float]
+    timezone_offset: str
 
 @dataclass
 class RouteInsights:
@@ -79,37 +99,63 @@ class TeamTravelIntelligence:
 
 
 
+
 class AmadeusAnalyzer:
-    """Optimized Amadeus analyzer with concurrent API calls and rate limiting"""
+    """Enhanced Amadeus analyzer with Forbes hotel integration and geolocation-based search"""
+    
+    # Configuration constants
+    MIN_REQUEST_INTERVAL = 0.1
+    MAX_WORKERS = 6
+    CONFIDENCE_THRESHOLD = 0.75
+    HOTEL_RADIUS_KM = 25
+    STRICT_RADIUS_KM = 20
+    MIN_HOTEL_RATING = 75
+    
+    # Hotel brand mappings
+    HOTEL_BRANDS = {
+        'four seasons': ['four seasons', 'fs '],
+        'ritz carlton': ['ritz carlton', 'ritz-carlton', 'ritzcarlton'],
+        'peninsula': ['peninsula'], 'park hyatt': ['park hyatt'], 'hyatt': ['hyatt'],
+        'waldorf astoria': ['waldorf astoria', 'waldorf-astoria'], 'langham': ['langham'],
+        'mandarin oriental': ['mandarin oriental', 'mandarin'], 'st regis': ['st regis', 'st. regis'],
+        'conrad': ['conrad'], 'w hotel': [' w ', 'w hotel'], 'beverly hills hotel': ['beverly hills hotel'],
+        'edition': ['edition'], 'trump': ['trump'], 'fairmont': ['fairmont'],
+        'intercontinental': ['intercontinental'], 'marriott': ['marriott'], 'hilton': ['hilton']
+    }
+    
+    # Location keywords for matching
+    LOCATION_KEYWORDS = {
+        'beverly hills', 'hollywood', 'downtown', 'airport', 'central', 'park',
+        'manhattan', 'times square', 'midtown', 'santa monica', 'west hollywood'
+    }
     
     def __init__(self, api_key: str, api_secret: str, aggregator=None):
+        import amadeus
+        
         self.amadeus = amadeus.Client(client_id=api_key, client_secret=api_secret)
+        self.aggregator = aggregator
+        self.logger = logging.getLogger(__name__)
+        
+        # Caches
         self._airport_cache: Dict[str, List[AirportInfo]] = {}
         self._hotel_cache: Dict[str, List[HotelOption]] = {}
         self._performance_cache: Dict[str, float] = {}
-        self.logger = logging.getLogger(__name__)
-        self.aggregator = aggregator
+        self._failed_matches_cache: Set[str] = set()
         
-        # OPTIMIZATION: Rate limiting - Amadeus allows 10 requests/second (100ms between requests)
-        self.min_request_interval = 0.1  # 100ms instead of 1 second
+        # Rate limiting
         self.last_request_time = 0
         self.request_lock = threading.Lock()
         
-        # OPTIMIZATION: Concurrent processing
-        self.max_workers = 6  # Process multiple routes simultaneously
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        # Thread pool for concurrent processing
+        self.executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
         
-        # OPTIMIZATION: Performance flags
-        self.skip_performance_calls = True  # Skip slow airport performance calls
-        self.skip_hotel_ratings = True  # Skip hotel sentiment API calls
-        
-        print("🚀 AmadeusAnalyzer optimized for fast concurrent processing")
+        # Performance flags
+        self.skip_performance_calls = False
     
-    def analyze_team_travel(self, team_info: TeamInfo, upcoming_games: List[GameData], days_ahead: int = 14) -> TeamTravelIntelligence:
-        """OPTIMIZED: Main analysis method with concurrent processing"""
+    def analyze_team_travel(self, team_info: 'TeamInfo', upcoming_games: List['GameData'], days_ahead: int = 14) -> TeamTravelIntelligence:
+        """Main analysis method with concurrent processing"""
         cutoff_date = datetime.now() + timedelta(days=days_ahead)
         
-        # Filter games within date range for this team
         relevant_games = [
             game for game in upcoming_games 
             if game.date <= cutoff_date and (
@@ -117,26 +163,19 @@ class AmadeusAnalyzer:
                 game.away_team.team_id == team_info.team_id
             )
         ]
-        
         relevant_games.sort(key=lambda x: x.date)
         
-        # Identify venue changes (routes to analyze)
+        # Find venue changes
         routes_to_analyze = []
         for i in range(len(relevant_games) - 1):
-            current_game = relevant_games[i]
-            next_game = relevant_games[i + 1]
-            
+            current_game, next_game = relevant_games[i], relevant_games[i + 1]
             if current_game.venue.venue_id != next_game.venue.venue_id:
                 routes_to_analyze.append((current_game.venue, next_game.venue, next_game))
         
         if not routes_to_analyze:
             return self._create_empty_intelligence(team_info)
         
-        print(f"🚀 Analyzing {len(routes_to_analyze)} routes concurrently")
-        
-        # OPTIMIZATION: Process all routes concurrently instead of sequentially
         route_insights = self._analyze_routes_concurrently(routes_to_analyze)
-        
         total_distance = sum(route.travel_distance for route in route_insights)
         
         return TeamTravelIntelligence(
@@ -150,99 +189,441 @@ class AmadeusAnalyzer:
         )
     
     def _analyze_routes_concurrently(self, routes: List[Tuple]) -> List[RouteInsights]:
-        """NEW: Analyze multiple routes concurrently using ThreadPoolExecutor"""
+        """Analyze multiple routes concurrently"""
         route_insights = []
+        future_to_route = {
+            self.executor.submit(self._analyze_route_between_venues, *route): route[0].city + " → " + route[1].city
+            for route in routes
+        }
         
-        # Submit all route analysis tasks
-        future_to_route = {}
-        for origin_venue, dest_venue, game in routes:
-            future = self.executor.submit(
-                self._analyze_route_between_venues, 
-                origin_venue, dest_venue, game
-            )
-            future_to_route[future] = (origin_venue.city, dest_venue.city)
-        
-        # Collect results as they complete
         for future in concurrent.futures.as_completed(future_to_route):
-            origin_city, dest_city = future_to_route[future]
+            route_name = future_to_route[future]
             try:
-                route_insight = future.result(timeout=30)  # 30 second timeout per route
-                if route_insight:
-                    route_insights.append(route_insight)
-                    print(f"✅ Route complete: {origin_city} → {dest_city}")
+                result = future.result(timeout=30)
+                if result:
+                    route_insights.append(result)
             except Exception as e:
-                print(f"⚠️ Route failed: {origin_city} → {dest_city} - {e}")
-                continue
+                print(f"⚠️ Route failed: {route_name} - {e}")
         
         return route_insights
     
-    def _analyze_route_between_venues(self, origin_venue: 'Venue', destination_venue: 'Venue', game: 'GameData') -> RouteInsights:
-        """OPTIMIZED: Analyze a specific travel route with faster API calls"""
-        
-        # Get airports near destination venue (with caching and rate limiting)
+    def _analyze_route_between_venues(self, origin_venue: Venue, destination_venue: Venue, game: GameData) -> RouteInsights:
+        """Analyze a specific travel route"""
         destination_airports = self._get_venue_airports(destination_venue, game.date)
-        
-        primary_airport = destination_airports[0] if destination_airports else None
-        alternate_airports = destination_airports[1:3] if len(destination_airports) > 1 else []
-        
-        # Get hotels near destination venue (skip ratings API call)
-        hotels = self._get_destination_hotels(destination_venue, game.date)
-        
-        # Calculate travel metrics between the two cities (no API calls)
-        distance = self._calculate_distance(origin_venue.city, destination_venue.city)
-        confidence = self._assess_travel_confidence(primary_airport, hotels)
-        risks = self._identify_risk_factors(primary_airport, game.date)
+        hotels = self._get_destination_hotels_by_geolocation(destination_venue, game.date)
         
         return RouteInsights(
             game_data=game,
-            primary_airport=primary_airport,
-            alternate_airports=alternate_airports,
-            destination_hotels=hotels[:5],  # Top 5 hotels
-            travel_distance=distance,
-            travel_confidence=confidence,
-            risk_factors=risks
+            primary_airport=destination_airports[0] if destination_airports else None,
+            alternate_airports=destination_airports[1:3] if len(destination_airports) > 1 else [],
+            destination_hotels=hotels[:5],
+            travel_distance=self._calculate_distance(origin_venue.city, destination_venue.city),
+            travel_confidence=self._assess_travel_confidence(destination_airports[0] if destination_airports else None, hotels),
+            risk_factors=self._identify_risk_factors(destination_airports[0] if destination_airports else None, game.date)
         )
     
-    def _get_venue_airports(self, venue: 'Venue', travel_date: datetime) -> List[AirportInfo]:
-        """OPTIMIZED: Get airports with aggressive caching and optional performance calls"""
-        cache_key = f"{venue.city}_{venue.state}_{venue.latitude}_{venue.longitude}"
+    def _get_destination_hotels_by_geolocation(self, venue: Venue, check_in_date: datetime) -> List[HotelOption]:
+        """Get hotels using pure geolocation approach"""
+        cache_key = f"geo_{venue.latitude}_{venue.longitude}"
+        if cache_key in self._hotel_cache:
+            return self._hotel_cache[cache_key]
         
-        if cache_key in self._airport_cache:
-            airports = self._airport_cache[cache_key]
-            print(f"🏆 Cache hit: {venue.city} airports")
+        # Get Amadeus hotels near stadium
+        amadeus_hotels = self._get_amadeus_hotels_by_coordinates(venue)
+        if not amadeus_hotels:
+            return []
+        
+        # Get Forbes hotels and match them
+        forbes_hotels = self._get_forbes_hotels(venue.city)
+        if forbes_hotels:
+            matched_hotels = self._match_forbes_to_amadeus(forbes_hotels, amadeus_hotels, venue)
+            # Fill remaining slots with quality Amadeus hotels
+            if len(matched_hotels) < 8:
+                matched_hotels.extend(self._get_additional_quality_hotels(matched_hotels, amadeus_hotels, venue))
         else:
-            airports = self._fetch_airports_for_venue(venue)
-            if airports:
-                self._airport_cache[cache_key] = airports
+            matched_hotels = self._create_hotels_from_amadeus_only(amadeus_hotels, venue)
         
-        # OPTIMIZATION: Skip individual airport performance calls (they're slow)
-        # Use default performance or only check primary airport if needed
+        # Sort by Forbes rating, then distance
+        matched_hotels.sort(key=lambda h: (
+            -(h.forbes_rating.get_numeric_rating() if h.forbes_rating else 3),
+            h.distance_from_venue
+        ))
+        
+        self._hotel_cache[cache_key] = matched_hotels
+        
+        # Concise debug output
+        print(f"🏨 {venue.city}: {len(amadeus_hotels)} Amadeus → {len(forbes_hotels)} Forbes → {len(matched_hotels)} final hotels")
+        print(f"matched_hotels: {matched_hotels}")
+        return matched_hotels
+    
+    def _get_amadeus_hotels_by_coordinates(self, venue: Venue) -> List[Dict]:
+        """Get Amadeus hotels using coordinate search"""
+        try:
+            self._wait_for_rate_limit()
+            response = self.amadeus.reference_data.locations.hotels.by_geocode.get(
+                latitude=venue.latitude, longitude=venue.longitude,
+                radius=self.HOTEL_RADIUS_KM, radiusUnit='KM'
+            )
+            return response.data if response.data else []
+        except Exception as e:
+            print(f"❌ Amadeus API error for {venue.city}: {e}")
+            return []
+    
+    def _match_forbes_to_amadeus(self, forbes_hotels: List[ForbesHotel], amadeus_hotels: List[Dict], venue: Venue) -> List[HotelOption]:
+        """Match Forbes hotels to Amadeus hotels"""
+        matched, matched_ids = [], set()
+        
+        for forbes_hotel in forbes_hotels:
+            cache_key = f"{forbes_hotel.hotel_name}_{venue.city}"
+            if cache_key in self._failed_matches_cache:
+                continue
+            
+            best_match, confidence = self._find_best_amadeus_match(forbes_hotel, amadeus_hotels)
+            print(f'{best_match}')
+            if (best_match and best_match['hotelId'] not in matched_ids and confidence >= self.CONFIDENCE_THRESHOLD):
+                distance = self._calculate_hotel_distance(best_match, venue)
+                if distance <= self.HOTEL_RADIUS_KM:
+                    matched.append(self._create_hotel_option(best_match, forbes_hotel, distance))
+                    matched_ids.add(best_match['hotelId'])
+                else:
+                    self._failed_matches_cache.add(cache_key)
+            else:
+                self._failed_matches_cache.add(cache_key)
+        
+        return matched
+    
+    def _find_best_amadeus_match(self, forbes_hotel: ForbesHotel, amadeus_hotels: List[Dict]) -> Tuple[Optional[Dict], float]:
+        """Find best matching Amadeus hotel with confidence scoring"""
+        if not amadeus_hotels:
+            return None, 0.0
+        
+        forbes_name = forbes_hotel.hotel_name.lower()
+        best_match, best_confidence = None, 0.0
+        
+        for amadeus_hotel in amadeus_hotels:
+            amadeus_name = amadeus_hotel.get('name', '').lower()
+            
+            # Calculate different similarity scores
+            brand_score = self._calculate_brand_similarity(forbes_name, amadeus_name)
+            name_score = self._calculate_name_similarity(forbes_name, amadeus_name)
+            location_score = self._calculate_location_similarity(forbes_name, amadeus_name)
+            
+            # Determine final confidence with strategy prioritization
+            if brand_score > 0.8:
+                confidence = brand_score
+            elif name_score > 0.7:
+                confidence = name_score
+            elif location_score > 0.8:
+                confidence = location_score * 0.7
+            elif brand_score > 0.5 and name_score > 0.3:
+                confidence = (brand_score * 0.7) + (name_score * 0.3)
+            else:
+                confidence = max(brand_score, name_score, location_score) * 0.5
+            
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_match = amadeus_hotel
+        
+        return best_match, best_confidence
+    
+    def _calculate_brand_similarity(self, forbes_name: str, amadeus_name: str) -> float:
+        """Calculate brand similarity score"""
+        # Find Forbes brand
+        forbes_brand = None
+        for brand, variations in self.HOTEL_BRANDS.items():
+            if any(var.strip() in forbes_name for var in variations if len(var.strip()) > 2):
+                forbes_brand = brand
+                break
+        
+        if not forbes_brand:
+            return 0.0
+        
+        # Check Amadeus name for same brand
+        brand_variations = self.HOTEL_BRANDS[forbes_brand]
+        if any(var.strip() in amadeus_name for var in brand_variations if len(var.strip()) > 2):
+            return 1.0
+        
+        # Check partial brand matches
+        brand_words = [w for w in forbes_brand.split() if len(w) > 3]
+        amadeus_words = amadeus_name.split()
+        
+        matches = sum(1 for brand_word in brand_words 
+                     for amadeus_word in amadeus_words
+                     if brand_word == amadeus_word or 
+                        (len(brand_word) > 4 and brand_word in amadeus_word))
+        
+        return matches / len(brand_words) if brand_words else 0.0
+    
+    def _calculate_name_similarity(self, forbes_name: str, amadeus_name: str) -> float:
+        """Calculate name similarity score"""
+        def clean_name(name):
+            # Remove spa terms and common words
+            for term in ['spa at', 'spa', 'chuan spa', 'health club']:
+                name = name.replace(term, ' ')
+            
+            words = [w.strip('.,();') for w in name.split() 
+                    if w not in {'hotel', 'resort', 'suites', 'suite', 'inn', 'lodge', 
+                                'the', 'a', 'an', 'and', 'at', 'by', 'of', 'in', '&'} 
+                    and len(w) > 2 and not w.isdigit()]
+            return ' '.join(words)
+        
+        clean_forbes = clean_name(forbes_name)
+        clean_amadeus = clean_name(amadeus_name)
+        
+        if not clean_forbes or not clean_amadeus:
+            return 0.0
+        
+        # Exact matches
+        if clean_forbes == clean_amadeus:
+            return 1.0
+        elif clean_forbes in clean_amadeus or clean_amadeus in clean_forbes:
+            return 0.9
+        
+        # Word overlap
+        forbes_words = set(clean_forbes.split())
+        amadeus_words = set(clean_amadeus.split())
+        
+        if forbes_words and amadeus_words:
+            intersection = forbes_words.intersection(amadeus_words)
+            if len(intersection) >= 2:
+                return len(intersection) / len(forbes_words.union(amadeus_words))
+            elif len(intersection) == 1:
+                matching_word = list(intersection)[0]
+                return 0.6 if len(matching_word) > 4 else 0.0
+        
+        return 0.0
+    
+    def _calculate_location_similarity(self, forbes_name: str, amadeus_name: str) -> float:
+        """Calculate location-based similarity score"""
+        forbes_locations = [loc for loc in self.LOCATION_KEYWORDS if loc in forbes_name]
+        amadeus_locations = [loc for loc in self.LOCATION_KEYWORDS if loc in amadeus_name]
+        
+        if forbes_locations and amadeus_locations:
+            for floc in forbes_locations:
+                for aloc in amadeus_locations:
+                    if floc == aloc:
+                        return 1.0
+                    elif floc in aloc or aloc in floc:
+                        return 0.8
+        return 0.0
+    
+    def _create_hotel_option(self, amadeus_hotel: Dict, forbes_hotel: ForbesHotel, distance: float) -> HotelOption:
+        """Create HotelOption from matched hotels"""
+        return HotelOption(
+            hotel_id=amadeus_hotel['hotelId'],
+            name=amadeus_hotel.get('name', forbes_hotel.hotel_name),
+            distance_from_venue=distance,
+            overall_rating=forbes_hotel.get_numeric_rating() * 20,
+            price_tier="LUXURY" if forbes_hotel.get_numeric_rating() >= 4 else "UPSCALE",
+            amenities=self._get_amenities_for_forbes_hotel(forbes_hotel),
+            location_score=max(0, 100 - int(distance * 4)),
+            coordinates=(amadeus_hotel['geoCode']['latitude'], amadeus_hotel['geoCode']['longitude']),
+            forbes_rating=forbes_hotel
+        )
+    
+    def _get_additional_quality_hotels(self, existing_hotels: List[HotelOption], amadeus_hotels: List[Dict], venue: Venue) -> List[HotelOption]:
+        """Get additional quality hotels from Amadeus"""
+        existing_ids = {h.hotel_id for h in existing_hotels}
+        additional = []
+        
+        for hotel_data in amadeus_hotels:
+            if (hotel_data['hotelId'] not in existing_ids and len(additional) < 5):
+                distance = self._calculate_hotel_distance(hotel_data, venue)
+                if distance <= self.STRICT_RADIUS_KM and self._estimate_hotel_rating(hotel_data) >= self.MIN_HOTEL_RATING:
+                    additional.append(self._create_amadeus_hotel_option(hotel_data, distance))
+        
+        return additional
+    
+    def _create_hotels_from_amadeus_only(self, amadeus_hotels: List[Dict], venue: Venue) -> List[HotelOption]:
+        """Create hotel options from Amadeus data only"""
+        hotels = []
+        for hotel_data in amadeus_hotels:
+            distance = self._calculate_hotel_distance(hotel_data, venue)
+            if distance <= self.HOTEL_RADIUS_KM:
+                hotels.append(self._create_amadeus_hotel_option(hotel_data, distance))
+        
+        hotels.sort(key=lambda h: (h.distance_from_venue, -h.overall_rating))
+        return hotels
+    
+    def _create_amadeus_hotel_option(self, hotel_data: Dict, distance: float) -> HotelOption:
+        """Create HotelOption from Amadeus data only"""
+        return HotelOption(
+            hotel_id=hotel_data['hotelId'],
+            name=hotel_data['name'],
+            distance_from_venue=distance,
+            overall_rating=self._estimate_hotel_rating(hotel_data),
+            price_tier=self._determine_price_tier(hotel_data),
+            amenities=self._extract_amenities(hotel_data),
+            location_score=max(0, 100 - int(distance * 4)),
+            coordinates=(hotel_data['geoCode']['latitude'], hotel_data['geoCode']['longitude']),
+            forbes_rating=None
+        )
+    
+    def _get_forbes_hotels(self, city_name: str) -> List[ForbesHotel]:
+        """Get Forbes hotels from database"""
+        if not self.aggregator or not hasattr(self.aggregator, 'db'):
+            return []
+        
+        # City variations for search
+        cities_to_search = [city_name]
+        city_variations = {
+            "Los Angeles": ["Beverly Hills", "Hollywood", "Santa Monica"],
+            "New York": ["Manhattan", "Brooklyn"],
+            "Washington": ["Washington DC"],
+            "Miami": ["Miami Beach", "South Beach"]
+        }
+        cities_to_search.extend(city_variations.get(city_name, []))
+        
+        try:
+            with sqlite3.connect(self.aggregator.db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                placeholders = ','.join(['?' for _ in cities_to_search])
+                
+                cursor = conn.execute(f"""
+                    SELECT hotel_name, destination, star_rating 
+                    FROM hotels 
+                    WHERE destination IN ({placeholders})
+                    AND star_rating IN ('FIVE_STAR', 'FOUR_STAR', 'RECOMMENDED')
+                    ORDER BY CASE star_rating WHEN 'FIVE_STAR' THEN 5 WHEN 'FOUR_STAR' THEN 4 ELSE 3 END DESC
+                    LIMIT 20
+                """, cities_to_search)
+                
+                return [ForbesHotel(
+                    hotel_name=self._clean_forbes_hotel_name(row['hotel_name']),
+                    destination=row['destination'],
+                    star_rating=row['star_rating']
+                ) for row in cursor.fetchall()]
+        except Exception:
+            return []
+    
+    def _clean_forbes_hotel_name(self, name: str) -> str:
+        """Clean Forbes hotel names for better matching"""
+        cleaned = re.sub(r'\b(spa at|chuan spa|spa)\b', '', name, flags=re.IGNORECASE).strip()
+        return ' '.join(cleaned.split())
+    
+    # Utility methods
+    def _wait_for_rate_limit(self):
+        """Ensure API rate limit compliance"""
+        with self.request_lock:
+            elapsed = time.time() - self.last_request_time
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+            self.last_request_time = time.time()
+    
+    def _calculate_hotel_distance(self, hotel_data: Dict, venue: Venue) -> float:
+        """Calculate distance between hotel and venue"""
+        if ('geoCode' not in hotel_data):
+            print(f"could not calculate distance: {hotel_data}")
+            return 999999
+        geo = hotel_data.get('geoCode', {})
+        
+        return self._haversine_distance(
+                venue.latitude, venue.longitude,
+                float(geo.get('latitude', 0)), float(geo.get('longitude', 0))
+            )
+    
+    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between coordinates in km"""
+        R = 6371  # Earth's radius in km
+        dlat, dlon = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+        a = (math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * 
+             math.cos(math.radians(lat2)) * math.sin(dlon/2)**2)
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    def _calculate_distance(self, origin_city: str, destination_city: str) -> float:
+        """Calculate distance between cities"""
+        try:
+            city_coords = (self.aggregator.espn_scraper.city_coordinates 
+                          if self.aggregator and hasattr(self.aggregator, 'espn_scraper') 
+                          else {})
+            
+            origin_coords = city_coords.get(origin_city)
+            dest_coords = city_coords.get(destination_city)
+            
+            if origin_coords and dest_coords:
+                return self._haversine_distance(*origin_coords, *dest_coords) * 0.621371
+            return 800.0
+        except Exception:
+            return 800.0
+    
+    def _estimate_hotel_rating(self, hotel_data: dict) -> int:
+        """Estimate hotel rating from available data"""
+        name, chain = hotel_data.get('name', '').upper(), hotel_data.get('chainCode', '').upper()
+        
+        luxury_indicators = (['RITZ', 'FOUR SEASONS', 'MANDARIN', 'ST. REGIS', 'WALDORF'], 
+                            {'RT', 'RC', 'LX', 'BU', 'SL', 'WR', 'PH', 'FS', 'JW'})
+        upscale_indicators = (['HILTON', 'MARRIOTT', 'HYATT', 'WESTIN', 'SHERATON'],
+                             {'HI', 'HL', 'DT', 'MP', 'HW', 'IC', 'IN', 'AC'})
+        
+        if chain in luxury_indicators[1] or any(kw in name for kw in luxury_indicators[0]):
+            return 90
+        elif chain in upscale_indicators[1] or any(kw in name for kw in upscale_indicators[0]):
+            return 80
+        return 70
+    
+    def _determine_price_tier(self, hotel_data: dict) -> str:
+        """Determine hotel price tier"""
+        rating = self._estimate_hotel_rating(hotel_data)
+        return "LUXURY" if rating >= 90 else "UPSCALE" if rating >= 80 else "MIDSCALE"
+    
+    def _extract_amenities(self, hotel_data: dict) -> List[str]:
+        """Extract amenities from hotel data"""
+        name = hotel_data.get('name', '').upper()
+        amenities = ['WIFI', 'PARKING']
+        
+        if any(kw in name for kw in ['RESORT', 'SPA']):
+            amenities.append('SPA')
+        if any(kw in name for kw in ['SUITES', 'SUITE']):
+            amenities.append('SUITES')
+        if 'AIRPORT' in name:
+            amenities.append('AIRPORT SHUTTLE')
+        
+        return amenities[:6]
+    
+    def _get_amenities_for_forbes_hotel(self, forbes_hotel: ForbesHotel) -> List[str]:
+        """Get amenities based on Forbes rating"""
+        rating = forbes_hotel.get_numeric_rating()
+        amenities = ['WIFI']
+        
+        if rating >= 3:
+            amenities.extend(['CONCIERGE', 'BUSINESS CENTER'])
+        if rating >= 4:
+            amenities.extend(['SPA', 'FITNESS CENTER', 'FINE DINING', 'VALET PARKING'])
+        if rating >= 5:
+            amenities.extend(['BUTLER SERVICE', 'LUXURY AMENITIES'])
+        
+        return amenities
+    
+    # Airport and risk assessment methods
+    def _get_venue_airports(self, venue: Venue, travel_date: datetime) -> List[AirportInfo]:
+        """Get airports near venue with caching"""
+        cache_key = f"{venue.city}_{venue.latitude}_{venue.longitude}"
+        
+        if cache_key not in self._airport_cache:
+            self._airport_cache[cache_key] = self._fetch_airports_for_venue(venue)
+        
+        airports = self._airport_cache[cache_key]
+        
+        # Update performance data if needed
         if not self.skip_performance_calls and airports:
             primary_airport = airports[0]
             perf_key = f"{primary_airport.iata_code}_{travel_date.strftime('%Y-%m-%d')}"
             if perf_key not in self._performance_cache:
-                perf = self._get_airport_performance(primary_airport.iata_code, travel_date)
-                self._performance_cache[perf_key] = perf
+                self._performance_cache[perf_key] = self._get_airport_performance(primary_airport.iata_code, travel_date)
             primary_airport.on_time_probability = self._performance_cache[perf_key]
         
         return sorted(airports, key=lambda x: x.distance_from_venue)
     
-    def _fetch_airports_for_venue(self, venue: 'Venue') -> List[AirportInfo]:
-        """OPTIMIZED: Fetch airports with proper rate limiting"""
+    def _fetch_airports_for_venue(self, venue: Venue) -> List[AirportInfo]:
+        """Fetch airports from Amadeus API"""
         try:
-            # OPTIMIZATION: Apply rate limiting (10 requests/second)
             self._wait_for_rate_limit()
-            
-            print(f"🛫 API call: airports for {venue.city}")
-            
             response = self.amadeus.reference_data.locations.airports.get(
-                latitude=venue.latitude,
-                longitude=venue.longitude,
-                radius=200  # 200km radius
+                latitude=venue.latitude, longitude=venue.longitude, radius=100
             )
             
             airports = []
-            for airport_data in response.data[:5]:  # Top 5 airports only
+            for airport_data in response.data:
                 distance = self._haversine_distance(
                     venue.latitude, venue.longitude,
                     airport_data['geoCode']['latitude'], 
@@ -254,166 +635,27 @@ class AmadeusAnalyzer:
                     name=airport_data['name'],
                     city=airport_data['address']['cityName'],
                     distance_from_venue=distance,
-                    on_time_probability=0.85,  # Default, updated later if needed
-                    traveler_score=airport_data.get('analytics', {}).get('travelers', {}).get('score', 80),
+                    on_time_probability=0.85,
+                    traveler_score=airport_data.get('analytics', {}).get('travelers', {}).get('score', 75),
                     coordinates=(airport_data['geoCode']['latitude'], airport_data['geoCode']['longitude']),
                     timezone_offset=airport_data.get('timeZoneOffset', '')
                 ))
             
             return airports
-            
         except Exception as e:
             self.logger.error(f"Failed to fetch airports for {venue.city}: {e}")
             return []
     
-    def _get_destination_hotels(self, venue: 'Venue', check_in_date: datetime) -> List[HotelOption]:
-        """OPTIMIZED: Get hotels without slow ratings API call"""
-        cache_key = f"{venue.latitude}_{venue.longitude}"
-        
-        if cache_key in self._hotel_cache:
-            print(f"🏨 Cache hit: {venue.city} hotels")
-            return self._hotel_cache[cache_key]
-        
-        try:
-            # OPTIMIZATION: Apply rate limiting
-            self._wait_for_rate_limit()
-            
-            print(f"🏨 API call: hotels for {venue.city}")
-            
-            hotels_response = self.amadeus.reference_data.locations.hotels.by_geocode.get(
-                latitude=venue.latitude,
-                longitude=venue.longitude,
-                radius=25,  # 25km radius
-                radiusUnit='KM'
-            )
-            
-            hotels = []
-            
-            # OPTIMIZATION: Skip hotel ratings API call (too slow)
-            # Estimate ratings from hotel name/chain instead
-            for hotel_data in hotels_response.data[:10]:  # Top 10 hotels
-                distance = self._haversine_distance(
-                    venue.latitude, venue.longitude,
-                    hotel_data['geoCode']['latitude'],
-                    hotel_data['geoCode']['longitude']
-                )
-                
-                # Estimate rating without API call
-                estimated_rating = self._estimate_hotel_rating(hotel_data)
-                
-                hotels.append(HotelOption(
-                    hotel_id=hotel_data['hotelId'],
-                    name=hotel_data['name'],
-                    distance_from_venue=distance,
-                    overall_rating=estimated_rating,
-                    price_tier=self._determine_price_tier(hotel_data),
-                    amenities=self._extract_amenities(hotel_data),
-                    location_score=75,  # Default score
-                    coordinates=(hotel_data['geoCode']['latitude'], hotel_data['geoCode']['longitude'])
-                ))
-            
-            hotels.sort(key=lambda h: (h.distance_from_venue, -h.overall_rating))
-            self._hotel_cache[cache_key] = hotels
-            return hotels
-            
-        except Exception as e:
-            self.logger.error(f"Failed to fetch hotels for venue: {e}")
-            return []
-    
     def _get_airport_performance(self, airport_code: str, date: datetime) -> float:
-        """OPTIMIZED: Get airport performance with rate limiting"""
+        """Get airport on-time performance"""
         try:
             self._wait_for_rate_limit()
-            
             response = self.amadeus.airport.predictions.on_time.get(
-                airportCode=airport_code,
-                date=date.strftime('%Y-%m-%d')
+                airportCode=airport_code, date=date.strftime('%Y-%m-%d')
             )
             return float(response.data['probability'])
         except:
-            return 0.85  # Default assumption
-    
-    def _wait_for_rate_limit(self):
-        """NEW: Ensure we don't exceed Amadeus rate limits (10 requests/second)"""
-        with self.request_lock:
-            current_time = time.time()
-            time_since_last = current_time - self.last_request_time
-            
-            if time_since_last < self.min_request_interval:
-                sleep_time = self.min_request_interval - time_since_last
-                time.sleep(sleep_time)
-            
-            self.last_request_time = time.time()
-    
-    def _estimate_hotel_rating(self, hotel_data: dict) -> int:
-        """NEW: Estimate hotel rating without API call"""
-        hotel_name = hotel_data.get('name', '').upper()
-        chain_code = hotel_data.get('chainCode', '').upper()
-        
-        # Luxury indicators
-        luxury_keywords = ['RITZ', 'FOUR SEASONS', 'MANDARIN', 'ST. REGIS', 'WALDORF']
-        upscale_keywords = ['HILTON', 'MARRIOTT', 'HYATT', 'WESTIN', 'SHERATON']
-        luxury_chains = {'RT', 'RC', 'LX', 'BU', 'SL', 'WR', 'PH', 'FS', 'JW'}
-        upscale_chains = {'HI', 'HL', 'DT', 'MP', 'HW', 'IC', 'IN', 'AC'}
-        
-        if chain_code in luxury_chains or any(keyword in hotel_name for keyword in luxury_keywords):
-            return 90
-        elif chain_code in upscale_chains or any(keyword in hotel_name for keyword in upscale_keywords):
-            return 80
-        else:
-            return 70
-    
-    def _create_empty_intelligence(self, team_info: TeamInfo) -> TeamTravelIntelligence:
-        """NEW: Create empty intelligence for teams with no travel"""
-        return TeamTravelIntelligence(
-            team_info=team_info,
-            upcoming_routes=[],
-            total_travel_distance=0,
-            highest_risk_route=None,
-            travel_complexity_score=0,
-            recommendations=["No upcoming travel required"],
-            analysis_timestamp=datetime.now()
-        )
-    
-    # Keep all existing methods unchanged
-    def _calculate_distance(self, origin_city: str, destination_city: str) -> float:
-        """Calculate real distance between cities using existing coordinates"""
-        try:
-            if self.aggregator and hasattr(self.aggregator, 'espn_scraper'):
-                city_coords = self.aggregator.espn_scraper.city_coordinates
-            else:
-                scraper = ESPNScheduleScraper()
-                city_coords = scraper.load_city_coordinates()
-            
-            origin_coords = city_coords.get(origin_city)
-            dest_coords = city_coords.get(destination_city)
-            
-            if not origin_coords or not dest_coords:
-                self.logger.warning(f"Coordinates not found for {origin_city} or {destination_city}")
-                return 800.0  # Reasonable default
-            
-            distance_km = self._haversine_distance(
-                origin_coords[0], origin_coords[1], 
-                dest_coords[0], dest_coords[1]
-            )
-            
-            distance_miles = distance_km * 0.621371
-            return distance_miles
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating distance: {e}")
-            return 800.0
-    
-    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Calculate distance between two coordinates in km"""
-        R = 6371  # Earth's radius in km
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = (math.sin(dlat/2) * math.sin(dlat/2) + 
-             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * 
-             math.sin(dlon/2) * math.sin(dlon/2))
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        return R * c
+            return 0.85
     
     def _assess_travel_confidence(self, airport: AirportInfo, hotels: List[HotelOption]) -> str:
         """Assess overall travel confidence"""
@@ -424,135 +666,56 @@ class AmadeusAnalyzer:
         hotel_score = max(h.overall_rating for h in hotels) / 100 if hotels else 0
         combined_score = (airport_score + hotel_score) / 2
         
-        if combined_score > 0.8:
-            return "HIGH"
-        elif combined_score > 0.6:
-            return "MEDIUM"
-        else:
-            return "LOW"
+        return "HIGH" if combined_score > 0.8 else "MEDIUM" if combined_score > 0.6 else "LOW"
     
     def _identify_risk_factors(self, airport: AirportInfo, date: datetime) -> List[str]:
-        """Identify potential travel risk factors"""
+        """Identify travel risk factors"""
         risks = []
         
         if airport and airport.on_time_probability < 0.7:
             risks.append("Poor airport on-time performance")
         
-        # Add seasonal weather risks
         if airport:
             month = date.month
-            if month in [12, 1, 2] and airport.iata_code in ['ORD', 'DEN', 'MSP', 'BOS']:
+            if month in [12, 1, 2] and airport.iata_code in ['DEN', 'MSP', 'BOS']:
                 risks.append("Winter weather concerns")
-            elif month in [6, 7, 8] and airport.iata_code in ['DFW', 'ATL', 'MIA']:
+            elif month in [6, 7, 8] and airport.iata_code in ['ORD', 'DFW', 'ATL', 'MIA']:
                 risks.append("Summer thunderstorm season")
         
         return risks
     
+    # Intelligence generation methods
+    def _create_empty_intelligence(self, team_info: 'TeamInfo') -> TeamTravelIntelligence:
+        """Create empty intelligence for teams with no travel"""
+        return TeamTravelIntelligence(
+            team_info=team_info, upcoming_routes=[], total_travel_distance=0,
+            highest_risk_route=None, travel_complexity_score=0,
+            recommendations=["No upcoming travel required"], analysis_timestamp=datetime.now()
+        )
+    
     def _identify_highest_risk_route(self, routes: List[RouteInsights]) -> Optional[RouteInsights]:
-        """Find the route with highest travel risk"""
-        if not routes:
-            return None
-        return min(routes, key=lambda r: r.primary_airport.on_time_probability if r.primary_airport else 0)
+        """Find highest risk route"""
+        return min(routes, key=lambda r: r.primary_airport.on_time_probability if r.primary_airport else 0) if routes else None
     
     def _calculate_complexity_score(self, routes: List[RouteInsights]) -> float:
-        """Calculate overall travel complexity score (0-100)"""
+        """Calculate travel complexity score (0-100)"""
         if not routes:
             return 0
         
         total_distance = sum(r.travel_distance for r in routes)
-        avg_airport_performance = sum(
-            r.primary_airport.on_time_probability for r in routes if r.primary_airport
-        ) / len(routes) if routes else 0.85
+        avg_performance = sum(r.primary_airport.on_time_probability for r in routes if r.primary_airport) / len(routes)
         
         distance_score = min(total_distance / 100, 100)
-        performance_score = (1 - avg_airport_performance) * 100
+        performance_score = (1 - avg_performance) * 100
         
         return (distance_score + performance_score) / 2
     
     def _generate_recommendations(self, routes: List[RouteInsights]) -> List[str]:
         """Generate travel recommendations"""
-        recommendations = []
-        
         high_risk_routes = [r for r in routes if r.travel_confidence == "LOW"]
-        if high_risk_routes:
-            recommendations.append(f"Monitor {len(high_risk_routes)} high-risk routes closely")
-        
-        if not recommendations:
-            recommendations.append("All routes look good for upcoming travel")
-        
-        return recommendations
-    
-    def _determine_price_tier(self, hotel_data: dict) -> str:
-        """Determine hotel price tier based on available data"""
-        try:
-            chain_code = hotel_data.get('chainCode', '').upper()
-            
-            luxury_chains = {
-                'RT', 'RC', 'LX', 'BU', 'SL', 'WR', 'PH', 'FS', 'JW', 
-                'W', 'ED', 'LH', 'PK', 'SH', 'SO', 'ST', 'AL', 'GR'
-            }
-            
-            upscale_chains = {
-                'HI', 'HL', 'DT', 'MP', 'HW', 'IC', 'IN', 'AC', 'BW', 
-                'CY', 'ES', 'HY', 'NH', 'NO', 'RA', 'RP', 'SG', 'WE'
-            }
-            
-            if chain_code in luxury_chains:
-                return "LUXURY"
-            elif chain_code in upscale_chains:
-                return "UPSCALE"
-            else:
-                hotel_name = hotel_data.get('name', '').upper()
-                
-                luxury_keywords = ['RITZ', 'FOUR SEASONS', 'MANDARIN', 'PENINSULA', 
-                                 'ST. REGIS', 'WALDORF', 'BULGARI', 'AMAN', 'ROSEWOOD']
-                
-                upscale_keywords = ['HILTON', 'MARRIOTT', 'HYATT', 'INTERCONTINENTAL', 
-                                  'WESTIN', 'SHERATON', 'DOUBLETREE', 'RENAISSANCE']
-                
-                for keyword in luxury_keywords:
-                    if keyword in hotel_name:
-                        return "LUXURY"
-                
-                for keyword in upscale_keywords:
-                    if keyword in hotel_name:
-                        return "UPSCALE"
-                
-                return "MIDSCALE"
-                
-        except Exception as e:
-            self.logger.warning(f"Error determining price tier: {e}")
-            return "MIDSCALE"
+        return ([f"Monitor {len(high_risk_routes)} high-risk routes closely"] if high_risk_routes 
+                else ["All routes look good for upcoming travel"])
 
-    def _extract_amenities(self, hotel_data: dict) -> List[str]:
-        """Extract hotel amenities from hotel data"""
-        amenities = []
-        
-        try:
-            hotel_name = hotel_data.get('name', '').upper()
-            
-            if any(keyword in hotel_name for keyword in ['RESORT', 'SPA']):
-                amenities.append('SPA')
-            
-            if any(keyword in hotel_name for keyword in ['SUITES', 'SUITE']):
-                amenities.append('SUITES')
-            
-            if any(keyword in hotel_name for keyword in ['CONFERENCE', 'CONVENTION']):
-                amenities.append('BUSINESS CENTER')
-            
-            if any(keyword in hotel_name for keyword in ['AIRPORT']):
-                amenities.append('AIRPORT SHUTTLE')
-            
-            standard_amenities = ['WIFI', 'PARKING', 'CONCIERGE']
-            amenities.extend(standard_amenities)
-            
-            amenities = list(set(amenities))[:6]
-            
-        except Exception as e:
-            self.logger.warning(f"Error extracting amenities: {e}")
-            amenities = ['WIFI', 'PARKING']
-        
-        return amenities
 
 class AmadeusWorker(QThread):
     """Simplified Amadeus worker that uses existing travel_data table"""
@@ -954,9 +1117,9 @@ class ESPNScheduleScraper:
         }
     
     def load_city_coordinates(self) -> Dict[str, Tuple[float, float]]:
-        """Enhanced city coordinates including NBA and NHL cities"""
+        """City coordinates for MLB, NHL, NBA"""
         return {
-            # Existing MLB cities
+            
             "Phoenix": (33.4484, -112.0740), "Atlanta": (33.7490, -84.3880),
             "Baltimore": (39.2904, -76.6122), "Boston": (42.3601, -71.0589),
             "Chicago": (41.8781, -87.6298), "Cincinnati": (39.1031, -84.5120),
@@ -971,14 +1134,14 @@ class ESPNScheduleScraper:
             "St. Louis": (38.6270, -90.1994), "Tampa": (27.9506, -82.4572),
             "Dallas": (32.7767, -96.7970), "Washington": (38.9072, -77.0369),
             
-            # Additional NBA cities
+            
             "Indianapolis": (39.7684, -86.1581), "Charlotte": (35.2271, -80.8431),
             "Orlando": (28.5383, -81.3792), "Portland": (45.5152, -122.6784),
             "Sacramento": (38.5816, -121.4944), "Salt Lake City": (40.7608, -111.8910),
             "Oklahoma City": (35.4676, -97.5164), "Memphis": (35.1495, -90.0490),
             "New Orleans": (29.9511, -90.0715), "San Antonio": (29.4241, -98.4936),
             
-            # Additional NHL cities
+            
             "Buffalo": (42.8864, -78.8784), "Sunrise": (26.1354, -80.2373),
             "Raleigh": (35.7796, -78.6382), "Columbus": (39.9612, -82.9988),
             "Newark": (40.7357, -74.1724), "Nashville": (36.1627, -86.7816),
@@ -1683,7 +1846,7 @@ class ESPNSportsDataAggregator(QObject):
         
         # Check if DB file exists; if not, scrape it all
         self.amadeus_worker = None
-        db_exists = Path(db_path).exists()    
+        db_exists = Path(db_path).exists()
         
         self.db = DatabaseManager(db_path)
         self.espn_scraper = ESPNScheduleScraper()
@@ -1781,7 +1944,7 @@ class ESPNSportsDataAggregator(QObject):
             print(f"Scraping {league} {season} season schedule from ESPN...")
             self.progressUpdated.emit(10)
             
-            self.db.clear_season_data(season, league)
+            #self.db.clear_season_data(season, league)
             
             season_games = self.espn_scraper.scrape_league_schedule(league, season)
             

@@ -54,7 +54,7 @@ class FlightControlPanel(QWidget):
         self.upcoming_games_list = QListWidget()
         self.upcoming_days_spin = QSpinBox()
         self.upcoming_days_spin.setRange(1, 30)
-        self.upcoming_days_spin.setValue(7)
+        self.upcoming_days_spin.setValue(14)
         self.upcoming_days_spin.setFixedWidth(50)
         
         

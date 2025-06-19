@@ -1855,7 +1855,6 @@ class PlaneModel:
         self.banking_factor = 0.5  # How much to bank in turns
         self.max_bank_angle = 25.0  # Maximum bank angle in degrees
         self.orientation_smoothing = 0.85  # Smoothing factor for orientation changes
-        self._previous_orientation = None
         
         # State
         self.is_loaded = False
@@ -1863,7 +1862,7 @@ class PlaneModel:
     def setup_airplane_model(self) -> bool:
         """
         NOTE, THE AIRPLANE MODEL IS EXPORTED FROM BLENDER WITH A 90
-        DEGREE ROTATION ON BOTH THE X AND Z AXES TO ACCOUNT FOR CORDINATE SYSTEM MISMATCH WOOPTY 
+        DEGREE ROTATION ON BOTH THE X AND Z AXES TO ACCOUNT FOR COORDINATE SYSTEM MISMATCH WOOPTY 
         """
         # Find airplane model file
         possible_files = ["pj_airplane_0degx.obj", "paper_airplane.obj"]
@@ -1946,12 +1945,6 @@ class PlaneModel:
         
         # Create orientation matrix with banking
         orientation = self._create_flight_orientation(tangent_vector, current_pos, bank_angle)
-        
-        # Apply smoothing to prevent jerky rotations
-        if self._previous_orientation is not None:
-            orientation = self._smooth_orientation_transition(self._previous_orientation, orientation)
-        
-        self._previous_orientation = orientation
         
         # Cache result
         self._orientation_cache[cache_key] = orientation
@@ -2106,15 +2099,6 @@ class PlaneModel:
             orientation = bank_rotation * orientation
         
         return orientation
-    
-    def _smooth_orientation_transition(self, previous: QMatrix4x4, current: QMatrix4x4) -> QMatrix4x4:
-        """Apply smoothing to orientation changes to prevent jerky motion"""
-        # FIXED: PyQt6 QMatrix4x4 doesn't support () access
-        # Instead, use proper matrix interpolation
-        
-        # Simple approach: just return current orientation for now
-        # TODO: Implement proper quaternion SLERP for smooth transitions
-        return current
     
     def _get_cached_transform_matrix(self, position: tuple, orientation: QMatrix4x4) -> QMatrix4x4:
         """Get cached transformation matrix if state unchanged"""

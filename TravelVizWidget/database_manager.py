@@ -462,9 +462,9 @@ class DatabaseManager:
                            at.alternate_color as away_alt_color, at.logo_url as away_logo,
                            at.division as away_division, at.league as away_league,
                            at.conference as away_conference,
-                           v.name as venue_name, v.city as venue_city, v.state as venue_state,
+                           v.venue_name as venue_name, v.city as venue_city, v.state as venue_state,
                            v.country as venue_country, v.latitude, v.longitude,
-                           v.capacity, v.timezone
+                           v.venue_capacity, v.time_zone
                     FROM games g
                     JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
                     JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league
@@ -510,8 +510,8 @@ class DatabaseManager:
                         country=row['venue_country'],
                         latitude=row['latitude'],
                         longitude=row['longitude'],
-                        capacity=row['capacity'],
-                        timezone=row['timezone']
+                        capacity=row['venue_capacity'],
+                        timezone=row['time_zone']
                     )
                     
                     game = GameData(
@@ -848,9 +848,9 @@ class DatabaseManager:
                            at.alternate_color as away_alt_color, at.logo_url as away_logo,
                            at.division as away_division, at.league as away_league,
                            at.conference as away_conference,
-                           v.name as venue_name, v.city as venue_city, v.state as venue_state,
+                           v.venue_name as venue_name, v.city as venue_city, v.state as venue_state,
                            v.country as venue_country, v.latitude, v.longitude,
-                           v.capacity, v.timezone
+                           v.venue_capacity, v.time_zone
                     FROM games g
                     JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
                     JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league
