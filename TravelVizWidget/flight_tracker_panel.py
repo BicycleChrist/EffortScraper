@@ -11,9 +11,14 @@ from datetime import datetime, timedelta
 from data_client import TeamTravelIntelligence
 from database_manager import TeamTravelData, DatabaseManager, TeamInfo
 
-
 class FlightControlPanel(QWidget):
-
+    # Style constants
+    HEADER_FONT = QFont("Segoe UI", 5, QFont.Weight.Bold)
+    CONTENT_FONT = QFont("Segoe UI", 6)
+    HEADER_STYLE = "color: #10B981; border: none; background: transparent;"
+    CONTENT_STYLE = "color: #D1D5DB; border: none; background: transparent;"
+    MUTED_STYLE = "color: #6B7280; border: none; background: transparent;"
+    
     # Signals
     modeChanged = pyqtSignal(str)  # League changed: "MLB", "NBA", "NHL"
     teamChanged = pyqtSignal(str)  # Team selection changed
@@ -34,14 +39,12 @@ class FlightControlPanel(QWidget):
         self.nhl_btn = None
         self.team_combo = None
         self.analyze_btn = None
-        self.refresh_btn = None
         self.days_spin = None
         self.analysis_progress = None
         self.status_message = None
         self.live_indicator = None
         self.total_miles_value = None
         self.route_breakdown = None
-        self.alerts_label = None
         self.season_analysis_btn = None
         self.compare_btn = None
         self.export_btn = None
@@ -252,15 +255,15 @@ class FlightControlPanel(QWidget):
         
         # Days Ahead control on same line as title
         days_label = QLabel("Days:")
-        days_label.setFont(QFont("Segoe UI", 6))
+        days_label.setFont(self.CONTENT_FONT)
         header_layout.addWidget(days_label)
         header_layout.addWidget(self.upcoming_days_spin)
         
         layout.addLayout(header_layout)
     
-        # Game list - let it expand to fill available space
+        # Game list
         self.upcoming_games_list.setFont(QFont("Segoe UI", 7))
-        self.upcoming_games_list.setMinimumHeight(120)  # Set minimum instead of fixed
+        self.upcoming_games_list.setMinimumHeight(120)
         layout.addWidget(self.upcoming_games_list)
     
         # Trigger refresh on spinbox change
@@ -280,12 +283,11 @@ class FlightControlPanel(QWidget):
                 margin: 0px;  /* No margin to save space */
             }
         """)
-        # Remove fixed height to allow expansion
-        frame.setMinimumHeight(75)  # Set minimum instead of maximum
+        frame.setMinimumHeight(75)
         
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(3, 1, 3, 3)  # Minimal top margin
-        layout.setSpacing(0)  # No spacing between header and content
+        layout.setContentsMargins(3, 1, 3, 3)
+        layout.setSpacing(0)
         
         # Compact header with thin border - stays visible
         header_container = QWidget()
@@ -302,8 +304,8 @@ class FlightControlPanel(QWidget):
         header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
         
         header_label = QLabel(title)
-        header_label.setFont(QFont("Segoe UI", 5, QFont.Weight.Bold))  # Smaller font
-        header_label.setStyleSheet("color: #10B981; border: none; background: transparent;")
+        header_label.setFont(self.HEADER_FONT)
+        header_label.setStyleSheet(self.HEADER_STYLE)
         header_layout.addWidget(header_label)
         header_layout.addStretch()
         
@@ -317,8 +319,8 @@ class FlightControlPanel(QWidget):
         
         # Add placeholder
         placeholder = QLabel("No data available")
-        placeholder.setFont(QFont("Segoe UI", 6))
-        placeholder.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+        placeholder.setFont(self.CONTENT_FONT)
+        placeholder.setStyleSheet(self.MUTED_STYLE)
         self.hotels_layout.addWidget(placeholder)
         
         layout.addWidget(hotels_container)
@@ -341,12 +343,11 @@ class FlightControlPanel(QWidget):
                 margin: 0px;  /* No margin to save space */
             }
         """)
-        # Remove fixed height to allow expansion
-        frame.setMinimumHeight(80)  # Set minimum instead of maximum
+        frame.setMinimumHeight(80)
         
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(3, 1, 3, 3)  # Minimal top margin
-        layout.setSpacing(0)  # No spacing between header and content
+        layout.setContentsMargins(3, 1, 3, 3)
+        layout.setSpacing(0)
         
         # Compact header with thin border
         header_container = QWidget()
@@ -363,8 +364,8 @@ class FlightControlPanel(QWidget):
         header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
         
         header_label = QLabel("✈️ FLIGHT INTELLIGENCE")
-        header_label.setFont(QFont("Segoe UI", 5, QFont.Weight.Bold))  # Smaller font
-        header_label.setStyleSheet("color: #10B981; border: none; background: transparent;")
+        header_label.setFont(self.HEADER_FONT)
+        header_label.setStyleSheet(self.HEADER_STYLE)
         header_layout.addWidget(header_label)
         header_layout.addStretch()
         
@@ -378,8 +379,8 @@ class FlightControlPanel(QWidget):
         
         # Add placeholder
         placeholder = QLabel("No flight data available")
-        placeholder.setFont(QFont("Segoe UI", 6))
-        placeholder.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+        placeholder.setFont(self.CONTENT_FONT)
+        placeholder.setStyleSheet(self.MUTED_STYLE)
         self.flight_layout.addWidget(placeholder)
         
         layout.addWidget(flight_container)
@@ -390,62 +391,6 @@ class FlightControlPanel(QWidget):
         
         return frame
     
-    def determine_hotel_needs(self, team_id: str, intelligence: 'TeamTravelIntelligence') -> Dict:
-        """Determine current and next hotel needs based on game data"""
-        if not self.aggregator or not intelligence:
-            return {'current_stay': None, 'next_destination': None}
-        
-        now = datetime.now()
-        season = self.aggregator.current_season
-        league = self.aggregator.current_league
-        
-        # Get all games for this team
-        games = self.aggregator.db.load_games(season, league)
-        team_games = [
-            g for g in games 
-            if g.home_team.team_id.lower() == team_id.lower() or g.away_team.team_id.lower() == team_id.lower()
-        ]
-        team_games.sort(key=lambda x: x.date)
-        
-        result = {'current_stay': None, 'next_destination': None}
-        
-        # Find most recent game (current location)
-        recent_games = [g for g in team_games if g.date <= now]
-        if recent_games:
-            recent_game = max(recent_games, key=lambda x: x.date)
-            # Check if team was away for most recent game
-            if recent_game.away_team.team_id.lower() == team_id.lower():
-                # Team is currently away - find hotels from intelligence
-                for route in intelligence.upcoming_routes:
-                    if (route.game_data and 
-                        route.game_data.venue.venue_id == recent_game.venue.venue_id):
-                        result['current_stay'] = {
-                            'venue': recent_game.venue,
-                            'game_date': recent_game.date,
-                            'opponent': recent_game.home_team.abbreviation,
-                            'hotels': route.destination_hotels[:3]
-                        }
-                        break
-        
-        # Find next upcoming game
-        upcoming_games = [g for g in team_games if g.date > now]
-        if upcoming_games:
-            next_game = min(upcoming_games, key=lambda x: x.date)
-            # Check if next game is away
-            if next_game.away_team.team_id.lower() == team_id.lower():
-                # Find corresponding route in intelligence
-                for route in intelligence.upcoming_routes:
-                    if (route.game_data and 
-                        route.game_data.venue.venue_id == next_game.venue.venue_id):
-                        result['next_destination'] = {
-                            'venue': next_game.venue,
-                            'game_date': next_game.date,
-                            'opponent': next_game.home_team.abbreviation,
-                            'hotels': route.destination_hotels[:3]
-                        }
-                        break
-        
-        return result
 
     def connect_signals(self):
         """Connect all UI signals"""
@@ -717,14 +662,11 @@ class FlightControlPanel(QWidget):
 
     def on_team_selection_changed(self, text: str):
         """Handle team selection change - FIXED version"""
-        print(f"🎯 Team selection changed, text: '{text}'")
         
         if self.team_combo.count() > 0:
             team_abbr = self.team_combo.currentData()
-            print(f"🎯 Current team data: '{team_abbr}'")
             
             if team_abbr and team_abbr != "":  # Check for valid team
-                print(f"✅ Valid team selected: {team_abbr}")
                 
                 # Emit signal for main window
                 self.teamChanged.emit(team_abbr)
@@ -735,27 +677,21 @@ class FlightControlPanel(QWidget):
                 # FIXED: Ensure analyze button is enabled
                 self.analyze_btn.setEnabled(True)
                 self.analyze_btn.setToolTip(f"Analyze travel for {team_abbr}")
-                print(f"✅ Analyze button enabled for {team_abbr}")
             else:
-                print("🚫 No valid team selected")
                 self.analyze_btn.setEnabled(False)
                 self.analyze_btn.setToolTip("Select a team to analyze")
         else:
-            print("🚫 No teams available in combo box")
             self.analyze_btn.setEnabled(False)
             self.analyze_btn.setToolTip("No teams available")
 
     def trigger_amadeus_analysis(self):
         """Trigger Amadeus analysis for selected team - FIXED with debugging"""
-        print("🚀 Analyze button clicked!")
         
         if self.team_combo.count() > 0:
             team_abbr = self.team_combo.currentData()
-            print(f"🎯 Selected team for analysis: '{team_abbr}'")
             
             if team_abbr:
                 days_ahead = self.days_spin.value()
-                print(f"🔄 Requesting analysis for {team_abbr}, {days_ahead} days ahead")
                 
                 # Emit the signal
                 self.amadeusAnalysisRequested.emit(team_abbr, days_ahead)
@@ -766,12 +702,9 @@ class FlightControlPanel(QWidget):
                 self.analyze_btn.setEnabled(False)
                 self.analyze_btn.setText("Analyzing...")
                 
-                print("✅ Analysis request emitted successfully")
             else:
-                print("❌ No team selected for analysis")
                 self.status_message.setText("Please select a team first")
         else:
-            print("❌ No teams available for analysis")
             self.status_message.setText("No teams available")
 
 
@@ -803,7 +736,6 @@ class FlightControlPanel(QWidget):
         """Load teams into the combo box"""
         current_selection = self.team_combo.currentData() if self.team_combo.count() > 0 else None
         
-        print(f"🔄 Loading {len(teams)} teams into control panel combo")
         
         self.team_combo.clear()
         self.team_combo.addItem("Select Team", "")
@@ -813,14 +745,12 @@ class FlightControlPanel(QWidget):
             team_data_value = team.team_id
             
             self.team_combo.addItem(display_text, team_data_value)
-            print(f"   Added: {display_text} -> {team_data_value}")
         
         # Restore selection if possible
         if current_selection:
             index = self.team_combo.findData(current_selection)
             if index >= 0:
                 self.team_combo.setCurrentIndex(index)
-                print(f"✅ Restored selection: {current_selection}")
 
     def update_intelligence_display(self, intelligence: 'TeamTravelIntelligence'):
         """Update the intelligence display with Amadeus data"""
@@ -833,45 +763,46 @@ class FlightControlPanel(QWidget):
         # Update route breakdown
         route_breakdown_text = ""
         for i, route in enumerate(intelligence.upcoming_routes[:5], 1):  # Show top 5 routes
-            try:
-                # Extract data from the correct attributes
-                # Get airport codes from linked travel data if available
-                if hasattr(route, 'travel_data') and route.travel_data:
-                    departure_airport = route.travel_data.departure_airport or "UNK"
-                    arrival_airport = route.travel_data.arrival_airport or "UNK"
-                    opponent = route.travel_data.opponent or "UNK"
-                    game_date = route.travel_data.game_date.strftime('%m/%d') if route.travel_data.game_date else "TBD"
-                else:
-                    # Fallback to route data
-                    departure_airport = "UNK"  # Not available in RouteInsights
-                    arrival_airport = route.primary_airport.iata_code if route.primary_airport else "UNK"
-                    game_date = route.game_data.date.strftime('%m/%d') if route.game_data else "TBD"
-                    # Determine opponent from game data
-                    if hasattr(intelligence, 'team_info') and route.game_data:
-                        if route.game_data.home_team.team_id == intelligence.team_info.team_id.lower():
-                            opponent = route.game_data.away_team.abbreviation
-                        else:
-                            opponent = route.game_data.home_team.abbreviation
-                    else:
-                        opponent = "UNK"
-                
-                confidence = route.travel_confidence  # Correct attribute name
-                distance = route.travel_distance  # Correct attribute name
-                
-                route_breakdown_text += f"{i}. {departure_airport} → {arrival_airport} vs {opponent} [{confidence}] {game_date} ({distance:.0f}mi)\n"
-                
-            except Exception as e:
-                print(f"Error formatting route {i}: {e}")
-                route_breakdown_text += f"{i}. Route formatting error\n"
-        
+            route_breakdown_text += self._format_route_text(i, route, intelligence)
         
         self.route_breakdown.setPlainText(route_breakdown_text.strip())
         
-        # NEW: Update hotel displays
+        # Update hotel displays
         self.update_hotel_displays(intelligence)
         
-        # NEW: Update flight intelligence
+        # Update flight intelligence
         self.update_flight_intelligence(intelligence)
+    
+    def _format_route_text(self, index: int, route, intelligence) -> str:
+        """Helper method to format a single route for display"""
+        try:
+            # Extract data from the correct attributes
+            if hasattr(route, 'travel_data') and route.travel_data:
+                departure_airport = route.travel_data.departure_airport or "UNK"
+                arrival_airport = route.travel_data.arrival_airport or "UNK"
+                opponent = route.travel_data.opponent or "UNK"
+                game_date = route.travel_data.game_date.strftime('%m/%d') if route.travel_data.game_date else "TBD"
+            else:
+                # Fallback to route data
+                departure_airport = "UNK"
+                arrival_airport = route.primary_airport.iata_code if route.primary_airport else "UNK"
+                game_date = route.game_data.date.strftime('%m/%d') if route.game_data else "TBD"
+                # Determine opponent from game data
+                if hasattr(intelligence, 'team_info') and route.game_data:
+                    if route.game_data.home_team.team_id == intelligence.team_info.team_id.lower():
+                        opponent = route.game_data.away_team.abbreviation
+                    else:
+                        opponent = route.game_data.home_team.abbreviation
+                else:
+                    opponent = "UNK"
+            
+            confidence = route.travel_confidence
+            distance = route.travel_distance
+            
+            return f"{index}. {departure_airport} → {arrival_airport} vs {opponent} [{confidence}] {game_date} ({distance:.0f}mi)\n"
+            
+        except Exception:
+            return f"{index}. Route formatting error\n"
 
     def update_ui_for_league(self, league: str):
         """Update UI elements for specific league"""
@@ -884,23 +815,18 @@ class FlightControlPanel(QWidget):
         # Update the analyze button state
         self.analyze_btn.setEnabled(False)
         
-        print(f"🔄 Updated UI for {league} league")
 
     def update_travel_data(self, travel_data: List['TeamTravelData']):
         """Update the control panel with new travel data"""
         self.travel_data = travel_data
-        print(f"📊 Control panel received {len(travel_data)} travel records")
     
     def update_hotel_displays(self, intelligence: 'TeamTravelIntelligence'):
         """Update hotel display sections"""
-        print(f"🏨 DEBUG: update_hotel_displays called")
         
         if not intelligence or not intelligence.team_info:
-            print(f"🏨 DEBUG: No intelligence or team_info")
             return
         
         team_id = intelligence.team_info.team_id
-        print(f"🏨 DEBUG: Team ID: {team_id}")
         
         # Simple fix: use different routes for each section
         if intelligence.upcoming_routes:
@@ -908,7 +834,6 @@ class FlightControlPanel(QWidget):
             if len(intelligence.upcoming_routes) >= 1:
                 route = intelligence.upcoming_routes[0]
                 if route.destination_hotels:
-                    print(f"🏨 DEBUG: Current stay - Found {len(route.destination_hotels)} hotels")
                     self.populate_hotel_section(self.current_hotels_widget, route.destination_hotels[:3])
                     self.current_hotels_widget.setVisible(True)
                 else:
@@ -919,36 +844,26 @@ class FlightControlPanel(QWidget):
             if len(intelligence.upcoming_routes) >= 2:
                 route = intelligence.upcoming_routes[1]
                 if route.destination_hotels:
-                    print(f"🏨 DEBUG: Next destination - Found {len(route.destination_hotels)} hotels")
                     self.populate_hotel_section(self.next_hotels_widget, route.destination_hotels[:3])
                     self.next_hotels_widget.setVisible(True)
                 else:
                     self.populate_hotel_section(self.next_hotels_widget, [])
                     self.next_hotels_widget.setVisible(True)
             else:
-                print(f"🏨 DEBUG: No second route for next destination")
                 self.populate_hotel_section(self.next_hotels_widget, [])
                 self.next_hotels_widget.setVisible(True)
         else:
-            print(f"🏨 DEBUG: No upcoming routes found")
             self.populate_hotel_section(self.current_hotels_widget, [])
             self.populate_hotel_section(self.next_hotels_widget, [])
             self.current_hotels_widget.setVisible(True)
             self.next_hotels_widget.setVisible(True)
     
     
-    def get_star_rating(self, hotel) -> str:
+    def get_hotel_star_rating(self, hotel) -> str:
         """Convert hotel rating to star display"""
         if hotel.forbes_rating:
             rating = hotel.forbes_rating.get_numeric_rating()
-            if rating >= 5:
-                return "★★★★★"
-            elif rating >= 4:
-                return "★★★★"
-            elif rating >= 3:
-                return "★★★"
-            else:
-                return "★★"
+            return "★" * max(2, min(5, rating))  # Ensure 2-5 stars
         else:
             # Use overall rating
             if hotel.overall_rating >= 90:
@@ -967,7 +882,6 @@ class FlightControlPanel(QWidget):
             return
         
         if not hasattr(self.flight_info_widget, 'flight_layout'):
-            print("No flight_layout found")
             return
             
         # Clear existing items
@@ -981,8 +895,8 @@ class FlightControlPanel(QWidget):
                 
                 # Create flight item label with full text - use available horizontal space
                 flight_label = QLabel(f"✈️ {airport.iata_code} ({airport.on_time_probability:.0%}) - {airport.distance_from_venue:.0f}km from {venue_name}")
-                flight_label.setFont(QFont("Segoe UI", 6))
-                flight_label.setStyleSheet("color: #D1D5DB; border: none; background: transparent;")
+                flight_label.setFont(self.CONTENT_FONT)
+                flight_label.setStyleSheet(self.CONTENT_STYLE)
                 flight_label.setWordWrap(True)  # Allow text to wrap if needed
                 self.flight_info_widget.flight_layout.addWidget(flight_label)
         
@@ -990,10 +904,8 @@ class FlightControlPanel(QWidget):
     
     def populate_hotel_section(self, widget: QFrame, hotels: list):
         """Populate hotel section with hotel data using custom compact layout"""
-        print(f"🏨 DEBUG: populate_test_hotels called with {len(hotels)} hotels")
         
         if not hasattr(widget, 'hotels_layout'):
-            print("No hotels_layout found")
             return
             
         # Clear existing items
@@ -1003,8 +915,8 @@ class FlightControlPanel(QWidget):
         if not hotels:
             # Show "no data" message
             no_data_label = QLabel("No data available")
-            no_data_label.setFont(QFont("Segoe UI", 6))
-            no_data_label.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+            no_data_label.setFont(self.CONTENT_FONT)
+            no_data_label.setStyleSheet(self.MUTED_STYLE)
             widget.hotels_layout.addWidget(no_data_label)
             return
         
@@ -1012,36 +924,21 @@ class FlightControlPanel(QWidget):
         for hotel in hotels[:3]:  # Show top 3 to fit in space
             # Truncate long hotel names for space efficiency
             name = hotel.name[:15] + "..." if len(hotel.name) > 15 else hotel.name
-            stars = self.get_star_rating_simple(hotel)
+            stars = self.get_hotel_star_rating(hotel)
             
             # Create compact hotel item label
             hotel_label = QLabel(f"• {name} ({hotel.distance_from_venue:.1f}km) {stars}")
-            hotel_label.setFont(QFont("Segoe UI", 6))
-            hotel_label.setStyleSheet("color: #D1D5DB; border: none; background: transparent;")
+            hotel_label.setFont(self.CONTENT_FONT)
+            hotel_label.setStyleSheet(self.CONTENT_STYLE)
             widget.hotels_layout.addWidget(hotel_label)
-            print(f"🏨 DEBUG: Added hotel: {hotel.name}")
         
         # Add "more" indicator if there are additional hotels
         if len(hotels) > 3:
             more_label = QLabel(f"+ {len(hotels)-3} more hotels")
             more_label.setFont(QFont("Segoe UI", 5))
-            more_label.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+            more_label.setStyleSheet(self.MUTED_STYLE)
             widget.hotels_layout.addWidget(more_label)
     
-    def get_star_rating_simple(self, hotel) -> str:
-        """Simple star rating for compact display"""
-        if hotel.forbes_rating:
-            rating = hotel.forbes_rating.get_numeric_rating()
-            return "★" * rating
-        else:
-            if hotel.overall_rating >= 90:
-                return "★★★★★"
-            elif hotel.overall_rating >= 80:
-                return "★★★★"
-            elif hotel.overall_rating >= 70:
-                return "★★★"
-            else:
-                return "★★"
     
     def clear_layout(self, layout):
         """Helper to clear all widgets from a layout"""
