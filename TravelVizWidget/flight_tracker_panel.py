@@ -40,8 +40,6 @@ class FlightControlPanel(QWidget):
         self.status_message = None
         self.live_indicator = None
         self.total_miles_value = None
-        self.risk_factor_value = None
-        self.optimal_routes_value = None
         self.route_breakdown = None
         self.alerts_label = None
         self.season_analysis_btn = None
@@ -55,7 +53,7 @@ class FlightControlPanel(QWidget):
         self.upcoming_days_spin = QSpinBox()
         self.upcoming_days_spin.setRange(1, 30)
         self.upcoming_days_spin.setValue(14)
-        self.upcoming_days_spin.setFixedWidth(50)
+        self.upcoming_days_spin.setFixedWidth(55)  # Wider to show both digits
         
         
         # Build UI
@@ -81,23 +79,15 @@ class FlightControlPanel(QWidget):
         selection_frame = self.create_selection_section()
         layout.addWidget(selection_frame)
 
-        # AMADEUS TRAVEL INTELLIGENCE (replaces basic travel stats)
+        # AMADEUS TRAVEL INTELLIGENCE (includes analysis controls and progress)
         intelligence_frame = self.create_intelligence_section()
-        layout.addWidget(intelligence_frame)
+        layout.addWidget(intelligence_frame, 3)  # Give it 3 parts of available space
 
-        # Live Analysis Status
-        status_frame = self.create_analysis_status_section()
-        layout.addWidget(status_frame)
-
-        # Analysis Configuration
-        config_frame = self.create_analysis_config_section()
-        layout.addWidget(config_frame)
-
+        # UPCOMING GAMES - No spacing between sections
+        games_frame = self.create_upcoming_games_section()
+        layout.addWidget(games_frame, 2)  # Give it 2 parts of available space
         
-        layout.addStretch()
         self.setLayout(layout)
-        
-        layout.addWidget(self.create_upcoming_games_section())
 
     def create_header_section(self) -> QFrame:
         # Headers
@@ -116,15 +106,9 @@ class FlightControlPanel(QWidget):
 
         # Live indicator
         self.live_indicator = QLabel("● LIVE")
-        self.live_indicator.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.live_indicator.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.live_indicator.setStyleSheet("color: #FF6B00;")
         layout.addWidget(self.live_indicator)
-
-        # Refresh button
-        self.refresh_btn = QPushButton("REFRESH")
-        self.refresh_btn.setFixedSize(80, 30)
-        self.refresh_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        layout.addWidget(self.refresh_btn)
 
         return frame
 
@@ -167,10 +151,10 @@ class FlightControlPanel(QWidget):
         self.team_combo.setFont(QFont("Consolas", 9))
         team_layout.addWidget(self.team_combo)
 
-        # Analysis trigger
+        # Analysis trigger - wider to prevent clipping
         self.analyze_btn = QPushButton("ANALYZE")
         self.analyze_btn.setFixedSize(80, 25)
-        self.analyze_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.analyze_btn.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
         team_layout.addWidget(self.analyze_btn)
 
         layout.addLayout(team_layout)
@@ -180,127 +164,288 @@ class FlightControlPanel(QWidget):
     def create_intelligence_section(self) -> QGroupBox:
         """Create Amadeus intelligence display"""
         group = QGroupBox("AMADEUS TRAVEL INTELLIGENCE")
-        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        group.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         layout = QVBoxLayout(group)
+        layout.setSpacing(2)  # Very tight spacing
+        layout.setContentsMargins(6, 1, 6, 6)  # Minimal top margin to move metrics up
 
-        # Key metrics
-        metrics_layout = QGridLayout()
+        # Top metrics row - moved to very top of section
+        top_metrics_layout = QHBoxLayout()
         
         # Total Miles
         miles_label = QLabel("TOTAL MILES:")
-        miles_label.setFont(QFont("Consolas", 8))
+        miles_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self.total_miles_value = QLabel("--")
-        self.total_miles_value.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        self.total_miles_value.setStyleSheet("color: #00FF88;")
-        metrics_layout.addWidget(miles_label, 0, 0)
-        metrics_layout.addWidget(self.total_miles_value, 0, 1)
+        self.total_miles_value.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.total_miles_value.setStyleSheet("color: #10B981;")
+        top_metrics_layout.addWidget(miles_label)
+        top_metrics_layout.addWidget(self.total_miles_value)
         
-        # Risk Factor
-        risk_label = QLabel("RISK FACTOR:")
-        risk_label.setFont(QFont("Consolas", 8))
-        self.risk_factor_value = QLabel("--")
-        self.risk_factor_value.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        self.risk_factor_value.setStyleSheet("color: #FFA500;")
-        metrics_layout.addWidget(risk_label, 0, 2)
-        metrics_layout.addWidget(self.risk_factor_value, 0, 3)
+        top_metrics_layout.addStretch()
         
-        # Optimal Routes
-        optimal_label = QLabel("OPTIMAL ROUTES:")
-        optimal_label.setFont(QFont("Consolas", 8))
-        self.optimal_routes_value = QLabel("--")
-        self.optimal_routes_value.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        self.optimal_routes_value.setStyleSheet("color: #00BFFF;")
-        metrics_layout.addWidget(optimal_label, 1, 0)
-        metrics_layout.addWidget(self.optimal_routes_value, 1, 1)
-        
-        layout.addLayout(metrics_layout)
-        
-        # Route breakdown
-        self.route_breakdown = QTextEdit()
-        self.route_breakdown.setReadOnly(True)
-        self.route_breakdown.setMaximumHeight(100)
-        self.route_breakdown.setFont(QFont("Consolas", 8))
-        self.route_breakdown.setPlainText("No intelligence data available")
-        layout.addWidget(self.route_breakdown)
-        
-        # Real-time alerts
-        self.alerts_label = QLabel("ALERTS: No active alerts")
-        self.alerts_label.setFont(QFont("Consolas", 8))
-        self.alerts_label.setStyleSheet("color: #00FF88; background: rgba(20, 40, 20, 100); padding: 4px; border-radius: 3px;")
-        layout.addWidget(self.alerts_label)
-
-        return group
-
-    def create_analysis_status_section(self) -> QFrame:
-        """Create real-time analysis status"""
-        frame = QFrame()
-        layout = QVBoxLayout(frame)
-        layout.setSpacing(4)
-
-        # Progress bar
-        self.analysis_progress = QProgressBar()
-        self.analysis_progress.setVisible(False)
-        self.analysis_progress.setFixedHeight(6)
-        layout.addWidget(self.analysis_progress)
-
-        # Status message
-        self.status_message = QLabel("Ready for analysis")
-        self.status_message.setFont(QFont("Consolas", 8))
-        self.status_message.setStyleSheet("color: #888;")
-        layout.addWidget(self.status_message)
-
-        return frame
-
-    def create_analysis_config_section(self) -> QGroupBox:
-        """Create analysis configuration section"""
-        group = QGroupBox("ANALYSIS CONFIGURATION")
-        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        layout = QVBoxLayout(group)
-
-        # Days ahead configuration
-        days_layout = QHBoxLayout()
-        
+        # Days config on same line
         days_label = QLabel("DAYS AHEAD:")
-        days_label.setFont(QFont("Consolas", 8))
-        days_layout.addWidget(days_label)
+        days_label.setFont(QFont("Segoe UI", 8))
+        top_metrics_layout.addWidget(days_label)
         
         self.days_spin = QSpinBox()
         self.days_spin.setRange(1, 30)
         self.days_spin.setValue(14)
-        self.days_spin.setFixedSize(50, 20)
-        self.days_spin.setFont(QFont("Consolas", 8))
-        days_layout.addWidget(self.days_spin)
+        self.days_spin.setFixedSize(45, 20)  # Wider to show both digits
+        self.days_spin.setFont(QFont("Segoe UI", 8))
+        top_metrics_layout.addWidget(self.days_spin)
         
-        days_layout.addStretch()
+        layout.addLayout(top_metrics_layout)
         
-        layout.addLayout(days_layout)
+        # Progress bar - moved right after top metrics
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setVisible(False)
+        self.analysis_progress.setFixedHeight(4)
+        layout.addWidget(self.analysis_progress)
+        
+        # Route breakdown - more compact
+        self.route_breakdown = QTextEdit()
+        self.route_breakdown.setReadOnly(True)
+        self.route_breakdown.setMaximumHeight(70)  # Smaller
+        self.route_breakdown.setFont(QFont("Segoe UI", 7))  # Smaller font
+        self.route_breakdown.setPlainText("No intelligence data available")
+        layout.addWidget(self.route_breakdown)
+        
+        # Hotel and Flight sections - no spacing between them
+        self.current_hotels_widget = self.create_hotel_section("🏨 CURRENT STAY", "")
+        self.next_hotels_widget = self.create_hotel_section("📍 NEXT DESTINATION", "")
+        self.flight_info_widget = self.create_flight_info_section()
+        
+        # Add to layout with minimal spacing for maximum space efficiency
+        layout.addWidget(self.current_hotels_widget)
+        layout.addWidget(self.next_hotels_widget)
+        layout.addWidget(self.flight_info_widget)
 
         return group
 
+
     def create_upcoming_games_section(self) -> QGroupBox:
-        group = QGroupBox("UPCOMING GAMES")
-        group.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        group = QGroupBox("")
+        group.setStyleSheet("""
+            QGroupBox {
+                border: 2px solid #374151;
+                border-radius: 6px;
+                margin-top: 2px;
+                padding-top: 4px;
+                background-color: #111922;
+            }
+        """)
         layout = QVBoxLayout(group)
+        layout.setSpacing(1)  # Very tight spacing
+        layout.setContentsMargins(4, 1, 4, 4)  # Minimal top margin to move header up
     
-        # Controls
-        control_layout = QHBoxLayout()
-        label = QLabel("Days Ahead:")
-        label.setFont(QFont("Consolas", 8))
-        control_layout.addWidget(label)
-        control_layout.addWidget(self.upcoming_days_spin)
-        control_layout.addStretch()
-        layout.addLayout(control_layout)
+        # Title and controls on same line to save space
+        header_layout = QHBoxLayout()
+        
+        # Section title
+        title_label = QLabel("UPCOMING GAMES")
+        title_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #10B981;")
+        header_layout.addWidget(title_label)
+        
+        header_layout.addStretch()
+        
+        # Days Ahead control on same line as title
+        days_label = QLabel("Days:")
+        days_label.setFont(QFont("Segoe UI", 6))
+        header_layout.addWidget(days_label)
+        header_layout.addWidget(self.upcoming_days_spin)
+        
+        layout.addLayout(header_layout)
     
-        # Game list
-        self.upcoming_games_list.setFont(QFont("Consolas", 8))
-        self.upcoming_games_list.setFixedHeight(150)
+        # Game list - let it expand to fill available space
+        self.upcoming_games_list.setFont(QFont("Segoe UI", 7))
+        self.upcoming_games_list.setMinimumHeight(120)  # Set minimum instead of fixed
         layout.addWidget(self.upcoming_games_list)
     
         # Trigger refresh on spinbox change
         self.upcoming_days_spin.valueChanged.connect(self.update_upcoming_games)
     
         return group
-
+    
+    def create_hotel_section(self, title: str, icon: str) -> QFrame:
+        """Create a compact hotel display section with maximum space efficiency"""
+        frame = QFrame()
+        frame.setVisible(True)
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: #1F2937;
+                border: 1px solid #374151;
+                border-radius: 4px;
+                margin: 0px;  /* No margin to save space */
+            }
+        """)
+        # Remove fixed height to allow expansion
+        frame.setMinimumHeight(75)  # Set minimum instead of maximum
+        
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(3, 1, 3, 3)  # Minimal top margin
+        layout.setSpacing(0)  # No spacing between header and content
+        
+        # Compact header with thin border - stays visible
+        header_container = QWidget()
+        header_container.setFixedHeight(10)  # Even thinner
+        header_container.setStyleSheet("""
+            QWidget {
+                background-color: #374151;
+                border: 1px solid #4B5563;
+                border-radius: 2px;
+            }
+        """)
+        
+        header_layout = QHBoxLayout(header_container)
+        header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
+        
+        header_label = QLabel(title)
+        header_label.setFont(QFont("Segoe UI", 5, QFont.Weight.Bold))  # Smaller font
+        header_label.setStyleSheet("color: #10B981; border: none; background: transparent;")
+        header_layout.addWidget(header_label)
+        header_layout.addStretch()
+        
+        layout.addWidget(header_container)
+        
+        # Container for hotel items - custom layout, not list widget
+        hotels_container = QWidget()
+        self.hotels_layout = QVBoxLayout(hotels_container)
+        self.hotels_layout.setContentsMargins(0, 0, 0, 0)
+        self.hotels_layout.setSpacing(2)  # Better spacing so items aren't jammed
+        
+        # Add placeholder
+        placeholder = QLabel("No data available")
+        placeholder.setFont(QFont("Segoe UI", 6))
+        placeholder.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+        self.hotels_layout.addWidget(placeholder)
+        
+        layout.addWidget(hotels_container)
+        
+        # Store references for updates
+        frame.hotels_layout = self.hotels_layout
+        frame.placeholder = placeholder
+        
+        return frame
+    
+    def create_flight_info_section(self) -> QFrame:
+        """Create compact flight intelligence section with maximum space efficiency"""
+        frame = QFrame()
+        frame.setVisible(True)
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: #1F2937;
+                border: 1px solid #374151;
+                border-radius: 4px;
+                margin: 0px;  /* No margin to save space */
+            }
+        """)
+        # Remove fixed height to allow expansion
+        frame.setMinimumHeight(80)  # Set minimum instead of maximum
+        
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(3, 1, 3, 3)  # Minimal top margin
+        layout.setSpacing(0)  # No spacing between header and content
+        
+        # Compact header with thin border
+        header_container = QWidget()
+        header_container.setFixedHeight(10)  # Even thinner
+        header_container.setStyleSheet("""
+            QWidget {
+                background-color: #374151;
+                border: 1px solid #4B5563;
+                border-radius: 2px;
+            }
+        """)
+        
+        header_layout = QHBoxLayout(header_container)
+        header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
+        
+        header_label = QLabel("✈️ FLIGHT INTELLIGENCE")
+        header_label.setFont(QFont("Segoe UI", 5, QFont.Weight.Bold))  # Smaller font
+        header_label.setStyleSheet("color: #10B981; border: none; background: transparent;")
+        header_layout.addWidget(header_label)
+        header_layout.addStretch()
+        
+        layout.addWidget(header_container)
+        
+        # Container for flight items - custom layout, not list widget
+        flight_container = QWidget()
+        self.flight_layout = QVBoxLayout(flight_container)
+        self.flight_layout.setContentsMargins(0, 0, 0, 0)
+        self.flight_layout.setSpacing(5)  # More spacing to prevent text jamming
+        
+        # Add placeholder
+        placeholder = QLabel("No flight data available")
+        placeholder.setFont(QFont("Segoe UI", 6))
+        placeholder.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+        self.flight_layout.addWidget(placeholder)
+        
+        layout.addWidget(flight_container)
+        
+        # Store references
+        frame.flight_layout = self.flight_layout
+        frame.placeholder = placeholder
+        
+        return frame
+    
+    def determine_hotel_needs(self, team_id: str, intelligence: 'TeamTravelIntelligence') -> Dict:
+        """Determine current and next hotel needs based on game data"""
+        if not self.aggregator or not intelligence:
+            return {'current_stay': None, 'next_destination': None}
+        
+        now = datetime.now()
+        season = self.aggregator.current_season
+        league = self.aggregator.current_league
+        
+        # Get all games for this team
+        games = self.aggregator.db.load_games(season, league)
+        team_games = [
+            g for g in games 
+            if g.home_team.team_id.lower() == team_id.lower() or g.away_team.team_id.lower() == team_id.lower()
+        ]
+        team_games.sort(key=lambda x: x.date)
+        
+        result = {'current_stay': None, 'next_destination': None}
+        
+        # Find most recent game (current location)
+        recent_games = [g for g in team_games if g.date <= now]
+        if recent_games:
+            recent_game = max(recent_games, key=lambda x: x.date)
+            # Check if team was away for most recent game
+            if recent_game.away_team.team_id.lower() == team_id.lower():
+                # Team is currently away - find hotels from intelligence
+                for route in intelligence.upcoming_routes:
+                    if (route.game_data and 
+                        route.game_data.venue.venue_id == recent_game.venue.venue_id):
+                        result['current_stay'] = {
+                            'venue': recent_game.venue,
+                            'game_date': recent_game.date,
+                            'opponent': recent_game.home_team.abbreviation,
+                            'hotels': route.destination_hotels[:3]
+                        }
+                        break
+        
+        # Find next upcoming game
+        upcoming_games = [g for g in team_games if g.date > now]
+        if upcoming_games:
+            next_game = min(upcoming_games, key=lambda x: x.date)
+            # Check if next game is away
+            if next_game.away_team.team_id.lower() == team_id.lower():
+                # Find corresponding route in intelligence
+                for route in intelligence.upcoming_routes:
+                    if (route.game_data and 
+                        route.game_data.venue.venue_id == next_game.venue.venue_id):
+                        result['next_destination'] = {
+                            'venue': next_game.venue,
+                            'game_date': next_game.date,
+                            'opponent': next_game.home_team.abbreviation,
+                            'hotels': route.destination_hotels[:3]
+                        }
+                        break
+        
+        return result
 
     def connect_signals(self):
         """Connect all UI signals"""
@@ -314,141 +459,208 @@ class FlightControlPanel(QWidget):
         
         # Analysis trigger
         self.analyze_btn.clicked.connect(self.trigger_amadeus_analysis)
-        
-        # Refresh
-        self.refresh_btn.clicked.connect(lambda: self.refreshRequested.emit())
 
     def apply_styles(self):
         self.setStyleSheet("""
+            /* Clean Professional Theme */
             QWidget {
-                background-color: #0A0E1A;
+                background-color: #1E2A3A;
                 color: #E0E6ED;
-                font-family: 'Consolas', 'Courier New', monospace;
+                font-family: 'Segoe UI', Arial, sans-serif;
             }
             
             QFrame {
-                border: 1px solid #1E2A3A;
+                border: 1px solid #2A3441;
                 border-radius: 4px;
                 background-color: #0F1419;
+                margin: 2px;
+            }
+            
+            /* Hotel and Flight sections */
+            QFrame[objectName="hotel_section"], QFrame[objectName="flight_section"] {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1A2634, stop: 1 #152028);
+                border: 1px solid #2563EB;
+                border-radius: 10px;
+                padding: 8px;
             }
             
             QPushButton {
-                background-color: #1A2332;
-                border: 1px solid #2A3441;
-                border-radius: 3px;
-                padding: 4px 8px;
-                color: #E0E6ED;
-                font-weight: bold;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #2563EB, stop: 1 #1D4ED8);
+                border: 1px solid #3B82F6;
+                border-radius: 6px;
+                padding: 6px 12px;
+                color: #FFFFFF;
+                font-weight: 600;
+                font-size: 11px;
             }
             
             QPushButton:hover {
-                background-color: #243040;
-                border-color: #3A4651;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #3B82F6, stop: 1 #2563EB);
+                border-color: #60A5FA;
             }
             
             QPushButton:checked {
-                background-color: #FF6B00;
-                color: white;
-                border-color: #FF8533;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #F59E0B, stop: 1 #D97706);
+                border-color: #FBBF24;
+                color: #1F2937;
             }
             
             QPushButton:pressed {
-                background-color: #0F1824;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1D4ED8, stop: 1 #1E40AF);
             }
             
             QGroupBox {
-                font-weight: bold;
-                border: 2px solid #2A3441;
-                border-radius: 6px;
-                margin-top: 1ex;
-                padding-top: 12px;
-                background-color: #111922;
+                font-weight: 600;
+                border: 2px solid #374151;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding-top: 16px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1F2937, stop: 1 #111827);
             }
             
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 8px 0 8px;
-                color: #00FF88;
-                font-size: 9px;
+                left: 16px;
+                padding: 0 12px 0 12px;
+                color: #10B981;
+                font-size: 12px;
+                font-weight: 700;
                 letter-spacing: 1px;
             }
             
             QLabel {
                 background: transparent;
                 border: none;
+                color: #E8F4FD;
             }
             
             QComboBox {
-                background-color: #1A2332;
-                border: 1px solid #2A3441;
-                border-radius: 3px;
-                padding: 2px 6px;
-                color: #E0E6ED;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #374151, stop: 1 #1F2937);
+                border: 1px solid #4B5563;
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: #E8F4FD;
+                font-size: 11px;
             }
             
             QComboBox::drop-down {
                 border: none;
-                width: 20px;
+                width: 24px;
             }
             
             QComboBox::down-arrow {
                 image: none;
                 border: none;
-                color: #E0E6ED;
+                color: #9CA3AF;
             }
             
             QComboBox QAbstractItemView {
-                background-color: #1A2332;
-                color: #E0E6ED;
-                border: 1px solid #2A3441;
-                selection-background-color: #FF6B00;
+                background-color: #374151;
+                color: #E8F4FD;
+                border: 1px solid #4B5563;
+                border-radius: 6px;
+                selection-background-color: #2563EB;
             }
             
             QSpinBox {
-                background-color: #1A2332;
-                border: 1px solid #2A3441;
-                border-radius: 3px;
-                padding: 2px;
-                color: #E0E6ED;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #374151, stop: 1 #1F2937);
+                border: 1px solid #4B5563;
+                border-radius: 6px;
+                padding: 4px;
+                color: #E8F4FD;
+                font-size: 11px;
+            }
+            
+            QSpinBox::up-button, QSpinBox::down-button {
+                background: transparent;
+                border: none;
+                width: 16px;
             }
             
             QCheckBox {
-                color: #E0E6ED;
-                spacing: 5px;
+                color: #E8F4FD;
+                spacing: 6px;
+                font-size: 11px;
             }
             
             QCheckBox::indicator {
-                width: 12px;
-                height: 12px;
-                border: 1px solid #2A3441;
-                border-radius: 2px;
-                background-color: #1A2332;
+                width: 14px;
+                height: 14px;
+                border: 2px solid #4B5563;
+                border-radius: 3px;
+                background-color: #1F2937;
             }
             
             QCheckBox::indicator:checked {
-                background-color: #00FF88;
+                background-color: #10B981;
+                border-color: #059669;
             }
             
             QTextEdit {
-                background-color: #0F1419;
-                border: 1px solid #2A3441;
-                border-radius: 4px;
-                font-family: 'Consolas', monospace;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1F2937, stop: 1 #111827);
+                border: 1px solid #374151;
+                border-radius: 8px;
+                font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+                font-size: 10px;
+                color: #D1D5DB;
+                padding: 8px;
             }
             
             QProgressBar {
-                border: 1px solid #2A3441;
-                border-radius: 3px;
+                border: 1px solid #374151;
+                border-radius: 4px;
                 text-align: center;
-                background-color: #1A2332;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1F2937, stop: 1 #111827);
+                color: #E8F4FD;
+                font-size: 10px;
+                font-weight: 600;
             }
             
             QProgressBar::chunk {
-                background-color: #00FF88;
-                border-radius: 2px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #10B981, stop: 1 #059669);
+                border-radius: 3px;
+            }
+            
+            QListWidget {
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #1F2937, stop: 1 #111827);
+                border: 1px solid #374151;
+                border-radius: 8px;
+                color: #D1D5DB;
+                font-size: 10px;
+                padding: 4px;
+            }
+            
+            QListWidget::item {
+                padding: 4px;
+                border-radius: 4px;
+                margin: 1px;
+            }
+            
+            QListWidget::item:selected {
+                background-color: #2563EB;
+                color: #FFFFFF;
             }
         """)
+        
+        # Set object names for specific styling
+        if hasattr(self, 'current_hotels_widget'):
+            self.current_hotels_widget.setObjectName("hotel_section")
+        if hasattr(self, 'next_hotels_widget'):
+            self.next_hotels_widget.setObjectName("hotel_section")
+        if hasattr(self, 'flight_info_widget'):
+            self.flight_info_widget.setObjectName("flight_section")
 
     def on_league_changed(self, league: str, button: QPushButton, checked: bool):
         """Handle league change"""
@@ -553,7 +765,6 @@ class FlightControlPanel(QWidget):
                 self.analysis_progress.setValue(0)
                 self.analyze_btn.setEnabled(False)
                 self.analyze_btn.setText("Analyzing...")
-                self.status_message.setText("Starting Amadeus analysis...")
                 
                 print("✅ Analysis request emitted successfully")
             else:
@@ -567,14 +778,15 @@ class FlightControlPanel(QWidget):
     def on_analysis_progress(self, percentage: int, message: str):
         """Handle analysis progress updates"""
         self.analysis_progress.setValue(percentage)
-        self.status_message.setText(message)
 
     def on_analysis_complete(self, intelligence: 'TeamTravelIntelligence'):
         """Handle completed analysis results"""
         self.current_intelligence = intelligence
         self.analysis_progress.setVisible(False)
         self.analyze_btn.setEnabled(True)
-        self.status_message.setText("Analysis complete")
+        self.analyze_btn.setText("ANALYZE")
+        
+        # Hide status message after analysis is complete
         
         # Update intelligence display
         if intelligence:
@@ -617,11 +829,6 @@ class FlightControlPanel(QWidget):
         
         # Update key metrics using correct attribute names
         self.total_miles_value.setText(f"{intelligence.total_travel_distance:,.0f}")
-        # Use travel_complexity_score as risk score (0-100 scale, convert to 0-10)
-        self.risk_factor_value.setText(f"{intelligence.travel_complexity_score/10:.1f}/10")
-        # Calculate optimization score (inverse of complexity for simplicity)
-        optimization_score = max(0.0, 100.0 - float(intelligence.travel_complexity_score)) / 100.0
-        self.optimal_routes_value.setText(f"{optimization_score:.0%}")
         
         # Update route breakdown
         route_breakdown_text = ""
@@ -657,21 +864,14 @@ class FlightControlPanel(QWidget):
                 print(f"Error formatting route {i}: {e}")
                 route_breakdown_text += f"{i}. Route formatting error\n"
         
+        
         self.route_breakdown.setPlainText(route_breakdown_text.strip())
-    
-        # Update alerts based on risk factors
-        all_risk_factors = []
-        for route in intelligence.upcoming_routes:
-            all_risk_factors.extend(route.risk_factors)
         
-        if all_risk_factors:
-            alerts_text = "ALERTS: " + "; ".join(all_risk_factors[:3])  # Show top 3 alerts
-            self.alerts_label.setStyleSheet("color: #FF8800; background: rgba(40, 20, 20, 100); padding: 4px; border-radius: 3px;")
-        else:
-            alerts_text = "ALERTS: No active alerts"
-            self.alerts_label.setStyleSheet("color: #00FF88; background: rgba(20, 40, 20, 100); padding: 4px; border-radius: 3px;")
+        # NEW: Update hotel displays
+        self.update_hotel_displays(intelligence)
         
-        self.alerts_label.setText(alerts_text)
+        # NEW: Update flight intelligence
+        self.update_flight_intelligence(intelligence)
 
     def update_ui_for_league(self, league: str):
         """Update UI elements for specific league"""
@@ -690,3 +890,162 @@ class FlightControlPanel(QWidget):
         """Update the control panel with new travel data"""
         self.travel_data = travel_data
         print(f"📊 Control panel received {len(travel_data)} travel records")
+    
+    def update_hotel_displays(self, intelligence: 'TeamTravelIntelligence'):
+        """Update hotel display sections"""
+        print(f"🏨 DEBUG: update_hotel_displays called")
+        
+        if not intelligence or not intelligence.team_info:
+            print(f"🏨 DEBUG: No intelligence or team_info")
+            return
+        
+        team_id = intelligence.team_info.team_id
+        print(f"🏨 DEBUG: Team ID: {team_id}")
+        
+        # Simple fix: use different routes for each section
+        if intelligence.upcoming_routes:
+            # Current stay: use first route if available
+            if len(intelligence.upcoming_routes) >= 1:
+                route = intelligence.upcoming_routes[0]
+                if route.destination_hotels:
+                    print(f"🏨 DEBUG: Current stay - Found {len(route.destination_hotels)} hotels")
+                    self.populate_hotel_section(self.current_hotels_widget, route.destination_hotels[:3])
+                    self.current_hotels_widget.setVisible(True)
+                else:
+                    self.populate_hotel_section(self.current_hotels_widget, [])
+                    self.current_hotels_widget.setVisible(True)
+            
+            # Next destination: use second route if available, otherwise show "no data"
+            if len(intelligence.upcoming_routes) >= 2:
+                route = intelligence.upcoming_routes[1]
+                if route.destination_hotels:
+                    print(f"🏨 DEBUG: Next destination - Found {len(route.destination_hotels)} hotels")
+                    self.populate_hotel_section(self.next_hotels_widget, route.destination_hotels[:3])
+                    self.next_hotels_widget.setVisible(True)
+                else:
+                    self.populate_hotel_section(self.next_hotels_widget, [])
+                    self.next_hotels_widget.setVisible(True)
+            else:
+                print(f"🏨 DEBUG: No second route for next destination")
+                self.populate_hotel_section(self.next_hotels_widget, [])
+                self.next_hotels_widget.setVisible(True)
+        else:
+            print(f"🏨 DEBUG: No upcoming routes found")
+            self.populate_hotel_section(self.current_hotels_widget, [])
+            self.populate_hotel_section(self.next_hotels_widget, [])
+            self.current_hotels_widget.setVisible(True)
+            self.next_hotels_widget.setVisible(True)
+    
+    
+    def get_star_rating(self, hotel) -> str:
+        """Convert hotel rating to star display"""
+        if hotel.forbes_rating:
+            rating = hotel.forbes_rating.get_numeric_rating()
+            if rating >= 5:
+                return "★★★★★"
+            elif rating >= 4:
+                return "★★★★"
+            elif rating >= 3:
+                return "★★★"
+            else:
+                return "★★"
+        else:
+            # Use overall rating
+            if hotel.overall_rating >= 90:
+                return "★★★★★"
+            elif hotel.overall_rating >= 80:
+                return "★★★★"
+            elif hotel.overall_rating >= 70:
+                return "★★★"
+            else:
+                return "★★"
+    
+    def update_flight_intelligence(self, intelligence: 'TeamTravelIntelligence'):
+        """Update flight intelligence section with custom layout"""
+        if not intelligence.upcoming_routes:
+            self.flight_info_widget.setVisible(False)
+            return
+        
+        if not hasattr(self.flight_info_widget, 'flight_layout'):
+            print("No flight_layout found")
+            return
+            
+        # Clear existing items
+        self.clear_layout(self.flight_info_widget.flight_layout)
+        
+        # Add flight info for all routes - we have the space now
+        for i, route in enumerate(intelligence.upcoming_routes):  # Show all routes
+            if route.primary_airport:
+                airport = route.primary_airport
+                venue_name = route.game_data.venue.name if route.game_data else "venue"
+                
+                # Create flight item label with full text - use available horizontal space
+                flight_label = QLabel(f"✈️ {airport.iata_code} ({airport.on_time_probability:.0%}) - {airport.distance_from_venue:.0f}km from {venue_name}")
+                flight_label.setFont(QFont("Segoe UI", 6))
+                flight_label.setStyleSheet("color: #D1D5DB; border: none; background: transparent;")
+                flight_label.setWordWrap(True)  # Allow text to wrap if needed
+                self.flight_info_widget.flight_layout.addWidget(flight_label)
+        
+        self.flight_info_widget.setVisible(True)
+    
+    def populate_hotel_section(self, widget: QFrame, hotels: list):
+        """Populate hotel section with hotel data using custom compact layout"""
+        print(f"🏨 DEBUG: populate_test_hotels called with {len(hotels)} hotels")
+        
+        if not hasattr(widget, 'hotels_layout'):
+            print("No hotels_layout found")
+            return
+            
+        # Clear existing items
+        self.clear_layout(widget.hotels_layout)
+        
+        # Check if we have hotels to display
+        if not hotels:
+            # Show "no data" message
+            no_data_label = QLabel("No data available")
+            no_data_label.setFont(QFont("Segoe UI", 6))
+            no_data_label.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+            widget.hotels_layout.addWidget(no_data_label)
+            return
+        
+        # Add hotel items in compact format
+        for hotel in hotels[:3]:  # Show top 3 to fit in space
+            # Truncate long hotel names for space efficiency
+            name = hotel.name[:15] + "..." if len(hotel.name) > 15 else hotel.name
+            stars = self.get_star_rating_simple(hotel)
+            
+            # Create compact hotel item label
+            hotel_label = QLabel(f"• {name} ({hotel.distance_from_venue:.1f}km) {stars}")
+            hotel_label.setFont(QFont("Segoe UI", 6))
+            hotel_label.setStyleSheet("color: #D1D5DB; border: none; background: transparent;")
+            widget.hotels_layout.addWidget(hotel_label)
+            print(f"🏨 DEBUG: Added hotel: {hotel.name}")
+        
+        # Add "more" indicator if there are additional hotels
+        if len(hotels) > 3:
+            more_label = QLabel(f"+ {len(hotels)-3} more hotels")
+            more_label.setFont(QFont("Segoe UI", 5))
+            more_label.setStyleSheet("color: #6B7280; border: none; background: transparent;")
+            widget.hotels_layout.addWidget(more_label)
+    
+    def get_star_rating_simple(self, hotel) -> str:
+        """Simple star rating for compact display"""
+        if hotel.forbes_rating:
+            rating = hotel.forbes_rating.get_numeric_rating()
+            return "★" * rating
+        else:
+            if hotel.overall_rating >= 90:
+                return "★★★★★"
+            elif hotel.overall_rating >= 80:
+                return "★★★★"
+            elif hotel.overall_rating >= 70:
+                return "★★★"
+            else:
+                return "★★"
+    
+    def clear_layout(self, layout):
+        """Helper to clear all widgets from a layout"""
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
