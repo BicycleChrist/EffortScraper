@@ -16,6 +16,8 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import asyncio
 from TableTennisClient import main as fetch_data
+from tt_elo import ELOCalculator
+from ttDB import TTDatabase
 import pathlib # For icon
 
 
@@ -107,6 +109,126 @@ class PointProgressionCanvas(FigureCanvas):
                 textcoords="offset points",
                 color='green',
                 fontweight='bold')
+        
+        self.fig.tight_layout()
+        self.draw()
+
+
+class ELOProgressionCanvas(FigureCanvas):
+    """Canvas for drawing ELO progression charts"""
+    def __init__(self, parent=None, width=4, height=3, dpi=80):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = self.fig.add_subplot(111)
+        
+        # Set dark theme style for the figure
+        self.fig.patch.set_facecolor('#2d2d2d')
+        self.axes.set_facecolor('#2d2d2d')
+        self.axes.spines['bottom'].set_color('#7f8c8d')
+        self.axes.spines['top'].set_color('#7f8c8d') 
+        self.axes.spines['right'].set_color('#7f8c8d')
+        self.axes.spines['left'].set_color('#7f8c8d')
+        self.axes.tick_params(axis='x', colors='#f0f0f0')
+        self.axes.tick_params(axis='y', colors='#f0f0f0')
+        self.axes.yaxis.label.set_color('#f0f0f0')
+        self.axes.xaxis.label.set_color('#f0f0f0')
+        self.axes.title.set_color('#f0f0f0')
+        self.axes.grid(color='#3a3a3a', linestyle='-', linewidth=0.5, alpha=0.7)
+        
+        super().__init__(self.fig)
+        self.setMinimumSize(300, 350)
+        
+        # Initialize with empty chart
+        self.clear_chart()
+    
+    def clear_chart(self):
+        """Clear the chart and show placeholder text"""
+        self.axes.clear()
+        
+        # Set style again after clearing
+        self.axes.set_facecolor('#2d2d2d')
+        self.axes.spines['bottom'].set_color('#7f8c8d')
+        self.axes.spines['top'].set_color('#7f8c8d')
+        self.axes.spines['right'].set_color('#7f8c8d')
+        self.axes.spines['left'].set_color('#7f8c8d')
+        self.axes.tick_params(axis='x', colors='#f0f0f0')
+        self.axes.tick_params(axis='y', colors='#f0f0f0')
+        self.axes.grid(color='#3a3a3a', linestyle='-', linewidth=0.5, alpha=0.7)
+        
+        # Add placeholder text
+        self.axes.text(0.5, 0.5, 'Select a match to view\nELO progression', 
+                      horizontalalignment='center', verticalalignment='center',
+                      transform=self.axes.transAxes, color='#f0f0f0', fontsize=10)
+        
+        self.axes.set_xlim(0, 1)
+        self.axes.set_ylim(0, 1)
+        self.axes.set_title("Player ELO Progression")
+        
+        self.fig.tight_layout()
+        self.draw()
+    
+    def plot_elo_progression(self, home_data, away_data, home_name, away_name, match_limit):
+        """Plot ELO progression for both players"""
+        # Clear previous plot
+        self.axes.clear()
+        
+        # Set style again after clearing
+        self.axes.set_facecolor('#2d2d2d')
+        self.axes.spines['bottom'].set_color('#7f8c8d')
+        self.axes.spines['top'].set_color('#7f8c8d')
+        self.axes.spines['right'].set_color('#7f8c8d')
+        self.axes.spines['left'].set_color('#7f8c8d')
+        self.axes.tick_params(axis='x', colors='#f0f0f0')
+        self.axes.tick_params(axis='y', colors='#f0f0f0')
+        self.axes.grid(color='#3a3a3a', linestyle='-', linewidth=0.5, alpha=0.7)
+        
+        if not home_data and not away_data:
+            self.axes.text(0.5, 0.5, 'No ELO data available\nfor these players', 
+                          horizontalalignment='center', verticalalignment='center',
+                          transform=self.axes.transAxes, color='#f0f0f0', fontsize=10)
+            self.axes.set_xlim(0, 1)
+            self.axes.set_ylim(0, 1)
+        else:
+            # Plot home player ELO progression
+            if home_data:
+                match_numbers = list(range(1, len(home_data) + 1))
+                elo_values = [point['new_elo'] for point in home_data]
+                self.axes.plot(match_numbers, elo_values, 'r-o', label=home_name, 
+                              linewidth=2, markersize=3, color='#e74c3c')
+            
+            # Plot away player ELO progression  
+            if away_data:
+                match_numbers = list(range(1, len(away_data) + 1))
+                elo_values = [point['new_elo'] for point in away_data]
+                self.axes.plot(match_numbers, elo_values, 'g-o', label=away_name, 
+                              linewidth=2, markersize=3, color='#2ecc71')
+            
+            # Set labels and title
+            self.axes.set_title(f"ELO Progression - Last {match_limit} Matches")
+            self.axes.set_xlabel("Match Number (Recent)")
+            self.axes.set_ylabel("ELO Rating")
+            
+            # Add legend
+            self.axes.legend(loc='upper left')
+            
+            # Set axis limits with some padding
+            all_elos = []
+            if home_data:
+                all_elos.extend([p['new_elo'] for p in home_data])
+            if away_data:
+                all_elos.extend([p['new_elo'] for p in away_data])
+            
+            if all_elos:
+                min_elo = min(all_elos)
+                max_elo = max(all_elos)
+                elo_range = max_elo - min_elo
+                padding = max(20, elo_range * 0.1)  # At least 20 ELO padding
+                
+                self.axes.set_ylim(min_elo - padding, max_elo + padding)
+                
+                max_matches = max(len(home_data) if home_data else 0, 
+                                len(away_data) if away_data else 0)
+                if max_matches > 0:
+                    self.axes.set_xlim(0.5, max_matches + 0.5)
         
         self.fig.tight_layout()
         self.draw()
@@ -464,7 +586,13 @@ class TableTennisGUI(QMainWindow):
         # Load data from JSON files
         self.load_data()
         
-        # Set up auto-refresh timer (every 5 minutes)
+        # Update ELO status
+        self.update_elo_status()
+        
+        # Initialize ELO chart
+        self.elo_chart.clear_chart()
+        
+        # Set up auto-refresh timer (every 30 minutes)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_data)
         self.refresh_timer.start(1800000)  # 30 minutes
@@ -566,8 +694,45 @@ class TableTennisGUI(QMainWindow):
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.control_layout.addWidget(self.status_label)
         
-        # Add stretcher to push everything up
-        self.control_layout.addStretch()
+        # ELO status label
+        self.elo_status_label = QLabel("ELO: Unknown")
+        self.elo_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.elo_status_label.setStyleSheet("color: #f39c12; font-size: 10px;")
+        self.control_layout.addWidget(self.elo_status_label)
+        
+        # ELO update button
+        self.elo_update_btn = QPushButton("Update ELO")
+        self.elo_update_btn.clicked.connect(self.update_elo_ratings)
+        self.elo_update_btn.setStyleSheet("background-color: #9b59b6; padding: 8px;")
+        self.control_layout.addWidget(self.elo_update_btn)
+        
+        # ELO Chart Section
+        elo_chart_group = QGroupBox("Player ELO Progression")
+        elo_chart_layout = QVBoxLayout(elo_chart_group)
+        
+        # Time window selector
+        time_window_layout = QHBoxLayout()
+        time_window_label = QLabel("Matches:")
+        time_window_label.setFont(QFont("Arial", 10))
+        self.elo_time_window = QComboBox()
+        self.elo_time_window.addItems(["Last 10", "Last 25", "Last 50"])
+        self.elo_time_window.setCurrentIndex(1)  # Default to 25
+        self.elo_time_window.currentIndexChanged.connect(self.update_elo_chart)
+        time_window_layout.addWidget(time_window_label)
+        time_window_layout.addWidget(self.elo_time_window)
+        time_window_layout.addStretch()
+        
+        elo_chart_layout.addLayout(time_window_layout)
+        
+        # ELO Chart Canvas (larger size to fill more space)
+        self.elo_chart = ELOProgressionCanvas(self, width=4, height=5, dpi=80)
+        elo_chart_layout.addWidget(self.elo_chart)
+        
+        # Give the chart group more weight in the layout
+        self.control_layout.addWidget(elo_chart_group, 3)  # Weight of 3 to expand
+        
+        # Much smaller stretcher - let the chart take up more space
+        self.control_layout.addStretch(1)
         
         # Add to splitter
         self.splitter.addWidget(self.control_panel)
@@ -922,6 +1087,9 @@ class TableTennisGUI(QMainWindow):
         except Exception as e:
             self.status_label.setText(f"Error refreshing data: {str(e)}")
             print(f"Error: {str(e)}")
+        
+        # Update ELO status after data refresh
+        self.update_elo_status()
 
     def load_data(self):
         """Load data from JSON files"""
@@ -1092,6 +1260,8 @@ class TableTennisGUI(QMainWindow):
     def filter_matches(self):
         """Apply filters and repopulate the table"""
         self.populate_matches_table()
+        # Clear ELO chart since selection may have changed
+        self.elo_chart.clear_chart()
 
     def show_match_details(self):
         """Display details for the selected match"""
@@ -1237,6 +1407,9 @@ class TableTennisGUI(QMainWindow):
         # Update H2H table
         self.update_h2h_data(h2h_data, home_name, away_name)
         
+        # Update ELO chart
+        self.update_elo_chart()
+        
     def update_h2h_data(self, h2h_data, home_name, away_name):
         """Update head-to-head data display"""
         # Clear table
@@ -1374,8 +1547,157 @@ class TableTennisGUI(QMainWindow):
             return "#e67e22"  # Dark orange - slight underdog
         else:
             return "#e74c3c"  # Red - strong underdog
+
+    def update_elo_status(self):
+        """Update the ELO status display"""
+        try:
+            db = TTDatabase()
+            elo_calculator = ELOCalculator(db)
             
-# Main application entry point
+            status = elo_calculator.get_elo_processing_status()
+            
+            if status:
+                processed = status.get('processed_matches', 0)
+                total = status.get('total_matches', 0)
+                unprocessed = status.get('unprocessed_matches', 0)
+                percentage = status.get('processed_percentage', 0)
+                
+                if unprocessed > 0:
+                    self.elo_status_label.setText(f"ELO: {processed}/{total} ({percentage:.1f}%) - {unprocessed} pending")
+                    self.elo_status_label.setStyleSheet("color: #f39c12; font-size: 10px;")  # Orange for pending
+                    self.elo_update_btn.setEnabled(True)
+                else:
+                    self.elo_status_label.setText(f"ELO: {processed}/{total} (100%) - Up to date")
+                    self.elo_status_label.setStyleSheet("color: #2ecc71; font-size: 10px;")  # Green for complete
+                    self.elo_update_btn.setEnabled(False)
+            else:
+                self.elo_status_label.setText("ELO: Unknown")
+                self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")  # Red for error
+                
+            db.close()
+        except Exception as e:
+            print(f"Error updating ELO status: {e}")
+            self.elo_status_label.setText("ELO: Error")
+            self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")
+
+    def update_elo_ratings(self):
+        """Update ELO ratings for unprocessed matches"""
+        try:
+            self.elo_status_label.setText("ELO: Processing...")
+            self.elo_status_label.setStyleSheet("color: #3498db; font-size: 10px;")
+            self.elo_update_btn.setEnabled(False)
+            QApplication.processEvents()
+            
+            db = TTDatabase()
+            elo_calculator = ELOCalculator(db)
+            
+            # Get initial status
+            initial_status = elo_calculator.get_elo_processing_status()
+            unprocessed_count = initial_status.get('unprocessed_matches', 0)
+            
+            if unprocessed_count > 0:
+                print(f"Processing {unprocessed_count} unprocessed ELO matches...")
+                
+                # Process unprocessed matches
+                matches_processed = elo_calculator.process_unprocessed_matches()
+                
+                print(f"Successfully processed {matches_processed} matches for ELO calculation.")
+                
+                # Update status display
+                self.update_elo_status()
+                
+                # Show completion message in status
+                if matches_processed > 0:
+                    self.status_label.setText(f"ELO updated: {matches_processed} matches processed")
+                else:
+                    self.status_label.setText("ELO update: No new matches to process")
+            else:
+                self.status_label.setText("ELO update: All matches already processed")
+                self.update_elo_status()
+                
+            db.close()
+            
+        except Exception as e:
+            print(f"Error updating ELO ratings: {e}")
+            self.status_label.setText(f"ELO update error: {str(e)}")
+            self.elo_status_label.setText("ELO: Error")
+            self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")
+            self.elo_update_btn.setEnabled(True)
+
+    def get_player_elo_progression(self, player_name: str, league_id: int, limit: int = 25) -> list:
+        """Get ELO progression data for a player"""
+        try:
+            db = TTDatabase()
+            
+            # Get player ELO history
+            db.cursor.execute('''
+            SELECT 
+                eh.new_elo,
+                eh.old_elo,
+                eh.new_elo - eh.old_elo as elo_change,
+                m.match_time,
+                ROW_NUMBER() OVER (ORDER BY m.match_time DESC) as match_number
+            FROM elo_history eh
+            JOIN players p ON eh.player_id = p.id AND eh.league_id = p.league_id
+            JOIN matches m ON eh.match_id = m.id
+            WHERE p.name = ? AND eh.league_id = ?
+            ORDER BY m.match_time DESC
+            LIMIT ?
+            ''', (player_name, league_id, limit))
+            
+            results = [dict(row) for row in db.cursor.fetchall()]
+            db.close()
+            
+            # Reverse to get chronological order (oldest to newest)
+            return list(reversed(results))
+            
+        except Exception as e:
+            print(f"Error fetching ELO progression for {player_name}: {e}")
+            return []
+
+    def update_elo_chart(self):
+        """Update the ELO chart based on current match selection"""
+        # Get currently selected match
+        selected_items = self.matches_table.selectedItems()
+        if not selected_items:
+            self.elo_chart.clear_chart()
+            return
+            
+        # Get match details
+        row = selected_items[0].row()
+        home_name = self.matches_table.item(row, 2).text()  # Home player
+        away_name = self.matches_table.item(row, 3).text()  # Away player
+        league_name = self.matches_table.item(row, 1).text()  # League
+        
+        # Map league name to ID
+        league_id = None
+        for lid, lname in self.leagues.items():
+            if lname == league_name:
+                league_id = int(lid)
+                break
+        
+        if not league_id:
+            self.elo_chart.clear_chart()
+            return
+        
+        # Get time window
+        time_window_text = self.elo_time_window.currentText()
+        if "10" in time_window_text:
+            limit = 10
+        elif "25" in time_window_text:
+            limit = 25
+        else:  # "50"
+            limit = 50
+        
+        # Fetch ELO data for both players
+        home_elo_data = self.get_player_elo_progression(home_name, league_id, limit)
+        away_elo_data = self.get_player_elo_progression(away_name, league_id, limit)
+        
+        # Update the chart
+        self.elo_chart.plot_elo_progression(home_elo_data, away_elo_data, 
+                                          home_name, away_name, limit)
+            
+
 def main():
     app = QApplication(sys.argv)
     window = TableTennisGUI()
