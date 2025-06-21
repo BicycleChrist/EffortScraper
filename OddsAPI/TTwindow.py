@@ -196,7 +196,7 @@ class ELOProgressionCanvas(FigureCanvas):
         self.fig.tight_layout()
         self.draw()
     
-    def plot_elo_progression(self, home_data, away_data, home_name, away_name, match_limit):
+    def plot_elo_progression(self, home_data, away_data, home_name, away_name, match_limit, h2h_matches=None):
         """Plot ELO progression for both players"""
         # Clear previous plot
         self.axes.clear()
@@ -222,23 +222,27 @@ class ELOProgressionCanvas(FigureCanvas):
             if home_data:
                 match_numbers = list(range(1, len(home_data) + 1))
                 elo_values = [point['new_elo'] for point in home_data]
-                self.axes.plot(match_numbers, elo_values, 'r-o', label=home_name, 
+                self.axes.plot(match_numbers, elo_values, '-o', label=home_name, 
                               linewidth=2, markersize=3, color='#e74c3c')
             
             # Plot away player ELO progression  
             if away_data:
                 match_numbers = list(range(1, len(away_data) + 1))
                 elo_values = [point['new_elo'] for point in away_data]
-                self.axes.plot(match_numbers, elo_values, 'g-o', label=away_name, 
+                self.axes.plot(match_numbers, elo_values, '-o', label=away_name, 
                               linewidth=2, markersize=3, color='#2ecc71')
             
             # Set labels and title
-            self.axes.set_title(f"ELO Progression - Last {match_limit} Matches")
+            if match_limit == -1:
+                self.axes.set_title(f"ELO Progression - All Time")
+            else:
+                self.axes.set_title(f"ELO Progression - Last {match_limit} Matches")
             self.axes.set_xlabel("Match Number (Recent)")
             self.axes.set_ylabel("ELO Rating")
             
-            # Add legend
-            self.axes.legend(loc='upper left')
+            # Add legend with transparency and better positioning
+            legend = self.axes.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
+            legend.get_frame().set_alpha(0.7)  # Make legend transparent
             
             # Set axis limits with some padding
             all_elos = []
@@ -259,9 +263,100 @@ class ELOProgressionCanvas(FigureCanvas):
                                 len(away_data) if away_data else 0)
                 if max_matches > 0:
                     self.axes.set_xlim(0.5, max_matches + 0.5)
+                    
+                # Add H2H vertical lines if data is available (but not for All Time)
+                if h2h_matches and (home_data or away_data) and match_limit != -1:
+                    self.add_h2h_vertical_lines(h2h_matches, home_data, away_data, home_name, away_name)
         
         self.fig.tight_layout()
         self.draw()
+
+    def add_h2h_vertical_lines(self, h2h_matches, home_data, away_data, home_name, away_name):
+        """Add vertical lines and labels for H2H matches within the plotted timeframe"""
+        if not h2h_matches:
+            return
+            
+        # Create combined time-ordered ELO data for position mapping
+        combined_data = []
+        if home_data:
+            for i, point in enumerate(home_data):
+                combined_data.append({
+                    'match_time': point['match_time'],
+                    'match_number': i + 1,
+                    'player': home_name
+                })
+        if away_data:
+            for i, point in enumerate(away_data):
+                combined_data.append({
+                    'match_time': point['match_time'],
+                    'match_number': i + 1,
+                    'player': away_name
+                })
+        
+        # Sort by time to get proper ordering
+        combined_data.sort(key=lambda x: x['match_time'])
+        
+        # Add vertical lines for each H2H match
+        for h2h_match in h2h_matches:
+            match_time = h2h_match.get('match_time_timestamp', 0)
+            
+            # Find the closest match position in our ELO data
+            closest_match = None
+            min_time_diff = float('inf')
+            
+            for data_point in combined_data:
+                time_diff = abs(data_point['match_time'] - match_time)
+                if time_diff < min_time_diff:
+                    min_time_diff = time_diff
+                    closest_match = data_point
+            
+            if closest_match:
+                x_pos = closest_match['match_number']
+                
+                # Add thin vertical line
+                self.axes.axvline(x=x_pos, color='#7f8c8d', linestyle='--', linewidth=1, alpha=0.7)
+                
+                # Create label with color-coded score based on who won
+                home_score = h2h_match['home_score']
+                away_score = h2h_match['away_score']
+                
+                # Get y position for label (near top of plot)
+                y_min, y_max = self.axes.get_ylim()
+                y_pos = y_min + (y_max - y_min) * 0.9
+                
+                # Get the scores and determine colors based on which line player scored what
+                # home_name is ALWAYS the red line, away_name is ALWAYS the green line
+                home_line_color = '#e74c3c'  # Red line color
+                away_line_color = '#2ecc71'  # Green line color
+                
+                if h2h_match['home_player_name'] == home_name:
+                    # home_name was home in this match, away_name was away
+                    home_line_score = str(home_score)  # Red line player's score
+                    away_line_score = str(away_score)  # Green line player's score
+                else:
+                    # home_name was away in this match, away_name was home
+                    home_line_score = str(away_score)  # Red line player's score  
+                    away_line_score = str(home_score)  # Green line player's score
+                
+                # Add the "h2h" label
+                self.axes.text(x_pos, y_pos + (y_max - y_min) * 0.02, "h2h", rotation=90,
+                             verticalalignment='bottom', horizontalalignment='center',
+                             fontsize=7, color='#f0f0f0', alpha=0.8)
+                
+                # Add home line player's score in red
+                self.axes.text(x_pos - 0.1, y_pos, home_line_score, rotation=90,
+                             verticalalignment='top', horizontalalignment='center',
+                             fontsize=8, color=home_line_color, alpha=0.9, weight='bold')
+                
+                # Add dash
+                self.axes.text(x_pos, y_pos - (y_max - y_min) * 0.01, "-", rotation=90,
+                             verticalalignment='top', horizontalalignment='center',
+                             fontsize=8, color='#f0f0f0', alpha=0.8)
+                
+                # Add away line player's score in green
+                self.axes.text(x_pos + 0.1, y_pos - (y_max - y_min) * 0.02, away_line_score, rotation=90,
+                             verticalalignment='top', horizontalalignment='center',
+                             fontsize=8, color=away_line_color, alpha=0.9, weight='bold')
 
 
 class SetScoreDialog(QDialog):
@@ -748,7 +843,7 @@ class TableTennisGUI(QMainWindow):
         time_window_label = QLabel("Matches:")
         time_window_label.setFont(QFont("Arial", 10))
         self.elo_time_window = QComboBox()
-        self.elo_time_window.addItems(["Last 10", "Last 25", "Last 50"])
+        self.elo_time_window.addItems(["Last 10", "Last 25", "Last 50", "All Time"])
         self.elo_time_window.setCurrentIndex(1)  # Default to 25
         self.elo_time_window.currentIndexChanged.connect(self.update_elo_chart)
         time_window_layout.addWidget(time_window_label)
@@ -1679,23 +1774,51 @@ class TableTennisGUI(QMainWindow):
         try:
             db = TTDatabase()
             
-            # Get player ELO history
-            db.cursor.execute('''
-            SELECT 
-                eh.new_elo,
-                eh.old_elo,
-                eh.new_elo - eh.old_elo as elo_change,
-                m.match_time,
-                ROW_NUMBER() OVER (ORDER BY m.match_time DESC) as match_number
-            FROM elo_history eh
-            JOIN players p ON eh.player_id = p.id AND eh.league_id = p.league_id
-            JOIN matches m ON eh.match_id = m.id
-            WHERE p.name = ? AND eh.league_id = ?
-            ORDER BY m.match_time DESC
-            LIMIT ?
-            ''', (player_name, league_id, limit))
+            # Build query based on whether limit is set (All Time vs limited)
+            if limit == -1:  # All Time
+                query = '''
+                SELECT 
+                    eh.new_elo,
+                    eh.old_elo,
+                    eh.new_elo - eh.old_elo as elo_change,
+                    m.match_time,
+                    ROW_NUMBER() OVER (ORDER BY m.match_time DESC) as match_number
+                FROM elo_history eh
+                JOIN players p ON eh.player_id = p.id AND eh.league_id = p.league_id
+                JOIN matches m ON eh.match_id = m.id
+                WHERE p.name = ? AND eh.league_id = ?
+                ORDER BY m.match_time DESC
+                '''
+                db.cursor.execute(query, (player_name, league_id))
+            else:
+                query = '''
+                SELECT 
+                    eh.new_elo,
+                    eh.old_elo,
+                    eh.new_elo - eh.old_elo as elo_change,
+                    m.match_time,
+                    ROW_NUMBER() OVER (ORDER BY m.match_time DESC) as match_number
+                FROM elo_history eh
+                JOIN players p ON eh.player_id = p.id AND eh.league_id = p.league_id
+                JOIN matches m ON eh.match_id = m.id
+                WHERE p.name = ? AND eh.league_id = ?
+                ORDER BY m.match_time DESC
+                LIMIT ?
+                '''
+                db.cursor.execute(query, (player_name, league_id, limit))
             
-            results = [dict(row) for row in db.cursor.fetchall()]
+            # Convert results and handle timestamp conversion
+            results = []
+            from datetime import datetime
+            for row in db.cursor.fetchall():
+                row_dict = dict(row)
+                # Convert match_time string to timestamp
+                try:
+                    dt = datetime.strptime(row_dict['match_time'], '%Y-%m-%d %H:%M:%S')
+                    row_dict['match_time'] = dt.timestamp()
+                except:
+                    row_dict['match_time'] = 0
+                results.append(row_dict)
             db.close()
             
             # Reverse to get chronological order (oldest to newest)
@@ -1703,6 +1826,67 @@ class TableTennisGUI(QMainWindow):
             
         except Exception as e:
             print(f"Error fetching ELO progression for {player_name}: {e}")
+            return []
+
+    def get_h2h_matches_in_timeframe(self, player1_name: str, player2_name: str, league_id: int, elo_data: list) -> list:
+        """Get head-to-head matches between two players within the ELO data timeframe"""
+        try:
+            if not elo_data:
+                return []
+                
+            db = TTDatabase()
+            
+            # Get the time range from the ELO data (convert to timestamps)
+            from datetime import datetime
+            earliest_time = min(match.get('match_time', 0) for match in elo_data)
+            latest_time = max(match.get('match_time', 0) for match in elo_data)
+            
+            # Convert numeric timestamps to datetime strings for database query
+            earliest_dt = datetime.fromtimestamp(earliest_time).strftime('%Y-%m-%d %H:%M:%S')
+            latest_dt = datetime.fromtimestamp(latest_time).strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Query for matches between these two players in this timeframe
+            query = '''
+            SELECT 
+                m.match_time,
+                m.home_player_name,
+                m.away_player_name,
+                m.home_score,
+                m.away_score,
+                m.id as match_id
+            FROM matches m
+            WHERE m.league_id = ?
+            AND m.match_time BETWEEN ? AND ?
+            AND (
+                (m.home_player_name = ? AND m.away_player_name = ?) OR
+                (m.home_player_name = ? AND m.away_player_name = ?)
+            )
+            ORDER BY m.match_time ASC
+            '''
+            
+            db.cursor.execute(query, (
+                league_id, earliest_dt, latest_dt,
+                player1_name, player2_name,
+                player2_name, player1_name
+            ))
+            
+            results = []
+            for row in db.cursor.fetchall():
+                row_dict = dict(row)
+                # Convert the datetime string back to timestamp for comparison
+                try:
+                    dt = datetime.strptime(row_dict['match_time'], '%Y-%m-%d %H:%M:%S')
+                    row_dict['match_time_timestamp'] = dt.timestamp()
+                except:
+                    row_dict['match_time_timestamp'] = 0
+                results.append(row_dict)
+                
+            db.close()
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error fetching H2H matches: {e}")
             return []
 
     def update_elo_chart(self):
@@ -1736,16 +1920,22 @@ class TableTennisGUI(QMainWindow):
             limit = 10
         elif "25" in time_window_text:
             limit = 25
-        else:  # "50"
+        elif "50" in time_window_text:
             limit = 50
+        else:  # "All Time"
+            limit = -1
         
         # Fetch ELO data for both players
         home_elo_data = self.get_player_elo_progression(home_name, league_id, limit)
         away_elo_data = self.get_player_elo_progression(away_name, league_id, limit)
         
+        # Get h2h matches within the timeframe (use the longer of the two datasets)
+        combined_elo_data = home_elo_data + away_elo_data
+        h2h_matches = self.get_h2h_matches_in_timeframe(home_name, away_name, league_id, combined_elo_data)
+        
         # Update the chart
         self.elo_chart.plot_elo_progression(home_elo_data, away_elo_data, 
-                                          home_name, away_name, limit)
+                                          home_name, away_name, limit, h2h_matches)
             
 
 def main():
