@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QSplitter, QGroupBox, QScrollArea, 
     QGridLayout, QHeaderView, QSizePolicy, QDialog, QDialogButtonBox,QStackedWidget
 )
-from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QIcon
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -19,6 +19,36 @@ from TableTennisClient import main as fetch_data
 from tt_elo import ELOCalculator
 from ttDB import TTDatabase
 import pathlib # For icon
+
+
+class AsyncDataFetcher(QThread):
+    """Thread for running async data fetching without blocking the UI"""
+    
+    # Qt signals for communication with main thread
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+    
+    def run(self):
+        """Run the async data fetching in this thread"""
+        try:
+            # Update status
+            self.status_update.emit("Fetching data...")
+            
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Run the async fetch_data function
+                loop.run_until_complete(fetch_data())
+                self.status_update.emit("Data fetch completed")
+                self.finished.emit()
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class PointProgressionCanvas(FigureCanvas):
@@ -592,6 +622,9 @@ class TableTennisGUI(QMainWindow):
         # Initialize ELO chart
         self.elo_chart.clear_chart()
         
+        # Initialize async data fetcher
+        self.data_fetcher = None
+        
         # Set up auto-refresh timer (every 30 minutes)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_data)
@@ -1021,21 +1054,7 @@ class TableTennisGUI(QMainWindow):
         except (ValueError, ZeroDivisionError):
             return "-"  # Return a dash if conversion fails
 
-    def american_to_decimal(self, american_odds):
-        """Convert American odds to decimal format"""
-        try:
-            # Remove the plus sign if it exists
-            american = american_odds.replace('+', '')
-            american = float(american)
-            
-            if american > 0:
-                # Positive American odds
-                return f"{(american / 100) + 1:.2f}"
-            else:
-                # Negative American odds
-                return f"{(100 / abs(american)) + 1:.2f}"
-        except (ValueError, ZeroDivisionError):
-            return "-"  # Return a dash if conversion fails
+  
 
     def toggle_odds_format(self):
         """Toggle between American and Decimal odds formats"""
@@ -1073,23 +1092,54 @@ class TableTennisGUI(QMainWindow):
                     pass
 
     def refresh_data(self):
-        """Refresh data by running the client script"""
-        self.status_label.setText("Refreshing data...")
-        QApplication.processEvents()
-        
-        try:
-            # Run client asynchronously
-            asyncio.run(fetch_data())
-            self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
+        """Refresh data by running the client script asynchronously"""
+        # Don't start new fetch if one is already running
+        if self.data_fetcher and self.data_fetcher.isRunning():
+            return
             
+        # Disable the refresh button to prevent multiple simultaneous fetches
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("Fetching...")
+        
+        # Create and configure the async data fetcher
+        self.data_fetcher = AsyncDataFetcher()
+        self.data_fetcher.finished.connect(self.on_data_fetch_finished)
+        self.data_fetcher.error.connect(self.on_data_fetch_error)
+        self.data_fetcher.status_update.connect(self.on_data_fetch_status)
+        
+        # Start the async fetch
+        self.data_fetcher.start()
+    
+    def on_data_fetch_finished(self):
+        """Called when async data fetch completes successfully"""
+        try:
             # Load the updated data
             self.load_data()
+            self.status_label.setText(f"Data refreshed: {datetime.now().strftime('%H:%M:%S')}")
+            
+            # Update ELO status after data refresh
+            self.update_elo_status()
+            
         except Exception as e:
-            self.status_label.setText(f"Error refreshing data: {str(e)}")
+            self.status_label.setText(f"Error loading data: {str(e)}")
             print(f"Error: {str(e)}")
+        finally:
+            # Re-enable the refresh button
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("Refresh Data")
+    
+    def on_data_fetch_error(self, error_msg: str):
+        """Called when async data fetch encounters an error"""
+        self.status_label.setText(f"Error refreshing data: {error_msg}")
+        print(f"Data fetch error: {error_msg}")
         
-        # Update ELO status after data refresh
-        self.update_elo_status()
+        # Re-enable the refresh button
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("Refresh Data")
+    
+    def on_data_fetch_status(self, status_msg: str):
+        """Called when async data fetch provides status updates"""
+        self.status_label.setText(status_msg)
 
     def load_data(self):
         """Load data from JSON files"""
