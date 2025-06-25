@@ -690,6 +690,120 @@ class SetScoreDialog(QDialog):
             self.stacked_widget.setCurrentIndex(0)  # Comprehensive view
 
 
+def get_player_streak_data(player_id, league_id, limit=20):
+    """
+    Calculate hot streak data for a player
+    Returns dict with current streak, recent form, and streak history
+    """
+    db = TTDatabase()
+    
+    # Get recent ELO history for the player
+    query = """
+    SELECT eh.old_elo, eh.new_elo, eh.match_date, eh.match_id,
+           m.home_player_id, m.away_player_id, m.home_score, m.away_score
+    FROM elo_history eh
+    JOIN matches m ON eh.match_id = m.id
+    WHERE eh.player_id = ? AND eh.league_id = ?
+    ORDER BY eh.match_date DESC
+    LIMIT ?
+    """
+    
+    db.cursor.execute(query, (player_id, league_id, limit))
+    results = db.cursor.fetchall()
+    db.close()
+    
+    if not results:
+        return {
+            'current_streak': 0,
+            'streak_type': 'none',
+            'recent_form': {'wins': 0, 'total': 0, 'win_rate': 0.0},
+            'form_5': {'wins': 0, 'total': 0, 'win_rate': 0.0},
+            'form_10': {'wins': 0, 'total': 0, 'win_rate': 0.0},
+            'elo_change': 0,
+            'form_trend': 'neutral'
+        }
+    
+    # Analyze matches
+    wins = []
+    elo_changes = []
+    
+    for result in results:
+        old_elo, new_elo = result['old_elo'], result['new_elo']
+        
+        # Determine if player won
+        won = new_elo > old_elo
+        wins.append(won)
+        elo_changes.append(new_elo - old_elo)
+    
+    # Calculate current streak
+    current_streak = 0
+    streak_type = 'none'
+    
+    if wins:
+        streak_type = 'win' if wins[0] else 'loss'
+        for won in wins:
+            if (streak_type == 'win' and won) or (streak_type == 'loss' and not won):
+                current_streak += 1
+            else:
+                break
+    
+    # Calculate form over different periods
+    def calc_form(games_back):
+        if len(wins) >= games_back:
+            recent_wins = sum(wins[:games_back])
+            return {
+                'wins': recent_wins,
+                'total': games_back,
+                'win_rate': recent_wins / games_back
+            }
+        elif wins:
+            recent_wins = sum(wins)
+            return {
+                'wins': recent_wins,
+                'total': len(wins),
+                'win_rate': recent_wins / len(wins)
+            }
+        else:
+            return {'wins': 0, 'total': 0, 'win_rate': 0.0}
+    
+    # ELO change over recent period
+    elo_change = sum(elo_changes) if elo_changes else 0
+    
+    # Determine form trend
+    form_trend = 'neutral'
+    if len(wins) >= 10:
+        recent_5_wr = calc_form(5)['win_rate']
+        older_5_wr = sum(wins[5:10]) / 5 if len(wins) >= 10 else calc_form(len(wins) - 5)['win_rate']
+        if recent_5_wr > older_5_wr + 0.2:
+            form_trend = 'improving'
+        elif recent_5_wr < older_5_wr - 0.2:
+            form_trend = 'declining'
+    
+    return {
+        'current_streak': current_streak,
+        'streak_type': streak_type,
+        'recent_form': calc_form(limit),
+        'form_5': calc_form(5),
+        'form_10': calc_form(10),
+        'elo_change': elo_change,
+        'form_trend': form_trend
+    }
+
+
+def get_streak_color(streak_data):
+    """Return color code based on streak data"""
+    if streak_data['streak_type'] == 'win' and streak_data['current_streak'] >= 3:
+        return "#27ae60"  # Green for hot streak
+    elif streak_data['streak_type'] == 'loss' and streak_data['current_streak'] >= 3:
+        return "#e74c3c"  # Red for cold streak
+    elif streak_data['form_5']['win_rate'] >= 0.7:
+        return "#f39c12"  # Orange for good form
+    elif streak_data['form_5']['win_rate'] <= 0.3:
+        return "#e67e22"  # Orange for poor form
+    else:
+        return "#95a5a6"  # Gray for neutral
+
+
 class TableTennisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -852,15 +966,61 @@ class TableTennisGUI(QMainWindow):
         
         elo_chart_layout.addLayout(time_window_layout)
         
-        # ELO Chart Canvas (larger size to fill more space)
+        # ELO Chart Canvas (dynamically sized with proper constraints)
         self.elo_chart = ELOProgressionCanvas(self, width=4, height=5, dpi=80)
-        elo_chart_layout.addWidget(self.elo_chart)
+        self.elo_chart.setMinimumHeight(300)  # Increased minimum height
+        # Remove maximum height constraint to allow growth but use stretch factors to control
+        elo_chart_layout.addWidget(self.elo_chart, 1)  # Give stretch factor to expand
         
-        # Give the chart group more weight in the layout
-        self.control_layout.addWidget(elo_chart_group, 3)  # Weight of 3 to expand
+        # Player Info Panel (Hot Streak Analysis) - compact design
+        self.player_info_panel = QGroupBox("Player Form Analysis")
+        player_info_layout = QHBoxLayout(self.player_info_panel)  # Use horizontal layout instead
         
-        # Much smaller stretcher - let the chart take up more space
-        self.control_layout.addStretch(1)
+        # Home player info (vertical layout within)
+        home_info_widget = QWidget()
+        home_info_layout = QVBoxLayout(home_info_widget)
+        home_info_layout.setContentsMargins(5, 5, 5, 5)
+        home_info_layout.setSpacing(2)
+        
+        self.home_player_label = QLabel("Home Player")
+        self.home_player_label.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.home_streak_label = QLabel("No data")
+        self.home_form_label = QLabel("Form: -")
+        
+        home_info_layout.addWidget(self.home_player_label)
+        home_info_layout.addWidget(self.home_streak_label)
+        home_info_layout.addWidget(self.home_form_label)
+        
+        # Away player info (vertical layout within)
+        away_info_widget = QWidget()
+        away_info_layout = QVBoxLayout(away_info_widget)
+        away_info_layout.setContentsMargins(5, 5, 5, 5)
+        away_info_layout.setSpacing(2)
+        
+        self.away_player_label = QLabel("Away Player")
+        self.away_player_label.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.away_streak_label = QLabel("No data")
+        self.away_form_label = QLabel("Form: -")
+        
+        away_info_layout.addWidget(self.away_player_label)
+        away_info_layout.addWidget(self.away_streak_label)
+        away_info_layout.addWidget(self.away_form_label)
+        
+        # Add both player info widgets to horizontal layout
+        player_info_layout.addWidget(home_info_widget)
+        player_info_layout.addWidget(away_info_widget)
+        
+        # Set reasonable fixed height
+        self.player_info_panel.setFixedHeight(85)
+        
+        # Add to ELO chart layout with no stretch factor (fixed size)
+        elo_chart_layout.addWidget(self.player_info_panel, 0)
+        
+        # Give the chart group significant weight to expand vertically
+        self.control_layout.addWidget(elo_chart_group, 2)  # Increased weight for more space
+        
+        # Minimal bottom stretch to use available space efficiently
+        self.control_layout.addStretch(0)
         
         # Add to splitter
         self.splitter.addWidget(self.control_panel)
@@ -1555,6 +1715,17 @@ class TableTennisGUI(QMainWindow):
         # Update ELO chart
         self.update_elo_chart()
         
+        # Map league name to ID for player info panel
+        league_id = None
+        for lid, lname in self.leagues.items():
+            if lname == league_name:
+                league_id = int(lid)
+                break
+        
+        # Update player info panel
+        if league_id:
+            self.update_player_info_panel(home_name, away_name, league_id)
+        
     def update_h2h_data(self, h2h_data, home_name, away_name):
         """Update head-to-head data display"""
         # Clear table
@@ -1941,6 +2112,86 @@ class TableTennisGUI(QMainWindow):
         # Update the chart
         self.elo_chart.plot_elo_progression(home_elo_data, away_elo_data, 
                                           home_name, away_name, limit, h2h_matches)
+    
+    def update_player_info_panel(self, home_name, away_name, league_id):
+        """Update the player info panel with streak data"""
+        try:
+            # Get player IDs
+            db = TTDatabase()
+            
+            # Get home player ID
+            db.cursor.execute("SELECT id FROM players WHERE name = ? AND league_id = ?", (home_name, league_id))
+            home_result = db.cursor.fetchone()
+            home_player_id = home_result['id'] if home_result else None
+            
+            # Get away player ID  
+            db.cursor.execute("SELECT id FROM players WHERE name = ? AND league_id = ?", (away_name, league_id))
+            away_result = db.cursor.fetchone()
+            away_player_id = away_result['id'] if away_result else None
+            
+            db.close()
+            
+            # Update home player info
+            self.home_player_label.setText(f"{home_name}")
+            if home_player_id:
+                home_streak_data = get_player_streak_data(home_player_id, league_id)
+                home_color = get_streak_color(home_streak_data)
+                
+                # Format streak text
+                if home_streak_data['current_streak'] > 0:
+                    streak_type = "W" if home_streak_data['streak_type'] == 'win' else "L"
+                    streak_text = f"{streak_type}{home_streak_data['current_streak']}"
+                else:
+                    streak_text = "No streak"
+                
+                # Format form text
+                form_5 = home_streak_data['form_5']
+                form_text = f"L5: {form_5['wins']}-{form_5['total']-form_5['wins']} ({form_5['win_rate']:.1%})"
+                
+                self.home_streak_label.setText(streak_text)
+                self.home_streak_label.setStyleSheet(f"color: {home_color}; font-weight: bold;")
+                self.home_form_label.setText(form_text)
+                self.home_form_label.setStyleSheet(f"color: {home_color};")
+            else:
+                self.home_streak_label.setText("No data")
+                self.home_form_label.setText("Form: -")
+                self.home_streak_label.setStyleSheet("color: #95a5a6;")
+                self.home_form_label.setStyleSheet("color: #95a5a6;")
+            
+            # Update away player info
+            self.away_player_label.setText(f"{away_name}")
+            if away_player_id:
+                away_streak_data = get_player_streak_data(away_player_id, league_id)
+                away_color = get_streak_color(away_streak_data)
+                
+                # Format streak text
+                if away_streak_data['current_streak'] > 0:
+                    streak_type = "W" if away_streak_data['streak_type'] == 'win' else "L"
+                    streak_text = f"{streak_type}{away_streak_data['current_streak']}"
+                else:
+                    streak_text = "No streak"
+                
+                # Format form text
+                form_5 = away_streak_data['form_5']
+                form_text = f"L5: {form_5['wins']}-{form_5['total']-form_5['wins']} ({form_5['win_rate']:.1%})"
+                
+                self.away_streak_label.setText(streak_text)
+                self.away_streak_label.setStyleSheet(f"color: {away_color}; font-weight: bold;")
+                self.away_form_label.setText(form_text)
+                self.away_form_label.setStyleSheet(f"color: {away_color};")
+            else:
+                self.away_streak_label.setText("No data")
+                self.away_form_label.setText("Form: -")
+                self.away_streak_label.setStyleSheet("color: #95a5a6;")
+                self.away_form_label.setStyleSheet("color: #95a5a6;")
+                
+        except Exception as e:
+            print(f"Error updating player info panel: {e}")
+            # Reset to default state
+            self.home_streak_label.setText("Error")
+            self.home_form_label.setText("Form: -")
+            self.away_streak_label.setText("Error")
+            self.away_form_label.setText("Form: -")
             
 
 def main():
