@@ -1090,6 +1090,87 @@ class TableTennisGUI(QMainWindow):
             
         self.details_layout.addWidget(self.match_summary)
         
+        # Player Analysis - Two Side-by-Side Panels
+        player_analysis_container = QHBoxLayout()
+        
+        # Home Player Panel
+        self.home_player_group = QGroupBox("Home Player")
+        self.home_player_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        home_layout = QVBoxLayout(self.home_player_group)
+        
+        self.home_player_name = QLabel("Home Player")
+        self.home_player_name.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.home_player_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.home_elo_display = QLabel("ELO: -")
+        self.home_elo_display.setFont(QFont("Arial", 11))
+        self.home_elo_display.setStyleSheet("color: #3498db; font-weight: bold;")
+        self.home_elo_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        home_prob_layout = QHBoxLayout()
+        self.home_elo_win_prob = QLabel("ELO: -%")
+        self.home_elo_win_prob.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.home_elo_win_prob.setStyleSheet("color: #27ae60;")
+        self.home_elo_win_prob.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.home_odds_win_prob = QLabel("Odds: -%")
+        self.home_odds_win_prob.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.home_odds_win_prob.setStyleSheet("color: #f39c12;")
+        self.home_odds_win_prob.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        home_prob_layout.addStretch()
+        home_prob_layout.addWidget(self.home_elo_win_prob)
+        home_prob_layout.addWidget(self.home_odds_win_prob)
+        home_prob_layout.addStretch()
+        
+        home_layout.addWidget(self.home_player_name)
+        home_layout.addWidget(self.home_elo_display)
+        home_layout.addLayout(home_prob_layout)
+        
+        # Away Player Panel
+        self.away_player_group = QGroupBox("Away Player")
+        self.away_player_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        away_layout = QVBoxLayout(self.away_player_group)
+        
+        self.away_player_name = QLabel("Away Player")
+        self.away_player_name.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        self.away_player_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.away_elo_display = QLabel("ELO: -")
+        self.away_elo_display.setFont(QFont("Arial", 11))
+        self.away_elo_display.setStyleSheet("color: #3498db; font-weight: bold;")
+        self.away_elo_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        away_prob_layout = QHBoxLayout()
+        self.away_elo_win_prob = QLabel("ELO: -%")
+        self.away_elo_win_prob.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.away_elo_win_prob.setStyleSheet("color: #e74c3c;")
+        self.away_elo_win_prob.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.away_odds_win_prob = QLabel("Odds: -%")
+        self.away_odds_win_prob.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.away_odds_win_prob.setStyleSheet("color: #f39c12;")
+        self.away_odds_win_prob.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        away_prob_layout.addStretch()
+        away_prob_layout.addWidget(self.away_elo_win_prob)
+        away_prob_layout.addWidget(self.away_odds_win_prob)
+        away_prob_layout.addStretch()
+        
+        away_layout.addWidget(self.away_player_name)
+        away_layout.addWidget(self.away_elo_display)
+        away_layout.addLayout(away_prob_layout)
+        
+        # Add both panels to container
+        player_analysis_container.addWidget(self.home_player_group)
+        player_analysis_container.addWidget(self.away_player_group)
+        
+        # Create a widget to hold the container layout
+        player_analysis_widget = QWidget()
+        player_analysis_widget.setLayout(player_analysis_container)
+        
+        self.details_layout.addWidget(player_analysis_widget)
+        
         # Odds details
         self.odds_group = QGroupBox("Betting Odds")
         self.odds_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1123,11 +1204,12 @@ class TableTennisGUI(QMainWindow):
         
         # Increase font size for headers and values
         header_font = QFont("Arial", 11, QFont.Weight.Bold)
-        value_font = QFont("Arial", 11)
+        value_font = QFont("Arial", 10)
+        small_font = QFont("Arial", 9)
         
         market_label = QLabel("Market")
         market_label.setFont(header_font)
-        home_label = QLabel("Home")
+        home_label = QLabel("Home (NoVig)")
         home_label.setFont(header_font)
         away_label = QLabel("Away/Under")
         away_label.setFont(header_font)
@@ -1185,6 +1267,16 @@ class TableTennisGUI(QMainWindow):
         
         # Store the raw decimal odds for conversion between formats
         self.raw_odds = {
+            "moneyline_home": "-",
+            "moneyline_away": "-",
+            "spread_home": "-",
+            "spread_away": "-",
+            "total_over": "-",
+            "total_under": "-"
+        }
+        
+        # Store NoVig odds
+        self.novig_odds = {
             "moneyline_home": "-",
             "moneyline_away": "-",
             "spread_home": "-",
@@ -1309,7 +1401,177 @@ class TableTennisGUI(QMainWindow):
         except (ValueError, ZeroDivisionError):
             return "-"  # Return a dash if conversion fails
 
-  
+    def calculate_novig_odds(self, odds1, odds2):
+        """Calculate no-vig fair odds from two decimal odds"""
+        try:
+            decimal1 = float(odds1)
+            decimal2 = float(odds2)
+            
+            # Convert to implied probabilities
+            prob1 = 1 / decimal1
+            prob2 = 1 / decimal2
+            
+            # Calculate the vig (overround)
+            total_prob = prob1 + prob2
+            
+            # Remove vig by normalizing probabilities
+            fair_prob1 = prob1 / total_prob
+            fair_prob2 = prob2 / total_prob
+            
+            # Convert back to decimal odds
+            fair_odds1 = 1 / fair_prob1
+            fair_odds2 = 1 / fair_prob2
+            
+            return round(fair_odds1, 2), round(fair_odds2, 2)
+        except (ValueError, ZeroDivisionError):
+            return "-", "-"
+
+    def calculate_elo_win_probability(self, elo1, elo2):
+        """Calculate win probability based on ELO difference"""
+        try:
+            elo_diff = float(elo1) - float(elo2)
+            # Standard ELO formula: P = 1 / (1 + 10^(elo_diff/400))
+            win_prob1 = 1 / (1 + 10**(-elo_diff / 400))
+            win_prob2 = 1 - win_prob1
+            return round(win_prob1 * 100, 1), round(win_prob2 * 100, 1)
+        except (ValueError, TypeError):
+            return "-", "-"
+
+    def calculate_implied_probability(self, decimal_odds):
+        """Calculate implied probability from decimal odds"""
+        try:
+            odds = float(decimal_odds)
+            implied_prob = (1 / odds) * 100
+            return round(implied_prob, 1)
+        except (ValueError, ZeroDivisionError):
+            return "-"
+
+    def get_player_current_elo(self, player_name, league_id):
+        """Get current ELO for a player from database (fast lookup)"""
+        try:
+            db = TTDatabase()
+            
+            # Find player ID by name and league
+            db.cursor.execute("""
+                SELECT id FROM players 
+                WHERE name = ? AND league_id = ?
+            """, (player_name, league_id))
+            
+            result = db.cursor.fetchone()
+            if not result:
+                return 1500  # Default ELO for new players
+                
+            player_id = result[0]
+            
+            # Get current ELO from fast current_elo table
+            db.cursor.execute("""
+                SELECT elo FROM current_elo 
+                WHERE player_id = ? AND league_id = ?
+            """, (player_id, league_id))
+            
+            elo_result = db.cursor.fetchone()
+            if elo_result:
+                return elo_result[0]
+            else:
+                return 1500  # Default ELO if not found
+                
+        except Exception as e:
+            print(f"Error getting ELO for {player_name}: {e}")
+            return 1500
+
+    def get_player_elo_from_history(self, player_name, league_id):
+        """Get most recent ELO from history table (for chart consistency)"""
+        try:
+            db = TTDatabase()
+            
+            # Get the most recent ELO from elo_history table (same source as chart)
+            db.cursor.execute("""
+                SELECT eh.new_elo
+                FROM elo_history eh
+                JOIN players p ON eh.player_id = p.id AND eh.league_id = p.league_id
+                JOIN matches m ON eh.match_id = m.id
+                WHERE p.name = ? AND eh.league_id = ?
+                ORDER BY m.match_time DESC
+                LIMIT 1
+            """, (player_name, league_id))
+            
+            result = db.cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                # Fallback to current_elo table
+                return self.get_player_current_elo(player_name, league_id)
+                
+        except Exception as e:
+            print(f"Error getting ELO from history for {player_name}: {e}")
+            return self.get_player_current_elo(player_name, league_id)
+
+    def calculate_elo_vs_bookmaker_deviation(self, home_name, away_name, home_odds, away_odds, league_id):
+        """Calculate deviation between ELO and bookmaker probabilities"""
+        try:
+            # Ensure league_id is an integer
+            if isinstance(league_id, str):
+                league_id = int(league_id)
+            
+            # Get ELO ratings for both players
+            home_elo = self.get_player_current_elo(home_name, league_id)
+            away_elo = self.get_player_current_elo(away_name, league_id)
+            
+            # Calculate ELO-based win probabilities
+            home_elo_prob, away_elo_prob = self.calculate_elo_win_probability(home_elo, away_elo)
+            
+            # Convert to decimal values (remove the percentage)
+            if home_elo_prob != "-" and away_elo_prob != "-":
+                home_elo_prob = float(home_elo_prob) / 100
+                away_elo_prob = float(away_elo_prob) / 100
+            else:
+                return None, None  # No ELO data available
+            
+            # Calculate bookmaker implied probabilities
+            home_bookmaker_prob = self.calculate_implied_probability(home_odds)
+            away_bookmaker_prob = self.calculate_implied_probability(away_odds)
+            
+            # Convert to decimal values
+            if home_bookmaker_prob != "-" and away_bookmaker_prob != "-":
+                home_bookmaker_prob = float(home_bookmaker_prob) / 100
+                away_bookmaker_prob = float(away_bookmaker_prob) / 100
+            else:
+                return None, None  # No odds data available
+            
+            # Calculate deviations (ELO probability - Bookmaker probability)
+            # Positive = ELO thinks player is undervalued by bookmaker
+            # Negative = ELO thinks player is overvalued by bookmaker
+            home_deviation = home_elo_prob - home_bookmaker_prob
+            away_deviation = away_elo_prob - away_bookmaker_prob
+            
+            return home_deviation, away_deviation
+            
+        except Exception as e:
+            print(f"Error calculating ELO vs bookmaker deviation: {e}")
+            return None, None
+
+    def get_value_bet_colors(self, home_deviation, away_deviation):
+        """Get colors based on ELO vs bookmaker deviation"""
+        from PyQt6.QtGui import QColor
+        
+        def deviation_to_color(deviation):
+            if deviation is None:
+                return None  # No color (default)
+            elif deviation > 0.15:  # >15% deviation - strong value
+                return QColor(0, 150, 0, 100)  # Bright green
+            elif deviation > 0.05:  # 5-15% deviation - potential value
+                return QColor(100, 200, 100, 80)  # Light green
+            elif deviation < -0.15:  # <-15% deviation - strong avoid
+                return QColor(200, 50, 50, 100)  # Bright red
+            elif deviation < -0.05:  # -15% to -5% deviation - avoid
+                return QColor(200, 150, 150, 80)  # Light red
+            else:  # -5% to +5% deviation - fair line
+                return None  # No color (default/gray)
+        
+        home_color = deviation_to_color(home_deviation)
+        away_color = deviation_to_color(away_deviation)
+        
+        return home_color, away_color
 
     def toggle_odds_format(self):
         """Toggle between American and Decimal odds formats"""
@@ -1317,16 +1579,28 @@ class TableTennisGUI(QMainWindow):
         
         if show_decimal:
             self.odds_format_checkbox.setText("American Odds")
-            # Show raw decimal odds
+            # Show combined decimal odds (original and NoVig)
             for key, value in self.raw_odds.items():
-                if value != "-":
-                    self.odds_labels[key].setText(value)
+                if value != "-" and key in self.odds_labels:
+                    novig_value = self.novig_odds.get(key, "-")
+                    if novig_value != "-":
+                        combined_display = f"{value} ({novig_value})"
+                    else:
+                        combined_display = value
+                    self.odds_labels[key].setText(combined_display)
         else:
             self.odds_format_checkbox.setText("Decimal Odds")
-            # Convert to American odds
+            # Show combined American odds (original and NoVig)
             for key, value in self.raw_odds.items():
-                if value != "-":
-                    self.odds_labels[key].setText(self.decimal_to_american(value))
+                if value != "-" and key in self.odds_labels:
+                    orig_american = self.decimal_to_american(value)
+                    novig_value = self.novig_odds.get(key, "-")
+                    if novig_value != "-":
+                        novig_american = self.decimal_to_american(novig_value)
+                        combined_display = f"{orig_american} ({novig_american})"
+                    else:
+                        combined_display = orig_american
+                    self.odds_labels[key].setText(combined_display)
         
         # Keep styling
         for key in self.raw_odds.keys():
@@ -1537,20 +1811,25 @@ class TableTennisGUI(QMainWindow):
                 time_item.setData(Qt.ItemDataRole.UserRole, match.get('id'))
                 time_item.setData(Qt.ItemDataRole.UserRole + 1, league_name)
                 
-                # Color code based on odds
+                # Color code based on ELO vs Bookmaker deviation
                 try:
-                    home_odd_val = float(home_odd) if 'home_odd' in locals() else 0
-                    if home_odd_val < 1.5:
-                        home_item.setBackground(QColor(100, 200, 100, 80))  # Green for heavy favorite
-                    elif home_odd_val < 2.0:
-                        home_item.setBackground(QColor(180, 180, 100, 80))  # Yellow for moderate favorite
+                    # Only apply colors if we have valid odds data
+                    if 'home_odd' in locals() and 'away_odd' in locals() and home_odd != '-' and away_odd != '-':
+                        # Calculate ELO vs bookmaker deviation
+                        home_deviation, away_deviation = self.calculate_elo_vs_bookmaker_deviation(
+                            home_name, away_name, home_odd, away_odd, league_id
+                        )
                         
-                    away_odd_val = float(away_odd) if 'away_odd' in locals() else 0
-                    if away_odd_val < 1.5:
-                        away_item.setBackground(QColor(100, 200, 100, 80))
-                    elif away_odd_val < 2.0:
-                        away_item.setBackground(QColor(180, 180, 100, 80))
-                except:
+                        # Get colors based on deviation
+                        home_color, away_color = self.get_value_bet_colors(home_deviation, away_deviation)
+                        
+                        # Apply colors if available
+                        if home_color is not None:
+                            home_item.setBackground(home_color)
+                        if away_color is not None:
+                            away_item.setBackground(away_color)
+                except Exception as e:
+                    # Silently continue if color calculation fails
                     pass
                 
                 row_index += 1
@@ -1631,18 +1910,29 @@ class TableTennisGUI(QMainWindow):
                 self.raw_odds["moneyline_home"] = home_decimal
                 self.raw_odds["moneyline_away"] = away_decimal
                 
-                # Set display based on current format
-                if self.odds_format_checkbox.isChecked():  # Decimal format
-                    self.odds_labels["moneyline_home"].setText(home_decimal)
-                    self.odds_labels["moneyline_away"].setText(away_decimal)
-                else:  # American format
-                    self.odds_labels["moneyline_home"].setText(self.decimal_to_american(home_decimal))
-                    self.odds_labels["moneyline_away"].setText(self.decimal_to_american(away_decimal))
-                
-                # Color code based on value
+                # Calculate NoVig odds for moneyline
                 try:
                     home_odd = float(home_decimal)
                     away_odd = float(away_decimal)
+                    
+                    novig_home, novig_away = self.calculate_novig_odds(home_decimal, away_decimal)
+                    self.novig_odds["moneyline_home"] = novig_home
+                    self.novig_odds["moneyline_away"] = novig_away
+                    
+                    # Set display based on current format - combine original and NoVig
+                    if self.odds_format_checkbox.isChecked():  # Decimal format
+                        home_display = f"{home_decimal} ({novig_home})"
+                        away_display = f"{away_decimal} ({novig_away})"
+                    else:  # American format
+                        home_orig = self.decimal_to_american(home_decimal)
+                        away_orig = self.decimal_to_american(away_decimal)
+                        home_novig = self.decimal_to_american(novig_home)
+                        away_novig = self.decimal_to_american(novig_away)
+                        home_display = f"{home_orig} ({home_novig})"
+                        away_display = f"{away_orig} ({away_novig})"
+                    
+                    self.odds_labels["moneyline_home"].setText(home_display)
+                    self.odds_labels["moneyline_away"].setText(away_display)
                     
                     # Set color based on odds value
                     home_color = self.get_odds_color(home_odd)
@@ -1663,15 +1953,36 @@ class TableTennisGUI(QMainWindow):
                 self.raw_odds["spread_home"] = home_decimal
                 self.raw_odds["spread_away"] = away_decimal
                 
-                # Set display based on current format
-                if self.odds_format_checkbox.isChecked():  # Decimal format
-                    self.odds_labels["spread_home"].setText(home_decimal)
-                    self.odds_labels["spread_away"].setText(away_decimal)
-                else:  # American format
-                    self.odds_labels["spread_home"].setText(self.decimal_to_american(home_decimal))
-                    self.odds_labels["spread_away"].setText(self.decimal_to_american(away_decimal))
-                    
                 self.odds_labels["spread_handicap"].setText(spread_odds[0].get('handicap', '-'))
+                
+                # Calculate NoVig odds for spread and combine display
+                try:
+                    novig_home, novig_away = self.calculate_novig_odds(home_decimal, away_decimal)
+                    self.novig_odds["spread_home"] = novig_home
+                    self.novig_odds["spread_away"] = novig_away
+                    
+                    # Set display based on current format - combine original and NoVig
+                    if self.odds_format_checkbox.isChecked():  # Decimal format
+                        home_display = f"{home_decimal} ({novig_home})"
+                        away_display = f"{away_decimal} ({novig_away})"
+                    else:  # American format
+                        home_orig = self.decimal_to_american(home_decimal)
+                        away_orig = self.decimal_to_american(away_decimal)
+                        home_novig = self.decimal_to_american(novig_home)
+                        away_novig = self.decimal_to_american(novig_away)
+                        home_display = f"{home_orig} ({home_novig})"
+                        away_display = f"{away_orig} ({away_novig})"
+                    
+                    self.odds_labels["spread_home"].setText(home_display)
+                    self.odds_labels["spread_away"].setText(away_display)
+                except:
+                    # Fallback to just original odds
+                    if self.odds_format_checkbox.isChecked():
+                        self.odds_labels["spread_home"].setText(home_decimal)
+                        self.odds_labels["spread_away"].setText(away_decimal)
+                    else:
+                        self.odds_labels["spread_home"].setText(self.decimal_to_american(home_decimal))
+                        self.odds_labels["spread_away"].setText(self.decimal_to_american(away_decimal))
             
             # Totals
             total_odds = market_data.get('odds', {}).get('92_3', [])
@@ -1683,15 +1994,36 @@ class TableTennisGUI(QMainWindow):
                 self.raw_odds["total_over"] = over_decimal
                 self.raw_odds["total_under"] = under_decimal
                 
-                # Set display based on current format
-                if self.odds_format_checkbox.isChecked():  # Decimal format
-                    self.odds_labels["total_over"].setText(over_decimal)
-                    self.odds_labels["total_under"].setText(under_decimal)
-                else:  # American format
-                    self.odds_labels["total_over"].setText(self.decimal_to_american(over_decimal))
-                    self.odds_labels["total_under"].setText(self.decimal_to_american(under_decimal))
-                    
                 self.odds_labels["total_points"].setText(total_odds[0].get('handicap', '-'))
+                
+                # Calculate NoVig odds for totals and combine display
+                try:
+                    novig_over, novig_under = self.calculate_novig_odds(over_decimal, under_decimal)
+                    self.novig_odds["total_over"] = novig_over
+                    self.novig_odds["total_under"] = novig_under
+                    
+                    # Set display based on current format - combine original and NoVig
+                    if self.odds_format_checkbox.isChecked():  # Decimal format
+                        over_display = f"{over_decimal} ({novig_over})"
+                        under_display = f"{under_decimal} ({novig_under})"
+                    else:  # American format
+                        over_orig = self.decimal_to_american(over_decimal)
+                        under_orig = self.decimal_to_american(under_decimal)
+                        over_novig = self.decimal_to_american(novig_over)
+                        under_novig = self.decimal_to_american(novig_under)
+                        over_display = f"{over_orig} ({over_novig})"
+                        under_display = f"{under_orig} ({under_novig})"
+                    
+                    self.odds_labels["total_over"].setText(over_display)
+                    self.odds_labels["total_under"].setText(under_display)
+                except:
+                    # Fallback to just original odds
+                    if self.odds_format_checkbox.isChecked():
+                        self.odds_labels["total_over"].setText(over_decimal)
+                        self.odds_labels["total_under"].setText(under_decimal)
+                    else:
+                        self.odds_labels["total_over"].setText(self.decimal_to_american(over_decimal))
+                        self.odds_labels["total_under"].setText(self.decimal_to_american(under_decimal))
         else:
             # Clear odds
             for label in self.odds_labels.values():
@@ -1701,6 +2033,75 @@ class TableTennisGUI(QMainWindow):
             # Clear raw odds
             for key in self.raw_odds.keys():
                 self.raw_odds[key] = "-"
+                
+            # Clear NoVig odds
+            for key in self.novig_odds.keys():
+                self.novig_odds[key] = "-"
+                
+        # Get league ID for ELO lookup
+        league_id = None
+        for lid, lname in self.leagues.items():
+            if lname == league_name:
+                league_id = lid
+                break
+        
+        # Update ELO analysis panel
+        if league_id:
+            try:
+                home_elo = self.get_player_elo_from_history(home_name, league_id)
+                away_elo = self.get_player_elo_from_history(away_name, league_id)
+                
+                # Update player names in analysis panel
+                self.home_player_name.setText(home_name)
+                self.away_player_name.setText(away_name)
+                
+                # Display current ELO scores
+                self.home_elo_display.setText(f"ELO: {home_elo}")
+                self.away_elo_display.setText(f"ELO: {away_elo}")
+                
+                # Calculate ELO-based win probabilities
+                home_win_prob, away_win_prob = self.calculate_elo_win_probability(home_elo, away_elo)
+                
+                # Display ELO win probabilities
+                self.home_elo_win_prob.setText(f"ELO: {home_win_prob}%")
+                self.away_elo_win_prob.setText(f"ELO: {away_win_prob}%")
+                
+            except Exception as e:
+                print(f"Error updating ELO information: {e}")
+                # Clear ELO labels on error
+                self.home_player_name.setText("Home Player")
+                self.away_player_name.setText("Away Player")
+                self.home_elo_display.setText("ELO: -")
+                self.away_elo_display.setText("ELO: -")
+                self.home_elo_win_prob.setText("ELO: -%")
+                self.away_elo_win_prob.setText("ELO: -%")
+                self.home_odds_win_prob.setText("Odds: -%")
+                self.away_odds_win_prob.setText("Odds: -%")
+        else:
+            # Clear ELO labels if no league ID found
+            self.home_player_name.setText("Home Player")
+            self.away_player_name.setText("Away Player")
+            self.home_elo_display.setText("ELO: -")
+            self.away_elo_display.setText("ELO: -")
+            self.home_elo_win_prob.setText("ELO: -%")
+            self.away_elo_win_prob.setText("ELO: -%")
+            self.home_odds_win_prob.setText("Odds: -%")
+            self.away_odds_win_prob.setText("Odds: -%")
+        
+        # Calculate and display odds implied probabilities (from moneyline)
+        home_odds_prob = "-"
+        away_odds_prob = "-"
+        if market_data:
+            moneyline_odds = market_data.get('odds', {}).get('92_1', [])
+            if moneyline_odds and len(moneyline_odds) > 0:
+                home_decimal = moneyline_odds[0].get('home_od', '-')
+                away_decimal = moneyline_odds[0].get('away_od', '-')
+                if home_decimal != '-' and away_decimal != '-':
+                    home_odds_prob = self.calculate_implied_probability(home_decimal)
+                    away_odds_prob = self.calculate_implied_probability(away_decimal)
+        
+        self.home_odds_win_prob.setText(f"Odds: {home_odds_prob}%")
+        self.away_odds_win_prob.setText(f"Odds: {away_odds_prob}%")
                 
         # Find H2H data
         h2h_data = None
