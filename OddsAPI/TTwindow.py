@@ -1053,7 +1053,7 @@ class TableTennisGUI(QMainWindow):
         self.details_layout.addWidget(self.h2h_group)
         
         # Win probability chart
-        self.prob_group = QGroupBox("Win Probability")
+        self.prob_group = QGroupBox("H2H results")
         prob_layout = QHBoxLayout(self.prob_group)
         
         self.home_prob = QLabel("Home: 50%")
@@ -1636,7 +1636,12 @@ class TableTennisGUI(QMainWindow):
                 except:
                     pass
         
-        # Connect table click for set scores
+        # Connect table click for set scores (disconnect first to avoid multiple connections)
+        try:
+            self.h2h_table.cellClicked.disconnect(self.handle_h2h_cell_click)
+        except TypeError:
+            # No connection exists yet, which is fine
+            pass
         self.h2h_table.cellClicked.connect(self.handle_h2h_cell_click)
         
         # Update H2H summary
