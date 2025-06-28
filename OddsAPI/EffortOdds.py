@@ -1,8 +1,9 @@
 import pathlib
 from datetime import datetime, timezone
 import aiohttp
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon,QFont
+import json
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPointF, pyqtProperty
+from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -20,7 +21,9 @@ from GUIbestlineswidget import *
 from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
 from effortcalculator import OddsConverterWidget
-
+import feedparser
+import traceback
+  # Use SUPER_KEY since ODDS_API_KEY is commented out
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
 # League market configurations
@@ -45,6 +48,646 @@ class ColoredTableItem(QTableWidgetItem):
     def __init__(self, text, game_id):
         super().__init__(text)
         self.game_id = game_id
+
+
+class TickerTape(QWidget):
+    """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
+    
+    def __init__(self, parent=None, transition_style="flip_card"):
+        super().__init__(parent)
+        
+        # Smooth scrolling properties - keep it simple!
+        self._scroll_position = -0.5  
+        self.scroll_speed = 2.0
+        self.is_paused = False
+        
+        # Transition style: "flip_card" or "split_reveal"
+        self.transition_style = transition_style
+        self.is_transitioning = False
+        self.transition_progress = 0.0  # 0.0 to 1.0
+        
+        # ESPN-style sport segments - start with loading state
+        self.sports_data = {
+            "LOADING": {
+                "color": QColor("#2C3E50"),  # Dark blue-gray
+                "accent": QColor("#3498DB"),  # Light blue
+                "icon": "⏳",
+                "games": ["Loading live sports data..."]
+            }
+        }
+        
+        # Current display state
+        self.current_sport_index = 0
+        self.current_game_index = 0
+        self.current_text = ""
+        self.segment_width = 120  # Width of sport segment
+        
+        # Fonts - Professional broadcast-style fonts, bigger and more imposing
+        self.sport_font = QFont("Arial Black", 14, QFont.Weight.ExtraBold)
+        self.game_font = QFont("Arial", 13, QFont.Weight.Bold)
+        
+        # Fallback to Segoe UI if Arial not available
+        if not self.sport_font.exactMatch():
+            self.sport_font = QFont("Segoe UI", 14, QFont.Weight.ExtraBold)
+            self.game_font = QFont("Segoe UI", 13, QFont.Weight.Bold)
+        
+        # Additional font settings for crisp, clean appearance
+        self.sport_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        self.game_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        self.sport_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        self.game_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        
+        # Simple animation timer - 60fps is plenty
+        self.animation_timer = QTimer()
+        self.animation_timer.timeout.connect(self.advance_animation)
+        self.animation_timer.start(16)  # 60fps smooth scrolling
+        
+        # Transition animation
+        self.transition_animation = QPropertyAnimation(self, b"transition_progress")
+        self.transition_animation.setDuration(300)  # 300ms transition
+        self.transition_animation.finished.connect(self.on_transition_finished)
+        
+        # Widget properties - increased height for larger fonts
+        self.setMinimumHeight(55)
+        self.setMaximumHeight(55)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+        
+        # Initialize content and start position
+        self.update_current_text()
+        self._scroll_position = self.width() if self.width() > 0 else 800
+        
+        # Cache text width to avoid recalculating every frame
+        self.cached_text_width = 0
+        self.update_text_width()
+        
+        # Store previous sport info for transitions
+        self.previous_sport_index = 0
+        self._transition_progress = 0.0
+        
+        # Live data functionality
+        self.cache_file = pathlib.Path(__file__).parent / "ticker_cache.json"
+        self.data_loaded = False
+        
+        # Schedule live data loading after UI is ready
+        QTimer.singleShot(5000, self.load_live_data)
+        
+    @pyqtProperty(float)
+    def scroll_position(self):
+        return self._scroll_position
+        
+    @scroll_position.setter  
+    def scroll_position(self, value):
+        self._scroll_position = value
+        self.update()
+        
+    @pyqtProperty(float)
+    def transition_progress(self):
+        return self._transition_progress
+        
+    @transition_progress.setter
+    def transition_progress(self, value):
+        self._transition_progress = value
+        self.update()
+        
+    def reset_scroll_position(self):
+        """Reset scroll position to start from the right edge"""
+        self._scroll_position = self.width()
+        
+    def update_current_text(self):
+        """Update the current text to display"""
+        sports = list(self.sports_data.keys())
+        sport = sports[self.current_sport_index]
+        games = self.sports_data[sport]["games"]
+        
+        if games:
+            game = games[self.current_game_index % len(games)]
+            self.current_text = f"{sport}: {game}"
+        else:
+            self.current_text = f"{sport}: No games available"
+            
+        # Update cached width when text changes
+        self.update_text_width()
+        
+    def update_text_width(self):
+        """Cache the text width to avoid calculating it every frame"""
+        font_metrics = QFontMetrics(self.game_font)
+        self.cached_text_width = font_metrics.horizontalAdvance(self.current_text)
+            
+    def rotate_content(self):
+        """Rotate through different sports and games"""
+        sports = list(self.sports_data.keys())
+        sport = sports[self.current_sport_index]
+        games = self.sports_data[sport]["games"]
+        
+        self.current_game_index += 1
+        if self.current_game_index >= len(games):
+            self.current_game_index = 0
+            # Store previous sport index for transition
+            self.previous_sport_index = self.current_sport_index
+            self.current_sport_index = (self.current_sport_index + 1) % len(sports)
+            
+            # Start transition animation if sport changed
+            self.start_transition()
+        else:
+            # Just update text for same sport
+            self.update_current_text()
+            
+    def start_transition(self):
+        """Start the sport segment transition animation"""
+        if not self.is_transitioning:
+            self.is_transitioning = True
+            self.transition_animation.setStartValue(0.0)
+            self.transition_animation.setEndValue(1.0)
+            self.transition_animation.start()
+            
+    def on_transition_finished(self):
+        """Called when transition animation completes"""
+        self.is_transitioning = False
+        self._transition_progress = 0.0
+        self.update_current_text()
+            
+    def advance_animation(self):
+        """Scroll and rotate content when text disappears under sport segment"""
+        if not self.is_paused and self.current_text:
+            self._scroll_position -= self.scroll_speed
+            
+            # When text disappears under sport segment, rotate to next content
+            if self._scroll_position < -(self.cached_text_width + self.segment_width + 20):
+                self.rotate_content()  # Move to next content
+                self._scroll_position = self.width()  # Reset position
+                
+            self.update()
+            
+    def get_current_sport_info(self):
+        """Get current sport color information"""
+        sports = list(self.sports_data.keys())
+        sport = sports[self.current_sport_index]
+        return self.sports_data[sport]
+        
+    def paintEvent(self, event):
+        """Paint the ESPN-style ticker with smooth animations"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        
+        rect = self.rect()
+        sport_info = self.get_current_sport_info()
+        
+        # Draw sophisticated background with sport-specific colors
+        self.draw_background(painter, rect, sport_info)
+        
+        # Draw scrolling game content FIRST (underneath everything)
+        self.draw_scrolling_content(painter, rect, sport_info)
+        
+        # Draw sport segment OVER the scrolling text (like an overlay)
+        self.draw_sport_segment(painter, rect, sport_info)
+        
+        # Draw accent elements and effects on top
+        self.draw_accent_effects(painter, rect, sport_info)
+        
+    def draw_background(self, painter, rect, sport_info):
+        """Draw gradient background with sport colors"""
+        gradient = QLinearGradient(0, 0, rect.width(), 0)
+        
+        # Sport color on the left fading to dark
+        gradient.setColorAt(0, sport_info["color"])
+        gradient.setColorAt(0.3, sport_info["color"].darker(150))
+        gradient.setColorAt(0.6, QColor("#2C3E50"))
+        gradient.setColorAt(1, QColor("#34495E"))
+        
+        painter.fillRect(rect, gradient)
+        
+        # Add subtle radial glow effect
+        glow_gradient = QRadialGradient(self.segment_width/2, rect.height()/2, self.segment_width)
+        glow_gradient.setColorAt(0, QColor(sport_info["accent"].red(), sport_info["accent"].green(), 
+                                          sport_info["accent"].blue(), 30))
+        glow_gradient.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.fillRect(0, 0, self.segment_width * 2, rect.height(), glow_gradient)
+        
+    def draw_sport_segment(self, painter, rect, sport_info):
+        """Draw the sport category segment with transition animations"""
+        if self.is_transitioning:
+            if self.transition_style == "flip_card":
+                self.draw_flip_card_transition(painter, rect)
+            elif self.transition_style == "split_reveal":
+                self.draw_split_reveal_transition(painter, rect)
+        else:
+            self.draw_normal_segment(painter, rect, sport_info)
+            
+    def draw_normal_segment(self, painter, rect, sport_info):
+        """Draw normal sport segment without transitions"""
+        # Create angular shape for sport segment
+        sport_path = QPainterPath()
+        sport_path.moveTo(0, 0)
+        sport_path.lineTo(self.segment_width - 15, 0)
+        sport_path.lineTo(self.segment_width, rect.height())
+        sport_path.lineTo(0, rect.height())
+        sport_path.closeSubpath()
+        
+        painter.fillPath(sport_path, sport_info["color"])
+        
+        # Sport segment border
+        painter.setPen(QPen(sport_info["accent"], 2))
+        painter.drawPath(sport_path)
+        
+        # Draw sport icon and text
+        self.draw_sport_text(painter, rect, sport_info)
+        
+    def draw_sport_text(self, painter, rect, sport_info):
+        """Draw sport icon and text with shadow"""
+        painter.setFont(self.sport_font)
+        
+        sports = list(self.sports_data.keys())
+        sport_name = sports[self.current_sport_index]
+        icon = sport_info["icon"]
+        
+        # Center the text in the segment
+        text_rect = QRectF(5, 0, self.segment_width - 20, rect.height())
+        shadow_rect = QRectF(6, 1, self.segment_width - 20, rect.height())
+        
+        # Draw text shadow
+        painter.setPen(QColor("#000000"))
+        painter.drawText(shadow_rect, Qt.AlignmentFlag.AlignCenter, f"{icon} {sport_name}")
+        
+        # Draw main text
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, f"{icon} {sport_name}")
+        
+    def draw_flip_card_transition(self, painter, rect):
+        """ESPN-style flip card transition"""
+        painter.save()
+        
+        # Calculate flip angle (0 to 180 degrees)
+        angle = self._transition_progress * 180
+        
+        # Get sport info for old and new sports
+        sports = list(self.sports_data.keys())
+        old_sport_info = self.sports_data[sports[self.previous_sport_index]]
+        new_sport_info = self.sports_data[sports[self.current_sport_index]]
+        
+        # Transform for 3D flip effect
+        center_x = self.segment_width / 2
+        center_y = rect.height() / 2
+        
+        painter.translate(center_x, center_y)
+        
+        if angle <= 90:
+            # First half: show old sport with scaling
+            scale_x = abs(1.0 - (angle / 90.0))
+            painter.scale(scale_x, 1.0)
+            painter.translate(-center_x, -center_y)
+            self.draw_normal_segment(painter, rect, old_sport_info)
+        else:
+            # Second half: show new sport with scaling
+            scale_x = abs((angle - 90) / 90.0)
+            painter.scale(scale_x, 1.0)
+            painter.translate(-center_x, -center_y)
+            self.draw_normal_segment(painter, rect, new_sport_info)
+            
+        painter.restore()
+        
+    def draw_split_reveal_transition(self, painter, rect):
+        """Split reveal transition - segment splits and new one grows from center"""
+        painter.save()
+        
+        sports = list(self.sports_data.keys())
+        old_sport_info = self.sports_data[sports[self.previous_sport_index]]
+        new_sport_info = self.sports_data[sports[self.current_sport_index]]
+        
+        progress = self._transition_progress
+        
+        if progress <= 0.5:
+            # First half: split the old segment
+            split_progress = progress * 2  # 0 to 1
+            split_height = rect.height() * split_progress / 2
+            
+            # Draw top half of old segment
+            painter.setClipRect(0, 0, self.segment_width, rect.height()/2 - split_height)
+            self.draw_normal_segment(painter, rect, old_sport_info)
+            
+            # Draw bottom half of old segment
+            painter.setClipRect(0, rect.height()/2 + split_height, self.segment_width, rect.height())
+            self.draw_normal_segment(painter, rect, old_sport_info)
+        else:
+            # Second half: grow new segment from center
+            grow_progress = (progress - 0.5) * 2  # 0 to 1
+            grow_height = rect.height() * grow_progress
+            
+            center_y = rect.height() / 2
+            clip_top = center_y - grow_height / 2
+            
+            painter.setClipRect(0, clip_top, self.segment_width, grow_height)
+            self.draw_normal_segment(painter, rect, new_sport_info)
+            
+        painter.restore()
+        
+    def draw_scrolling_content(self, painter, rect, sport_info):
+        """Simple scrolling text - no complications"""
+        painter.setFont(self.game_font)
+        
+        # Just draw the text at the current scroll position
+        y_baseline = rect.height() / 2 + 4
+        
+        # Draw text shadow
+        painter.setPen(QColor("#000000"))
+        painter.drawText(QPointF(self._scroll_position + 1, y_baseline + 1), self.current_text)
+        
+        # Draw main text
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(QPointF(self._scroll_position, y_baseline), self.current_text)
+        
+    def draw_accent_effects(self, painter, rect, sport_info):
+        """Draw accent lines and effects"""
+        # Top accent line
+        top_gradient = QLinearGradient(0, 0, rect.width(), 0)
+        top_gradient.setColorAt(0, sport_info["accent"])
+        top_gradient.setColorAt(0.7, sport_info["accent"].darker(200))
+        top_gradient.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        painter.fillRect(0, 0, rect.width(), 3, top_gradient)
+        
+        # Bottom accent line  
+        bottom_gradient = QLinearGradient(0, rect.height()-3, rect.width(), rect.height()-3)
+        bottom_gradient.setColorAt(0, sport_info["accent"])
+        bottom_gradient.setColorAt(0.7, sport_info["accent"].darker(200))
+        bottom_gradient.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        painter.fillRect(0, rect.height()-3, rect.width(), 3, bottom_gradient)
+        
+    def enterEvent(self, event):
+        """Pause animations on hover"""
+        self.is_paused = True
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+    def leaveEvent(self, event):
+        """Resume animations"""
+        self.is_paused = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+    def update_sports_data(self, new_data):
+        """Update the sports data with real odds information"""
+        if new_data:
+            self.sports_data.update(new_data)
+            self.update_current_text()
+            
+    def resizeEvent(self, event):
+        """Handle window resize to keep ticker responsive"""
+        super().resizeEvent(event)
+        # Reset position if we're off-screen after resize
+        if self._scroll_position > self.width():
+            self._scroll_position = self.width()
+    
+    def should_refresh_cache(self):
+        """Check if cached data is stale (older than 1 day)"""
+        if not self.cache_file.exists():
+            return True
+        
+        try:
+            with open(self.cache_file, 'r') as f:
+                cached_data = json.load(f)
+            
+            cached_date = cached_data.get('date', '')
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            return cached_date != today
+        except Exception as e:
+            print(f"Error reading cache: {e}")
+            return True
+    
+    def load_cached_data(self):
+        """Load cached ticker data if available"""
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r') as f:
+                    cached_data = json.load(f)
+                
+                if 'sports_data' in cached_data:
+                    print("Loading cached ticker data...")
+                    self.sports_data = cached_data['sports_data']
+                    self.update_current_text()
+                    return True
+        except Exception as e:
+            print(f"Error loading cached data: {e}")
+        
+        return False
+    
+    def save_cached_data(self, sports_data):
+        """Save ticker data to cache"""
+        try:
+            cache_data = {
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'sports_data': sports_data
+            }
+            
+            with open(self.cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            print("Ticker data cached successfully")
+        except Exception as e:
+            print(f"Error saving cache: {e}")
+    
+    async def odds_for_tt(self):
+        """Fetch live odds for in-season sports using existing API infrastructure"""
+        try:
+            # Currently handling MLB since it's the only sport in season
+            # When other sports come into season, this can be extended
+            async with aiohttp.ClientSession() as session:
+                odds_data = await odds_query(
+                    "baseball_mlb", 
+                    "us", 
+                    "h2h,totals", 
+                    "american", 
+                    "iso", 
+                    session
+                )
+                
+                if not odds_data:
+                    return []
+                
+                formatted_games = []
+                for game in odds_data[:6]:  # Limit to 6 games
+                    home_team = game.get('home_team', 'Home')
+                    away_team = game.get('away_team', 'Away')
+                    
+                    # Find the best moneyline and total odds
+                    best_moneyline = None
+                    best_total = None
+                    
+                    # Track best moneyline for each team
+                    best_ml_lines = {
+                        home_team: {'price': None},
+                        away_team: {'price': None}
+                    }
+                    
+                    for bookmaker in game.get('bookmakers', []):
+                        for market in bookmaker.get('markets', []):
+                            if market['key'] == 'h2h':  # moneyline market
+                                for outcome in market['outcomes']:
+                                    team = outcome['name']
+                                    price = outcome.get('price', 0)
+                                    
+                                    # Update best moneyline for the team if this is better (higher odds = better)
+                                    if team in best_ml_lines:
+                                        if best_ml_lines[team]['price'] is None or price > best_ml_lines[team]['price']:
+                                            best_ml_lines[team]['price'] = price
+                            
+                            elif market['key'] == 'totals' and not best_total:
+                                for outcome in market['outcomes']:
+                                    if outcome['name'] == 'Over':
+                                        best_total = outcome.get('point', '')
+                                        break
+                    
+                    # Format both teams' moneyline odds
+                    away_ml = best_ml_lines[away_team]['price']
+                    home_ml = best_ml_lines[home_team]['price']
+                    
+                    # Format away team with odds
+                    if away_ml is not None:
+                        if away_ml > 0:
+                            away_display = f"{away_team} (+{away_ml})"
+                        else:
+                            away_display = f"{away_team} ({away_ml})"
+                    else:
+                        away_display = away_team
+                    
+                    # Format home team with odds
+                    if home_ml is not None:
+                        if home_ml > 0:
+                            home_display = f"{home_team} (+{home_ml})"
+                        else:
+                            home_display = f"{home_team} ({home_ml})"
+                    else:
+                        home_display = home_team
+                    
+                    # Format the game line with both teams' moneylines and total
+                    if best_total:
+                        game_line = f"{away_display} vs {home_display} • O/U {best_total}"
+                    else:
+                        game_line = f"{away_display} vs {home_display}"
+                    
+                    formatted_games.append(game_line)
+                
+                return formatted_games
+                
+        except Exception as e:
+            print(f"Error fetching live odds for ticker: {e}")
+            return []
+    
+    async def fetch_news_headlines(self, league_key):
+        """Fetch news headlines for off-season leagues"""
+        try:
+            
+            
+            # RSS feeds for each league
+            rss_urls = {
+                "basketball_nba": "https://www.espn.com/espn/rss/nba/news",
+                "football_nfl": "https://www.espn.com/espn/rss/nfl/news",
+                "icehockey_nhl": "https://www.espn.com/espn/rss/nhl/news"
+            }
+            
+            url = rss_urls.get(league_key)
+            if not url:
+                return []
+            
+            feed = feedparser.parse(url)
+            headlines = []
+            
+            for entry in feed.entries[:4]:  # Limit to 4 headlines
+                title = entry.title
+                # No character limit - display full headlines
+                headlines.append(f"📰 {title}")
+            
+            return headlines
+            
+        except Exception as e:
+            print(f"Error fetching {league_key} news: {e}")
+            return []
+    
+    async def fetch_live_data_async(self):
+        """Fetch live data for all sports"""
+        try:
+            new_sports_data = {}
+            
+            # Fetch live odds for in-season sports (currently MLB)
+            in_season_games = await self.odds_for_tt()
+            if in_season_games:
+                new_sports_data["MLB"] = {
+                    "color": QColor("#132448"),
+                    "accent": QColor("#BF0D3E"),
+                    "icon": "⚾",
+                    "games": in_season_games
+                }
+            
+            # Off-season leagues - fetch news headlines
+            off_season_leagues = [
+                ("basketball_nba", "NBA", QColor("#C8102E"), QColor("#1D428A"), "🏀"),
+                ("football_nfl", "NFL", QColor("#013369"), QColor("#D50A0A"), "🏈"),
+                ("icehockey_nhl", "NHL", QColor("#000000"), QColor("#F99923"), "🏒")
+            ]
+            
+            for league_key, league_name, color, accent, icon in off_season_leagues:
+                headlines = await self.fetch_news_headlines(league_key)
+                if headlines:
+                    new_sports_data[league_name] = {
+                        "color": color,
+                        "accent": accent,
+                        "icon": icon,
+                        "games": headlines
+                    }
+            
+            return new_sports_data
+            
+        except Exception as e:
+            print(f"Error fetching live data: {e}")
+            return {}
+    
+    def load_live_data(self):
+        """Load live data with caching logic"""
+        if self.data_loaded:
+            return
+        
+        print("Loading ticker tape data...")
+        
+        # Try to load cached data first
+        if not self.should_refresh_cache():
+            if self.load_cached_data():
+                self.data_loaded = True
+                return
+        
+        # Fetch fresh data asynchronously
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Schedule the async data fetch
+        QTimer.singleShot(0, lambda: asyncio.ensure_future(self._fetch_and_update_data()))
+    
+    async def _fetch_and_update_data(self):
+        """Helper method to fetch and update data"""
+        try:
+            new_data = await self.fetch_live_data_async()
+            
+            if new_data:
+                # Replace loading state with real data
+                self.sports_data = new_data
+                self.update_current_text()
+                
+                # Save to cache
+                self.save_cached_data(new_data)
+                
+                print(f"Updated ticker with live data for {len(new_data)} sports")
+            else:
+                print("No live data fetched, keeping loading state")
+            
+            self.data_loaded = True
+            
+        except Exception as e:
+            print(f"Error in _fetch_and_update_data: {e}")
+            self.data_loaded = True  # Prevent repeated attempts
 
 
 
@@ -415,10 +1058,17 @@ class ModernOddsWindow(QMainWindow):
         
         self.layout.addLayout(league_layout)
         
-        # --------- REGION SECTION ---------
-        # Region selection checkboxes
+        # --------- REGION AND TICKER SECTION ---------
+        # Create horizontal layout for region selection and ticker tape
+        region_ticker_layout = QHBoxLayout()
+        
+        # Left side: Region selection
+        region_section = QWidget()
+        region_section_layout = QVBoxLayout(region_section)
+        region_section_layout.setContentsMargins(0, 0, 0, 0)
+        
         region_label = QLabel("Select Region:")
-        self.layout.addWidget(region_label)
+        region_section_layout.addWidget(region_label)
         
         region_container = QWidget()
         region_layout = QGridLayout(region_container)
@@ -438,7 +1088,41 @@ class ModernOddsWindow(QMainWindow):
         
         region_container.setFixedHeight(58)
         region_container.setFixedWidth(200)
-        self.layout.addWidget(region_container)
+        region_section_layout.addWidget(region_container)
+        region_section.setFixedWidth(220)
+        
+        region_ticker_layout.addWidget(region_section)
+        
+        # Add vertical separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        separator.setStyleSheet("""
+            QFrame {
+                color: #34495E;
+                background-color: #34495E;
+                border: none;
+            }
+        """)
+        separator.setFixedWidth(2)
+        region_ticker_layout.addWidget(separator)
+        
+        # Add some spacing after separator
+        region_ticker_layout.addSpacing(15)
+        
+        # Right side: Ticker tape
+        ticker_section = QWidget()
+        ticker_section_layout = QVBoxLayout(ticker_section)
+        ticker_section_layout.setContentsMargins(0, 0, 0, 0)
+        
+        
+        # Choose transition style: "flip_card" or "split_reveal"
+        self.ticker_tape = TickerTape(transition_style="flip_card")
+        ticker_section_layout.addWidget(self.ticker_tape)
+        
+        region_ticker_layout.addWidget(ticker_section, 1)  # Give ticker section stretch
+        
+        self.layout.addLayout(region_ticker_layout)
         
         # --------- MARKET AND STREAMING SECTION ---------
         # This is where the key change happens - we put the streaming widget in the same row as the market buttons
@@ -1108,7 +1792,7 @@ class ModernOddsWindow(QMainWindow):
                 QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
         except Exception as e:
             print(f"Error refreshing splits data: {e}")
-            import traceback
+            
             traceback.print_exc()
             self.splits_refresh_button.setText("✗") 
             QTimer.singleShot(1500, lambda: self.splits_refresh_button.setText("↻"))
@@ -1507,7 +2191,7 @@ class ModernOddsWindow(QMainWindow):
                         print("Best lines widget updated successfully")
                     except Exception as e:
                         print(f"Error updating best lines widget: {e}")
-                        import traceback
+                        
                         traceback.print_exc()
                 else:
                     print("Best lines widget not available")
@@ -1535,7 +2219,7 @@ class ModernOddsWindow(QMainWindow):
             print(f"Error: {e}")
             self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
             self.update_status.setText("An error occurred")
-            import traceback
+            
             traceback.print_exc()
         finally:
             self.fetch_odds_button.setEnabled(True)
