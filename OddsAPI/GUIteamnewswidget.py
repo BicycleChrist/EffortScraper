@@ -50,6 +50,7 @@ class NewsWorker(QObject):
         self.team_name = None
         self.running = False
         self.news_items = None
+        self.news_by_league = {}  # Store headlines by league for ticker tape
         self.print_fetches = False
         self.scraper = FantasyProsScraper()
         print(f"[NewsWorker] printing_fetches: {self.print_fetches}")
@@ -147,11 +148,13 @@ class NewsWorker(QObject):
         news_items.sort(key=lambda x: x['date'], reverse=True)
         return news_items
 
-    async def fetch_rss_feed(self, url):
-        """Fetch and parse an RSS feed"""
+    async def fetch_rss_feed_with_session(self, session, url):
+        """Fetch and parse an RSS feed using provided session"""
         if self.print_fetches: print(f"fetching rss feed: {url}");
         try:
-            feed = feedparser.parse(url)
+            async with session.get(url) as response:
+                content = await response.text()
+                feed = feedparser.parse(content)
             
             # Check if feed parsed correctly
             if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
@@ -224,37 +227,48 @@ class NewsWorker(QObject):
             return []
 
     async def fetch_news(self):
-        """Fetch news from all configured sources"""
+        """Fetch news from all configured sources with connection pooling"""
         try:
-            if not self.league_key:
-                self.error_occurred.emit("No league selected")
-                return
-
+            import aiohttp
+            
+            # Fetch news for all 4 sports leagues for ticker tape
+            all_leagues = ["basketball_nba", "football_nfl", "baseball_mlb", "icehockey_nhl"]
             sources = []
+            
+            # Add RSS feeds for all leagues
+            for league in all_leagues:
+                league_feeds = self.rss_urls.get(league, {})
+                if league_feeds:
+                    sources.extend(league_feeds.get('general', []))
 
-            # Add RSS feeds for the current league
-            league_feeds = self.rss_urls.get(self.league_key, {})
-            if league_feeds:
-                # Add general feeds for the league
-                sources.extend(league_feeds.get('general', []))
-
-                # Add team-specific feeds if a team is selected
-                if self.team_name and self.team_name in league_feeds.get('teams', {}):
+            # If we have a specific league_key set, also add team-specific feeds for that league
+            if self.league_key:
+                league_feeds = self.rss_urls.get(self.league_key, {})
+                if league_feeds and self.team_name and self.team_name in league_feeds.get('teams', {}):
                     sources.extend(league_feeds['teams'][self.team_name])
 
-            # Fetch from all RSS sources in parallel
-            tasks = [self.fetch_rss_feed(url) for url in sources]
+            # Use single session for all requests - much faster!
+            timeout = aiohttp.ClientTimeout(total=2)  # Reduced to 2 seconds
+            connector = aiohttp.TCPConnector(limit=50, limit_per_host=10)  # Connection pooling
             
-            # Add FantasyPros scraping task
-            tasks.append(self.fetch_fantasypros_news())
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                # Fetch from all RSS sources in parallel
+                tasks = [self.fetch_rss_feed_with_session(session, url) for url in sources]
+                
+                # Add FantasyPros scraping task
+                tasks.append(self.fetch_fantasypros_news())
 
-            # Execute all tasks
-            results = await asyncio.gather(*tasks)
+                # Execute all tasks with faster concurrency
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Combine and sort all news items
+            # Combine and sort all news items (handle exceptions)
             all_news = []
             for result in results:
-                all_news.extend(result)
+                if isinstance(result, Exception):
+                    print(f"News fetch error: {result}")
+                    continue
+                if isinstance(result, list):
+                    all_news.extend(result)
 
             # Filter by team name if specified
             if self.team_name:
@@ -276,6 +290,7 @@ class NewsWorker(QObject):
             # Apply injury news prioritization (but keep date sorting)
             all_news = self.prioritize_injury_news(all_news)
             self.news_items = all_news
+            
             
             # Emit the signal with results
             self.news_fetched.emit(all_news)

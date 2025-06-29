@@ -56,6 +56,7 @@ class TickerTape(QWidget):
     def __init__(self, parent=None, transition_style="flip_card", news_widget=None):
         super().__init__(parent)
         self.news_widget = news_widget
+        self.loading_attempted = False
         
         # Smooth scrolling properties - keep it simple!
         self._scroll_position = -0.5  
@@ -67,13 +68,19 @@ class TickerTape(QWidget):
         self.is_transitioning = False
         self.transition_progress = 0.0  # 0.0 to 1.0
         
-        # ESPN-style sport segments - start with static loading display
+        # Loading animation state
+        self.loading_animation_frame = 0
+        self.loading_animation_timer = QTimer()
+        self.loading_animation_timer.timeout.connect(self.update_loading_animation)
+        self.loading_animation_timer.start(200)  # Update every 200ms
+        
+        # ESPN-style sport segments - start with animated loading display
         self.sports_data = {
-            "LOADING": {
+            "": {  # Empty key = no text, just spinning globe
                 "color": QColor("#2C3E50"),  # Dark blue-gray
                 "accent": QColor("#3498DB"),  # Light blue
-                "icon": "⏳",
-                "games": ["Gathering live sports data..."]
+                "icon": self.get_loading_globe_icon(),
+                "games": [self.get_loading_animation_text()]
             }
         }
         
@@ -161,9 +168,9 @@ class TickerTape(QWidget):
         
         if games:
             game = games[self.current_game_index % len(games)]
-            self.current_text = f"{sport}: {game}"
+            self.current_text = game  # Remove sport prefix since league segment shows it
         else:
-            self.current_text = f"{sport}: No games available"
+            self.current_text = "No games available"
             
         # Update cached width when text changes
         self.update_text_width()
@@ -453,54 +460,230 @@ class TickerTape(QWidget):
         headlines = []
         news_items = worker.news_items
         
-        # Limit to 4 headlines and prioritize injury news
+        # Get more headlines and prioritize injury news
         sorted_news = sorted(news_items, 
                            key=lambda x: (x.get('injury_score', 0), x.get('date', datetime.min)), 
                            reverse=True)
         
-        for item in sorted_news[:4]:
+        # Take more headlines for cycling through leagues
+        for item in sorted_news[:20]:  # Increased from 4 to 20
             title = item.get('title', '')
             if not title:
                 continue
-                
-            # Add injury indicator for injury news (score >= 2)
-            if item.get('injury_score', 0) >= 2:
-                headlines.append(f"🚨 {title}")
-            else:
-                headlines.append(f"📰 {title}")
+            
+            # Clean up "None:" prefix that comes from RSS feeds
+            if title.startswith("None: "):
+                title = title[6:]  # Remove "None: " (6 characters)
+            
+            # Add cleaned title
+            headlines.append(title)
         
         return headlines
     
-    def load_live_data(self):
-        """Load headlines from existing NewsWidget"""
+    def get_loading_animation_text(self):
+        """Generate animated loading text"""
+        # Create a sleek progress bar animation
+        bar_length = 8
+        filled_char = "■"
+        empty_char = "□"
+        
+        # Create moving progress bar
+        position = self.loading_animation_frame % (bar_length * 2)
+        if position < bar_length:
+            # Moving forward
+            filled_count = position + 1
+        else:
+            # Moving backward
+            filled_count = bar_length - (position - bar_length) - 1
+        
+        filled_count = max(0, min(bar_length, filled_count))
+        empty_count = bar_length - filled_count
+        
+        progress_bar = filled_char * filled_count + empty_char * empty_count
+        return f"Loading sports news {progress_bar}"
+    
+    def get_loading_globe_icon(self):
+        """Generate spinning globe icon for sport segment"""
+        # Spinning globe animation frames
+        globe_frames = ["🌍", "🌎", "🌏", "🌎"]  # Earth rotating through different views
+        current_frame = self.loading_animation_frame % len(globe_frames)
+        return globe_frames[current_frame]
+    
+    def update_loading_animation(self):
+        """Update the loading animation frame"""
+        if "" in self.sports_data:  # Empty key for loading state
+            self.loading_animation_frame += 1
+            self.sports_data[""]["games"] = [self.get_loading_animation_text()]
+            self.sports_data[""]["icon"] = self.get_loading_globe_icon()  # Update spinning globe
+            self.update_current_text()
+            self.update()  # Trigger repaint
+    
+    def stop_loading_animation(self):
+        """Stop the loading animation when real data loads"""
+        if hasattr(self, 'loading_animation_timer'):
+            self.loading_animation_timer.stop()
+    
+    def on_news_ready(self, news_items):
+        """Called when NewsWorker finishes fetching news"""
         if self.data_loaded:
             return
+            
+        print("NewsWorker finished - loading ticker headlines...")
+        headlines = self.get_headlines_from_news_widget()
         
+        if headlines:
+            self.populate_ticker_with_headlines(headlines)
+    
+    def load_live_data(self):
+        """Load headlines from existing NewsWidget"""
+        if self.data_loaded or self.loading_attempted:
+            return
+        
+        self.loading_attempted = True
         print("Loading ticker tape news headlines...")
         
-        # Get headlines from existing NewsWidget
+        # Try to get headlines immediately
         headlines = self.get_headlines_from_news_widget()
         
         if headlines:
             self.populate_ticker_with_headlines(headlines)
         else:
-            # If no headlines yet, try again in a bit
-            QTimer.singleShot(2000, self.load_live_data)
+            # If no headlines yet, wait for NewsWorker signal
+            print("Waiting for NewsWorker to finish...")
+    
+    def categorize_headline_by_content(self, headline):
+        """Advanced headline categorization using multiple signals"""
+        headline_lower = headline.lower()
+        
+        # Advanced filtering patterns with weighted scoring
+        league_signals = {
+            "NBA": {
+                "league_names": ["nba", "basketball"],  # 8 points each
+                "terminology": ["three-pointer", "dunk", "playoffs", "draft", "trade deadline", "salary cap", "g league", "all-star"], # 6 points each
+                "positions": ["point guard", "center", "forward", "guard"], # 4 points each
+                "mega_stars": ["lebron", "curry", "durant", "giannis"], # 4 points each
+                "cities": ["los angeles", "boston", "miami", "chicago", "new york"], # 4 points each
+                "venues": ["madison square garden", "staples center", "td garden"] # 3 points each
+            },
+            "NFL": {
+                "league_names": ["nfl", "football"],
+                "terminology": ["touchdown", "quarterback", "draft pick", "free agency", "super bowl", "combine", "pro bowl"],
+                "positions": ["quarterback", "running back", "wide receiver", "linebacker", "defensive back"],
+                "mega_stars": ["mahomes", "brady", "rodgers", "josh allen"],
+                "cities": ["green bay", "dallas", "kansas city", "buffalo", "tampa bay"],
+                "venues": ["lambeau field", "arrowhead stadium", "gillette stadium"]
+            },
+            "MLB": {
+                "league_names": ["mlb", "baseball"],
+                "terminology": ["home run", "rbi", "batting average", "era", "world series", "spring training", "all-star game"],
+                "positions": ["pitcher", "catcher", "shortstop", "outfielder", "first base"],
+                "mega_stars": ["ohtani", "judge", "trout", "soto"],
+                "cities": ["new york", "los angeles", "boston", "chicago", "houston"],
+                "venues": ["yankee stadium", "fenway park", "dodger stadium"]
+            },
+            "NHL": {
+                "league_names": ["nhl", "hockey"],
+                "terminology": ["goal", "assist", "power play", "stanley cup", "playoffs", "trade deadline"],
+                "positions": ["goalie", "defenseman", "winger", "center"],
+                "mega_stars": ["mcdavid", "ovechkin", "pastrnak"],
+                "cities": ["boston", "toronto", "montreal", "chicago", "detroit"],
+                "venues": ["madison square garden", "td garden", "united center"]
+            }
+        }
+        
+        best_league = None
+        best_score = 0
+        
+        # Score each league using multiple signals
+        for league, signals in league_signals.items():
+            score = 0
+            
+            # League names (8 points each)
+            for term in signals["league_names"]:
+                if term in headline_lower:
+                    score += 8
+            
+            # Sport-specific terminology (6 points each)
+            for term in signals["terminology"]:
+                if term in headline_lower:
+                    score += 6
+            
+            # Position names (4 points each)
+            for term in signals["positions"]:
+                if term in headline_lower:
+                    score += 4
+            
+            # Mega stars only (4 points each)
+            for star in signals["mega_stars"]:
+                if star in headline_lower:
+                    score += 4
+            
+            # City names (4 points each)
+            for city in signals["cities"]:
+                if city in headline_lower:
+                    score += 4
+            
+            # Venues (3 points each)
+            for venue in signals["venues"]:
+                if venue in headline_lower:
+                    score += 3
+            
+            # Team names from existing method (10 points each - highest weight)
+            if self.news_widget and hasattr(self.news_widget, 'get_teams_for_league'):
+                league_key = f"{league.lower().replace('nhl', 'icehockey_nhl').replace('nba', 'basketball_nba').replace('nfl', 'football_nfl').replace('mlb', 'baseball_mlb')}"
+                if league == "NBA":
+                    league_key = "basketball_nba"
+                elif league == "NFL":
+                    league_key = "football_nfl"
+                elif league == "MLB":
+                    league_key = "baseball_mlb"
+                elif league == "NHL":
+                    league_key = "icehockey_nhl"
+                    
+                teams = self.news_widget.get_teams_for_league(league_key)
+                for team in teams:
+                    if team.lower() in headline_lower:
+                        score += 10
+            
+            if score > best_score:
+                best_score = score
+                best_league = league
+        
+        return best_league if best_score > 0 else "MLB"  # Default to MLB
     
     def populate_ticker_with_headlines(self, headlines):
-        """Populate ticker with provided headlines"""
-        new_sports_data = {}
+        """Populate ticker with headlines properly categorized by content"""
+        # League configurations
+        league_configs = {
+            "MLB": (QColor("#132448"), QColor("#BF0D3E"), "⚾"),
+            "NBA": (QColor("#C8102E"), QColor("#1D428A"), "🏀"),
+            "NFL": (QColor("#013369"), QColor("#D50A0A"), "🏈"),
+            "NHL": (QColor("#000000"), QColor("#F99923"), "🏒")
+        }
         
-        # For now, put all headlines under a general "NEWS" category
-        if headlines:
-            new_sports_data["NEWS"] = {
-                "color": QColor("#2C3E50"),
-                "accent": QColor("#3498DB"),
-                "icon": "📰",
-                "games": headlines
-            }
+        # Categorize headlines by content
+        categorized_headlines = {league: [] for league in league_configs.keys()}
+        
+        for headline in headlines:
+            league = self.categorize_headline_by_content(headline)
+            categorized_headlines[league].append(headline)
+        
+        # Build sports data only for leagues that have headlines
+        new_sports_data = {}
+        for league_name, (color, accent, icon) in league_configs.items():
+            league_headlines = categorized_headlines[league_name]
+            if league_headlines:
+                new_sports_data[league_name] = {
+                    "color": color,
+                    "accent": accent,
+                    "icon": icon,
+                    "games": league_headlines
+                }
         
         if new_sports_data:
+            # Stop loading animation
+            self.stop_loading_animation()
+            
             # Replace loading state with real data
             self.sports_data = new_sports_data
             self.update_current_text()
@@ -509,7 +692,8 @@ class TickerTape(QWidget):
             if not self.animation_timer.isActive():
                 self.animation_timer.start(16)  # 60fps smooth scrolling
             
-            print(f"Updated ticker with {len(headlines)} headlines")
+            total_headlines = sum(len(headlines) for headlines in categorized_headlines.values())
+            print(f"Updated ticker with {total_headlines} headlines across {len(new_sports_data)} leagues")
             self.data_loaded = True
 
 
@@ -1026,6 +1210,10 @@ class ModernOddsWindow(QMainWindow):
         
         # Set the news widget reference for the ticker tape
         self.ticker_tape.news_widget = self.team_news_widget
+        
+        # Connect to NewsWorker signal to avoid polling
+        if hasattr(self.team_news_widget, 'worker'):
+            self.team_news_widget.worker.news_fetched.connect(self.ticker_tape.on_news_ready)
         
         # Create news container and add the team news widget
         self.news_container = QWidget()
