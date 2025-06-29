@@ -3,8 +3,10 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, pyqtPropert
 from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 from PyQt6.QtCore import QRectF, QPointF
+from livetape_scraper import scrape_espn_scores
+import threading
 
-
+#TODO: get live quarter/inning data along side the scores
 class TickerTape(QWidget):
     """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
     
@@ -90,8 +92,8 @@ class TickerTape(QWidget):
         # Live data functionality
         self.data_loaded = False
         
-        # Schedule live data loading after UI is ready
-        QTimer.singleShot(5000, self.load_live_data)
+        # Load scores immediately, no delays
+        QTimer.singleShot(500, self.load_live_scores)  # Load scores very fast
         
     @pyqtProperty(float)
     def scroll_position(self):
@@ -412,7 +414,7 @@ class TickerTape(QWidget):
                            reverse=True)
         
         # Take more headlines for cycling through leagues
-        for item in sorted_news[:5]:  # Increased from 4 to 20
+        for item in sorted_news[:10]:  # Set headline number
             title = item.get('title', '')
             if not title:
                 continue
@@ -470,32 +472,100 @@ class TickerTape(QWidget):
             self.loading_animation_timer.stop()
     
     def on_news_ready(self, news_items):
-        """Called when NewsWorker finishes fetching news"""
-        if self.data_loaded:
-            return
-            
-        print("NewsWorker finished - loading ticker headlines...")
-        headlines = self.get_headlines_from_news_widget()
-        
-        if headlines:
-            self.populate_ticker_with_headlines(headlines)
+        """Called when NewsWorker finishes fetching news - DISABLED"""
+        pass  # No longer automatically load headlines
     
+    def load_live_scores(self):
+        """Load MLB scores in background thread (non-blocking)"""
+        print("Loading live MLB scores...")
+        
+        def fetch_scores_background():
+            try:
+                scores = scrape_espn_scores()
+                if scores:
+                    # Convert scores to ticker format
+                    score_items = []
+                    for game in scores:
+                        away_team = game['away_team']
+                        home_team = game['home_team']
+                        away_runs = game['away_score']['runs']
+                        home_runs = game['home_score']['runs']
+                        inning = game.get('inning', 'Unknown')
+                        
+                        # Format score display
+                        if inning == 'Final':
+                            score_text = f"{away_team} {away_runs}, {home_team} {home_runs} - Final"
+                        elif inning == 'Pre-Game':
+                            score_text = f"{away_team} vs {home_team} - Starting Soon"
+                        else:
+                            score_text = f"{away_team} {away_runs}, {home_team} {home_runs} - {inning}"
+                        
+                        score_items.append(score_text)
+                    
+                    # Store the data and signal main thread
+                    self.pending_scores = score_items
+                    # Use metaObject().invokeMethod for thread-safe Qt calls
+                    QTimer.singleShot(0, self.process_pending_scores)
+                    print(f"Loaded {len(score_items)} MLB games")
+                else:
+                    print("No MLB games found")
+            except Exception as e:
+                print(f"Error loading scores: {e}")
+        
+        # Run in background thread
+        threading.Thread(target=fetch_scores_background, daemon=True).start()
+    
+    def process_pending_scores(self):
+        """Process scores on main thread"""
+        if hasattr(self, 'pending_scores'):
+            self.add_scores_to_ticker(self.pending_scores)
+            delattr(self, 'pending_scores')
+    
+    def add_scores_to_ticker(self, score_items):
+        """Add live scores to ticker data (runs on main thread)"""
+        if score_items:
+            print(f"Adding {len(score_items)} scores to ticker...")
+            
+            # Remove loading animation data first
+            if "" in self.sports_data:
+                del self.sports_data[""]
+            
+            # Add MLB scores at the beginning
+            mlb_config = {
+                "color": QColor("#132448"),
+                "accent": QColor("#BF0D3E"),
+                "icon": "⚾",
+                "games": score_items
+            }
+            
+            # Always prioritize scores - create new sports data with MLB first
+            new_sports_data = {"MLB": mlb_config}
+            
+            # Add any existing non-MLB sports after
+            for sport, data in self.sports_data.items():
+                if sport != "MLB" and sport != "":
+                    new_sports_data[sport] = data
+            
+            self.sports_data = new_sports_data
+            
+            # Reset to show MLB scores first
+            self.current_sport_index = 0
+            self.current_game_index = 0
+            
+            # Stop loading animation and start ticker
+            self.stop_loading_animation()
+            if not self.animation_timer.isActive():
+                self.animation_timer.start(16)
+            self.data_loaded = True
+            
+            self.update_current_text()
+            print(f"✓ Live scores added - MLB first with {len(score_items)} games")
+            print(f"Current sports: {list(self.sports_data.keys())}")
+            print(f"Current text: {self.current_text[:50]}...")
+
     def load_live_data(self):
-        """Load headlines from existing NewsWidget"""
-        if self.data_loaded or self.loading_attempted:
-            return
-        
-        self.loading_attempted = True
-        print("Loading ticker tape news headlines...")
-        
-        # Try to get headlines immediately
-        headlines = self.get_headlines_from_news_widget()
-        
-        if headlines:
-            self.populate_ticker_with_headlines(headlines)
-        else:
-            # If no headlines yet, wait for NewsWorker signal
-            print("Waiting for NewsWorker to finish...")
+        """Load headlines from existing NewsWidget - REMOVED, scores only"""
+        pass  # No longer needed - just show live scores
     
     def categorize_headline_by_content(self, headline):
         """Advanced headline categorization using multiple signals"""
@@ -614,30 +684,51 @@ class TickerTape(QWidget):
             league = self.categorize_headline_by_content(headline)
             categorized_headlines[league].append(headline)
         
-        # Build sports data only for leagues that have headlines
+        # Build sports data, preserving existing live scores and maintaining order
         new_sports_data = {}
+        
+        # First, preserve ALL existing data in order (especially live scores)
+        for existing_league, existing_data in self.sports_data.items():
+            if existing_league != "":  # Skip loading animation
+                new_sports_data[existing_league] = existing_data.copy()
+        
+        # Then merge in headlines for matching leagues
         for league_name, (color, accent, icon) in league_configs.items():
             league_headlines = categorized_headlines[league_name]
+            
             if league_headlines:
-                new_sports_data[league_name] = {
-                    "color": color,
-                    "accent": accent,
-                    "icon": icon,
-                    "games": league_headlines
-                }
+                if league_name in new_sports_data:
+                    # Add headlines to existing league data (scores already there)
+                    existing_games = new_sports_data[league_name]["games"]
+                    new_sports_data[league_name]["games"] = existing_games + league_headlines
+                    print(f"Merged {len(league_headlines)} headlines with existing {league_name} data")
+                else:
+                    # Create new league with just headlines
+                    new_sports_data[league_name] = {
+                        "color": color,
+                        "accent": accent,
+                        "icon": icon,
+                        "games": league_headlines
+                    }
         
         if new_sports_data:
-            # Stop loading animation
-            self.stop_loading_animation()
+            print(f"Before headline merge - current sports: {list(self.sports_data.keys())}")
+            print(f"After headline merge - new sports: {list(new_sports_data.keys())}")
             
-            # Replace loading state with real data
+            # Update with merged data
             self.sports_data = new_sports_data
             self.update_current_text()
             
-            # Start animation timer now that data is loaded
+            # Start animation timer if not already running
             if not self.animation_timer.isActive():
                 self.animation_timer.start(16)  # 60fps smooth scrolling
             
             total_headlines = sum(len(headlines) for headlines in categorized_headlines.values())
-            print(f"Updated ticker with {total_headlines} headlines across {len(new_sports_data)} leagues")
-            self.data_loaded = True
+            print(f"✓ Headlines merged - {total_headlines} headlines across {len(new_sports_data)} leagues")
+            print(f"Final sports order: {list(self.sports_data.keys())}")
+            
+            # Check if MLB still has scores
+            if "MLB" in self.sports_data:
+                mlb_games = self.sports_data["MLB"]["games"]
+                score_count = sum(1 for game in mlb_games if " - " in game and ("Final" in game or "vs" in game or any(inning in game for inning in ["Top", "Bot", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th"])))
+                print(f"MLB has {len(mlb_games)} total items, {score_count} appear to be scores")

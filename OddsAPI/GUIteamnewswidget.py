@@ -61,7 +61,6 @@ class NewsWorker(QObject):
                 "general": [
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
-                    "https://sports.yahoo.com/nba/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ],
             },
@@ -72,29 +71,24 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
                     "https://www.cbssports.com/rss/headlines/nfl",
-                    "https://sports.yahoo.com/nfl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl"
                 ]
             },
             # MLB
             "baseball_mlb": {
-                "general": [
-                    "https://www.mlb.com/feeds/news/rss.xml",
+                "general":[
                     "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
                     "https://www.cbssports.com/rss/headlines/mlb/",
-                    "https://sports.yahoo.com/mlb/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb"
                 ]
             },
             # NHL
             "icehockey_nhl": {
                 "general": [
-                    "http://www.nhl.com/rss/news.xml",
                     "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
                     "https://www.cbssports.com/rss/headlines/nhl/injuries",
-                    "https://sports.yahoo.com/nhl/rss.xml",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
                 ]
             }
