@@ -2,7 +2,7 @@ import pathlib
 from datetime import datetime, timezone
 import aiohttp
 import json
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPointF, pyqtProperty
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPointF, pyqtProperty, QThread
 from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
@@ -53,8 +53,9 @@ class ColoredTableItem(QTableWidgetItem):
 class TickerTape(QWidget):
     """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
     
-    def __init__(self, parent=None, transition_style="flip_card"):
+    def __init__(self, parent=None, transition_style="flip_card", news_widget=None):
         super().__init__(parent)
+        self.news_widget = news_widget
         
         # Smooth scrolling properties - keep it simple!
         self._scroll_position = -0.5  
@@ -66,13 +67,13 @@ class TickerTape(QWidget):
         self.is_transitioning = False
         self.transition_progress = 0.0  # 0.0 to 1.0
         
-        # ESPN-style sport segments - start with loading state
+        # ESPN-style sport segments - start with static loading display
         self.sports_data = {
             "LOADING": {
                 "color": QColor("#2C3E50"),  # Dark blue-gray
                 "accent": QColor("#3498DB"),  # Light blue
                 "icon": "⏳",
-                "games": ["Loading live sports data..."]
+                "games": ["Gathering live sports data..."]
             }
         }
         
@@ -97,10 +98,9 @@ class TickerTape(QWidget):
         self.sport_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         self.game_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         
-        # Simple animation timer - 60fps is plenty
+        # Animation timer - don't start until data is loaded
         self.animation_timer = QTimer()
         self.animation_timer.timeout.connect(self.advance_animation)
-        self.animation_timer.start(16)  # 60fps smooth scrolling
         
         # Transition animation
         self.transition_animation = QPropertyAnimation(self, b"transition_progress")
@@ -126,7 +126,6 @@ class TickerTape(QWidget):
         self._transition_progress = 0.0
         
         # Live data functionality
-        self.cache_file = pathlib.Path(__file__).parent / "ticker_cache.json"
         self.data_loaded = False
         
         # Schedule live data loading after UI is ready
@@ -439,255 +438,79 @@ class TickerTape(QWidget):
         if self._scroll_position > self.width():
             self._scroll_position = self.width()
     
-    def should_refresh_cache(self):
-        """Check if cached data is stale (older than 1 day)"""
-        if not self.cache_file.exists():
-            return True
-        
-        try:
-            with open(self.cache_file, 'r') as f:
-                cached_data = json.load(f)
-            
-            cached_date = cached_data.get('date', '')
-            today = datetime.now().strftime('%Y-%m-%d')
-            
-            return cached_date != today
-        except Exception as e:
-            print(f"Error reading cache: {e}")
-            return True
     
-    def load_cached_data(self):
-        """Load cached ticker data if available"""
-        try:
-            if self.cache_file.exists():
-                with open(self.cache_file, 'r') as f:
-                    cached_data = json.load(f)
-                
-                if 'sports_data' in cached_data:
-                    print("Loading cached ticker data...")
-                    self.sports_data = cached_data['sports_data']
-                    self.update_current_text()
-                    return True
-        except Exception as e:
-            print(f"Error loading cached data: {e}")
-        
-        return False
     
-    def save_cached_data(self, sports_data):
-        """Save ticker data to cache"""
-        try:
-            cache_data = {
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'sports_data': sports_data
-            }
-            
-            with open(self.cache_file, 'w') as f:
-                json.dump(cache_data, f, indent=2)
-            
-            print("Ticker data cached successfully")
-        except Exception as e:
-            print(f"Error saving cache: {e}")
-    
-    async def odds_for_tt(self):
-        """Fetch live odds for in-season sports using existing API infrastructure"""
-        try:
-            # Currently handling MLB since it's the only sport in season
-            # When other sports come into season, this can be extended
-            async with aiohttp.ClientSession() as session:
-                odds_data = await odds_query(
-                    "baseball_mlb", 
-                    "us", 
-                    "h2h,totals", 
-                    "american", 
-                    "iso", 
-                    session
-                )
-                
-                if not odds_data:
-                    return []
-                
-                formatted_games = []
-                for game in odds_data[:6]:  # Limit to 6 games
-                    home_team = game.get('home_team', 'Home')
-                    away_team = game.get('away_team', 'Away')
-                    
-                    # Find the best moneyline and total odds
-                    best_moneyline = None
-                    best_total = None
-                    
-                    # Track best moneyline for each team
-                    best_ml_lines = {
-                        home_team: {'price': None},
-                        away_team: {'price': None}
-                    }
-                    
-                    for bookmaker in game.get('bookmakers', []):
-                        for market in bookmaker.get('markets', []):
-                            if market['key'] == 'h2h':  # moneyline market
-                                for outcome in market['outcomes']:
-                                    team = outcome['name']
-                                    price = outcome.get('price', 0)
-                                    
-                                    # Update best moneyline for the team if this is better (higher odds = better)
-                                    if team in best_ml_lines:
-                                        if best_ml_lines[team]['price'] is None or price > best_ml_lines[team]['price']:
-                                            best_ml_lines[team]['price'] = price
-                            
-                            elif market['key'] == 'totals' and not best_total:
-                                for outcome in market['outcomes']:
-                                    if outcome['name'] == 'Over':
-                                        best_total = outcome.get('point', '')
-                                        break
-                    
-                    # Format both teams' moneyline odds
-                    away_ml = best_ml_lines[away_team]['price']
-                    home_ml = best_ml_lines[home_team]['price']
-                    
-                    # Format away team with odds
-                    if away_ml is not None:
-                        if away_ml > 0:
-                            away_display = f"{away_team} (+{away_ml})"
-                        else:
-                            away_display = f"{away_team} ({away_ml})"
-                    else:
-                        away_display = away_team
-                    
-                    # Format home team with odds
-                    if home_ml is not None:
-                        if home_ml > 0:
-                            home_display = f"{home_team} (+{home_ml})"
-                        else:
-                            home_display = f"{home_team} ({home_ml})"
-                    else:
-                        home_display = home_team
-                    
-                    # Format the game line with both teams' moneylines and total
-                    if best_total:
-                        game_line = f"{away_display} vs {home_display} • O/U {best_total}"
-                    else:
-                        game_line = f"{away_display} vs {home_display}"
-                    
-                    formatted_games.append(game_line)
-                
-                return formatted_games
-                
-        except Exception as e:
-            print(f"Error fetching live odds for ticker: {e}")
+    def get_headlines_from_news_widget(self):
+        """Get existing headlines from the NewsWidget that's already running"""
+        if not self.news_widget or not hasattr(self.news_widget, 'worker'):
             return []
-    
-    async def fetch_news_headlines(self, league_key):
-        """Fetch news headlines for off-season leagues"""
-        try:
-            
-            
-            # RSS feeds for each league
-            rss_urls = {
-                "basketball_nba": "https://www.espn.com/espn/rss/nba/news",
-                "football_nfl": "https://www.espn.com/espn/rss/nfl/news",
-                "icehockey_nhl": "https://www.espn.com/espn/rss/nhl/news"
-            }
-            
-            url = rss_urls.get(league_key)
-            if not url:
-                return []
-            
-            feed = feedparser.parse(url)
-            headlines = []
-            
-            for entry in feed.entries[:4]:  # Limit to 4 headlines
-                title = entry.title
-                # No character limit - display full headlines
+        
+        # Access the worker's news_items
+        worker = self.news_widget.worker
+        if not hasattr(worker, 'news_items') or not worker.news_items:
+            return []
+        
+        headlines = []
+        news_items = worker.news_items
+        
+        # Limit to 4 headlines and prioritize injury news
+        sorted_news = sorted(news_items, 
+                           key=lambda x: (x.get('injury_score', 0), x.get('date', datetime.min)), 
+                           reverse=True)
+        
+        for item in sorted_news[:4]:
+            title = item.get('title', '')
+            if not title:
+                continue
+                
+            # Add injury indicator for injury news (score >= 2)
+            if item.get('injury_score', 0) >= 2:
+                headlines.append(f"🚨 {title}")
+            else:
                 headlines.append(f"📰 {title}")
-            
-            return headlines
-            
-        except Exception as e:
-            print(f"Error fetching {league_key} news: {e}")
-            return []
-    
-    async def fetch_live_data_async(self):
-        """Fetch live data for all sports"""
-        try:
-            new_sports_data = {}
-            
-            # Fetch live odds for in-season sports (currently MLB)
-            in_season_games = await self.odds_for_tt()
-            if in_season_games:
-                new_sports_data["MLB"] = {
-                    "color": QColor("#132448"),
-                    "accent": QColor("#BF0D3E"),
-                    "icon": "⚾",
-                    "games": in_season_games
-                }
-            
-            # Off-season leagues - fetch news headlines
-            off_season_leagues = [
-                ("basketball_nba", "NBA", QColor("#C8102E"), QColor("#1D428A"), "🏀"),
-                ("football_nfl", "NFL", QColor("#013369"), QColor("#D50A0A"), "🏈"),
-                ("icehockey_nhl", "NHL", QColor("#000000"), QColor("#F99923"), "🏒")
-            ]
-            
-            for league_key, league_name, color, accent, icon in off_season_leagues:
-                headlines = await self.fetch_news_headlines(league_key)
-                if headlines:
-                    new_sports_data[league_name] = {
-                        "color": color,
-                        "accent": accent,
-                        "icon": icon,
-                        "games": headlines
-                    }
-            
-            return new_sports_data
-            
-        except Exception as e:
-            print(f"Error fetching live data: {e}")
-            return {}
+        
+        return headlines
     
     def load_live_data(self):
-        """Load live data with caching logic"""
+        """Load headlines from existing NewsWidget"""
         if self.data_loaded:
             return
         
-        print("Loading ticker tape data...")
+        print("Loading ticker tape news headlines...")
         
-        # Try to load cached data first
-        if not self.should_refresh_cache():
-            if self.load_cached_data():
-                self.data_loaded = True
-                return
+        # Get headlines from existing NewsWidget
+        headlines = self.get_headlines_from_news_widget()
         
-        # Fetch fresh data asynchronously
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        # Schedule the async data fetch
-        QTimer.singleShot(0, lambda: asyncio.ensure_future(self._fetch_and_update_data()))
+        if headlines:
+            self.populate_ticker_with_headlines(headlines)
+        else:
+            # If no headlines yet, try again in a bit
+            QTimer.singleShot(2000, self.load_live_data)
     
-    async def _fetch_and_update_data(self):
-        """Helper method to fetch and update data"""
-        try:
-            new_data = await self.fetch_live_data_async()
+    def populate_ticker_with_headlines(self, headlines):
+        """Populate ticker with provided headlines"""
+        new_sports_data = {}
+        
+        # For now, put all headlines under a general "NEWS" category
+        if headlines:
+            new_sports_data["NEWS"] = {
+                "color": QColor("#2C3E50"),
+                "accent": QColor("#3498DB"),
+                "icon": "📰",
+                "games": headlines
+            }
+        
+        if new_sports_data:
+            # Replace loading state with real data
+            self.sports_data = new_sports_data
+            self.update_current_text()
             
-            if new_data:
-                # Replace loading state with real data
-                self.sports_data = new_data
-                self.update_current_text()
-                
-                # Save to cache
-                self.save_cached_data(new_data)
-                
-                print(f"Updated ticker with live data for {len(new_data)} sports")
-            else:
-                print("No live data fetched, keeping loading state")
+            # Start animation timer now that data is loaded
+            if not self.animation_timer.isActive():
+                self.animation_timer.start(16)  # 60fps smooth scrolling
             
+            print(f"Updated ticker with {len(headlines)} headlines")
             self.data_loaded = True
-            
-        except Exception as e:
-            print(f"Error in _fetch_and_update_data: {e}")
-            self.data_loaded = True  # Prevent repeated attempts
 
 
 
@@ -1200,6 +1023,9 @@ class ModernOddsWindow(QMainWindow):
         self.team_news_widget = TeamNewsWidget()
         self.team_news_widget.setVisible(False)  # Hidden by default
         self.team_news_widget.setFixedWidth(650)  # Fixed width
+        
+        # Set the news widget reference for the ticker tape
+        self.ticker_tape.news_widget = self.team_news_widget
         
         # Create news container and add the team news widget
         self.news_container = QWidget()
@@ -2447,7 +2273,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main(), debug=True)
-    except KeyboardInterrupt:
-        pass
+    
+    asyncio.run(main(), debug=True)
