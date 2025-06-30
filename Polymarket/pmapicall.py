@@ -6,9 +6,73 @@ from py_clob_client.client import ClobClient
 from mmKEY import pmkey
 import pathlib
 import requests
+import base64
 
 from datetime import datetime
+
+def get_market_volume_single(token_id):
+    """Fetch volume data for a single token_id from Gamma API"""
+    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+    try:
+        print(f"Fetching volume for token: {token_id}")
+        response = requests.get(url)
+        print(f"Response status: {response.status_code}")
+        response.raise_for_status()
+        data = response.json()
+        print(f"Response data length: {len(data) if data else 0}")
+        
+        if data and len(data) > 0:
+            market_data = data[0]
+            volume_data = {
+                'volume': market_data.get('volume', 0),
+                'volume_24hr': market_data.get('volume24hr', 0),
+                'liquidity': market_data.get('liquidity', 0),
+                'volume_formatted': market_data.get('volumeNum', 0)
+            }
+            print(f"Volume data for {token_id}: {volume_data}")
+            return volume_data
+        else:
+            print(f"No data returned for token {token_id}")
+    except requests.RequestException as e:
+        print(f"REQUEST ERROR for token {token_id}: {e}")
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"PARSING ERROR for token {token_id}: {e}")
+    except Exception as e:
+        print(f"UNEXPECTED ERROR for token {token_id}: {e}")
+    
+    print(f"Returning zeros for token {token_id}")
+    return {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0}
+
+def get_market_volume_batch(token_ids):
+    """Fetch volume data for multiple token_ids using parallel requests"""
+    import concurrent.futures
+    import threading
+    
+    if not token_ids:
+        return {}
+    
+    volume_map = {}
+    
+    # Use ThreadPoolExecutor for parallel requests
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Submit all requests
+        future_to_token = {executor.submit(get_market_volume_single, token_id): token_id for token_id in token_ids}
+        
+        # Collect results
+        for future in concurrent.futures.as_completed(future_to_token):
+            token_id = future_to_token[future]
+            try:
+                volume_data = future.result()
+                volume_map[token_id] = volume_data
+            except Exception as exc:
+                print(f"Token {token_id} generated an exception: {exc}")
+                volume_map[token_id] = {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0}
+    
+    return volume_map
+
 def GetCurrentTimestamp(): return datetime.now().timestamp()
+
+
 def DateFromTimestamp(timestamp: int) -> str: return datetime.fromtimestamp(timestamp).date().isoformat()
 
 TIMESERIES_DIR = pathlib.Path.cwd() / "timeseries_cache"
@@ -17,6 +81,21 @@ TIMESERIES_CACHE = None
 
 # counting how many markets needed to be fetched
 CACHE_MISS_COUNT = 0
+
+# cursor persistence for recent_only queries
+CURSOR_FILE = pathlib.Path.cwd() / "last_cursor.txt"
+
+def SaveLastCursor(cursor: str):
+    """Save the last cursor to file for persistence across runs"""
+    with open(CURSOR_FILE, 'w') as f:
+        f.write(cursor)
+
+def LoadLastCursor():
+    """Load the last saved cursor from file"""
+    if CURSOR_FILE.exists():
+        with open(CURSOR_FILE, 'r') as f:
+            return f.read().strip()
+    return None
 
 # Polymarket CLOB API host
 host = "https://clob.polymarket.com"
@@ -88,11 +167,23 @@ def GetOrderbook(token_ids:list):
 # KDE's regex engine seems to be bugged and '\s' (whitespace) doesn't include newline, which is why '[ \t\n\r]' is used instead
 # not all markets have "All" tag? and occasionally "tags" is null (test markets)
 
-def FetchMarkets(next_cursor=None):
+def FetchMarkets(next_cursor=None, recent_only=True):
     # Initialize variables for pagination
     markets_list = []
     limit = 10
     i = 0
+    last_valid_cursor = None
+    
+    # If recent_only is True, use saved cursor or default to high cursor number
+    if recent_only and next_cursor is None:
+        saved_cursor = LoadLastCursor()
+        if saved_cursor:
+            next_cursor = saved_cursor
+            print(f"Resuming from saved cursor: {next_cursor}")
+        else:
+            next_cursor = 'NjM1MDA='
+            print("Starting from default recent markets cursor")
+    
     # Fetch all available markets using pagination
     #while i < limit:
     while True:
@@ -107,9 +198,16 @@ def FetchMarkets(next_cursor=None):
                 break
             
             markets_list.extend(response['data'])
+            last_valid_cursor = next_cursor  # Save current cursor before getting next one
             next_cursor = response.get("next_cursor")
             
             if not next_cursor:
+                break
+            
+            # Stop before LTE= endmarker as it's not a valid cursor
+            if next_cursor.startswith('LTE='):
+                print(f"Reached endmarker cursor {next_cursor}, stopping pagination")
+                next_cursor = None
                 break
         except Exception as e:
             print(f"Exception occurred: {e}")
@@ -117,6 +215,12 @@ def FetchMarkets(next_cursor=None):
             print(f"Error message: {e.args}")
             break
         i += 1
+    
+    # Save the last valid cursor if we got one and recent_only is True
+    if recent_only and last_valid_cursor:
+        SaveLastCursor(last_valid_cursor)
+        print(f"Saved last valid cursor: {last_valid_cursor}")
+    
     return markets_list
 
 
@@ -132,11 +236,50 @@ def FilterData(markets) -> list[dict]:
         { field: market[field] for field in wanted_fields }
         for market in markets
     ]
+    
+    # Collect all token IDs for batch volume request
+    all_token_ids = []
     for market in filtered_data:
         market["lines"] = [ token['outcome'] + ': ' + str(token['price']*100) + '%' for token in market["tokens"] ]
         market["token_ids"] = [token['token_id'] for token in market['tokens']]
+        all_token_ids.extend(market["token_ids"])
+    
+    print(f"Fetching volume data for {len(all_token_ids)} tokens in batch...")
+    # Single batch request for all token volumes
+    volume_map = get_market_volume_batch(all_token_ids)
+    
+    print("Processing volume data for markets...")
+    print(f"Volume map keys: {list(volume_map.keys())[:5]}...")  # Show first 5 keys
+    
+    for i, market in enumerate(filtered_data):
+        # Get volume data for each token from the batch result
+        volume_data = []
+        total_volume = 0
+        total_volume_24hr = 0
+        total_liquidity = 0
+        
+        print(f"Processing market {i}: {market['question'][:50]}...")
+        print(f"Market token_ids: {market['token_ids']}")
+        
+        for token_id in market["token_ids"]:
+            print(f"Looking up token_id: {token_id}")
+            print(f"Token in volume_map: {token_id in volume_map}")
+            vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
+            print(f"Vol data for {token_id}: {vol_data}")
+            volume_data.append(vol_data)
+            total_volume += float(vol_data['volume']) if vol_data['volume'] else 0
+            total_volume_24hr += float(vol_data['volume_24hr']) if vol_data['volume_24hr'] else 0
+            total_liquidity += float(vol_data['liquidity']) if vol_data['liquidity'] else 0
+        
+        # Add volume fields to market data
+        market["volume_data"] = volume_data
+        market["total_volume"] = total_volume
+        market["total_volume_24hr"] = total_volume_24hr
+        market["total_liquidity"] = total_liquidity
+        
         if market["tags"] is None: market["tags"] = []; # ensure 'tags' is always a list (handling case where it was null in JSON)
         del market["tokens"]
+    
     return filtered_data
 
 def WriteJsonDump(data: list[dict], filename="PMdump"):
@@ -204,8 +347,8 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-def fetch_and_process_markets():
-    markets_list = FetchMarkets()
+def fetch_and_process_markets(recent_only=True):
+    markets_list = FetchMarkets(recent_only=recent_only)
     filtered_data = FilterData(markets_list)
     WriteJsonDump(filtered_data)
     WriteJsonDump(markets_list, "PMdump_all")
@@ -263,26 +406,26 @@ def GetAllTags(markets:list[dict]):
 if __name__ == "__main__":
     markets = LoadJsonDump()
     GetAllTags(markets)
-    # print(markets)
-    # fetch_and_process_markets()
+    print(markets)
+    fetch_and_process_markets()
     
-    # markets_list = FetchMarkets()
-    # filtered = FilterData(markets_list)
+    markets_list = FetchMarkets()
+    filtered = FilterData(markets_list)
     # Debugging step: Print out the raw data
-    #print("Raw Market Data:")
-    #print(json.dumps(markets_list, indent=2))
-    # print(json.dumps(filtered, indent=2))
-    # WriteJsonDump(filtered)
-    
+    print("Raw Market Data:")
+    print(json.dumps(markets_list, indent=2))
+    print(json.dumps(filtered, indent=2))
+    WriteJsonDump(filtered)
+
     # market["active"] is always True?? Even when it's closed.
-    # print(f"\n\n returned {len(markets_list)} markets \n")
-    # open_markets = [market for market in markets_list if ((market["active"] is True) and (not market["closed"]))]
-    # print(f"#open_markets: {len(open_markets)}")
-    # print("\n\n")
-    # pprint([market["market_slug"] for market in open_markets])
+    print(f"\n\n returned {len(markets_list)} markets \n")
+    open_markets = [market for market in markets_list if ((market["active"] is True) and (not market["closed"]))]
+    print(f"#open_markets: {len(open_markets)}")
+    print("\n\n")
+    pprint([market["market_slug"] for market in open_markets])
     
-    # GenerateHTML(filtered)
-    # SaveToCSV(filtered, "all")
+    GenerateHTML(filtered)
+    SaveToCSV(filtered, "all")
 
 
 
