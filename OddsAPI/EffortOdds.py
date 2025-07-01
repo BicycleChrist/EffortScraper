@@ -22,6 +22,8 @@ from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
 from effortcalculator import OddsConverterWidget
 from tickertape import TickerTape
+from polymarketquery import fetch_and_process_markets
+from prediction_markets_worker import PredictionMarketsWorker
 import feedparser
 import traceback
   # Use SUPER_KEY since ODDS_API_KEY is commented out
@@ -480,6 +482,14 @@ class ModernOddsWindow(QMainWindow):
         # Choose transition style: "flip_card" or "split_reveal"
         self.ticker_tape = TickerTape(transition_style="flip_card")
         ticker_section_layout.addWidget(self.ticker_tape)
+        
+        # Initialize prediction markets worker for ticker
+        self.prediction_markets_worker = PredictionMarketsWorker()
+        self.prediction_markets_worker.data_ready.connect(self.ticker_tape.add_prediction_markets)
+        self.prediction_markets_worker.error_occurred.connect(self.handle_prediction_markets_error)
+        self.prediction_markets_worker.status_update.connect(self.handle_prediction_markets_status)
+        # Start the worker to begin fetching prediction market data
+        self.prediction_markets_worker.start()
         
         region_ticker_layout.addWidget(ticker_section, 1)  # Give ticker section stretch
         
@@ -1795,6 +1805,20 @@ class ModernOddsWindow(QMainWindow):
         self.calc_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.calc_window.show()
     
+    def handle_prediction_markets_error(self, error_message):
+        """Handle errors from prediction markets worker"""
+        print(f"Prediction markets error: {error_message}")
+    
+    def handle_prediction_markets_status(self, status_message):
+        """Handle status updates from prediction markets worker"""
+        print(f"Prediction markets status: {status_message}")
+    
+    def closeEvent(self, event):
+        """Clean up when the application is closing"""
+        # Stop the prediction markets worker
+        if hasattr(self, 'prediction_markets_worker'):
+            self.prediction_markets_worker.stop()
+        event.accept()
 
 
     
