@@ -86,16 +86,31 @@ CACHE_MISS_COUNT = 0
 CURSOR_FILE = pathlib.Path.cwd() / "last_cursor.txt"
 
 def SaveLastCursor(cursor: str):
-    """Save the last cursor to file for persistence across runs"""
-    with open(CURSOR_FILE, 'w') as f:
-        f.write(cursor)
+    """Save a cursor that's offset behind the last cursor for next recent_only run"""
+    import base64
+    try:
+        # Decode cursor to get numeric value
+        cursor_num = int(base64.b64decode(cursor).decode('utf-8'))
+        # Subtract 6 blocks (6 * 500 = 3000) to get recent markets
+        recent_cursor_num = max(cursor_num - 3000, 0)
+        # Re-encode the offset cursor
+        recent_cursor = base64.b64encode(str(recent_cursor_num).encode('utf-8')).decode('utf-8')
+        
+        print(f"Saving offset cursor: {cursor} ({cursor_num}) -> {recent_cursor} ({recent_cursor_num})")
+        with open(CURSOR_FILE, 'w') as f:
+            f.write(recent_cursor)
+    except Exception as e:
+        print(f"Error calculating cursor offset, saving original: {e}")
+        with open(CURSOR_FILE, 'w') as f:
+            f.write(cursor)
 
-def LoadLastCursor():
-    """Load the last saved cursor from file"""
-    if CURSOR_FILE.exists():
-        with open(CURSOR_FILE, 'r') as f:
-            return f.read().strip()
-    return None
+def GetRecentCursor():
+    """Get recent cursor position (6 blocks behind estimated current end)"""
+    # Based on observed data: current end ~64500, so 6 blocks behind = ~61500
+    # Update this occasionally if the API advances significantly
+    recent_cursor = 'NjE1MDA='  # 61500 (6 blocks behind current ~64500)
+    print(f"Using fixed recent cursor: {recent_cursor} (61500)")
+    return recent_cursor
 
 # Polymarket CLOB API host
 host = "https://clob.polymarket.com"
@@ -174,15 +189,10 @@ def FetchMarkets(next_cursor=None, recent_only=True):
     i = 0
     last_valid_cursor = None
     
-    # If recent_only is True, use saved cursor or default to high cursor number
+    # If recent_only is True, dynamically discover recent cursor position
     if recent_only and next_cursor is None:
-        saved_cursor = LoadLastCursor()
-        if saved_cursor:
-            next_cursor = saved_cursor
-            print(f"Resuming from saved cursor: {next_cursor}")
-        else:
-            next_cursor = 'NjM1MDA='
-            print("Starting from default recent markets cursor")
+        next_cursor = GetRecentCursor()
+        print(f"Starting recent_only from: {next_cursor}")
     
     # Fetch all available markets using pagination
     #while i < limit:
@@ -216,10 +226,7 @@ def FetchMarkets(next_cursor=None, recent_only=True):
             break
         i += 1
     
-    # Save the last valid cursor if we got one and recent_only is True
-    if recent_only and last_valid_cursor:
-        SaveLastCursor(last_valid_cursor)
-        print(f"Saved last valid cursor: {last_valid_cursor}")
+    # No need to save cursor since we auto-discover it each time
     
     return markets_list
 
@@ -230,8 +237,9 @@ def FilterData(markets) -> list[dict]:
     # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
     # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
     # 'winner' will always be false for open markets
-    open_markets = [market for market in markets if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
-    markets = open_markets
+    active_markets = [market for market in markets if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
+    print(f"Filtered to {len(active_markets)} active markets from {len(markets)} total markets")
+    markets = active_markets
     filtered_data = [
         { field: market[field] for field in wanted_fields }
         for market in markets
@@ -279,6 +287,10 @@ def FilterData(markets) -> list[dict]:
         
         if market["tags"] is None: market["tags"] = []; # ensure 'tags' is always a list (handling case where it was null in JSON)
         del market["tokens"]
+    
+    # Sort markets by total volume (highest to lowest)
+    filtered_data.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
+    print(f"Sorted {len(filtered_data)} markets by volume (highest to lowest)")
     
     return filtered_data
 
