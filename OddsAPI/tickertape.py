@@ -3,7 +3,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, pyqtPropert
 from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 from PyQt6.QtCore import QRectF, QPointF
-from livetape_scraper import scrape_espn_scores
+from livetape_scraper import scrape_espn_scores 
 import threading
 
 #TODO: get live quarter/inning data along side the scores
@@ -138,13 +138,21 @@ class TickerTape(QWidget):
         self.cached_text_width = font_metrics.horizontalAdvance(self.current_text)
             
     def rotate_content(self):
-        """Rotate through different sports and games"""
+        """Rotate through different sports and games with balanced cycling"""
         sports = list(self.sports_data.keys())
+        if not sports:
+            return
+            
         sport = sports[self.current_sport_index]
         games = self.sports_data[sport]["games"]
         
         self.current_game_index += 1
-        if self.current_game_index >= len(games):
+        
+        # Limit games per sport to ensure fair cycling between sports
+        # Show more items per sport to properly cycle through content
+        max_items_per_sport = 5
+        
+        if self.current_game_index >= min(len(games), max_items_per_sport):
             self.current_game_index = 0
             # Store previous sport index for transition
             self.previous_sport_index = self.current_sport_index
@@ -397,13 +405,25 @@ class TickerTape(QWidget):
     
     def get_headlines_from_news_widget(self):
         """Get existing headlines from the NewsWidget that's already running"""
-        if not self.news_widget or not hasattr(self.news_widget, 'worker'):
+        if not self.news_widget:
+            print("No news widget available")
+            return []
+        
+        if not hasattr(self.news_widget, 'worker'):
+            print("News widget has no worker")
             return []
         
         # Access the worker's news_items
         worker = self.news_widget.worker
-        if not hasattr(worker, 'news_items') or not worker.news_items:
+        if not hasattr(worker, 'news_items'):
+            print("Worker has no news_items attribute")
             return []
+        
+        if not worker.news_items:
+            print(f"Worker news_items is empty: {worker.news_items}")
+            return []
+        
+        print(f"Found {len(worker.news_items)} news items in worker")
         
         headlines = []
         news_items = worker.news_items
@@ -413,8 +433,9 @@ class TickerTape(QWidget):
                            key=lambda x: (x.get('injury_score', 0), x.get('date', datetime.min)), 
                            reverse=True)
         
-        # Take more headlines for cycling through leagues
-        for item in sorted_news[:10]:  # Set headline number
+        # Process ALL available headlines for categorization
+        all_headlines = []
+        for item in sorted_news:  # Categorize all headlines first
             title = item.get('title', '')
             if not title:
                 continue
@@ -423,10 +444,43 @@ class TickerTape(QWidget):
             if title.startswith("None: "):
                 title = title[6:]  # Remove "None: " (6 characters)
             
-            # Add cleaned title
-            headlines.append(title)
+            all_headlines.append(title)
         
-        return headlines
+        print(f"Total headlines available for categorization: {len(all_headlines)}")
+        
+        # Now categorize all headlines and select best ones
+        categorized_headlines = {"NFL": [], "NBA": [], "MLB": [], "NHL": []}
+        
+        for headline in all_headlines:
+            sport = self.categorize_headline_by_content(headline)
+            if sport:
+                categorized_headlines[sport].append(headline)
+        
+        # Select balanced representation from each sport (max 10 per sport)
+        selected_headlines = []
+        for sport, headlines_list in categorized_headlines.items():
+            # Take up to 10 best headlines per sport (injury-scored items first)
+            selected_from_sport = headlines_list[:10]
+            selected_headlines.extend(selected_from_sport)
+            print(f"Selected {len(selected_from_sport)} headlines from {sport} (out of {len(headlines_list)} available)")
+        
+        # If we have fewer than 40, fill with remaining high-injury-score headlines
+        if len(selected_headlines) < 40:
+            remaining_count = 40 - len(selected_headlines)
+            print(f"Filling remaining {remaining_count} slots with uncategorized high-priority headlines")
+            
+            # Get uncategorized headlines
+            uncategorized = []
+            for headline in all_headlines:
+                sport = self.categorize_headline_by_content(headline)
+                if not sport:
+                    uncategorized.append(headline)
+            
+            # Add uncategorized headlines to reach 40 total
+            selected_headlines.extend(uncategorized[:remaining_count])
+        
+        print(f"Final selection: {len(selected_headlines)} headlines for ticker")
+        return selected_headlines[:40]  # Ensure we don't exceed 40
     
     def get_loading_animation_text(self):
         """Generate animated loading text"""
@@ -562,89 +616,118 @@ class TickerTape(QWidget):
             print(f"✓ Live scores added - MLB first with {len(score_items)} games")
             print(f"Current sports: {list(self.sports_data.keys())}")
             print(f"Current text: {self.current_text[:50]}...")
+            
+            # Load headlines after scores are added to ensure proper cycling
+            # Give news widget more time to load, then retry if needed
+            QTimer.singleShot(5000, self.load_headlines_for_cycling)
 
-    def load_live_data(self):
-        """Load headlines from existing NewsWidget - REMOVED, scores only"""
-        pass  # No longer needed - just show live scores
+    def load_headlines_for_cycling(self, retry_count=0):
+        """Load headlines from news widget for cycling between sports"""
+        headlines = self.get_headlines_from_news_widget()
+        if headlines:
+            print(f"Loading {len(headlines)} headlines for sport cycling...")
+            self.populate_ticker_with_headlines(headlines)
+        else:
+            print(f"No headlines available from news widget (attempt {retry_count + 1})")
+            # Retry up to 3 times with longer delays
+            if retry_count < 3:
+                delay = 10000 + (retry_count * 5000)  # 10s, 15s, 20s
+                print(f"Retrying in {delay/1000}s...")
+                QTimer.singleShot(delay, lambda: self.load_headlines_for_cycling(retry_count + 1))
     
     def categorize_headline_by_content(self, headline):
-        """Advanced headline categorization using multiple signals"""
+        """Improved headline categorization using multiple signals and confidence scoring"""
         headline_lower = headline.lower()
         
-        # Advanced filtering patterns with weighted scoring
+        # Enhanced league-specific terminology with better signal quality
         league_signals = {
             "NBA": {
-                "league_names": ["nba", "basketball"],  # 8 points each
-                "terminology": ["three-pointer", "dunk", "playoffs", "draft", "trade deadline", "salary cap", "g league", "all-star"], # 6 points each
-                "positions": ["point guard", "center", "forward", "guard"], # 4 points each
-                "mega_stars": ["lebron", "curry", "durant", "giannis"], # 4 points each
-                "cities": ["los angeles", "boston", "miami", "chicago", "new york"], # 4 points each
-                "venues": ["madison square garden", "staples center", "td garden"] # 3 points each
+                "league_names": ["nba", "basketball"],  # 12 points each
+                "unique_terms": ["three-pointer", "dunk", "rebound", "assist", "block", "steal", "buzzer beater",
+                               "fast break", "alley-oop", "free throw", "technical foul", "flagrant", "and-one"],  # 8 points each
+                "positions": ["PG", "SG", "SF", "PF", "C", "point guard", "shooting guard", "small forward", 
+                            "power forward", "center", "sixth man"],  # 6 points each
+                "concepts": ["salary cap", "luxury tax", "lottery pick", "summer league", "g league", "all-star", 
+                           "finals mvp", "rookie of the year"],  # 6 points each
+                "mega_stars": ["lebron", "curry", "durant", "giannis", "luka", "tatum", "jokic", "embiid", 
+                             "kawhi", "harden"],  # 10 points each
+                "unique_cities": ["los angeles lakers", "golden state", "milwaukee", "phoenix suns"]  # 7 points each
             },
             "NFL": {
-                "league_names": ["nfl", "football"],
-                "terminology": ["touchdown", "quarterback", "draft pick", "free agency", "super bowl", "combine", "pro bowl"],
-                "positions": ["quarterback", "running back", "wide receiver", "linebacker", "defensive back"],
-                "mega_stars": ["mahomes", "brady", "rodgers", "josh allen"],
-                "cities": ["green bay", "dallas", "kansas city", "buffalo", "tampa bay"],
-                "venues": ["lambeau field", "arrowhead stadium", "gillette stadium"]
+                "league_names": ["nfl", "football"],  # 12 points each
+                "unique_terms": ["touchdown", "quarterback", "endzone", "snap count", "blitz", "sack", "interception", 
+                               "gridiron", "pigskin", "redzone", "fourth down", "field goal", "punt", "fumble"],  # 8 points each
+                "positions": ["QB", "RB", "WR", "TE", "OL", "DL", "LB", "CB", "S", "quarterback", "running back", 
+                            "wide receiver", "linebacker", "defensive back", "tight end"],  # 6 points each
+                "concepts": ["draft combine", "hard knocks", "pro bowl", "super bowl", "nfc", "afc", "wildcard"],  # 6 points each
+                "mega_stars": ["mahomes", "brady", "rodgers", "josh allen", "jalen hurts", "lane johnson", 
+                             "lamar jackson", "joe burrow", "dak prescott", "russell wilson"],  # 10 points each
+                "unique_cities": ["green bay", "kansas city", "buffalo", "tampa bay", "philadelphia", "pittsburgh"]  # 7 points each
             },
             "MLB": {
-                "league_names": ["mlb", "baseball"],
-                "terminology": ["home run", "rbi", "batting average", "era", "world series", "spring training", "all-star game"],
-                "positions": ["pitcher", "catcher", "shortstop", "outfielder", "first base"],
-                "mega_stars": ["ohtani", "judge", "trout", "soto"],
-                "cities": ["new york", "los angeles", "boston", "chicago", "houston"],
-                "venues": ["yankee stadium", "fenway park", "dodger stadium"]
+                "league_names": ["mlb", "baseball"],  # 12 points each
+                "unique_terms": ["home run", "strikeout", "ERA", "RBI", "batting average", "bullpen", "closer",
+                               "grand slam", "double play", "triple play", "balk", "wild pitch", "stolen base"],  # 8 points each
+                "positions": ["pitcher", "catcher", "shortstop", "designated hitter", "DH", "closer", "setup man",
+                            "first base", "second base", "third base", "outfielder"],  # 6 points each
+                "concepts": ["spring training", "world series", "cy young", "mvp", "rookie of the year", 
+                           "all-star game", "trade deadline", "waiver wire"],  # 6 points each
+                "mega_stars": ["ohtani", "judge", "trout", "soto", "betts", "tatis", "guerrero", "acuna", 
+                             "freeman", "machado"],  # 10 points each
+                "unique_cities": ["yankee stadium", "fenway park", "dodger stadium", "wrigley field"]  # 7 points each
             },
             "NHL": {
-                "league_names": ["nhl", "hockey"],
-                "terminology": ["goal", "assist", "power play", "stanley cup", "playoffs", "trade deadline"],
-                "positions": ["goalie", "defenseman", "winger", "center"],
-                "mega_stars": ["mcdavid", "ovechkin", "pastrnak"],
-                "cities": ["boston", "toronto", "montreal", "chicago", "detroit"],
-                "venues": ["madison square garden", "td garden", "united center"]
+                "league_names": ["nhl", "hockey"],  # 12 points each
+                "unique_terms": ["goal", "assist", "power play", "penalty kill", "face-off", "icing", "offside",
+                               "hat trick", "one-timer", "slap shot", "wrist shot", "breakaway", "shootout"],  # 8 points each
+                "positions": ["goalie", "defenseman", "winger", "center", "left wing", "right wing", "d-man",
+                            "netminder", "tender"],  # 6 points each
+                "concepts": ["stanley cup", "overtime", "shootout", "playoffs", "draft lottery", "trade deadline",
+                           "all-star game", "calder trophy", "hart trophy"],  # 6 points each
+                "mega_stars": ["mcdavid", "ovechkin", "pastrnak", "kane", "crosby", "mackinnon", "draisaitl", 
+                             "matthews", "hedman", "vasilevskiy"],  # 10 points each
+                "unique_cities": ["edmonton", "winnipeg", "calgary", "vancouver", "montreal", "ottawa", "toronto"]  # 7 points each
             }
         }
         
         best_league = None
         best_score = 0
         
-        # Score each league using multiple signals
+        # Score each league using weighted signals
         for league, signals in league_signals.items():
             score = 0
             
-            # League names (8 points each)
+            # League names (12 points each - high confidence)
             for term in signals["league_names"]:
+                if term in headline_lower:
+                    score += 12
+            
+            # Unique sport terminology (8 points each)
+            for term in signals["unique_terms"]:
                 if term in headline_lower:
                     score += 8
             
-            # Sport-specific terminology (6 points each)
-            for term in signals["terminology"]:
+            # Position names (6 points each)
+            for term in signals["positions"]:
                 if term in headline_lower:
                     score += 6
             
-            # Position names (4 points each)
-            for term in signals["positions"]:
+            # Sport concepts (6 points each)
+            for term in signals["concepts"]:
                 if term in headline_lower:
-                    score += 4
+                    score += 6
             
-            # Mega stars only (4 points each)
+            # Mega stars (10 points each - high confidence)
             for star in signals["mega_stars"]:
                 if star in headline_lower:
-                    score += 4
+                    score += 10
             
-            # City names (4 points each)
-            for city in signals["cities"]:
+            # Unique city identifiers (7 points each)
+            for city in signals["unique_cities"]:
                 if city in headline_lower:
-                    score += 4
+                    score += 7
             
-            # Venues (3 points each)
-            for venue in signals["venues"]:
-                if venue in headline_lower:
-                    score += 3
-            
-            # Team names from existing method (10 points each - highest weight)
+            # Team names from news widget (15 points each - highest weight)
             if self.news_widget and hasattr(self.news_widget, 'get_teams_for_league'):
                 league_key = f"{league.lower().replace('nhl', 'icehockey_nhl').replace('nba', 'basketball_nba').replace('nfl', 'football_nfl').replace('mlb', 'baseball_mlb')}"
                 if league == "NBA":
@@ -659,13 +742,14 @@ class TickerTape(QWidget):
                 teams = self.news_widget.get_teams_for_league(league_key)
                 for team in teams:
                     if team.lower() in headline_lower:
-                        score += 10
+                        score += 15
             
             if score > best_score:
                 best_score = score
                 best_league = league
         
-        return best_league if best_score > 0 else "MLB"  # Default to MLB
+        # Require higher confidence threshold to avoid misclassification
+        return best_league if best_score >= 10 else None
     
     def populate_ticker_with_headlines(self, headlines):
         """Populate ticker with headlines properly categorized by content"""
@@ -682,7 +766,15 @@ class TickerTape(QWidget):
         
         for headline in headlines:
             league = self.categorize_headline_by_content(headline)
-            categorized_headlines[league].append(headline)
+            if league:  # Only add if we have a confident categorization
+                categorized_headlines[league].append(headline)
+                print(f"Categorized: '{headline[:50]}...' -> {league}")
+            else:
+                print(f"Skipped (low confidence): '{headline[:50]}...'")
+        
+        # Print categorization summary
+        for league, headlines_list in categorized_headlines.items():
+            print(f"{league}: {len(headlines_list)} headlines")
         
         # Build sports data, preserving existing live scores and maintaining order
         new_sports_data = {}
@@ -692,24 +784,26 @@ class TickerTape(QWidget):
             if existing_league != "":  # Skip loading animation
                 new_sports_data[existing_league] = existing_data.copy()
         
-        # Then merge in headlines for matching leagues
+        # Then merge in headlines for matching leagues OR add default news for empty leagues
         for league_name, (color, accent, icon) in league_configs.items():
             league_headlines = categorized_headlines[league_name]
             
-            if league_headlines:
-                if league_name in new_sports_data:
-                    # Add headlines to existing league data (scores already there)
-                    existing_games = new_sports_data[league_name]["games"]
+            if league_name in new_sports_data:
+                # Add headlines to existing league data (scores already there)
+                existing_games = new_sports_data[league_name]["games"]
+                if league_headlines:
                     new_sports_data[league_name]["games"] = existing_games + league_headlines
                     print(f"Merged {len(league_headlines)} headlines with existing {league_name} data")
-                else:
-                    # Create new league with just headlines
+            else:
+                # Only create new league if we have real headlines
+                if league_headlines:
                     new_sports_data[league_name] = {
                         "color": color,
                         "accent": accent,
                         "icon": icon,
                         "games": league_headlines
                     }
+                    print(f"Created {league_name} with {len(league_headlines)} headlines")
         
         if new_sports_data:
             print(f"Before headline merge - current sports: {list(self.sports_data.keys())}")

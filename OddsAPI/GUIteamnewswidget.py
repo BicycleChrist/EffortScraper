@@ -61,7 +61,9 @@ class NewsWorker(QObject):
                 "general": [
                     "https://www.rotowire.com/rss/news.php?sport=nba",
                     "https://www.espn.com/espn/rss/nba/news",
-                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba",
+                    "https://sports.yahoo.com/nba/rss/",
+                    "https://www.cbssports.com/rss/headlines/nba"
                 ],
             },
             # NFL
@@ -71,7 +73,8 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=nfl,",
                     "https://www.espn.com/espn/rss/nfl/news",
                     "https://www.cbssports.com/rss/headlines/nfl",
-                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl"
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl",
+                    "https://sports.yahoo.com/nfl/rss/"
                 ]
             },
             # MLB
@@ -80,7 +83,8 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=mlb",
                     "https://www.espn.com/espn/rss/mlb/news",
                     "https://www.cbssports.com/rss/headlines/mlb/",
-                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb"
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb",
+                    "https://sports.yahoo.com/mlb/rss/"
                 ]
             },
             # NHL
@@ -89,7 +93,8 @@ class NewsWorker(QObject):
                     "https://www.rotowire.com/rss/news.php?sport=nhl",
                     "https://www.espn.com/espn/rss/nhl/news",
                     "https://www.cbssports.com/rss/headlines/nhl/injuries",
-                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nba"
+                    "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nhl",
+                    "https://sports.yahoo.com/nhl/rss/"
                 ]
             }
         }
@@ -202,7 +207,7 @@ class NewsWorker(QObject):
             print(f"Error fetching RSS feed {url}: {str(e)}")
             return []
             
-    async def fetch_fantasypros_news(self):
+    def fetch_fantasypros_news(self):
         """Fetch news from FantasyPros website using HTML scraping"""
         try:
             # Use the appropriate method based on league
@@ -249,8 +254,8 @@ class NewsWorker(QObject):
                 # Fetch from all RSS sources in parallel
                 tasks = [self.fetch_rss_feed_with_session(session, url) for url in sources]
                 
-                # Add FantasyPros scraping task
-                tasks.append(self.fetch_fantasypros_news())
+                # Add FantasyPros scraping (no longer async)
+                # Skip FantasyPros for now to avoid blocking - can add back later if needed
 
                 # Execute all tasks with faster concurrency
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -293,7 +298,7 @@ class NewsWorker(QObject):
             self.running = False
 
     def run_fetch(self):
-        """Start the fetch operation in a separate thread"""
+        """Start the fetch operation in a background thread"""
         if self.running: 
             print(f"fetch already in progress!")
             return
@@ -301,7 +306,17 @@ class NewsWorker(QObject):
         # Reset news_items to None to allow fresh fetching
         self.news_items = None
         self.running = True
-        asyncio.run(self.fetch_news())
+        
+        # Use a simple thread to run the async fetch without blocking the UI
+        import threading
+        def run_async_fetch():
+            try:
+                asyncio.run(self.fetch_news())
+            except Exception as e:
+                print(f"Error in background fetch: {e}")
+        
+        thread = threading.Thread(target=run_async_fetch, daemon=True)
+        thread.start()
 
 
 class NewsArticleWidget(QFrame):
@@ -649,7 +664,7 @@ class TeamNewsWidget(QWidget):
         # Make sure the running flag is reset (in case it got stuck)
         self.worker.running = False
 
-        # Start the worker in its thread
+        # Start the worker using QTimer to avoid blocking
         QTimer.singleShot(0, self.worker.run_fetch)
 
     def clear_news_items(self):
