@@ -557,11 +557,6 @@ class ModernOddsWindow(QMainWindow):
         # Add the market_streaming_layout to the main layout
         self.layout.addLayout(market_streaming_layout)
         
-        # --------- PROGRESS BAR ---------
-        # Progress bar
-        self.progress = QProgressBar()
-        self.layout.addWidget(self.progress)
-        
         # --------- SEARCH BAR ---------
         # Create search bar container
         search_container = QWidget()
@@ -753,6 +748,25 @@ class ModernOddsWindow(QMainWindow):
         self.status_frame_layout.addWidget(self.progress_indicator)
         self.status_frame_layout.addWidget(self.last_update_label)
         self.status_frame_layout.addWidget(self.update_status)
+        
+        # Add progress bar (hidden by default)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)  # Hidden by default
+        self.progress.setMaximumHeight(15)  # Make it more compact
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #dee2e6;
+                border-radius: 3px;
+                text-align: center;
+                font-size: 9pt;
+            }
+            QProgressBar::chunk {
+                background-color: #007bff;
+                border-radius: 2px;
+            }
+        """)
+        self.status_frame_layout.addWidget(self.progress)
+        
         update_controls_layout.addWidget(self.status_frame)
         update_controls_layout.addStretch()
         
@@ -1402,6 +1416,8 @@ class ModernOddsWindow(QMainWindow):
             print("Leagues not loaded yet. Please wait.")
             return
     
+        # Show and reset progress bar
+        self.progress.setVisible(True)
         self.progress.setValue(0)
         self.fetch_odds_button.setEnabled(False)
         
@@ -1639,8 +1655,11 @@ class ModernOddsWindow(QMainWindow):
             traceback.print_exc()
         finally:
             self.fetch_odds_button.setEnabled(True)
-            # Reset progress bar
-            QTimer.singleShot(2000, lambda: self.progress.setValue(0))
+            # Hide and reset progress bar
+            QTimer.singleShot(2000, lambda: (
+                self.progress.setValue(0),
+                self.progress.setVisible(False)
+            ))
             # Reset error messages after a delay
             if not self.auto_update_check.isChecked():
                 QTimer.singleShot(5000, lambda: self.update_status.setText(""))
