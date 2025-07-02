@@ -7,7 +7,7 @@ from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetri
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter
+    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit
 )
 from PropQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -562,10 +562,43 @@ class ModernOddsWindow(QMainWindow):
         self.progress = QProgressBar()
         self.layout.addWidget(self.progress)
         
+        # --------- SEARCH BAR ---------
+        # Create search bar container
+        search_container = QWidget()
+        search_layout = QHBoxLayout(search_container)
+        search_layout.setContentsMargins(0, 5, 0, 5)
+        
+        # Create search bar
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Filter odds table (team names, markets, etc.)")
+        self.search_bar.setStyleSheet("""
+            QLineEdit {
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 10pt;
+                color: #495057;
+            }
+            QLineEdit:focus {
+                border-color: #007bff;
+                background-color: white;
+                outline: 0;
+                box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
+            }
+        """)
+        self.search_bar.setFixedHeight(28)
+        self.search_bar.setMaximumWidth(400)
+        search_layout.addWidget(self.search_bar)
+        
+        # Add stretch to push search to the left
+        search_layout.addStretch()
+        
+        self.layout.addWidget(search_container)
+        
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
         self.tab_widget = QTabWidget()
-        self.layout.addWidget(QLabel("Odds:"))
         
         # Create the team news widget first
         self.team_news_widget = TeamNewsWidget()
@@ -848,6 +881,7 @@ class ModernOddsWindow(QMainWindow):
         self.props_button.clicked.connect(self.handle_props_button)
         self.news_toggle_button.clicked.connect(self.toggle_news_feed)
         self.tt_button.clicked.connect(self.handle_tt_button)
+        self.search_bar.textChanged.connect(self.filter_table)
         
 
 
@@ -930,6 +964,10 @@ class ModernOddsWindow(QMainWindow):
                 tab_data = self.league_tabs[self.current_league]
                 if hasattr(tab_data, 'consolidated_odds_data'):
                     self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
+            
+            # Apply current search filter to the new tab
+            if hasattr(self, 'search_bar'):
+                self.filter_table()
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
         """Create a new tab for a league with specific markets"""
@@ -1650,8 +1688,8 @@ class ModernOddsWindow(QMainWindow):
                             status_text, is_live, scores_text = "Starting Soon", False, "";
                         elif time_diff < 14400:  # Less than 4 hours after (likely live)
                             status_text, is_live, scores_text = "🔴LIVE", True, "";
-                        else:  # More than 4 hours after (likely finished)
-                            status_text, is_live, scores_text = "Finished", False, "";
+                        else:  
+                            continue
                         
                         if status_text != old_status or scores_text != old_scores:
                             tab_data.game_status[game_id] = {
@@ -1804,6 +1842,45 @@ class ModernOddsWindow(QMainWindow):
         self.calc_window = OddsConverterWidget()
         self.calc_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.calc_window.show()
+    
+    def filter_table(self):
+        """Filter the current table based on search term"""
+        search_term = self.search_bar.text().lower().strip()
+        current_table = self.tab_widget.currentWidget()
+        
+        if not current_table or not isinstance(current_table, QTableWidget):
+            return
+            
+        # Show all rows if search is empty
+        if not search_term:
+            for row in range(current_table.rowCount()):
+                current_table.setRowHidden(row, False)
+            return
+            
+        # Filter rows based on search term
+        for row in range(current_table.rowCount()):
+            # Get the market/outcome text (first column)
+            header_item = current_table.item(row, 0)
+            if not header_item:
+                current_table.setRowHidden(row, True)
+                continue
+                
+            row_text = header_item.text().lower()
+            
+            # Also check bookmaker odds in other columns
+            match_found = search_term in row_text
+            
+            if not match_found:
+                # Check odds values in bookmaker columns
+                for col in range(1, current_table.columnCount()):
+                    item = current_table.item(row, col)
+                    if item and item.text():
+                        if search_term in item.text().lower():
+                            match_found = True
+                            break
+            
+            # Show/hide row based on match
+            current_table.setRowHidden(row, not match_found)
     
     def handle_prediction_markets_error(self, error_message):
         """Handle errors from prediction markets worker"""
