@@ -6,7 +6,6 @@ from PyQt6.QtCore import QRectF, QPointF
 from livetape_scraper import scrape_espn_scores 
 import threading
 
-#TODO: Filter out duplicate headlines
 class TickerTape(QWidget):
     """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
     
@@ -48,13 +47,13 @@ class TickerTape(QWidget):
         self.segment_width = 120  # Width of sport segment
         
         # Fonts - Professional broadcast-style fonts, bigger and more imposing
-        self.sport_font = QFont("Arial Black", 14, QFont.Weight.ExtraBold)
-        self.game_font = QFont("Arial", 13, QFont.Weight.Bold)
+        self.sport_font = QFont("Roboto", 14, QFont.Weight.ExtraBold)
+        self.game_font = QFont("Roboto", 15, QFont.Weight.Bold)
         
         # Fallback to Segoe UI if Arial not available
         if not self.sport_font.exactMatch():
             self.sport_font = QFont("Segoe UI", 14, QFont.Weight.ExtraBold)
-            self.game_font = QFont("Segoe UI", 13, QFont.Weight.Bold)
+            self.game_font = QFont("Source Code Pro ", 15, QFont.Weight.Bold)
         
         # Additional font settings for crisp, clean appearance
         self.sport_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
@@ -93,7 +92,7 @@ class TickerTape(QWidget):
         self.data_loaded = False
         
         # Load scores immediately, no delays
-        QTimer.singleShot(500, self.load_live_scores)  # Load scores very fast
+        QTimer.singleShot(500, self.load_live_scores)  # Load scores first
         
     @pyqtProperty(float)
     def scroll_position(self):
@@ -428,7 +427,7 @@ class TickerTape(QWidget):
         headlines = []
         news_items = worker.news_items
         
-        # Get more headlines and prioritize injury news
+        # Get more headlines - prioritize by injury score first, then by date (newest first)
         sorted_news = sorted(news_items, 
                            key=lambda x: (x.get('injury_score', 0), x.get('date', datetime.min)), 
                            reverse=True)
@@ -445,6 +444,9 @@ class TickerTape(QWidget):
                 title = title[6:]  # Remove "None: " (6 characters)
             
             all_headlines.append(title)
+        
+        # Apply duplicate filtering to all headlines
+        all_headlines = self.filter_duplicate_headlines(all_headlines)
         
         print(f"Total headlines available for categorization: {len(all_headlines)}")
         
@@ -751,8 +753,58 @@ class TickerTape(QWidget):
         # Require higher confidence threshold to avoid misclassification
         return best_league if best_score >= 10 else None
     
+    def filter_duplicate_headlines(self, headlines):
+        """Filter out duplicate headlines using fuzzy matching and keyword comparison"""
+        import difflib
+        import re
+        
+        if not headlines:
+            return headlines
+            
+        def extract_key_terms(headline):
+            """Extract key terms from headline for comparison"""
+            # Remove common words and extract meaningful terms
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'vs', 'beat', 'defeat', 'win', 'lose'}
+            words = re.findall(r'\w+', headline.lower())
+            return set(word for word in words if len(word) > 2 and word not in stop_words)
+        
+        unique_headlines = []
+        seen_headlines = []
+        
+        for headline in headlines:
+            is_duplicate = False
+            current_terms = extract_key_terms(headline)
+            
+            # Compare with existing headlines
+            for existing in seen_headlines:
+                # Calculate similarity ratio (more sensitive threshold)
+                similarity = difflib.SequenceMatcher(None, headline.lower(), existing.lower()).ratio()
+                
+                # Also check for common key terms
+                existing_terms = extract_key_terms(existing)
+                if current_terms and existing_terms:
+                    term_overlap = len(current_terms & existing_terms) / len(current_terms | existing_terms)
+                else:
+                    term_overlap = 0
+                
+                # Consider duplicates if high similarity OR high term overlap
+                if similarity > 0.75 or term_overlap > 0.6:
+                    print(f"🔄 Duplicate filtered: '{headline[:40]}...' (sim: {similarity:.2f}, terms: {term_overlap:.2f})")
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                unique_headlines.append(headline)
+                seen_headlines.append(headline)
+        
+        print(f"📰 Duplicate filtering: {len(headlines)} → {len(unique_headlines)} headlines")
+        return unique_headlines
+    
     def populate_ticker_with_headlines(self, headlines):
         """Populate ticker with headlines properly categorized by content"""
+        # Apply duplicate filtering first
+        headlines = self.filter_duplicate_headlines(headlines)
+        
         # League configurations
         league_configs = {
             "MLB": (QColor("#132448"), QColor("#BF0D3E"), "⚾"),

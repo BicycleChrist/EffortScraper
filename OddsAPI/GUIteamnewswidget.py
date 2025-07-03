@@ -449,6 +449,9 @@ class TeamNewsWidget(QWidget):
         self.refresh_timer.timeout.connect(self.refresh_news)
         self.refresh_timer.start(10 * 60 * 1000)  # 5 minutes in milliseconds
         self.current_refresh_interval = 5  # Store current interval in minutes
+        
+        # Trigger initial news fetch immediately - RSS feeds should be first priority
+        QTimer.singleShot(100, self.refresh_news)  # Minimal delay to ensure UI is ready
 
     def setup_ui(self):
         """Set up the UI components"""

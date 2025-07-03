@@ -488,8 +488,8 @@ class ModernOddsWindow(QMainWindow):
         self.prediction_markets_worker.data_ready.connect(self.ticker_tape.add_prediction_markets)
         self.prediction_markets_worker.error_occurred.connect(self.handle_prediction_markets_error)
         self.prediction_markets_worker.status_update.connect(self.handle_prediction_markets_status)
-        # Start the worker to begin fetching prediction market data
-        self.prediction_markets_worker.start()
+        # Delay prediction markets to let RSS feeds fetch first (they're much faster)
+        QTimer.singleShot(5000, self.prediction_markets_worker.start)  # 5 second delay
         
         region_ticker_layout.addWidget(ticker_section, 1)  # Give ticker section stretch
         
@@ -1259,39 +1259,50 @@ class ModernOddsWindow(QMainWindow):
         """Toggle visibility of the news feed widget with optimized spacing"""
         visible = self.news_toggle_button.isChecked()
         
-        # Make the widget visible first (needed for proper layout calculations)
-        self.news_container.setVisible(visible)
-        self.team_news_widget.setVisible(visible)
+        # Defer the heavy layout work to avoid blocking during Polymarket fetching
+        def do_layout_work():
+            # Make the widget visible first (needed for proper layout calculations)
+            self.news_container.setVisible(visible)
+            self.team_news_widget.setVisible(visible)
+            
+            # Update button text and adjust container size
+            if visible:
+                self.news_toggle_button.setText("Hide Injury News ▲")
+                
+                # Calculate exact height for 3 articles
+                article_height = 85
+                container_height = (article_height * 3)
+                self.news_container.setMinimumHeight(container_height)
+                
+                # KEY FIX: Set negative top margin on progress bar to pull it upward
+                prog_margins = self.progress.contentsMargins()
+                prog_margins.setTop(-100)  # Adjust this value as needed
+                self.progress.setContentsMargins(prog_margins)
+                
+                # Set minimal spacing in main layout
+                self.layout.setSpacing(0)
+            else:
+                self.news_toggle_button.setText("Show Injury News ▼")
+                
+                # Reset progress bar margins to normal
+                prog_margins = self.progress.contentsMargins()
+                prog_margins.setTop(0)
+                self.progress.setContentsMargins(prog_margins)
+                
+                # Reset layout spacing
+                self.layout.setSpacing(0)
+            
+            # Force update to apply changes
+            self.update()
         
-        # Update button text and adjust container size
+        # Update button text immediately for responsive feedback
         if visible:
             self.news_toggle_button.setText("Hide Injury News ▲")
-            
-            # Calculate exact height for 3 articles
-            article_height = 85
-            container_height = (article_height * 3)
-            self.news_container.setMinimumHeight(container_height)
-            
-            # KEY FIX: Set negative top margin on progress bar to pull it upward
-            prog_margins = self.progress.contentsMargins()
-            prog_margins.setTop(-100)  # Adjust this value as needed
-            self.progress.setContentsMargins(prog_margins)
-            
-            # Set minimal spacing in main layout
-            self.layout.setSpacing(0)
         else:
             self.news_toggle_button.setText("Show Injury News ▼")
-            
-            # Reset progress bar margins to normal
-            prog_margins = self.progress.contentsMargins()
-            prog_margins.setTop(0)
-            self.progress.setContentsMargins(prog_margins)
-            
-            # Reset layout spacing
-            self.layout.setSpacing(0)
         
-        # Force update to apply changes
-        QTimer.singleShot(10, self.update)
+        # Defer the heavy layout work by 1ms to avoid blocking
+        QTimer.singleShot(1, do_layout_work)
         
         
     def toggle_historical_odds(self):
@@ -1916,9 +1927,28 @@ class ModernOddsWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Clean up when the application is closing"""
+        print("Application closing, cleaning up background operations...")
+        
         # Stop the prediction markets worker
         if hasattr(self, 'prediction_markets_worker'):
+            print("Stopping prediction markets worker...")
             self.prediction_markets_worker.stop()
+        
+        # Stop team news widget worker
+        if hasattr(self, 'team_news_widget') and hasattr(self.team_news_widget, 'worker_thread'):
+            print("Stopping team news worker...")
+            self.team_news_widget.worker.running = False
+            self.team_news_widget.worker_thread.quit()
+            if not self.team_news_widget.worker_thread.wait(2000):
+                print("Team news worker didn't stop gracefully, terminating...")
+                self.team_news_widget.worker_thread.terminate()
+                self.team_news_widget.worker_thread.wait(1000)
+        
+        # Stop any update timers
+        if hasattr(self, 'update_timer') and self.update_timer.isActive():
+            self.update_timer.stop()
+        
+        print("Cleanup complete")
         event.accept()
 
 
