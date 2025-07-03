@@ -722,7 +722,7 @@ class ModernOddsWindow(QMainWindow):
         self.update_interval = QSpinBox()
         self.update_interval.setRange(1, 60)
         self.update_interval.setSuffix(" min")
-        self.update_interval.setValue(5)
+        self.update_interval.setValue(30)
         self.update_interval.setEnabled(True)
         update_controls_layout.addWidget(QLabel("Update Interval:"))
         update_controls_layout.addWidget(self.update_interval)
@@ -979,8 +979,9 @@ class ModernOddsWindow(QMainWindow):
                 if hasattr(tab_data, 'consolidated_odds_data'):
                     self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
             
-            # Apply current search filter to the new tab
+            # Clear search bar when switching tabs
             if hasattr(self, 'search_bar'):
+                self.search_bar.clear()
                 self.filter_table()
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
@@ -1512,7 +1513,11 @@ class ModernOddsWindow(QMainWindow):
                     away_team = odds.get('away_team', 'Unknown')
                     
                     # Get game status using the new function
-                    status_text, is_live, scores_text = get_game_status(odds, scores_data)
+                    status_result = get_game_status(odds, scores_data)
+                    if status_result is None:
+                        # Skip games that are completed or too old
+                        continue
+                    status_text, is_live, scores_text = status_result
                     
                     # Store status info in tab_data
                     if not hasattr(tab_data, 'game_status'):

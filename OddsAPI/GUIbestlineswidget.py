@@ -13,6 +13,7 @@ class BestLinesWidget(QTableWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.best_lines = {}
         self.show_splits = False  # Flag to toggle between best lines and splits display
         self.current_sport = None  # Track the current sport for loading splits data
         self.splits_data = {}  # Cache for splits data

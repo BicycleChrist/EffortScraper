@@ -1,4 +1,5 @@
 import asyncio
+import aiohttp
 import feedparser
 from datetime import datetime
 import re
@@ -53,6 +54,7 @@ class NewsWorker(QObject):
         self.news_by_league = {}  # Store headlines by league for ticker tape
         self.print_fetches = False
         self.scraper = FantasyProsScraper()
+        self.current_thread = None  # Track current fetch thread
         print(f"[NewsWorker] printing_fetches: {self.print_fetches}")
         
         self.rss_urls = {
@@ -228,7 +230,7 @@ class NewsWorker(QObject):
     async def fetch_news(self):
         """Fetch news from all configured sources with connection pooling"""
         try:
-            import aiohttp
+            
             
             # Fetch news for all 4 sports leagues for ticker tape
             all_leagues = ["basketball_nba", "football_nfl", "baseball_mlb", "icehockey_nhl"]
@@ -247,7 +249,7 @@ class NewsWorker(QObject):
                     sources.extend(league_feeds['teams'][self.team_name])
 
             # Use single session for all requests - much faster!
-            timeout = aiohttp.ClientTimeout(total=2)  # Reduced to 2 seconds
+            timeout = aiohttp.ClientTimeout(total=2)  # 2 second timeout
             connector = aiohttp.TCPConnector(limit=50, limit_per_host=10)  # Connection pooling
             
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -316,6 +318,7 @@ class NewsWorker(QObject):
                 print(f"Error in background fetch: {e}")
         
         thread = threading.Thread(target=run_async_fetch, daemon=True)
+        self.current_thread = thread
         thread.start()
 
 
@@ -444,7 +447,7 @@ class TeamNewsWidget(QWidget):
         # Add auto-refresh timer (5 minutes by default)
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_news)
-        self.refresh_timer.start(5 * 60 * 1000)  # 5 minutes in milliseconds
+        self.refresh_timer.start(10 * 60 * 1000)  # 5 minutes in milliseconds
         self.current_refresh_interval = 5  # Store current interval in minutes
 
     def setup_ui(self):
@@ -471,7 +474,7 @@ class TeamNewsWidget(QWidget):
         refresh_layout.addWidget(QLabel("Refresh Freq"))
         self.refresh_interval = QSpinBox()
         self.refresh_interval.setRange(0, 30)
-        self.refresh_interval.setValue(5)
+        self.refresh_interval.setValue(25)
         self.refresh_interval.setSuffix(" min")
         self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
         self.refresh_interval.setFixedWidth(70)
@@ -565,8 +568,9 @@ class TeamNewsWidget(QWidget):
         # Update team dropdown with teams for this league
         self.update_team_dropdown(league_key)
 
-        # Refresh news with the new league
-        self.refresh_news()
+        # Apply filter to existing news items instead of fetching new ones
+        if hasattr(self.worker, 'news_items') and self.worker.news_items:
+            self.update_news_items(self.worker.news_items)
 
     def update_team_dropdown(self, league_key):
         """Update the team dropdown with teams for the current league"""
@@ -633,8 +637,9 @@ class TeamNewsWidget(QWidget):
             self.current_team = team_name
             self.worker.set_team(team_name)
 
-        # Refresh news with the new team filter
-        self.refresh_news()
+        # Apply filter to existing news items instead of refreshing
+        if hasattr(self.worker, 'news_items') and self.worker.news_items:
+            self.update_news_items(self.worker.news_items)
 
     def toggle_injury_filter(self, checked):
         """Toggle showing only injury news"""

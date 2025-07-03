@@ -6,7 +6,7 @@ from PyQt6.QtCore import QRectF, QPointF
 from livetape_scraper import scrape_espn_scores 
 import threading
 
-#TODO: get live quarter/inning data along side the scores
+#TODO: Filter out duplicate headlines
 class TickerTape(QWidget):
     """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
     
@@ -758,7 +758,8 @@ class TickerTape(QWidget):
             "MLB": (QColor("#132448"), QColor("#BF0D3E"), "⚾"),
             "NBA": (QColor("#C8102E"), QColor("#1D428A"), "🏀"),
             "NFL": (QColor("#013369"), QColor("#D50A0A"), "🏈"),
-            "NHL": (QColor("#000000"), QColor("#F99923"), "🏒")
+            "NHL": (QColor("#000000"), QColor("#F99923"), "🏒"),
+            "PRED": (QColor("#6A0DAD"), QColor("#FF6B35"), "🔮")  # Purple/Orange for prediction markets
         }
         
         # Categorize headlines by content
@@ -826,3 +827,32 @@ class TickerTape(QWidget):
                 mlb_games = self.sports_data["MLB"]["games"]
                 score_count = sum(1 for game in mlb_games if " - " in game and ("Final" in game or "vs" in game or any(inning in game for inning in ["Top", "Bot", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th"])))
                 print(f"MLB has {len(mlb_games)} total items, {score_count} appear to be scores")
+    
+    def add_prediction_markets(self, prediction_markets):
+        """Add prediction market data to the ticker"""
+        if not prediction_markets:
+            print("No prediction markets to add")
+            return
+        
+        print(f"Adding {len(prediction_markets)} prediction markets to ticker...")
+        
+        # Create or update PRED section
+        pred_config = {
+            "color": QColor("#6A0DAD"),  # Purple
+            "accent": QColor("#FF6B35"),  # Orange
+            "icon": "🔮",
+            "games": prediction_markets
+        }
+        
+        # Add PRED section to existing sports data
+        self.sports_data["PRED"] = pred_config
+        
+        # Update current text if needed
+        self.update_current_text()
+        
+        # Start animation timer if not already running
+        if not self.animation_timer.isActive():
+            self.animation_timer.start(16)  # 60fps smooth scrolling
+        
+        print(f"✓ Prediction markets added - PRED section with {len(prediction_markets)} markets")
+        print(f"Updated sports order: {list(self.sports_data.keys())}")
