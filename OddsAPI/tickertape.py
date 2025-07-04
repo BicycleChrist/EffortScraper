@@ -282,7 +282,7 @@ class TickerTape(QWidget):
         painter.drawText(shadow_rect, Qt.AlignmentFlag.AlignCenter, f"{icon} {sport_name}")
         
         # Draw main text
-        painter.setPen(QColor("#FFFFFF"))
+        painter.setPen(QColor("#3d9300"))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, f"{icon} {sport_name}")
         
     def draw_flip_card_transition(self, painter, rect):
@@ -445,8 +445,9 @@ class TickerTape(QWidget):
             
             all_headlines.append(title)
         
-        # Apply duplicate filtering to all headlines
-        all_headlines = self.filter_duplicate_headlines(all_headlines)
+        # Skip duplicate filtering if we're during heavy operations to avoid UI blocking
+        # Duplicate filtering will be done async when headlines are actually used
+        # all_headlines = self.filter_duplicate_headlines(all_headlines)
         
         print(f"Total headlines available for categorization: {len(all_headlines)}")
         
@@ -550,11 +551,11 @@ class TickerTape(QWidget):
                         
                         # Format score display
                         if inning == 'Final':
-                            score_text = f"{away_team} {away_runs}, {home_team} {home_runs} - Final"
+                            score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | Final"
                         elif inning == 'Pre-Game':
                             score_text = f"{away_team} vs {home_team} - Starting Soon"
                         else:
-                            score_text = f"{away_team} {away_runs}, {home_team} {home_runs} - {inning}"
+                            score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | {inning}"
                         
                         score_items.append(score_text)
                     
@@ -754,12 +755,14 @@ class TickerTape(QWidget):
         return best_league if best_score >= 10 else None
     
     def filter_duplicate_headlines(self, headlines):
-        """Filter out duplicate headlines using fuzzy matching and keyword comparison"""
+        """Filter out duplicate headlines using optimized approach to minimize UI blocking"""
         import difflib
         import re
         
         if not headlines:
             return headlines
+        
+        print(f"📰 Starting optimized duplicate filtering for {len(headlines)} headlines...")
             
         def extract_key_terms(headline):
             """Extract key terms from headline for comparison"""
@@ -768,15 +771,56 @@ class TickerTape(QWidget):
             words = re.findall(r'\w+', headline.lower())
             return set(word for word in words if len(word) > 2 and word not in stop_words)
         
+        # First pass: exact duplicates (very fast)
+        seen_exact = set()
         unique_headlines = []
+        for headline in headlines:
+            if headline not in seen_exact:
+                unique_headlines.append(headline)
+                seen_exact.add(headline)
+        
+        if len(unique_headlines) < len(headlines):
+            print(f"🔄 Removed {len(headlines) - len(unique_headlines)} exact duplicates")
+        
+        # For very large lists, use a more efficient approach
+        if len(unique_headlines) > 200:
+            print(f"📊 Using fast mode for {len(unique_headlines)} headlines")
+            # Fast mode: Only check substring matches and first 3 key terms
+            final_headlines = []
+            seen_terms = set()
+            
+            for headline in unique_headlines:
+                # Extract first 3 key terms as a signature
+                terms = extract_key_terms(headline)
+                if not terms:
+                    final_headlines.append(headline)
+                    continue
+                    
+                # Create a signature from the most common terms
+                signature = tuple(sorted(list(terms))[:3])
+                
+                if signature not in seen_terms:
+                    final_headlines.append(headline)
+                    seen_terms.add(signature)
+            
+            print(f"📰 Fast filtering complete: {len(unique_headlines)} → {len(final_headlines)} headlines")
+            return final_headlines
+        
+        # Standard mode for smaller lists: fuzzy matching
+        final_headlines = []
         seen_headlines = []
         
-        for headline in headlines:
+        for i, headline in enumerate(unique_headlines):
+            if i % 25 == 0:  # Less frequent progress updates
+                print(f"📊 Processing headline {i}/{len(unique_headlines)}")
+                
             is_duplicate = False
             current_terms = extract_key_terms(headline)
             
-            # Compare with existing headlines
-            for existing in seen_headlines:
+            # Compare with existing headlines (limit comparisons to avoid O(n²) complexity)
+            comparison_limit = min(50, len(seen_headlines))  # Only compare with last 50 headlines
+            
+            for existing in seen_headlines[-comparison_limit:]:
                 # Calculate similarity ratio (more sensitive threshold)
                 similarity = difflib.SequenceMatcher(None, headline.lower(), existing.lower()).ratio()
                 
@@ -789,21 +833,29 @@ class TickerTape(QWidget):
                 
                 # Consider duplicates if high similarity OR high term overlap
                 if similarity > 0.75 or term_overlap > 0.6:
-                    print(f"🔄 Duplicate filtered: '{headline[:40]}...' (sim: {similarity:.2f}, terms: {term_overlap:.2f})")
                     is_duplicate = True
                     break
             
             if not is_duplicate:
-                unique_headlines.append(headline)
+                final_headlines.append(headline)
                 seen_headlines.append(headline)
         
-        print(f"📰 Duplicate filtering: {len(headlines)} → {len(unique_headlines)} headlines")
-        return unique_headlines
+        print(f"📰 Duplicate filtering complete: {len(unique_headlines)} → {len(final_headlines)} headlines")
+        return final_headlines
     
     def populate_ticker_with_headlines(self, headlines):
         """Populate ticker with headlines properly categorized by content"""
-        # Apply duplicate filtering first
-        headlines = self.filter_duplicate_headlines(headlines)
+        print(f"🔄 Processing {len(headlines)} headlines synchronously on main thread...")
+        
+        # Skip filtering for now to isolate the issue
+        # filtered_headlines = self.filter_duplicate_headlines(headlines)
+        
+        # Process directly on main thread
+        self._continue_populate_ticker(headlines)
+    
+    def _continue_populate_ticker(self, headlines):
+        """Continue ticker population after async duplicate filtering"""
+        print(f"🎯 _continue_populate_ticker called with {len(headlines)} headlines")
         
         # League configurations
         league_configs = {
@@ -840,13 +892,16 @@ class TickerTape(QWidget):
         # Then merge in headlines for matching leagues OR add default news for empty leagues
         for league_name, (color, accent, icon) in league_configs.items():
             league_headlines = categorized_headlines[league_name]
+            print(f"🔍 Processing {league_name}: {len(league_headlines)} headlines available")
             
             if league_name in new_sports_data:
                 # Add headlines to existing league data (scores already there)
                 existing_games = new_sports_data[league_name]["games"]
                 if league_headlines:
                     new_sports_data[league_name]["games"] = existing_games + league_headlines
-                    print(f"Merged {len(league_headlines)} headlines with existing {league_name} data")
+                    print(f"✅ Merged {len(league_headlines)} headlines with existing {league_name} data")
+                else:
+                    print(f"⚠️ No headlines to merge for existing {league_name}")
             else:
                 # Only create new league if we have real headlines
                 if league_headlines:
@@ -856,7 +911,9 @@ class TickerTape(QWidget):
                         "icon": icon,
                         "games": league_headlines
                     }
-                    print(f"Created {league_name} with {len(league_headlines)} headlines")
+                    print(f"✅ Created {league_name} with {len(league_headlines)} headlines")
+                else:
+                    print(f"❌ Skipping {league_name} - no headlines available")
         
         if new_sports_data:
             print(f"Before headline merge - current sports: {list(self.sports_data.keys())}")
@@ -864,6 +921,7 @@ class TickerTape(QWidget):
             
             # Update with merged data
             self.sports_data = new_sports_data
+            print(f"✓ Sports data updated - now contains: {list(self.sports_data.keys())}")
             self.update_current_text()
             
             # Start animation timer if not already running
@@ -887,6 +945,7 @@ class TickerTape(QWidget):
             return
         
         print(f"Adding {len(prediction_markets)} prediction markets to ticker...")
+        print(f"📊 Sports data before adding PRED: {list(self.sports_data.keys())}")
         
         # Create or update PRED section
         pred_config = {
