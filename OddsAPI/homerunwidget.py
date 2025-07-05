@@ -1908,6 +1908,21 @@ class SplitView(QWidget):
         self.wind_vector_widget = WindVectorWidget()
         top_layout.addWidget(self.wind_vector_widget)
         
+        # Create a horizontal layout for organized stats display
+        stats_layout = QHBoxLayout()
+        
+        # Weather info panel
+        self.weather_label = QLabel("Weather data: Not loaded")
+        self.weather_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 120); padding: 8px; margin: 2px;")
+        stats_layout.addWidget(self.weather_label, 1)
+        
+        # Flight stats panel
+        self.flight_info_label = QLabel("Flight data: No simulation")
+        self.flight_info_label.setStyleSheet("color: white; background-color: rgba(0, 0, 100, 120); padding: 8px; margin: 2px;")
+        stats_layout.addWidget(self.flight_info_label, 1)
+        
+        top_layout.addLayout(stats_layout)
+        
         self.layout.addLayout(top_layout)
         
         # Main views container - side by side
@@ -1920,7 +1935,7 @@ class SplitView(QWidget):
         
         # Top-down stadium view
         self.stadium_view = StadiumView()
-        self.stadium_view.setMinimumSize(1000, 850)
+        self.stadium_view.setMinimumSize(600, 600)
         stadium_view_layout.addWidget(self.stadium_view)
         
         # Stadium info label positioned at top-right of stadium view
@@ -1948,7 +1963,7 @@ class SplitView(QWidget):
             self.stadium_view.width() - 420,
             self.stadium_view.height() - 160
         )
-        self.flight_stats_list.show()
+        self.flight_stats_list.hide()  # Hidden by default, show with flight history
         
         # Update flight_stats_list position when stadium_view is resized
         original_resize_event = self.stadium_view.resizeEvent
@@ -1961,18 +1976,14 @@ class SplitView(QWidget):
             )
         self.stadium_view.resizeEvent = new_resize_event
         
-        views_layout.addWidget(stadium_view_container, 85)
+        views_layout.addWidget(stadium_view_container, 20)
         
         # 3D umpire view on the right
         self.umpire_view = UmpireView3D()
-        self.umpire_view.setMinimumSize(1280, 720)
-        views_layout.addWidget(self.umpire_view)
+        self.umpire_view.setMinimumSize(1400, 800)
+        views_layout.addWidget(self.umpire_view, 80)
         
         self.layout.addLayout(views_layout)
-        
-        # Weather status label
-        self.weather_label = QLabel("Weather data: Not loaded")
-        self.layout.addWidget(self.weather_label)
     
     
     def update_starting_position(self):
@@ -2114,10 +2125,11 @@ class SplitView(QWidget):
         self.flight_stats_list.addItem(stats_text)
         self.flight_stats_list.scrollToBottom()
         
-        # Also update the weather label for backward compatibility
-        self.weather_label.setText(
-            f"{self.weather_label.text()} | Distance: {distance:.1f} ft | "
-            f"Max Height: {max_height:.1f} ft{' - ' + hr_text if hr_text else ''}"
+        # Update the flight info label
+        self.flight_info_label.setText(
+            f"Distance: {distance:.1f} ft | Max Height: {max_height:.1f} ft | "
+            f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm"
+            f"{' - ' + hr_text if hr_text else ''}"
         )
         
         # Start animation timer
