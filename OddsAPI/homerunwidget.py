@@ -12,7 +12,6 @@ from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *
 from OpenGL.GLUT.fonts import *
-from svg.path import parse_path
 from xml.dom import minidom
 from PyQt6.QtSvg import QtSvg, QSvgRenderer
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem

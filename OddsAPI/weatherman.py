@@ -1,15 +1,161 @@
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QLinearGradient, QPolygonF
 from PyQt6.QtCore import Qt, QPointF
 import math
 import numpy as np
 import requests
 from Creds import open_weather_key
+
+# Helper function for polar coordinate equations
+def polar_equation(angle_deg, coefficients):
+    """
+    Evaluate polar coordinate equation for stadium outfield wall
+    angle_deg: angle in degrees from right field foul line
+    coefficients: (numerator, sin_coeff, cos_coeff) where equation is r = numerator/(sin_coeff*sin(θ) + cos_coeff*cos(θ))
+    """
+    theta = math.radians(angle_deg)
+    numerator, sin_coeff, cos_coeff = coefficients
+    denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta)
+    
+    if abs(denominator) < 1e-10:  # Avoid division by zero
+        return float('inf')
+    
+    return numerator / denominator
+
+def kansascity_r(theta_deg):
+    """Polar equation for Kauffman Stadium - simpler piecewise functions"""
+    θ = math.radians(theta_deg)
+    
+    if 0 <= theta_deg < 5.9:
+        # Complex fraction from image
+        numerator = 1738857 * math.cos(math.radians(theta_deg - 10.1)) - 495945 * math.cos(math.radians(theta_deg - 169.9))
+        denominator = 5417 - 1545 * math.cos(math.radians(theta_deg - 180))
+        return numerator / denominator
+    elif 5.9 <= theta_deg < 22.1:
+        return 25784.376 / (math.sin(θ) + 71.503534 * math.cos(θ))
+    elif 22.1 <= theta_deg < 59:
+        # Complex fraction
+        numerator = 19759218 * math.cos(math.radians(theta_deg - 50.9)) - 1837968 * math.cos(math.radians(theta_deg + 76.9))
+        denominator = 111634 - 10384 * math.cos(math.radians(2 * (theta_deg + 26)))
+        return numerator / denominator
+    elif 59 <= theta_deg < 76.9:
+        return 5643864 * math.cos(math.radians(theta_deg - 68.7)) - 4885980 * math.cos(math.radians(theta_deg + 80.7)) / (16218 - 10400 * math.cos(math.radians(2 * (theta_deg + 12))))
+    elif 76.9 <= theta_deg < 82.7:
+        return 361.884 / (math.sin(θ) + 0.01803985 * math.cos(θ))
+    elif 82.7 <= theta_deg <= 90:
+        # Complex final segment
+        sqrt_part = math.sqrt(2897 - 975 * math.cos(math.radians(theta_deg - 38.5)))
+        numerator = 1929 * sqrt_part - 74122 * math.sin(math.radians(theta_deg - 82.6))**2
+        denominator = 2897 - 975 * math.cos(math.radians(theta_deg - 38.5))
+        return numerator / denominator
+    else:
+        raise ValueError("θ out of bounds for kansascity")
+
+def houston_r(theta_deg):
+    """Polar equation for Minute Maid Park"""
+    θ = math.radians(theta_deg)
+
+    if 0 <= theta_deg < 23:
+        return -2738.7177 / (math.sin(θ) - 8.400974 * math.cos(θ))
+    elif 23 <= theta_deg < 24.1:
+        return 315.172 / (math.sin(θ) + 0.493462 * math.cos(θ))
+    elif 24.1 <= theta_deg < 33.7:
+        return -2943.702 / (math.sin(θ) - 9.23423 * math.cos(θ))
+    elif 33.7 <= theta_deg < 34:
+        return 310.475 / (math.sin(θ) + 0.236868 * math.cos(θ))
+    elif 34 <= theta_deg < 49.6:
+        # Complex segment from image
+        cos_term1 = math.cos(math.radians(theta_deg - 42.5))
+        cos_term2 = math.cos(math.radians(theta_deg + 42.5))
+        cos_2theta = math.cos(math.radians(2 * theta_deg))
+        sin_term = math.sin(math.radians(theta_deg - 42.5))**2
+        
+        sqrt_part = math.sqrt(10525 - 725 * cos_2theta)
+        numerator = (3820575 * cos_term1 - 263175 * cos_term2 + 7424.6 * sqrt_part - 263538 * sin_term)
+        denominator = 10525 - 725 * cos_2theta
+        return numerator / denominator
+    elif 49.6 <= theta_deg < 67.7:
+        return 347.579 / (math.sin(θ) + 0.120385 * math.cos(θ))
+    elif 67.7 <= theta_deg < 67.9:
+        return 42.673422 / (math.sin(θ) - 2.124119 * math.cos(θ))
+    elif 67.9 <= theta_deg <= 90:
+        return 315 / (math.sin(θ) + 0.0366002 * math.cos(θ))
+    else:
+        raise ValueError("θ out of bounds for houston")
+
+def chicagocubs_r(theta_deg):
+    """Corrected polar equation for Wrigley Field"""
+    θ = math.radians(theta_deg)
+
+    if 0 <= theta_deg < 10.9:
+        return -4499.412 / (math.sin(θ) - 12.7462 * math.cos(θ))
+    elif 10.9 <= theta_deg < 13.1:
+        return 297.1748 / (math.sin(θ) + 0.636566 * math.cos(θ))
+    elif 13.1 <= theta_deg < 29.4:
+        return 18363.859 / (math.sin(θ) + 53.4839 * math.cos(θ))
+    elif 29.4 <= theta_deg < 49.2:
+        # Complex equation - carefully transcribed from image
+        # Numerator: 9353823.75*cos(θ - 33.2°) - 2540504.25*cos(θ - 146.8°) + 
+        #           22815.51*√[33526.25 - 9105.75*cos(2θ - 180°)] - 1515682*sin²(θ - 33.2°)
+        # Denominator: 33526.25 - 9105.75*cos(2θ - 180°)
+        
+        cos1 = math.cos(math.radians(theta_deg - 33.2))
+        cos2 = math.cos(math.radians(theta_deg - 146.8))
+        cos3 = math.cos(math.radians(2 * theta_deg - 180))
+        sin_sq = math.sin(math.radians(theta_deg - 33.2))**2
+        
+        sqrt_term = math.sqrt(33526.25 - 9105.75 * cos3)
+        numerator = (9353823.75 * cos1 - 2540504.25 * cos2 + 
+                    22815.51 * sqrt_term - 1515682 * sin_sq)
+        denominator = 33526.25 - 9105.75 * cos3
+        
+        return numerator / denominator
+    elif 49.2 <= theta_deg < 73.2:
+        return 357.8732 / (math.sin(θ) + 0.166827 * math.cos(θ))
+    elif 73.2 <= theta_deg < 74.8:
+        return 496.86435 / (math.sin(θ) + 1.62768 * math.cos(θ))
+    elif 74.8 <= theta_deg <= 90:
+        return 355 / (math.sin(θ) + 0.112061 * math.cos(θ))
+    else:
+        raise ValueError("θ out of bounds for chicagocubs")
+
+def get_stadium_wall_distance(stadium_name, angle_deg):
+    """
+    Get the distance to the outfield wall at a given angle for a stadium
+    stadium_name: Name of the stadium
+    angle_deg: Angle in degrees from right field foul line (0° = RF, 90° = LF)
+    Returns: Distance to wall in feet, or None if no polar coordinates available
+    """
+    if stadium_name not in STADIUM_DATA:
+        return None
+    
+    stadium = STADIUM_DATA[stadium_name]
+    if "polar_coords" not in stadium:
+        return None
+    
+    # Handle complex functions
+    if stadium["polar_coords"] == "complex_function":
+        if "polar_function" in stadium:
+            func_name = stadium["polar_function"]
+            if func_name == "kansascity_r":
+                return kansascity_r(angle_deg)
+            elif func_name == "houston_r":
+                return houston_r(angle_deg)
+            elif func_name == "chicagocubs_r":
+                return chicagocubs_r(angle_deg)
+        return None
+    
+    # Handle standard piecewise functions
+    for angle_start, angle_end, coefficients in stadium["polar_coords"]:
+        if angle_start <= angle_deg <= angle_end:
+            return polar_equation(angle_deg, coefficients)
+    
+    return None
 # ==============================================
 # Stadium Data
 # ==============================================
 STADIUM_DATA = {
-    "American Family field": {  # Milwaukee Brewers
+    "American Family Field": {  # Milwaukee Brewers
         "image_path": "MLBstadiumgraphics/AmericanFamilyField.gif",
         "lat": 43.0280,
         "lon": -87.9712,
@@ -20,7 +166,19 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 374,
             "right_field": 345
-        }
+        },
+        "polar_coords": [
+            (0, 16.5, (4068.1011, 1, 11.7916)),
+            (16.5, 16.8, (60.8626, 1, -0.47706)),
+            (16.8, 23.3, (3834.475, 1, 10.73232)),
+            (23.3, 35.5, (1042.985, 1, 2.60569)),
+            (35.5, 37.7, (-1107.4106, 1, -4.23855)),
+            (37.7, 52.3, (566.71123, 1, 1)),
+            (52.3, 56.2, (287.52, 1, -0.130068)),
+            (56.2, 74, (393.82239, 1, 0.374126)),
+            (74, 85, (358.50448, 1, 0.027824)),
+            (85, 90, (344, 1, -0.435742))
+        ]
     },
     "Angel Stadium": {  # Los Angeles Angels
         "image_path": "MLBstadiumgraphics/AnaheimStadium.gif",
@@ -33,7 +191,21 @@ STADIUM_DATA = {
             "center_field": 398,
             "right_center": 368,
             "right_field": 330
-        }
+        },
+        "polar_coords": [
+            (0, 1.6, (-352.2388, 1, -1.06739)),
+            (1.6, 3.2, (-496.7696, 1, -1.49306)),
+            (3.2, 4.8, (-641.02615, 1, -1.9114787)),
+            (4.8, 6.6, (-1020.3203, 1, -2.9928111)),
+            (6.6, 11.2, (6919.533, 1, 19.3875915)),
+            (11.2, 42.6, (1240.50705, 1, 3.314747)),
+            (42.6, 68, (437.37505, 1, 0.5733725)),
+            (68, 84, (351.0005, 1, -0.028659)),
+            (84, 85.6, (340.789, 1, -0.3046164)),
+            (85.6, 87, (329.5441, 1, -0.72339596)),
+            (87, 88.4, (324.50638, 1, -1.005588)),
+            (88.4, 90, (328, 1, -0.629411))
+        ]
     },
     "Busch Stadium": {  # St. Louis Cardinals
         "image_path": "MLBstadiumgraphics/BuschStadium.gif",
@@ -46,7 +218,16 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 375,
             "right_field": 335
-        }
+        },
+        "polar_coords": [
+            (0, 3.3, (-436.689, 1, -1.3173)),
+            (3.3, 25.6, (346.303, 0, 1)),  # r = 346.303/cos θ
+            (25.6, 39.9, (857.076, 1, 1.955805)),
+            (39.9, 50, (569.534, 1, 1.04571)),
+            (50, 64, (434.192, 1, 0.514)),
+            (64, 88.4, (346.76, 1, 0)),  # r = 346.76/sin θ
+            (88.4, 90, (330, 1, -1.73033))
+        ]
     },
     "Camden Yards": {  # Baltimore Orioles
         "image_path": "MLBstadiumgraphics/CamdenYards.gif",
@@ -59,7 +240,24 @@ STADIUM_DATA = {
             "center_field": 410,
             "right_center": 373,
             "right_field": 318
-        }
+        },
+        "polar_coords": [
+            (3.0, 7.2, (316.0, 1, 0)),
+            (7.2, 10.8, (313.5, 1, 0)),
+            (10.8, 13.6, (312.6, 1, 0)),
+            (13.6, 16.8, (312.4, 1, 0)),
+            (16.8, 18.5, (312.4, 1, 0)),
+            (18.5, 20.5, (313.3, 1, 0)),
+            (20.5, 21.5, (311.6, 1, 0)),
+            (21.5, 23.6, (305.2, 1, 0)),
+            (23.6, 26.3, (297.0, 1, 0)),
+            (26.3, 28.9, (289.1, 1, 0)),
+            (28.9, 31.8, (282.2, 1, 0)),
+            (31.8, 35.6, (274.4, 1, 0)),
+            (35.6, 39.0, (267.4, 1, 0)),
+            (39.0, 41.8, (262.9, 1, 0)),
+            (41.8, 45.2, (258.8, 1, 0)),
+        ]
     },
     "Chase Field": {  # Arizona Diamondbacks
         "image_path": "MLBstadiumgraphics/ChaseField.gif",
@@ -72,7 +270,24 @@ STADIUM_DATA = {
             "center_field": 407,
             "right_center": 376,
             "right_field": 334
-        }
+        },
+        "polar_coords": [
+            (0, 4.9, (-389.4197, 1, -1.624468)),
+            (4.9, 6.6, (423.5471, 1, 1.085346)),
+            (6.6, 31.7, (6211.3885, 1, 17.49789)),
+            (31.7, 32.9, (427.9667, 1, 0.630552)),
+            (32.9, 34, (1197.8397, 1, 2.9286229)),
+            (34, 38.9, (559.10919, 1, 1.0079058)),
+            (38.9, 39.1, (-91.557622, 1, -1.0399598)),
+            (39.1, 50.5, (571.92414, 1, 1.0070058)),
+            (50.5, 50.8, (114.59269, 1, -0.78826977)),
+            (50.8, 55.7, (557.962, 1, 1.0031979)),
+            (55.7, 56.7, (403.8808, 1, 0.3213439)),
+            (56.7, 57.7, (755.17044, 1, 1.924906)),
+            (57.7, 82.5, (353.793768, 1, 0.06108017)),
+            (82.5, 84.2, (395.0241, 1, 0.9533913)),
+            (84.2, 90, (327, 1, -0.9060869))
+        ]
     },
     "Citi Field": {  # New York Mets
         "image_path": "MLBstadiumgraphics/CitiField.gif",
@@ -85,7 +300,18 @@ STADIUM_DATA = {
             "center_field": 408,
             "right_center": 378,
             "right_field": 330
-        }
+        },
+        "polar_coords": [
+            (0, 5.2, (-2766.825, 1, -8.3843195)),
+            (5.2, 7, (-371.523921, 1, -1.204617)),
+            (7, 18.8, (-1855.73071, 1, -5.52645)),
+            (18.8, 23.3, (682.2307, 1, 1.566132)),
+            (23.3, 29.5, (-40721.387, 1, -119.6063)),
+            (29.5, 38.2, (1281.67692, 1, 3.1812751)),
+            (38.2, 49.1, (575.86589, 1, 0.9960149)),
+            (49.1, 82.1, (358.6125, 1, 0.1847202)),
+            (82.1, 90, (335, 1, -0.30194697))
+        ]
     },
     "Citizens Bank Park": {  # Philadelphia Phillies
         "image_path": "MLBstadiumgraphics/CitizensBankPark.gif",
@@ -98,7 +324,15 @@ STADIUM_DATA = {
             "center_field": 401,
             "right_center": 369,
             "right_field": 330
-        }
+        },
+        "polar_coords": [
+            (0, 34.3, (330, 0, 1)),  # r = 330/cos θ
+            (34.3, 50.7, (644.15, 1, 1.2770169)),
+            (50.7, 55.9, (308.591, 1, -0.02468)),
+            (55.9, 59.3, (343.1657, 1, 0)),  # r = 343.1657/sin θ
+            (59.3, 88.3, (331, 1, 1.08071)),
+            (88.3, 90, (325, 1, -0.596191))
+        ]
     },
     "Comerica Park": {  # Detroit Tigers
         "image_path": "MLBstadiumgraphics/ComericaPark.gif",
@@ -111,7 +345,15 @@ STADIUM_DATA = {
             "center_field": 420,
             "right_center": 388,
             "right_field": 345
-        }
+        },
+        "polar_coords": [
+            (0, 1.25, (-405.584, 1, -1.23813)),
+            (1.25, 22.5, (337.21, 0, 1)),  # r = 337.21/cos θ
+            (22.5, 24.6, (-430.4868, 1, -1.6908)),
+            (24.6, 35.3, (347.675, 0, 1)),  # r = 347.675/cos θ
+            (35.3, 54, (593.97, 1, 1)),  # r = 593.97/(sin θ + cos θ)
+            (54, 90, (345, 1, 0))  # r = 345/sin θ
+        ]
     },
     "Coors Field": {  # Colorado Rockies
         "image_path": "MLBstadiumgraphics/CoorsField.gif",
@@ -124,7 +366,13 @@ STADIUM_DATA = {
             "center_field": 415,
             "right_center": 387,
             "right_field": 350
-        }
+        },
+        "polar_coords": [
+            (0, 1.25, (-551.417, 1, -1.57548)),
+            (1.25, 37.5, (4061.537, 1, 11.422)),
+            (37.5, 60.2, (536.536, 1, 0.84288)),
+            (60.2, 90, (330, 1, 0.08135))
+        ]
     },
     "Dodger Stadium": {  # Los Angeles Dodgers
         "image_path": "MLBstadiumgraphics/DodgerStadium.gif",
@@ -137,7 +385,30 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 375,
             "right_field": 330
-        }
+        },
+        "polar_coords": [
+            (0, 4.2, (-443.8081, 1, -1.344873)),
+            (4.2, 7.8, (-829.5118, 1, -2.44985)),
+            (7.8, 9.5, (-10942.3745, 1, -30.646819)),
+            (9.5, 25.1, (1719.756, 1, 4.622957)),
+            (25.1, 31.1, (1115.073, 1, 2.83277)),
+            (31.1, 42.6, (928.868, 1, 2.258998)),
+            (42.6, 44.0, (742.26267, 1, 1.620443)),
+            (44.0, 46.3, (562.6864, 1, 0.9947777)),
+            (46.3, 49.2, (472.8006, 1, 0.66870534)),
+            (49.2, 55.3, (423.6147, 1, 0.478618)),
+            (55.3, 59, (395.11776, 1, 0.349269)),
+            (59, 63.1, (392.2193, 1, 0.3344991)),
+            (63.1, 69.2, (381.7462, 1, 0.2729345)),
+            (69.2, 74.7, (372.8431, 1, 0.2051737)),
+            (74.7, 80.5, (368.8506, 1, 0.163833)),
+            (80.5, 82.1, (362.2344, 1, 0.053704)),
+            (82.1, 83.3, (353.007, 1, -0.139245)),
+            (83.3, 85.6, (331.774, 1, -0.564136)),
+            (85.6, 87.2, (333.006, 1, -0.629807)),
+            (87.2, 88.4, (328.317, 1, -0.90885)),
+            (88.4, 90, (330, 1, -0.729958))
+        ]
     },
     "Fenway Park": {  # Boston Red Sox
         "image_path": "MLBstadiumgraphics/FenwayPark.gif",
@@ -150,7 +421,20 @@ STADIUM_DATA = {
             "center_field": 390,
             "right_center": 380,
             "right_field": 302
-        }
+        },
+        "polar_coords": [
+            # Format: (angle_start, angle_end, (numerator, sin_coeff, cos_coeff)) where r = numerator/(sin_coeff*sin(θ) + cos_coeff*cos(θ))
+            (0, 3.8, (-119.0423, 1, -0.3941798)),
+            (3.8, 4.9, (-402.289, 1, -1.174046)),
+            (4.9, 6, (-808.953, 1, -2.274195)),
+            (6, 7.1, (-2332.79083, 1, -6.360156)),
+            (7.1, 8.1, (-20759.85313, 1, -55.616)),
+            (8.1, 31, (1129.33168, 1, 2.875435)),
+            (31, 33.8, (-417.143116, 1, -1.8849057)),
+            (33.8, 52.2, (431.2604, 1, 0.587157)),  # Fixed: positive numerator
+            (52.2, 53.1, (2077.8716, 1, 7.7513156)),
+            (53.1, 90, (306, 1, 0.0957087))
+        ]
     },
     "Globe Life Field": {  # Texas Rangers
         "image_path": "MLBstadiumgraphics/GlobeLifeField.gif",
@@ -163,7 +447,17 @@ STADIUM_DATA = {
             "center_field": 407,
             "right_center": 374,
             "right_field": 326
-        }
+        },
+        "polar_coords": [
+            (0, 4, (-432.031, 1, -1.3252)),
+            (4, 24, (343.5, 0, 1)),  # r = 343.5/cos θ
+            (24, 26.1, (543.706, 1, 1.1376)),
+            (26.1, 34.3, (336.22, 0, 1)),  # r = 336.22/cos θ
+            (34.3, 53.1, (565.81, 1, 1)),  # r = 565.81/(sin θ + cos θ)
+            (53.1, 64.3, (416.6997, 1, 0.38598)),
+            (64.3, 84.2, (349.203, 1, 0)),  # r = 349.203/sin θ
+            (84.2, 90, (331, 1, -0.51319))
+        ]
     },
     "Great American Ball Park": {  # Cincinnati Reds
         "image_path": "MLBstadiumgraphics/GreatAmericanBallPark.gif",
@@ -176,7 +470,13 @@ STADIUM_DATA = {
             "center_field": 404,
             "right_center": 365,
             "right_field": 325
-        }
+        },
+        "polar_coords": [
+            (0, 44.7, (11951552.5, 1, 39.393117)),
+            (44.7, 60.3, (436.311, 1, 0.5223157)),
+            (60.3, 86.6, (336.435, 1, 0.0014347)),
+            (86.6, 90, (326, 1, -0.5206991))
+        ]
     },
     "Guaranteed Rate Field": {  # Chicago White Sox
         "image_path": "MLBstadiumgraphics/GuaranteedRateField.gif",
@@ -189,7 +489,19 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 375,
             "right_field": 335
-        }
+        },
+        "polar_coords": [
+            (0, 24.1, (-7014.6043, 1, -20.939117)),
+            (24.1, 30.6, (1495.6997, 1, 3.92207)),
+            (30.6, 36.6, (820.061, 1, 1.88324)),
+            (36.6, 39.1, (1969.1459, 1, 5.562717)),
+            (39.1, 50.6, (561.4969, 1, 1.00525)),
+            (50.6, 54, (363.2118, 1, 0.2203438)),
+            (54, 58.7, (426.18639, 1, 0.49718)),
+            (58.7, 63.4, (378.8179, 1, 0.259128)),
+            (63.4, 79, (340.82399, 1, 0.03285)),
+            (79, 90, (327, 1, -0.221087))
+        ]
     },
     "Kauffman Stadium": {  # Kansas City Royals
         "image_path": "MLBstadiumgraphics/KauffmanStadium.gif",
@@ -202,7 +514,27 @@ STADIUM_DATA = {
             "center_field": 410,
             "right_center": 375,
             "right_field": 330
-        }
+        },
+        "polar_coords": [
+            (0.0, 3.2, (329.2, 1, 0)),
+            (3.2, 5.2, (328.6, 1, 0)),
+            (5.2, 9.7, (328.0, 1, 0)),
+            (9.7, 13.4, (325.7, 1, 0)),
+            (13.4, 18.2, (321.2, 1, 0)),
+            (18.2, 22.1, (315.9, 1, 0)),
+            (22.1, 25.1, (311.6, 1, 0)),
+            (25.1, 27.7, (308.6, 1, 0)),
+            (27.7, 31.2, (304.4, 1, 0)),
+            (31.2, 33.5, (299.9, 1, 0)),
+            (33.5, 35.9, (296.7, 1, 0)),
+            (35.9, 38.4, (293.3, 1, 0)),
+            (38.4, 40.5, (291.4, 1, 0)),
+            (40.5, 42.0, (288.3, 1, 0)),
+            (42.0, 43.1, (282.7, 1, 0)),
+            (43.1, 44.3, (276.4, 1, 0)),
+            (44.3, 45.0, (270.6, 1, 0)),
+            (45.0, 45.3, (267.3, 1, 0)),
+        ]
     },
     "LoanDepot Park": {  # Miami Marlins
         "image_path": "MLBstadiumgraphics/LoanDepotPark.gif",
@@ -215,7 +547,31 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 392,
             "right_field": 335
-        }
+        },
+        "polar_coords": [
+            (0, 23.7, (-3285.092, 1, -9.80624)),
+            (23.7, 27.1, (5130.955, 1, 14.1917)),
+            (27.1, 33.1, (1260.2215, 1, 3.099602)),
+            (33.1, 37.2, (928.6866, 1, 2.112672)),
+            (37.2, 41.2, (822.69397, 1, 1.78492)),
+            (41.2, 44.6, (697.690, 1, 1.380603)),
+            (44.6, 47.9, (624.24997, 1, 1.1315557)),
+            (47.9, 51.2, (567.2532, 1, 0.927194)),
+            (51.2, 51.3, (123.3194, 1, -0.7717929)),
+            (51.3, 51.6, (163.114, 1, -0.618006)),
+            (51.6, 52.3, (268.849, 1, -0.295638)),
+            (52.3, 53.6, (333.1776, 1, 0.061447)),
+            (53.6, 55, (333.94836, 1, 0.06472688)),
+            (55, 56.5, (391.363, 1, 0.3213203)),
+            (56.5, 59, (457.485, 1, 0.630953)),
+            (59, 60.8, (389.587, 1, 0.2903055)),
+            (60.8, 63.6, (387.8902, 1, 0.281246)),
+            (63.6, 68.2, (367.932, 1, 0.163124)),
+            (68.2, 72.1, (360.9411, 1, 0.112519)),
+            (72.1, 79.2, (349.332, 1, 0.0031917)),
+            (79.2, 84.3, (339.562, 1, -0.137541)),
+            (84.3, 90, (337, 1, -0.212114))
+        ]
     },
     "Minute Maid Park": {  # Houston Astros
         "image_path": "MLBstadiumgraphics/MinuteMaidPark.gif",
@@ -228,7 +584,24 @@ STADIUM_DATA = {
             "center_field": 409,
             "right_center": 373,
             "right_field": 326
-        }
+        },
+        "polar_coords": [
+            (0.0, 3.2, (325.9, 1, 0)),
+            (3.2, 7.3, (327.3, 1, 0)),
+            (7.3, 9.7, (330.4, 1, 0)),
+            (9.7, 11.7, (327.4, 1, 0)),
+            (11.7, 13.2, (319.2, 1, 0)),
+            (13.2, 14.7, (312.9, 1, 0)),
+            (14.7, 16.6, (306.4, 1, 0)),
+            (16.6, 18.8, (299.5, 1, 0)),
+            (18.8, 20.4, (297.2, 1, 0)),
+            (20.4, 22.3, (294.9, 1, 0)),
+            (22.3, 24.2, (288.8, 1, 0)),
+            (24.2, 26.6, (284.2, 1, 0)),
+            (26.6, 28.2, (281.2, 1, 0)),
+            (28.2, 30.2, (276.9, 1, 0)),
+            (30.2, 44.9, (266.4, 1, 0)),
+        ]
     },
     "Nationals Park": {  # Washington Nationals
         "image_path": "MLBstadiumgraphics/NationalsPark.gif",
@@ -241,20 +614,50 @@ STADIUM_DATA = {
             "center_field": 402,
             "right_center": 370,
             "right_field": 335
-        }
+        },
+        "polar_coords": [
+            (0, 13.1, (-1192.9, 1, -3.56091)),
+            (13.1, 46.5, (1018.837, 1, 2.609847)),
+            (46.5, 57.9, (372.8509, 1, 0.286983)),
+            (57.9, 59, (1089.637, 1, 3.903208)),
+            (59, 74.1, (383.87617, 1, 0.297133)),
+            (74.1, 74.2, (163.401, 1, -1.88975)),
+            (74.2, 76.5, (377.1893, 1, 0.261412)),
+            (76.5, 90, (336, 1, -0.221087))
+        ]
     },
-    "Oakland Coliseum": {  # Oakland Athletics
-        "image_path": "MLBstadiumgraphics/OaklandColiseum.gif",
-        "lat": 37.7516,
-        "lon": -122.2005,
-        "altitude": 20,
+    "Sutter Health Park": {  # Oakland Athletics - 2025-2027 temporary venue
+        "image_path": "MLBstadiumgraphics/SutterHealthPark.gif",
+        "lat": 38.6561,
+        "lon": -121.5025,
+        "altitude": 30,
         "dimensions": {
-            "left_field": 330,
-            "left_center": 367,
+            "left_field": 325,
+            "left_center": 362,
             "center_field": 400,
-            "right_center": 367,
-            "right_field": 330
-        }
+            "right_center": 365,
+            "right_field": 320
+        },
+        "polar_coords": [
+            (1.7, 4.6, (315.1, 1, 0)),
+            (4.6, 6.1, (314.3, 1, 0)),
+            (6.1, 8.8, (309.1, 1, 0)),
+            (8.8, 10.7, (304.0, 1, 0)),
+            (10.7, 13.4, (299.7, 1, 0)),
+            (13.4, 16.2, (295.5, 1, 0)),
+            (16.2, 18.8, (292.3, 1, 0)),
+            (18.8, 21.7, (289.9, 1, 0)),
+            (21.7, 23.8, (288.3, 1, 0)),
+            (23.8, 26.7, (287.1, 1, 0)),
+            (26.7, 29.0, (286.2, 1, 0)),
+            (29.0, 30.2, (286.2, 1, 0)),
+            (30.2, 31.1, (285.5, 1, 0)),
+            (31.1, 33.3, (281.4, 1, 0)),
+            (33.3, 35.7, (274.9, 1, 0)),
+            (35.7, 38.7, (268.2, 1, 0)),
+            (38.7, 41.8, (262.2, 1, 0)),
+            (41.8, 45.1, (256.4, 1, 0)),
+        ]
     },
     "Oracle Park": {  # San Francisco Giants
         "image_path": "MLBstadiumgraphics/OraclePark.gif",
@@ -267,7 +670,15 @@ STADIUM_DATA = {
             "center_field": 399,
             "right_center": 415,
             "right_field": 309
-        }
+        },
+        "polar_coords": [
+            (0, 15, (-697.339, 1, -2.25676)),
+            (15, 18, (946.0859, 1, 2.4155)),
+            (18, 26, (-712.5915, 1, -2.3890)),
+            (26, 55, (564.2761, 1, 1)),
+            (55, 86.5, (347.526, 1, 0.07005)),
+            (86.5, 90, (335, 1, -0.513097))
+        ]
     },
     "Petco Park": {  # San Diego Padres
         "image_path": "MLBstadiumgraphics/PetcoPark.gif",
@@ -280,7 +691,20 @@ STADIUM_DATA = {
             "center_field": 396,
             "right_center": 391,
             "right_field": 322
-        }
+        },
+        "polar_coords": [
+            (0, 3.4, (321.433, 0, 1)),  # r = 321.433/cos θ
+            (3.4, 7.2, (-311.7359, 1, -1.029242)),
+            (7.2, 27.8, (345.87116, 0, 1)),  # r = 345.87116/cos θ
+            (27.8, 31.8, (1425.7353, 1, 3.59492)),
+            (31.8, 38.3, (740.2202, 1, 1.568308)),
+            (38.3, 49.2, (543.05468, 1, 0.9402139)),
+            (49.2, 50.4, (318.3662, 1, 0.0718681)),
+            (50.4, 56.2, (539.44852, 1, 0.9611939)),
+            (56.2, 63.5, (393.566469, 1, 0.2972904)),
+            (63.5, 83.8, (344.316, 1, 0.0091096)),
+            (83.8, 90, (336, 1, -0.2134522))
+        ]
     },
     "PNC Park": {  # Pittsburgh Pirates
         "image_path": "MLBstadiumgraphics/PNCPark.gif",
@@ -293,7 +717,16 @@ STADIUM_DATA = {
             "center_field": 399,
             "right_center": 375,
             "right_field": 320
-        }
+        },
+        "polar_coords": [
+            (0, 22.3, (-1759.947, 1, -5.4827)),
+            (22.3, 34.1, (1120.146, 1, 2.81843)),
+            (34.1, 44.3, (716.884, 1, 1.56)),
+            (44.3, 58.5, (478.809, 1, 0.71785)),
+            (58.5, 59.6, (-4560.837, 1, -24.0136)),
+            (59.6, 81.5, (366.846, 1, 0.089958)),
+            (81.5, 90, (321, 1, -0.75751))
+        ]
     },
     "Progressive Field": {  # Cleveland Guardians
         "image_path": "MLBstadiumgraphics/ProgressiveField.gif",
@@ -306,7 +739,13 @@ STADIUM_DATA = {
             "center_field": 405,
             "right_center": 375,
             "right_field": 325
-        }
+        },
+        "polar_coords": [
+            (0, 20.3, (-1609.844, 1, -4.98404)),
+            (20.3, 48.25, (906.183, 1, 2.2274)),
+            (48.25, 78.25, (356.7465, 1, 0.197554)),
+            (78.25, 90, (321, 1, -0.303978))
+        ]
     },
     "Rogers Centre": {  # Toronto Blue Jays
         "image_path": "MLBstadiumgraphics/RogersCentre.gif",
@@ -319,7 +758,14 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 375,
             "right_field": 328
-        }
+        },
+        "polar_coords": [
+            (0, 20, (-1725.1974, 1, -5.2597)),
+            (20, 32.5, (2160.354, 1, 5.7667)),
+            (32.5, 57.5, (400, 1, 0)),  # r = 400/sin θ
+            (57.5, 70, (374.6529, 1, 0.17341)),
+            (70, 90, (328, 1, -0.19012))
+        ]
     },
     "T-Mobile Park": {  # Seattle Mariners
         "image_path": "MLBstadiumgraphics/TMobilePark.gif",
@@ -332,7 +778,15 @@ STADIUM_DATA = {
             "center_field": 401,
             "right_center": 381,
             "right_field": 326
-        }
+        },
+        "polar_coords": [
+            (0, 26.5, (-3502.437, 1, -10.74367)),
+            (26.5, 47, (825.224, 1, 1.91548)),
+            (47, 59.6, (414.271, 1, 0.427476)),
+            (59.6, 66.5, (437.4922, 1, 0.2382)),
+            (66.5, 88.5, (336.558, 1, -0.037016)),
+            (88.5, 90, (331, 1, -0.6671))
+        ]
     },
     "Target Field": {  # Minnesota Twins
         "image_path": "MLBstadiumgraphics/TargetField.gif",
@@ -345,20 +799,45 @@ STADIUM_DATA = {
             "center_field": 404,
             "right_center": 367,
             "right_field": 328
-        }
+        },
+        "polar_coords": [
+            (0, 20, (-2731.998, 1, -8.3292)),
+            (20, 38.5, (1691.285, 1, 4.5671)),
+            (38.5, 51.2, (629.3765, 1, 1.2001)),
+            (51.2, 67, (382.741, 1, 0.24243)),
+            (67, 90, (339, 1, -0.06451))
+        ]
     },
-    "Tropicana Field": {  # Tampa Bay Rays
-        "image_path": "MLBstadiumgraphics/TropicanaField.gif",
-        "lat": 27.7682,
-        "lon": -82.6534,
-        "altitude": 30,
+    "George M. Steinbrenner Field": {  # Tampa Bay Rays - 2025 temporary venue
+        "image_path": "MLBstadiumgraphics/SteinbrennerField.gif", 
+        "lat": 28.0647,
+        "lon": -82.5069,
+        "altitude": 15,
         "dimensions": {
-            "left_field": 315,
-            "left_center": 370,
-            "center_field": 404,
+            "left_field": 318,
+            "left_center": 360,
+            "center_field": 408,
             "right_center": 370,
-            "right_field": 322
-        }
+            "right_field": 325
+        },
+        "polar_coords": [
+            (0.7, 4.1, (312.5, 1, 0)),
+            (4.1, 6.8, (309.7, 1, 0)),
+            (6.8, 9.7, (306.3, 1, 0)),
+            (9.7, 12.0, (302.1, 1, 0)),
+            (12.0, 14.9, (296.9, 1, 0)),
+            (14.9, 17.8, (289.8, 1, 0)),
+            (17.8, 20.3, (282.9, 1, 0)),
+            (20.3, 23.6, (276.3, 1, 0)),
+            (23.6, 26.6, (270.2, 1, 0)),
+            (26.6, 29.6, (266.1, 1, 0)),
+            (29.6, 32.8, (262.0, 1, 0)),
+            (32.8, 35.6, (258.5, 1, 0)),
+            (35.6, 38.5, (256.1, 1, 0)),
+            (38.5, 41.5, (252.6, 1, 0)),
+            (41.5, 43.5, (247.7, 1, 0)),
+            (43.5, 45.4, (242.0, 1, 0)),
+        ]
     },
     "Truist Park": {  # Atlanta Braves
         "image_path": "MLBstadiumgraphics/TruistPark.gif",
@@ -371,7 +850,11 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 375,
             "right_field": 325
-        }
+        },
+        "polar_coords": [
+            (0, 18, (-1169.68, 1, -3.544497)),
+            (18, 90, (70149.053, 1, 193.783))
+        ]
     },
     "Wrigley Field": {  # Chicago Cubs
         "image_path": "MLBstadiumgraphics/WrigleyField.gif",
@@ -384,7 +867,30 @@ STADIUM_DATA = {
             "center_field": 400,
             "right_center": 368,
             "right_field": 353
-        }
+        },
+        "polar_coords": [
+            (1.1, 1.4, (354.5, 1, 0)),
+            (1.4, 2.2, (355.7, 1, 0)),
+            (2.2, 4.6, (355.9, 1, 0)),
+            (4.6, 6.0, (356.0, 1, 0)),
+            (6.0, 9.8, (354.6, 1, 0)),
+            (9.8, 12.9, (352.1, 1, 0)),
+            (12.9, 16.2, (347.4, 1, 0)),
+            (16.2, 20.1, (339.9, 1, 0)),
+            (20.1, 27.0, (326.9, 1, 0)),
+            (27.0, 28.9, (317.8, 1, 0)),
+            (28.9, 30.7, (315.4, 1, 0)),
+            (30.7, 32.0, (315.3, 1, 0)),
+            (32.0, 32.9, (319.6, 1, 0)),
+            (32.9, 34.0, (324.0, 1, 0)),
+            (34.0, 35.4, (324.8, 1, 0)),
+            (35.4, 37.5, (322.2, 1, 0)),
+            (37.5, 39.7, (319.6, 1, 0)),
+            (39.7, 39.7, (318.3, 1, 0)),
+            (39.7, 41.4, (318.0, 1, 0)),
+            (41.4, 43.7, (316.8, 1, 0)),
+            (43.7, 45.4, (315.4, 1, 0)),
+        ]
     },
     "Yankee Stadium": {  # New York Yankees
         "image_path": "MLBstadiumgraphics/YankeeStadium.gif",
@@ -397,7 +903,22 @@ STADIUM_DATA = {
             "center_field": 408,
             "right_center": 385,
             "right_field": 314
-        }
+        },
+        "polar_coords": [
+            (0, 3.2, (-752.7415, 1, -2.397266)),
+            (3.2, 4.9, (-1341.4764, 1, -4.22849)),
+            (4.9, 30.6, (323.639, 0, 1)),
+            (30.6, 36.1, (50683.6147, 1, 7.700602)),
+            (36.1, 40.4, (913.27186, 1, 2.139572)),
+            (40.4, 44.4, (707.36801, 1, 1.4653105)),
+            (44.4, 48.4, (600.811759, 1, 1.096466)),
+            (48.4, 52.1, (496.317582, 1, 0.7103848)),
+            (52.1, 56.7, (445.2994, 1, 0.5055365)),
+            (56.7, 62.8, (390.30014, 1, 0.2548946)),
+            (62.8, 80.6, (345.39856, 1, 0.00171098)),
+            (80.6, 84.8, (324.4985, 1, -0.3638949)),
+            (84.8, 90, (316, 1, -0.6421415))
+        ]
     }
 }
 
@@ -446,61 +967,69 @@ class WeatherService:
         return weather_data
 
 
-# ==============================================
-# Wind Vector Drawing Functions
-# ==============================================
-def draw_wind_vector(painter, x, y, speed, direction):
-    """Draw a wind vector arrow"""
-    # Convert wind direction from meteorological to mathematical angle
-    # In meteorological conventions, 0° is North, and increases clockwise
-    # In mathematical conventions, 0° is East, and increases counterclockwise
-    math_angle = (270 - direction) % 360
-    rad_angle = math.radians(math_angle)
-
-    # Scale length based on wind speed - MAKE MUCH BIGGER
-    max_length = 80  # Increased from 30 to 80
-    min_length = 40  # Increased from 5 to 40
-    scaled_length = min(max_length, max(min_length, speed * 4))  # Double multiplier
-
-    # Calculate end point
-    end_x = x + scaled_length * math.cos(rad_angle)
-    end_y = y + scaled_length * math.sin(rad_angle)
-
-    # Set color based on wind speed - MAKE MORE VIBRANT
-    if speed < 5:
-        color = QColor(47, 88, 109)  # Bright green for light wind
-    elif speed < 10:
-        color = QColor(30, 236, 205)  # Bright blue for moderate wind
-    else:
-        color = QColor(255, 0, 0)  # Bright red for strong wind
-
-    # Draw the arrow line - MAKE THICKER
-    pen = QPen(color, 4)  # Thicker line (4px)
-    painter.setPen(pen)
+    # Use this at later date, see whos gonna miss FG wide right
+    def draw_wind_vector(painter, x, y, speed, direction):
+        """Draw a wind vector arrow with solid arrowhead"""
+        # Convert wind direction from meteorological to mathematical angle
+        math_angle = (270 - direction) % 360
+        rad_angle = math.radians(math_angle)
     
-    # Use QPointF for proper float handling in PyQt6
-    start_point = QPointF(float(x), float(y))
-    end_point = QPointF(float(end_x), float(end_y))
-    painter.drawLine(start_point, end_point)
-
-    # Draw arrowhead - MAKE BIGGER
-    arrowhead_angle = 25  # degrees
-    arrowhead_length = 25  # pixels - increased from 8 to 20
-
-    angle1 = rad_angle + math.radians(180 - arrowhead_angle)
-    angle2 = rad_angle + math.radians(180 + arrowhead_angle)
-
-    arrow1_x = end_x + arrowhead_length * math.cos(angle1)
-    arrow1_y = end_y + arrowhead_length * math.sin(angle1)
-    arrow2_x = end_x + arrowhead_length * math.cos(angle2)
-    arrow2_y = end_y + arrowhead_length * math.sin(angle2)
-
-    # Use QPointF for arrowhead lines too
-    arrow1_point = QPointF(float(arrow1_x), float(arrow1_y))
-    arrow2_point = QPointF(float(arrow2_x), float(arrow2_y))
+        # Scale length based on wind speed
+        max_length = 90
+        min_length = 40
+        scaled_length = min(max_length, max(min_length, speed * 4.5))
     
-    painter.drawLine(end_point, arrow1_point)
-    painter.drawLine(end_point, arrow2_point)
+        # Calculate shaft end point (where arrowhead begins)
+        shaft_end_x = x + (scaled_length * 0.7) * math.cos(rad_angle)
+        shaft_end_y = y + (scaled_length * 0.7) * math.sin(rad_angle)
+        
+        # Calculate the true end point (tip of arrow)
+        tip_x = x + scaled_length * math.cos(rad_angle)
+        tip_y = y + scaled_length * math.sin(rad_angle)
+    
+        # Set color based on wind speed
+        if speed < 5:
+            color = QColor(0, 120, 255)  # Blue for light wind
+        elif speed < 10:
+            color = QColor(0, 200, 100)  # Green for moderate wind
+        else:
+            color = QColor(255, 40, 40)  # Red for strong wind
+    
+        # Save painter state
+        painter.save()
+        
+        # Draw the shaft as a thick line
+        pen = QPen(color, 6)  # Thicker line for visibility
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)  # Rounded ends
+        painter.setPen(pen)
+        painter.drawLine(QPointF(x, y), QPointF(shaft_end_x, shaft_end_y))
+        
+        # Create arrowhead as a polygon
+        arrowhead_width = min(25, scaled_length * 0.4)  # Width proportional to length
+        
+        # Calculate the perpendicular direction for arrowhead width
+        perp_angle = rad_angle + math.pi/2  # 90 degrees
+        
+        # Calculate the two base points of the arrowhead
+        left_x = shaft_end_x + arrowhead_width * math.cos(perp_angle)
+        left_y = shaft_end_y + arrowhead_width * math.sin(perp_angle)
+        
+        right_x = shaft_end_x - arrowhead_width * math.cos(perp_angle)
+        right_y = shaft_end_y - arrowhead_width * math.sin(perp_angle)
+        
+        # Create the polygon
+        arrowhead = QPolygonF()
+        arrowhead.append(QPointF(tip_x, tip_y))  # Tip
+        arrowhead.append(QPointF(left_x, left_y))  # Left corner
+        arrowhead.append(QPointF(right_x, right_y))  # Right corner
+        
+        # Fill the arrowhead polygon
+        painter.setPen(Qt.PenStyle.NoPen)  # No outline
+        painter.setBrush(QBrush(color))  # Solid fill
+        painter.drawPolygon(arrowhead)
+        
+        # Restore painter state
+        painter.restore()
 
 def draw_precipitation(painter, precipitation, width, height, is_in_stadium_area_func):
     """Draw precipitation visualization"""
