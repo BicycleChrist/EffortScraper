@@ -435,21 +435,52 @@ class ModernOddsWindow(QMainWindow):
         
         region_container = QWidget()
         region_layout = QGridLayout(region_container)
-        region_layout.setSpacing(10)
+        region_layout.setSpacing(6)
+        region_layout.setContentsMargins(0, 2, 0, 0)
+        
+        # Define toggle pill style
+        toggle_pill_style = """
+            QPushButton {
+                background-color: #2C3E50;
+                color: white;
+                border: 1px solid #34495E;
+                padding: 3px 8px;
+                border-radius: 12px;
+                font-size: 9pt;
+                font-weight: bold;
+                min-width: 28px;
+                max-width: 44px;
+                min-height: 20px;
+                max-height: 20px;
+            }
+            QPushButton:checked {
+                background-color: #28a745;
+                color: white;
+                border: 1px solid #218838;
+            }
+            QPushButton:hover {
+                background-color: #34495E;
+            }
+            QPushButton:checked:hover {
+                background-color: #218838;
+            }
+        """
         
         self.region_checkboxes = {}
-        regions = ['us', 'us2', 'eu', 'au', 'uk', 'global']
+        regions = ['us', 'us2', 'eu', 'au', 'uk', 'all']
         
-        # Create checkboxes in a 3x2 grid (3 columns, 2 rows)
+        # Create toggle pill buttons in a 3x2 grid (3 columns, 2 rows)
         for i, region in enumerate(regions):
-            checkbox = QCheckBox(region)
+            pill_button = QPushButton(region.upper())
+            pill_button.setCheckable(True)
+            pill_button.setStyleSheet(toggle_pill_style)
             if region == 'us':
-                checkbox.setChecked(True)
-            checkbox.stateChanged.connect(lambda state, r=region: self.handle_region_change(r))
-            self.region_checkboxes[region] = checkbox
-            region_layout.addWidget(checkbox, i // 3, i % 3)
+                pill_button.setChecked(True)
+            pill_button.clicked.connect(lambda checked, r=region: self.handle_region_change(r))
+            self.region_checkboxes[region] = pill_button
+            region_layout.addWidget(pill_button, i // 3, i % 3)
         
-        region_container.setFixedHeight(58)
+        region_container.setFixedHeight(66)
         region_container.setFixedWidth(200)
         region_section_layout.addWidget(region_container)
         region_section.setFixedWidth(220)
@@ -804,20 +835,20 @@ class ModernOddsWindow(QMainWindow):
       
     def handle_region_change(self, region):
         """Handle region selection changes"""
-        if region == 'global' and self.region_checkboxes['global'].isChecked():
-            # Check all other regions when global is selected
-            for r, cb in self.region_checkboxes.items():
-                if r != 'global':
-                    cb.setChecked(True)
+        if region == 'all' and self.region_checkboxes['all'].isChecked():
+            # Check all other regions when all is selected
+            for r, pill in self.region_checkboxes.items():
+                if r != 'all':
+                    pill.setChecked(True)
             self.selected_region = "us,us2,eu,au,uk"  # Ensure it's a string, not a set
         else:
-            # If global is unchecked, uncheck it when selecting individual regions
-            if region != 'global':
-                self.region_checkboxes['global'].setChecked(False)
+            # If all is unchecked, uncheck it when selecting individual regions
+            if region != 'all':
+                self.region_checkboxes['all'].setChecked(False)
             
-            # Get all selected regions except 'global'
-            selected = [r for r, cb in self.region_checkboxes.items() 
-                       if cb.isChecked() and r != 'global']
+            # Get all selected regions except 'all'
+            selected = [r for r, pill in self.region_checkboxes.items() 
+                       if pill.isChecked() and r != 'all']
             
             # Join selected regions with commas or default to "us"
             self.selected_region = ",".join(selected) if selected else "us"  # Ensure string format
@@ -970,19 +1001,21 @@ class ModernOddsWindow(QMainWindow):
             # Extract the league name without the market info
             if "(" in self.current_league:
                 base_league = self.current_league.split(" (")[0]
-                # Optionally update league selector to match the tab
+                # Update league selector without triggering change event
+                self.league_selector.blockSignals(True)
                 self.league_selector.setCurrentText(base_league)
+                self.league_selector.blockSignals(False)
             
-            # UPDATE BEST LINES FOR CURRENT TAB
+            # UPDATE BEST LINES FOR CURRENT TAB - defer to avoid blocking tab switch
             if hasattr(self, 'best_lines_widget') and self.current_league in self.league_tabs:
                 tab_data = self.league_tabs[self.current_league]
                 if hasattr(tab_data, 'consolidated_odds_data'):
-                    self.best_lines_widget.update_display(tab_data.consolidated_odds_data)
+                    # Use QTimer to defer the update so tab switching is instant
+                    QTimer.singleShot(0, lambda: self.best_lines_widget.update_display(tab_data.consolidated_odds_data))
             
             # Clear search bar when switching tabs
             if hasattr(self, 'search_bar'):
                 self.search_bar.clear()
-                self.filter_table()
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
         """Create a new tab for a league with specific markets"""
