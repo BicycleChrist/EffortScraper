@@ -1013,9 +1013,14 @@ class ModernOddsWindow(QMainWindow):
                     # Use QTimer to defer the update so tab switching is instant
                     QTimer.singleShot(0, lambda: self.best_lines_widget.update_display(tab_data.consolidated_odds_data))
             
-            # Clear search bar when switching tabs
+            # Clear search bar and reset table display when switching tabs
             if hasattr(self, 'search_bar'):
                 self.search_bar.clear()
+                # Reset table display to show all rows
+                current_table = self.tab_widget.currentWidget()
+                if current_table and isinstance(current_table, QTableWidget):
+                    for row in range(current_table.rowCount()):
+                        current_table.setRowHidden(row, False)
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
         """Create a new tab for a league with specific markets"""
