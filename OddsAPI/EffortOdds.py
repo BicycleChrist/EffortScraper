@@ -430,7 +430,7 @@ class ModernOddsWindow(QMainWindow):
         region_section_layout = QVBoxLayout(region_section)
         region_section_layout.setContentsMargins(0, 0, 0, 0)
         
-        region_label = QLabel("Select Region:")
+        region_label = QLabel("Region:")
         region_section_layout.addWidget(region_label)
         
         region_container = QWidget()

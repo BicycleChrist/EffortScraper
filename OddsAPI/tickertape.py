@@ -6,6 +6,8 @@ from PyQt6.QtCore import QRectF, QPointF
 from livetape_scraper import scrape_espn_scores 
 import threading
 
+# Movie box office information that can be gathered as why the hell not (polymarket specific)
+
 class TickerTape(QWidget):
     """Advanced ESPN-style ticker with segmented sports and ultra-smooth scrolling"""
     

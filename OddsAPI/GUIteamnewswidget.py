@@ -149,6 +149,199 @@ class NewsWorker(QObject):
         news_items.sort(key=lambda x: x['date'], reverse=True)
         return news_items
 
+    def filter_low_value_headlines(self, news_items):
+        """Filter out fantasy rankings, speculation, and low-value headlines"""
+        if not news_items:
+            return news_items
+        
+        import re
+        
+        # Patterns that indicate low-value content
+        low_value_patterns = [
+            # Fantasy/ranking content
+            r'\brank\b.*\btop\s*\d+\b',  # "rank 2025's top 10"
+            r'\bbest\b.*\brank\b',  # "best running backs? ... rank"
+            r'\btop\s*\d+\b.*\brank',  # "top 10 ... rank"
+            r'\bpower\s*ranking',  # "power ranking"
+            r'\bfantasy\s*football\b',  # "fantasy football"
+            r'\bfantasy\s*baseball\b',  # "fantasy baseball"
+            r'\bfantasy\s*basketball\b',  # "fantasy basketball"
+            r'\bfantasy\s*hockey\b',  # "fantasy hockey"
+            r'\bfantasy\s*impact\b',  # "fantasy impact"
+            r'\bfantasy\s*outlook\b',  # "fantasy outlook"
+            r'\bfantasy\s*preview\b',  # "fantasy preview"
+            r'\bstart\s*(\w+\s+)?sit\b',  # "start/sit", "start or sit"
+            r'\bweek\s*\d+\s*start\b',  # "week 10 start"
+            r'\bweek\s*\d+\s*sit\b',  # "week 10 sit"
+            r'\blineup\s*advice\b',  # "lineup advice"
+            r'\bpick\s*up\b.*\bwaiver\b',  # "pick up waiver"
+            r'\bwaiver\s*wire\b',  # "waiver wire"
+            r'\bdraft\s*(\w+\s+)?pick\b',  # "draft pick", "draft top pick"
+            r'\bsleeper\s*pick\b',  # "sleeper pick"
+            r'\bmock\s*draft\b',  # "mock draft"
+            
+            # Speculation/rumor content
+            r'\brumor\s*roundup\b',  # "rumor roundup"
+            r'\bquestions\s*about\b',  # "questions about"
+            r'\bwhat\s*if\b',  # "what if"
+            r'\bshould\s*(\w+\s+)?trade\b',  # "should trade", "should the team trade"
+            r'\bwill\s*(\w+\s+)?be\s*traded\b',  # "will be traded"
+            r'\bfuture\s*with\b',  # "future with"
+            r'\bwhere\s*will\b',  # "where will"
+            r'\bwho\s*are\s*the\b',  # "who are the"
+            r'\bwho\s*has\s*the\b',  # "who has the"
+            r'\bwhich\s*team\b',  # "which team"
+            r'\bprediction\b',  # "prediction"
+            r'\bpredict\b',  # "predict"
+            r'\bexpectation\b',  # "expectation"
+            r'\blikely\s*to\b',  # "likely to"
+            r'\bcould\s*be\b',  # "could be"
+            r'\bmight\s*be\b',  # "might be"
+            r'\bpotential\s*(\w+\s+)?target\b',  # "potential target"
+            r'\bspeculation\b',  # "speculation"
+            r'\blatest\s*on\b',  # "latest on"
+            
+            # Content that's more opinion/analysis than news
+            r'\bopinion\b',  # "opinion"
+            r'\banalysis\b',  # "analysis"
+            r'\btakeaway\b',  # "takeaway"
+            r'\bbreakdown\b',  # "breakdown"
+            r'\bgrade\b',  # "grade"
+            r'\bgrading\b',  # "grading"
+            r'\brated\b',  # "rated"
+            r'\brating\b',  # "rating"
+            r'\boverrated\b',  # "overrated"
+            r'\bunderrated\b',  # "underrated"
+            r'\bwinner\b.*\bloser\b',  # "winner and loser"
+            r'\bbiggest\s*(\w+\s+)?surprise\b',  # "biggest surprise"
+            r'\bbest\s*(\w+\s+)?worst\b',  # "best and worst"
+            r'\bmost\s*(\w+\s+)?least\b',  # "most and least"
+            
+            # List/countdown content
+            r'\bevery\s*(\w+\s+)?team\b.*\brank\b',  # "every team ranked"
+            r'\ball\s*\d+\s*team\b',  # "all 32 teams"
+            r'\bcount\s*down\b',  # "count down"
+            r'\btier\s*list\b',  # "tier list"
+            r'\btiers\b',  # "tiers"
+            
+            # Generic "content" headlines
+            r'\bthings\s*to\s*know\b',  # "things to know"
+            r'\bwhat\s*to\s*watch\b',  # "what to watch"
+            r'\bkey\s*storylines\b',  # "key storylines"
+            r'\bbiggest\s*questions\b',  # "biggest questions"
+            r'\bmajor\s*questions\b',  # "major questions"
+            
+            # Help/advice content
+            r'\bhelp\b.*\brank\b',  # "help rank"
+            r'\bscouts\s*help\b',  # "scouts help"
+            r'\bcoaches\s*help\b',  # "coaches help"
+            r'\bexecs\s*help\b',  # "execs help"
+            r'\bexperts\s*help\b',  # "experts help"
+        ]
+        
+        # Compile patterns for efficiency
+        compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in low_value_patterns]
+        
+        # Positive patterns that indicate legitimate news (override filters)
+        legitimate_patterns = [
+            r'\binjur\w+\b',  # "injury", "injured", "injuries"
+            r'\bsign\w+\b',  # "signed", "signing"
+            r'\btrade\w+\b',  # "traded", "trading" (when not speculation)
+            r'\brelease\w+\b',  # "released", "releasing"
+            r'\bcut\b',  # "cut"
+            r'\bwaivers\b',  # "waivers"
+            r'\bretire\w+\b',  # "retired", "retiring"
+            r'\bsuspend\w+\b',  # "suspended", "suspending"
+            r'\bfin\w+\b',  # "fined", "fining"
+            r'\bcontract\b',  # "contract"
+            r'\bextension\b',  # "extension"
+            r'\bdeal\b',  # "deal"
+            r'\bmillion\b',  # "$X million"
+            r'\byear\b.*\b(deal|contract|extension)\b',  # "4-year deal"
+            r'\bagreement\b',  # "agreement"
+            r'\bactivate\w+\b',  # "activated", "activating"
+            r'\bIR\b',  # "IR" (injured reserve)
+            r'\bIL\b',  # "IL" (injured list)
+            r'\bDL\b',  # "DL" (disabled list)
+            r'\bPUP\b',  # "PUP" (physically unable to perform)
+            r'\bNFI\b',  # "NFI" (non-football injury)
+            r'\boptioned\b',  # "optioned"
+            r'\bclaimed\b',  # "claimed"
+            r'\bDFA\b',  # "DFA" (designated for assignment)
+            r'\boutright\b',  # "outright"
+            r'\brecall\w+\b',  # "recalled", "recalling"
+            r'\bdemoted\b',  # "demoted"
+            r'\bpromoted\b',  # "promoted"
+            r'\bstarting\b',  # "starting"
+            r'\bbenched\b',  # "benched"
+            r'\breturn\w+\b.*\b(from|injury|IL|IR|DL)\b',  # "returns from injury"
+            r'\bcleared\b',  # "cleared"
+            r'\bmedical\b',  # "medical"
+            r'\bsurgery\b',  # "surgery"
+            r'\boperation\b',  # "operation"
+            r'\brehab\b',  # "rehab"
+            r'\brecovery\b',  # "recovery"
+            r'\bhealth\b',  # "health"
+            r'\bdiagnosis\b',  # "diagnosis"
+            r'\btest\b.*\b(positive|negative|results)\b',  # "test positive"
+            r'\bprotocol\b',  # "protocol"
+            r'\bquestionable\b',  # "questionable"
+            r'\bdoubtful\b',  # "doubtful"
+            r'\bout\b.*\b(week|month|season|game)\b',  # "out for week"
+            r'\bmiss\b.*\b(game|week|month|season)\b',  # "miss game"
+            r'\bexpected\s*to\s*miss\b',  # "expected to miss"
+            r'\bruled\s*out\b',  # "ruled out"
+            r'\bgame\s*time\s*decision\b',  # "game time decision"
+            r'\bprobable\b',  # "probable"
+            r'\bday\s*to\s*day\b',  # "day to day"
+            r'\bweek\s*to\s*week\b',  # "week to week"
+            r'\bbreaking\b',  # "breaking"
+            r'\bbreaking\s*news\b',  # "breaking news"
+            r'\bofficial\b',  # "official"
+            r'\bconfirm\w+\b',  # "confirmed", "confirming"
+            r'\bannounce\w+\b',  # "announced", "announcing"
+            r'\breport\w+\b',  # "reported", "reporting"
+            r'\bstatement\b',  # "statement"
+            r'\bpress\s*release\b',  # "press release"
+            r'\bpress\s*conference\b',  # "press conference"
+            r'\binterview\b',  # "interview"
+            r'\bquote\w+\b',  # "quoted", "quoting"
+            r'\bsay\w+\b',  # "says", "said"
+            r'\bcomment\w+\b',  # "commented", "commenting"
+            r'\baddress\w+\b',  # "addressed", "addressing"
+            r'\brespond\w+\b',  # "responded", "responding"
+        ]
+        
+        compiled_legitimate = [re.compile(pattern, re.IGNORECASE) for pattern in legitimate_patterns]
+        
+        filtered_news = []
+        filtered_count = 0
+        
+        for item in news_items:
+            title = item.get('title', '')
+            if not title:
+                continue
+                
+            # Check if headline has legitimate news indicators
+            is_legitimate = any(pattern.search(title) for pattern in compiled_legitimate)
+            
+            if is_legitimate:
+                filtered_news.append(item)
+                continue
+                
+            # Check if headline matches low-value patterns
+            is_low_value = any(pattern.search(title) for pattern in compiled_patterns)
+            
+            if not is_low_value:
+                filtered_news.append(item)
+            else:
+                filtered_count += 1
+                if self.print_fetches:
+                    print(f"[NewsWorker] Filtered out low-value headline: '{title[:80]}...'")
+        
+        print(f"[NewsWorker] Low-value filtering: {len(news_items)} → {len(filtered_news)} headlines ({filtered_count} filtered)")
+        return filtered_news
+
     async def fetch_rss_feed_with_session(self, session, url):
         """Fetch and parse an RSS feed using provided session"""
         if self.print_fetches: print(f"fetching rss feed: {url}");
@@ -290,6 +483,10 @@ class NewsWorker(QObject):
 
             # Apply injury news prioritization (but keep date sorting)
             all_news = self.prioritize_injury_news(all_news)
+            
+            # Apply comprehensive headline filtering for ticker tape
+            all_news = self.filter_low_value_headlines(all_news)
+            
             self.news_items = all_news
             
             
