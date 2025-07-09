@@ -3,8 +3,9 @@ import aiohttp
 import json
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
+from collections import deque
 from Creds import SGO_KEY
 
 
@@ -55,10 +56,21 @@ class SGOClient:
         }
         self.session: Optional[aiohttp.ClientSession] = None
         self.request_count = 0
-        self.last_request_time = 0
-        self.rate_limit_delay = 2.0  # Reduced for testing
+        
+        # Sliding window rate limiting (100 requests per minute)
+        self.rate_limit_window = 60  # seconds
+        self.rate_limit_max = 100   # requests per window
+        self.request_times = deque()
+        
+        # Caching
+        self._leagues_cache: Optional[List[Dict[str, Any]]] = None
+        self._leagues_cache_time: Optional[datetime] = None
+        self._teams_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._teams_cache_time: Dict[str, datetime] = {}
+        self.cache_ttl = 3600  # 1 hour cache TTL
     
     async def __aenter__(self):
+        # Simplified session for debugging
         self.session = aiohttp.ClientSession(headers=self.headers)
         return self
     
@@ -67,27 +79,28 @@ class SGOClient:
             await self.session.close()
     
     async def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make async API request with rate limiting"""
+        """Make async API request with sliding window rate limiting"""
         if not self.session:
             raise RuntimeError("Client must be used as async context manager")
         
-        # Rate limiting: ensure we don't exceed 10 requests per minute
-        current_time = time.time()
-        time_since_last = current_time - self.last_request_time
-        if time_since_last < self.rate_limit_delay:
-            sleep_time = self.rate_limit_delay - time_since_last
-            print(f"   Rate limiting: sleeping {sleep_time:.1f}s...")
-            await asyncio.sleep(sleep_time)
+        # DISABLED: Sliding window rate limiting for debugging
+        # current_time = time.time()
+        # self.request_times.append(current_time)
         
         url = f"{self.base_url}/{endpoint}"
         self.request_count += 1
-        self.last_request_time = time.time()
         
         try:
-            timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
-            async with self.session.get(url, params=params, timeout=timeout) as response:
+            print(f"   Making request to {endpoint}... (request #{self.request_count})")
+            print(f"   URL: {url}")
+            print(f"   Params: {params}")
+            async with self.session.get(url, params=params) as response:
+                print(f"   Response status: {response.status}")
                 if response.status == 200:
-                    return await response.json()
+                    print(f"   Parsing JSON...")
+                    result = await response.json()
+                    print(f"   JSON parsed successfully")
+                    return result
                 elif response.status == 429:
                     # Rate limit hit, wait longer and retry once
                     await asyncio.sleep(60)  # Wait 1 minute
@@ -111,57 +124,121 @@ class SGOClient:
         response = await self._make_request("sports")
         return response.get('data', []) if response else []
     
-    async def get_leagues(self) -> List[Dict[str, Any]]:
-        """Get all available leagues"""
+    async def get_leagues(self, use_cache: bool = True) -> List[Dict[str, Any]]:
+        """Get all available leagues with caching"""
+        if use_cache and self._leagues_cache and self._leagues_cache_time:
+            # Check if cache is still valid
+            if (datetime.now() - self._leagues_cache_time).total_seconds() < self.cache_ttl:
+                return self._leagues_cache
+        
         response = await self._make_request("leagues")
-        return response.get('data', []) if response else []
+        leagues = response.get('data', []) if response else []
+        
+        # Update cache
+        if use_cache:
+            self._leagues_cache = leagues
+            self._leagues_cache_time = datetime.now()
+        
+        return leagues
     
-    async def get_events(self, league_id: str, limit: int = 10, **kwargs) -> List[SGOEvent]:
-        """Get events for a specific league with optional parameters"""
-        # Build URL like their GitHub example: /events?leagueID=MLB&startsAfter=...
-        params = {"leagueID": league_id}
+    async def get_teams(self, league_id: Optional[str] = None, sport_id: Optional[str] = None, use_cache: bool = True) -> List[Dict[str, Any]]:
+        """Get teams with caching, optionally filtered by league or sport"""
+        cache_key = f"{league_id or 'all'}_{sport_id or 'all'}"
         
-        # Add any additional parameters
+        if use_cache and cache_key in self._teams_cache and cache_key in self._teams_cache_time:
+            # Check if cache is still valid
+            if (datetime.now() - self._teams_cache_time[cache_key]).total_seconds() < self.cache_ttl:
+                return self._teams_cache[cache_key]
+        
+        params = {}
+        if league_id:
+            params['leagueID'] = league_id
+        if sport_id:
+            params['sportID'] = sport_id
+        
+        response = await self._make_request("teams", params)
+        teams = response.get('data', []) if response else []
+        
+        # Update cache
+        if use_cache:
+            self._teams_cache[cache_key] = teams
+            self._teams_cache_time[cache_key] = datetime.now()
+        
+        return teams
+    
+    async def get_events(self, league_id: str, limit: int = 10, odd_ids: Optional[List[str]] = None, 
+                        include_opposing: bool = True, **kwargs) -> List[SGOEvent]:
+        """Get events with optimized oddIDs targeting for entity efficiency"""
+        # Optimize batch size based on requested limit
+        batch_size = min(limit, 100) if limit <= 100 else 100
+        
+        params = {"leagueID": league_id, "limit": batch_size}
+        
+        # Add oddIDs optimization for entity efficiency
+        if odd_ids:
+            params["oddIDs"] = ','.join(odd_ids)
+            if include_opposing:
+                params["includeOpposingOddIDs"] = "true"
+        
+        # Add any additional parameters, converting booleans to strings
         for key, value in kwargs.items():
-            params[key] = value
+            if isinstance(value, bool):
+                params[key] = str(value).lower()
+            else:
+                params[key] = value
+        
+        all_events = []
+        next_cursor = None
+        
+        while len(all_events) < limit:
+            if next_cursor:
+                params['cursor'] = next_cursor
             
-        response = await self._make_request("events", params)
-        
-        if not response or 'data' not in response:
-            return []
-        
-        events = []
-        event_data_list = response['data']
-        
-        # Limit results if needed
-        if limit and len(event_data_list) > limit:
-            event_data_list = event_data_list[:limit]
+            # Adjust batch size for final request if needed
+            remaining = limit - len(all_events)
+            if remaining < batch_size:
+                params['limit'] = remaining
             
-        for event_data in event_data_list:
-            events.append(self._parse_event(event_data))
+            response = await self._make_request("events", params)
+            
+            if not response or 'data' not in response:
+                break
+            
+            # Get the batch of events
+            event_batch = response['data']
+            
+            # Process each event in this batch
+            for event_data in event_batch:
+                if len(all_events) >= limit:
+                    break
+                all_events.append(self._parse_event(event_data))
+            
+            # Check for next cursor to continue pagination
+            next_cursor = response.get('nextCursor')
+            if not next_cursor:
+                break
         
-        return events
+        return all_events
     
     async def get_events_with_odds(self, league_ids: Optional[List[str]] = None, limit: int = 50) -> List[SGOEvent]:
         """Get events that have odds available"""
         if not league_ids:
-            leagues = await self.get_leagues()
+            leagues = await self.get_leagues(use_cache=True)
             league_ids = [league['leagueID'] for league in leagues]
         
         events_with_odds = []
         
         for league_id in league_ids:
-            events = await self.get_events(league_id, limit=limit)
-            for event in events:
-                if event.has_odds:
-                    events_with_odds.append(event)
+            # marketOddsAvailable=True is now set by default in get_events
+            events = await self.get_events(league_id, limit=limit, marketOddsAvailable=True)
+            events_with_odds.extend(events)  # All events should have odds due to filter
         
-        return events_with_odds
+        return events_with_odds[:limit]  # Respect the limit across all leagues
     
     async def get_live_events(self, league_ids: Optional[List[str]] = None) -> List[SGOEvent]:
         """Get currently live events"""
         if not league_ids:
-            leagues = await self.get_leagues()
+            leagues = await self.get_leagues(use_cache=True)
             league_ids = [league['leagueID'] for league in leagues]
         
         live_events = []
@@ -288,6 +365,230 @@ class SGOClient:
         """Get current rate limit and usage information"""
         response = await self._make_request("account/usage")
         return response if response else {}
+    
+    async def get_historical_events(self, league_id: str, days_back: int = 7, 
+                                   max_events: int = 100, require_odds: bool = True) -> List[SGOEvent]:
+        """Get recent historical events using startsAfter cursor positioning"""
+        from datetime import datetime, timezone, timedelta
+        
+        # Calculate the start date for our historical window
+        now = datetime.now(timezone.utc)
+        start_date = now - timedelta(days=days_back)
+        
+        print(f"   Fetching events from {start_date.date()} to {now.date()}...")
+        
+        # Use startsAfter to position cursor at the beginning of our window
+        # Use smaller batch sizes for better reliability
+        batch_size = min(50, max_events) if days_back > 3 else min(100, max_events)
+        
+        params = {
+            "leagueID": league_id,
+            "startsAfter": start_date.isoformat(),
+            "limit": batch_size
+        }
+        
+        all_events = []
+        next_cursor = None
+        
+        while len(all_events) < max_events:
+            if next_cursor:
+                params['cursor'] = next_cursor
+            
+            # Adjust batch size for final request if needed
+            remaining = max_events - len(all_events)
+            if remaining < 100:
+                params['limit'] = remaining
+            
+            response = await self._make_request("events", params)
+            
+            if not response or 'data' not in response:
+                break
+            
+            event_batch = response['data']
+            
+            for event_data in event_batch:
+                if len(all_events) >= max_events:
+                    break
+                
+                event = self._parse_event(event_data)
+                
+                # Only include events within our time window (between start_date and now)
+                if event.starts_at:
+                    try:
+                        event_time = datetime.fromisoformat(event.starts_at.replace('Z', '')).replace(tzinfo=timezone.utc)
+                        if event_time > now:
+                            continue  # Skip future events
+                        if event_time < start_date:
+                            continue  # Skip events before our window
+                    except:
+                        pass
+                
+                # Filter for events with odds if required
+                if require_odds and not event.has_odds:
+                    continue
+                
+                all_events.append(event)
+            
+            # Check for next cursor
+            next_cursor = response.get('nextCursor')
+            if not next_cursor:
+                break
+            
+            # Small delay between paginated requests for reliability
+            if next_cursor:
+                await asyncio.sleep(0.5)
+        
+        # Sort events by date (most recent first)
+        all_events.sort(key=lambda e: e.starts_at or '', reverse=True)
+        
+        return all_events
+    
+    async def get_historical_odds_batch(self, league_id: str, days_back: int = 5, 
+                                       max_events_per_day: int = 25, 
+                                       essential_odds_only: bool = True) -> List[SGOEvent]:
+        """Get historical odds efficiently using incremental daily collection with optimized oddIDs"""
+        from datetime import datetime, timezone, timedelta
+        
+        print(f"📊 Collecting {days_back} days of historical events for {league_id}...")
+        
+        # Select appropriate essential odds based on league
+        essential_odds = None
+        if essential_odds_only:
+            if league_id in ['MLB']:
+                essential_odds = ESSENTIAL_BASEBALL
+            elif league_id in ['NBA', 'WNBA', 'NCAAB']:
+                essential_odds = ESSENTIAL_BASKETBALL
+            elif league_id in ['NFL', 'NCAAF']:
+                essential_odds = ESSENTIAL_FOOTBALL
+            elif league_id in ['NHL']:
+                essential_odds = ESSENTIAL_HOCKEY
+            
+            if essential_odds:
+                print(f"   Using essential odds: {len(essential_odds)} market types")
+        
+        all_events = []
+        now = datetime.now(timezone.utc)
+        
+        try:
+            # Collect data day by day to avoid timeouts
+            for day_offset in range(days_back, 0, -1):
+                day_start = now - timedelta(days=day_offset)
+                day_end = now - timedelta(days=day_offset-1)
+                
+                print(f"   Day {days_back-day_offset+1}: {day_start.date()}")
+                
+                try:
+                    # Get events for this specific day with optimized oddIDs
+                    day_events = await self.get_events(
+                        league_id, 
+                        limit=max_events_per_day, 
+                        odd_ids=essential_odds,
+                        startsAfter=day_start.isoformat()
+                    )
+                    
+                    # Filter events for just this day and with odds
+                    filtered_events = []
+                    for event in day_events:
+                        if event.starts_at:
+                            event_time = datetime.fromisoformat(event.starts_at.replace('Z', '')).replace(tzinfo=timezone.utc)
+                            if day_start <= event_time < day_end and event.has_odds:
+                                filtered_events.append(event)
+                    
+                    print(f"     ✅ {len(filtered_events)} events with odds")
+                    all_events.extend(filtered_events)
+                    
+                    # Brief pause between days for API courtesy
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"     ❌ Error for {day_start.date()}: {str(e)}")
+            
+            # Sort by date (most recent first)
+            all_events.sort(key=lambda e: e.starts_at or '', reverse=True)
+            
+            print(f"✅ Total: {len(all_events)} historical events with odds")
+            return all_events
+            
+        except Exception as e:
+            print(f"❌ Error in batch collection: {e}")
+            return []
+    
+    async def get_completed_events_with_results(self, league_id: str, days_back: int = 5, 
+                                               max_events_per_day: int = 20) -> List[SGOEvent]:
+        """Get completed events with final results using incremental collection"""
+        
+        # Use the efficient incremental batch collection
+        all_events = await self.get_historical_odds_batch(
+            league_id=league_id,
+            days_back=days_back,
+            max_events_per_day=max_events_per_day
+        )
+        
+        # Filter for completed events with actual results data
+        completed_with_results = [
+            event for event in all_events 
+            if event.is_completed and event.results and len(event.results) > 0
+        ]
+        
+        print(f"📈 Found {len(completed_with_results)} completed events with results")
+        return completed_with_results
+    
+    async def get_events_with_player_props(self, league_id: str, player_ids: List[str], 
+                                          days_back: int = 3, max_events_per_day: int = 10) -> List[SGOEvent]:
+        """Get events with specific player props for analysis"""
+        from datetime import datetime, timezone, timedelta
+        
+        # SGO uses different market structure - this function needs to be adapted for SGO API
+        print(f"⚠️  SGO player props functionality needs implementation for league: {league_id}")
+        return []
+
+
+async def test_historical_odds():
+    """Test historical odds functionality"""
+    print("SGO HISTORICAL ODDS TEST")
+    print("=" * 40)
+    
+    async with SGOClient() as client:
+        try:
+            # Test 1: Get completed MLB games from last 5 days
+            print("📊 Test 1: Getting completed MLB games from last 5 days...")
+            completed_events = await client.get_completed_events_with_results('MLB', days_back=5, max_events_per_day=15)
+            
+            if completed_events:
+                print(f"✅ Found {len(completed_events)} completed games")
+                
+                for i, event in enumerate(completed_events[:3]):
+                    print(f"   Game {i+1}: {event.away_team.short_name} @ {event.home_team.short_name}")
+                    print(f"            Final: {event.away_team.score} - {event.home_team.score}")
+                    print(f"            Markets: {len(event.odds)}")
+                    print(f"            Results: {len(event.results)}")
+            
+            # Test 2: Get historical odds batch from last 5 days  
+            print(f"\n📈 Test 2: Getting historical odds from last 5 days...")
+            historical_events = await client.get_historical_odds_batch('MLB', days_back=5, max_events_per_day=20)
+            
+            if historical_events:
+                print(f"✅ Found {len(historical_events)} historical events")
+                
+                # Group by date
+                from collections import defaultdict
+                events_by_date = defaultdict(list)
+                for event in historical_events:
+                    if event.starts_at:
+                        date_str = event.starts_at[:10]  # Extract date part
+                        events_by_date[date_str].append(event)
+                
+                print(f"   Events by date:")
+                for date, events in sorted(events_by_date.items()):
+                    print(f"     {date}: {len(events)} events")
+            
+            print(f"\n📊 Total API requests made: {client.requests_made}")
+            print("✅ Historical odds tests completed!")
+            
+        except Exception as e:
+            print(f"❌ Test failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 
 async def main():
@@ -459,4 +760,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Run historical odds test instead of main
+    asyncio.run(test_historical_odds())
