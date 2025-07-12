@@ -275,10 +275,10 @@ class PropsWindow(BaseTableWindow):
         self.icon_timer.start(16)
         
         
-        # Line highlighting colors
-        self.best_over_color = QColor(0, 100, 0)  # Dark Green
-        self.best_under_color = QColor(0, 70, 140)  # Dark Blue
-        self.best_text_color = QColor(27, 16, 16) # Black Text
+        # Line highlighting colors - use alpha 180 to prevent override by update_table_display
+        self.best_over_color = QColor(0, 200, 0, 180)  # Bright Green
+        self.best_under_color = QColor(0, 100, 255, 180)  # Bright Blue
+        self.best_text_color = QColor(255, 255, 255) # White Text
             
     def UpdateIcon(self):
         framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
@@ -738,6 +738,7 @@ class PropsWindow(BaseTableWindow):
                     self.update_table_display()
                     # Update best lines display right after processing data
                     self.update_best_lines_display()
+                    # Highlight AFTER table display is updated to prevent override
                     self.highlight_best_lines()
                 else:
                     print("No valid bookmaker data was processed")
@@ -808,15 +809,14 @@ class PropsWindow(BaseTableWindow):
         return best_over, best_under
 
     def highlight_best_lines(self):
-        if not hasattr(self, 'consolidated_odds_data') or not self.consolidated_odds_data:
-            print("No data available for highlighting")
+        if not hasattr(self, 'best_lines') or not self.best_lines:
+            print("No best lines data available for highlighting")
             return
         
         if not self.current_tab_data:
             return 
         
         table = self.table_widget
-        bookmakers = [bm['title'] for bm in self.consolidated_odds_data['bookmakers']]
         
         # First reset all highlighting
         for row in range(table.rowCount()):
@@ -830,95 +830,45 @@ class PropsWindow(BaseTableWindow):
                         item.setBackground(bg_color)
                     item.setForeground(QColor('black'))
     
-        # Find and highlight best lines
-        market_best_lines = {}
-        for row_idx, row_label in enumerate(self.current_tab_data.table_rows):
-            row_data = self.current_tab_data.table_data.get(row_label, {})
+        # Use LineCalculator results to highlight best lines
+        highlighted_count = 0
+        for market_key, best_data in self.best_lines.items():
+            # Find the row for this market
+            player_name, market_type = market_key.split(':', 1)
+            row_label = f"{player_name} - {market_type}"
             
-            # Skip header rows
-            if row_data.get('is_header', False):
+            if row_label not in self.current_tab_data.table_rows:
                 continue
                 
-            parts = row_label.split(' - ')
-            if len(parts) < 2:
-                continue
-                
-            player_name, market_type = parts[0], parts[1]
-            market_key = f"{player_name}:{market_type}"
+            row_idx = self.current_tab_data.table_rows.index(row_label)
             
-            if market_key not in market_best_lines:
-                market_best_lines[market_key] = {
-                    'over': {'odds': -999999.9, 'point': 999999.9, 'bookmaker': None, 'row': row_idx, 'col': 0},
-                    'under': {'odds': 999999.9, 'point': -999999.9, 'bookmaker': None, 'row': row_idx, 'col': 0},
-                }
+            # Highlight best OVER if it exists
+            if best_data['over'] and best_data['over'].get('bookmaker'):
+                over_bm = best_data['over']['bookmaker']
+                if over_bm in self.current_tab_data.bookmakers:
+                    col_idx = self.current_tab_data.bookmakers.index(over_bm) + 1  # +1 for row header
+                    if item := table.item(row_idx, col_idx):
+                        item.setBackground(self.best_over_color)
+                        item.setForeground(self.best_text_color)
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        highlighted_count += 1
             
-            # Check each bookmaker column
-            for col_idx, bm in enumerate(self.current_tab_data.bookmakers, 1):
-                value = row_data.get(bm, "")
-                if not value:
-                    continue
-                    
-                # Process over odds
-                over_result = extract_odds_point(value, 'O')
-                if over_result:
-                    over_odds, point = over_result
-                    current = market_best_lines[market_key]['over']
-                    
-                    # Better = lower point OR same point with better odds
-                    if (point < current['point'] or 
-                        (point == current['point'] and over_odds > current['odds'])):
-                        market_best_lines[market_key]['over'] = {
-                            'odds': over_odds,
-                            'point': point,
-                            'bookmaker': bm,
-                            'row': row_idx,
-                            'col': col_idx
-                        }
+            # Highlight best UNDER if it exists
+            if best_data['under'] and best_data['under'].get('bookmaker'):
+                under_bm = best_data['under']['bookmaker']
+                if under_bm in self.current_tab_data.bookmakers:
+                    col_idx = self.current_tab_data.bookmakers.index(under_bm) + 1  # +1 for row header
+                    if item := table.item(row_idx, col_idx):
+                        item.setBackground(self.best_under_color)
+                        item.setForeground(self.best_text_color)
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        highlighted_count += 1
     
-                # Process under odds
-                under_result = extract_odds_point(value, 'U')
-                if under_result:
-                    under_odds, point = under_result
-                    current = market_best_lines[market_key]['under']
-                    
-                    # Better = higher point OR same point with better odds
-                    if (point > current['point'] or 
-                        (point == current['point'] and under_odds > current['odds'])):
-                        market_best_lines[market_key]['under'] = {
-                            'odds': under_odds,
-                            'point': point,
-                            'bookmaker': bm,
-                            'row': row_idx,
-                            'col': col_idx
-                        }
-    
-        # Apply highlighting
-        for market_key, best in market_best_lines.items():
-            # Highlight best OVER
-            if best['over']['bookmaker']:
-                row = best['over']['row']
-                col = best['over']['col']
-                if item := table.item(row, col):
-                    item.setBackground(self.best_over_color)
-                    item.setForeground(self.best_text_color)
-                    # Make text bold for better visibility
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-    
-            # Highlight best UNDER
-            if best['under']['bookmaker']:
-                row = best['under']['row']
-                col = best['under']['col']
-                if item := table.item(row, col):
-                    item.setBackground(self.best_under_color)
-                    item.setForeground(self.best_text_color)
-                    # Make text bold for better visibility
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-    
-        print(f"Highlighted {len(market_best_lines)} markets")
+        print(f"Highlighted {highlighted_count} best lines (over and under) from LineCalculator results")
     
     def process_odds_data(self, odds):
         """Process odds data into table format without overwriting existing markets"""
@@ -976,7 +926,7 @@ class PropsWindow(BaseTableWindow):
                     price = f"{under_price} U ({point})"
                 else:
                     price = f"({point})"
-                    
+                
                 self.current_tab_data.table_data[label][bm_title] = price
     
     
@@ -999,48 +949,18 @@ class PropsWindow(BaseTableWindow):
         if not self.current_tab_data:
             return
             
-        # Transform data for BestLinesCalculator
+        # Use existing table data and bookmakers from current tab
         table_data = self.current_tab_data.table_data
-        bookmakers = []
-        
-        for bm in self.consolidated_odds_data.get('bookmakers', []):
-            bm_title = bm['title']
-            if bm_title not in bookmakers:
-                bookmakers.append(bm_title)
-            
-            for market in bm.get('markets', []):
-                # Only include markets that match the current tab's market type
-                if market['key'] != self.current_market:
-                    continue
-                    
-                market_key = market['key']
-                game_id = market.get('game_id', '')
-                
-                for outcome in market.get('outcomes', []):
-                    player_name = outcome.get('description', outcome.get('name', ''))
-                    row_label = f"{player_name} - {market_key}"
-                    
-                    if row_label not in table_data:
-                        table_data[row_label] = {'game_id': game_id}
-                    
-                    # Format the value
-                    outcome_name = outcome.get('name', '').lower()
-                    point = outcome.get('point', '')
-                    price = outcome.get('price', '')
-                    
-                    if outcome_name == 'over':
-                        value = f"{price} O ({point})"
-                    elif outcome_name == 'under':
-                        value = f"{price} U ({point})"
-                    else:
-                        value = f"{price} ({point})"
-                    
-                    table_data[row_label][bm_title] = value
+        bookmakers = self.current_tab_data.bookmakers
         
         # Calculate and display best lines
         self.best_lines = LineCalculator.calculate_best_lines(table_data, bookmakers)
         print("BEST LINES (from LineCalculator)")
-        print(self.best_lines)
+        # Print just the structure to see if we have under data
+        for market_key, data in self.best_lines.items():
+            over_status = "YES" if data['over'] else "NO"
+            under_status = "YES" if data['under'] else "NO"
+            print(f"{market_key}: OVER={over_status}, UNDER={under_status}")
         self._populate_best_lines_widget(self.best_lines)
         # self.best_lines_widget.update_display(self.consolidated_odds_data)
         return
@@ -1125,7 +1045,7 @@ class PropsWindow(BaseTableWindow):
             best_lines_table.setColumnCount(5)
             best_lines_table.setHorizontalHeaderLabels(["Player", "Market", "Best Line", "Avg Odds", "Implied Prob Deviation"])
             
-            # Sort markets by deviation
+            # Sort markets by deviation - include both over and under lines
             sorted_markets = []
             for market_key, data in best_lines.items():
                 # Extract market details
@@ -1137,16 +1057,16 @@ class PropsWindow(BaseTableWindow):
                     player_name = parts[0]
                     market_type = parts[1]
                     
-                    # Get the best over/under line based on deviation
-                    over_dev = data['over']['deviation'] if data['over'] and 'deviation' in data['over'] else 0
-                    under_dev = data['under']['deviation'] if data['under'] and 'deviation' in data['under'] else 0
+                    # Add over line if it exists
+                    if data['over'] and 'deviation' in data['over']:
+                        over_dev = data['over']['deviation']
+                        sorted_markets.append((player_name, market_type, data, over_dev, True))
                     
-                    # Determine which has highest deviation
-                    max_deviation = max(over_dev, under_dev)
-                    use_over = over_dev >= under_dev
-                    
-                    # Store for sorting
-                    sorted_markets.append((player_name, market_type, data, max_deviation, use_over))
+                    # Add under line if it exists  
+                    if data['under'] and 'deviation' in data['under']:
+                        under_dev = data['under']['deviation']
+                        sorted_markets.append((player_name, market_type, data, under_dev, False))
+                        
                 except Exception as e:
                     print(f"Error processing market {market_key}: {str(e)}")
                     continue
