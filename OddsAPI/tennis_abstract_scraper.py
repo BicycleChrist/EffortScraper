@@ -174,6 +174,24 @@ class ServeSpeedData:
     second_serve_max: str
 
 @dataclass
+class TacticsData:
+    match: str
+    result: str
+    snv_freq: str
+    snv_w_pct: str
+    net_freq: str
+    net_w_pct: str
+    fh_wnr_pct: str
+    dtl_wnr_pct: str
+    io_wnr_pct: str
+    bh_wnr_pct: str
+    dtl_wnr_pct_bh: str
+    drop_freq: str
+    drop_wnr_pct: str
+    rally_agg: str
+    return_agg: str
+
+@dataclass
 class PlayerBio:
     name: str
     country: str
@@ -201,6 +219,7 @@ class PlayerData:
     last52_splits: List[SplitStats]
     winners_errors: List[WinnersErrorsData]
     serve_speed: List[ServeSpeedData]
+    tactics: List[TacticsData]
     scrape_timestamp: str
     source_url: str
 
@@ -612,6 +631,41 @@ class TennisAbstractScraper:
             
         return data
     
+    def _scrape_tactics(self, driver: webdriver.Firefox) -> List[TacticsData]:
+        """Scrape tactics table (mcp-tactics)"""
+        data = []
+        try:
+            table = driver.find_element(By.ID, "mcp-tactics")
+            tbody = table.find_element(By.TAG_NAME, "tbody")
+            rows = tbody.find_elements(By.TAG_NAME, "tr")
+            
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 15:
+                    tactics = TacticsData(
+                        match=cells[0].text.strip(),
+                        result=cells[1].text.strip(),
+                        snv_freq=cells[2].text.strip(),
+                        snv_w_pct=cells[3].text.strip(),
+                        net_freq=cells[4].text.strip(),
+                        net_w_pct=cells[5].text.strip(),
+                        fh_wnr_pct=cells[6].text.strip(),
+                        dtl_wnr_pct=cells[7].text.strip(),
+                        io_wnr_pct=cells[8].text.strip(),
+                        bh_wnr_pct=cells[9].text.strip(),
+                        dtl_wnr_pct_bh=cells[10].text.strip(),
+                        drop_freq=cells[11].text.strip(),
+                        drop_wnr_pct=cells[12].text.strip(),
+                        rally_agg=cells[13].text.strip(),
+                        return_agg=cells[14].text.strip()
+                    )
+                    data.append(tactics)
+                    
+        except Exception as e:
+            print(f"Error scraping tactics: {e}")
+            
+        return data
+    
     def _scrape_player_page(self, url: str) -> Optional[PlayerData]:
         """Scrape a single player page"""
         driver = self._create_driver()
@@ -637,6 +691,7 @@ class TennisAbstractScraper:
             last52_splits = self._scrape_split_stats(driver, "last52-splits")
             winners_errors = self._scrape_winners_errors(driver)
             serve_speed = self._scrape_serve_speed(driver)
+            tactics = self._scrape_tactics(driver)
             
             player_data = PlayerData(
                 player_name=player_name,
@@ -651,6 +706,7 @@ class TennisAbstractScraper:
                 last52_splits=last52_splits,
                 winners_errors=winners_errors,
                 serve_speed=serve_speed,
+                tactics=tactics,
                 scrape_timestamp=datetime.now().isoformat(),
                 source_url=url
             )
@@ -660,7 +716,7 @@ class TennisAbstractScraper:
                   f"{len(recent_finals)} finals, {len(year_end_rankings)} year rankings, "
                   f"{len(recent_events)} events, {len(career_splits)} career splits, "
                   f"{len(last52_splits)} recent splits, {len(winners_errors)} winner/error matches, "
-                  f"{len(serve_speed)} serve speed matches")
+                  f"{len(serve_speed)} serve speed matches, {len(tactics)} tactics matches")
             
             return player_data
             

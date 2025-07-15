@@ -1,4 +1,3 @@
-
 import sys
 import math
 import threading
@@ -9,7 +8,8 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame, QGridLayout, QProgressBar, QSizePolicy, QLineEdit, QPushButton, QMenu, QListWidgetItem, QListWidget
+    QFrame, QGridLayout, QProgressBar, QSizePolicy, QLineEdit, QPushButton, QMenu, QListWidgetItem, QListWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPointF
 from PyQt6.QtGui import (
@@ -17,10 +17,11 @@ from PyQt6.QtGui import (
     QRadialGradient, QPolygonF, QPainterPath, QAction
 )
 
-from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio
+from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsData
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
 
-#TODO: Format search bar better, avoid focus being stolen by suggestion menu.
+#TODO: Display Serve data, Tactics gatherd from Tennis abstract
+
 class TennisTheme:
     """Tennis theme colors"""
     BACKGROUND = "#0A0E1A"
@@ -71,7 +72,7 @@ class CompactSurfaceWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.surface_stats = SurfaceStats()
-        self.setFixedSize(130, 85)  # Reduced size to remove unused space
+        self.setFixedSize(150, 85)  # Wider to fit all 4 surfaces
         self.setToolTip("Surface Performance")
         
     def update_stats(self, stats: SurfaceStats):
@@ -95,11 +96,11 @@ class CompactSurfaceWidget(QWidget):
             ('Indoor', TennisTheme.INDOOR_COURT, self.surface_stats.get_percentage('indoor'))
         ]
         
-        # Draw compact bars
-        bar_width = 26
+        # Draw compact bars - adjusted for 4 surfaces
+        bar_width = 28
         bar_height = 45
-        spacing = 4
-        start_x = 5
+        spacing = 3
+        start_x = 8
         start_y = 25
         
         for i, (name, color, percentage) in enumerate(surfaces):
@@ -125,6 +126,95 @@ class CompactSurfaceWidget(QWidget):
             painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
             percentage_text = f"{percentage:.0f}%" if percentage > 0 else "0%"
             painter.drawText(x, start_y + bar_height + 5, bar_width, 10, Qt.AlignmentFlag.AlignCenter, percentage_text)
+
+class DualPlayerSurfaceTableWidget(QWidget):
+    """Standalone dual-player surface performance table widget"""
+    
+    def __init__(self):
+        super().__init__()
+        self.player1_stats = SurfaceStats()
+        self.player2_stats = SurfaceStats()
+        self.player1_name = ""
+        self.player2_name = ""
+        self.setFixedSize(750, 200)
+        self.setStyleSheet(f"""
+            DualPlayerSurfaceTableWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 2px solid {TennisTheme.SURFACE};
+                border-radius: 12px;
+            }}
+        """)
+        
+    def update_player_stats(self, player_name: str, stats: SurfaceStats, player_num: int):
+        """Update surface statistics for a specific player"""
+        if player_num == 1:
+            self.player1_stats = stats
+            self.player1_name = player_name
+        else:
+            self.player2_stats = stats
+            self.player2_name = player_name
+        self.update()
+        
+    def paintEvent(self, event):
+        """Custom paint for dual player surface table"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        
+        # Title
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "Surface Performance Comparison")
+        
+        # Draw two columns - one for each player
+        self.draw_player_surface_stats(painter, self.player1_name, self.player1_stats, 50, 50, TennisTheme.PRIMARY)
+        self.draw_player_surface_stats(painter, self.player2_name, self.player2_stats, 400, 50, TennisTheme.ACCENT)
+        
+    def draw_player_surface_stats(self, painter, player_name, stats, x_offset, y_offset, color):
+        """Draw surface statistics for one player"""
+        # Player name header
+        painter.setPen(QColor(color))
+        painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        painter.drawText(x_offset, y_offset, player_name if player_name else "Select Player")
+        
+        # Surface data
+        surfaces = [
+            ('Hard Court', TennisTheme.HARD_COURT, stats.hard_wins, stats.hard_total),
+            ('Clay Court', TennisTheme.CLAY_COURT, stats.clay_wins, stats.clay_total),
+            ('Grass Court', TennisTheme.GRASS_COURT, stats.grass_wins, stats.grass_total),
+            ('Indoor Hard', TennisTheme.INDOOR_COURT, stats.indoor_wins, stats.indoor_total)
+        ]
+        
+        # Table headers
+        y = y_offset + 30
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        painter.drawText(x_offset, y, "Surface")
+        painter.drawText(x_offset + 120, y, "Record")
+        painter.drawText(x_offset + 180, y, "Win %")
+        
+        # Draw surface rows
+        for i, (name, surface_color, wins, total) in enumerate(surfaces):
+            y = y_offset + 50 + (i * 25)
+            
+            # Surface name with color indicator
+            painter.setPen(QColor(surface_color))
+            painter.setFont(QFont("Arial", 10))
+            painter.drawText(x_offset, y, f"● {name}")
+            
+            # Win-loss record
+            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+            painter.setFont(QFont("Arial", 10))
+            record_text = f"{wins}-{total-wins}" if total > 0 else "0-0"
+            painter.drawText(x_offset + 120, y, record_text)
+            
+            # Win percentage
+            percentage = (wins / total * 100) if total > 0 else 0
+            painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            painter.setFont(QFont("Arial", 10))
+            painter.drawText(x_offset + 180, y, f"{percentage:.1f}%")
 
 class CompactRankingChart(QWidget):
     """Compact ranking evolution chart with dual player overlay"""
@@ -340,15 +430,15 @@ class CompactPlayerSearchWidget(QWidget):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)  # Much more compact margins
+        layout.setContentsMargins(4, 4, 4, 4)  # ompact margins
         layout.setSpacing(2)  # Tighter spacing
 
         # Main search frame - much more compact
         search_frame = QFrame()
-        search_frame.setFixedHeight(60)  # Reduced from 80
+        search_frame.setFixedHeight(70)  # Reduced from 80
         search_layout = QHBoxLayout(search_frame)
         search_layout.setContentsMargins(8, 6, 8, 6)  # Much smaller margins
-        search_layout.setSpacing(12)  # Reduced spacing
+        search_layout.setSpacing(14)  # Reduced spacing
 
         # Player 1 section
         p1_layout = QVBoxLayout()
@@ -418,11 +508,11 @@ class CompactPlayerSearchWidget(QWidget):
         search_layout.addWidget(vs_label)
         search_layout.addLayout(p2_layout, 1)
 
-        # Results areas (embedded, no popups) - more compact
+        # Results areas (embedded)
         self.results1_frame = QFrame()
         self.results1_layout = QVBoxLayout(self.results1_frame)
-        self.results1_layout.setContentsMargins(0, 0, 0, 0)
-        self.results1_layout.setSpacing(1)  # Minimal spacing
+        self.results1_layout.setContentsMargins(0,0,0,0)
+        self.results1_layout.setSpacing(2)  # Minimal spacing
         self.results1_frame.hide()
 
         self.results2_frame = QFrame()
@@ -485,16 +575,16 @@ class CompactPlayerSearchWidget(QWidget):
         for name, rank in filtered_players:
             btn = QPushButton(f"#{rank} {name}")
             btn.clicked.connect(lambda checked, n=name, p=player_num: self.select_player(n, p))
-            btn.setFixedHeight(22)  # Much smaller height
+            btn.setFixedHeight(28)  # More comfortable height for suggestions
             btn.setStyleSheet(f"""
                 QPushButton {{
                     text-align: left;
-                    padding: 3px 8px;
+                    padding: 6px 12px;
                     background: #252B3A;
                     border: 1px solid #2A3441;
                     color: white;
-                    font-size: 11px;
-                    border-radius: 3px;
+                    font-size: 12px;
+                    border-radius: 4px;
                     margin: 1px;
                 }}
                 QPushButton:hover {{
@@ -585,10 +675,13 @@ class PlayerProfileWidget(QWidget):
     
     # Signals
     dataUpdated = pyqtSignal(str)  # player_name
+    tacticsDataLoaded = pyqtSignal(str, list)  # player_name, tactics_data
+    surfaceStatsLoaded = pyqtSignal(str, object, int)  # player_name, SurfaceStats, player_num
     
-    def __init__(self, player_color: str = TennisTheme.PRIMARY):
+    def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
         self.player_color = player_color
+        self.player_num = player_num
         self.player_name = ""
         self.player_bio: Optional[PlayerBio] = None
         self.current_ranking: Optional[PlayerRanking] = None
@@ -602,7 +695,7 @@ class PlayerProfileWidget(QWidget):
         
     def setup_ui(self):
         """Setup the compact player profile UI"""
-        self.setFixedSize(350, 200)
+        self.setFixedSize(350, 200)  # Back to original height
         self.setStyleSheet(f"""
             PlayerProfileWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -738,24 +831,12 @@ class PlayerProfileWidget(QWidget):
                     if hasattr(player_data, 'career_splits') and player_data.career_splits:
                         surface_stats = self.extract_surface_stats(player_data.career_splits)
                         self.surface_widget.update_stats(surface_stats)
-                    
-                    # Extract recent form from recent results
-                    if hasattr(player_data, 'recent_results') and player_data.recent_results:
-                        recent_form = []
-                        for result in player_data.recent_results[-8:]:  # Last 8 matches
-                            # Analyze score to determine win/loss
-                            if hasattr(result, 'score') and result.score:
-                                score = result.score.strip()
-                                # If score has sets like "6-4 6-2", analyze first player perspective
-                                # Tennis Abstract shows results from player's perspective
-                                if self.is_winning_score(score):
-                                    recent_form.append('W')
-                                else:
-                                    recent_form.append('L')
-                            else:
-                                recent_form.append('?')  # Unknown result
-                        self.update_form(recent_form)
-                    
+                        self.surfaceStatsLoaded.emit(self.player_name, surface_stats, self.player_num)
+                        
+                    # Emit tactics data if available
+                    if hasattr(player_data, 'tactics') and player_data.tactics:
+                        self.tacticsDataLoaded.emit(self.player_name, player_data.tactics)
+                
                 # Load ATP ranking data
                 rankings = self.h2h_scraper.get_atp_rankings_sync(top_n=1000)
                 player_ranking = self.h2h_scraper.find_player_ranking(self.player_name, rankings)
@@ -765,6 +846,50 @@ class PlayerProfileWidget(QWidget):
                     # Update with ATP data if Abstract data wasn't available
                     if not self.player_bio:
                         self.ranking_widget.update_ranking(player_ranking.rank, None)
+                
+                # Get recent form and surface data from H2H scraper by doing a dummy comparison
+                try:
+                    # Create a dummy comparison to get player stats with recent form and surface data
+                    dummy_player = "Carlos Alcaraz"  # Use a common player as dummy
+                    if self.player_name.lower() == dummy_player.lower():
+                        dummy_player = "Jannik Sinner"  # Use different dummy if same player
+                    
+                    h2h_data = self.h2h_scraper.scrape_h2h_comprehensive_sync(self.player_name, dummy_player)
+                    if h2h_data:
+                        # Check which player matches our target player by name similarity
+                        target_player_data = None
+                        
+                        # Check if player1 name matches our target player
+                        if (h2h_data.player1.name and 
+                            self.player_name.lower() in h2h_data.player1.name.lower() or
+                            h2h_data.player1.name.lower() in self.player_name.lower()):
+                            target_player_data = h2h_data.player1
+                        # Check if player2 name matches our target player  
+                        elif (h2h_data.player2.name and 
+                              self.player_name.lower() in h2h_data.player2.name.lower() or
+                              h2h_data.player2.name.lower() in self.player_name.lower()):
+                            target_player_data = h2h_data.player2
+                        
+                        # Use the recent form from the correct player
+                        if target_player_data and target_player_data.recent_form:
+                            self.update_form(target_player_data.recent_form)
+                        else:
+                            # Fallback: try player1 first, then player2
+                            if h2h_data.player1.recent_form:
+                                self.update_form(h2h_data.player1.recent_form)
+                            elif h2h_data.player2.recent_form:
+                                self.update_form(h2h_data.player2.recent_form)
+                                
+                        # Extract surface stats from yearly stats (overwrites Tennis Abstract data)
+                        if target_player_data and target_player_data.yearly_stats:
+                            surface_stats = self.extract_surface_stats_from_h2h(target_player_data.yearly_stats)
+                            self.surface_widget.update_stats(surface_stats)
+                            self.surfaceStatsLoaded.emit(self.player_name, surface_stats, self.player_num)
+                            
+                except Exception as e:
+                    print(f"Error getting H2H data for {self.player_name}: {e}")
+                    # Fallback to placeholder if H2H scraper fails
+                    self.update_form(['L', 'L', 'L', 'L', 'L'])
                         
                 # Emit signal that data is updated
                 self.dataUpdated.emit(self.player_name)
@@ -784,6 +909,11 @@ class PlayerProfileWidget(QWidget):
         """Extract surface statistics from career splits data"""
         stats = SurfaceStats()
         
+        # Debug: Print what splits we're getting
+        print(f"DEBUG: Extracting surface stats from {len(career_splits)} splits:")
+        for split in career_splits:
+            print(f"  Split: '{split.split}' - Wins: {split.wins}, Matches: {split.matches}")
+        
         for split in career_splits:
             split_name = split.split.lower()
             
@@ -795,19 +925,91 @@ class PlayerProfileWidget(QWidget):
                 if 'hard' in split_name or 'outdoor hard' in split_name:
                     stats.hard_wins += wins
                     stats.hard_total += total
+                    print(f"  -> Added to HARD: {wins}/{total}")
                 elif 'clay' in split_name:
                     stats.clay_wins += wins
                     stats.clay_total += total
+                    print(f"  -> Added to CLAY: {wins}/{total}")
                 elif 'grass' in split_name:
                     stats.grass_wins += wins
                     stats.grass_total += total
+                    print(f"  -> Added to GRASS: {wins}/{total}")
                 elif 'indoor' in split_name or 'carpet' in split_name:
                     stats.indoor_wins += wins
                     stats.indoor_total += total
+                    print(f"  -> Added to INDOOR: {wins}/{total}")
+                else:
+                    print(f"  -> UNMATCHED: '{split_name}'")
                     
             except (ValueError, AttributeError):
                 continue
                 
+        print(f"Final stats: Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
+        print(f"             Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
+        print(f"             Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
+        print(f"             Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
+        
+        return stats
+    
+    def extract_surface_stats_from_h2h(self, yearly_stats: Dict[str, Dict[str, str]]) -> SurfaceStats:
+        """Extract surface statistics from H2H scraper yearly stats data"""
+        stats = SurfaceStats()
+        
+        # Debug: Print what yearly stats we're getting
+        print(f"DEBUG: Extracting surface stats from H2H yearly stats:")
+        for year, surfaces in yearly_stats.items():
+            print(f"  Year {year}: {surfaces}")
+        
+        # Use the most recent year (2025)
+        current_year = "2025"
+        if current_year in yearly_stats:
+            surfaces = yearly_stats[current_year]
+            
+            for surface_name, record in surfaces.items():
+                if not record or record == "--":
+                    continue
+                    
+                # Parse records like "7-0", "11-2", "0-0" 
+                try:
+                    if '-' in record:
+                        wins_str, losses_str = record.split('-')
+                        wins = int(wins_str.strip())
+                        losses = int(losses_str.strip())
+                        total = wins + losses
+                        
+                        surface_lower = surface_name.lower()
+                        
+                        if 'hard' in surface_lower:
+                            if 'i.hard' in surface_lower or 'indoor' in surface_lower:
+                                stats.indoor_wins += wins
+                                stats.indoor_total += total
+                                print(f"  -> Added to INDOOR: {wins}/{total} from '{surface_name}: {record}'")
+                            else:
+                                stats.hard_wins += wins
+                                stats.hard_total += total
+                                print(f"  -> Added to HARD: {wins}/{total} from '{surface_name}: {record}'")
+                        elif 'clay' in surface_lower:
+                            stats.clay_wins += wins
+                            stats.clay_total += total
+                            print(f"  -> Added to CLAY: {wins}/{total} from '{surface_name}: {record}'")
+                        elif 'grass' in surface_lower:
+                            stats.grass_wins += wins
+                            stats.grass_total += total
+                            print(f"  -> Added to GRASS: {wins}/{total} from '{surface_name}: {record}'")
+                        else:
+                            print(f"  -> UNMATCHED: '{surface_name}: {record}'")
+                            
+                except (ValueError, AttributeError) as e:
+                    print(f"  -> ERROR parsing '{surface_name}: {record}': {e}")
+                    continue
+        else:
+            print(f"  -> No data found for current year {current_year}")
+            
+        print(f"H2H Final stats: Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
+        print(f"                 Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
+        print(f"                 Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
+        print(f"                 Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
+        
         return stats
     
     def is_winning_score(self, score: str) -> bool:
@@ -857,8 +1059,12 @@ class PlayerProfileWidget(QWidget):
             self.form_display.setText("No data")
             return
             
+        # Take the first 5 matches from TennisTonic (they display in chronological order)
+        # The rightmost position shows the most recent match
+        first_5_matches = recent_form[:5] if len(recent_form) >= 5 else recent_form
+        
         form_display = ""
-        for result in recent_form[-5:]:  # Last 5 matches
+        for result in first_5_matches:
             if result.upper() == 'W':
                 form_display += "🟢"
             elif result.upper() == 'L':
@@ -868,23 +1074,179 @@ class PlayerProfileWidget(QWidget):
                 
         self.form_display.setText(form_display)
 
+
+
+
+
+class TacticsTableWidget(QWidget):
+    """Dual-table widget displaying tactics data for both players"""
+    
+    def __init__(self):
+        super().__init__()
+        self.player1_tactics = []
+        self.player2_tactics = []
+        self.player1_name = ""
+        self.player2_name = ""
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup the tactics table UI"""
+        self.setFixedSize(1150, 450)  # Sized to fit within window bounds
+        self.setStyleSheet(f"""
+            TacticsTableWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 2px solid {TennisTheme.SURFACE};
+                border-radius: 12px;
+            }}
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(0)  # No spacing between tables
+        
+        # Title
+        title_label = QLabel("Player Tactics Comparison")
+        title_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title_label.setStyleSheet(f"color: {TennisTheme.TEXT_PRIMARY}; margin-bottom: 4px;")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Create stacked tables for each player
+        self.player1_table = self.create_player_tactics_table(self.player1_name, TennisTheme.PRIMARY)
+        self.player2_table = self.create_player_tactics_table(self.player2_name, TennisTheme.ACCENT)
+        
+        layout.addWidget(title_label)
+        layout.addWidget(self.player1_table)
+        layout.addWidget(self.player2_table)
+        
+    def create_player_tactics_table(self, player_name: str, color: str) -> QTableWidget:
+        """Create a tactics table for one player"""
+        # Create table directly without container
+        table = QTableWidget()
+        
+        # Define all tactics columns
+        headers = [
+            "Match", "Result", "SnV Freq", "SnV W%", "Net Freq", "Net W%",
+            "FH Wnr%", "DTL Wnr%", "IO Wnr%", "BH Wnr%", "DTL Wnr%", 
+            "Drop Freq", "Drop W%", "Rally Agg", "Return Agg"
+        ]
+        
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setFixedSize(1100, 180)  # Fixed height for 5 rows + header + scrollbar
+        
+        # Style table with player color
+        table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {TennisTheme.SURFACE};
+                border: 2px solid {color};
+                gridline-color: {TennisTheme.TEXT_MUTED};
+                color: {TennisTheme.TEXT_PRIMARY};
+                font-size: 9px;
+            }}
+            QHeaderView::section {{
+                background: {color};
+                color: white;
+                font-weight: bold;
+                padding: 4px;
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                font-size: 9px;
+            }}
+            QTableWidget::item {{
+                padding: 2px 4px;
+                border-bottom: 1px solid {TennisTheme.TEXT_MUTED};
+            }}
+            QScrollBar:vertical {{
+                background: {TennisTheme.SURFACE};
+                width: 12px;
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+            }}
+            QScrollBar::handle:vertical {{
+                background: {color};
+                border-radius: 6px;
+            }}
+        """)
+        
+        # Configure table
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(True)
+        
+        return table
+        
+    def update_tactics_data(self, player_num: int, tactics_data: List[TacticsData], player_name: str):
+        """Update tactics data for a player"""
+        if player_num == 1:
+            self.player1_tactics = tactics_data
+            self.player1_name = player_name
+            self.populate_player_table(self.player1_table, tactics_data)
+        else:
+            self.player2_tactics = tactics_data
+            self.player2_name = player_name
+            self.populate_player_table(self.player2_table, tactics_data)
+            
+    def populate_player_table(self, table: QTableWidget, tactics_data: List[TacticsData]):
+        """Populate individual player table with tactics data"""
+        if not tactics_data:
+            table.setRowCount(1)
+            table.setItem(0, 0, QTableWidgetItem("No data available"))
+            return
+            
+        # Filter out career totals and get individual matches
+        match_data = [data for data in tactics_data if "Career" not in data.match]
+        
+        # Sort by most recent first
+        match_data.sort(key=lambda x: x.match, reverse=True)
+        
+        table.setRowCount(len(match_data))
+        
+        for row, data in enumerate(match_data):
+            # Populate all columns
+            table.setItem(row, 0, QTableWidgetItem(data.match))
+            table.setItem(row, 1, QTableWidgetItem(data.result))
+            table.setItem(row, 2, QTableWidgetItem(data.snv_freq))
+            table.setItem(row, 3, QTableWidgetItem(data.snv_w_pct))
+            table.setItem(row, 4, QTableWidgetItem(data.net_freq))
+            table.setItem(row, 5, QTableWidgetItem(data.net_w_pct))
+            table.setItem(row, 6, QTableWidgetItem(data.fh_wnr_pct))
+            table.setItem(row, 7, QTableWidgetItem(data.dtl_wnr_pct))
+            table.setItem(row, 8, QTableWidgetItem(data.io_wnr_pct))
+            table.setItem(row, 9, QTableWidgetItem(data.bh_wnr_pct))
+            table.setItem(row, 10, QTableWidgetItem(data.dtl_wnr_pct_bh))
+            table.setItem(row, 11, QTableWidgetItem(data.drop_freq))
+            table.setItem(row, 12, QTableWidgetItem(data.drop_wnr_pct))
+            table.setItem(row, 13, QTableWidgetItem(data.rally_agg))
+            table.setItem(row, 14, QTableWidgetItem(data.return_agg))
+
+
 class CompactTennisComparisonWidget(QWidget):
     """Main container combining search and player profile widgets"""
     
     def __init__(self):
         super().__init__()
+        self.h2h_scraper = TennisScraper()
+        self.current_player1 = ""
+        self.current_player2 = ""
         self.setup_ui()
         self.setup_connections()
         
     def setup_ui(self):
         """Setup the complete comparison interface"""
         self.setWindowTitle("Compact Tennis Player Comparison")
-        self.setGeometry(100, 100, 750, 470)  # More height for larger ranking chart
+        self.setGeometry(100, 100, 1900, 800)  # Optimized size for stacked tables
         self.setStyleSheet(f"background: {TennisTheme.BACKGROUND};")
         
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        # Main layout: Grid layout for better organization
+        main_layout = QGridLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
+        
+        # Top-left area: Player comparison widgets
+        top_left_widget = QWidget()
+        top_left_widget.setFixedSize(750, 470)  # Match original size
+        top_left_layout = QVBoxLayout(top_left_widget)
+        top_left_layout.setContentsMargins(0, 0, 0, 0)
+        top_left_layout.setSpacing(12)
         
         # Search widget
         self.search_widget = CompactPlayerSearchWidget()
@@ -893,61 +1255,108 @@ class CompactTennisComparisonWidget(QWidget):
         profiles_layout = QHBoxLayout()
         profiles_layout.setSpacing(15)
         
-        self.player1_widget = PlayerProfileWidget(TennisTheme.PRIMARY)
-        self.player2_widget = PlayerProfileWidget(TennisTheme.ACCENT)
+        self.player1_widget = PlayerProfileWidget(TennisTheme.PRIMARY, player_num=1)
+        self.player2_widget = PlayerProfileWidget(TennisTheme.ACCENT, player_num=2)
         
         profiles_layout.addWidget(self.player1_widget)
         profiles_layout.addWidget(self.player2_widget)
         
-        # Rankings chart widget
+        # Rankings chart widget (compact size)
         self.ranking_chart = CompactRankingChart()
+        self.ranking_chart.setFixedSize(600, 220)  # Fixed size for compact view
         
-        # Bottom section with ranking chart taking full width
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(0)
-        bottom_layout.addWidget(self.ranking_chart)
+        # Add widgets to top-left layout
+        top_left_layout.addWidget(self.search_widget)
+        top_left_layout.addLayout(profiles_layout)
+        top_left_layout.addWidget(self.ranking_chart)
+        top_left_layout.addStretch()  # Push everything to top
         
-        # Status label
-        self.status_label = QLabel("Select two players to compare")
-        self.status_label.setFont(QFont("Arial", 11))
-        self.status_label.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; margin-top: 4px;")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Place top-left widget in grid position (0, 0)
+        main_layout.addWidget(top_left_widget, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        layout.addWidget(self.search_widget)
-        layout.addLayout(profiles_layout)
-        layout.addLayout(bottom_layout)
-        layout.addWidget(self.status_label)
+        # Top-right area: Tactics comparison tables
+        self.tactics_widget = TacticsTableWidget()
+        main_layout.addWidget(self.tactics_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        
+        # Bottom area: Surface performance comparison table
+        self.surface_table_widget = DualPlayerSurfaceTableWidget()
+        main_layout.addWidget(self.surface_table_widget, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
         
     def setup_connections(self):
         """Connect search signals to player widgets"""
         self.search_widget.player1Selected.connect(self.on_player1_selected)
         self.search_widget.player2Selected.connect(self.on_player2_selected)
         
+        # Connect tactics data signals
+        self.player1_widget.tacticsDataLoaded.connect(self.on_player1_tactics_loaded)
+        self.player2_widget.tacticsDataLoaded.connect(self.on_player2_tactics_loaded)
+        
+        # Connect surface stats signals
+        self.player1_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
+        self.player2_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
+        
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
+        self.current_player1 = player_name
         self.player1_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 1)
         self.update_status()
+        self.check_and_load_h2h()
         
     def on_player2_selected(self, player_name: str):
         """Handle player 2 selection"""
+        self.current_player2 = player_name
         self.player2_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 2)
         self.update_status()
+        self.check_and_load_h2h()
+        
+    def on_player1_tactics_loaded(self, player_name: str, tactics_data: list):
+        """Handle player 1 tactics data loaded"""
+        self.tactics_widget.update_tactics_data(1, tactics_data, player_name)
+        
+    def on_player2_tactics_loaded(self, player_name: str, tactics_data: list):
+        """Handle player 2 tactics data loaded"""
+        self.tactics_widget.update_tactics_data(2, tactics_data, player_name)
+        
+    def on_surface_stats_loaded(self, player_name: str, surface_stats, player_num: int):
+        """Handle surface statistics loaded for either player"""
+        self.surface_table_widget.update_player_stats(player_name, surface_stats, player_num)
         
     def update_status(self):
         """Update status label"""
-        p1_name = self.player1_widget.player_name
-        p2_name = self.player2_widget.player_name
-        
-        if p1_name and p2_name:
-            self.status_label.setText(f"Comparing: {p1_name} vs {p2_name}")
-        elif p1_name:
-            self.status_label.setText(f"Player 1: {p1_name} | Select Player 2")
-        elif p2_name:
-            self.status_label.setText(f"Player 2: {p2_name} | Select Player 1")
+        if self.current_player1 and self.current_player2:
+            pass  # Status is handled by H2H widget now
+        elif self.current_player1:
+            pass  # Individual status if needed
+        elif self.current_player2:
+            pass  # Individual status if needed
         else:
-            self.status_label.setText("Select two players to compare")
+            pass  # Default status if needed
+            
+    def check_and_load_h2h(self):
+        """Load H2H data if both players are selected"""
+        if self.current_player1 and self.current_player2:
+            # Load H2H data in background thread
+            def load_h2h():
+                try:
+                    h2h_data = self.h2h_scraper.scrape_h2h_comprehensive_sync(
+                        self.current_player1, self.current_player2
+                    )
+                    # Could add H2H display here in the future
+                    print(f"H2H data loaded for {self.current_player1} vs {self.current_player2}")
+                except Exception as e:
+                    print(f"Error loading comparison data: {e}")
+            
+            # Run in background thread
+            import threading
+            thread = threading.Thread(target=load_h2h, daemon=True)
+            thread.start()
+        else:
+            # No action needed when not both players selected
+            pass
+        
 
 # Test application
 if __name__ == "__main__":
