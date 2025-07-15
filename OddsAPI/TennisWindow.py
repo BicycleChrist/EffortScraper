@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QProgressBar, QSizePolicy, QLineEdit, QPushButton, QMenu, QListWidgetItem, QListWidget,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPointF, QRect
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QPen, QBrush, QLinearGradient,
     QRadialGradient, QPolygonF, QPainterPath, QAction
@@ -290,7 +290,11 @@ class CompactRankingChart(QWidget):
         self.player2_data = []
         self.player1_name = ""
         self.player2_name = ""
+        self.player1_points = []  # Store point coordinates for hover detection
+        self.player2_points = []
+        self.hover_point = None  # Current hovered point info
         self.setMinimumSize(600, 220)  # Much wider for better horizontal space
+        self.setMouseTracking(True)  # Enable mouse tracking for hover
         self.setStyleSheet(f"""
             CompactRankingChart {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -312,8 +316,8 @@ class CompactRankingChart(QWidget):
             
         self.update()
         
-    def load_player_rankings(self, player_name: str) -> List[Tuple[str, int]]:
-        """Load last 52 weeks of ranking data for player from most recent date available"""
+    def load_player_rankings(self, player_name: str) -> List[Tuple[str, int, int, int]]:
+        """Load last 52 weeks of ranking data for player with points and rank changes"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -332,9 +336,9 @@ class CompactRankingChart(QWidget):
             earliest_datetime = latest_datetime - timedelta(weeks=52)
             earliest_date = earliest_datetime.strftime('%Y-%m-%d')
             
-            # Get ranking data for the player within the last 52 weeks
+            # Get ranking data with points and rank changes for the player within the last 52 weeks
             cursor.execute('''
-                SELECT ranking_date, rank
+                SELECT ranking_date, rank, points, rank_change
                 FROM rankings 
                 WHERE player_name = ? 
                 AND ranking_date >= ?
@@ -359,10 +363,15 @@ class CompactRankingChart(QWidget):
         # Fill background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
         
-        # Chart area - more space, no title, larger left margin for Y-axis labels
+        # Draw legend at the top first
+        self._draw_legend(painter)
+        
+        # Chart area - adjusted margins for legend at top and X-axis labels at bottom
         left_margin = 35  # More space for Y-axis labels
-        other_margin = 20
-        chart_rect = self.rect().adjusted(left_margin, other_margin, -other_margin, -other_margin - 20)
+        top_margin = 40   # Space for legend at top
+        bottom_margin = 35  # Space for X-axis date labels
+        right_margin = 20
+        chart_rect = self.rect().adjusted(left_margin, top_margin, -right_margin, -bottom_margin)
         
         if not self.player1_data and not self.player2_data:
             # No data message
@@ -374,9 +383,9 @@ class CompactRankingChart(QWidget):
         # Calculate scale
         all_ranks = []
         if self.player1_data:
-            all_ranks.extend([rank for _, rank in self.player1_data])
+            all_ranks.extend([rank for _, rank, _, _ in self.player1_data])
         if self.player2_data:
-            all_ranks.extend([rank for _, rank in self.player2_data])
+            all_ranks.extend([rank for _, rank, _, _ in self.player2_data])
             
         if not all_ranks:
             return
@@ -415,23 +424,33 @@ class CompactRankingChart(QWidget):
             y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
             painter.drawText(5, int(y - 7), 30, 14, Qt.AlignmentFlag.AlignCenter, f"#{int(rank)}")
         
-        # Legend
-        self._draw_legend(painter)
+        # Draw X-axis date labels
+        self._draw_x_axis_dates(painter, chart_rect)
         
     def _draw_player_line(self, painter, data, chart_rect, min_rank, max_rank, color, player_name):
-        """Draw ranking line for a player"""
+        """Draw ranking line for a player with data points"""
         if len(data) < 2:
             return
             
         painter.setPen(QPen(QColor(color), 3))
         
         points = []
-        for i, (date, rank) in enumerate(data):
+        point_data = []  # Store data for hover detection
+        
+        for i, (date, rank, points_val, rank_change) in enumerate(data):
             x = chart_rect.left() + (chart_rect.width() * i / max(len(data) - 1, 1))
             # Correct Y axis: better rank (#1) at top, worse rank (#100) at bottom
             y_ratio = (rank - min_rank) / (max_rank - min_rank)
             y = chart_rect.top() + (chart_rect.height() * y_ratio)
-            points.append(QPointF(x, y))
+            point = QPointF(x, y)
+            points.append(point)
+            point_data.append((date, rank, points_val, rank_change, point))
+        
+        # Store points for hover detection
+        if player_name == self.player1_name:
+            self.player1_points = point_data
+        else:
+            self.player2_points = point_data
         
         # Draw line with glow effect
         painter.setPen(QPen(QColor(color + "80"), 6))  # Semi-transparent thicker line
@@ -442,7 +461,13 @@ class CompactRankingChart(QWidget):
         for i in range(len(points) - 1):
             painter.drawLine(points[i], points[i + 1])
         
-        # Draw current rank point
+        # Draw data point dots
+        painter.setBrush(QBrush(QColor(color)))
+        painter.setPen(QPen(QColor(color), 2))
+        for point in points:
+            painter.drawEllipse(int(point.x() - 3), int(point.y() - 3), 6, 6)
+        
+        # Highlight current rank point with larger dot
         if points:
             painter.setBrush(QBrush(QColor(color)))
             painter.setPen(QPen(QColor(color), 2))
@@ -450,12 +475,12 @@ class CompactRankingChart(QWidget):
             painter.drawEllipse(int(last_point.x() - 4), int(last_point.y() - 4), 8, 8)
     
     def _draw_legend(self, painter):
-        """Draw compact legend"""
+        """Draw compact legend at the top"""
         if not self.player1_name and not self.player2_name:
             return
             
-        legend_y = self.height() - 15
-        x_pos = 25
+        legend_y = 20  # Position at top
+        x_pos = 35
         
         painter.setFont(QFont("Arial", 9))
         
@@ -466,7 +491,7 @@ class CompactRankingChart(QWidget):
             painter.setPen(QColor(TennisTheme.PRIMARY))
             painter.drawText(x_pos + 20, legend_y - 6, 100, 12, Qt.AlignmentFlag.AlignLeft, 
                            self.player1_name[:12] + ("..." if len(self.player1_name) > 12 else ""))
-            x_pos += 120
+            x_pos += 140
             
         if self.player2_name:
             # Player 2 legend
@@ -475,6 +500,248 @@ class CompactRankingChart(QWidget):
             painter.setPen(QColor(TennisTheme.ACCENT))
             painter.drawText(x_pos + 20, legend_y - 6, 100, 12, Qt.AlignmentFlag.AlignLeft,
                            self.player2_name[:12] + ("..." if len(self.player2_name) > 12 else ""))
+    
+    def _draw_x_axis_dates(self, painter, chart_rect):
+        """Draw X-axis date labels"""
+        # Use the longer dataset to determine date positions
+        data_to_use = self.player1_data if len(self.player1_data) >= len(self.player2_data) else self.player2_data
+        
+        if not data_to_use:
+            return
+            
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.setFont(QFont("Arial", 8))
+        
+        # Show dates at regular intervals
+        num_labels = min(6, len(data_to_use))  # Show max 6 date labels
+        step = max(1, len(data_to_use) // num_labels)
+        
+        for i in range(0, len(data_to_use), step):
+            if i < len(data_to_use):
+                date, _, _, _ = data_to_use[i]
+                x = chart_rect.left() + (chart_rect.width() * i / max(len(data_to_use) - 1, 1))
+                
+                # Format date (show month/year)
+                try:
+                    from datetime import datetime
+                    date_obj = datetime.strptime(date, '%Y-%m-%d')
+                    formatted_date = date_obj.strftime('%m/%y')
+                except:
+                    formatted_date = date[-5:]  # Fallback to last 5 chars
+                
+                painter.drawText(int(x - 15), chart_rect.bottom() + 20, 30, 12, 
+                               Qt.AlignmentFlag.AlignCenter, formatted_date)
+    
+    def mouseMoveEvent(self, event):
+        """Handle mouse movement for hover tooltips"""
+        mouse_pos = event.pos()
+        hover_found = False
+        
+        # Check player 1 points
+        for date, rank, points_val, rank_change, point in self.player1_points:
+            if self._is_point_hovered(mouse_pos, point):
+                self.hover_point = {
+                    'date': date,
+                    'rank': rank, 
+                    'points': points_val,
+                    'rank_change': rank_change,
+                    'player': self.player1_name,
+                    'color': TennisTheme.PRIMARY,
+                    'pos': point
+                }
+                hover_found = True
+                break
+        
+        # Check player 2 points if no player 1 hover found
+        if not hover_found:
+            for date, rank, points_val, rank_change, point in self.player2_points:
+                if self._is_point_hovered(mouse_pos, point):
+                    self.hover_point = {
+                        'date': date,
+                        'rank': rank,
+                        'points': points_val, 
+                        'rank_change': rank_change,
+                        'player': self.player2_name,
+                        'color': TennisTheme.ACCENT,
+                        'pos': point
+                    }
+                    hover_found = True
+                    break
+        
+        if not hover_found:
+            self.hover_point = None
+            
+        self.update()  # Trigger repaint to show/hide tooltip
+    
+    def _is_point_hovered(self, mouse_pos, point):
+        """Check if mouse is hovering over a data point"""
+        hover_radius = 8  # Hover detection radius
+        distance = ((mouse_pos.x() - point.x()) ** 2 + (mouse_pos.y() - point.y()) ** 2) ** 0.5
+        return distance <= hover_radius
+    
+    def paintEvent(self, event):
+        """Custom paint for ranking chart with hover tooltips"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Fill background
+        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        
+        # Draw legend at the top first
+        self._draw_legend(painter)
+        
+        # Chart area - adjusted margins for legend at top and X-axis labels at bottom
+        left_margin = 35  # More space for Y-axis labels
+        top_margin = 40   # Space for legend at top
+        bottom_margin = 35  # Space for X-axis date labels
+        right_margin = 20
+        chart_rect = self.rect().adjusted(left_margin, top_margin, -right_margin, -bottom_margin)
+        
+        if not self.player1_data and not self.player2_data:
+            # No data message
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.setFont(QFont("Arial", 10))
+            painter.drawText(chart_rect, Qt.AlignmentFlag.AlignCenter, "Select players to view rankings")
+            return
+        
+        # Calculate scale
+        all_ranks = []
+        if self.player1_data:
+            all_ranks.extend([rank for _, rank, _, _ in self.player1_data])
+        if self.player2_data:
+            all_ranks.extend([rank for _, rank, _, _ in self.player2_data])
+            
+        if not all_ranks:
+            return
+            
+        min_rank = min(all_ranks)
+        max_rank = max(all_ranks)
+        rank_range = max_rank - min_rank
+        
+        # Add padding to range
+        padding = max(1, rank_range * 0.1)
+        min_rank = max(1, min_rank - padding)
+        max_rank = max_rank + padding
+        
+        # Draw grid lines
+        painter.setPen(QPen(QColor("#2A3441"), 1))
+        grid_lines = 4
+        for i in range(grid_lines + 1):
+            y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
+            painter.drawLine(chart_rect.left(), int(y), chart_rect.right(), int(y))
+        
+        # Draw Player 1
+        if self.player1_data:
+            self._draw_player_line(painter, self.player1_data, chart_rect, min_rank, max_rank, 
+                                 TennisTheme.PRIMARY, self.player1_name)
+        
+        # Draw Player 2  
+        if self.player2_data:
+            self._draw_player_line(painter, self.player2_data, chart_rect, min_rank, max_rank,
+                                 TennisTheme.ACCENT, self.player2_name)
+        
+        # Draw Y-axis labels (rankings) - better positioning
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.setFont(QFont("Arial", 10))
+        for i in range(grid_lines + 1):
+            rank = min_rank + (max_rank - min_rank) * (i / grid_lines)
+            y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
+            painter.drawText(5, int(y - 7), 30, 14, Qt.AlignmentFlag.AlignCenter, f"#{int(rank)}")
+        
+        # Draw X-axis date labels
+        self._draw_x_axis_dates(painter, chart_rect)
+        
+        # Draw hover tooltip if there's a hovered point
+        if self.hover_point:
+            self._draw_tooltip(painter)
+    
+    def _draw_tooltip(self, painter):
+        """Draw hover tooltip for data points"""
+        if not self.hover_point:
+            return
+            
+        # Tooltip content
+        date = self.hover_point['date']
+        rank = self.hover_point['rank']
+        points = self.hover_point['points']
+        rank_change = self.hover_point['rank_change']
+        player = self.hover_point['player']
+        color = self.hover_point['color']
+        pos = self.hover_point['pos']
+        
+        # Format date
+        try:
+            from datetime import datetime
+            date_obj = datetime.strptime(date, '%Y-%m-%d')
+            formatted_date = date_obj.strftime('%B %d, %Y')
+        except:
+            formatted_date = date
+        
+        # Format rank change (handle None values)
+        if rank_change is None:
+            change_text = "━ N/A"
+            change_color = TennisTheme.TEXT_SECONDARY
+        elif rank_change > 0:
+            change_text = f"▲ {rank_change}"
+            change_color = "#4CAF50"  # Green for improvement
+        elif rank_change < 0:
+            change_text = f"▼ {abs(rank_change)}"
+            change_color = "#FF6B6B"  # Red for decline
+        else:
+            change_text = "━ 0"
+            change_color = TennisTheme.TEXT_SECONDARY
+        
+        # Tooltip text
+        points_text = f"{points:,}" if points is not None else "N/A"
+        tooltip_lines = [
+            f"{player}",
+            f"{formatted_date}",
+            f"Rank: #{rank}",
+            f"Points: {points_text}",
+            f"Change: {change_text}"
+        ]
+        
+        # Calculate tooltip size
+        painter.setFont(QFont("Arial", 9))
+        max_width = 0
+        line_height = 14
+        for line in tooltip_lines:
+            metrics = painter.fontMetrics()
+            text_width = metrics.horizontalAdvance(line)
+            max_width = max(max_width, text_width)
+        
+        tooltip_width = max_width + 20
+        tooltip_height = len(tooltip_lines) * line_height + 10
+        
+        # Position tooltip near the point but within widget bounds
+        tooltip_x = int(pos.x() + 15)
+        tooltip_y = int(pos.y() - tooltip_height - 10)
+        
+        # Adjust if tooltip goes off-screen
+        if tooltip_x + tooltip_width > self.width():
+            tooltip_x = int(pos.x() - tooltip_width - 15)
+        if tooltip_y < 0:
+            tooltip_y = int(pos.y() + 15)
+        
+        # Draw tooltip background
+        tooltip_rect = QRect(tooltip_x, tooltip_y, tooltip_width, tooltip_height)
+        painter.setPen(QPen(QColor(color), 2))
+        painter.setBrush(QBrush(QColor("#2A3441")))
+        painter.drawRoundedRect(tooltip_rect, 5, 5)
+        
+        # Draw tooltip text
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        painter.drawText(tooltip_x + 10, tooltip_y + 15, tooltip_lines[0])  # Player name
+        
+        painter.setFont(QFont("Arial", 9))
+        for i, line in enumerate(tooltip_lines[1:], 1):
+            y_pos = tooltip_y + 15 + (i * line_height)
+            if i == 4:  # Rank change line
+                painter.setPen(QColor(change_color))
+            else:
+                painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            painter.drawText(tooltip_x + 10, y_pos, line)
 
 class CompactPlayerSearchWidget(QWidget):
     """Dual-player search using embedded results frames - no popups, no focus issues."""
