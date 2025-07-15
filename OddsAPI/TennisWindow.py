@@ -425,17 +425,27 @@ class CompactPlayerSearchWidget(QWidget):
         self.players = []
         self.current_player1 = ""
         self.current_player2 = ""
+        self.selected_index_p1 = -1  # Currently selected suggestion index for player 1
+        self.selected_index_p2 = -1  # Currently selected suggestion index for player 2
+        self.current_suggestions_p1 = []  # Current suggestions for player 1
+        self.current_suggestions_p2 = []  # Current suggestions for player 2
+        self.suggestion_buttons_p1 = []  # Button references for player 1
+        self.suggestion_buttons_p2 = []  # Button references for player 2
         self.load_players()
         self.setup_ui()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)  # ompact margins
+        layout.setContentsMargins(4, 4, 4, 4)  # Compact margins
         layout.setSpacing(2)  # Tighter spacing
+        
+        # Set minimum size for the widget but allow it to expand
+        self.setMinimumHeight(70)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         # Main search frame - much more compact
         search_frame = QFrame()
-        search_frame.setFixedHeight(70)  # Reduced from 80
+        search_frame.setFixedHeight(70)  # Keep search bar area fixed
         search_layout = QHBoxLayout(search_frame)
         search_layout.setContentsMargins(8, 6, 8, 6)  # Much smaller margins
         search_layout.setSpacing(14)  # Reduced spacing
@@ -450,6 +460,7 @@ class CompactPlayerSearchWidget(QWidget):
         self.player1_input = QLineEdit()
         self.player1_input.setPlaceholderText("Search first player...")
         self.player1_input.textChanged.connect(lambda text: self.filter_players(text, 1))
+        self.player1_input.keyPressEvent = lambda event: self.handle_key_press(event, 1)
         self.player1_input.setFixedHeight(28)  # Much smaller height
         self.player1_input.setStyleSheet("""
             QLineEdit {
@@ -485,6 +496,7 @@ class CompactPlayerSearchWidget(QWidget):
         self.player2_input = QLineEdit()
         self.player2_input.setPlaceholderText("Search second player...")
         self.player2_input.textChanged.connect(lambda text: self.filter_players(text, 2))
+        self.player2_input.keyPressEvent = lambda event: self.handle_key_press(event, 2)
         self.player2_input.setFixedHeight(28)  # Much smaller height
         self.player2_input.setStyleSheet("""
             QLineEdit {
@@ -508,17 +520,37 @@ class CompactPlayerSearchWidget(QWidget):
         search_layout.addWidget(vs_label)
         search_layout.addLayout(p2_layout, 1)
 
-        # Results areas (embedded)
+        # Results areas (embedded) - allow dynamic expansion
         self.results1_frame = QFrame()
+        self.results1_frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.results1_frame.setMaximumHeight(320)  # Limit max height to prevent excessive expansion
         self.results1_layout = QVBoxLayout(self.results1_frame)
-        self.results1_layout.setContentsMargins(0,0,0,0)
-        self.results1_layout.setSpacing(2)  # Minimal spacing
+        self.results1_layout.setContentsMargins(8, 8, 8, 8)  # Add some margins for better appearance
+        self.results1_layout.setSpacing(6)  # Even more spacing for better readability
+        self.results1_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {TennisTheme.SURFACE};
+                border: 1px solid #2A3441;
+                border-radius: 6px;
+                margin-top: 4px;
+            }}
+        """)
         self.results1_frame.hide()
 
         self.results2_frame = QFrame()
+        self.results2_frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.results2_frame.setMaximumHeight(320)  # Limit max height to prevent excessive expansion
         self.results2_layout = QVBoxLayout(self.results2_frame)
-        self.results2_layout.setContentsMargins(0, 0, 0, 0)
-        self.results2_layout.setSpacing(1)  # Minimal spacing
+        self.results2_layout.setContentsMargins(8, 8, 8, 8)  # Add some margins for better appearance
+        self.results2_layout.setSpacing(6)  # Even more spacing for better readability
+        self.results2_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {TennisTheme.SURFACE};
+                border: 1px solid #2A3441;
+                border-radius: 6px;
+                margin-top: 4px;
+            }}
+        """)
         self.results2_frame.hide()
 
         layout.addWidget(search_frame)
@@ -546,12 +578,24 @@ class CompactPlayerSearchWidget(QWidget):
         if not text:
             if player_num == 1:
                 self.results1_frame.hide()
+                self.selected_index_p1 = -1
+                self.current_suggestions_p1 = []
             else:
                 self.results2_frame.hide()
+                self.selected_index_p2 = -1
+                self.current_suggestions_p2 = []
             return
 
         filtered = [(name, rank) for name, rank in self.players 
                    if text.lower() in name.lower()][:8]
+
+        # Store current suggestions and reset selection
+        if player_num == 1:
+            self.current_suggestions_p1 = filtered
+            self.selected_index_p1 = -1
+        else:
+            self.current_suggestions_p2 = filtered
+            self.selected_index_p2 = -1
 
         self.update_results(filtered, player_num)
 
@@ -560,41 +604,65 @@ class CompactPlayerSearchWidget(QWidget):
         if player_num == 1:
             frame = self.results1_frame
             layout = self.results1_layout
+            button_list = self.suggestion_buttons_p1
         else:
             frame = self.results2_frame
             layout = self.results2_layout
+            button_list = self.suggestion_buttons_p2
 
         # Clear previous
         for i in reversed(range(layout.count())):
             layout.itemAt(i).widget().setParent(None)
+        button_list.clear()
 
         if not filtered_players:
             frame.hide()
             return
 
-        for name, rank in filtered_players:
+        for i, (name, rank) in enumerate(filtered_players):
             btn = QPushButton(f"#{rank} {name}")
             btn.clicked.connect(lambda checked, n=name, p=player_num: self.select_player(n, p))
-            btn.setFixedHeight(28)  # More comfortable height for suggestions
-            btn.setStyleSheet(f"""
-                QPushButton {{
+            btn.setFixedHeight(38)  # Even larger height for better visibility
+            btn.setMinimumWidth(320)  # Ensure minimum width for full names
+            btn.setStyleSheet(self.get_button_style(False))  # Normal style initially
+            layout.addWidget(btn)
+            button_list.append(btn)
+
+        frame.show()
+
+    def get_button_style(self, is_selected):
+        """Get button style based on selection state"""
+        if is_selected:
+            return """
+                QPushButton {
                     text-align: left;
-                    padding: 6px 12px;
+                    padding: 8px 12px;
+                    background: #00D4AA;
+                    border: 2px solid #00D4AA;
+                    color: white;
+                    font-size: 13px;
+                    border-radius: 6px;
+                    margin: 3px 0px;
+                    font-weight: bold;
+                }
+            """
+        else:
+            return """
+                QPushButton {
+                    text-align: left;
+                    padding: 8px 12px;
                     background: #252B3A;
                     border: 1px solid #2A3441;
                     color: white;
-                    font-size: 12px;
-                    border-radius: 4px;
-                    margin: 1px;
-                }}
-                QPushButton:hover {{
+                    font-size: 13px;
+                    border-radius: 6px;
+                    margin: 3px 0px;
+                }
+                QPushButton:hover {
                     background: #00D4AA;
                     color: white;
-                }}
-            """)
-            layout.addWidget(btn)
-
-        frame.show()
+                }
+            """
 
     def select_player(self, name, player_num):
         """Select player and emit signal"""
@@ -611,6 +679,72 @@ class CompactPlayerSearchWidget(QWidget):
             self.player1Selected.emit(name)
         else:
             self.player2Selected.emit(name)
+
+    def handle_key_press(self, event, player_num):
+        """Handle arrow key navigation and Enter key selection"""
+        key = event.key()
+        
+        if player_num == 1:
+            suggestions = self.current_suggestions_p1
+            selected_index = self.selected_index_p1
+            button_list = self.suggestion_buttons_p1
+            frame = self.results1_frame
+        else:
+            suggestions = self.current_suggestions_p2
+            selected_index = self.selected_index_p2
+            button_list = self.suggestion_buttons_p2
+            frame = self.results2_frame
+        
+        if not suggestions or not frame.isVisible():
+            # Let the line edit handle normal text input
+            QLineEdit.keyPressEvent(self.player1_input if player_num == 1 else self.player2_input, event)
+            return
+        
+        if key == Qt.Key.Key_Down:
+            # Move selection down
+            new_index = min(selected_index + 1, len(suggestions) - 1)
+            self.update_selection(player_num, new_index)
+            event.accept()
+        elif key == Qt.Key.Key_Up:
+            # Move selection up
+            new_index = max(selected_index - 1, 0) if selected_index > -1 else len(suggestions) - 1
+            self.update_selection(player_num, new_index)
+            event.accept()
+        elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            # Select current highlighted item
+            if 0 <= selected_index < len(suggestions):
+                name, rank = suggestions[selected_index]
+                self.select_player(name, player_num)
+            event.accept()
+        elif key == Qt.Key.Key_Escape:
+            # Hide suggestions
+            frame.hide()
+            if player_num == 1:
+                self.selected_index_p1 = -1
+            else:
+                self.selected_index_p2 = -1
+            event.accept()
+        else:
+            # Let the line edit handle normal text input
+            QLineEdit.keyPressEvent(self.player1_input if player_num == 1 else self.player2_input, event)
+
+    def update_selection(self, player_num, new_index):
+        """Update visual selection of suggestion buttons"""
+        if player_num == 1:
+            old_index = self.selected_index_p1
+            self.selected_index_p1 = new_index
+            button_list = self.suggestion_buttons_p1
+        else:
+            old_index = self.selected_index_p2
+            self.selected_index_p2 = new_index
+            button_list = self.suggestion_buttons_p2
+        
+        # Update button styles
+        for i, btn in enumerate(button_list):
+            if i == new_index:
+                btn.setStyleSheet(self.get_button_style(True))
+            else:
+                btn.setStyleSheet(self.get_button_style(False))
 
 
 
@@ -1234,6 +1368,7 @@ class CompactTennisComparisonWidget(QWidget):
         """Setup the complete comparison interface"""
         self.setWindowTitle("Compact Tennis Player Comparison")
         self.setGeometry(100, 100, 1900, 800)  # Optimized size for stacked tables
+        self.setMinimumSize(1400, 600)  # Set minimum size for proper functionality
         self.setStyleSheet(f"background: {TennisTheme.BACKGROUND};")
         
         # Main layout: Grid layout for better organization
@@ -1243,7 +1378,9 @@ class CompactTennisComparisonWidget(QWidget):
         
         # Top-left area: Player comparison widgets
         top_left_widget = QWidget()
-        top_left_widget.setFixedSize(750, 470)  # Match original size
+        top_left_widget.setFixedWidth(750)  # Keep width fixed but allow height to expand
+        top_left_widget.setMinimumHeight(470)  # Minimum height but allow expansion
+        top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
         top_left_layout.setContentsMargins(0, 0, 0, 0)
         top_left_layout.setSpacing(12)
