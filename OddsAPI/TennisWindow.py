@@ -1,10 +1,12 @@
 import sys
 import math
+import time
 import threading
 import sqlite3
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+import traceback
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -20,7 +22,7 @@ from PyQt6.QtGui import (
 from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsData
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
 
-#TODO: Display Serve data, Tactics gatherd from Tennis abstract
+#TODO: Display Serve data,fix I-Hard surface dissappearing in career surface widget display
 
 class TennisTheme:
     """Tennis theme colors"""
@@ -67,17 +69,98 @@ class SurfaceStats:
         return 0
 
 class CompactSurfaceWidget(QWidget):
-    """Compact surface performance visualization"""
+    """Compact surface performance visualization - FRESH IMPLEMENTATION"""
     
     def __init__(self):
         super().__init__()
         self.surface_stats = SurfaceStats()
-        self.setFixedSize(150, 85)  # Wider to fit all 4 surfaces
+        self.setFixedSize(180, 85)
         self.setToolTip("Surface Performance")
+        self.is_populated = False
+        print(f"NEW CompactSurfaceWidget initialized - Size: 180x85")
         
-    def update_stats(self, stats: SurfaceStats):
-        """Update surface statistics"""
+    def update_stats_from_yearly_data(self, yearly_stats: dict):
+        """Update surface statistics from H2H yearly stats - SINGLE UPDATE ONLY"""
+        if self.is_populated:
+            print("WARNING: CompactSurfaceWidget already populated, ignoring update")
+            return
+            
+        print(f"CompactSurfaceWidget.update_stats_from_yearly_data called")
+        print(f"Available years: {list(yearly_stats.keys())}")
+        
+        # Get last 3 years of data, or use career totals if insufficient
+        current_year = 2025
+        last_3_years = [str(current_year), str(current_year-1), str(current_year-2)]
+        
+        available_years = [year for year in last_3_years if year in yearly_stats]
+        print(f"Available years in last 3: {available_years}")
+        
+        if len(available_years) >= 3:
+            # Use last 3 years data
+            print("Using last 3 years of data")
+            data_source = "Last 3 Years"
+            years_to_use = available_years
+        else:
+            # Use career totals
+            print("Insufficient recent data, using career totals")
+            data_source = "Career Totals"
+            if "Year Total" in yearly_stats:
+                years_to_use = ["Year Total"]
+            else:
+                print("ERROR: No career totals available")
+                return
+                
+        # Aggregate surface stats from selected years
+        stats = SurfaceStats()
+        
+        for year in years_to_use:
+            year_data = yearly_stats[year]
+            print(f"Processing year {year}: {year_data}")
+            
+            for surface_key, record in year_data.items():
+                if not record or record == "--" or record == "0-0":
+                    continue
+                    
+                if '-' not in record:
+                    continue
+                    
+                try:
+                    wins_str, losses_str = record.split('-')
+                    wins = int(wins_str.strip())
+                    losses = int(losses_str.strip())
+                    
+                    surface_lower = surface_key.lower()
+                    
+                    if surface_lower == 'hard':
+                        stats.hard_wins += wins
+                        stats.hard_total += (wins + losses)
+                        print(f"  HARD: +{wins}/{wins+losses} -> Total: {stats.hard_wins}/{stats.hard_total}")
+                    elif surface_lower == 'clay':
+                        stats.clay_wins += wins
+                        stats.clay_total += (wins + losses)
+                        print(f"  CLAY: +{wins}/{wins+losses} -> Total: {stats.clay_wins}/{stats.clay_total}")
+                    elif surface_lower == 'grass':
+                        stats.grass_wins += wins
+                        stats.grass_total += (wins + losses)
+                        print(f"  GRASS: +{wins}/{wins+losses} -> Total: {stats.grass_wins}/{stats.grass_total}")
+                    elif surface_lower == 'i.hard':
+                        stats.indoor_wins += wins
+                        stats.indoor_total += (wins + losses)
+                        print(f"  I.HARD: +{wins}/{wins+losses} -> Total: {stats.indoor_wins}/{stats.indoor_total}")
+                        
+                except (ValueError, AttributeError) as e:
+                    print(f"  ERROR parsing {surface_key}: {record} - {e}")
+                    continue
+                    
+        print(f"FINAL STATS ({data_source}):")
+        print(f"  Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
+        print(f"  Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
+        print(f"  Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
+        print(f"  Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
+        
         self.surface_stats = stats
+        self.is_populated = True
+        print("CompactSurfaceWidget populated and locked")
         self.update()
         
     def paintEvent(self, event):
@@ -88,7 +171,12 @@ class CompactSurfaceWidget(QWidget):
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.SURFACE))
         
-        # Surface data
+        # Career label at the top
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.setFont(QFont("Arial", 7))
+        painter.drawText(2, 2, 156, 10, Qt.AlignmentFlag.AlignCenter, "Trailing 3y Surface W%")
+        
+        # Surface data - ALL 4 SURFACES ALWAYS
         surfaces = [
             ('Hard', TennisTheme.HARD_COURT, self.surface_stats.get_percentage('hard')),
             ('Clay', TennisTheme.CLAY_COURT, self.surface_stats.get_percentage('clay')),
@@ -96,7 +184,11 @@ class CompactSurfaceWidget(QWidget):
             ('Indoor', TennisTheme.INDOOR_COURT, self.surface_stats.get_percentage('indoor'))
         ]
         
-        # Draw compact bars - adjusted for 4 surfaces
+        print(f"PAINTING 4 surfaces:")
+        for i, (name, color, percentage) in enumerate(surfaces):
+            print(f"  {i}: {name} = {percentage:.1f}%")
+        
+        # Draw compact bars
         bar_width = 28
         bar_height = 45
         spacing = 3
@@ -105,6 +197,7 @@ class CompactSurfaceWidget(QWidget):
         
         for i, (name, color, percentage) in enumerate(surfaces):
             x = start_x + i * (bar_width + spacing)
+            print(f"  Drawing {name} at x={x} (width={bar_width})")
             
             # Background bar
             painter.setPen(QPen(QColor("#2A3441"), 1))
@@ -112,19 +205,21 @@ class CompactSurfaceWidget(QWidget):
             painter.drawRect(x, start_y, bar_width, bar_height)
             
             # Performance bar
-            fill_height = int((percentage / 100) * bar_height)
-            painter.setBrush(QBrush(QColor(color)))
-            painter.drawRect(x, start_y + bar_height - fill_height, bar_width, fill_height)
+            fill_height = max(1, int((percentage / 100) * bar_height)) if percentage > 0 else 0
+            if fill_height > 0:
+                painter.setBrush(QBrush(QColor(color)))
+                painter.drawRect(x, start_y + bar_height - fill_height, bar_width, fill_height)
             
             # Surface label
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-            painter.setFont(QFont("Arial", 8))
-            painter.drawText(x, start_y - 5, bar_width, 12, Qt.AlignmentFlag.AlignCenter, name[:1])
+            painter.setFont(QFont("Arial", 7))
+            label = "I.Hard" if name == "Indoor" else name[:1]
+            painter.drawText(x, start_y - 5, bar_width, 12, Qt.AlignmentFlag.AlignCenter, label)
             
             # Percentage
             painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
             painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
-            percentage_text = f"{percentage:.0f}%" if percentage > 0 else "0%"
+            percentage_text = f"{percentage:.0f}%"
             painter.drawText(x, start_y + bar_height + 5, bar_width, 10, Qt.AlignmentFlag.AlignCenter, percentage_text)
 
 class HistoricalSurfaceTableWidget(QWidget):
@@ -136,7 +231,7 @@ class HistoricalSurfaceTableWidget(QWidget):
         self.player2_yearly_stats = {}
         self.player1_name = ""
         self.player2_name = ""
-        self.setFixedSize(750, 240)  # Reduced height to eliminate unused space
+        self.setFixedSize(900, 240)  # Wider to match top-left container
         self.setStyleSheet(f"""
             HistoricalSurfaceTableWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -164,8 +259,8 @@ class HistoricalSurfaceTableWidget(QWidget):
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
         
         # Draw two side-by-side tables with no spacing
-        self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 375, TennisTheme.PRIMARY)
-        self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 375, 0, 375, TennisTheme.ACCENT)
+        self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 450, TennisTheme.PRIMARY)
+        self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 450, 0, 450, TennisTheme.ACCENT)
         
     def draw_player_table(self, painter, player_name, yearly_stats, x_offset, y_offset, width, accent_color):
         """Draw historical surface table for one player"""
@@ -293,7 +388,7 @@ class CompactRankingChart(QWidget):
         self.player1_points = []  # Store point coordinates for hover detection
         self.player2_points = []
         self.hover_point = None  # Current hovered point info
-        self.setMinimumSize(600, 220)  # Much wider for better horizontal space
+        self.setMinimumSize(900, 220)  # Match surface table width
         self.setMouseTracking(True)  # Enable mouse tracking for hover
         self.setStyleSheet(f"""
             CompactRankingChart {{
@@ -1161,7 +1256,7 @@ class PlayerProfileWidget(QWidget):
         
     def setup_ui(self):
         """Setup the compact player profile UI"""
-        self.setFixedSize(350, 200)  # Back to original height
+        self.setFixedSize(420, 200)  # Even wider to prevent bio text from pushing widgets
         self.setStyleSheet(f"""
             PlayerProfileWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -1223,13 +1318,13 @@ class PlayerProfileWidget(QWidget):
         # Center: Ranking display
         self.ranking_widget = RankingGraphWidget()
         
-        # Right: Surface performance
+        # Right: Surface performance - FRESH IMPLEMENTATION
         self.surface_widget = CompactSurfaceWidget()
         
         # Assemble content
         content_layout.addWidget(bio_widget, 1)
-        content_layout.addWidget(self.ranking_widget)
-        content_layout.addWidget(self.surface_widget)
+        content_layout.addWidget(self.ranking_widget, 0)
+        content_layout.addWidget(self.surface_widget, 0)
         
         # Assemble main layout
         layout.addWidget(header_widget)
@@ -1243,21 +1338,9 @@ class PlayerProfileWidget(QWidget):
         self.player_name = player_name
         self.name_label.setText(player_name)
         
-        # Reset display
-        self.reset_display()
-        
         # Load data asynchronously
         self.load_player_data()
-        
-    def reset_display(self):
-        """Reset all displays to default state"""
-        self.country_label.setText("Country: Loading...")
-        self.age_label.setText("Age: Loading...")
-        self.plays_label.setText("Plays: Loading...")
-        self.elo_label.setText("ELO: Loading...")
-        self.ranking_widget.update_ranking(None, None)
-        self.surface_widget.update_stats(SurfaceStats())
-        self.form_display.setText("Loading...")
+         
         
     def load_player_data(self):
         """Load player data from multiple sources"""
@@ -1292,11 +1375,6 @@ class PlayerProfileWidget(QWidget):
                     except:
                         pass
                     
-                    # Extract surface stats from career splits
-                    if hasattr(player_data, 'career_splits') and player_data.career_splits:
-                        surface_stats = self.extract_surface_stats(player_data.career_splits)
-                        self.surface_widget.update_stats(surface_stats)
-                        self.surfaceStatsLoaded.emit(self.player_name, surface_stats, self.player_num)
                         
                     # Emit tactics data if available
                     if hasattr(player_data, 'tactics') and player_data.tactics:
@@ -1345,11 +1423,9 @@ class PlayerProfileWidget(QWidget):
                             elif h2h_data.player2.recent_form:
                                 self.update_form(h2h_data.player2.recent_form)
                                 
-                        # Extract surface stats from yearly stats (overwrites Tennis Abstract data)
+                        # Update surface widget with yearly stats data - SINGLE UPDATE ONLY
                         if target_player_data and target_player_data.yearly_stats:
-                            surface_stats = self.extract_surface_stats_from_h2h(target_player_data.yearly_stats)
-                            self.surface_widget.update_stats(surface_stats)
-                            self.surfaceStatsLoaded.emit(self.player_name, surface_stats, self.player_num)
+                            self.surface_widget.update_stats_from_yearly_data(target_player_data.yearly_stats)
                             
                             # Also emit yearly stats for historical table
                             self.yearlyStatsLoaded.emit(self.player_name, target_player_data.yearly_stats, self.player_num)
@@ -1447,15 +1523,15 @@ class PlayerProfileWidget(QWidget):
                         
                         surface_lower = surface_name.lower()
                         
-                        if 'hard' in surface_lower:
-                            if 'i.hard' in surface_lower or 'indoor' in surface_lower:
-                                stats.indoor_wins += wins
-                                stats.indoor_total += total
-                                print(f"  -> Added to INDOOR: {wins}/{total} from '{surface_name}: {record}'")
-                            else:
-                                stats.hard_wins += wins
-                                stats.hard_total += total
-                                print(f"  -> Added to HARD: {wins}/{total} from '{surface_name}: {record}'")
+                        # Handle I.hard/indoor specifically first to prevent it from matching 'hard'
+                        if surface_lower == 'i.hard' or 'indoor' in surface_lower:
+                            stats.indoor_wins += wins
+                            stats.indoor_total += total
+                            print(f"  -> Added to INDOOR: {wins}/{total} from '{surface_name}: {record}'")
+                        elif 'hard' in surface_lower and 'i.hard' not in surface_lower:
+                            stats.hard_wins += wins
+                            stats.hard_total += total
+                            print(f"  -> Added to HARD: {wins}/{total} from '{surface_name}: {record}'")
                         elif 'clay' in surface_lower:
                             stats.clay_wins += wins
                             stats.clay_total += total
@@ -1712,7 +1788,7 @@ class CompactTennisComparisonWidget(QWidget):
         
         # Top-left area: Player comparison widgets
         top_left_widget = QWidget()
-        top_left_widget.setFixedWidth(750)  # Keep width fixed but allow height to expand
+        top_left_widget.setFixedWidth(900)  # Wider to accommodate both 420px player widgets
         top_left_widget.setMinimumHeight(470)  # Minimum height but allow expansion
         top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
@@ -1734,12 +1810,15 @@ class CompactTennisComparisonWidget(QWidget):
         
         # Rankings chart widget (compact size)
         self.ranking_chart = CompactRankingChart()
-        self.ranking_chart.setFixedSize(600, 220)  # Fixed size for compact view
+        self.ranking_chart.setFixedSize(900, 220)  # Fixed size matching surface table
+        
+        # Historical surface performance table
+        self.surface_table_widget = HistoricalSurfaceTableWidget()
         
         # Add widgets to top-left layout
         top_left_layout.addWidget(self.search_widget)
         top_left_layout.addLayout(profiles_layout)
-        top_left_layout.addWidget(self.ranking_chart)
+        top_left_layout.addWidget(self.surface_table_widget)
         top_left_layout.addStretch()  # Push everything to top
         
         # Place top-left widget in grid position (0, 0)
@@ -1749,9 +1828,8 @@ class CompactTennisComparisonWidget(QWidget):
         self.tactics_widget = TacticsTableWidget()
         main_layout.addWidget(self.tactics_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        # Bottom area: Historical surface performance table
-        self.surface_table_widget = HistoricalSurfaceTableWidget()
-        main_layout.addWidget(self.surface_table_widget, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # Bottom area: Rankings chart
+        main_layout.addWidget(self.ranking_chart, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         
     def setup_connections(self):
