@@ -127,94 +127,158 @@ class CompactSurfaceWidget(QWidget):
             percentage_text = f"{percentage:.0f}%" if percentage > 0 else "0%"
             painter.drawText(x, start_y + bar_height + 5, bar_width, 10, Qt.AlignmentFlag.AlignCenter, percentage_text)
 
-class DualPlayerSurfaceTableWidget(QWidget):
-    """Standalone dual-player surface performance table widget"""
+class HistoricalSurfaceTableWidget(QWidget):
+    """Historical surface performance table widget matching Tennis Tonic style"""
     
     def __init__(self):
         super().__init__()
-        self.player1_stats = SurfaceStats()
-        self.player2_stats = SurfaceStats()
+        self.player1_yearly_stats = {}
+        self.player2_yearly_stats = {}
         self.player1_name = ""
         self.player2_name = ""
-        self.setFixedSize(750, 200)
+        self.setFixedSize(750, 240)  # Reduced height to eliminate unused space
         self.setStyleSheet(f"""
-            DualPlayerSurfaceTableWidget {{
+            HistoricalSurfaceTableWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
                 border: 2px solid {TennisTheme.SURFACE};
-                border-radius: 12px;
+                border-radius: 8px;
             }}
         """)
         
-    def update_player_stats(self, player_name: str, stats: SurfaceStats, player_num: int):
-        """Update surface statistics for a specific player"""
+    def update_player_stats(self, player_name: str, yearly_stats: dict, player_num: int):
+        """Update yearly surface statistics for a specific player"""
         if player_num == 1:
-            self.player1_stats = stats
+            self.player1_yearly_stats = yearly_stats
             self.player1_name = player_name
         else:
-            self.player2_stats = stats
+            self.player2_yearly_stats = yearly_stats
             self.player2_name = player_name
         self.update()
         
     def paintEvent(self, event):
-        """Custom paint for dual player surface table"""
+        """Custom paint for historical surface table"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
         
-        # Title
-        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
-        painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "Surface Performance Comparison")
+        # Draw two side-by-side tables with no spacing
+        self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 375, TennisTheme.PRIMARY)
+        self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 375, 0, 375, TennisTheme.ACCENT)
         
-        # Draw two columns - one for each player
-        self.draw_player_surface_stats(painter, self.player1_name, self.player1_stats, 50, 50, TennisTheme.PRIMARY)
-        self.draw_player_surface_stats(painter, self.player2_name, self.player2_stats, 400, 50, TennisTheme.ACCENT)
+    def draw_player_table(self, painter, player_name, yearly_stats, x_offset, y_offset, width, accent_color):
+        """Draw historical surface table for one player"""
+        # Header background
+        header_color = QColor("#2A3441") 
+        painter.fillRect(x_offset, y_offset, width, 30, header_color)
         
-    def draw_player_surface_stats(self, painter, player_name, stats, x_offset, y_offset, color):
-        """Draw surface statistics for one player"""
-        # Player name header
-        painter.setPen(QColor(color))
+        # Player name in header
+        painter.setPen(QColor(accent_color))
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        painter.drawText(x_offset, y_offset, player_name if player_name else "Select Player")
-        
-        # Surface data
-        surfaces = [
-            ('Hard Court', TennisTheme.HARD_COURT, stats.hard_wins, stats.hard_total),
-            ('Clay Court', TennisTheme.CLAY_COURT, stats.clay_wins, stats.clay_total),
-            ('Grass Court', TennisTheme.GRASS_COURT, stats.grass_wins, stats.grass_total),
-            ('Indoor Hard', TennisTheme.INDOOR_COURT, stats.indoor_wins, stats.indoor_total)
-        ]
+        painter.drawText(x_offset + 10, y_offset + 20, player_name if player_name else "Select Player")
         
         # Table headers
         y = y_offset + 30
-        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        painter.drawText(x_offset, y, "Surface")
-        painter.drawText(x_offset + 120, y, "Record")
-        painter.drawText(x_offset + 180, y, "Win %")
+        header_height = 25
+        painter.fillRect(x_offset, y, width, header_height, QColor("#1A1F2E"))
         
-        # Draw surface rows
-        for i, (name, surface_color, wins, total) in enumerate(surfaces):
-            y = y_offset + 50 + (i * 25)
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        
+        # Column headers
+        headers = ["Year", "Sum", "Hard", "Clay", "I.hard", "Grass"]
+        col_widths = [45, 55, 55, 45, 50, 50]
+        x_pos = x_offset + 5
+        
+        for header, col_width in zip(headers, col_widths):
+            painter.drawText(x_pos, y + 17, header)
+            x_pos += col_width
             
-            # Surface name with color indicator
-            painter.setPen(QColor(surface_color))
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(x_offset, y, f"● {name}")
+        # Draw data rows
+        if yearly_stats:
+            # Sort years in descending order
+            sorted_years = sorted([year for year in yearly_stats.keys() if year != "Year Total"], reverse=True)
             
-            # Win-loss record
-            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
-            painter.setFont(QFont("Arial", 10))
-            record_text = f"{wins}-{total-wins}" if total > 0 else "0-0"
-            painter.drawText(x_offset + 120, y, record_text)
+            row_y = y + header_height
+            row_height = 22
             
-            # Win percentage
-            percentage = (wins / total * 100) if total > 0 else 0
-            painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(x_offset + 180, y, f"{percentage:.1f}%")
+            # Data rows
+            for i, year in enumerate(sorted_years[:8]):  # Show last 8 years
+                if i % 2 == 0:
+                    painter.fillRect(x_offset, row_y, width, row_height, QColor("#252B3A"))
+                else:
+                    painter.fillRect(x_offset, row_y, width, row_height, QColor("#1E242F"))
+                
+                year_data = yearly_stats[year]
+                
+                painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+                painter.setFont(QFont("Arial", 9))
+                
+                # Year
+                painter.drawText(x_offset + 5, row_y + 15, year)
+                
+                # Data columns
+                data_values = [
+                    year_data.get('Sum.', '0-0'),
+                    year_data.get('Hard', '0-0'),  
+                    year_data.get('Clay', '0-0'),
+                    year_data.get('I.hard', '0-0'),
+                    year_data.get('Grass', '0-0')
+                ]
+                
+                x_pos = x_offset + 50
+                for value, col_width in zip(data_values, col_widths[1:]):
+                    # Color code based on performance
+                    if '-' in value and value != '0-0':
+                        wins, losses = value.split('-')
+                        try:
+                            win_pct = int(wins) / (int(wins) + int(losses)) if int(wins) + int(losses) > 0 else 0
+                            if win_pct >= 0.7:
+                                painter.setPen(QColor("#4CAF50"))  # Green for good performance
+                            elif win_pct >= 0.5:
+                                painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))  # Normal
+                            else:
+                                painter.setPen(QColor("#FF6B6B"))  # Red for poor performance
+                        except:
+                            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+                    else:
+                        painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+                    
+                    painter.drawText(x_pos, row_y + 15, value)
+                    x_pos += col_width
+                
+                row_y += row_height
+            
+            # Total row (if available)
+            if "Year Total" in yearly_stats:
+                # Separator line
+                painter.setPen(QColor(accent_color))
+                painter.drawLine(x_offset, row_y, x_offset + width, row_y)
+                row_y += 2
+                
+                # Total row background
+                painter.fillRect(x_offset, row_y, width, row_height, QColor("#2A3441"))
+                
+                total_data = yearly_stats["Year Total"]
+                
+                painter.setPen(QColor(accent_color))
+                painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+                painter.drawText(x_offset + 5, row_y + 15, "Total")
+                
+                # Total data
+                total_values = [
+                    total_data.get('Sum.', '0-0'),
+                    total_data.get('Hard', '0-0'),
+                    total_data.get('Clay', '0-0'), 
+                    total_data.get('I.hard', '0-0'),
+                    total_data.get('Grass', '0-0')
+                ]
+                
+                x_pos = x_offset + 50
+                for value, col_width in zip(total_values, col_widths[1:]):
+                    painter.drawText(x_pos, row_y + 15, value)
+                    x_pos += col_width
 
 class CompactRankingChart(QWidget):
     """Compact ranking evolution chart with dual player overlay"""
@@ -811,6 +875,7 @@ class PlayerProfileWidget(QWidget):
     dataUpdated = pyqtSignal(str)  # player_name
     tacticsDataLoaded = pyqtSignal(str, list)  # player_name, tactics_data
     surfaceStatsLoaded = pyqtSignal(str, object, int)  # player_name, SurfaceStats, player_num
+    yearlyStatsLoaded = pyqtSignal(str, dict, int)  # player_name, yearly_stats_dict, player_num
     
     def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
@@ -842,11 +907,26 @@ class PlayerProfileWidget(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         
-        # Header with player name
+        # Header with player name and recent form
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+        
         self.name_label = QLabel("Select Player")
         self.name_label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
         self.name_label.setStyleSheet(f"color: {self.player_color}; margin-bottom: 4px;")
-        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Recent form display (moved from bottom)
+        self.form_display = QLabel("🔴🔴🔴🔴🔴")
+        self.form_display.setFont(QFont("Arial", 12))
+        self.form_display.setAlignment(Qt.AlignmentFlag.AlignRight)
+        
+        header_layout.addWidget(self.name_label)
+        header_layout.addStretch()
+        header_layout.addWidget(self.form_display)
+        
+        header_widget = QWidget()
+        header_widget.setLayout(header_layout)
         
         # Main content area
         content_widget = QWidget()
@@ -884,25 +964,9 @@ class PlayerProfileWidget(QWidget):
         content_layout.addWidget(self.ranking_widget)
         content_layout.addWidget(self.surface_widget)
         
-        # Recent form at bottom
-        form_layout = QHBoxLayout()
-        form_layout.setContentsMargins(0, 0, 0, 0)
-        
-        form_title = QLabel("Recent Form:")
-        form_title.setFont(QFont("Arial", 10))
-        form_title.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY};")
-        
-        self.form_display = QLabel("🔴🔴🔴🔴🔴")
-        self.form_display.setFont(QFont("Arial", 10))
-        
-        form_layout.addWidget(form_title)
-        form_layout.addWidget(self.form_display)
-        form_layout.addStretch()
-        
         # Assemble main layout
-        layout.addWidget(self.name_label)
+        layout.addWidget(header_widget)
         layout.addWidget(content_widget, 1)
-        layout.addLayout(form_layout)
         
     def set_player(self, player_name: str):
         """Set the player and load their data"""
@@ -1019,6 +1083,9 @@ class PlayerProfileWidget(QWidget):
                             surface_stats = self.extract_surface_stats_from_h2h(target_player_data.yearly_stats)
                             self.surface_widget.update_stats(surface_stats)
                             self.surfaceStatsLoaded.emit(self.player_name, surface_stats, self.player_num)
+                            
+                            # Also emit yearly stats for historical table
+                            self.yearlyStatsLoaded.emit(self.player_name, target_player_data.yearly_stats, self.player_num)
                             
                 except Exception as e:
                     print(f"Error getting H2H data for {self.player_name}: {e}")
@@ -1415,8 +1482,8 @@ class CompactTennisComparisonWidget(QWidget):
         self.tactics_widget = TacticsTableWidget()
         main_layout.addWidget(self.tactics_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        # Bottom area: Surface performance comparison table
-        self.surface_table_widget = DualPlayerSurfaceTableWidget()
+        # Bottom area: Historical surface performance table
+        self.surface_table_widget = HistoricalSurfaceTableWidget()
         main_layout.addWidget(self.surface_table_widget, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         
@@ -1432,6 +1499,10 @@ class CompactTennisComparisonWidget(QWidget):
         # Connect surface stats signals
         self.player1_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
         self.player2_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
+        
+        # Connect yearly stats signals for historical table
+        self.player1_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
+        self.player2_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
         
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
@@ -1459,7 +1530,12 @@ class CompactTennisComparisonWidget(QWidget):
         
     def on_surface_stats_loaded(self, player_name: str, surface_stats, player_num: int):
         """Handle surface statistics loaded for either player"""
-        self.surface_table_widget.update_player_stats(player_name, surface_stats, player_num)
+        # This is kept for compatibility but the historical table uses yearly stats instead
+        pass
+        
+    def on_yearly_stats_loaded(self, player_name: str, yearly_stats: dict, player_num: int):
+        """Handle yearly surface statistics loaded for either player"""
+        self.surface_table_widget.update_player_stats(player_name, yearly_stats, player_num)
         
     def update_status(self):
         """Update status label"""
