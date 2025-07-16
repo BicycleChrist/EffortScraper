@@ -1,6 +1,6 @@
 from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, pyqtProperty
-from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
+from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath, QFontDatabase
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 from PyQt6.QtCore import QRectF, QPointF
 from livetape_scraper import scrape_espn_scores 
@@ -48,14 +48,14 @@ class TickerTape(QWidget):
         self.current_text = ""
         self.segment_width = 120  # Width of sport segment
         
-        # Fonts - Professional broadcast-style fonts, bigger and more imposing
-        self.sport_font = QFont("Roboto", 14, QFont.Weight.ExtraBold)
-        self.game_font = QFont("Roboto", 15, QFont.Weight.Bold)
+        # this fuckaround is required to load a font from a file
+        font_id = QFontDatabase.addApplicationFont("custom_fonts/Z003-MediumItalic.otf")
+        _fontstr = QFontDatabase.applicationFontFamilies(font_id)[0]
+        custom_font = QFont(_fontstr, 15)
         
-        # Fallback to Segoe UI if Arial not available
-        if not self.sport_font.exactMatch():
-            self.sport_font = QFont("Segoe UI", 14, QFont.Weight.ExtraBold)
-            self.game_font = QFont("Source Code Pro ", 15, QFont.Weight.Bold)
+        self.sport_font = QFont("Roboto", 14, QFont.Weight.ExtraBold)
+        # self.game_font = QFont("Roboto", 15, QFont.Weight.Bold)
+        self.game_font = custom_font
         
         # Additional font settings for crisp, clean appearance
         self.sport_font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
