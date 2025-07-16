@@ -1253,7 +1253,41 @@ class PlayerProfileWidget(QWidget):
         self.abstract_scraper = TennisAbstractScraper(headless=True)
         self.h2h_scraper = TennisScraper()
         
+        # Database path for rankings
+        self.db_path = "tennis_rankings.db"
+        
         self.setup_ui()
+        
+    def get_player_rankings_from_db(self, player_name: str) -> Tuple[Optional[int], Optional[int]]:
+        """Get current and peak rankings from the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get current ranking (most recent entry)
+            cursor.execute("""
+                SELECT rank FROM rankings 
+                WHERE player_name = ? 
+                ORDER BY ranking_date DESC 
+                LIMIT 1
+            """, (player_name,))
+            current_result = cursor.fetchone()
+            current_rank = current_result[0] if current_result else None
+            
+            # Get peak ranking (minimum rank value)
+            cursor.execute("""
+                SELECT MIN(rank) FROM rankings 
+                WHERE player_name = ?
+            """, (player_name,))
+            peak_result = cursor.fetchone()
+            peak_rank = peak_result[0] if peak_result else None
+            
+            conn.close()
+            return current_rank, peak_rank
+            
+        except Exception as e:
+            print(f"Error getting rankings from database for {player_name}: {e}")
+            return None, None
         
     def setup_ui(self):
         """Setup the compact player profile UI"""
@@ -1316,16 +1350,35 @@ class PlayerProfileWidget(QWidget):
             
         bio_layout.addStretch()
         
-        # Center: Ranking display
-        self.ranking_widget = RankingGraphWidget()
+        # Center: Ranking display aligned with Country label
+        center_layout = QVBoxLayout()
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(4)
         
-        # Right: Surface performance - FRESH IMPLEMENTATION
+        self.ranking_widget = RankingGraphWidget()
+        center_layout.addWidget(self.ranking_widget)
+        center_layout.addStretch()  # Push ranking widget to top
+        
+        center_widget = QWidget()
+        center_widget.setLayout(center_layout)
+        
+        # Right side: Surface performance aligned with Country label
+        right_side_layout = QVBoxLayout()
+        right_side_layout.setContentsMargins(0, 0, 0, 0)
+        right_side_layout.setSpacing(4)
+        
+        # Surface performance widget positioned at top to align with Country label
         self.surface_widget = CompactSurfaceWidget()
+        right_side_layout.addWidget(self.surface_widget)
+        right_side_layout.addStretch()  # Push surface widget to top
+        
+        right_side_widget = QWidget()
+        right_side_widget.setLayout(right_side_layout)
         
         # Assemble content
         content_layout.addWidget(bio_widget, 1)
-        content_layout.addWidget(self.ranking_widget, 0)
-        content_layout.addWidget(self.surface_widget, 0)
+        content_layout.addWidget(center_widget, 0)
+        content_layout.addWidget(right_side_widget, 0)
         
         # Assemble main layout
         layout.addWidget(header_widget)
@@ -1372,10 +1425,14 @@ class PlayerProfileWidget(QWidget):
                     except:
                         self.elo_label.setText("ELO: --")
                     
-                    # Parse ranking info
+                    # Get rankings from database instead of scraping
                     try:
-                        current_rank = int(player_data.player_bio.current_rank) if player_data.player_bio.current_rank.isdigit() else None
-                        peak_rank = int(player_data.player_bio.peak_rank) if player_data.player_bio.peak_rank.isdigit() else None
+                        current_rank_db, peak_rank_db = self.get_player_rankings_from_db(self.player_name)
+                        
+                        # Use database rankings if available, otherwise fallback to scraped data
+                        current_rank = current_rank_db if current_rank_db is not None else (int(player_data.player_bio.current_rank) if player_data.player_bio.current_rank.isdigit() else None)
+                        peak_rank = peak_rank_db if peak_rank_db is not None else (int(player_data.player_bio.peak_rank) if player_data.player_bio.peak_rank.isdigit() else None)
+                        
                         self.ranking_widget.update_ranking(current_rank, peak_rank, elo_rating)
                     except:
                         pass
@@ -1389,15 +1446,14 @@ class PlayerProfileWidget(QWidget):
                     if hasattr(player_data, '__dict__'):
                         self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
                 
-                # Load ATP ranking data
-                rankings = self.h2h_scraper.get_atp_rankings_sync(top_n=1000)
-                player_ranking = self.h2h_scraper.find_player_ranking(self.player_name, rankings)
-                
-                if player_ranking:
-                    self.current_ranking = player_ranking
-                    # Update with ATP data if Abstract data wasn't available
-                    if not self.player_bio:
-                        self.ranking_widget.update_ranking(player_ranking.rank, None)
+                # Get rankings from database for cases where Abstract data wasn't available
+                if not self.player_bio:
+                    try:
+                        current_rank_db, peak_rank_db = self.get_player_rankings_from_db(self.player_name)
+                        if current_rank_db is not None:
+                            self.ranking_widget.update_ranking(current_rank_db, peak_rank_db)
+                    except:
+                        pass
                 
                 # Get recent form and surface data from H2H scraper by doing a dummy comparison
                 try:
@@ -1799,7 +1855,7 @@ class TacticsTableWidget(QWidget):
 
 
 class CompactStatsWidget(QWidget):
-    """Compact stats widget showing Tour-Level vs Challenger stats with toggle"""
+    """Compact stats widget showing Tour-Level vs Challenger stats with individual toggles"""
     
     def __init__(self):
         super().__init__()
@@ -1807,8 +1863,12 @@ class CompactStatsWidget(QWidget):
         self.player2_data = {}
         self.player1_name = ""
         self.player2_name = ""
-        self.show_tour_level = True  # Toggle between Tour-Level and Challenger
-        self.setFixedSize(280, 240)  # Compact size to fit in available space
+        self.player1_show_tour = True  # Individual toggle for player 1
+        self.player2_show_tour = True  # Individual toggle for player 2
+        self.stats_mode = "current_year"  # current_year, career, last52
+        self.current_split_type = "Hard"  # Current split type for career/last52 modes
+        self.available_splits = []  # Will be populated when data is loaded
+        self.setFixedSize(280, 280)  # Taller for additional toggle button
         self.setStyleSheet(f"""
             CompactStatsWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -1816,6 +1876,208 @@ class CompactStatsWidget(QWidget):
                 border-radius: 8px;
             }}
         """)
+        
+        # Create toggle buttons for each player
+        self.setup_toggle_buttons()
+        
+    def setup_toggle_buttons(self):
+        """Create individual toggle buttons for each player"""
+        # Mode toggle button (cycles through current_year, career, last52) - left side
+        self.mode_toggle = QPushButton("2025")
+        self.mode_toggle.setFixedSize(60, 20)
+        self.mode_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: none;
+                border-radius: 10px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: {TennisTheme.SECONDARY};
+            }}
+        """)
+        self.mode_toggle.clicked.connect(self.toggle_stats_mode)
+        self.mode_toggle.setParent(self)
+        self.mode_toggle.move(85, 25)  # Left side of center
+        
+        # Split type toggle button (only active for career/last52 modes) - right side
+        self.split_toggle = QPushButton("Hard")
+        self.split_toggle.setFixedSize(70, 20)
+        self.split_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: {TennisTheme.TEXT_MUTED};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: none;
+                border-radius: 10px;
+                font-size: 8px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: {TennisTheme.SECONDARY};
+            }}
+            QPushButton:disabled {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_MUTED};
+            }}
+        """)
+        self.split_toggle.clicked.connect(self.toggle_split_type)
+        self.split_toggle.setParent(self)
+        self.split_toggle.move(150, 25)  # Right side of center
+        self.split_toggle.setEnabled(False)  # Initially disabled
+        
+        # Player 1 toggle button - positioned inline with player 1 name
+        self.player1_toggle = QPushButton("Tour")
+        self.player1_toggle.setFixedSize(35, 14)
+        self.player1_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: {TennisTheme.PRIMARY};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: none;
+                border-radius: 7px;
+                font-size: 7px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: {TennisTheme.SECONDARY};
+            }}
+            QPushButton:disabled {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_MUTED};
+            }}
+        """)
+        self.player1_toggle.clicked.connect(lambda: self.toggle_player_stats(1))
+        self.player1_toggle.setParent(self)
+        self.player1_toggle.move(100, 65)  # Inline with player 1 name (adjusted for new y position)
+        
+        # Player 2 toggle button - positioned inline with player 2 name
+        self.player2_toggle = QPushButton("Tour")
+        self.player2_toggle.setFixedSize(35, 14)
+        self.player2_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: {TennisTheme.ACCENT};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: none;
+                border-radius: 7px;
+                font-size: 7px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: {TennisTheme.SECONDARY};
+            }}
+            QPushButton:disabled {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_MUTED};
+            }}
+        """)
+        self.player2_toggle.clicked.connect(lambda: self.toggle_player_stats(2))
+        self.player2_toggle.setParent(self)
+        self.player2_toggle.move(240, 65)  # Inline with player 2 name (adjusted for new y position)
+        
+    def toggle_player_stats(self, player_num: int):
+        """Toggle between Tour-Level and Challenger for specific player"""
+        if player_num == 1:
+            self.player1_show_tour = not self.player1_show_tour
+            self.player1_toggle.setText("Tour" if self.player1_show_tour else "Chall")
+        else:
+            self.player2_show_tour = not self.player2_show_tour
+            self.player2_toggle.setText("Tour" if self.player2_show_tour else "Chall")
+        self.update()
+        
+    def toggle_stats_mode(self):
+        """Toggle between current year, career, and last 52 week stats"""
+        if self.stats_mode == "current_year":
+            self.stats_mode = "career"
+            self.mode_toggle.setText("Career")
+            self.split_toggle.setEnabled(True)  # Enable split toggle for career mode
+            self.player1_toggle.setEnabled(False)  # Disable tour/challenger for splits
+            self.player2_toggle.setEnabled(False)
+            self.update_available_splits()
+        elif self.stats_mode == "career":
+            self.stats_mode = "last52"
+            self.mode_toggle.setText("Last52")
+            self.split_toggle.setEnabled(True)  # Enable split toggle for last52 mode
+            self.player1_toggle.setEnabled(False)  # Disable tour/challenger for splits
+            self.player2_toggle.setEnabled(False)
+            self.update_available_splits()
+        else:
+            self.stats_mode = "current_year"
+            self.mode_toggle.setText("2025")
+            self.split_toggle.setEnabled(False)  # Disable split toggle for current year mode
+            self.player1_toggle.setEnabled(True)  # Enable tour/challenger for season stats
+            self.player2_toggle.setEnabled(True)
+        self.update()
+        
+    def toggle_split_type(self):
+        """Toggle between different split types for career/last52 modes"""
+        if not self.available_splits:
+            return
+            
+        current_index = self.available_splits.index(self.current_split_type) if self.current_split_type in self.available_splits else 0
+        next_index = (current_index + 1) % len(self.available_splits)
+        self.current_split_type = self.available_splits[next_index]
+        
+        # Update button text (abbreviate long names)
+        button_text = self.current_split_type
+        if len(button_text) > 8:
+            abbreviations = {
+                "Grand Slams": "GS",
+                "Masters": "M1000",
+                "Other Tours": "Other",
+                "Best of 5": "Bo5",
+                "Best of 3": "Bo3",
+                "Semi-finals": "SF",
+                "Quarter-finals": "QF",
+                "vs Righties": "vsR",
+                "vs Lefties": "vsL",
+                "vs Top 10": "vsT10"
+            }
+            button_text = abbreviations.get(button_text, button_text[:8])
+        
+        self.split_toggle.setText(button_text)
+        self.update()
+        
+    def update_available_splits(self):
+        """Update available splits based on current data"""
+        splits_key = "career_splits" if self.stats_mode == "career" else "last52_splits"
+        
+        # Gather all unique splits from both players
+        all_splits = set()
+        
+        for player_data in [self.player1_data, self.player2_data]:
+            if player_data and splits_key in player_data:
+                for split_data in player_data[splits_key]:
+                    if hasattr(split_data, 'split'):
+                        all_splits.add(split_data.split)
+        
+        # Convert to sorted list, prioritizing common splits
+        priority_splits = ["Hard", "Clay", "Grass", "Grand Slams", "Masters", "vs Lefties", "vs Top 10"]
+        self.available_splits = [s for s in priority_splits if s in all_splits]
+        self.available_splits.extend(sorted([s for s in all_splits if s not in priority_splits]))
+        
+        # Set default split type if current one is not available
+        if self.current_split_type not in self.available_splits and self.available_splits:
+            self.current_split_type = self.available_splits[0]
+            
+        # Update button text
+        if self.available_splits:
+            button_text = self.current_split_type
+            if len(button_text) > 8:
+                abbreviations = {
+                    "Grand Slams": "GS",
+                    "Masters": "M1000",
+                    "Other Tours": "Other",
+                    "Best of 5": "Bo5",
+                    "Best of 3": "Bo3",
+                    "Semi-finals": "SF",
+                    "Quarter-finals": "QF",
+                    "vs Righties": "vsR",
+                    "vs Lefties": "vsL",
+                    "vs Top 10": "vsT10"
+                }
+                button_text = abbreviations.get(button_text, button_text[:8])
+            self.split_toggle.setText(button_text)
         
     def update_player_data(self, player_name: str, player_data: dict, player_num: int):
         """Update player data from tennis abstract"""
@@ -1825,11 +2087,11 @@ class CompactStatsWidget(QWidget):
         else:
             self.player2_data = player_data
             self.player2_name = player_name
-        self.update()
         
-    def mousePressEvent(self, event):
-        """Toggle between Tour-Level and Challenger on click"""
-        self.show_tour_level = not self.show_tour_level
+        # Update available splits when new data is loaded
+        if self.stats_mode in ["career", "last52"]:
+            self.update_available_splits()
+        
         self.update()
         
     def paintEvent(self, event):
@@ -1840,49 +2102,86 @@ class CompactStatsWidget(QWidget):
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
         
-        # Title with toggle indicator
-        title = "Tour-Level Stats" if self.show_tour_level else "Challenger Stats"
+        # Title based on current mode
+        mode_titles = {
+            "current_year": "2025 Stats",
+            "career": "Career Stats", 
+            "last52": "Last 52 Weeks"
+        }
+        title = mode_titles.get(self.stats_mode, "Stats")
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         painter.drawText(5, 5, 270, 20, Qt.AlignmentFlag.AlignCenter, title)
         
-        # Toggle hint
-        painter.setPen(QColor(TennisTheme.TEXT_MUTED))
-        painter.setFont(QFont("Arial", 8))
-        painter.drawText(5, 20, 270, 15, Qt.AlignmentFlag.AlignCenter, "Click to toggle")
+        # Draw player stats tables with individual toggles (5px spacing from top toggles)
+        self.draw_player_stats(painter, self.player1_name, self.player1_data, 0, 50, 140, TennisTheme.PRIMARY, self.player1_show_tour)
+        self.draw_player_stats(painter, self.player2_name, self.player2_data, 140, 50, 140, TennisTheme.ACCENT, self.player2_show_tour)
         
-        # Draw player stats tables
-        self.draw_player_stats(painter, self.player1_name, self.player1_data, 0, 35, 140, TennisTheme.PRIMARY)
-        self.draw_player_stats(painter, self.player2_name, self.player2_data, 140, 35, 140, TennisTheme.ACCENT)
-        
-    def draw_player_stats(self, painter, player_name, player_data, x_offset, y_offset, width, accent_color):
+    def draw_player_stats(self, painter, player_name, player_data, x_offset, y_offset, width, accent_color, show_tour_level):
         """Draw stats for one player"""
-        # Player name header
+        # Player name header  
         painter.setPen(QColor(accent_color))
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(x_offset + 5, y_offset + 15, player_name[:15] + ("..." if len(player_name) > 15 else ""))
         
-        # Get current year stats
-        current_year = "2025"
-        stats_key = "tour_seasons" if self.show_tour_level else "challenger_seasons"
-        
-        if not player_data or stats_key not in player_data:
+        # Get data based on current mode
+        if not player_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
             painter.drawText(x_offset + 5, y_offset + 40, "No data")
             return
             
-        # Find current year data
         current_data = None
-        for season in player_data[stats_key]:
-            if hasattr(season, 'year') and season.year == current_year:
-                current_data = season
-                break
+        
+        if self.stats_mode == "current_year":
+            # Get current year stats
+            current_year = "2025"
+            stats_key = "tour_seasons" if show_tour_level else "challenger_seasons"
+            
+            if stats_key not in player_data:
+                painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+                painter.setFont(QFont("Arial", 9))
+                painter.drawText(x_offset + 5, y_offset + 40, "No data")
+                return
                 
+            # Find current year data
+            for season in player_data[stats_key]:
+                if hasattr(season, 'year') and season.year == current_year:
+                    current_data = season
+                    break
+                    
+        elif self.stats_mode == "career":
+            # Get career splits data for specific split type (ignores tour/challenger)
+            if "career_splits" not in player_data:
+                painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+                painter.setFont(QFont("Arial", 9))
+                painter.drawText(x_offset + 5, y_offset + 40, "No career data")
+                return
+                
+            # Find the specific split type
+            for split_data in player_data["career_splits"]:
+                if hasattr(split_data, 'split') and split_data.split == self.current_split_type:
+                    current_data = split_data
+                    break
+                    
+        elif self.stats_mode == "last52":
+            # Get last 52 weeks splits data for specific split type (ignores tour/challenger)
+            if "last52_splits" not in player_data:
+                painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+                painter.setFont(QFont("Arial", 9))
+                painter.drawText(x_offset + 5, y_offset + 40, "No last52 data")
+                return
+                
+            # Find the specific split type
+            for split_data in player_data["last52_splits"]:
+                if hasattr(split_data, 'split') and split_data.split == self.current_split_type:
+                    current_data = split_data
+                    break
+                    
         if not current_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
-            painter.drawText(x_offset + 5, y_offset + 40, "No 2025 data")
+            painter.drawText(x_offset + 5, y_offset + 40, "No data")
             return
             
         # Draw stats
@@ -1976,11 +2275,11 @@ class CompactTennisComparisonWidget(QWidget):
         # Top-left area: Player comparison widgets
         top_left_widget = QWidget()
         top_left_widget.setFixedWidth(900)  # Wider to accommodate both 420px player widgets
-        top_left_widget.setMinimumHeight(470)  # Minimum height but allow expansion
+        top_left_widget.setMinimumHeight(420)  # Reduced minimum height to allow more compact layout
         top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
         top_left_layout.setContentsMargins(0, 0, 0, 0)
-        top_left_layout.setSpacing(12)
+        top_left_layout.setSpacing(8)  # Reduced spacing from 12 to 8
         
         # Search widget
         self.search_widget = CompactPlayerSearchWidget()
