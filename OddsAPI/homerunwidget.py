@@ -21,7 +21,7 @@ import sys
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
-from weatherman import WeatherService, STADIUM_DATA
+from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance
 from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
@@ -463,7 +463,7 @@ class StadiumView(QGraphicsView):
         self.trajectory_path = None
         
         # Set background color
-        self.setBackgroundBrush(QBrush(QColor(20, 90, 50)))  # Dark green for grass
+        self.setBackgroundBrush(QBrush(QColor(0, 0, 0)))
         
         # Enable mouse tracking for interactive elements
         self.setMouseTracking(True)
@@ -479,89 +479,252 @@ class StadiumView(QGraphicsView):
         super().resizeEvent(event)
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
     
-    def load_stadium_svg(self, svg_path, dimensions):
-        """Load an SVG stadium outline and set it up in the view"""
+    def draw_stadium_polar(self, stadium_name, dimensions):
+        """Draw stadium outline using polar coordinate data from weatherman.py"""
         # Delete all stadium items and create a new layer
         self.scene.removeItem(self.stadium_layer)
         self.stadium_layer = QGraphicsItemGroup()
         self.scene.addItem(self.stadium_layer)
         
-        # Create SVG renderer
-        try:
-            self.svg_renderer = QSvgRenderer(svg_path)
+        print(f"Drawing stadium using polar coordinates: {stadium_name}")
+        
+        # Scale factor - increased for better space usage and visibility
+        scale_factor = 4.5
+        
+        # Home plate position - centered horizontally, positioned to show full field
+        home_plate_x = 0
+        home_plate_y = 200  # Reduced to show more of the field in view
+        
+        # Generate points for the outfield wall using polar coordinates
+        wall_points = []
+        angle_step = 1.0  # 1-degree increments for smooth curve
+        
+        # Generate points from right field (0°) to left field (90°)
+        for angle in np.arange(0, 91, angle_step):
+            # Get distance to wall at this angle
+            distance = get_stadium_wall_distance(stadium_name, angle)
             
-            # Check if the SVG loaded successfully
-            if not self.svg_renderer.isValid():
-                print(f"Invalid SVG file: {svg_path}")
-                # Fall back to drawing method if SVG is invalid
-                self.draw_stadium(dimensions)
+            if distance is None:
+                print(f"No polar data for {stadium_name} at angle {angle}°")
+                # Fall back to basic dimensions
+                self.draw_stadium_fallback(dimensions)
                 return
             
-            # Create SVG item
-            self.stadium_svg_item = QGraphicsSvgItem()
-            self.stadium_svg_item.setSharedRenderer(self.svg_renderer)
+            # Convert polar to Cartesian coordinates
+            # Baseball polar coordinate system: 0° = right field foul line, 90° = left field foul line
+            # Standard baseball field layout: home plate at bottom, center field at top
+            angle_rad = math.radians(angle)
             
-            # Get the SVG's default size
-            default_size = self.svg_renderer.defaultSize()
-            if default_size.width() <= 0 or default_size.height() <= 0:
-                print(f"Invalid SVG dimensions: {default_size.width()} x {default_size.height()}")
-                # Fall back to drawing method
-                self.draw_stadium(dimensions)
-                return
+            # Baseball field coordinate transformation:
+            # 0° (right field) → +X direction from home plate
+            # 45° (center field) → -Y direction from home plate (toward top of screen)
+            # 90° (left field) → -X direction from home plate
             
-            # Determine appropriate scaling and positioning
-            scale_factor = 2.0
+            # For baseball polar coordinates, we need to convert angles properly:
+            # Baseball angle 0° = right field = standard polar 0°
+            # Baseball angle 45° = center field = standard polar 90°
+            # Baseball angle 90° = left field = standard polar 180°
             
-            # Get maximum distance for proper scaling
-            max_distance = max(
-                dimensions["left_field"],
-                dimensions["left_center"],
-                dimensions["center_field"],
-                dimensions["right_center"],
-                dimensions["right_field"]
-            ) * scale_factor
+            # Convert baseball polar to field coordinates
+            # The infield foul lines are at 45° angles:
+            # Right field foul line: direction (0.707, -0.707) = 45° from home to first base
+            # Left field foul line: direction (-0.707, -0.707) = 135° from home to third base
+            # Center field is straight up: direction (0, -1) = 90°
             
-            # Calculate the scaling ratio to fit our desired size
-            svg_size = QSizeF(max_distance * 2, max_distance * 2)
-            scale_x = svg_size.width() / default_size.width()
-            scale_y = svg_size.height() / default_size.height()
+            # Convert polar coordinates to match these exact infield directions
+            # Rotate the polar coordinates by 45° to align with the diamond
+            adjusted_angle = angle_rad + math.pi/4  # Add 45° to align with infield
+            field_x = distance * math.cos(adjusted_angle) * scale_factor
+            field_y = -distance * math.sin(adjusted_angle) * scale_factor
             
-            # Apply scaling transform to the SVG item
-            scale = min(scale_x, scale_y)
-            self.stadium_svg_item.setScale(scale)
+            # Adjust for home plate position in scene
+            final_x = home_plate_x + field_x
+            final_y = home_plate_y + field_y
             
-            # Center the SVG on home plate (0,0)
-            # SVG has its own coordinate system, so we need to adjust positioning
-            # to ensure home plate is at (0,0) in the scene
-            svg_center_x = default_size.width() / 2
-            svg_center_y = default_size.height() / 2
+            wall_points.append(QPointF(final_x, final_y))
+        
+        # Create the outfield wall path and foul lines
+        if wall_points:
+            # Draw the complete field boundary (outfield wall + foul lines)
+            field_boundary = QPainterPath()
+            home_plate_point = QPointF(home_plate_x, home_plate_y)
             
-            self.stadium_svg_item.setPos(
-                -svg_center_x * scale,
-                -svg_center_y * scale
-            )
+            # Start from home plate, go to right field foul line
+            field_boundary.moveTo(home_plate_point)
+            field_boundary.lineTo(wall_points[0])  # Right field (0°)
+            
+            # Follow the outfield wall from right field to left field
+            for point in wall_points[1:]:
+                field_boundary.lineTo(point)
+            
+            # Close the boundary by connecting left field back to home plate
+            field_boundary.lineTo(home_plate_point)
+            
+            # Create graphics item for the complete field boundary
+            boundary_item = QGraphicsPathItem(field_boundary)
+            boundary_item.setPen(QPen(QColor(139, 69, 19), 4))  # Brown wall color
+            boundary_item.setBrush(QBrush())  # No fill
             
             # Add to stadium layer
-            self.stadium_layer.addToGroup(self.stadium_svg_item)
-            
-            
-            # Resize scene to fit the stadium with margin
-            margin = 150
-            self.scene.setSceneRect(
-                -max_distance-margin, 
-                -max_distance-margin, 
-                (max_distance+margin)*2, 
-                (max_distance+margin)*2
-            )
-            
-            # Force view update
-            self.resetCachedContent()
-            self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-            self.update()
+            self.stadium_layer.addToGroup(boundary_item)
         
-        except Exception as e:
-            print(f"Error loading SVG: {e}")
-            # Fall back to drawing method
+        # Draw the infield (basic diamond shape)
+        self.draw_infield(home_plate_x, home_plate_y, scale_factor)
+        
+        # Calculate scene bounds based on maximum distance
+        max_distance = max(
+            dimensions["left_field"],
+            dimensions["left_center"], 
+            dimensions["center_field"],
+            dimensions["right_center"],
+            dimensions["right_field"]
+        ) * scale_factor
+        
+        # Set scene rectangle - optimized for view space usage
+        margin = 100
+        
+        # Calculate better bounds based on actual stadium shape
+        scene_width = max_distance * 2 + margin * 2
+        scene_height = max_distance + home_plate_y + margin * 2
+        
+        self.scene.setSceneRect(
+            -max_distance - margin,
+            home_plate_y - max_distance - margin,
+            scene_width,
+            scene_height
+        )
+        
+        # Force view update
+        self.resetCachedContent()
+        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.update()
+        
+        print(f"Successfully drew stadium {stadium_name} using polar coordinates")
+
+    def draw_infield(self, home_x, home_y, scale_factor):
+        """Draw basic infield diamond"""
+        # Base distances (90 feet between bases)
+        base_distance = 90 * scale_factor
+        
+        # Base positions (clockwise from home)
+        first_base = QPointF(home_x + base_distance * 0.707, home_y - base_distance * 0.707)
+        second_base = QPointF(home_x, home_y - base_distance * 1.414)
+        third_base = QPointF(home_x - base_distance * 0.707, home_y - base_distance * 0.707)
+        home_plate = QPointF(home_x, home_y)
+        
+        # Draw base paths
+        infield_path = QPainterPath()
+        infield_path.moveTo(home_plate)
+        infield_path.lineTo(first_base)
+        infield_path.lineTo(second_base)
+        infield_path.lineTo(third_base)
+        infield_path.lineTo(home_plate)
+        
+        infield_item = QGraphicsPathItem(infield_path)
+        infield_item.setPen(QPen(QColor(255, 82, 45), 10))  # Brown infield lines
+        infield_item.setBrush(QBrush(QColor(139, 69, 19, 50)))  # Light brown fill
+        
+        self.stadium_layer.addToGroup(infield_item)
+        
+        # Draw pitcher's mound
+        mound_distance = 60.5 * scale_factor  # Distance from home to pitcher's mound
+        mound_x = home_x
+        mound_y = home_y - mound_distance
+        mound_radius = 9 * scale_factor  # Pitcher's mound radius
+        
+        mound_item = QGraphicsEllipseItem(
+            mound_x - mound_radius, 
+            mound_y - mound_radius,
+            mound_radius * 2,
+            mound_radius * 2
+        )
+        mound_item.setPen(QPen(QColor(255, 82, 45), 10))
+        mound_item.setBrush(QBrush(QColor(255, 69, 19, 100)))
+        
+        self.stadium_layer.addToGroup(mound_item)
+
+    def draw_stadium_fallback(self, dimensions):
+        """Fallback method using basic dimensions when polar data unavailable"""
+        print("Using fallback stadium drawing with basic dimensions")
+        
+        # Delete all stadium items and create a new layer
+        self.scene.removeItem(self.stadium_layer)
+        self.stadium_layer = QGraphicsItemGroup()
+        self.scene.addItem(self.stadium_layer)
+        
+        scale_factor = 3.0
+        home_x, home_y = 0, 400
+        
+        # Draw basic outfield arc using dimension data
+        wall_points = []
+        
+        # Create points for basic outfield shape
+        angles = [0, 22.5, 45, 67.5, 90]  # Right field to left field
+        distances = [
+            dimensions["right_field"],
+            dimensions["right_center"], 
+            dimensions["center_field"],
+            dimensions["left_center"],
+            dimensions["left_field"]
+        ]
+        
+        for angle, distance in zip(angles, distances):
+            angle_rad = math.radians(angle)
+            scene_x = distance * math.sin(angle_rad) * scale_factor  # sin for right field → left field
+            scene_y = -distance * math.cos(angle_rad) * scale_factor  # -cos for toward center field
+            final_x = home_x + scene_x
+            final_y = home_y + scene_y
+            wall_points.append(QPointF(final_x, final_y))
+        
+        # Create smooth curve through points
+        if wall_points:
+            wall_path = QPainterPath()
+            wall_path.moveTo(wall_points[0])
+            for point in wall_points[1:]:
+                wall_path.lineTo(point)
+            
+            wall_item = QGraphicsPathItem(wall_path)
+            wall_item.setPen(QPen(QColor(139, 69, 19), 4))
+            self.stadium_layer.addToGroup(wall_item)
+        
+        # Draw infield
+        self.draw_infield(home_x, home_y, scale_factor)
+        
+        # Set scene bounds  
+        max_distance = max(distances) * scale_factor
+        margin = 100
+        scene_width = max_distance * 2 + margin * 2
+        scene_height = max_distance + home_y + margin * 2
+        
+        self.scene.setSceneRect(
+            -max_distance - margin,
+            home_y - max_distance - margin,
+            scene_width,
+            scene_height
+        )
+        
+        self.resetCachedContent()
+        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.update()
+
+    def load_stadium_svg(self, svg_path, dimensions):
+        """Legacy SVG loading method - now redirects to polar coordinate drawing"""
+        # Extract stadium name from the SVG path or use a lookup
+        stadium_name = None
+        
+        # Try to find stadium name from STADIUM_DATA that matches this svg_path
+        for name, data in STADIUM_DATA.items():
+            if "image_path" in data and svg_path.endswith(data["image_path"]):
+                stadium_name = name
+                break
+        
+        if stadium_name:
+            print(f"Redirecting SVG load to polar coordinate drawing for: {stadium_name}")
+            self.draw_stadium_polar(stadium_name, dimensions)
+        else:
+            print(f"Could not find stadium name for SVG path: {svg_path}")
+            print("Using fallback drawing method")
+            self.draw_stadium_fallback(dimensions)
     
     
     def draw_starting_position(self, start_x, start_y, start_z):
@@ -571,12 +734,12 @@ class StadiumView(QGraphicsView):
             if hasattr(item, 'is_start_indicator') and item.is_start_indicator:
                 self.scene.removeItem(item)
         
-        # Scale factor - must match the one used in load_stadium_svg
-        scale_factor = 2.0
+        # Scale factor - must match the one used in draw_stadium_polar
+        scale_factor = 4.5
         
         # Set a fixed home plate position - same as in start_ball_trajectory
         fixed_home_x = 0
-        fixed_home_y = 255
+        fixed_home_y = 200
         
         # Create the start position indicator (a larger circle with crosshairs)
         indicator_size = 15
@@ -742,12 +905,12 @@ class StadiumView(QGraphicsView):
             if not (hasattr(item, 'is_start_indicator') and item.is_start_indicator):
                 self.scene.removeItem(item)
         
-        # Scale factor - must match the one used in load_stadium_svg
-        scale_factor = 2.0
+        # Scale factor - must match the one used in draw_stadium_polar
+        scale_factor = 4.5
         
         # Set a fixed home plate position - this is the key point of alignment
         fixed_home_x = 0
-        fixed_home_y = 255
+        fixed_home_y = 200
         
         # Create the ball
         ball_size = 10 
@@ -812,8 +975,8 @@ class StadiumView(QGraphicsView):
         if frame >= len(trajectory_data["x"]):
             return False
         
-        # Scale factor - must match the one used in load_stadium_svg
-        scale_factor = 2.0
+        # Scale factor - must match the one used in draw_stadium_polar
+        scale_factor = 4.5
         
         # Get coordinates with proper scaling from the home plate position
         x = self.home_plate_x + trajectory_data["z"][frame] * scale_factor
@@ -1869,9 +2032,6 @@ class SplitView(QWidget):
     # In SplitView class
     def update_stadium(self, stadium_name):
         """Update the stadium when selection changes"""
-        # Get SVG path for the selected stadium
-        svg_path = self.svg_manager.get_svg_path(stadium_name)
-        
         if stadium_name in STADIUM_DATA:
             # Update stadium properties
             self.dimensions = STADIUM_DATA[stadium_name]["dimensions"]
@@ -1888,8 +2048,8 @@ class SplitView(QWidget):
             stadium_info = f"{stadium_name}\nAlt: {self.altitude} ft"
             self.info_label.setText(stadium_info)
             
-            # 2D View
-            self.stadium_view.load_stadium_svg(svg_path, self.dimensions)
+            # 2D View - now using polar coordinates directly
+            self.stadium_view.draw_stadium_polar(stadium_name, self.dimensions)
             
             # 3D View
             self.umpire_view.update()
@@ -2173,45 +2333,72 @@ class SplitView(QWidget):
         self.update()
 
     def check_if_home_run(self, trajectory_data):
-        """Check if the trajectory results in a home run"""
-        if not self.dimensions:
+        """Check if the trajectory results in a home run using precise polar coordinate data"""
+        if not self.stadium_name or not trajectory_data:
             return False
             
         # Get the final point in the trajectory
-        final_x = trajectory_data["x"][-1]  # Distance toward center field
-        final_z = trajectory_data["z"][-1]  # Distance toward right field (positive) or left field (negative)
+        final_x = trajectory_data["x"][-1]  # Distance toward center field (feet)
+        final_z = trajectory_data["z"][-1]  # Distance toward right field (+) or left field (-) (feet)
+        final_height = trajectory_data["y"][-1]  # Height above ground (feet)
         
         # Calculate distance from home plate in the horizontal plane
         distance = np.sqrt(final_x**2 + final_z**2)
         
-        # Get the launch angle in the horizontal plane
-        # arctan2(z, x) gives angle from center field line
-        # Positive angles are toward right field, negative toward left field
-        horizontal_angle = np.degrees(np.arctan2(final_z, final_x))
+        # Calculate the baseball polar angle from the trajectory coordinates
+        # Convert from trajectory coordinates to baseball polar coordinates
+        # Trajectory: +X = toward center field, +Z = toward right field
+        # Baseball polar: 0° = right field foul line, 90° = left field foul line
         
-        # Determine the wall distance based on the angle
-        dimensions = self.dimensions
-        wall_distance = None
+        # Calculate angle from right field foul line
+        angle_rad = math.atan2(final_x, final_z)  # atan2(center_field_distance, right_field_distance)
+        angle_deg = math.degrees(angle_rad)
         
-        # Left field (negative z, positive x)
-        if horizontal_angle < -15:
-            wall_distance = dimensions["left_field"]
-        # Left-center field
-        elif -15 <= horizontal_angle < 0:
-            wall_distance = dimensions["left_center"]
-        # Center field
-        elif 0 <= horizontal_angle < 15:
-            wall_distance = dimensions["center_field"]
-        # Right-center field
-        elif 15 <= horizontal_angle < 45:
-            wall_distance = dimensions["right_center"]
-        # Right field
-        else:
-            wall_distance = dimensions["right_field"]
+        # Convert to baseball polar coordinate system (0-90 degrees)
+        if angle_deg < 0:
+            angle_deg += 180  # Handle negative angles
+        
+        # Clamp to fair territory (0-90 degrees)
+        if angle_deg < 0 or angle_deg > 90:
+            return False  # Foul ball
+            
+        # Get the precise wall distance at this angle using polar coordinate data
+        wall_distance = get_stadium_wall_distance(self.stadium_name, angle_deg)
+        
+        if wall_distance is None:
+            # Fallback to basic dimensions if polar data unavailable
+            return self.check_if_home_run_fallback(final_x, final_z, final_height)
         
         # Check if the ball cleared the wall and was high enough
         # Ball must be above ~8 feet at the wall to be a home run
-        return distance >= wall_distance and trajectory_data["y"][-1] > 8
+        cleared_wall = distance >= wall_distance
+        high_enough = final_height > 8
+        
+        print(f"HR Check: angle={angle_deg:.1f}°, distance={distance:.1f}ft, wall={wall_distance:.1f}ft, height={final_height:.1f}ft, cleared={cleared_wall}, high={high_enough}")
+        
+        return cleared_wall and high_enough
+    
+    def check_if_home_run_fallback(self, final_x, final_z, final_height):
+        """Fallback homerun detection using basic dimensions"""
+        if not self.dimensions:
+            return False
+            
+        distance = np.sqrt(final_x**2 + final_z**2)
+        horizontal_angle = np.degrees(np.arctan2(final_z, final_x))
+        
+        # Determine wall distance based on angle ranges
+        if horizontal_angle < -15:
+            wall_distance = self.dimensions["left_field"]
+        elif -15 <= horizontal_angle < 0:
+            wall_distance = self.dimensions["left_center"]
+        elif 0 <= horizontal_angle < 15:
+            wall_distance = self.dimensions["center_field"]
+        elif 15 <= horizontal_angle < 45:
+            wall_distance = self.dimensions["right_center"]
+        else:
+            wall_distance = self.dimensions["right_field"]
+        
+        return distance >= wall_distance and final_height > 8
 
 
 class MLBWeatherApp(QMainWindow):

@@ -1,4 +1,3 @@
-from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QLinearGradient, QPolygonF
 from PyQt6.QtCore import Qt, QPointF
 import math
@@ -11,113 +10,128 @@ def polar_equation(angle_deg, coefficients):
     """
     Evaluate polar coordinate equation for stadium outfield wall
     angle_deg: angle in degrees from right field foul line
-    coefficients: (numerator, sin_coeff, cos_coeff) where equation is r = numerator/(sin_coeff*sin(θ) + cos_coeff*cos(θ))
+    coefficients: Can be one of:
+        - (numerator, sin_coeff, cos_coeff) for simple equations
+        - (numerator, sin_coeff, cos_coeff, constant) for equations with constant term
+        - A string describing a complex equation
+        - A dictionary with 'type' key for special equations
     """
     theta = math.radians(angle_deg)
-    numerator, sin_coeff, cos_coeff = coefficients
-    denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta)
     
-    if abs(denominator) < 1e-10:  # Avoid division by zero
-        return float('inf')
+    # Handle string descriptions of complex equations
+    if isinstance(coefficients, str):
+        if "Complex" in coefficients:
+            # For now, return a default distance for complex equations
+            # These would need individual implementations
+            return 400  # Default distance
+        return None
     
-    return numerator / denominator
+    # Handle dictionary format for special equations
+    if isinstance(coefficients, dict):
+        eq_type = coefficients.get('type')
+        
+        if eq_type == 'cos_only':
+            # r = numerator / cos(θ)
+            cos_val = math.cos(theta)
+            if abs(cos_val) < 1e-10:
+                return float('inf')
+            return coefficients['numerator'] / cos_val
+            
+        elif eq_type == 'sin_only':
+            # r = numerator / sin(θ)
+            sin_val = math.sin(theta)
+            if abs(sin_val) < 1e-10:
+                return float('inf')
+            return coefficients['numerator'] / sin_val
+            
+        elif eq_type == 'special_cos':
+            # r = numerator * cos(θ) / denominator
+            return coefficients['numerator'] * math.cos(theta) / coefficients['denominator']
+        
+        
+        # Complex equation for Great American Ball Park (0-44.7 degrees)
+        elif eq_type == 'complex_great_american':
+            num1 = 11951552.5 * math.cos(theta - math.radians(25.2)) - (8986447.5 * math.cos(theta - math.radians(164.8)))
+            num2 = 19212.09 * math.sqrt(41212.25 - (30987.75 * math.cos(2*theta - math.radians(190))) - 168200 * (math.sin(theta - math.radians(25.2))**2))
+            numerator = num1 + num2
+            
+            denominator = 41212.25 - (30987.75 * math.cos(2*theta - math.radians(190)))
+            return numerator / denominator
+        
+        # Complex equation for Minute Maid Park (34-49.6 degrees)
+        # Current function for Minute Maid was made when Tals Hill was still a part of the field
+        elif eq_type == 'complex_minute_maid':
+            numerator1 = (3820575 * math.cos(theta - math.radians(42.5))) - (263175* math.cos(theta + math.radians(42.5)))
+            numerator2 = 7424.6 * math.sqrt(10525 - (725 * math.cos(2 * theta)) - 263538* math.sin(theta - math.radians(42.5)) ** 2)
+            denominator = 10525 - 725*math.cos(2*theta)
+            return (numerator1+numerator2) / denominator
+        
+        # Complex equation for Kauffman Stadium (0-10.9 degrees) - from Image 3
+        elif eq_type == 'complex_kauffman1':
+            num1 = 1738857 * math.cos(theta - math.radians(10.1)) - 495945 * math.cos(theta - math.radians(169.9))
+            num2 = 3671.3 * math.sqrt(5417 - 1545 * math.cos(2*theta - math.radians(180)) - (206082 * (math.sin(theta - math.radians(10.1)) ** 2)))
+            numerator = num1 + num2
+            
+            denominator = 5417 - 1545 * math.cos(2*theta - math.radians(180))
+            return numerator / denominator
+        
+        # (22.1-59) degrees
+        elif eq_type == 'complex_kauffman2':
+            num1 = 19759218 * math.cos(theta - math.radians(50.9)) - 1837968 * math.cos(theta + math.radians(76.9))
+            num2 = 78594.9 * math.sqrt(111634 - 10384*math.cos(2*theta + math.radians(26)) - (62658 * (math.sin(theta - math.radians(50.9))**2)))
+            numerator = num1 + num2
+            denominator = 111634 - (10384 * math.cos(2*theta - math.radians(180)))
+            return numerator / denominator
+        
+        # (59-76.9) degrees
+        elif eq_type == 'complex_kauffman3':
+            num1 = 5643864 * math.cos(theta - math.radians(68.7)) - 4885920 * math.cos(theta + math.radians(80.7))
+            num2 = 5740.3 * math.sqrt(16218 - (14040 * math.cos(2*theta + math.radians(12))) - (242208*(math.sin(theta - math.radians(68.7))**2)))
+            numerator = num1 + num2
+            denominator = 16218 - (14040 * math.cos(2*theta + math.radians(12)))
+            return numerator / denominator
+        
+        # (82.7-90) degrees
+        elif eq_type == 'complex_kauffman4':
+            num1 = 958907 * math.cos(theta - math.radians(82.6)) - 322725 * math.cos(theta + math.radians(44.6))
+            num2 = 1929 * math.sqrt(2897 - (975*math.cos(2*theta - math.radians(38))) - (219122 * (math.sin(theta - math.radians(82.6)) ** 2)))
+            numerator = num1 + num2
+            denominator = 2897 - (975 * math.cos(2*theta - math.radians(38)))
+            return numerator / denominator
+        
+        elif eq_type == 'complex_wrigley':
+            # Common denominator
+            common_denom = 33526.25 - 9105.75 * math.cos(2 * theta - math.radians(180))
+            
+            # First fraction numerator
+            num1 = 9353823.75 * math.cos(theta - math.radians(33.2)) - 2540504.25 * math.cos(theta - math.radians(146.8))
+            num2 = 22815.51 * math.sqrt(33526.25 - (9105.75 * math.cos(2 * theta - math.radians(180))) - (155682 * (math.sin(theta - math.radians(33.2)))** 2))
+            return (num1 + num2)/common_denom
 
-def kansascity_r(theta_deg):
-    """Polar equation for Kauffman Stadium - simpler piecewise functions"""
-    θ = math.radians(theta_deg)
     
-    if 0 <= theta_deg < 5.9:
-        # Complex fraction from image
-        numerator = 1738857 * math.cos(math.radians(theta_deg - 10.1)) - 495945 * math.cos(math.radians(theta_deg - 169.9))
-        denominator = 5417 - 1545 * math.cos(math.radians(theta_deg - 180))
-        return numerator / denominator
-    elif 5.9 <= theta_deg < 22.1:
-        return 25784.376 / (math.sin(θ) + 71.503534 * math.cos(θ))
-    elif 22.1 <= theta_deg < 59:
-        # Complex fraction
-        numerator = 19759218 * math.cos(math.radians(theta_deg - 50.9)) - 1837968 * math.cos(math.radians(theta_deg + 76.9))
-        denominator = 111634 - 10384 * math.cos(math.radians(2 * (theta_deg + 26)))
-        return numerator / denominator
-    elif 59 <= theta_deg < 76.9:
-        return 5643864 * math.cos(math.radians(theta_deg - 68.7)) - 4885980 * math.cos(math.radians(theta_deg + 80.7)) / (16218 - 10400 * math.cos(math.radians(2 * (theta_deg + 12))))
-    elif 76.9 <= theta_deg < 82.7:
-        return 361.884 / (math.sin(θ) + 0.01803985 * math.cos(θ))
-    elif 82.7 <= theta_deg <= 90:
-        # Complex final segment
-        sqrt_part = math.sqrt(2897 - 975 * math.cos(math.radians(theta_deg - 38.5)))
-        numerator = 1929 * sqrt_part - 74122 * math.sin(math.radians(theta_deg - 82.6))**2
-        denominator = 2897 - 975 * math.cos(math.radians(theta_deg - 38.5))
-        return numerator / denominator
-    else:
-        raise ValueError("θ out of bounds for kansascity")
-
-def houston_r(theta_deg):
-    """Polar equation for Minute Maid Park"""
-    θ = math.radians(theta_deg)
-
-    if 0 <= theta_deg < 23:
-        return -2738.7177 / (math.sin(θ) - 8.400974 * math.cos(θ))
-    elif 23 <= theta_deg < 24.1:
-        return 315.172 / (math.sin(θ) + 0.493462 * math.cos(θ))
-    elif 24.1 <= theta_deg < 33.7:
-        return -2943.702 / (math.sin(θ) - 9.23423 * math.cos(θ))
-    elif 33.7 <= theta_deg < 34:
-        return 310.475 / (math.sin(θ) + 0.236868 * math.cos(θ))
-    elif 34 <= theta_deg < 49.6:
-        # Complex segment from image
-        cos_term1 = math.cos(math.radians(theta_deg - 42.5))
-        cos_term2 = math.cos(math.radians(theta_deg + 42.5))
-        cos_2theta = math.cos(math.radians(2 * theta_deg))
-        sin_term = math.sin(math.radians(theta_deg - 42.5))**2
+    # Handle tuple format
+    if len(coefficients) == 3:
+        # Simple format: r = numerator / (sin(θ) + cos_coeff * cos(θ))
+        numerator, sin_coeff, cos_coeff = coefficients
+        denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta)
         
-        sqrt_part = math.sqrt(10525 - 725 * cos_2theta)
-        numerator = (3820575 * cos_term1 - 263175 * cos_term2 + 7424.6 * sqrt_part - 263538 * sin_term)
-        denominator = 10525 - 725 * cos_2theta
-        return numerator / denominator
-    elif 49.6 <= theta_deg < 67.7:
-        return 347.579 / (math.sin(θ) + 0.120385 * math.cos(θ))
-    elif 67.7 <= theta_deg < 67.9:
-        return 42.673422 / (math.sin(θ) - 2.124119 * math.cos(θ))
-    elif 67.9 <= theta_deg <= 90:
-        return 315 / (math.sin(θ) + 0.0366002 * math.cos(θ))
-    else:
-        raise ValueError("θ out of bounds for houston")
-
-def chicagocubs_r(theta_deg):
-    """Corrected polar equation for Wrigley Field"""
-    θ = math.radians(theta_deg)
-
-    if 0 <= theta_deg < 10.9:
-        return -4499.412 / (math.sin(θ) - 12.7462 * math.cos(θ))
-    elif 10.9 <= theta_deg < 13.1:
-        return 297.1748 / (math.sin(θ) + 0.636566 * math.cos(θ))
-    elif 13.1 <= theta_deg < 29.4:
-        return 18363.859 / (math.sin(θ) + 53.4839 * math.cos(θ))
-    elif 29.4 <= theta_deg < 49.2:
-        # Complex equation - carefully transcribed from image
-        # Numerator: 9353823.75*cos(θ - 33.2°) - 2540504.25*cos(θ - 146.8°) + 
-        #           22815.51*√[33526.25 - 9105.75*cos(2θ - 180°)] - 1515682*sin²(θ - 33.2°)
-        # Denominator: 33526.25 - 9105.75*cos(2θ - 180°)
-        
-        cos1 = math.cos(math.radians(theta_deg - 33.2))
-        cos2 = math.cos(math.radians(theta_deg - 146.8))
-        cos3 = math.cos(math.radians(2 * theta_deg - 180))
-        sin_sq = math.sin(math.radians(theta_deg - 33.2))**2
-        
-        sqrt_term = math.sqrt(33526.25 - 9105.75 * cos3)
-        numerator = (9353823.75 * cos1 - 2540504.25 * cos2 + 
-                    22815.51 * sqrt_term - 1515682 * sin_sq)
-        denominator = 33526.25 - 9105.75 * cos3
+        if abs(denominator) < 1e-10:  # Avoid division by zero
+            return float('inf')
         
         return numerator / denominator
-    elif 49.2 <= theta_deg < 73.2:
-        return 357.8732 / (math.sin(θ) + 0.166827 * math.cos(θ))
-    elif 73.2 <= theta_deg < 74.8:
-        return 496.86435 / (math.sin(θ) + 1.62768 * math.cos(θ))
-    elif 74.8 <= theta_deg <= 90:
-        return 355 / (math.sin(θ) + 0.112061 * math.cos(θ))
-    else:
-        raise ValueError("θ out of bounds for chicagocubs")
+        
+    elif len(coefficients) == 4:
+        # Format with constant: r = numerator / (sin(θ) + cos_coeff * cos(θ) + constant)
+        numerator, sin_coeff, cos_coeff, constant = coefficients
+        denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta) + constant
+        
+        if abs(denominator) < 1e-10:
+            return float('inf')
+            
+        return numerator / denominator
+    
+    return None
+
 
 def get_stadium_wall_distance(stadium_name, angle_deg):
     """
@@ -133,24 +147,14 @@ def get_stadium_wall_distance(stadium_name, angle_deg):
     if "polar_coords" not in stadium:
         return None
     
-    # Handle complex functions
-    if stadium["polar_coords"] == "complex_function":
-        if "polar_function" in stadium:
-            func_name = stadium["polar_function"]
-            if func_name == "kansascity_r":
-                return kansascity_r(angle_deg)
-            elif func_name == "houston_r":
-                return houston_r(angle_deg)
-            elif func_name == "chicagocubs_r":
-                return chicagocubs_r(angle_deg)
-        return None
-    
     # Handle standard piecewise functions
     for angle_start, angle_end, coefficients in stadium["polar_coords"]:
         if angle_start <= angle_deg <= angle_end:
             return polar_equation(angle_deg, coefficients)
     
     return None
+
+
 # ==============================================
 # Stadium Data
 # ==============================================
@@ -221,11 +225,11 @@ STADIUM_DATA = {
         },
         "polar_coords": [
             (0, 3.3, (-436.689, 1, -1.3173)),
-            (3.3, 25.6, (346.303, 0, 1)),  # r = 346.303/cos θ
+            (3.3, 25.6, {'type': 'cos_only', 'numerator': 346.303}),  # r = 346.303/cos θ
             (25.6, 39.9, (857.076, 1, 1.955805)),
             (39.9, 50, (569.534, 1, 1.04571)),
             (50, 64, (434.192, 1, 0.514)),
-            (64, 88.4, (346.76, 1, 0)),  # r = 346.76/sin θ
+            (64, 88.4, {'type': 'sin_only', 'numerator': 346.76}),  # r = 346.76/sin θ
             (88.4, 90, (330, 1, -1.73033))
         ]
     },
@@ -242,21 +246,10 @@ STADIUM_DATA = {
             "right_field": 318
         },
         "polar_coords": [
-            (3.0, 7.2, (316.0, 1, 0)),
-            (7.2, 10.8, (313.5, 1, 0)),
-            (10.8, 13.6, (312.6, 1, 0)),
-            (13.6, 16.8, (312.4, 1, 0)),
-            (16.8, 18.5, (312.4, 1, 0)),
-            (18.5, 20.5, (313.3, 1, 0)),
-            (20.5, 21.5, (311.6, 1, 0)),
-            (21.5, 23.6, (305.2, 1, 0)),
-            (23.6, 26.3, (297.0, 1, 0)),
-            (26.3, 28.9, (289.1, 1, 0)),
-            (28.9, 31.8, (282.2, 1, 0)),
-            (31.8, 35.6, (274.4, 1, 0)),
-            (35.6, 39.0, (267.4, 1, 0)),
-            (39.0, 41.8, (262.9, 1, 0)),
-            (41.8, 45.2, (258.8, 1, 0)),
+            (0, 25.5, (-1786.977, 1, -5.61942)),
+            (25.5, 49, (845.9, 1, 1.830)),
+            (49, 82, (359.7761, 1, 0.187168)),
+            (82, 90, (331, 1, -0.396914))
         ]
     },
     "Chase Field": {  # Arizona Diamondbacks
@@ -272,20 +265,20 @@ STADIUM_DATA = {
             "right_field": 334
         },
         "polar_coords": [
-            (0, 4.9, (-389.4197, 1, -1.624468)),
+            (0, 4.9, (-389.4197, 1, -1.1624468)),
             (4.9, 6.6, (423.5471, 1, 1.085346)),
             (6.6, 31.7, (6211.3885, 1, 17.49789)),
             (31.7, 32.9, (427.9667, 1, 0.630552)),
             (32.9, 34, (1197.8397, 1, 2.9286229)),
             (34, 38.9, (559.10919, 1, 1.0079058)),
-            (38.9, 39.1, (-91.557622, 1, -1.0399598)),
-            (39.1, 50.5, (571.92414, 1, 1.0070058)),
-            (50.5, 50.8, (114.59269, 1, -0.78826977)),
+            (38.9, 39.1, (-91.557622, 1, -1.1039858)),
+            (39.1, 50.5, (571.92441, 1, 1.0070058)),
+            (50.5, 50.8, (114.59269, 1, -0.7682697)),
             (50.8, 55.7, (557.962, 1, 1.0031979)),
             (55.7, 56.7, (403.8808, 1, 0.3213439)),
-            (56.7, 57.7, (755.17044, 1, 1.924906)),
+            (56.7, 57.7, (755.17044, 1, 1.924966)),
             (57.7, 82.5, (353.793768, 1, 0.06108017)),
-            (82.5, 84.2, (395.0241, 1, 0.9533913)),
+            (82.5, 84.2, (395.0241, 1, 0.9534313)),
             (84.2, 90, (327, 1, -0.9060869))
         ]
     },
@@ -302,15 +295,16 @@ STADIUM_DATA = {
             "right_field": 330
         },
         "polar_coords": [
-            (0, 5.2, (-2766.825, 1, -8.3843195)),
-            (5.2, 7, (-371.523921, 1, -1.204617)),
-            (7, 18.8, (-1855.73071, 1, -5.52645)),
-            (18.8, 23.3, (682.2307, 1, 1.566132)),
-            (23.3, 29.5, (-40721.387, 1, -119.6063)),
-            (29.5, 38.2, (1281.67692, 1, 3.1812751)),
-            (38.2, 49.1, (575.86589, 1, 0.9960149)),
-            (49.1, 82.1, (358.6125, 1, 0.1847202)),
-            (82.1, 90, (335, 1, -0.30194697))
+            (0, 3.8, (-119.0423, 1, -0.3941798, 402.289)),  # With constant term
+            (3.8, 4.9, (-808.953, 1, -2.274195)),
+            (4.9, 6, (-808.953, 1, -2.274195)),
+            (6, 7.1, (-2332.74083, 1, -6.3601456, -20759.85313)),  # With constant term
+            (7.1, 8.1, {'type': 'special_cos', 'numerator': 55.616, 'denominator': 1129.33168}),
+            (8.1, 31, (1129.33168, 1, 2.875435, -417.143116)),  # With constant term
+            (31, 33.8, (431.2604, 1, -1.8849057, 431.2604)),  # With constant term
+            (33.8, 52.2, (2077.8716, 1, 0.587157, 2077.8716)),  # With constant term
+            (52.2, 53.1, (306, 1, 7.7513156, 306)),  # With constant term
+            (53.1, 90, (306, 1, 0.00577087))
         ]
     },
     "Citizens Bank Park": {  # Philadelphia Phillies
@@ -326,10 +320,10 @@ STADIUM_DATA = {
             "right_field": 330
         },
         "polar_coords": [
-            (0, 34.3, (330, 0, 1)),  # r = 330/cos θ
+            (0, 34.3, {'type': 'cos_only', 'numerator': 330}),  # r = 330/cos θ
             (34.3, 50.7, (644.15, 1, 1.2770169)),
             (50.7, 55.9, (308.591, 1, -0.02468)),
-            (55.9, 59.3, (343.1657, 1, 0)),  # r = 343.1657/sin θ
+            (55.9, 59.3, {'type': 'sin_only', 'numerator': 343.1657}),  # r = 343.1657/sin θ
             (59.3, 88.3, (331, 1, 1.08071)),
             (88.3, 90, (325, 1, -0.596191))
         ]
@@ -348,11 +342,11 @@ STADIUM_DATA = {
         },
         "polar_coords": [
             (0, 1.25, (-405.584, 1, -1.23813)),
-            (1.25, 22.5, (337.21, 0, 1)),  # r = 337.21/cos θ
+            (1.25, 22.5, {'type': 'cos_only', 'numerator': 337.21}),  # r = 337.21/cos θ
             (22.5, 24.6, (-430.4868, 1, -1.6908)),
-            (24.6, 35.3, (347.675, 0, 1)),  # r = 347.675/cos θ
+            (24.6, 35.3, {'type': 'cos_only', 'numerator': 347.675}),  # r = 347.675/cos θ
             (35.3, 54, (593.97, 1, 1)),  # r = 593.97/(sin θ + cos θ)
-            (54, 90, (345, 1, 0))  # r = 345/sin θ
+            (54, 90, {'type': 'sin_only', 'numerator': 345})  # r = 345/sin θ
         ]
     },
     "Coors Field": {  # Colorado Rockies
@@ -450,12 +444,12 @@ STADIUM_DATA = {
         },
         "polar_coords": [
             (0, 4, (-432.031, 1, -1.3252)),
-            (4, 24, (343.5, 0, 1)),  # r = 343.5/cos θ
+            (4, 24, {'type': 'cos_only', 'numerator': 343.5}),  # r = 343.5/cos θ
             (24, 26.1, (543.706, 1, 1.1376)),
-            (26.1, 34.3, (336.22, 0, 1)),  # r = 336.22/cos θ
+            (26.1, 34.3, {'type': 'cos_only', 'numerator': 336.22}),  # r = 336.22/cos θ
             (34.3, 53.1, (565.81, 1, 1)),  # r = 565.81/(sin θ + cos θ)
             (53.1, 64.3, (416.6997, 1, 0.38598)),
-            (64.3, 84.2, (349.203, 1, 0)),  # r = 349.203/sin θ
+            (64.3, 84.2, {'type': 'sin_only', 'numerator': 349.203}),  # r = 349.203/sin θ
             (84.2, 90, (331, 1, -0.51319))
         ]
     },
@@ -472,8 +466,8 @@ STADIUM_DATA = {
             "right_field": 325
         },
         "polar_coords": [
-            (0, 44.7, (11951552.5, 1, 39.393117)),
-            (44.7, 60.3, (436.311, 1, 0.5223157)),
+            (0, 44.7, {'type': 'complex_great_american'}),  # Complex equation
+            (44.7, 60.3, (436.311, 1, 0.52231577)),
             (60.3, 86.6, (336.435, 1, 0.0014347)),
             (86.6, 90, (326, 1, -0.5206991))
         ]
@@ -516,24 +510,12 @@ STADIUM_DATA = {
             "right_field": 330
         },
         "polar_coords": [
-            (0.0, 3.2, (329.2, 1, 0)),
-            (3.2, 5.2, (328.6, 1, 0)),
-            (5.2, 9.7, (328.0, 1, 0)),
-            (9.7, 13.4, (325.7, 1, 0)),
-            (13.4, 18.2, (321.2, 1, 0)),
-            (18.2, 22.1, (315.9, 1, 0)),
-            (22.1, 25.1, (311.6, 1, 0)),
-            (25.1, 27.7, (308.6, 1, 0)),
-            (27.7, 31.2, (304.4, 1, 0)),
-            (31.2, 33.5, (299.9, 1, 0)),
-            (33.5, 35.9, (296.7, 1, 0)),
-            (35.9, 38.4, (293.3, 1, 0)),
-            (38.4, 40.5, (291.4, 1, 0)),
-            (40.5, 42.0, (288.3, 1, 0)),
-            (42.0, 43.1, (282.7, 1, 0)),
-            (43.1, 44.3, (276.4, 1, 0)),
-            (44.3, 45.0, (270.6, 1, 0)),
-            (45.0, 45.3, (267.3, 1, 0)),
+            (0, 5.9, {'type': 'complex_kauffman1'}),
+            (5.9, 22.1, (25784.376, 1, 71.503534)),
+            (22.1, 59, {'type': 'complex_kauffman2'}),
+            (59, 76.9, {'type': 'complex_kauffman3'}),
+            (76.9, 82.7, (361.884, 1, 0.01803985)),
+            (82.7, 90, {'type': 'complex_kauffman4'})
         ]
     },
     "LoanDepot Park": {  # Miami Marlins
@@ -586,21 +568,14 @@ STADIUM_DATA = {
             "right_field": 326
         },
         "polar_coords": [
-            (0.0, 3.2, (325.9, 1, 0)),
-            (3.2, 7.3, (327.3, 1, 0)),
-            (7.3, 9.7, (330.4, 1, 0)),
-            (9.7, 11.7, (327.4, 1, 0)),
-            (11.7, 13.2, (319.2, 1, 0)),
-            (13.2, 14.7, (312.9, 1, 0)),
-            (14.7, 16.6, (306.4, 1, 0)),
-            (16.6, 18.8, (299.5, 1, 0)),
-            (18.8, 20.4, (297.2, 1, 0)),
-            (20.4, 22.3, (294.9, 1, 0)),
-            (22.3, 24.2, (288.8, 1, 0)),
-            (24.2, 26.6, (284.2, 1, 0)),
-            (26.6, 28.2, (281.2, 1, 0)),
-            (28.2, 30.2, (276.9, 1, 0)),
-            (30.2, 44.9, (266.4, 1, 0)),
+            (0, 23, (-2738.7177, 1, -8.400974)),
+            (23, 24.1, (315.172, 1, 0.493462)),
+            (24.1, 33.7, (-2943.702, 1, -9.23423)),
+            (33.7, 34, (310.475, 1, 0.23668)),
+            (34, 49.6, {'type': 'complex_minute_maid'}),  # Complex equation
+            (49.6, 67.7, (347.579, 1, 0.120385)),
+            (67.7, 67.9, (42.673422, 1, -2.124119)),
+            (67.9, 90, (315, 1, 0.0366002))
         ]
     },
     "Nationals Park": {  # Washington Nationals
@@ -639,24 +614,24 @@ STADIUM_DATA = {
             "right_field": 320
         },
         "polar_coords": [
-            (1.7, 4.6, (315.1, 1, 0)),
-            (4.6, 6.1, (314.3, 1, 0)),
-            (6.1, 8.8, (309.1, 1, 0)),
-            (8.8, 10.7, (304.0, 1, 0)),
-            (10.7, 13.4, (299.7, 1, 0)),
-            (13.4, 16.2, (295.5, 1, 0)),
-            (16.2, 18.8, (292.3, 1, 0)),
-            (18.8, 21.7, (289.9, 1, 0)),
-            (21.7, 23.8, (288.3, 1, 0)),
-            (23.8, 26.7, (287.1, 1, 0)),
-            (26.7, 29.0, (286.2, 1, 0)),
-            (29.0, 30.2, (286.2, 1, 0)),
-            (30.2, 31.1, (285.5, 1, 0)),
-            (31.1, 33.3, (281.4, 1, 0)),
-            (33.3, 35.7, (274.9, 1, 0)),
-            (35.7, 38.7, (268.2, 1, 0)),
-            (38.7, 41.8, (262.2, 1, 0)),
-            (41.8, 45.1, (256.4, 1, 0)),
+            (1.7, 4.6, {'type': 'sin_only', 'numerator': 315.1}),
+            (4.6, 6.1, {'type': 'sin_only', 'numerator': 314.3}),
+            (6.1, 8.8, {'type': 'sin_only', 'numerator': 309.1}),
+            (8.8, 10.7, {'type': 'sin_only', 'numerator': 304.0}),
+            (10.7, 13.4, {'type': 'sin_only', 'numerator': 299.7}),
+            (13.4, 16.2, {'type': 'sin_only', 'numerator': 295.5}),
+            (16.2, 18.8, {'type': 'sin_only', 'numerator': 292.3}),
+            (18.8, 21.7, {'type': 'sin_only', 'numerator': 289.9}),
+            (21.7, 23.8, {'type': 'sin_only', 'numerator': 288.3}),
+            (23.8, 26.7, {'type': 'sin_only', 'numerator': 287.1}),
+            (26.7, 29.0, {'type': 'sin_only', 'numerator': 286.2}),
+            (29.0, 30.2, {'type': 'sin_only', 'numerator': 286.2}),
+            (30.2, 31.1, {'type': 'sin_only', 'numerator': 285.5}),
+            (31.1, 33.3, {'type': 'sin_only', 'numerator': 281.4}),
+            (33.3, 35.7, {'type': 'sin_only', 'numerator': 274.9}),
+            (35.7, 38.7, {'type': 'sin_only', 'numerator': 268.2}),
+            (38.7, 41.8, {'type': 'sin_only', 'numerator': 262.2}),
+            (41.8, 45.1, {'type': 'sin_only', 'numerator': 256.4}),
         ]
     },
     "Oracle Park": {  # San Francisco Giants
@@ -693,9 +668,9 @@ STADIUM_DATA = {
             "right_field": 322
         },
         "polar_coords": [
-            (0, 3.4, (321.433, 0, 1)),  # r = 321.433/cos θ
+            (0, 3.4, {'type': 'cos_only', 'numerator': 321.433}),  # r = 321.433/cos θ
             (3.4, 7.2, (-311.7359, 1, -1.029242)),
-            (7.2, 27.8, (345.87116, 0, 1)),  # r = 345.87116/cos θ
+            (7.2, 27.8, {'type': 'cos_only', 'numerator': 345.87116}),  # r = 345.87116/cos θ
             (27.8, 31.8, (1425.7353, 1, 3.59492)),
             (31.8, 38.3, (740.2202, 1, 1.568308)),
             (38.3, 49.2, (543.05468, 1, 0.9402139)),
@@ -762,7 +737,7 @@ STADIUM_DATA = {
         "polar_coords": [
             (0, 20, (-1725.1974, 1, -5.2597)),
             (20, 32.5, (2160.354, 1, 5.7667)),
-            (32.5, 57.5, (400, 1, 0)),  # r = 400/sin θ
+            (32.5, 57.5, {'type': 'sin_only', 'numerator': 400}),  # r = 400/sin θ
             (57.5, 70, (374.6529, 1, 0.17341)),
             (70, 90, (328, 1, -0.19012))
         ]
@@ -781,12 +756,13 @@ STADIUM_DATA = {
         },
         "polar_coords": [
             (0, 26.5, (-3502.437, 1, -10.74367)),
-            (26.5, 47, (825.224, 1, 1.91548)),
+            (26.5, 47, (825.224, 1, 1.9153)),
             (47, 59.6, (414.271, 1, 0.427476)),
-            (59.6, 66.5, (437.4922, 1, 0.2382)),
+            (59.6, 66.5, (377.4922, 1, 0.2382)),
             (66.5, 88.5, (336.558, 1, -0.037016)),
             (88.5, 90, (331, 1, -0.6671))
         ]
+
     },
     "Target Field": {  # Minnesota Twins
         "image_path": "MLBstadiumgraphics/TargetField.gif",
@@ -821,22 +797,22 @@ STADIUM_DATA = {
             "right_field": 325
         },
         "polar_coords": [
-            (0.7, 4.1, (312.5, 1, 0)),
-            (4.1, 6.8, (309.7, 1, 0)),
-            (6.8, 9.7, (306.3, 1, 0)),
-            (9.7, 12.0, (302.1, 1, 0)),
-            (12.0, 14.9, (296.9, 1, 0)),
-            (14.9, 17.8, (289.8, 1, 0)),
-            (17.8, 20.3, (282.9, 1, 0)),
-            (20.3, 23.6, (276.3, 1, 0)),
-            (23.6, 26.6, (270.2, 1, 0)),
-            (26.6, 29.6, (266.1, 1, 0)),
-            (29.6, 32.8, (262.0, 1, 0)),
-            (32.8, 35.6, (258.5, 1, 0)),
-            (35.6, 38.5, (256.1, 1, 0)),
-            (38.5, 41.5, (252.6, 1, 0)),
-            (41.5, 43.5, (247.7, 1, 0)),
-            (43.5, 45.4, (242.0, 1, 0)),
+            (0.7, 4.1, {'type': 'sin_only', 'numerator': 312.5}),
+            (4.1, 6.8, {'type': 'sin_only', 'numerator': 309.7}),
+            (6.8, 9.7, {'type': 'sin_only', 'numerator': 306.3}),
+            (9.7, 12.0, {'type': 'sin_only', 'numerator': 302.1}),
+            (12.0, 14.9, {'type': 'sin_only', 'numerator': 296.9}),
+            (14.9, 17.8, {'type': 'sin_only', 'numerator': 289.8}),
+            (17.8, 20.3, {'type': 'sin_only', 'numerator': 282.9}),
+            (20.3, 23.6, {'type': 'sin_only', 'numerator': 276.3}),
+            (23.6, 26.6, {'type': 'sin_only', 'numerator': 270.2}),
+            (26.6, 29.6, {'type': 'sin_only', 'numerator': 266.1}),
+            (29.6, 32.8, {'type': 'sin_only', 'numerator': 262.0}),
+            (32.8, 35.6, {'type': 'sin_only', 'numerator': 258.5}),
+            (35.6, 38.5, {'type': 'sin_only', 'numerator': 256.1}),
+            (38.5, 41.5, {'type': 'sin_only', 'numerator': 252.6}),
+            (41.5, 43.5, {'type': 'sin_only', 'numerator': 247.7}),
+            (43.5, 45.4, {'type': 'sin_only', 'numerator': 242.0}),
         ]
     },
     "Truist Park": {  # Atlanta Braves
@@ -869,27 +845,13 @@ STADIUM_DATA = {
             "right_field": 353
         },
         "polar_coords": [
-            (1.1, 1.4, (354.5, 1, 0)),
-            (1.4, 2.2, (355.7, 1, 0)),
-            (2.2, 4.6, (355.9, 1, 0)),
-            (4.6, 6.0, (356.0, 1, 0)),
-            (6.0, 9.8, (354.6, 1, 0)),
-            (9.8, 12.9, (352.1, 1, 0)),
-            (12.9, 16.2, (347.4, 1, 0)),
-            (16.2, 20.1, (339.9, 1, 0)),
-            (20.1, 27.0, (326.9, 1, 0)),
-            (27.0, 28.9, (317.8, 1, 0)),
-            (28.9, 30.7, (315.4, 1, 0)),
-            (30.7, 32.0, (315.3, 1, 0)),
-            (32.0, 32.9, (319.6, 1, 0)),
-            (32.9, 34.0, (324.0, 1, 0)),
-            (34.0, 35.4, (324.8, 1, 0)),
-            (35.4, 37.5, (322.2, 1, 0)),
-            (37.5, 39.7, (319.6, 1, 0)),
-            (39.7, 39.7, (318.3, 1, 0)),
-            (39.7, 41.4, (318.0, 1, 0)),
-            (41.4, 43.7, (316.8, 1, 0)),
-            (43.7, 45.4, (315.4, 1, 0)),
+            (0, 10.9, (-4499.412, 1, -12.7462)),
+            (10.9, 13.1, (297.1748, 1, 0.636566)),
+            (13.1, 29.4, (18363.859, 1, 53.4839)),
+            (29.4, 49.2, {'type': 'complex_wrigley'}),
+            (49.2, 73.2, (357.8732, 1, 0.245827)),
+            (73.2, 74.8, (496.86435, 1, 1.62768)),
+            (74.8, 90, (355, 1, 0.112061))
         ]
     },
     "Yankee Stadium": {  # New York Yankees
@@ -907,7 +869,7 @@ STADIUM_DATA = {
         "polar_coords": [
             (0, 3.2, (-752.7415, 1, -2.397266)),
             (3.2, 4.9, (-1341.4764, 1, -4.22849)),
-            (4.9, 30.6, (323.639, 0, 1)),
+            (4.9, 30.6, {'type': 'cos_only', 'numerator': 323.639}),
             (30.6, 36.1, (50683.6147, 1, 7.700602)),
             (36.1, 40.4, (913.27186, 1, 2.139572)),
             (40.4, 44.4, (707.36801, 1, 1.4653105)),
