@@ -231,7 +231,7 @@ class HistoricalSurfaceTableWidget(QWidget):
         self.player2_yearly_stats = {}
         self.player1_name = ""
         self.player2_name = ""
-        self.setFixedSize(900, 240)  # Wider to match top-left container
+        self.setFixedSize(600, 240)  # Reduced width for more compact layout
         self.setStyleSheet(f"""
             HistoricalSurfaceTableWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -259,8 +259,8 @@ class HistoricalSurfaceTableWidget(QWidget):
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
         
         # Draw two side-by-side tables with no spacing
-        self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 450, TennisTheme.PRIMARY)
-        self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 450, 0, 450, TennisTheme.ACCENT)
+        self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 300, TennisTheme.PRIMARY)
+        self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 300, 0, 300, TennisTheme.ACCENT)
         
     def draw_player_table(self, painter, player_name, yearly_stats, x_offset, y_offset, width, accent_color):
         """Draw historical surface table for one player"""
@@ -283,7 +283,7 @@ class HistoricalSurfaceTableWidget(QWidget):
         
         # Column headers
         headers = ["Year", "Sum", "Hard", "Clay", "I.hard", "Grass"]
-        col_widths = [45, 55, 55, 45, 50, 50]
+        col_widths = [45, 50, 50, 45, 50, 50]
         x_pos = x_offset + 5
         
         for header, col_width in zip(headers, col_widths):
@@ -1238,6 +1238,7 @@ class PlayerProfileWidget(QWidget):
     tacticsDataLoaded = pyqtSignal(str, list)  # player_name, tactics_data
     surfaceStatsLoaded = pyqtSignal(str, object, int)  # player_name, SurfaceStats, player_num
     yearlyStatsLoaded = pyqtSignal(str, dict, int)  # player_name, yearly_stats_dict, player_num
+    rawPlayerDataLoaded = pyqtSignal(str, object, int)  # player_name, raw_player_data, player_num
     
     def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
@@ -1379,6 +1380,10 @@ class PlayerProfileWidget(QWidget):
                     # Emit tactics data if available
                     if hasattr(player_data, 'tactics') and player_data.tactics:
                         self.tacticsDataLoaded.emit(self.player_name, player_data.tactics)
+                    
+                    # Emit raw player data for stats widget
+                    if hasattr(player_data, '__dict__'):
+                        self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
                 
                 # Load ATP ranking data
                 rankings = self.h2h_scraper.get_atp_rankings_sync(top_n=1000)
@@ -1763,6 +1768,158 @@ class TacticsTableWidget(QWidget):
             table.setItem(row, 14, QTableWidgetItem(data.return_agg))
 
 
+class CompactStatsWidget(QWidget):
+    """Compact stats widget showing Tour-Level vs Challenger stats with toggle"""
+    
+    def __init__(self):
+        super().__init__()
+        self.player1_data = {}
+        self.player2_data = {}
+        self.player1_name = ""
+        self.player2_name = ""
+        self.show_tour_level = True  # Toggle between Tour-Level and Challenger
+        self.setFixedSize(280, 240)  # Compact size to fit in available space
+        self.setStyleSheet(f"""
+            CompactStatsWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 2px solid {TennisTheme.SURFACE};
+                border-radius: 8px;
+            }}
+        """)
+        
+    def update_player_data(self, player_name: str, player_data: dict, player_num: int):
+        """Update player data from tennis abstract"""
+        if player_num == 1:
+            self.player1_data = player_data
+            self.player1_name = player_name
+        else:
+            self.player2_data = player_data
+            self.player2_name = player_name
+        self.update()
+        
+    def mousePressEvent(self, event):
+        """Toggle between Tour-Level and Challenger on click"""
+        self.show_tour_level = not self.show_tour_level
+        self.update()
+        
+    def paintEvent(self, event):
+        """Custom paint for stats display"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        
+        # Title with toggle indicator
+        title = "Tour-Level Stats" if self.show_tour_level else "Challenger Stats"
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        painter.drawText(5, 5, 270, 20, Qt.AlignmentFlag.AlignCenter, title)
+        
+        # Toggle hint
+        painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+        painter.setFont(QFont("Arial", 8))
+        painter.drawText(5, 20, 270, 15, Qt.AlignmentFlag.AlignCenter, "Click to toggle")
+        
+        # Draw player stats tables
+        self.draw_player_stats(painter, self.player1_name, self.player1_data, 0, 35, 140, TennisTheme.PRIMARY)
+        self.draw_player_stats(painter, self.player2_name, self.player2_data, 140, 35, 140, TennisTheme.ACCENT)
+        
+    def draw_player_stats(self, painter, player_name, player_data, x_offset, y_offset, width, accent_color):
+        """Draw stats for one player"""
+        # Player name header
+        painter.setPen(QColor(accent_color))
+        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        painter.drawText(x_offset + 5, y_offset + 15, player_name[:15] + ("..." if len(player_name) > 15 else ""))
+        
+        # Get current year stats
+        current_year = "2025"
+        stats_key = "tour_seasons" if self.show_tour_level else "challenger_seasons"
+        
+        if not player_data or stats_key not in player_data:
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.setFont(QFont("Arial", 9))
+            painter.drawText(x_offset + 5, y_offset + 40, "No data")
+            return
+            
+        # Find current year data
+        current_data = None
+        for season in player_data[stats_key]:
+            if hasattr(season, 'year') and season.year == current_year:
+                current_data = season
+                break
+                
+        if not current_data:
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.setFont(QFont("Arial", 9))
+            painter.drawText(x_offset + 5, y_offset + 40, "No 2025 data")
+            return
+            
+        # Draw stats
+        stats_y = y_offset + 35
+        painter.setFont(QFont("Arial", 10))
+        
+        # Stats to display
+        stats_items = [
+            ("Set%", getattr(current_data, "set_percentage", "0%")),
+            ("Game%", getattr(current_data, "game_percentage", "0%")),
+            ("Hld%", getattr(current_data, "hold_percentage", "0%")),
+            ("Brk%", getattr(current_data, "break_percentage", "0%")),
+            ("SPW%", getattr(current_data, "service_points_won", "0%")),
+            ("DF%", getattr(current_data, "double_fault_rate", "0%")),
+            ("RPW%", getattr(current_data, "return_points_won", "0%")),
+            ("DR", getattr(current_data, "dominance_ratio", "0.0"))
+        ]
+        
+        for i, (label, value) in enumerate(stats_items):
+            y_pos = stats_y + (i * 20)
+            
+            # Label
+            painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            painter.drawText(x_offset + 5, y_pos, 45, 20, Qt.AlignmentFlag.AlignLeft, label)
+            
+            # Value with color coding
+            if label == "DR":
+                # Color code dominance ratio
+                try:
+                    dr_value = float(value)
+                    if dr_value >= 1.0:
+                        painter.setPen(QColor("#4CAF50"))  # Green for good
+                    elif dr_value >= 0.9:
+                        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))  # Normal
+                    else:
+                        painter.setPen(QColor("#FF6B6B"))  # Red for poor
+                except:
+                    painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+            else:
+                # Color code percentages
+                try:
+                    pct_value = float(value.replace('%', ''))
+                    if label in ["Set%", "Game%", "Hld%", "Brk%", "SPW%", "RPW%"]:
+                        if pct_value >= 50:
+                            painter.setPen(QColor("#4CAF50"))  # Green for good
+                        elif pct_value >= 40:
+                            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))  # Normal
+                        else:
+                            painter.setPen(QColor("#FF6B6B"))  # Red for poor
+                    elif label == "DF%":
+                        # Double fault rate - lower is better
+                        if pct_value <= 2.0:
+                            painter.setPen(QColor("#4CAF50"))  # Green for low DF%
+                        elif pct_value <= 4.0:
+                            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))  # Normal
+                        else:
+                            painter.setPen(QColor("#FF6B6B"))  # Red for high DF%
+                    else:
+                        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+                except:
+                    painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+            
+            painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            painter.drawText(x_offset + 55, y_pos, 80, 20, Qt.AlignmentFlag.AlignRight, value)
+            painter.setFont(QFont("Arial", 10))
+
+
 class CompactTennisComparisonWidget(QWidget):
     """Main container combining search and player profile widgets"""
     
@@ -1815,10 +1972,19 @@ class CompactTennisComparisonWidget(QWidget):
         # Historical surface performance table
         self.surface_table_widget = HistoricalSurfaceTableWidget()
         
+        # Create horizontal layout for surface table and stats widget
+        surface_stats_layout = QHBoxLayout()
+        surface_stats_layout.setSpacing(20)  # Spacing between surface table and stats widget
+        surface_stats_layout.addWidget(self.surface_table_widget)
+        
+        # Compact stats widget
+        self.stats_widget = CompactStatsWidget()
+        surface_stats_layout.addWidget(self.stats_widget)
+        
         # Add widgets to top-left layout
         top_left_layout.addWidget(self.search_widget)
         top_left_layout.addLayout(profiles_layout)
-        top_left_layout.addWidget(self.surface_table_widget)
+        top_left_layout.addLayout(surface_stats_layout)
         top_left_layout.addStretch()  # Push everything to top
         
         # Place top-left widget in grid position (0, 0)
@@ -1848,6 +2014,10 @@ class CompactTennisComparisonWidget(QWidget):
         # Connect yearly stats signals for historical table
         self.player1_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
         self.player2_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
+        
+        # Connect raw player data signals for stats widget
+        self.player1_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
+        self.player2_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
         
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
@@ -1881,6 +2051,10 @@ class CompactTennisComparisonWidget(QWidget):
     def on_yearly_stats_loaded(self, player_name: str, yearly_stats: dict, player_num: int):
         """Handle yearly surface statistics loaded for either player"""
         self.surface_table_widget.update_player_stats(player_name, yearly_stats, player_num)
+        
+    def on_raw_player_data_loaded(self, player_name: str, player_data: dict, player_num: int):
+        """Handle raw player data loaded for stats widget"""
+        self.stats_widget.update_player_data(player_name, player_data, player_num)
         
     def update_status(self):
         """Update status label"""
