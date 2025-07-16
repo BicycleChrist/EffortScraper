@@ -74,7 +74,7 @@ class CompactSurfaceWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.surface_stats = SurfaceStats()
-        self.setFixedSize(180, 85)
+        self.setFixedSize(140, 85)
         self.setToolTip("Surface Performance")
         self.is_populated = False
         print(f"NEW CompactSurfaceWidget initialized - Size: 180x85")
@@ -1359,7 +1359,11 @@ class PlayerProfileWidget(QWidget):
                     # Update bio info
                     self.country_label.setText(f"Country: {player_data.player_bio.country}")
                     self.age_label.setText(f"Age: {player_data.player_bio.age}")
-                    self.plays_label.setText(f"Plays: {player_data.player_bio.plays}")
+                    
+                    # Parse and abbreviate plays info
+                    plays_text = player_data.player_bio.plays
+                    abbreviated_plays = self.abbreviate_plays(plays_text)
+                    self.plays_label.setText(f"Plays: {abbreviated_plays}")
                     
                     # Parse ELO rating
                     try:
@@ -1453,6 +1457,32 @@ class PlayerProfileWidget(QWidget):
         # Run in background thread
         thread = threading.Thread(target=background_load, daemon=True)
         thread.start()
+        
+    def abbreviate_plays(self, plays_text: str) -> str:
+        """Abbreviate plays information to standard tennis format"""
+        if not plays_text:
+            return "--"
+            
+        # Convert to lowercase for easier matching
+        plays_lower = plays_text.lower()
+        
+        # Determine handedness
+        if "right" in plays_lower:
+            handedness = "RH"
+        elif "left" in plays_lower:
+            handedness = "LH"
+        else:
+            handedness = "?"
+            
+        # Determine backhand style
+        if "two" in plays_lower or "2" in plays_lower:
+            backhand = "2HBH"
+        elif "one" in plays_lower or "1" in plays_lower:
+            backhand = "1HBH"
+        else:
+            backhand = "?"
+            
+        return f"{handedness}/{backhand}"
         
     def extract_surface_stats(self, career_splits: List) -> SurfaceStats:
         """Extract surface statistics from career splits data"""
@@ -1640,7 +1670,7 @@ class TacticsTableWidget(QWidget):
         
     def setup_ui(self):
         """Setup the tactics table UI"""
-        self.setFixedSize(1150, 450)  # Sized to fit within window bounds
+        self.setFixedSize(950, 450)  # Reduced width to prevent extending off screen
         self.setStyleSheet(f"""
             TacticsTableWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -1681,7 +1711,7 @@ class TacticsTableWidget(QWidget):
         
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
-        table.setFixedSize(1100, 180)  # Fixed height for 5 rows + header + scrollbar
+        table.setFixedSize(900, 180)  # Reduced width to fit within container
         
         # Style table with player color
         table.setStyleSheet(f"""
