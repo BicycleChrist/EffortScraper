@@ -1250,7 +1250,6 @@ class PlayerProfileWidget(QWidget):
         self.surface_stats = SurfaceStats()
         
         # Scrapers
-        self.abstract_scraper = TennisAbstractScraper(headless=True)
         self.h2h_scraper = TennisScraper()
         
         # Database path for rankings
@@ -1258,21 +1257,38 @@ class PlayerProfileWidget(QWidget):
         
         self.setup_ui()
         
-    def get_player_rankings_from_db(self, player_name: str) -> Tuple[Optional[int], Optional[int]]:
-        """Get current and peak rankings from the database"""
+    def get_player_rankings_from_db(self, player_name: str) -> Tuple[Optional[int], Optional[int], bool]:
+        """Get current and peak rankings from the database, and whether current rank is recent"""
         try:
+            from datetime import datetime, timedelta
+            
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # Get current ranking (most recent entry)
+            # Get current ranking (most recent entry) with date
             cursor.execute("""
-                SELECT rank FROM rankings 
+                SELECT rank, ranking_date FROM rankings 
                 WHERE player_name = ? 
                 ORDER BY ranking_date DESC 
                 LIMIT 1
             """, (player_name,))
             current_result = cursor.fetchone()
-            current_rank = current_result[0] if current_result else None
+            
+            current_rank = None
+            is_current = False
+            
+            if current_result:
+                current_rank = current_result[0]
+                ranking_date_str = current_result[1]
+                
+                # Check if ranking is recent (within last 3 months)
+                try:
+                    ranking_date = datetime.strptime(ranking_date_str, '%Y-%m-%d')
+                    three_months_ago = datetime.now() - timedelta(days=90)
+                    is_current = ranking_date >= three_months_ago
+                except:
+                    # If date parsing fails, consider it not current
+                    is_current = False
             
             # Get peak ranking (minimum rank value)
             cursor.execute("""
@@ -1283,11 +1299,11 @@ class PlayerProfileWidget(QWidget):
             peak_rank = peak_result[0] if peak_result else None
             
             conn.close()
-            return current_rank, peak_rank
+            return current_rank, peak_rank, is_current
             
         except Exception as e:
             print(f"Error getting rankings from database for {player_name}: {e}")
-            return None, None
+            return None, None, False
         
     def setup_ui(self):
         """Setup the compact player profile UI"""
@@ -1400,11 +1416,17 @@ class PlayerProfileWidget(QWidget):
         """Load player data from multiple sources"""
         def background_load():
             try:
-                # Load Tennis Abstract data
+                # Load Tennis Abstract data - create new scraper instance for each use
                 formatted_name = self.player_name.replace(' ', '')
                 url = f"https://www.tennisabstract.com/cgi-bin/player.cgi?p={formatted_name}"
                 
-                player_data = self.abstract_scraper._scrape_player_page(url)
+                abstract_scraper = TennisAbstractScraper(headless=True)
+                try:
+                    player_data = abstract_scraper._scrape_player_page(url)
+                finally:
+                    # Always close the scraper after use
+                    abstract_scraper.close()
+                    print(f"Closed scraper for {self.player_name}")
                 
                 if player_data and player_data.player_bio:
                     self.player_bio = player_data.player_bio
@@ -1425,12 +1447,19 @@ class PlayerProfileWidget(QWidget):
                     except:
                         self.elo_label.setText("ELO: --")
                     
-                    # Get rankings from database instead of scraping
+                    # Get rankings from database with recency check
                     try:
-                        current_rank_db, peak_rank_db = self.get_player_rankings_from_db(self.player_name)
+                        current_rank_db, peak_rank_db, is_current = self.get_player_rankings_from_db(self.player_name)
                         
-                        # Use database rankings if available, otherwise fallback to scraped data
-                        current_rank = current_rank_db if current_rank_db is not None else (int(player_data.player_bio.current_rank) if player_data.player_bio.current_rank.isdigit() else None)
+                        # Use database current ranking only if it's recent (within 3 months)
+                        # Otherwise fallback to Tennis Abstract scraped ranking
+                        if is_current and current_rank_db is not None:
+                            current_rank = current_rank_db
+                        else:
+                            # Use Tennis Abstract current_rank as fallback for stale DB data
+                            current_rank = int(player_data.player_bio.current_rank) if player_data.player_bio.current_rank.isdigit() else None
+                        
+                        # Always use database peak rank if available (historical data is always valid)
                         peak_rank = peak_rank_db if peak_rank_db is not None else (int(player_data.player_bio.peak_rank) if player_data.player_bio.peak_rank.isdigit() else None)
                         
                         self.ranking_widget.update_ranking(current_rank, peak_rank, elo_rating)
@@ -1449,8 +1478,9 @@ class PlayerProfileWidget(QWidget):
                 # Get rankings from database for cases where Abstract data wasn't available
                 if not self.player_bio:
                     try:
-                        current_rank_db, peak_rank_db = self.get_player_rankings_from_db(self.player_name)
-                        if current_rank_db is not None:
+                        current_rank_db, peak_rank_db, is_current = self.get_player_rankings_from_db(self.player_name)
+                        # Only use database ranking if it's current, otherwise show no ranking
+                        if is_current and current_rank_db is not None:
                             self.ranking_widget.update_ranking(current_rank_db, peak_rank_db)
                     except:
                         pass
@@ -1991,15 +2021,15 @@ class CompactStatsWidget(QWidget):
             self.stats_mode = "career"
             self.mode_toggle.setText("Career")
             self.split_toggle.setEnabled(True)  # Enable split toggle for career mode
-            self.player1_toggle.setEnabled(False)  # Disable tour/challenger for splits
-            self.player2_toggle.setEnabled(False)
+            self.player1_toggle.setEnabled(True)  # Enable tour/challenger for splits (now we have both)
+            self.player2_toggle.setEnabled(True)
             self.update_available_splits()
         elif self.stats_mode == "career":
             self.stats_mode = "last52"
             self.mode_toggle.setText("Last52")
             self.split_toggle.setEnabled(True)  # Enable split toggle for last52 mode
-            self.player1_toggle.setEnabled(False)  # Disable tour/challenger for splits
-            self.player2_toggle.setEnabled(False)
+            self.player1_toggle.setEnabled(True)  # Enable tour/challenger for splits (now we have both)
+            self.player2_toggle.setEnabled(True)
             self.update_available_splits()
         else:
             self.stats_mode = "current_year"
@@ -2040,16 +2070,26 @@ class CompactStatsWidget(QWidget):
         
     def update_available_splits(self):
         """Update available splits based on current data"""
-        splits_key = "career_splits" if self.stats_mode == "career" else "last52_splits"
+        # Check both tour and challenger splits for available split types
+        tour_key = "career_splits" if self.stats_mode == "career" else "last52_splits"
+        chall_key = "career_splits_chall" if self.stats_mode == "career" else "last52_splits_chall"
         
-        # Gather all unique splits from both players
+        # Gather all unique splits from both players and both levels
         all_splits = set()
         
         for player_data in [self.player1_data, self.player2_data]:
-            if player_data and splits_key in player_data:
-                for split_data in player_data[splits_key]:
-                    if hasattr(split_data, 'split'):
-                        all_splits.add(split_data.split)
+            if player_data:
+                # Check tour-level splits
+                if tour_key in player_data:
+                    for split_data in player_data[tour_key]:
+                        if isinstance(split_data, dict) and 'split' in split_data:
+                            all_splits.add(split_data['split'])
+                
+                # Check challenger-level splits
+                if chall_key in player_data:
+                    for split_data in player_data[chall_key]:
+                        if isinstance(split_data, dict) and 'split' in split_data:
+                            all_splits.add(split_data['split'])
         
         # Convert to sorted list, prioritizing common splits
         priority_splits = ["Hard", "Clay", "Grass", "Grand Slams", "Masters", "vs Lefties", "vs Top 10"]
@@ -2151,30 +2191,45 @@ class CompactStatsWidget(QWidget):
                     break
                     
         elif self.stats_mode == "career":
-            # Get career splits data for specific split type (ignores tour/challenger)
-            if "career_splits" not in player_data:
+            # Debug: Print available keys
+            print(f"Debug - player_data keys: {list(player_data.keys()) if player_data else 'None'}")
+            
+            # Get career splits data 
+            splits_key = "career_splits" if show_tour_level else "career_splits_chall"
+            
+            if splits_key not in player_data:
+                print(f"Debug - Missing key: {splits_key}")
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 painter.drawText(x_offset + 5, y_offset + 40, "No career data")
                 return
+            
+            print(f"Debug - {splits_key} data: {player_data[splits_key][:2] if player_data[splits_key] else 'Empty'}")
                 
             # Find the specific split type
-            for split_data in player_data["career_splits"]:
-                if hasattr(split_data, 'split') and split_data.split == self.current_split_type:
+            for split_data in player_data[splits_key]:
+                if isinstance(split_data, dict) and split_data.get('split') == self.current_split_type:
                     current_data = split_data
                     break
                     
         elif self.stats_mode == "last52":
-            # Get last 52 weeks splits data for specific split type (ignores tour/challenger)
-            if "last52_splits" not in player_data:
+            # Get last 52 weeks splits data with fallback for old data structure
+            if show_tour_level:
+                # Try new structure first, fallback to old
+                splits_key = "last52_splits" if "last52_splits" in player_data else None
+            else:
+                # Try new challenger structure first, fallback to old
+                splits_key = "last52_splits_chall" if "last52_splits_chall" in player_data else "last52_splits"
+            
+            if not splits_key or splits_key not in player_data:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 painter.drawText(x_offset + 5, y_offset + 40, "No last52 data")
                 return
                 
             # Find the specific split type
-            for split_data in player_data["last52_splits"]:
-                if hasattr(split_data, 'split') and split_data.split == self.current_split_type:
+            for split_data in player_data[splits_key]:
+                if isinstance(split_data, dict) and split_data.get('split') == self.current_split_type:
                     current_data = split_data
                     break
                     
@@ -2188,16 +2243,22 @@ class CompactStatsWidget(QWidget):
         stats_y = y_offset + 35
         painter.setFont(QFont("Arial", 10))
         
-        # Stats to display
+        # Stats to display - handle both dict and object data
+        def get_stat_value(data, key, default="0%"):
+            if isinstance(data, dict):
+                return data.get(key, default)
+            else:
+                return getattr(data, key, default)
+        
         stats_items = [
-            ("Set%", getattr(current_data, "set_percentage", "0%")),
-            ("Game%", getattr(current_data, "game_percentage", "0%")),
-            ("Hld%", getattr(current_data, "hold_percentage", "0%")),
-            ("Brk%", getattr(current_data, "break_percentage", "0%")),
-            ("SPW%", getattr(current_data, "service_points_won", "0%")),
-            ("DF%", getattr(current_data, "double_fault_rate", "0%")),
-            ("RPW%", getattr(current_data, "return_points_won", "0%")),
-            ("DR", getattr(current_data, "dominance_ratio", "0.0"))
+            ("Set%", get_stat_value(current_data, "set_percentage", "0%")),
+            ("Game%", get_stat_value(current_data, "game_percentage", "0%")),
+            ("Hld%", get_stat_value(current_data, "hold_percentage", "0%")),
+            ("Brk%", get_stat_value(current_data, "break_percentage", "0%")),
+            ("SPW%", get_stat_value(current_data, "service_points_won", "0%")),
+            ("DF%", get_stat_value(current_data, "double_fault_rate", "0%")),
+            ("RPW%", get_stat_value(current_data, "return_points_won", "0%")),
+            ("DR", get_stat_value(current_data, "dominance_ratio", "0.0"))
         ]
         
         for i, (label, value) in enumerate(stats_items):
@@ -2207,7 +2268,7 @@ class CompactStatsWidget(QWidget):
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
             painter.drawText(x_offset + 5, y_pos, 45, 20, Qt.AlignmentFlag.AlignLeft, label)
             
-            # Value with color coding
+            # Value with color coding 
             if label == "DR":
                 # Color code dominance ratio
                 try:
@@ -2417,6 +2478,19 @@ class CompactTennisComparisonWidget(QWidget):
         else:
             # No action needed when not both players selected
             pass
+    
+    def closeEvent(self, event):
+        """Cleanup scrapers when window is closed"""
+        try:
+            # Close H2H scraper
+            if hasattr(self.h2h_scraper, 'close'):
+                self.h2h_scraper.close()
+            
+            print("Scrapers cleaned up successfully")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        finally:
+            event.accept()
         
 
 # Test application

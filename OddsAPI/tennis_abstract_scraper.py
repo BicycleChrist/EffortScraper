@@ -217,6 +217,8 @@ class PlayerData:
     recent_events: List[EventResult]
     career_splits: List[SplitStats]
     last52_splits: List[SplitStats]
+    career_splits_chall: List[SplitStats]
+    last52_splits_chall: List[SplitStats]
     winners_errors: List[WinnersErrorsData]
     serve_speed: List[ServeSpeedData]
     tactics: List[TacticsData]
@@ -224,19 +226,86 @@ class PlayerData:
     source_url: str
 
 class TennisAbstractScraper:
-    def __init__(self, headless: bool = False, timeout: int = 10):
-        self.headless = headless
+    def __init__(self, headless: bool = False, timeout: int = 10, max_workers: int = 4, reuse_driver: bool = True):
+        self.headless = False
         self.timeout = timeout
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.reuse_driver = reuse_driver
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._driver_pool = []
+        self._element_cache = {}
         
     def _create_driver(self) -> webdriver.Firefox:
         """Create a new Firefox driver instance"""
         options = FirefoxOptions()
         if self.headless:
             options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.set_preference('dom.webnotifications.enabled', False)
+        options.set_preference('media.volume_scale', '0.0')
         driver = webdriver.Firefox(options=options)
-        driver.implicitly_wait(self.timeout)
+        driver.implicitly_wait(1)  # Reduced to 1 second for speed
         return driver
+    
+    def _get_driver(self) -> webdriver.Firefox:
+        """Get a driver from pool or create new one"""
+        if self.reuse_driver and self._driver_pool:
+            return self._driver_pool.pop()
+        return self._create_driver()
+    
+    def _return_driver(self, driver: webdriver.Firefox):
+        """Return driver to pool for reuse"""
+        if self.reuse_driver and len(self._driver_pool) < 2:
+            self._driver_pool.append(driver)
+        else:
+            driver.quit()
+    
+    def _get_cached_elements(self, driver: webdriver.Firefox, url: str) -> Dict:
+        """Cache and return all table elements at once, optimized for player ranking level"""
+        if url in self._element_cache:
+            return self._element_cache[url]
+        
+        elements = {}
+        
+        # Get player bio
+        try:
+            bio_elements = driver.find_elements(By.ID, "bio")
+            elements["bio"] = bio_elements[0] if bio_elements else None
+        except:
+            elements["bio"] = None
+        
+        # Get all possible tables with no waiting - let empty lists handle missing data
+        all_table_ids = [
+            "recent-results", "tour-years", "chall-years", "recent-finals", 
+            "year-end-rankings", "recent-events", "career-splits", 
+            "last52-splits", "career-splits-chall", "last52-splits-chall",
+            "winners-errors", "serve-speed", "mcp-tactics"
+        ]
+        
+        # Get all tables quickly with no waits
+        for table_id in all_table_ids:
+            elements[table_id] = self._get_table_rows_safe(driver, table_id)
+            
+        self._element_cache[url] = elements
+        return elements
+    
+    
+    def _get_table_rows_safe(self, driver: webdriver.Firefox, table_id: str, quick_check: bool = False) -> List:
+        """Safely get table rows with minimal waiting"""
+        try:
+            # Always use find_elements (no wait) instead of find_element
+            tables = driver.find_elements(By.ID, table_id)
+            if not tables:
+                return []
+                
+            table = tables[0]
+            tbody_elements = table.find_elements(By.TAG_NAME, "tbody")
+            if not tbody_elements:
+                return []
+                
+            return tbody_elements[0].find_elements(By.TAG_NAME, "tr")
+        except:
+            return []
     
     def _extract_player_name(self, driver: webdriver.Firefox) -> str:
         """Extract player name from page title or header"""
@@ -329,38 +398,32 @@ class TennisAbstractScraper:
             print(f"Error extracting player bio: {e}")
             return PlayerBio("", "", "", "", "", "", "", "", "", "", "")
     
-    def _scrape_recent_results(self, driver: webdriver.Firefox) -> List[MatchResult]:
-        """Scrape recent results table"""
+    def _scrape_recent_results(self, rows: List) -> List[MatchResult]:
+        """Scrape recent results table from cached rows"""
         results = []
         try:
-            table = driver.find_element(By.ID, "recent-results")
-            tbody = table.find_element(By.TAG_NAME, "tbody")
-            rows = tbody.find_elements(By.TAG_NAME, "tr")
-            
             for row in rows:
                 cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) >= 16:  # Ensure we have all expected columns
-                    # Extract opponent name from the complex cell (index 6)
-                    opponent_cell = cells[6]
-                    opponent_text = opponent_cell.text
+                if len(cells) >= 16:
+                    cell_texts = [cell.text.strip() for cell in cells[:16]]
                     
                     result = MatchResult(
-                        date=cells[0].text.strip(),
-                        tournament=cells[1].text.strip(),
-                        surface=cells[2].text.strip(),
-                        round=cells[3].text.strip(),
-                        player_rank=cells[4].text.strip(),
-                        opponent_rank=cells[5].text.strip(),
-                        opponent=opponent_text.strip(),
-                        score=cells[7].text.strip(),
-                        dominance_ratio=cells[8].text.strip(),
-                        ace_rate=cells[9].text.strip(),
-                        double_fault_rate=cells[10].text.strip(),
-                        first_serve_in=cells[11].text.strip(),
-                        first_serve_won=cells[12].text.strip(),
-                        second_serve_won=cells[13].text.strip(),
-                        break_points_saved=cells[14].text.strip(),
-                        match_time=cells[15].text.strip()
+                        date=cell_texts[0],
+                        tournament=cell_texts[1],
+                        surface=cell_texts[2],
+                        round=cell_texts[3],
+                        player_rank=cell_texts[4],
+                        opponent_rank=cell_texts[5],
+                        opponent=cell_texts[6],
+                        score=cell_texts[7],
+                        dominance_ratio=cell_texts[8],
+                        ace_rate=cell_texts[9],
+                        double_fault_rate=cell_texts[10],
+                        first_serve_in=cell_texts[11],
+                        first_serve_won=cell_texts[12],
+                        second_serve_won=cell_texts[13],
+                        break_points_saved=cell_texts[14],
+                        match_time=cell_texts[15]
                     )
                     results.append(result)
                     
@@ -369,47 +432,45 @@ class TennisAbstractScraper:
             
         return results
     
-    def _scrape_season_stats(self, driver: webdriver.Firefox, table_id: str) -> List[SeasonStats]:
-        """Scrape season statistics table (tour or challenger)"""
+    def _scrape_season_stats(self, rows: List) -> List[SeasonStats]:
+        """Scrape season statistics table from cached rows"""
         stats = []
         try:
-            table = driver.find_element(By.ID, table_id)
-            tbody = table.find_element(By.TAG_NAME, "tbody")
-            rows = tbody.find_elements(By.TAG_NAME, "tr")
-            
             for row in rows:
                 cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) >= 23:  # Ensure we have all expected columns
+                if len(cells) >= 23:
+                    cell_texts = [cell.text.strip() for cell in cells]
+                    
                     season = SeasonStats(
-                        year=cells[0].text.strip(),
-                        matches=cells[1].text.strip(),
-                        wins=cells[2].text.strip(),
-                        losses=cells[3].text.strip(),
-                        win_percentage=cells[4].text.strip(),
-                        set_record=cells[5].text.strip(),
-                        set_percentage=cells[6].text.strip(),
-                        game_record=cells[7].text.strip(),
-                        game_percentage=cells[8].text.strip(),
-                        tiebreak_record=cells[9].text.strip(),
-                        tiebreak_percentage=cells[10].text.strip(),
-                        matches_with_stats=cells[11].text.strip(),
-                        hold_percentage=cells[12].text.strip(),
-                        break_percentage=cells[13].text.strip(),
-                        ace_rate=cells[14].text.strip(),
-                        double_fault_rate=cells[15].text.strip(),
-                        first_serve_in=cells[16].text.strip(),
-                        first_serve_won=cells[17].text.strip(),
-                        second_serve_won=cells[18].text.strip(),
-                        service_points_won=cells[19].text.strip(),
-                        return_points_won=cells[20].text.strip(),
-                        total_points_won=cells[21].text.strip(),
-                        dominance_ratio=cells[22].text.strip(),
-                        best_result=cells[23].text.strip() if len(cells) > 23 else ""
+                        year=cell_texts[0],
+                        matches=cell_texts[1],
+                        wins=cell_texts[2],
+                        losses=cell_texts[3],
+                        win_percentage=cell_texts[4],
+                        set_record=cell_texts[5],
+                        set_percentage=cell_texts[6],
+                        game_record=cell_texts[7],
+                        game_percentage=cell_texts[8],
+                        tiebreak_record=cell_texts[9],
+                        tiebreak_percentage=cell_texts[10],
+                        matches_with_stats=cell_texts[11],
+                        hold_percentage=cell_texts[12],
+                        break_percentage=cell_texts[13],
+                        ace_rate=cell_texts[14],
+                        double_fault_rate=cell_texts[15],
+                        first_serve_in=cell_texts[16],
+                        first_serve_won=cell_texts[17],
+                        second_serve_won=cell_texts[18],
+                        service_points_won=cell_texts[19],
+                        return_points_won=cell_texts[20],
+                        total_points_won=cell_texts[21],
+                        dominance_ratio=cell_texts[22],
+                        best_result=cell_texts[23] if len(cell_texts) > 23 else ""
                     )
                     stats.append(season)
                     
         except Exception as e:
-            print(f"Error scraping {table_id}: {e}")
+            print(f"Error scraping season stats: {e}")
             
         return stats
     
@@ -668,30 +729,35 @@ class TennisAbstractScraper:
     
     def _scrape_player_page(self, url: str) -> Optional[PlayerData]:
         """Scrape a single player page"""
-        driver = self._create_driver()
+        driver = self._get_driver()
         try:
             print(f"Scraping: {url}")
             driver.get(url)
             
-            # Wait for main content to load
-            WebDriverWait(driver, self.timeout).until(
-                EC.presence_of_element_located((By.ID, "main"))
-            )
+            # Quick check that page loaded
+            sleep(0.5)  # Brief pause for page load
             
-            # Extract player data
+            # Get all cached elements at once
+            elements = self._get_cached_elements(driver, url)
+            
+            # Extract player data using cached elements
             player_name = self._extract_player_name(driver)
-            player_bio = self._extract_player_bio(driver)
-            recent_results = self._scrape_recent_results(driver)
-            tour_seasons = self._scrape_season_stats(driver, "tour-years")
-            challenger_seasons = self._scrape_season_stats(driver, "chall-years")
-            recent_finals = self._scrape_finals_results(driver)
-            year_end_rankings = self._scrape_year_end_rankings(driver)
-            recent_events = self._scrape_recent_events(driver)
-            career_splits = self._scrape_split_stats(driver, "career-splits")
-            last52_splits = self._scrape_split_stats(driver, "last52-splits")
-            winners_errors = self._scrape_winners_errors(driver)
-            serve_speed = self._scrape_serve_speed(driver)
-            tactics = self._scrape_tactics(driver)
+            player_bio = self._extract_player_bio_cached(elements["bio"]) if elements["bio"] else PlayerBio("", "", "", "", "", "", "", "", "", "", "")
+            
+            # Process all tables using cached rows
+            recent_results = self._scrape_recent_results(elements["recent-results"])
+            tour_seasons = self._scrape_season_stats(elements["tour-years"])
+            challenger_seasons = self._scrape_season_stats(elements["chall-years"])
+            recent_finals = self._scrape_finals_results_cached(elements["recent-finals"])
+            year_end_rankings = self._scrape_year_end_rankings_cached(elements["year-end-rankings"])
+            recent_events = self._scrape_recent_events_cached(elements["recent-events"])
+            career_splits = self._scrape_split_stats_cached(elements["career-splits"])
+            last52_splits = self._scrape_split_stats_cached(elements["last52-splits"])
+            career_splits_chall = self._scrape_split_stats_cached(elements["career-splits-chall"])
+            last52_splits_chall = self._scrape_split_stats_cached(elements["last52-splits-chall"])
+            winners_errors = self._scrape_winners_errors_cached(elements["winners-errors"])
+            serve_speed = self._scrape_serve_speed_cached(elements["serve-speed"])
+            tactics = self._scrape_tactics_cached(elements["mcp-tactics"])
             
             player_data = PlayerData(
                 player_name=player_name,
@@ -704,6 +770,8 @@ class TennisAbstractScraper:
                 recent_events=recent_events,
                 career_splits=career_splits,
                 last52_splits=last52_splits,
+                career_splits_chall=career_splits_chall,
+                last52_splits_chall=last52_splits_chall,
                 winners_errors=winners_errors,
                 serve_speed=serve_speed,
                 tactics=tactics,
@@ -724,7 +792,7 @@ class TennisAbstractScraper:
             print(f"Error scraping {url}: {e}")
             return None
         finally:
-            driver.quit()
+            self._return_driver(driver)
     
     async def scrape_players_async(self, urls: List[str]) -> Dict[str, PlayerData]:
         """Asynchronously scrape multiple player pages"""
@@ -772,17 +840,169 @@ class TennisAbstractScraper:
         
         print(f"Data saved to {save_path}")
     
+    def _extract_player_bio_cached(self, bio_element) -> PlayerBio:
+        """Extract player bio from cached element"""
+        try:
+            bio_table = bio_element.find_element(By.TAG_NAME, "table")
+            
+            # Extract photo URL
+            photo_url = ""
+            try:
+                img_element = bio_table.find_element(By.TAG_NAME, "img")
+                photo_url = img_element.get_attribute("src")
+            except:
+                pass
+            
+            # Extract text data
+            bio_rows = bio_table.find_elements(By.TAG_NAME, "tr")
+            bio_text = [row.text.strip() for row in bio_rows if row.text.strip()]
+            
+            # Parse bio information
+            name = country = age = birth_date = plays = current_rank = peak_rank = peak_rank_date = elo_rank = elo_rating = ""
+            
+            for line in bio_text:
+                if "[" in line and "]" in line:
+                    name = line.split("[")[0].strip()
+                    country = line.split("[")[1].split("]")[0].strip()
+                elif line.startswith("Age:"):
+                    age_parts = line.replace("Age:", "").strip()
+                    if "(" in age_parts:
+                        age = age_parts.split("(")[0].strip()
+                        birth_date = age_parts.split("(")[1].replace(")", "").strip()
+                elif line.startswith("Plays:"):
+                    plays = line.replace("Plays:", "").strip()
+                elif line.startswith("Current rank:"):
+                    current_rank = line.replace("Current rank:", "").strip()
+                elif line.startswith("Peak rank:"):
+                    peak_parts = line.replace("Peak rank:", "").strip()
+                    if "(" in peak_parts:
+                        peak_rank = peak_parts.split("(")[0].strip()
+                        peak_rank_date = peak_parts.split("(")[1].replace(")", "").strip()
+                elif line.startswith("Elo rank:"):
+                    elo_parts = line.replace("Elo rank:", "").strip()
+                    if "(" in elo_parts:
+                        elo_rank = elo_parts.split("(")[0].strip()
+                        rating_part = elo_parts.split("rating:")[1].replace(")", "").strip() if "rating:" in elo_parts else ""
+                        elo_rating = rating_part
+            
+            return PlayerBio(name, country, age, birth_date, plays, current_rank, peak_rank, peak_rank_date, elo_rank, elo_rating, photo_url)
+            
+        except Exception as e:
+            print(f"Error extracting player bio: {e}")
+            return PlayerBio("", "", "", "", "", "", "", "", "", "", "")
+    
+    def _scrape_finals_results_cached(self, rows: List) -> List[FinalsResult]:
+        """Scrape finals results from cached rows"""
+        results = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 16:
+                    cell_texts = [cell.text.strip() for cell in cells[:16]]
+                    result = FinalsResult(*cell_texts)
+                    results.append(result)
+        except Exception as e:
+            print(f"Error scraping finals results: {e}")
+        return results
+    
+    def _scrape_year_end_rankings_cached(self, rows: List) -> List[YearEndRanking]:
+        """Scrape year-end rankings from cached rows"""
+        rankings = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 11:
+                    cell_texts = [cell.text.strip() for cell in cells[:11]]
+                    ranking = YearEndRanking(*cell_texts)
+                    rankings.append(ranking)
+        except Exception as e:
+            print(f"Error scraping year-end rankings: {e}")
+        return rankings
+    
+    def _scrape_recent_events_cached(self, rows: List) -> List[EventResult]:
+        """Scrape recent events from cached rows"""
+        events = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 25:
+                    cell_texts = [cell.text.strip() for cell in cells[:25]]
+                    event = EventResult(*cell_texts)
+                    events.append(event)
+        except Exception as e:
+            print(f"Error scraping recent events: {e}")
+        return events
+    
+    def _scrape_split_stats_cached(self, rows: List) -> List[SplitStats]:
+        """Scrape split stats from cached rows"""
+        splits = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 22:
+                    cell_texts = [cell.text.strip() for cell in cells]
+                    dominance_ratio = cell_texts[22] if len(cell_texts) > 22 else ""
+                    split = SplitStats(*cell_texts[:22], dominance_ratio)
+                    splits.append(split)
+        except Exception as e:
+            print(f"Error scraping split stats: {e}")
+        return splits
+    
+    def _scrape_winners_errors_cached(self, rows: List) -> List[WinnersErrorsData]:
+        """Scrape winners/errors from cached rows"""
+        data = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 15:
+                    cell_texts = [cell.text.strip() for cell in cells[:15]]
+                    winners_errors = WinnersErrorsData(*cell_texts)
+                    data.append(winners_errors)
+        except Exception as e:
+            print(f"Error scraping winners/errors: {e}")
+        return data
+    
+    def _scrape_serve_speed_cached(self, rows: List) -> List[ServeSpeedData]:
+        """Scrape serve speed from cached rows"""
+        data = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 5:
+                    cell_texts = [cell.text.strip() for cell in cells[:5]]
+                    serve_speed = ServeSpeedData(*cell_texts)
+                    data.append(serve_speed)
+        except Exception as e:
+            print(f"Error scraping serve speed: {e}")
+        return data
+    
+    def _scrape_tactics_cached(self, rows: List) -> List[TacticsData]:
+        """Scrape tactics from cached rows"""
+        data = []
+        try:
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 15:
+                    cell_texts = [cell.text.strip() for cell in cells[:15]]
+                    tactics = TacticsData(*cell_texts)
+                    data.append(tactics)
+        except Exception as e:
+            print(f"Error scraping tactics: {e}")
+        return data
+
     def close(self):
-        """Clean up thread pool"""
+        """Clean up resources"""
+        for driver in self._driver_pool:
+            driver.quit()
+        self._driver_pool.clear()
+        self._element_cache.clear()
         self.executor.shutdown(wait=True)
 
 # Example usage and testing
 def main():
     # Example player URLs - these would typically be discovered through search
     test_urls = [
-        "https://www.tennisabstract.com/cgi-bin/player.cgi?p=BrandonHolt",
-        "https://www.tennisabstract.com/cgi-bin/player.cgi?p=JannikSinner",
-        "https://www.tennisabstract.com/cgi-bin/player.cgi?p=RafaelNadal"
+        "https://www.tennisabstract.com/cgi-bin/player.cgi?p=GovindNanda"
     ]
     
     scraper = TennisAbstractScraper(headless=True)
@@ -790,6 +1010,7 @@ def main():
     try:
         # Scrape players asynchronously
         data = scraper.scrape_players(test_urls)
+        
         
         # Save results
         scraper.save_data(data)
