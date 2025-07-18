@@ -4,7 +4,7 @@ import time
 import threading
 import sqlite3
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
 import traceback
 
@@ -1473,7 +1473,14 @@ class PlayerProfileWidget(QWidget):
                     
                     # Emit raw player data for stats widget
                     if hasattr(player_data, '__dict__'):
-                        self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
+                        # Convert dataclass to dict properly, including nested lists
+                        try:
+                            player_dict = asdict(player_data)
+                            self.rawPlayerDataLoaded.emit(self.player_name, player_dict, self.player_num)
+                        except Exception as e:
+                            print(f"Error converting player data to dict: {e}")
+                            # Fallback to __dict__ if asdict fails
+                            self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
                 
                 # Get rankings from database for cases where Abstract data wasn't available
                 if not self.player_bio:
@@ -2013,6 +2020,8 @@ class CompactStatsWidget(QWidget):
         else:
             self.player2_show_tour = not self.player2_show_tour
             self.player2_toggle.setText("Tour" if self.player2_show_tour else "Chall")
+        
+        # Trigger repaint to show updated data
         self.update()
         
     def toggle_stats_mode(self):
@@ -2070,7 +2079,7 @@ class CompactStatsWidget(QWidget):
         
     def update_available_splits(self):
         """Update available splits based on current data"""
-        # Check both tour and challenger splits for available split types
+        # Get splits from all players, combining both tour and challenger data
         tour_key = "career_splits" if self.stats_mode == "career" else "last52_splits"
         chall_key = "career_splits_chall" if self.stats_mode == "career" else "last52_splits_chall"
         
@@ -2079,14 +2088,14 @@ class CompactStatsWidget(QWidget):
         
         for player_data in [self.player1_data, self.player2_data]:
             if player_data:
-                # Check tour-level splits
-                if tour_key in player_data:
+                # Check tour-level splits (if available)
+                if tour_key in player_data and player_data[tour_key]:
                     for split_data in player_data[tour_key]:
                         if isinstance(split_data, dict) and 'split' in split_data:
                             all_splits.add(split_data['split'])
                 
-                # Check challenger-level splits
-                if chall_key in player_data:
+                # Check challenger-level splits (if available)
+                if chall_key in player_data and player_data[chall_key]:
                     for split_data in player_data[chall_key]:
                         if isinstance(split_data, dict) and 'split' in split_data:
                             all_splits.add(split_data['split'])
@@ -2100,7 +2109,7 @@ class CompactStatsWidget(QWidget):
         if self.current_split_type not in self.available_splits and self.available_splits:
             self.current_split_type = self.available_splits[0]
             
-        # Update button text
+        # Update button text and enable/disable based on available data
         if self.available_splits:
             button_text = self.current_split_type
             if len(button_text) > 8:
@@ -2118,6 +2127,12 @@ class CompactStatsWidget(QWidget):
                 }
                 button_text = abbreviations.get(button_text, button_text[:8])
             self.split_toggle.setText(button_text)
+            
+            # Enable button if we have multiple split types to cycle through
+            if self.stats_mode in ["career", "last52"]:
+                self.split_toggle.setEnabled(len(self.available_splits) > 1)
+        else:
+            self.split_toggle.setEnabled(False)
         
     def update_player_data(self, player_name: str, player_data: dict, player_num: int):
         """Update player data from tennis abstract"""
@@ -2174,37 +2189,33 @@ class CompactStatsWidget(QWidget):
         current_data = None
         
         if self.stats_mode == "current_year":
-            # Get current year stats
+            # Get current year stats - only use the requested level (no fallback)
             current_year = "2025"
             stats_key = "tour_seasons" if show_tour_level else "challenger_seasons"
             
-            if stats_key not in player_data:
+            if stats_key not in player_data or not player_data[stats_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
-                painter.drawText(x_offset + 5, y_offset + 40, "No data")
+                level_text = "tour" if show_tour_level else "challenger"
+                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} data")
                 return
                 
             # Find current year data
             for season in player_data[stats_key]:
-                if hasattr(season, 'year') and season.year == current_year:
+                if isinstance(season, dict) and season.get('year') == current_year:
                     current_data = season
                     break
                     
         elif self.stats_mode == "career":
-            # Debug: Print available keys
-            print(f"Debug - player_data keys: {list(player_data.keys()) if player_data else 'None'}")
-            
-            # Get career splits data 
+            # Get career splits data - only use the requested level (no fallback)
             splits_key = "career_splits" if show_tour_level else "career_splits_chall"
             
-            if splits_key not in player_data:
-                print(f"Debug - Missing key: {splits_key}")
+            if splits_key not in player_data or not player_data[splits_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
-                painter.drawText(x_offset + 5, y_offset + 40, "No career data")
+                level_text = "tour" if show_tour_level else "challenger"
+                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} career data")
                 return
-            
-            print(f"Debug - {splits_key} data: {player_data[splits_key][:2] if player_data[splits_key] else 'Empty'}")
                 
             # Find the specific split type
             for split_data in player_data[splits_key]:
@@ -2213,18 +2224,14 @@ class CompactStatsWidget(QWidget):
                     break
                     
         elif self.stats_mode == "last52":
-            # Get last 52 weeks splits data with fallback for old data structure
-            if show_tour_level:
-                # Try new structure first, fallback to old
-                splits_key = "last52_splits" if "last52_splits" in player_data else None
-            else:
-                # Try new challenger structure first, fallback to old
-                splits_key = "last52_splits_chall" if "last52_splits_chall" in player_data else "last52_splits"
+            # Get last 52 weeks splits data - only use the requested level (no fallback)
+            splits_key = "last52_splits" if show_tour_level else "last52_splits_chall"
             
-            if not splits_key or splits_key not in player_data:
+            if splits_key not in player_data or not player_data[splits_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
-                painter.drawText(x_offset + 5, y_offset + 40, "No last52 data")
+                level_text = "tour" if show_tour_level else "challenger"
+                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} last52 data")
                 return
                 
             # Find the specific split type
