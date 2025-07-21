@@ -55,3 +55,6 @@ OddsAPI/betr_dumps/
 OddsAPI/savedata/
 OddsAPI/*.json
 OddsAPI/TTT_savedata/
+
+# too big for github
+libQt6WebEngineCore.so.6.9.1

@@ -1,0 +1,116 @@
+LIBRARY OVERRIDES - Qt WebEngine System Integration Fix
+=========================================================
+
+Date: 2025-07-21
+Issue: ImportError: undefined symbol: av_stream_get_first_dts, version LIBAVFORMAT_61
+Solution: Override .venv libraries with system libraries to resolve version mismatches
+
+OVERRIDDEN LIBRARIES:
+=====================
+
+1. QT6 WEBENGINE LIBRARIES (PySide6):
+   - ./PySide6/Qt/lib/libQt6WebEngineCore.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineCore.so.6
+     → Backup: ./PySide6/Qt/lib/libQt6WebEngineCore.so.6.backup
+
+   - ./PySide6/Qt/lib/libQt6WebEngineQuick.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineQuick.so.6
+     → Backup: ./PySide6/Qt/lib/libQt6WebEngineQuick.so.6.backup
+
+   - ./PySide6/Qt/lib/libQt6WebEngineWidgets.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineWidgets.so.6
+     → Backup: ./PySide6/Qt/lib/libQt6WebEngineWidgets.so.6.backup
+
+   - ./PySide6/Qt/lib/libQt6WebEngineQuickDelegatesQml.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineQuickDelegatesQml.so.6
+     → Backup: ./PySide6/Qt/lib/libQt6WebEngineQuickDelegatesQml.so.6.backup
+
+2. QT6 WEBENGINE LIBRARIES (PyQt6):
+   - ./PyQt6/Qt6/lib/libQt6WebEngineCore.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineCore.so.6
+     → Backup: ./PyQt6/Qt6/lib/libQt6WebEngineCore.so.6.backup
+
+   - ./PyQt6/Qt6/lib/libQt6WebEngineQuick.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineQuick.so.6
+     → Backup: ./PyQt6/Qt6/lib/libQt6WebEngineQuick.so.6.backup
+
+   - ./PyQt6/Qt6/lib/libQt6WebEngineWidgets.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineWidgets.so.6
+     → Backup: ./PyQt6/Qt6/lib/libQt6WebEngineWidgets.so.6.backup
+
+   - ./PyQt6/Qt6/lib/libQt6WebEngineQuickDelegatesQml.so.6
+     → Symlinked to: /usr/lib/libQt6WebEngineQuickDelegatesQml.so.6
+     → Backup: ./PyQt6/Qt6/lib/libQt6WebEngineQuickDelegatesQml.so.6.backup
+
+3. FFMPEG LIBRARIES (PySide6):
+   - ./PySide6/Qt/lib/libavformat.so.61.7.100
+     → Symlinked to: /usr/lib/libavformat.so.61.7.100
+     → Backup: ./PySide6/Qt/lib/libavformat.so.61.7.100.backup
+
+   - ./PySide6/Qt/lib/libavformat.so.61
+     → Symlinked to: /usr/lib/libavformat.so.61
+     → Backup: ./PySide6/Qt/lib/libavformat.so.61.backup
+
+   - ./PySide6/Qt/lib/libavformat.so
+     → Symlinked to: /usr/lib/libavformat.so
+     → Backup: ./PySide6/Qt/lib/libavformat.so.backup
+
+   - ./PySide6/Qt/lib/libavcodec.so.61.19.101
+     → Symlinked to: /usr/lib/libavcodec.so.61.19.101
+     → Backup: ./PySide6/Qt/lib/libavcodec.so.61.19.101.backup
+
+   - ./PySide6/Qt/lib/libavcodec.so.61
+     → Symlinked to: /usr/lib/libavcodec.so.61
+     → Backup: ./PySide6/Qt/lib/libavcodec.so.61.backup
+
+   - ./PySide6/Qt/lib/libavcodec.so
+     → Symlinked to: /usr/lib/libavcodec.so
+     → Backup: ./PySide6/Qt/lib/libavcodec.so.backup
+
+   - ./PySide6/Qt/lib/libavutil.so.59.39.100
+     → Symlinked to: /usr/lib/libavutil.so.59.39.100
+     → Backup: ./PySide6/Qt/lib/libavutil.so.59.39.100.backup
+
+   - ./PySide6/Qt/lib/libavutil.so.59
+     → Symlinked to: /usr/lib/libavutil.so.59
+     → Backup: ./PySide6/Qt/lib/libavutil.so.59.backup
+
+   - ./PySide6/Qt/lib/libavutil.so
+     → Symlinked to: /usr/lib/libavutil.so
+     → Backup: ./PySide6/Qt/lib/libavutil.so.backup
+
+4. FFMPEG LIBRARIES (PyQt6):
+   - ./PyQt6/Qt6/lib/libavformat.so.61
+     → Symlinked to: /usr/lib/libavformat.so.61
+     → Backup: ./PyQt6/Qt6/lib/libavformat.so.61.backup
+
+   - ./PyQt6/Qt6/lib/libavcodec.so.61
+     → Symlinked to: /usr/lib/libavcodec.so.61
+     → Backup: ./PyQt6/Qt6/lib/libavcodec.so.61.backup
+
+   - ./PyQt6/Qt6/lib/libavutil.so.59
+     → Symlinked to: /usr/lib/libavutil.so.59
+     → Backup: ./PyQt6/Qt6/lib/libavutil.so.59.backup
+
+SYSTEM LIBRARY VERSIONS:
+========================
+- Qt6 WebEngine: 6.9.1
+- FFmpeg libavformat: 61.7.100
+- FFmpeg libavcodec: 61.19.101
+- FFmpeg libavutil: 59.39.100
+
+TOTAL OVERRIDES: 21 libraries
+- Qt6 WebEngine libraries: 8 (4 PySide6 + 4 PyQt6)
+- FFmpeg libraries: 13 (9 PySide6 + 3 PyQt6 + 1 duplicate)
+
+NOTES:
+======
+- All original libraries backed up with .backup extension
+- Symlinks point to system libraries to ensure version compatibility
+- This resolves av_stream_get_first_dts symbol mismatch between Qt WebEngine and FFmpeg
+- System libraries are maintained by package manager ensuring compatibility
+
+REVERTING (if needed):
+======================
+To revert any library, remove the symlink and restore from backup:
+rm ./path/to/library.so && mv ./path/to/library.so.backup ./path/to/library.so
