@@ -231,7 +231,7 @@ class HistoricalSurfaceTableWidget(QWidget):
         self.player2_yearly_stats = {}
         self.player1_name = ""
         self.player2_name = ""
-        self.setFixedSize(600, 240)  # Reduced width for more compact layout
+        self.setFixedSize(600, 280)  # Height increased to match stats widget
         self.setStyleSheet(f"""
             HistoricalSurfaceTableWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -296,10 +296,10 @@ class HistoricalSurfaceTableWidget(QWidget):
             sorted_years = sorted([year for year in yearly_stats.keys() if year != "Year Total"], reverse=True)
             
             row_y = y + header_height
-            row_height = 22
+            row_height = 20  # Slightly reduced for better space utilization
             
-            # Data rows
-            for i, year in enumerate(sorted_years[:8]):  # Show last 8 years
+            # Data rows - show more years with increased height
+            for i, year in enumerate(sorted_years[:10]):  # Show last 10 years
                 if i % 2 == 0:
                     painter.fillRect(x_offset, row_y, width, row_height, QColor("#252B3A"))
                 else:
@@ -311,7 +311,7 @@ class HistoricalSurfaceTableWidget(QWidget):
                 painter.setFont(QFont("Arial", 9))
                 
                 # Year
-                painter.drawText(x_offset + 5, row_y + 15, year)
+                painter.drawText(x_offset + 5, row_y + 14, year)
                 
                 # Data columns
                 data_values = [
@@ -340,7 +340,7 @@ class HistoricalSurfaceTableWidget(QWidget):
                     else:
                         painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                     
-                    painter.drawText(x_pos, row_y + 15, value)
+                    painter.drawText(x_pos, row_y + 14, value)
                     x_pos += col_width
                 
                 row_y += row_height
@@ -372,7 +372,7 @@ class HistoricalSurfaceTableWidget(QWidget):
                 
                 x_pos = x_offset + 50
                 for value, col_width in zip(total_values, col_widths[1:]):
-                    painter.drawText(x_pos, row_y + 15, value)
+                    painter.drawText(x_pos, row_y + 14, value)
                     x_pos += col_width
 
 class CompactRankingChart(QWidget):
@@ -674,81 +674,7 @@ class CompactRankingChart(QWidget):
         distance = ((mouse_pos.x() - point.x()) ** 2 + (mouse_pos.y() - point.y()) ** 2) ** 0.5
         return distance <= hover_radius
     
-    def paintEvent(self, event):
-        """Custom paint for ranking chart with hover tooltips"""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Fill background
-        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
-        
-        # Draw legend at the top first
-        self._draw_legend(painter)
-        
-        # Chart area - adjusted margins for legend at top and X-axis labels at bottom
-        left_margin = 35  # More space for Y-axis labels
-        top_margin = 40   # Space for legend at top
-        bottom_margin = 35  # Space for X-axis date labels
-        right_margin = 20
-        chart_rect = self.rect().adjusted(left_margin, top_margin, -right_margin, -bottom_margin)
-        
-        if not self.player1_data and not self.player2_data:
-            # No data message
-            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(chart_rect, Qt.AlignmentFlag.AlignCenter, "Select players to view rankings")
-            return
-        
-        # Calculate scale
-        all_ranks = []
-        if self.player1_data:
-            all_ranks.extend([rank for _, rank, _, _ in self.player1_data])
-        if self.player2_data:
-            all_ranks.extend([rank for _, rank, _, _ in self.player2_data])
-            
-        if not all_ranks:
-            return
-            
-        min_rank = min(all_ranks)
-        max_rank = max(all_ranks)
-        rank_range = max_rank - min_rank
-        
-        # Add padding to range
-        padding = max(1, rank_range * 0.1)
-        min_rank = max(1, min_rank - padding)
-        max_rank = max_rank + padding
-        
-        # Draw grid lines
-        painter.setPen(QPen(QColor("#2A3441"), 1))
-        grid_lines = 4
-        for i in range(grid_lines + 1):
-            y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
-            painter.drawLine(chart_rect.left(), int(y), chart_rect.right(), int(y))
-        
-        # Draw Player 1
-        if self.player1_data:
-            self._draw_player_line(painter, self.player1_data, chart_rect, min_rank, max_rank, 
-                                 TennisTheme.PRIMARY, self.player1_name)
-        
-        # Draw Player 2  
-        if self.player2_data:
-            self._draw_player_line(painter, self.player2_data, chart_rect, min_rank, max_rank,
-                                 TennisTheme.ACCENT, self.player2_name)
-        
-        # Draw Y-axis labels (rankings) - better positioning
-        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-        painter.setFont(QFont("Arial", 10))
-        for i in range(grid_lines + 1):
-            rank = min_rank + (max_rank - min_rank) * (i / grid_lines)
-            y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
-            painter.drawText(5, int(y - 7), 30, 14, Qt.AlignmentFlag.AlignCenter, f"#{int(rank)}")
-        
-        # Draw X-axis date labels
-        self._draw_x_axis_dates(painter, chart_rect)
-        
-        # Draw hover tooltip if there's a hovered point
-        if self.hover_point:
-            self._draw_tooltip(painter)
+    
     
     def _draw_tooltip(self, painter):
         """Draw hover tooltip for data points"""
@@ -1235,10 +1161,10 @@ class PlayerProfileWidget(QWidget):
     
     # Signals
     dataUpdated = pyqtSignal(str)  # player_name
-    tacticsDataLoaded = pyqtSignal(str, list)  # player_name, tactics_data
     surfaceStatsLoaded = pyqtSignal(str, object, int)  # player_name, SurfaceStats, player_num
     yearlyStatsLoaded = pyqtSignal(str, dict, int)  # player_name, yearly_stats_dict, player_num
     rawPlayerDataLoaded = pyqtSignal(str, object, int)  # player_name, raw_player_data, player_num
+    recentResultsLoaded = pyqtSignal(str, list, int)  # player_name, recent_results_list, player_num
     
     def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
@@ -1317,7 +1243,7 @@ class PlayerProfileWidget(QWidget):
         """)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(12, 12, 12, 4)  # Reduced bottom margin to decrease spacing
         layout.setSpacing(8)
         
         # Header with player name and recent form
@@ -1467,9 +1393,6 @@ class PlayerProfileWidget(QWidget):
                         pass
                     
                         
-                    # Emit tactics data if available
-                    if hasattr(player_data, 'tactics') and player_data.tactics:
-                        self.tacticsDataLoaded.emit(self.player_name, player_data.tactics)
                     
                     # Emit raw player data for stats widget
                     if hasattr(player_data, '__dict__'):
@@ -1481,6 +1404,10 @@ class PlayerProfileWidget(QWidget):
                             print(f"Error converting player data to dict: {e}")
                             # Fallback to __dict__ if asdict fails
                             self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
+                    
+                    # Emit recent results for form/momentum widget
+                    if hasattr(player_data, 'recent_results') and player_data.recent_results:
+                        self.recentResultsLoaded.emit(self.player_name, player_data.recent_results, self.player_num)
                 
                 # Get rankings from database for cases where Abstract data wasn't available
                 if not self.player_bio:
@@ -1750,145 +1677,6 @@ class PlayerProfileWidget(QWidget):
 
 
 
-class TacticsTableWidget(QWidget):
-    """Dual-table widget displaying tactics data for both players"""
-    
-    def __init__(self):
-        super().__init__()
-        self.player1_tactics = []
-        self.player2_tactics = []
-        self.player1_name = ""
-        self.player2_name = ""
-        self.setup_ui()
-        
-    def setup_ui(self):
-        """Setup the tactics table UI"""
-        self.setFixedSize(950, 450)  # Reduced width to prevent extending off screen
-        self.setStyleSheet(f"""
-            TacticsTableWidget {{
-                background: {TennisTheme.CARD_BACKGROUND};
-                border: 2px solid {TennisTheme.SURFACE};
-                border-radius: 12px;
-            }}
-        """)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(0)  # No spacing between tables
-        
-        # Title
-        title_label = QLabel("Player Tactics Comparison")
-        title_label.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-        title_label.setStyleSheet(f"color: {TennisTheme.TEXT_PRIMARY}; margin-bottom: 4px;")
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        # Create stacked tables for each player
-        self.player1_table = self.create_player_tactics_table(self.player1_name, TennisTheme.PRIMARY)
-        self.player2_table = self.create_player_tactics_table(self.player2_name, TennisTheme.ACCENT)
-        
-        layout.addWidget(title_label)
-        layout.addWidget(self.player1_table)
-        layout.addWidget(self.player2_table)
-        
-    def create_player_tactics_table(self, player_name: str, color: str) -> QTableWidget:
-        """Create a tactics table for one player"""
-        # Create table directly without container
-        table = QTableWidget()
-        
-        # Define all tactics columns
-        headers = [
-            "Match", "Result", "SnV Freq", "SnV W%", "Net Freq", "Net W%",
-            "FH Wnr%", "DTL Wnr%", "IO Wnr%", "BH Wnr%", "DTL Wnr%", 
-            "Drop Freq", "Drop W%", "Rally Agg", "Return Agg"
-        ]
-        
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setFixedSize(900, 180)  # Reduced width to fit within container
-        
-        # Style table with player color
-        table.setStyleSheet(f"""
-            QTableWidget {{
-                background: {TennisTheme.SURFACE};
-                border: 2px solid {color};
-                gridline-color: {TennisTheme.TEXT_MUTED};
-                color: {TennisTheme.TEXT_PRIMARY};
-                font-size: 9px;
-            }}
-            QHeaderView::section {{
-                background: {color};
-                color: white;
-                font-weight: bold;
-                padding: 4px;
-                border: 1px solid {TennisTheme.TEXT_MUTED};
-                font-size: 9px;
-            }}
-            QTableWidget::item {{
-                padding: 2px 4px;
-                border-bottom: 1px solid {TennisTheme.TEXT_MUTED};
-            }}
-            QScrollBar:vertical {{
-                background: {TennisTheme.SURFACE};
-                width: 12px;
-                border: 1px solid {TennisTheme.TEXT_MUTED};
-            }}
-            QScrollBar::handle:vertical {{
-                background: {color};
-                border-radius: 6px;
-            }}
-        """)
-        
-        # Configure table
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        table.verticalHeader().setVisible(False)
-        table.setAlternatingRowColors(True)
-        table.setSortingEnabled(True)
-        
-        return table
-        
-    def update_tactics_data(self, player_num: int, tactics_data: List[TacticsData], player_name: str):
-        """Update tactics data for a player"""
-        if player_num == 1:
-            self.player1_tactics = tactics_data
-            self.player1_name = player_name
-            self.populate_player_table(self.player1_table, tactics_data)
-        else:
-            self.player2_tactics = tactics_data
-            self.player2_name = player_name
-            self.populate_player_table(self.player2_table, tactics_data)
-            
-    def populate_player_table(self, table: QTableWidget, tactics_data: List[TacticsData]):
-        """Populate individual player table with tactics data"""
-        if not tactics_data:
-            table.setRowCount(1)
-            table.setItem(0, 0, QTableWidgetItem("No data available"))
-            return
-            
-        # Filter out career totals and get individual matches
-        match_data = [data for data in tactics_data if "Career" not in data.match]
-        
-        # Sort by most recent first
-        match_data.sort(key=lambda x: x.match, reverse=True)
-        
-        table.setRowCount(len(match_data))
-        
-        for row, data in enumerate(match_data):
-            # Populate all columns
-            table.setItem(row, 0, QTableWidgetItem(data.match))
-            table.setItem(row, 1, QTableWidgetItem(data.result))
-            table.setItem(row, 2, QTableWidgetItem(data.snv_freq))
-            table.setItem(row, 3, QTableWidgetItem(data.snv_w_pct))
-            table.setItem(row, 4, QTableWidgetItem(data.net_freq))
-            table.setItem(row, 5, QTableWidgetItem(data.net_w_pct))
-            table.setItem(row, 6, QTableWidgetItem(data.fh_wnr_pct))
-            table.setItem(row, 7, QTableWidgetItem(data.dtl_wnr_pct))
-            table.setItem(row, 8, QTableWidgetItem(data.io_wnr_pct))
-            table.setItem(row, 9, QTableWidgetItem(data.bh_wnr_pct))
-            table.setItem(row, 10, QTableWidgetItem(data.dtl_wnr_pct_bh))
-            table.setItem(row, 11, QTableWidgetItem(data.drop_freq))
-            table.setItem(row, 12, QTableWidgetItem(data.drop_wnr_pct))
-            table.setItem(row, 13, QTableWidgetItem(data.rally_agg))
-            table.setItem(row, 14, QTableWidgetItem(data.return_agg))
 
 
 class CompactStatsWidget(QWidget):
@@ -2263,6 +2051,8 @@ class CompactStatsWidget(QWidget):
             ("Hld%", get_stat_value(current_data, "hold_percentage", "0%")),
             ("Brk%", get_stat_value(current_data, "break_percentage", "0%")),
             ("SPW%", get_stat_value(current_data, "service_points_won", "0%")),
+            ("1st%", get_stat_value(current_data, "first_serve_in", "0%")),
+            ("2nd%", get_stat_value(current_data, "second_serve_won", "0%")),
             ("DF%", get_stat_value(current_data, "double_fault_rate", "0%")),
             ("RPW%", get_stat_value(current_data, "return_points_won", "0%")),
             ("DR", get_stat_value(current_data, "dominance_ratio", "0.0"))
@@ -2292,7 +2082,7 @@ class CompactStatsWidget(QWidget):
                 # Color code percentages
                 try:
                     pct_value = float(value.replace('%', ''))
-                    if label in ["Set%", "Game%", "Hld%", "Brk%", "SPW%", "RPW%"]:
+                    if label in ["Set%", "Game%", "Hld%", "Brk%", "SPW%", "1st%", "2nd%", "RPW%"]:
                         if pct_value >= 50:
                             painter.setPen(QColor("#4CAF50"))  # Green for good
                         elif pct_value >= 40:
@@ -2315,6 +2105,514 @@ class CompactStatsWidget(QWidget):
             painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             painter.drawText(x_offset + 55, y_pos, 80, 20, Qt.AlignmentFlag.AlignRight, value)
             painter.setFont(QFont("Arial", 10))
+
+
+class RecentFormMomentumWidget(QWidget):
+    """Recent form and momentum widget with rolling averages graph"""
+    
+    def __init__(self):
+        super().__init__()
+        self.player1_recent_results = []
+        self.player2_recent_results = []
+        self.player1_name = ""
+        self.player2_name = ""
+        self.current_metric = "first_serve_in"  # Default metric
+        self.current_surface = "All"  # Default surface filter
+        self.setFixedSize(950, 450)  # Matching the removed tactics widget space
+        self.setStyleSheet(f"""
+            RecentFormMomentumWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 2px solid {TennisTheme.SURFACE};
+                border-radius: 12px;
+            }}
+        """)
+        
+        # Create dropdown controls
+        self.create_controls()
+        
+    def create_controls(self):
+        """Create metric and surface filter dropdown controls"""
+        from PyQt6.QtWidgets import QComboBox, QLabel
+        
+        # Metric selector
+        self.metric_combo = QComboBox(self)
+        self.metric_combo.addItems([
+            "1st Serve %", "Dominance Ratio", "Ace %", "Double Fault %", 
+            "1st Serve Won %", "2nd Serve Won %", "Break Points Saved %"
+        ])
+        self.metric_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 4px;
+                min-width: 120px;
+            }}
+        """)
+        self.metric_combo.currentTextChanged.connect(self.on_metric_changed)
+        self.metric_combo.setGeometry(80, 45, 130, 25)
+        
+        # Surface filter
+        self.surface_combo = QComboBox(self)
+        self.surface_combo.addItems(["All", "Hard", "Clay", "Grass", "Carpet"])
+        self.surface_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 4px;
+                min-width: 80px;
+            }}
+        """)
+        self.surface_combo.currentTextChanged.connect(self.on_surface_changed)
+        self.surface_combo.setGeometry(280, 45, 90, 25)
+        
+    def on_metric_changed(self, text):
+        """Handle metric selection change"""
+        metric_mapping = {
+            "1st Serve %": "first_serve_in",
+            "Dominance Ratio": "dominance_ratio", 
+            "Ace %": "ace_rate",
+            "Double Fault %": "double_fault_rate",
+            "1st Serve Won %": "first_serve_won",
+            "2nd Serve Won %": "second_serve_won",
+            "Break Points Saved %": "break_points_saved"
+        }
+        self.current_metric = metric_mapping.get(text, "first_serve_in")
+        self.update()
+        
+    def on_surface_changed(self, text):
+        """Handle surface filter change"""
+        self.current_surface = text
+        self.update()
+        
+    def filter_by_surface(self, recent_results):
+        """Filter results by selected surface"""
+        if self.current_surface == "All":
+            return recent_results
+        return [result for result in recent_results if result.surface == self.current_surface]
+        
+    def update_player_results(self, player_name: str, recent_results: list, player_num: int):
+        """Update recent results for a player"""
+        # Filter out matches with no underlying data
+        filtered_results = self.filter_valid_matches(recent_results)
+        
+        if player_num == 1:
+            self.player1_recent_results = filtered_results[:15]  # Last 15 valid matches
+            self.player1_name = player_name
+        else:
+            self.player2_recent_results = filtered_results[:15]  # Last 15 valid matches
+            self.player2_name = player_name
+        self.update()
+        
+    def filter_valid_matches(self, recent_results: list) -> list:
+        """Filter out matches that have no underlying statistical data"""
+        valid_matches = []
+        
+        for match in recent_results:
+            # Check if match has meaningful data
+            if self.has_valid_match_data(match):
+                valid_matches.append(match)
+                
+        return valid_matches
+        
+    def has_valid_match_data(self, match_result) -> bool:
+        """Check if a match result has valid underlying data"""
+        # Check for presence of key statistical fields
+        required_fields = ['opponent', 'score']
+        optional_stats = ['first_serve_in', 'ace_rate', 'double_fault_rate', 'dominance_ratio']
+        
+        # Must have basic match info
+        for field in required_fields:
+            if not hasattr(match_result, field) or not getattr(match_result, field):
+                return False
+                
+        # Check if score is meaningful (not empty or placeholder)
+        score = getattr(match_result, 'score', '')
+        if not score or score.strip() == '' or score.strip() == '--':
+            return False
+            
+        # Check if opponent field has meaningful data
+        opponent = getattr(match_result, 'opponent', '')
+        if not opponent or opponent.strip() == '' or opponent.strip() == '--':
+            return False
+            
+        # At least one statistical field should have data
+        has_stats = False
+        for stat in optional_stats:
+            if hasattr(match_result, stat):
+                value = getattr(match_result, stat)
+                if value and value.strip() != '' and value.strip() != '--':
+                    has_stats = True
+                    break
+                    
+        return has_stats
+        
+    def paintEvent(self, event):
+        """Custom paint for recent form and momentum display"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        
+        # Title
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title_rect = QRect(0, 10, self.width(), 30)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, "Recent Form & Momentum")
+        
+        # Draw labels for controls
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        painter.drawText(15, 60, "Metric:")
+        painter.drawText(220, 60, "Surface:")
+        
+        # Account for controls at top (70px height for controls)
+        controls_height = 75
+        content_y = controls_height
+        content_height = self.height() - controls_height - 10
+        
+        # Split into two main areas: Form summary (left) and Rolling averages graph (right)
+        form_area_width = 300
+        graph_area_width = self.width() - form_area_width - 20
+        
+        # Draw form summary area
+        self.draw_form_summary(painter, 10, content_y, form_area_width, content_height)
+        
+        # Draw rolling averages graph area
+        self.draw_rolling_averages_graph(painter, form_area_width + 20, content_y, graph_area_width, content_height)
+        
+    def draw_form_summary(self, painter, x, y, width, height):
+        """Draw recent form summary for both players"""
+        # Player 1 section
+        painter.setPen(QColor(TennisTheme.PRIMARY))
+        painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        player1_rect = QRect(x, y, width, 25)
+        painter.drawText(player1_rect, Qt.AlignmentFlag.AlignLeft, self.player1_name or "Player 1")
+        
+        # Player 1 form indicators
+        self.draw_player_form(painter, x, y + 30, width, 150, self.player1_recent_results, TennisTheme.PRIMARY)
+        
+        # Separator line
+        painter.setPen(QColor(TennisTheme.SURFACE))
+        painter.drawLine(x, y + 200, x + width, y + 200)
+        
+        # Player 2 section
+        painter.setPen(QColor(TennisTheme.ACCENT))
+        painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        player2_rect = QRect(x, y + 220, width, 25)
+        painter.drawText(player2_rect, Qt.AlignmentFlag.AlignLeft, self.player2_name or "Player 2")
+        
+        # Player 2 form indicators
+        self.draw_player_form(painter, x, y + 250, width, 150, self.player2_recent_results, TennisTheme.ACCENT)
+        
+    def draw_player_form(self, painter, x, y, width, height, recent_results, color):
+        """Draw form indicators for one player"""
+        if not recent_results:
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.setFont(QFont("Arial", 10))
+            painter.drawText(x, y + 20, "No recent results available")
+            return
+            
+        # Win/Loss streak visualization
+        form_y = y + 10
+        circle_size = 18
+        circle_spacing = 22
+        
+        painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        
+        # Show last 10 results as colored circles
+        results_to_show = recent_results[:10]
+        for i, result in enumerate(results_to_show):
+            circle_x = x + (i * circle_spacing)
+            
+            # Determine if win or loss from score
+            is_win = self.is_match_win(result)
+            
+            # Draw circle
+            if is_win:
+                painter.setBrush(QBrush(QColor("#31596F")))  # Green for wins
+                painter.setPen(QColor("#31596F"))
+            else:
+                painter.setBrush(QBrush(QColor("#FF6B6B")))  # Red for losses
+                painter.setPen(QColor("#FF6B6B"))
+                
+            painter.drawEllipse(circle_x, form_y, circle_size, circle_size)
+            
+            # Draw W/L in circle
+            painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+            text_rect = QRect(circle_x, form_y, circle_size, circle_size)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "W" if is_win else "L")
+        
+        # Recent stats summary
+        stats_y = form_y + 35
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 9))
+        
+        # Calculate recent form stats
+        wins = sum(1 for result in results_to_show if self.is_match_win(result))
+        total = len(results_to_show)
+        win_pct = (wins / total * 100) if total > 0 else 0
+        
+        # Stats display
+        stats_text = f"Last {total}: {wins}W-{total-wins}L ({win_pct:.1f}%)"
+        painter.drawText(x, stats_y, stats_text)
+        
+        # Comprehensive stats display (averaged from recent matches)
+        if recent_results and hasattr(recent_results[0], 'first_serve_in') and recent_results[0].first_serve_in:
+            filtered_results = self.filter_by_surface(results_to_show)
+            if filtered_results:
+                all_stats = self.calculate_comprehensive_stats(filtered_results)
+                stats_y_start = stats_y + 20
+                
+                painter.setFont(QFont("Arial", 8))
+                row_height = 12
+                
+                # First column of stats
+                col1_stats = [
+                    f"DR: {all_stats.get('dominance_ratio', 0):.2f}",
+                    f"1st Serve: {all_stats.get('first_serve_in', 0):.1f}%",
+                    f"Aces: {all_stats.get('ace_rate', 0):.1f}%",
+                    f"DF: {all_stats.get('double_fault_rate', 0):.1f}%"
+                ]
+                
+                for i, stat_text in enumerate(col1_stats):
+                    painter.drawText(x, stats_y_start + (i * row_height), stat_text)
+                
+                # Second column of stats
+                col2_x = x + 140
+                col2_stats = [
+                    f"1st Won: {all_stats.get('first_serve_won', 0):.1f}%",
+                    f"2nd Won: {all_stats.get('second_serve_won', 0):.1f}%", 
+                    f"BP Saved: {all_stats.get('break_points_saved', 0):.1f}%",
+                    f"Surface: {self.current_surface} ({len(filtered_results)})"
+                ]
+                
+                for i, stat_text in enumerate(col2_stats):
+                    painter.drawText(col2_x, stats_y_start + (i * row_height), stat_text)
+            
+    def draw_rolling_averages_graph(self, painter, x, y, width, height):
+        """Draw rolling averages graph for serve statistics"""
+        # Graph background - use card background to avoid green tint
+        painter.fillRect(x, y, width, height, QColor(TennisTheme.CARD_BACKGROUND))
+        
+        # Graph border
+        painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+        painter.drawRect(x, y, width, height)
+        
+        # Title
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        title_rect = QRect(x, y + 10, width, 20)
+        # Dynamic title based on selected metric
+        metric_titles = {
+            "first_serve_in": "1st Serve %",
+            "dominance_ratio": "Dominance Ratio", 
+            "ace_rate": "Ace %",
+            "double_fault_rate": "Double Fault %",
+            "first_serve_won": "1st Serve Won %",
+            "second_serve_won": "2nd Serve Won %",
+            "break_points_saved": "Break Points Saved %"
+        }
+        metric_title = metric_titles.get(self.current_metric, "1st Serve %")
+        surface_text = f" ({self.current_surface})" if self.current_surface != "All" else ""
+        title_text = f"{metric_title} - Rolling Averages (10-match){surface_text}"
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, title_text)
+        
+        # Graph area
+        graph_x = x + 40
+        graph_y = y + 40
+        graph_width = width - 80
+        graph_height = height - 80
+        
+        # Draw axes
+        painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        painter.drawLine(graph_x, graph_y + graph_height, graph_x + graph_width, graph_y + graph_height)  # X-axis
+        painter.drawLine(graph_x, graph_y, graph_x, graph_y + graph_height)  # Y-axis
+        
+        # Y-axis labels (0-100%)
+        painter.setFont(QFont("Arial", 8))
+        for i in range(0, 101, 25):
+            label_y = int(graph_y + graph_height - (i * graph_height / 100))
+            painter.drawText(graph_x - 30, label_y + 3, f"{i}%")
+            # Grid lines
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.drawLine(graph_x, int(label_y), graph_x + graph_width, int(label_y))
+            painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        
+        # Plot rolling averages for both players with current metric and surface filter
+        filtered_p1_results = self.filter_by_surface(self.player1_recent_results)
+        filtered_p2_results = self.filter_by_surface(self.player2_recent_results)
+        
+        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
+                                 filtered_p1_results, TennisTheme.PRIMARY, self.current_metric)
+        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
+                                 filtered_p2_results, TennisTheme.ACCENT, self.current_metric)
+        
+        # Legend
+        legend_y = y + height - 25
+        painter.setFont(QFont("Arial", 9))
+        
+        # Player 1 legend
+        painter.setPen(QColor(TennisTheme.PRIMARY))
+        painter.drawLine(x + 20, legend_y, x + 35, legend_y)
+        painter.drawText(x + 40, legend_y + 4, self.player1_name or "Player 1")
+        
+        # Player 2 legend
+        painter.setPen(QColor(TennisTheme.ACCENT))
+        painter.drawLine(x + 150, legend_y, x + 165, legend_y)
+        painter.drawText(x + 170, legend_y + 4, self.player2_name or "Player 2")
+        
+    def plot_rolling_average(self, painter, graph_x, graph_y, graph_width, graph_height, 
+                           recent_results, color, stat_key):
+        """Plot rolling average line for a specific statistic"""
+        if len(recent_results) < 10:  # Need at least 10 matches for rolling average
+            return
+            
+        painter.setPen(QColor(color))
+        
+        # Calculate rolling averages
+        rolling_avgs = []
+        for i in range(9, len(recent_results)):  # Start from 10th match
+            window = recent_results[i-9:i+1]  # 10-match window
+            avg = self.calculate_stat_average(window, stat_key)
+            if avg is not None:
+                rolling_avgs.append(avg)
+                
+        # Debug output
+        if rolling_avgs:
+            print(f"Rolling averages for {stat_key}: {rolling_avgs[:5]}...")  # First 5 values
+        
+        if not rolling_avgs:
+            return
+            
+        # Plot points and lines
+        points_count = len(rolling_avgs)
+        for i in range(points_count):
+            x_pos = int(graph_x + (i * graph_width / max(1, points_count - 1)))
+            y_pos = int(graph_y + graph_height - (rolling_avgs[i] * graph_height / 100))
+            
+            # Draw point
+            painter.drawEllipse(x_pos - 2, y_pos - 2, 4, 4)
+            
+            # Draw line to next point
+            if i < points_count - 1:
+                next_x = int(graph_x + ((i + 1) * graph_width / max(1, points_count - 1)))
+                next_y = int(graph_y + graph_height - (rolling_avgs[i + 1] * graph_height / 100))
+                painter.drawLine(x_pos, y_pos, next_x, next_y)
+                
+    def is_match_win(self, match_result):
+        """Determine if match result is a win based on opponent column data"""
+        if not hasattr(match_result, 'opponent') or not match_result.opponent:
+            return True  # Default assumption if no data
+        
+        opponent_str = match_result.opponent.strip()
+        
+        # Tennis Abstract format in opponent column shows: "Winner d. Loser"
+        # Examples:
+        # - "Juan Manuel Cerundolo [ARG] d. (1)Ruud" -> Cerundolo beat Ruud (current player lost)
+        # - "(1)Sinner d. (2)Carlos Alcaraz [ESP]" -> Sinner beat Alcaraz (current player won)
+        
+        if ' d. ' in opponent_str:
+            parts = opponent_str.split(' d. ')
+            if len(parts) == 2:
+                winner_part = parts[0].strip()
+                loser_part = parts[1].strip()
+                
+                # Check if current player (indicated by ranking in parentheses) is the winner
+                # Current player typically appears with their ranking like "(1)", "(15)", etc.
+                if winner_part.startswith('(') and ')' in winner_part:
+                    return True  # Current player won
+                elif loser_part.startswith('(') and ')' in loser_part:
+                    return False  # Current player lost
+                else:
+                    # If no clear ranking indicators, need to check the match structure
+                    # Tennis Abstract puts current player info in the loser position when they lose
+                    # Conservative approach: if ranking appears at end, player lost
+                    return False
+        
+        # No ' d. ' separator found - unclear format
+        return True  # Default assumption
+        
+    def extract_player_name(self, name_part):
+        """Extract clean player name from Tennis Abstract format"""
+        # Remove ranking numbers like (1), (15), etc.
+        import re
+        cleaned = re.sub(r'\(\d+\)', '', name_part)
+        # Remove country codes like [ESP], [ARG], etc.
+        cleaned = re.sub(r'\[[A-Z]{3}\]', '', cleaned)
+        return cleaned.strip()
+        
+    def calculate_comprehensive_stats(self, recent_results):
+        """Calculate comprehensive averaged statistics from recent results"""
+        stats = {
+            'dominance_ratio': 0.0,
+            'first_serve_in': 0.0,
+            'ace_rate': 0.0,
+            'double_fault_rate': 0.0,
+            'first_serve_won': 0.0,
+            'second_serve_won': 0.0,
+            'break_points_saved': 0.0
+        }
+        
+        # Counters for each stat type
+        counts = {key: 0 for key in stats.keys()}
+        totals = {key: 0.0 for key in stats.keys()}
+        
+        for result in recent_results:
+            try:
+                # Process each stat if available
+                stat_fields = {
+                    'dominance_ratio': 'dominance_ratio',
+                    'first_serve_in': 'first_serve_in', 
+                    'ace_rate': 'ace_rate',
+                    'double_fault_rate': 'double_fault_rate',
+                    'first_serve_won': 'first_serve_won',
+                    'second_serve_won': 'second_serve_won',
+                    'break_points_saved': 'break_points_saved'
+                }
+                
+                for stat_key, field_name in stat_fields.items():
+                    if hasattr(result, field_name):
+                        field_value = getattr(result, field_name)
+                        if field_value and field_value.strip() not in ['', '--']:
+                            # Handle dominance ratio (no % symbol)
+                            if stat_key == 'dominance_ratio':
+                                value = float(field_value)
+                            else:
+                                # Handle percentage values
+                                value = float(field_value.replace('%', ''))
+                            
+                            totals[stat_key] += value
+                            counts[stat_key] += 1
+                            
+            except (ValueError, AttributeError):
+                continue
+                
+        # Calculate averages only for stats with valid data
+        for stat_key in stats.keys():
+            if counts[stat_key] > 0:
+                stats[stat_key] = totals[stat_key] / counts[stat_key]
+            
+        return stats
+        
+    def calculate_stat_average(self, match_window, stat_key):
+        """Calculate average for a specific stat over a window of matches"""
+        values = []
+        for match in match_window:
+            try:
+                if hasattr(match, stat_key):
+                    value_str = getattr(match, stat_key)
+                    if value_str and value_str.strip() not in ['', '--', 'N/A']:
+                        value = float(value_str.replace('%', ''))
+                        # Sanity check for reasonable percentage values
+                        if 0 <= value <= 100:
+                            values.append(value)
+            except (ValueError, AttributeError):
+                continue
+                
+        return sum(values) / len(values) if values else None
 
 
 class CompactTennisComparisonWidget(QWidget):
@@ -2347,7 +2645,6 @@ class CompactTennisComparisonWidget(QWidget):
         top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
         top_left_layout.setContentsMargins(0, 0, 0, 0)
-        top_left_layout.setSpacing(8)  # Reduced spacing from 12 to 8
         
         # Search widget
         self.search_widget = CompactPlayerSearchWidget()
@@ -2387,9 +2684,9 @@ class CompactTennisComparisonWidget(QWidget):
         # Place top-left widget in grid position (0, 0)
         main_layout.addWidget(top_left_widget, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        # Top-right area: Tactics comparison tables
-        self.tactics_widget = TacticsTableWidget()
-        main_layout.addWidget(self.tactics_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # Top-right area: Recent Form & Momentum Widget
+        self.form_momentum_widget = RecentFormMomentumWidget()
+        main_layout.addWidget(self.form_momentum_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
         # Bottom area: Rankings chart
         main_layout.addWidget(self.ranking_chart, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -2400,9 +2697,6 @@ class CompactTennisComparisonWidget(QWidget):
         self.search_widget.player1Selected.connect(self.on_player1_selected)
         self.search_widget.player2Selected.connect(self.on_player2_selected)
         
-        # Connect tactics data signals
-        self.player1_widget.tacticsDataLoaded.connect(self.on_player1_tactics_loaded)
-        self.player2_widget.tacticsDataLoaded.connect(self.on_player2_tactics_loaded)
         
         # Connect surface stats signals
         self.player1_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
@@ -2415,6 +2709,10 @@ class CompactTennisComparisonWidget(QWidget):
         # Connect raw player data signals for stats widget
         self.player1_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
         self.player2_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
+        
+        # Connect recent results signals for form momentum widget
+        self.player1_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
+        self.player2_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
         
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
@@ -2432,13 +2730,6 @@ class CompactTennisComparisonWidget(QWidget):
         self.update_status()
         self.check_and_load_h2h()
         
-    def on_player1_tactics_loaded(self, player_name: str, tactics_data: list):
-        """Handle player 1 tactics data loaded"""
-        self.tactics_widget.update_tactics_data(1, tactics_data, player_name)
-        
-    def on_player2_tactics_loaded(self, player_name: str, tactics_data: list):
-        """Handle player 2 tactics data loaded"""
-        self.tactics_widget.update_tactics_data(2, tactics_data, player_name)
         
     def on_surface_stats_loaded(self, player_name: str, surface_stats, player_num: int):
         """Handle surface statistics loaded for either player"""
@@ -2452,6 +2743,10 @@ class CompactTennisComparisonWidget(QWidget):
     def on_raw_player_data_loaded(self, player_name: str, player_data: dict, player_num: int):
         """Handle raw player data loaded for stats widget"""
         self.stats_widget.update_player_data(player_name, player_data, player_num)
+        
+    def on_recent_results_loaded(self, player_name: str, recent_results: list, player_num: int):
+        """Handle recent results loaded for form momentum widget"""
+        self.form_momentum_widget.update_player_results(player_name, recent_results, player_num)
         
     def update_status(self):
         """Update status label"""
