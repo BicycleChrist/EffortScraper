@@ -1,24 +1,16 @@
 import sys
-import math
-import time
 import threading
 import sqlite3
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
-from datetime import datetime
-import traceback
-
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame, QGridLayout, QProgressBar, QSizePolicy, QLineEdit, QPushButton, QMenu, QListWidgetItem, QListWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPointF, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect
 from PyQt6.QtGui import (
-    QFont, QColor, QPainter, QPen, QBrush, QLinearGradient,
-    QRadialGradient, QPolygonF, QPainterPath, QAction
+    QFont, QColor, QPainter, QPen, QBrush
 )
-
 from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsData
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
 
@@ -521,6 +513,9 @@ class CompactRankingChart(QWidget):
         
         # Draw X-axis date labels
         self._draw_x_axis_dates(painter, chart_rect)
+        
+        # Draw tooltip if hovering over a point
+        self._draw_tooltip(painter)
         
     def _draw_player_line(self, painter, data, chart_rect, min_rank, max_rank, color, player_name):
         """Draw ranking line for a player with data points"""
@@ -2292,7 +2287,7 @@ class RecentFormMomentumWidget(QWidget):
         painter.drawText(player1_rect, Qt.AlignmentFlag.AlignLeft, self.player1_name or "Player 1")
         
         # Player 1 form indicators
-        self.draw_player_form(painter, x, y + 30, width, 150, self.player1_recent_results, TennisTheme.PRIMARY)
+        self.draw_player_form(painter, x, y + 30, width, 150, self.player1_recent_results, TennisTheme.PRIMARY, self.player1_name)
         
         # Separator line
         painter.setPen(QColor(TennisTheme.SURFACE))
@@ -2305,9 +2300,9 @@ class RecentFormMomentumWidget(QWidget):
         painter.drawText(player2_rect, Qt.AlignmentFlag.AlignLeft, self.player2_name or "Player 2")
         
         # Player 2 form indicators
-        self.draw_player_form(painter, x, y + 250, width, 150, self.player2_recent_results, TennisTheme.ACCENT)
+        self.draw_player_form(painter, x, y + 250, width, 150, self.player2_recent_results, TennisTheme.ACCENT, self.player2_name)
         
-    def draw_player_form(self, painter, x, y, width, height, recent_results, color):
+    def draw_player_form(self, painter, x, y, width, height, recent_results, color, player_name):
         """Draw form indicators for one player"""
         if not recent_results:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
@@ -2327,16 +2322,16 @@ class RecentFormMomentumWidget(QWidget):
         for i, result in enumerate(results_to_show):
             circle_x = x + (i * circle_spacing)
             
-            # Determine if win or loss from score
-            is_win = self.is_match_win(result)
+            # Determine if win or loss from score - pass player name
+            is_win = self.is_match_win(result, player_name)
             
             # Draw circle
             if is_win:
                 painter.setBrush(QBrush(QColor("#31596F")))  # Green for wins
                 painter.setPen(QColor("#31596F"))
             else:
-                painter.setBrush(QBrush(QColor("#FF6B6B")))  # Red for losses
-                painter.setPen(QColor("#FF6B6B"))
+                painter.setBrush(QBrush(QColor("#651b1b")))  # Red for losses
+                painter.setPen(QColor("#651b1b"))
                 
             painter.drawEllipse(circle_x, form_y, circle_size, circle_size)
             
@@ -2350,8 +2345,8 @@ class RecentFormMomentumWidget(QWidget):
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 9))
         
-        # Calculate recent form stats
-        wins = sum(1 for result in results_to_show if self.is_match_win(result))
+        # Calculate recent form stats - pass player name
+        wins = sum(1 for result in results_to_show if self.is_match_win(result, player_name))
         total = len(results_to_show)
         win_pct = (wins / total * 100) if total > 0 else 0
         
@@ -2431,24 +2426,39 @@ class RecentFormMomentumWidget(QWidget):
         painter.drawLine(graph_x, graph_y + graph_height, graph_x + graph_width, graph_y + graph_height)  # X-axis
         painter.drawLine(graph_x, graph_y, graph_x, graph_y + graph_height)  # Y-axis
         
-        # Y-axis labels (0-100%)
+        # Get filtered results for axis calculations
+        filtered_p1_results = self.filter_by_surface(self.player1_recent_results)
+        filtered_p2_results = self.filter_by_surface(self.player2_recent_results)
+        
+        # Dynamic Y-axis based on metric type and data range
+        if self.current_metric == "dominance_ratio":
+            # For DR, use a different scale (typically 0.5 to 2.0)
+            min_val, max_val, step = self.calculate_dr_axis_range(filtered_p1_results, filtered_p2_results)
+            y_format = "{:.1f}"
+        else:
+            # For percentages, calculate dynamic range based on actual data
+            min_val, max_val, step = self.calculate_percentage_axis_range(filtered_p1_results, filtered_p2_results)
+            y_format = "{:.0f}%"
+        
+        # Y-axis labels with dynamic range
         painter.setFont(QFont("Arial", 8))
-        for i in range(0, 101, 25):
-            label_y = int(graph_y + graph_height - (i * graph_height / 100))
-            painter.drawText(graph_x - 30, label_y + 3, f"{i}%")
+        num_labels = int((max_val - min_val) / step) + 1
+        for i in range(num_labels):
+            value = min_val + (i * step)
+            normalized_pos = (value - min_val) / (max_val - min_val) if max_val > min_val else 0
+            label_y = int(graph_y + graph_height - (normalized_pos * graph_height))
+            
+            painter.drawText(graph_x - 35, label_y + 3, y_format.format(value))
             # Grid lines
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.drawLine(graph_x, int(label_y), graph_x + graph_width, int(label_y))
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         
         # Plot rolling averages for both players with current metric and surface filter
-        filtered_p1_results = self.filter_by_surface(self.player1_recent_results)
-        filtered_p2_results = self.filter_by_surface(self.player2_recent_results)
-        
         self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
-                                 filtered_p1_results, TennisTheme.PRIMARY, self.current_metric)
+                                 filtered_p1_results, TennisTheme.PRIMARY, self.current_metric, min_val, max_val)
         self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
-                                 filtered_p2_results, TennisTheme.ACCENT, self.current_metric)
+                                 filtered_p2_results, TennisTheme.ACCENT, self.current_metric, min_val, max_val)
         
         # Legend
         legend_y = y + height - 25
@@ -2465,8 +2475,8 @@ class RecentFormMomentumWidget(QWidget):
         painter.drawText(x + 170, legend_y + 4, self.player2_name or "Player 2")
         
     def plot_rolling_average(self, painter, graph_x, graph_y, graph_width, graph_height, 
-                           recent_results, color, stat_key):
-        """Plot rolling average line for a specific statistic"""
+                           recent_results, color, stat_key, min_val, max_val):
+        """Plot rolling average line for a specific statistic with dynamic scaling"""
         if len(recent_results) < 10:  # Need at least 10 matches for rolling average
             return
             
@@ -2480,18 +2490,19 @@ class RecentFormMomentumWidget(QWidget):
             if avg is not None:
                 rolling_avgs.append(avg)
                 
-        # Debug output
-        if rolling_avgs:
-            print(f"Rolling averages for {stat_key}: {rolling_avgs[:5]}...")  # First 5 values
-        
         if not rolling_avgs:
             return
             
-        # Plot points and lines
+        # Plot points and lines with dynamic scaling
         points_count = len(rolling_avgs)
+        value_range = max_val - min_val if max_val > min_val else 1
+        
         for i in range(points_count):
             x_pos = int(graph_x + (i * graph_width / max(1, points_count - 1)))
-            y_pos = int(graph_y + graph_height - (rolling_avgs[i] * graph_height / 100))
+            
+            # Use dynamic scaling instead of fixed 0-100%
+            normalized_value = (rolling_avgs[i] - min_val) / value_range
+            y_pos = int(graph_y + graph_height - (normalized_value * graph_height))
             
             # Draw point
             painter.drawEllipse(x_pos - 2, y_pos - 2, 4, 4)
@@ -2499,20 +2510,26 @@ class RecentFormMomentumWidget(QWidget):
             # Draw line to next point
             if i < points_count - 1:
                 next_x = int(graph_x + ((i + 1) * graph_width / max(1, points_count - 1)))
-                next_y = int(graph_y + graph_height - (rolling_avgs[i + 1] * graph_height / 100))
+                next_normalized = (rolling_avgs[i + 1] - min_val) / value_range
+                next_y = int(graph_y + graph_height - (next_normalized * graph_height))
                 painter.drawLine(x_pos, y_pos, next_x, next_y)
                 
-    def is_match_win(self, match_result):
+    def is_match_win(self, match_result, player_name=None):
         """Determine if match result is a win based on opponent column data"""
         if not hasattr(match_result, 'opponent') or not match_result.opponent:
             return True  # Default assumption if no data
         
         opponent_str = match_result.opponent.strip()
         
-        # Tennis Abstract format in opponent column shows: "Winner d. Loser"
-        # Examples:
-        # - "Juan Manuel Cerundolo [ARG] d. (1)Ruud" -> Cerundolo beat Ruud (current player lost)
-        # - "(1)Sinner d. (2)Carlos Alcaraz [ESP]" -> Sinner beat Alcaraz (current player won)
+        # Skip incomplete matches (using "vs" instead of "d.")
+        if ' vs ' in opponent_str:
+            return True  # Default for incomplete matches
+        
+        # Tennis Abstract format: "Winner d. Loser"
+        # Current player appears with name like "(1)PlayerName", "(14)PlayerName", etc.
+        # Examples from actual data:
+        # WINS: "(1)Rublev d. Emilio Nava [USA]", "(14)Rublev d. Lloyd Harris [RSA]"
+        # LOSSES: "(7)Aleksandar Kovacevic [USA] d. (1)Rublev", "(2)Carlos Alcaraz [ESP] d. (14)Rublev"
         
         if ' d. ' in opponent_str:
             parts = opponent_str.split(' d. ')
@@ -2520,29 +2537,40 @@ class RecentFormMomentumWidget(QWidget):
                 winner_part = parts[0].strip()
                 loser_part = parts[1].strip()
                 
-                # Check if current player (indicated by ranking in parentheses) is the winner
-                # Current player typically appears with their ranking like "(1)", "(15)", etc.
-                if winner_part.startswith('(') and ')' in winner_part:
-                    return True  # Current player won
-                elif loser_part.startswith('(') and ')' in loser_part:
-                    return False  # Current player lost
+                # Extract last name from full player name (e.g., "Andrey Rublev" -> "Rublev")
+                if player_name:
+                    # Get the last name from full name
+                    last_name = player_name.split()[-1] if ' ' in player_name else player_name
                 else:
-                    # If no clear ranking indicators, need to check the match structure
-                    # Tennis Abstract puts current player info in the loser position when they lose
-                    # Conservative approach: if ranking appears at end, player lost
-                    return False
+                    # Try to extract player name from the context (fallback)
+                    # Look for pattern like "(ranking)Name" and extract the name
+                    import re
+                    match = re.search(r'\([^)]+\)([A-Za-z]+)', opponent_str)
+                    if match:
+                        last_name = match.group(1)
+                    else:
+                        # Fallback: check if winner starts with ranking
+                        return winner_part.startswith('(')
+                
+                # Look specifically for the current player's last name with ranking prefix
+                import re
+                current_player_pattern = rf'\([^)]+\){re.escape(last_name)}'
+                
+                # Check if current player appears in winner or loser part
+                winner_has_current_player = bool(re.search(current_player_pattern, winner_part))
+                loser_has_current_player = bool(re.search(current_player_pattern, loser_part))
+                
+                if winner_has_current_player and not loser_has_current_player:
+                    return True  # Current player won (appears in winner position)
+                elif loser_has_current_player and not winner_has_current_player:
+                    return False  # Current player lost (appears in loser position)
+                else:
+                    # Fallback: check if winner part starts with ranking
+                    return winner_part.startswith('(')
         
-        # No ' d. ' separator found - unclear format
+        # No ' d. ' separator found - unclear format  
         return True  # Default assumption
         
-    def extract_player_name(self, name_part):
-        """Extract clean player name from Tennis Abstract format"""
-        # Remove ranking numbers like (1), (15), etc.
-        import re
-        cleaned = re.sub(r'\(\d+\)', '', name_part)
-        # Remove country codes like [ESP], [ARG], etc.
-        cleaned = re.sub(r'\[[A-Z]{3}\]', '', cleaned)
-        return cleaned.strip()
         
     def calculate_comprehensive_stats(self, recent_results):
         """Calculate comprehensive averaged statistics from recent results"""
@@ -2596,6 +2624,64 @@ class RecentFormMomentumWidget(QWidget):
                 stats[stat_key] = totals[stat_key] / counts[stat_key]
             
         return stats
+        
+    def calculate_dr_axis_range(self, p1_results, p2_results):
+        """Calculate appropriate axis range for Dominance Ratio"""
+        all_values = []
+        
+        # Collect all DR values from both players
+        for results in [p1_results, p2_results]:
+            if len(results) >= 10:
+                for i in range(9, len(results)):
+                    window = results[i-9:i+1]
+                    avg = self.calculate_stat_average(window, "dominance_ratio")
+                    if avg is not None:
+                        all_values.append(avg)
+        
+        if not all_values:
+            return 0.5, 2.0, 0.25  # Default DR range
+            
+        min_val = max(0.5, min(all_values) - 0.1)
+        max_val = min(2.5, max(all_values) + 0.1)
+        
+        # Round to nice values
+        min_val = round(min_val * 4) / 4  # Round to nearest 0.25
+        max_val = round(max_val * 4) / 4
+        
+        step = 0.25
+        return min_val, max_val, step
+        
+    def calculate_percentage_axis_range(self, p1_results, p2_results):
+        """Calculate appropriate axis range for percentage metrics"""
+        all_values = []
+        
+        # Collect all values from both players
+        for results in [p1_results, p2_results]:
+            if len(results) >= 10:
+                for i in range(9, len(results)):
+                    window = results[i-9:i+1]
+                    avg = self.calculate_stat_average(window, self.current_metric)
+                    if avg is not None:
+                        all_values.append(avg)
+        
+        if not all_values:
+            return 0, 100, 25  # Default percentage range
+            
+        min_val = max(0, min(all_values) - 5)
+        max_val = min(100, max(all_values) + 5)
+        
+        # Round to nice values
+        min_val = round(min_val / 10) * 10
+        max_val = round(max_val / 10) * 10
+        
+        # Ensure reasonable range
+        if max_val - min_val < 20:
+            center = (min_val + max_val) / 2
+            min_val = max(0, center - 15)
+            max_val = min(100, center + 15)
+        
+        step = 10 if max_val - min_val > 40 else 5
+        return min_val, max_val, step
         
     def calculate_stat_average(self, match_window, stat_key):
         """Calculate average for a specific stat over a window of matches"""
