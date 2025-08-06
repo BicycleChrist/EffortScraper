@@ -30,7 +30,7 @@ class TennisTheme:
     CLAY_COURT = "#D84315"
     GRASS_COURT = "#388E3C"
     INDOOR_COURT = "#9C27B0"  # Purple for indoor
-    
+    f
     # Text Colors
     TEXT_PRIMARY = "#FFFFFF"
     TEXT_SECONDARY = "#B0BEC5"
@@ -2714,7 +2714,7 @@ class CompactTennisComparisonWidget(QWidget):
         
     def setup_ui(self):
         """Setup the complete comparison interface"""
-        self.setWindowTitle("Compact Tennis Player Comparison")
+        self.setWindowTitle("Effort H2H Tennis Analyzer")
         self.setGeometry(100, 100, 1900, 800)  # Optimized size for stacked tables
         self.setMinimumSize(1400, 600)  # Set minimum size for proper functionality
         self.setStyleSheet(f"background: {TennisTheme.BACKGROUND};")
