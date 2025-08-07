@@ -1164,6 +1164,7 @@ class PlayerProfileWidget(QWidget):
     yearlyStatsLoaded = pyqtSignal(str, dict, int)  # player_name, yearly_stats_dict, player_num
     rawPlayerDataLoaded = pyqtSignal(str, object, int)  # player_name, raw_player_data, player_num
     recentResultsLoaded = pyqtSignal(str, list, int)  # player_name, recent_results_list, player_num
+    historicalMatchesLoaded = pyqtSignal(str, list, int)  # player_name, historical_matches_list, player_num
     
     def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
@@ -1407,6 +1408,10 @@ class PlayerProfileWidget(QWidget):
                     # Emit recent results for form/momentum widget
                     if hasattr(player_data, 'recent_results') and player_data.recent_results:
                         self.recentResultsLoaded.emit(self.player_name, player_data.recent_results, self.player_num)
+                    
+                    # Emit historical matches for enhanced momentum analysis
+                    if hasattr(player_data, 'historical_matches') and player_data.historical_matches:
+                        self.historicalMatchesLoaded.emit(self.player_name, player_data.historical_matches, self.player_num)
                 
                 # Get rankings from database for cases where Abstract data wasn't available
                 if not self.player_bio:
@@ -2113,10 +2118,13 @@ class RecentFormMomentumWidget(QWidget):
         super().__init__()
         self.player1_recent_results = []
         self.player2_recent_results = []
+        self.player1_historical_data = []
+        self.player2_historical_data = []
         self.player1_name = ""
         self.player2_name = ""
         self.current_metric = "first_serve_in"  # Default metric
         self.current_surface = "All"  # Default surface filter
+        self.current_match_count = 10  # Default rolling average window
         self.setFixedSize(950, 450)  # Matching the removed tactics widget space
         self.setStyleSheet(f"""
             RecentFormMomentumWidget {{
@@ -2166,6 +2174,21 @@ class RecentFormMomentumWidget(QWidget):
         self.surface_combo.currentTextChanged.connect(self.on_surface_changed)
         self.surface_combo.setGeometry(280, 45, 90, 25)
         
+        # Match count selection dropdown
+        self.match_count_combo = QComboBox(self)
+        self.match_count_combo.addItems(["10", "25", "50", "All Career"])
+        self.match_count_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 4px;
+                min-width: 80px;
+            }}
+        """)
+        self.match_count_combo.currentTextChanged.connect(self.on_match_count_changed)
+        self.match_count_combo.setGeometry(380, 45, 90, 25)
+        
     def on_metric_changed(self, text):
         """Handle metric selection change"""
         metric_mapping = {
@@ -2183,6 +2206,14 @@ class RecentFormMomentumWidget(QWidget):
     def on_surface_changed(self, text):
         """Handle surface filter change"""
         self.current_surface = text
+        self.update()
+    
+    def on_match_count_changed(self, text):
+        """Handle match count selection change"""
+        if text == "All Career":
+            self.current_match_count = -1  # Use all available matches
+        else:
+            self.current_match_count = int(text)
         self.update()
         
     def filter_by_surface(self, recent_results):
@@ -2202,6 +2233,43 @@ class RecentFormMomentumWidget(QWidget):
         else:
             self.player2_recent_results = filtered_results[:15]  # Last 15 valid matches
             self.player2_name = player_name
+        self.update()
+    
+    def update_player_historical_data(self, player_name: str, historical_matches: list, player_num: int):
+        """Update historical matches for enhanced analysis"""
+        # Convert HistoricalMatchData to MatchResult format for compatibility
+        converted_matches = []
+        for match in historical_matches:
+            if hasattr(match, 'date') and match.date:
+                # Create MatchResult-compatible object from HistoricalMatchData
+                # Handle missing fields gracefully
+                converted_match = type('MatchResult', (), {
+                    'date': getattr(match, 'date', ''),
+                    'tournament': getattr(match, 'tournament', ''),
+                    'surface': getattr(match, 'surface', ''),
+                    'round': getattr(match, 'round', ''),
+                    'opponent': getattr(match, 'opponent', ''),
+                    'score': getattr(match, 'score', ''),
+                    'dominance_ratio': getattr(match, 'dominance_ratio', ''),
+                    'ace_rate': getattr(match, 'ace_rate', ''),
+                    'double_fault_rate': getattr(match, 'double_fault_rate', ''),
+                    'first_serve_in': getattr(match, 'first_serve_in', ''),
+                    'first_serve_won': getattr(match, 'first_serve_won', ''),
+                    'second_serve_won': getattr(match, 'second_serve_won', ''),
+                    'break_points_saved': getattr(match, 'break_points_saved', ''),
+                    'match_time': getattr(match, 'match_time', '')
+                })()
+                converted_matches.append(converted_match)
+        
+        # Use historical data if recent results are insufficient
+        if player_num == 1:
+            self.player1_historical_data = converted_matches[:50]  # Last 50 matches
+            if len(self.player1_recent_results) < 10:
+                self.player1_recent_results = converted_matches[:15]
+        else:
+            self.player2_historical_data = converted_matches[:50]  # Last 50 matches  
+            if len(self.player2_recent_results) < 10:
+                self.player2_recent_results = converted_matches[:15]
         self.update()
         
     def filter_valid_matches(self, recent_results: list) -> list:
@@ -2266,6 +2334,7 @@ class RecentFormMomentumWidget(QWidget):
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(15, 60, "Metric:")
         painter.drawText(220, 60, "Surface:")
+        painter.drawText(380, 60, "Matches:")
         
         # Account for controls at top (70px height for controls)
         controls_height = 75
@@ -2334,8 +2403,8 @@ class RecentFormMomentumWidget(QWidget):
                 painter.setBrush(QBrush(QColor("#31596F")))  # Green for wins
                 painter.setPen(QColor("#31596F"))
             else:
-                painter.setBrush(QBrush(QColor("#651b1b")))  # Red for losses
-                painter.setPen(QColor("#651b1b"))
+                painter.setBrush(QBrush(QColor("#6b3562")))  # Red for losses
+                painter.setPen(QColor("#6b3562"))
                 
             painter.drawEllipse(circle_x, form_y, circle_size, circle_size)
             
@@ -2416,7 +2485,7 @@ class RecentFormMomentumWidget(QWidget):
         }
         metric_title = metric_titles.get(self.current_metric, "1st Serve %")
         surface_text = f" ({self.current_surface})" if self.current_surface != "All" else ""
-        title_text = f"{metric_title} - Rolling Averages (10-match){surface_text}"
+        title_text = f"{metric_title} - Rolling Averages{surface_text}"
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, title_text)
         
         # Graph area
@@ -2430,9 +2499,12 @@ class RecentFormMomentumWidget(QWidget):
         painter.drawLine(graph_x, graph_y + graph_height, graph_x + graph_width, graph_y + graph_height)  # X-axis
         painter.drawLine(graph_x, graph_y, graph_x, graph_y + graph_height)  # Y-axis
         
-        # Get filtered results for axis calculations
-        filtered_p1_results = self.filter_by_surface(self.player1_recent_results)
-        filtered_p2_results = self.filter_by_surface(self.player2_recent_results)
+        # Get filtered results for axis calculations - use historical data when available
+        p1_data = self.player1_historical_data if len(self.player1_historical_data) > len(self.player1_recent_results) else self.player1_recent_results
+        p2_data = self.player2_historical_data if len(self.player2_historical_data) > len(self.player2_recent_results) else self.player2_recent_results
+        
+        filtered_p1_results = self.filter_by_surface(p1_data)
+        filtered_p2_results = self.filter_by_surface(p2_data)
         
         # Dynamic Y-axis based on metric type and data range
         if self.current_metric == "dominance_ratio":
@@ -2464,49 +2536,69 @@ class RecentFormMomentumWidget(QWidget):
         self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
                                  filtered_p2_results, TennisTheme.ACCENT, self.current_metric, min_val, max_val)
         
-        # Legend
+        # Legend and current values
         legend_y = y + height - 25
         painter.setFont(QFont("Arial", 9))
         
-        # Player 1 legend
+        # Calculate current rolling averages for display
+        p1_current = self.get_current_rolling_average(filtered_p1_results, self.current_metric)
+        p2_current = self.get_current_rolling_average(filtered_p2_results, self.current_metric)
+        
+        # Player 1 legend with current value box
         painter.setPen(QColor(TennisTheme.PRIMARY))
         painter.drawLine(x + 20, legend_y, x + 35, legend_y)
         painter.drawText(x + 40, legend_y + 4, self.player1_name or "Player 1")
         
-        # Player 2 legend
+        # Player 1 current value box
+        if p1_current is not None:
+            box_x = x + graph_width - 180
+            box_y = y + 30
+            self.draw_value_box(painter, box_x, box_y, p1_current, self.current_metric, TennisTheme.PRIMARY)
+        
+        # Player 2 legend with current value box
         painter.setPen(QColor(TennisTheme.ACCENT))
         painter.drawLine(x + 150, legend_y, x + 165, legend_y)
         painter.drawText(x + 170, legend_y + 4, self.player2_name or "Player 2")
         
+        # Player 2 current value box
+        if p2_current is not None:
+            box_x = x + graph_width - 180
+            box_y = y + 80
+            self.draw_value_box(painter, box_x, box_y, p2_current, self.current_metric, TennisTheme.ACCENT)
+        
     def plot_rolling_average(self, painter, graph_x, graph_y, graph_width, graph_height, 
                            recent_results, color, stat_key, min_val, max_val):
-        """Plot rolling average line for a specific statistic with dynamic scaling"""
-        if len(recent_results) < 10:  # Need at least 10 matches for rolling average
+        """Plot individual match statistics as connected line for trend analysis"""
+        if len(recent_results) < 2:
             return
             
         painter.setPen(QColor(color))
         
-        # Calculate rolling averages
-        rolling_avgs = []
-        for i in range(9, len(recent_results)):  # Start from 10th match
-            window = recent_results[i-9:i+1]  # 10-match window
-            avg = self.calculate_stat_average(window, stat_key)
-            if avg is not None:
-                rolling_avgs.append(avg)
-                
-        if not rolling_avgs:
+        # Get individual match values (not rolling averages)
+        match_values = []
+        matches_to_show = recent_results[:self.current_match_count] if self.current_match_count > 0 else recent_results
+        
+        for match in matches_to_show:
+            value = self.get_match_stat_value(match, stat_key)
+            if value is not None:
+                match_values.append(value)
+        
+        if len(match_values) < 2:
             return
             
-        # Plot points and lines with dynamic scaling
-        points_count = len(rolling_avgs)
+        # Plot individual match data points connected by lines
+        points_count = len(match_values)
         value_range = max_val - min_val if max_val > min_val else 1
         
         for i in range(points_count):
             x_pos = int(graph_x + (i * graph_width / max(1, points_count - 1)))
             
-            # Use dynamic scaling instead of fixed 0-100%
-            normalized_value = (rolling_avgs[i] - min_val) / value_range
+            # Use dynamic scaling with boundary clamping
+            normalized_value = max(0.0, min(1.0, (match_values[i] - min_val) / value_range))
             y_pos = int(graph_y + graph_height - (normalized_value * graph_height))
+            
+            # Ensure coordinates stay within graph bounds
+            y_pos = max(graph_y, min(graph_y + graph_height, y_pos))
             
             # Draw point
             painter.drawEllipse(x_pos - 2, y_pos - 2, 4, 4)
@@ -2514,9 +2606,41 @@ class RecentFormMomentumWidget(QWidget):
             # Draw line to next point
             if i < points_count - 1:
                 next_x = int(graph_x + ((i + 1) * graph_width / max(1, points_count - 1)))
-                next_normalized = (rolling_avgs[i + 1] - min_val) / value_range
+                next_normalized = max(0.0, min(1.0, (match_values[i + 1] - min_val) / value_range))
                 next_y = int(graph_y + graph_height - (next_normalized * graph_height))
+                next_y = max(graph_y, min(graph_y + graph_height, next_y))
                 painter.drawLine(x_pos, y_pos, next_x, next_y)
+    
+    def get_match_stat_value(self, match, stat_key):
+        """Get individual match statistic value"""
+        try:
+            if hasattr(match, stat_key):
+                value_str = getattr(match, stat_key)
+                if value_str and value_str.strip() not in ['', '--', 'N/A']:
+                    # Handle different stat types
+                    if stat_key == "break_points_saved":
+                        # Handle fraction format "7/14" -> percentage
+                        if '/' in value_str:
+                            parts = value_str.split('/')
+                            if len(parts) == 2 and parts[1] != '0':
+                                saved = float(parts[0])
+                                total = float(parts[1])
+                                return (saved / total) * 100
+                        else:
+                            return float(value_str.replace('%', ''))
+                    elif stat_key == "dominance_ratio":
+                        # Dominance ratio is not a percentage
+                        value = float(value_str)
+                        if 0.1 <= value <= 5.0:  # Reasonable DR range
+                            return value
+                    else:
+                        # Standard percentage values
+                        value = float(value_str.replace('%', ''))
+                        if 0 <= value <= 100:  # Reasonable percentage range
+                            return value
+        except (ValueError, AttributeError, ZeroDivisionError):
+            pass
+        return None
                 
     def is_match_win(self, match_result, player_name=None):
         """Determine if match result is a win based on opponent column data"""
@@ -2630,23 +2754,27 @@ class RecentFormMomentumWidget(QWidget):
         return stats
         
     def calculate_dr_axis_range(self, p1_results, p2_results):
-        """Calculate appropriate axis range for Dominance Ratio"""
+        """Calculate appropriate axis range for Dominance Ratio based on individual match values"""
         all_values = []
         
-        # Collect all DR values from both players
+        # Collect individual DR values from both players
         for results in [p1_results, p2_results]:
-            if len(results) >= 10:
-                for i in range(9, len(results)):
-                    window = results[i-9:i+1]
-                    avg = self.calculate_stat_average(window, "dominance_ratio")
-                    if avg is not None:
-                        all_values.append(avg)
+            matches_to_show = results[:self.current_match_count] if self.current_match_count > 0 else results
+            for match in matches_to_show:
+                value = self.get_match_stat_value(match, "dominance_ratio")
+                if value is not None:
+                    all_values.append(value)
         
         if not all_values:
             return 0.5, 2.0, 0.25  # Default DR range
             
-        min_val = max(0.5, min(all_values) - 0.1)
-        max_val = min(2.5, max(all_values) + 0.1)
+        # Add padding to ensure all data points are visible
+        data_min = min(all_values)
+        data_max = max(all_values)
+        range_padding = (data_max - data_min) * 0.1  # 10% padding
+        
+        min_val = max(0.1, data_min - max(0.1, range_padding))
+        max_val = min(5.0, data_max + max(0.1, range_padding))
         
         # Round to nice values
         min_val = round(min_val * 4) / 4  # Round to nearest 0.25
@@ -2656,23 +2784,27 @@ class RecentFormMomentumWidget(QWidget):
         return min_val, max_val, step
         
     def calculate_percentage_axis_range(self, p1_results, p2_results):
-        """Calculate appropriate axis range for percentage metrics"""
+        """Calculate appropriate axis range for percentage metrics based on individual match values"""
         all_values = []
         
-        # Collect all values from both players
+        # Collect individual match values from both players
         for results in [p1_results, p2_results]:
-            if len(results) >= 10:
-                for i in range(9, len(results)):
-                    window = results[i-9:i+1]
-                    avg = self.calculate_stat_average(window, self.current_metric)
-                    if avg is not None:
-                        all_values.append(avg)
+            matches_to_show = results[:self.current_match_count] if self.current_match_count > 0 else results
+            for match in matches_to_show:
+                value = self.get_match_stat_value(match, self.current_metric)
+                if value is not None:
+                    all_values.append(value)
         
         if not all_values:
             return 0, 100, 25  # Default percentage range
             
-        min_val = max(0, min(all_values) - 5)
-        max_val = min(100, max(all_values) + 5)
+        # Add padding to ensure all data points are visible
+        data_min = min(all_values)
+        data_max = max(all_values)
+        range_padding = (data_max - data_min) * 0.1  # 10% padding
+        
+        min_val = max(0, data_min - max(5, range_padding))
+        max_val = min(100, data_max + max(5, range_padding))
         
         # Round to nice values
         min_val = round(min_val / 10) * 10
@@ -2686,6 +2818,57 @@ class RecentFormMomentumWidget(QWidget):
         
         step = 10 if max_val - min_val > 40 else 5
         return min_val, max_val, step
+    
+    def get_current_rolling_average(self, recent_results, stat_key):
+        """Get the most recent rolling average for display"""
+        if not recent_results:
+            return None
+            
+        window_size = self.current_match_count if self.current_match_count > 0 else len(recent_results)
+        if len(recent_results) < window_size:
+            window_size = len(recent_results)
+            
+        # Get the most recent window
+        recent_window = recent_results[:window_size]
+        return self.calculate_stat_average(recent_window, stat_key)
+    
+    def draw_value_box(self, painter, x, y, value, metric_key, color):
+        """Draw a value display box in the graph"""
+        box_width = 120
+        box_height = 35
+        
+        # Draw box background with slight transparency effect
+        painter.fillRect(x, y, box_width, box_height, QColor(color).darker(150))
+        painter.setPen(QColor(color))
+        painter.drawRect(x, y, box_width, box_height)
+        
+        # Format value based on metric type
+        if metric_key == "dominance_ratio":
+            value_text = f"{value:.2f}"
+        else:
+            value_text = f"{value:.1f}%"
+        
+        # Draw metric label and value
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 8))
+        metric_display = self.get_metric_display_name(metric_key)
+        painter.drawText(x + 5, y + 12, metric_display)
+        
+        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        painter.drawText(x + 5, y + 28, value_text)
+    
+    def get_metric_display_name(self, metric_key):
+        """Get display name for metric"""
+        display_names = {
+            "first_serve_in": "1st Serve %",
+            "dominance_ratio": "Dom Ratio", 
+            "ace_rate": "Ace %",
+            "double_fault_rate": "DF %",
+            "first_serve_won": "1st Won %",
+            "second_serve_won": "2nd Won %",
+            "break_points_saved": "BP Saved %"
+        }
+        return display_names.get(metric_key, metric_key)
         
     def calculate_stat_average(self, match_window, stat_key):
         """Calculate average for a specific stat over a window of matches"""
@@ -2695,11 +2878,34 @@ class RecentFormMomentumWidget(QWidget):
                 if hasattr(match, stat_key):
                     value_str = getattr(match, stat_key)
                     if value_str and value_str.strip() not in ['', '--', 'N/A']:
-                        value = float(value_str.replace('%', ''))
-                        # Sanity check for reasonable percentage values
-                        if 0 <= value <= 100:
+                        # Handle different stat types
+                        if stat_key == "break_points_saved":
+                            # Handle fraction format "7/14" -> percentage
+                            if '/' in value_str:
+                                parts = value_str.split('/')
+                                if len(parts) == 2 and parts[1] != '0':
+                                    saved = float(parts[0])
+                                    total = float(parts[1])
+                                    value = (saved / total) * 100
+                                else:
+                                    continue
+                            else:
+                                value = float(value_str.replace('%', ''))
+                        elif stat_key == "dominance_ratio":
+                            # Dominance ratio is not a percentage
+                            value = float(value_str)
+                            if 0.1 <= value <= 5.0:  # Reasonable DR range
+                                values.append(value)
+                            continue
+                        else:
+                            # Standard percentage values
+                            value = float(value_str.replace('%', ''))
+                        
+                        # Sanity check for percentage values (not DR)
+                        if stat_key != "dominance_ratio" and 0 <= value <= 100:
                             values.append(value)
-            except (ValueError, AttributeError):
+                            
+            except (ValueError, AttributeError, ZeroDivisionError):
                 continue
                 
         return sum(values) / len(values) if values else None
@@ -2804,6 +3010,10 @@ class CompactTennisComparisonWidget(QWidget):
         self.player1_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
         self.player2_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
         
+        # Connect historical matches signals for enhanced momentum analysis
+        self.player1_widget.historicalMatchesLoaded.connect(self.on_historical_matches_loaded)
+        self.player2_widget.historicalMatchesLoaded.connect(self.on_historical_matches_loaded)
+        
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
         self.current_player1 = player_name
@@ -2837,6 +3047,10 @@ class CompactTennisComparisonWidget(QWidget):
     def on_recent_results_loaded(self, player_name: str, recent_results: list, player_num: int):
         """Handle recent results loaded for form momentum widget"""
         self.form_momentum_widget.update_player_results(player_name, recent_results, player_num)
+    
+    def on_historical_matches_loaded(self, player_name: str, historical_matches: list, player_num: int):
+        """Handle historical matches loaded for enhanced momentum analysis"""
+        self.form_momentum_widget.update_player_historical_data(player_name, historical_matches, player_num)
         
     def update_status(self):
         """Update status label"""
