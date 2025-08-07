@@ -30,7 +30,7 @@ class TennisTheme:
     CLAY_COURT = "#D84315"
     GRASS_COURT = "#388E3C"
     INDOOR_COURT = "#9C27B0"  # Purple for indoor
-    f
+
     # Text Colors
     TEXT_PRIMARY = "#FFFFFF"
     TEXT_SECONDARY = "#B0BEC5"
@@ -910,10 +910,14 @@ class CompactPlayerSearchWidget(QWidget):
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT DISTINCT player_name, MIN(rank) as best_rank
-                FROM rankings 
-                GROUP BY player_name 
-                ORDER BY best_rank
+                SELECT r1.player_name, r1.rank
+                FROM rankings r1
+                INNER JOIN (
+                    SELECT player_name, MAX(ranking_date) as latest_date
+                    FROM rankings 
+                    GROUP BY player_name
+                ) r2 ON r1.player_name = r2.player_name AND r1.ranking_date = r2.latest_date
+                ORDER BY r1.rank
             ''')
             self.players = [(name, rank) for name, rank in cursor.fetchall()]
             conn.close()
