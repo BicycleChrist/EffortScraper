@@ -108,28 +108,23 @@ class TennisScraper:
             return None
     
     def update_current_rankings(self):
-        """Check and update rankings if current week is missing from database."""
-        current_monday = self.get_current_monday()
+        """Check and update rankings using incremental scraping."""
         latest_db_date = self.get_latest_db_date()
         
         if latest_db_date is None:
             self.logger.info("No rankings data found, skipping automatic update")
             return
         
+        current_monday = self.get_current_monday()
+        
         # Check if we need to update
         if latest_db_date >= current_monday:
             self.logger.info(f"Rankings up to date (latest: {latest_db_date}, current week: {current_monday})")
             return
         
-        # Try to get current week's rankings
-        self.logger.info(f"Attempting to update rankings for current week: {current_monday}")
-        rankings_data = self.atp_scraper.scrape_rankings_for_date(current_monday)
-        
-        if rankings_data:
-            self.atp_scraper.save_rankings_to_db(rankings_data)
-            self.logger.info(f"✅ Updated rankings for {current_monday} ({len(rankings_data)} players)")
-        else:
-            self.logger.info(f"No rankings published yet for {current_monday}")
+        # Use incremental scraping to get current rankings
+        self.logger.info("Updating rankings using incremental scraping")
+        self.atp_scraper.scrape_incremental_data(delay_seconds=0.5)
     
     def create_h2h_url(self, player1_name: str, player2_name: str) -> str:
         """Create H2H URL from player names."""

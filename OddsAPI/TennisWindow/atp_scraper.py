@@ -55,6 +55,34 @@ class ATPRankingsScraper:
         conn.close()
         logger.info(f"Database initialized: {self.db_path}")
     
+    def get_latest_date_in_db(self) -> Optional[str]:
+        """Get the most recent ranking date in the database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX(ranking_date) FROM rankings')
+        result = cursor.fetchone()[0]
+        conn.close()
+        return result
+
+    def get_monday_dates_from_date(self, start_date_str: str) -> List[str]:
+        """Generate list of Monday dates from given start date to current."""
+        dates = []
+        today = datetime.now()
+        
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        next_monday = start_date + timedelta(days=7)
+        
+        days_ahead = 0 - next_monday.weekday()
+        if days_ahead != 0:
+            next_monday += timedelta(days=days_ahead)
+        
+        current_date = next_monday
+        while current_date <= today:
+            dates.append(current_date.strftime('%Y-%m-%d'))
+            current_date += timedelta(days=7)
+        
+        return dates
+
     def get_monday_dates_last_3_years(self) -> List[str]:
         """Generate list of Monday dates for last 3 years (ATP updates on Mondays)."""
         dates = []
@@ -85,11 +113,14 @@ class ATPRankingsScraper:
         conn.close()
         return count > 0
     
-    def scrape_rankings_for_date(self, date: str, max_players: int = 2000) -> List[Tuple]:
-        """Scrape ATP rankings for a specific date."""
-        # Convert date to ATP URL format
-        date_obj = datetime.strptime(date, '%Y-%m-%d')
-        url = f"https://www.atptour.com/en/rankings/singles?dateWeek={date}&rankRange=0-{max_players}"
+    def scrape_rankings_for_date(self, date: str, max_players: int = 5000, use_current: bool = False) -> List[Tuple]:
+        """Scrape ATP rankings for a specific date or current rankings."""
+        if use_current:
+            # Use base URL for most current rankings
+            url = f"https://www.atptour.com/en/rankings/singles?rankRange=0-{max_players}"
+        else:
+            # Use historical URL with specific date
+            url = f"https://www.atptour.com/en/rankings/singles?dateWeek={date}&rankRange=0-{max_players}"
         
         logger.info(f"Scraping rankings for {date}: {url}")
         
@@ -97,6 +128,12 @@ class ATPRankingsScraper:
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # If using current rankings, extract the actual date from the page
+            actual_date = date
+            if use_current:
+                actual_date = self._extract_ranking_date_from_page(soup) or date
+                logger.info(f"Extracted actual ranking date: {actual_date}")
             
             rankings_data = []
             ranking_rows = soup.find_all('tr')
@@ -154,7 +191,7 @@ class ATPRankingsScraper:
                                     pass
                     
                     if name and points > 0:
-                        rankings_data.append((date, rank_num, name, points, rank_change))
+                        rankings_data.append((actual_date, rank_num, name, points, rank_change))
                         
                         if len(rankings_data) >= max_players:
                             break
@@ -162,13 +199,36 @@ class ATPRankingsScraper:
                 except (ValueError, AttributeError) as e:
                     continue
             
-            logger.info(f"Scraped {len(rankings_data)} rankings for {date}")
+            logger.info(f"Scraped {len(rankings_data)} rankings for {actual_date}")
             return rankings_data
         
         except Exception as e:
             logger.error(f"Error scraping rankings for {date}: {e}")
             return []
     
+    def _extract_ranking_date_from_page(self, soup) -> Optional[str]:
+        """Extract the actual ranking date from the ATP rankings page."""
+        try:
+            # Look for date indicators in the page
+            date_elements = soup.find_all(text=re.compile(r'\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}'))
+            for element in date_elements:
+                # Try to parse common date formats
+                if re.search(r'\d{4}-\d{2}-\d{2}', element):
+                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', element)
+                    if date_match:
+                        return date_match.group(1)
+                elif re.search(r'\d{1,2}/\d{1,2}/\d{4}', element):
+                    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', element)
+                    if date_match:
+                        try:
+                            parsed_date = datetime.strptime(date_match.group(1), '%m/%d/%Y')
+                            return parsed_date.strftime('%Y-%m-%d')
+                        except ValueError:
+                            continue
+        except Exception:
+            pass
+        return None
+
     def save_rankings_to_db(self, rankings_data: List[Tuple]):
         """Save rankings data to the database."""
         if not rankings_data:
@@ -187,6 +247,46 @@ class ATPRankingsScraper:
         conn.close()
         logger.info(f"Saved {len(rankings_data)} rankings to database")
     
+    def scrape_incremental_data(self, delay_seconds: float = 1.0):
+        """Scrape rankings data from the most recent date in DB to current."""
+        latest_date = self.get_latest_date_in_db()
+        
+        if not latest_date:
+            logger.info("No existing data found, performing full historical scrape")
+            return self.scrape_all_historical_data(delay_seconds)
+        
+        dates = self.get_monday_dates_from_date(latest_date)
+        
+        if not dates:
+            logger.info("Database is already current - no new data to scrape")
+            return
+        
+        logger.info(f"Will scrape {len(dates)} weeks of new rankings data from {dates[0]} onwards")
+        
+        successful_scrapes = 0
+        # Determine current Monday for comparison
+        today = datetime.now()
+        days_since_monday = today.weekday()
+        current_monday = today - timedelta(days=days_since_monday)
+        current_monday_str = current_monday.strftime('%Y-%m-%d')
+        
+        for i, date in enumerate(dates):
+            # Use current rankings URL if this is the current week
+            use_current = (date == current_monday_str)
+            rankings_data = self.scrape_rankings_for_date(date, use_current=use_current)
+            
+            if rankings_data:
+                self.save_rankings_to_db(rankings_data)
+                successful_scrapes += 1
+                logger.info(f"✅ Completed {date} ({i+1}/{len(dates)})")
+            else:
+                logger.warning(f"❌ Failed to scrape {date} ({i+1}/{len(dates)})")
+            
+            if i < len(dates) - 1:
+                time.sleep(delay_seconds)
+        
+        logger.info(f"Incremental scraping completed! {successful_scrapes} successful")
+
     def scrape_all_historical_data(self, delay_seconds: float = 1.0):
         """Scrape all historical data for the last 3 years."""
         dates = self.get_monday_dates_last_3_years()
@@ -264,32 +364,39 @@ class ATPRankingsScraper:
         print(f"  Weeks of data: {weeks_of_data}")
 
 def main():
-    """Main function to run the historical scraper."""
+    """Main function to run the scraper with incremental or full mode."""
     scraper = ATPRankingsScraper()
     
-    print("🎾 ATP Historical Rankings Scraper")
-    print("This will scrape the last 3 years of ATP rankings data...")
-    
-    # Check current database state
+    print("🎾 ATP Rankings Scraper")
     scraper.get_database_stats()
     
-    # Ask user if they want to proceed
+    latest_date = scraper.get_latest_date_in_db()
+    if latest_date:
+        print(f"\nLatest data in DB: {latest_date}")
+        print("1. Incremental update (recommended)")
+        print("2. Full historical scrape")
+        choice = input("Select mode (1/2): ").strip()
+    else:
+        print("\nNo existing data found - will perform full historical scrape")
+        choice = "2"
+    
     response = input("\nProceed with scraping? (y/n): ").lower().strip()
     if response != 'y':
         print("Scraping cancelled.")
         return
     
-    # Start scraping
     start_time = time.time()
-    scraper.scrape_all_historical_data(delay_seconds=1.5)  # Be nice to ATP servers
-    end_time = time.time()
     
+    if choice == "1":
+        scraper.scrape_incremental_data(delay_seconds=1.5)
+    else:
+        scraper.scrape_all_historical_data(delay_seconds=1.5)
+    
+    end_time = time.time()
     print(f"\n⏱️ Scraping completed in {end_time - start_time:.1f} seconds")
     
-    # Show final stats
     scraper.get_database_stats()
     
-    # Test with a sample player
     print("\n🧪 Testing with sample player data:")
     djokovic_history = scraper.get_player_ranking_history("Djokovic", limit=10)
     if djokovic_history:
