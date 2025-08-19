@@ -2,7 +2,6 @@ import requests
 from bs4 import BeautifulSoup
 import traceback
 
-
 def get_page(url) -> BeautifulSoup | None:
     """Fetch a web page and return a BeautifulSoup object, or None if the request fails."""
     try:
@@ -238,7 +237,7 @@ def get_todays_pitchers():
                             team_pitcher_map[pitcher_name] = {"team": team_name, "side": "home"}
                         else:
                             team_pitcher_map[pitcher_name] = {"team": team_name, "side": "unknown"}
-
+        
         print(f"Found {len(pitcher_names)} probable pitchers for today")
         return pitcher_names, team_pitcher_map
 
@@ -264,5 +263,4 @@ def get_weather_by_team_matchup():
     except Exception as e:
         print(f"Error extracting weather data: {e}")
         return {}
-
 

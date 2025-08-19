@@ -4,7 +4,49 @@ from py_clob_client.client import ClobClient
 from mmKEY import pmkey
 import pathlib
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
+
+def is_cache_fresh(cache_file="markets_cache.json", cache_hours=24):
+    """Check if markets cache is still fresh"""
+    try:
+        if not pathlib.Path(cache_file).exists():
+            return False
+        
+        with open(cache_file, 'r') as f:
+            cache_data = json.load(f)
+        
+        cache_time = datetime.fromisoformat(cache_data['timestamp'])
+        current_time = datetime.now(timezone.utc)
+        hours_old = (current_time - cache_time).total_seconds() / 3600
+        
+        return hours_old < cache_hours
+    except Exception as e:
+        print(f"Error checking cache freshness: {e}")
+        return False
+
+def load_cached_markets(cache_file="markets_cache.json"):
+    """Load markets from cache file"""
+    try:
+        with open(cache_file, 'r') as f:
+            cache_data = json.load(f)
+        return cache_data.get('markets', [])
+    except Exception as e:
+        print(f"Error loading cached markets: {e}")
+        return []
+
+def save_markets_cache(markets_list, cache_file="markets_cache.json", cache_hours=24):
+    """Save markets to cache with timestamp"""
+    try:
+        cache_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cache_duration_hours": cache_hours,
+            "markets": markets_list
+        }
+        with open(cache_file, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+        print(f"Saved {len(markets_list)} markets to cache")
+    except Exception as e:
+        print(f"Error saving markets cache: {e}")
 
 def get_market_volume_single(token_id):
     """Fetch volume data for a single token_id from Gamma API with optimized rate limiting"""
@@ -66,7 +108,7 @@ def get_market_volume_single(token_id):
     
     return {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0}
 
-def get_market_volume_batch(token_ids):
+def get_market_volume_batch(token_ids, cancellation_flag=None):
     """Fetch volume data with optimized rate limiting for maximum speed"""
     import concurrent.futures
     import time
@@ -90,6 +132,14 @@ def get_market_volume_batch(token_ids):
         # Submit with adaptive pacing - burst then throttle
         future_to_token = {}
         for i, token_id in enumerate(token_ids):
+            # Check for cancellation before submitting more requests
+            if cancellation_flag and cancellation_flag.get('should_stop', False):
+                print(f"🚫 Volume fetch cancelled after submitting {i} requests")
+                # Cancel any pending futures
+                for pending_future in future_to_token.keys():
+                    pending_future.cancel()
+                return {}
+            
             # Adaptive pacing: fast for first 100, then slower
             if i > 0 and i % max_workers == 0:
                 if i < 100:
@@ -107,6 +157,14 @@ def get_market_volume_batch(token_ids):
         successful = 0
         
         for future in concurrent.futures.as_completed(future_to_token):
+            # Check for cancellation during result collection
+            if cancellation_flag and cancellation_flag.get('should_stop', False):
+                print(f"🚫 Volume fetch cancelled during result collection (completed {completed}/{len(token_ids)})")
+                # Cancel remaining futures
+                for remaining_future in future_to_token.keys():
+                    remaining_future.cancel()
+                return volume_map  # Return partial results
+            
             token_id = future_to_token[future]
             try:
                 volume_data = future.result()
@@ -193,49 +251,55 @@ def FetchMarkets(next_cursor=None, recent_only=True):
     
     return markets_list
 
+def get_cached_or_fresh_markets(recent_only=True):
+    """Get markets from cache if fresh, otherwise fetch from API"""
+    if is_cache_fresh():
+        print("📋 Using cached markets (fresh)")
+        return load_cached_markets()
+    else:
+        print("🔄 Cache stale, fetching fresh markets from CLOB API")
+        markets_list = FetchMarkets(recent_only=recent_only)
+        save_markets_cache(markets_list)
+        return markets_list
 
-def FilterData(markets) -> list[dict]:
+
+def process_markets_metadata(markets) -> list[dict]:
+    """Process markets metadata without volume data"""
     wanted_fields = ("question", "description", "tokens", "question_id", "condition_id", "tags")
-    # there are always two tokens. https://docs.polymarket.com/#get-markets
-    # "outcome" is the line the token represents. Usually "Yes/No", but sometimes not.
-    # (which-party-will-win-the-2024-united-states-presidential-election: "Democratic"/"Republican")
-    # 'winner' will always be false for open markets
     active_markets = [market for market in markets if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
     print(f"Filtered to {len(active_markets)} active markets from {len(markets)} total markets")
-    markets = active_markets
+    
     filtered_data = [
         { field: market[field] for field in wanted_fields }
-        for market in markets
+        for market in active_markets
     ]
     
-    # Optimize volume queries - only query first 200 markets where volume is concentrated
-    volume_limit = min(200, len(filtered_data))
-    
-    all_token_ids = []
     for market in filtered_data:
         market["lines"] = [ token['outcome'] + ': ' + str(token['price']*100) + '%' for token in market["tokens"] ]
         market["token_ids"] = [token['token_id'] for token in market['tokens']]
-        # Only collect token IDs for volume query if in first 200 markets
-        if filtered_data.index(market) < volume_limit:
+        if market["tags"] is None: 
+            market["tags"] = []
+        del market["tokens"]
+    
+    return filtered_data
+
+def add_volume_data_to_markets(markets, volume_limit=200, cancellation_flag=None) -> list[dict]:
+    """Add fresh volume data to markets"""
+    all_token_ids = []
+    for i, market in enumerate(markets):
+        if i < volume_limit:
             all_token_ids.extend(market["token_ids"])
     
     print(f"Fetching volume data for {len(all_token_ids)} tokens from first {volume_limit} markets...")
-    volume_map = get_market_volume_batch(all_token_ids)
+    volume_map = get_market_volume_batch(all_token_ids, cancellation_flag=cancellation_flag)
     
-    print("Processing volume data for markets...")
-    print(f"Volume map keys: {list(volume_map.keys())[:5]}...")
-    
-    for i, market in enumerate(filtered_data):
-        # Get volume data for each token from the batch result
+    for i, market in enumerate(markets):
         volume_data = []
         total_volume = 0
         total_volume_24hr = 0
         total_liquidity = 0
         
-        # Only process volume data for markets in the volume_limit range
         if i < volume_limit:
-            print(f"Processing market {i}: {market['question'][:50]}...")
-            
             for token_id in market["token_ids"]:
                 vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
                 volume_data.append(vol_data)
@@ -243,23 +307,23 @@ def FilterData(markets) -> list[dict]:
                 total_volume_24hr += float(vol_data['volume_24hr']) if vol_data['volume_24hr'] else 0
                 total_liquidity += float(vol_data['liquidity']) if vol_data['liquidity'] else 0
         else:
-            # For markets beyond volume_limit, set zero volume (they likely have none anyway)
             volume_data = [{'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0} for _ in market["token_ids"]]
         
-        # Add volume fields to market data
         market["volume_data"] = volume_data
         market["total_volume"] = total_volume
         market["total_volume_24hr"] = total_volume_24hr
         market["total_liquidity"] = total_liquidity
-        
-        if market["tags"] is None: market["tags"] = []; # ensure 'tags' is always a list (handling case where it was null in JSON)
-        del market["tokens"]
     
-    # Sort markets by total volume (highest to lowest)
-    filtered_data.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
-    print(f"Sorted {len(filtered_data)} markets by volume (highest to lowest)")
+    # Sort by volume
+    markets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
+    print(f"Sorted {len(markets)} markets by volume (highest to lowest)")
     
-    return filtered_data
+    return markets
+
+def FilterData(markets) -> list[dict]:
+    """Legacy function for backward compatibility"""
+    processed_markets = process_markets_metadata(markets)
+    return add_volume_data_to_markets(processed_markets)
 
 def WriteJsonDump(data: list[dict], filename="PMdump"):
     with open((pathlib.Path.cwd() / f"{filename}.json"), "w") as json_file:
@@ -319,7 +383,41 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-def fetch_and_process_markets(recent_only=True):
+def fetch_and_process_markets(recent_only=True, cancellation_flag=None):
+    """Optimized version using 24hr cache for markets, fresh volume data every run"""
+    # Get markets (cached if fresh, otherwise fetch from API)
+    markets_list = get_cached_or_fresh_markets(recent_only=recent_only)
+    
+    # Check for cancellation
+    if cancellation_flag and cancellation_flag.get('should_stop', False):
+        print("🚫 Market fetch cancelled before processing")
+        return []
+    
+    # Process markets metadata (fast operation)
+    processed_markets = process_markets_metadata(markets_list)
+    
+    # Check for cancellation again
+    if cancellation_flag and cancellation_flag.get('should_stop', False):
+        print("🚫 Market fetch cancelled before volume data")
+        return []
+    
+    # Always fetch fresh volume data (this is what changes frequently)
+    print("💰 Fetching fresh volume data...")
+    final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
+    
+    # Check for cancellation before saving
+    if cancellation_flag and cancellation_flag.get('should_stop', False):
+        print("🚫 Market fetch cancelled before saving")
+        return []
+    
+    # Save results
+    WriteJsonDump(final_data)
+    WriteJsonDump(markets_list, "PMdump_all")
+    
+    return final_data
+
+def fetch_and_process_markets_legacy(recent_only=True):
+    """Original version without caching - kept for fallback"""
     markets_list = FetchMarkets(recent_only=recent_only)
     filtered_data = FilterData(markets_list)
     WriteJsonDump(filtered_data)

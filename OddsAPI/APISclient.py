@@ -713,7 +713,7 @@ class APISportsClient:
             print(f"{i}. {away_team} @ {home_team} ({league_name}) - Status: {game_status}")
 
 
-# Example usage (commented out to avoid token usage)
+# Needs more test woopty
 if __name__ == "__main__":
     client = APISportsClient()
     

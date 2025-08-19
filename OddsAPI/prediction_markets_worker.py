@@ -24,21 +24,60 @@ class PredictionMarketsWorker(QThread):
                 # Import and run polymarketquery in this thread
                 try:
                     from polymarketquery import fetch_and_process_markets
+                    import concurrent.futures
                     
-                    # Fetch and process markets (this takes ~40 seconds)
-                    markets_data = fetch_and_process_markets(recent_only=True)
+                    # Check if we should stop before starting the long operation
+                    if self.should_stop:
+                        break
                     
-                    if markets_data:
-                        # Format for tickertape display
-                        formatted_markets = self.format_for_tickertape(markets_data)
+                    # Create a shared cancellation flag
+                    cancellation_flag = {'should_stop': False}
+                    
+                    # Use ThreadPoolExecutor with timeout for better control
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        # Submit the task with cancellation flag
+                        future = executor.submit(fetch_and_process_markets, recent_only=True, cancellation_flag=cancellation_flag)
                         
-                        if formatted_markets:
-                            self.data_ready.emit(formatted_markets)
-                            self.status_update.emit(f"Loaded {len(formatted_markets)} prediction markets")
-                        else:
-                            self.status_update.emit("No markets with sufficient volume found")
-                    else:
-                        self.status_update.emit("No prediction market data received")
+                        try:
+                            # Wait for completion with timeout, checking stop flag frequently
+                            markets_data = None
+                            timeout_seconds = 50  # 50 second timeout
+                            check_interval = 1  # Check every second
+                            
+                            for i in range(timeout_seconds):
+                                if self.should_stop:
+                                    # Signal cancellation to the running operation
+                                    cancellation_flag['should_stop'] = True
+                                    print("🚫 Cancelling polymarket operation...")
+                                    future.cancel()  # Try to cancel
+                                    break
+                                
+                                try:
+                                    markets_data = future.result(timeout=check_interval)
+                                    break  # Got result
+                                except concurrent.futures.TimeoutError:
+                                    continue  # Keep waiting
+                            
+                            # Check again if we should stop after the operation
+                            if self.should_stop:
+                                break
+                            
+                            if markets_data:
+                                # Format for tickertape display
+                                formatted_markets = self.format_for_tickertape(markets_data)
+                                
+                                if formatted_markets and not self.should_stop:
+                                    self.data_ready.emit(formatted_markets)
+                                    self.status_update.emit(f"Loaded {len(formatted_markets)} prediction markets")
+                                else:
+                                    self.status_update.emit("No markets with sufficient volume found")
+                            else:
+                                if not self.should_stop:
+                                    self.status_update.emit("No prediction market data received")
+                                    
+                        except Exception as e:
+                            if not self.should_stop:
+                                self.error_occurred.emit(f"Error during market fetch: {e}")
                         
                 except ImportError as e:
                     self.error_occurred.emit(f"Failed to import pmapicall: {e}")
@@ -53,7 +92,12 @@ class PredictionMarketsWorker(QThread):
                     
             except Exception as e:
                 self.error_occurred.emit(f"Unexpected error in prediction markets worker: {e}")
-                time.sleep(30)  # Wait 30 seconds before retrying on error
+                # Shorter retry delay when stopping
+                retry_delay = 5 if self.should_stop else 30
+                for _ in range(retry_delay):
+                    if self.should_stop:
+                        break
+                    time.sleep(1)
     
     def format_for_tickertape(self, markets_data):
         """Format prediction market data for tickertape display"""
@@ -108,4 +152,8 @@ class PredictionMarketsWorker(QThread):
         """Signal the worker to stop gracefully"""
         self.should_stop = True
         self.quit()
-        self.wait()
+        # Don't wait indefinitely - give it 2 seconds max then force quit
+        if not self.wait(2000):  # 2 second timeout
+            print("Prediction markets worker didn't stop gracefully, terminating...")
+            self.terminate()
+            self.wait(1000)  # Wait up to 1 more second for termination

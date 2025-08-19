@@ -22,15 +22,19 @@ import pathlib # For icon
 
 
 class AsyncDataFetcher(QThread):
-    """Thread for running async data fetching without blocking the UI"""
+    """Thread for running async data fetching and ELO updates without blocking the UI"""
     
     # Qt signals for communication with main thread
     finished = pyqtSignal()
     error = pyqtSignal(str)
     status_update = pyqtSignal(str)
     
+    def __init__(self, include_elo_update=False):
+        super().__init__()
+        self.include_elo_update = include_elo_update
+    
     def run(self):
-        """Run the async data fetching in this thread"""
+        """Run the async data fetching and optionally ELO updates in this thread"""
         try:
             # Update status
             self.status_update.emit("Fetching data...")
@@ -43,6 +47,28 @@ class AsyncDataFetcher(QThread):
                 # Run the async fetch_data function
                 loop.run_until_complete(fetch_data())
                 self.status_update.emit("Data fetch completed")
+                
+                # If ELO update is requested, run it as well
+                if self.include_elo_update:
+                    self.status_update.emit("Updating ELO ratings...")
+                    
+                    # Import here to avoid circular imports
+                    from ttDB import TTDatabase
+                    from tt_elo import ELOCalculator
+                    
+                    # Run ELO update asynchronously
+                    db = TTDatabase()
+                    elo_calculator = ELOCalculator(db)
+                    matches_processed = loop.run_until_complete(
+                        elo_calculator.process_unprocessed_matches_async()
+                    )
+                    db.close()
+                    
+                    if matches_processed > 0:
+                        self.status_update.emit(f"ELO update completed: {matches_processed} matches processed")
+                    else:
+                        self.status_update.emit("ELO update completed: No new matches to process")
+                
                 self.finished.emit()
             finally:
                 loop.close()
@@ -925,9 +951,9 @@ class TableTennisGUI(QMainWindow):
         
         self.control_layout.addWidget(time_group)
         
-        # Refresh button
-        self.refresh_btn = QPushButton("Refresh Data")
-        self.refresh_btn.clicked.connect(self.refresh_data)
+        # Combined refresh and ELO update button
+        self.refresh_btn = QPushButton("Refresh Data & Update ELO")
+        self.refresh_btn.clicked.connect(self.refresh_data_and_elo)
         self.refresh_btn.setStyleSheet("background-color: #27ae60; padding: 8px;")
         self.control_layout.addWidget(self.refresh_btn)
         
@@ -941,12 +967,6 @@ class TableTennisGUI(QMainWindow):
         self.elo_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.elo_status_label.setStyleSheet("color: #f39c12; font-size: 10px;")
         self.control_layout.addWidget(self.elo_status_label)
-        
-        # ELO update button
-        self.elo_update_btn = QPushButton("Update ELO")
-        self.elo_update_btn.clicked.connect(self.update_elo_ratings)
-        self.elo_update_btn.setStyleSheet("background-color: #9b59b6; padding: 8px;")
-        self.control_layout.addWidget(self.elo_update_btn)
         
         # ELO Chart Section
         elo_chart_group = QGroupBox("Player ELO Progression")
@@ -1621,17 +1641,28 @@ class TableTennisGUI(QMainWindow):
                     pass
 
     def refresh_data(self):
-        """Refresh data by running the client script asynchronously"""
+        """Refresh data by running the client script asynchronously (data only)"""
+        self._start_data_fetch(include_elo=False)
+    
+    def refresh_data_and_elo(self):
+        """Refresh data and update ELO ratings asynchronously"""
+        self._start_data_fetch(include_elo=True)
+    
+    def _start_data_fetch(self, include_elo=False):
+        """Internal method to start data fetching with optional ELO update"""
         # Don't start new fetch if one is already running
         if self.data_fetcher and self.data_fetcher.isRunning():
             return
             
         # Disable the refresh button to prevent multiple simultaneous fetches
         self.refresh_btn.setEnabled(False)
-        self.refresh_btn.setText("Fetching...")
+        if include_elo:
+            self.refresh_btn.setText("Refreshing & Updating ELO...")
+        else:
+            self.refresh_btn.setText("Fetching...")
         
         # Create and configure the async data fetcher
-        self.data_fetcher = AsyncDataFetcher()
+        self.data_fetcher = AsyncDataFetcher(include_elo_update=include_elo)
         self.data_fetcher.finished.connect(self.on_data_fetch_finished)
         self.data_fetcher.error.connect(self.on_data_fetch_error)
         self.data_fetcher.status_update.connect(self.on_data_fetch_status)
@@ -1655,7 +1686,7 @@ class TableTennisGUI(QMainWindow):
         finally:
             # Re-enable the refresh button
             self.refresh_btn.setEnabled(True)
-            self.refresh_btn.setText("Refresh Data")
+            self.refresh_btn.setText("Refresh Data & Update ELO")
     
     def on_data_fetch_error(self, error_msg: str):
         """Called when async data fetch encounters an error"""
@@ -1664,7 +1695,7 @@ class TableTennisGUI(QMainWindow):
         
         # Re-enable the refresh button
         self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Refresh Data")
+        self.refresh_btn.setText("Refresh Data & Update ELO")
     
     def on_data_fetch_status(self, status_msg: str):
         """Called when async data fetch provides status updates"""
@@ -2287,11 +2318,9 @@ class TableTennisGUI(QMainWindow):
                 if unprocessed > 0:
                     self.elo_status_label.setText(f"ELO: {processed}/{total} ({percentage:.1f}%) - {unprocessed} pending")
                     self.elo_status_label.setStyleSheet("color: #f39c12; font-size: 10px;")  # Orange for pending
-                    self.elo_update_btn.setEnabled(True)
                 else:
                     self.elo_status_label.setText(f"ELO: {processed}/{total} (100%) - Up to date")
                     self.elo_status_label.setStyleSheet("color: #2ecc71; font-size: 10px;")  # Green for complete
-                    self.elo_update_btn.setEnabled(False)
             else:
                 self.elo_status_label.setText("ELO: Unknown")
                 self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")  # Red for error
@@ -2302,49 +2331,10 @@ class TableTennisGUI(QMainWindow):
             self.elo_status_label.setText("ELO: Error")
             self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")
 
-    def update_elo_ratings(self):
-        """Update ELO ratings for unprocessed matches"""
-        try:
-            self.elo_status_label.setText("ELO: Processing...")
-            self.elo_status_label.setStyleSheet("color: #3498db; font-size: 10px;")
-            self.elo_update_btn.setEnabled(False)
-            QApplication.processEvents()
-            
-            db = TTDatabase()
-            elo_calculator = ELOCalculator(db)
-            
-            # Get initial status
-            initial_status = elo_calculator.get_elo_processing_status()
-            unprocessed_count = initial_status.get('unprocessed_matches', 0)
-            
-            if unprocessed_count > 0:
-                print(f"Processing {unprocessed_count} unprocessed ELO matches...")
-                
-                # Process unprocessed matches
-                matches_processed = elo_calculator.process_unprocessed_matches()
-                
-                print(f"Successfully processed {matches_processed} matches for ELO calculation.")
-                
-                # Update status display
-                self.update_elo_status()
-                
-                # Show completion message in status
-                if matches_processed > 0:
-                    self.status_label.setText(f"ELO updated: {matches_processed} matches processed")
-                else:
-                    self.status_label.setText("ELO update: No new matches to process")
-            else:
-                self.status_label.setText("ELO update: All matches already processed")
-                self.update_elo_status()
-                
-            db.close()
-            
-        except Exception as e:
-            print(f"Error updating ELO ratings: {e}")
-            self.status_label.setText(f"ELO update error: {str(e)}")
-            self.elo_status_label.setText("ELO: Error")
-            self.elo_status_label.setStyleSheet("color: #e74c3c; font-size: 10px;")
-            self.elo_update_btn.setEnabled(True)
+    # Deprecated: ELO updates are now handled by the combined refresh_data_and_elo method
+    # def update_elo_ratings(self):
+    #     """Update ELO ratings for unprocessed matches - DEPRECATED"""
+    #     pass
 
     def get_player_elo_progression(self, player_name: str, league_id: int, limit: int = 25) -> list:
         """Get ELO progression data for a player"""

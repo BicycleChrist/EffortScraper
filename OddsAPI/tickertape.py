@@ -48,8 +48,11 @@ class TickerTape(QWidget):
         self.current_text = ""
         self.segment_width = 120  # Width of sport segment
         
+        #custom_font_name = "Z003-MediumItalic.otf"
+        custom_font_name = "URWBookman-DemiItalic.otf"
+        
         # this fuckaround is required to load a font from a file
-        font_id = QFontDatabase.addApplicationFont("custom_fonts/Z003-MediumItalic.otf")
+        font_id = QFontDatabase.addApplicationFont(f"custom_fonts/{custom_font_name}")
         _fontstr = QFontDatabase.applicationFontFamilies(font_id)[0]
         custom_font = QFont(_fontstr, 15)
         

@@ -12,11 +12,12 @@ from Creds import TT_KEY
 BASE_URL = "https://api.b365api.com"
 SPORT_ID = 92  # table tennis
 TARGET_LEAGUE_IDS = {
-    22307: "Setka Cup",
+    22307: "Setka Cup", # Current league key
     22742: "Czech Republic Liga Pro",
     22534: "TT CUP",
     24536: "Poland TT Elite Series",
 }
+# '38395','Setka Cup (2020): '38394', 'Setka Cup (2021): , 'Setka Cup (2022): '38396', 'Setka Cup (2023): '38397',   
 DEFAULT_BOOKMAKER = "bet365"
 TIME_WINDOW_HOURS = 6  # Only fetch events within next 6 hours
 

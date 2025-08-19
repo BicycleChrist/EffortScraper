@@ -567,6 +567,27 @@ class ELOCalculator:
             
         return stats
 
+    async def process_unprocessed_matches_async(self, league_id: Optional[int] = None, batch_size: int = 2000, limit: Optional[int] = None) -> int:
+        """
+        Async wrapper for process_unprocessed_matches that runs in a thread pool
+        to avoid blocking the UI.
+        
+        Args:
+            league_id: Optional league ID to filter matches
+            batch_size: Number of matches to process in each batch
+            limit: Optional limit on total matches to process
+            
+        Returns the number of matches processed.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, 
+            self.process_unprocessed_matches, 
+            league_id, 
+            batch_size, 
+            limit
+        )
+
     def sync_existing_elo_data(self) -> int:
         """
         Sync existing ELO history with the new tracking system.
