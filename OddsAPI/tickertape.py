@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import QWidget, QSizePolicy
 from PyQt6.QtCore import QRectF, QPointF
 from livetape_scraper import scrape_espn_scores 
 import threading
+import platform
 
 # Movie box office information that can be gathered as why the hell not (polymarket specific)
 
@@ -225,9 +226,16 @@ class TickerTape(QWidget):
     def paintEvent(self, event):
         """Paint the ESPN-style ticker with smooth animations"""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        
+        # Windows-specific performance optimization
+        if platform.system() == "Windows":
+            # Only use essential antialiasing on Windows
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        else:
+            # Full antialiasing on Linux/Mac
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         
         rect = self.rect()
         sport_info = self.get_current_sport_info()
