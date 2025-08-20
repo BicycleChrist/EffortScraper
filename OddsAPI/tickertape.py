@@ -119,6 +119,11 @@ class TickerTape(QWidget):
         # Live data functionality
         self.data_loaded = False
         
+        # Graphics caches - invalidated only when sport/size changes
+        self._cached_gradients = None
+        self._cached_sport_path = None
+        self._cache_key = None
+        
         # Load scores immediately, no delays
         QTimer.singleShot(500, self.load_live_scores)  # Load scores first
         
@@ -158,6 +163,9 @@ class TickerTape(QWidget):
             
         # Update cached width when text changes
         self.update_text_width()
+        # Invalidate graphics cache when sport changes
+        self._cached_gradients = None
+        self._cached_sport_path = None
         
     def update_text_width(self):
         """Cache the text width to avoid calculating it every frame"""
@@ -240,6 +248,12 @@ class TickerTape(QWidget):
         rect = self.rect()
         sport_info = self.get_current_sport_info()
         
+        # Cache graphics objects when sport or size changes
+        cache_key = (self.current_sport_index, rect.width(), rect.height())
+        if self._cache_key != cache_key or self._cached_gradients is None:
+            self._create_cached_graphics(rect, sport_info)
+            self._cache_key = cache_key
+        
         # Draw sophisticated background with sport-specific colors
         self.draw_background(painter, rect, sport_info)
         
@@ -252,24 +266,52 @@ class TickerTape(QWidget):
         # Draw accent elements and effects on top
         self.draw_accent_effects(painter, rect, sport_info)
         
+    def _create_cached_graphics(self, rect, sport_info):
+        """Create and cache gradients and paths"""
+        self._cached_gradients = {
+            'background': QLinearGradient(0, 0, rect.width(), 0),
+            'glow': QRadialGradient(self.segment_width/2, rect.height()/2, self.segment_width),
+            'top_accent': QLinearGradient(0, 0, rect.width(), 0),
+            'bottom_accent': QLinearGradient(0, rect.height()-3, rect.width(), rect.height()-3)
+        }
+        
+        # Background gradient
+        bg = self._cached_gradients['background']
+        bg.setColorAt(0, sport_info["color"])
+        bg.setColorAt(0.3, sport_info["color"].darker(150))
+        bg.setColorAt(0.6, QColor("#2C3E50"))
+        bg.setColorAt(1, QColor("#34495E"))
+        
+        # Glow gradient
+        glow = self._cached_gradients['glow']
+        glow.setColorAt(0, QColor(sport_info["accent"].red(), sport_info["accent"].green(), 
+                                  sport_info["accent"].blue(), 30))
+        glow.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        # Top accent gradient
+        top = self._cached_gradients['top_accent']
+        top.setColorAt(0, sport_info["accent"])
+        top.setColorAt(0.7, sport_info["accent"].darker(200))
+        top.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        # Bottom accent gradient
+        bottom = self._cached_gradients['bottom_accent']
+        bottom.setColorAt(0, sport_info["accent"])
+        bottom.setColorAt(0.7, sport_info["accent"].darker(200))
+        bottom.setColorAt(1, QColor(0, 0, 0, 0))
+        
+        # Sport segment path
+        self._cached_sport_path = QPainterPath()
+        self._cached_sport_path.moveTo(0, 0)
+        self._cached_sport_path.lineTo(self.segment_width - 15, 0)
+        self._cached_sport_path.lineTo(self.segment_width, rect.height())
+        self._cached_sport_path.lineTo(0, rect.height())
+        self._cached_sport_path.closeSubpath()
+        
     def draw_background(self, painter, rect, sport_info):
-        """Draw gradient background with sport colors"""
-        gradient = QLinearGradient(0, 0, rect.width(), 0)
-        
-        # Sport color on the left fading to dark
-        gradient.setColorAt(0, sport_info["color"])
-        gradient.setColorAt(0.3, sport_info["color"].darker(150))
-        gradient.setColorAt(0.6, QColor("#2C3E50"))
-        gradient.setColorAt(1, QColor("#34495E"))
-        
-        painter.fillRect(rect, gradient)
-        
-        # Add subtle radial glow effect
-        glow_gradient = QRadialGradient(self.segment_width/2, rect.height()/2, self.segment_width)
-        glow_gradient.setColorAt(0, QColor(sport_info["accent"].red(), sport_info["accent"].green(), 
-                                          sport_info["accent"].blue(), 30))
-        glow_gradient.setColorAt(1, QColor(0, 0, 0, 0))
-        painter.fillRect(0, 0, self.segment_width * 2, rect.height(), glow_gradient)
+        """Draw gradient background using cached gradients"""
+        painter.fillRect(rect, self._cached_gradients['background'])
+        painter.fillRect(0, 0, self.segment_width * 2, rect.height(), self._cached_gradients['glow'])
         
     def draw_sport_segment(self, painter, rect, sport_info):
         """Draw the sport category segment with transition animations"""
@@ -282,20 +324,12 @@ class TickerTape(QWidget):
             self.draw_normal_segment(painter, rect, sport_info)
             
     def draw_normal_segment(self, painter, rect, sport_info):
-        """Draw normal sport segment without transitions"""
-        # Create angular shape for sport segment
-        sport_path = QPainterPath()
-        sport_path.moveTo(0, 0)
-        sport_path.lineTo(self.segment_width - 15, 0)
-        sport_path.lineTo(self.segment_width, rect.height())
-        sport_path.lineTo(0, rect.height())
-        sport_path.closeSubpath()
-        
-        painter.fillPath(sport_path, sport_info["color"])
+        """Draw normal sport segment using cached path"""
+        painter.fillPath(self._cached_sport_path, sport_info["color"])
         
         # Sport segment border
         painter.setPen(QPen(sport_info["accent"], 2))
-        painter.drawPath(sport_path)
+        painter.drawPath(self._cached_sport_path)
         
         # Draw sport icon and text
         self.draw_sport_text(painter, rect, sport_info)
@@ -404,22 +438,9 @@ class TickerTape(QWidget):
         painter.drawText(QPointF(self._scroll_position, y_baseline), self.current_text)
         
     def draw_accent_effects(self, painter, rect, sport_info):
-        """Draw accent lines and effects"""
-        # Top accent line
-        top_gradient = QLinearGradient(0, 0, rect.width(), 0)
-        top_gradient.setColorAt(0, sport_info["accent"])
-        top_gradient.setColorAt(0.7, sport_info["accent"].darker(200))
-        top_gradient.setColorAt(1, QColor(0, 0, 0, 0))
-        
-        painter.fillRect(0, 0, rect.width(), 3, top_gradient)
-        
-        # Bottom accent line  
-        bottom_gradient = QLinearGradient(0, rect.height()-3, rect.width(), rect.height()-3)
-        bottom_gradient.setColorAt(0, sport_info["accent"])
-        bottom_gradient.setColorAt(0.7, sport_info["accent"].darker(200))
-        bottom_gradient.setColorAt(1, QColor(0, 0, 0, 0))
-        
-        painter.fillRect(0, rect.height()-3, rect.width(), 3, bottom_gradient)
+        """Draw accent lines using cached gradients"""
+        painter.fillRect(0, 0, rect.width(), 3, self._cached_gradients['top_accent'])
+        painter.fillRect(0, rect.height()-3, rect.width(), 3, self._cached_gradients['bottom_accent'])
             
         
     def update_sports_data(self, new_data):
