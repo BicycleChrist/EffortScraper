@@ -48,13 +48,35 @@ class TickerTape(QWidget):
         self.current_text = ""
         self.segment_width = 120  # Width of sport segment
         
+        # Custom font loading with fallback
         #custom_font_name = "Z003-MediumItalic.otf"
         custom_font_name = "URWBookman-DemiItalic.otf"
+        custom_font_path = f"custom_fonts/{custom_font_name}"
         
-        # this fuckaround is required to load a font from a file
-        font_id = QFontDatabase.addApplicationFont(f"custom_fonts/{custom_font_name}")
-        _fontstr = QFontDatabase.applicationFontFamilies(font_id)[0]
-        custom_font = QFont(_fontstr, 15)
+        print(f"TickerTape: Attempting to load custom font '{custom_font_name}' from '{custom_font_path}'")
+        
+        try:
+            # this fuckaround is required to load a font from a file
+            # font_id = QFontDatabase.addApplicationFont(f"custom_fonts/{custom_font_name}")
+            # _fontstr = QFontDatabase.applicationFontFamilies(font_id)[0]
+            # custom_font = QFont(_fontstr, 15)
+            
+            font_id = QFontDatabase.addApplicationFont(custom_font_path)
+            if font_id != -1:
+                font_families = QFontDatabase.applicationFontFamilies(font_id)
+                if font_families:
+                    _fontstr = font_families[0]
+                    custom_font = QFont(_fontstr, 15)
+                    print(f"TickerTape: ✓ Custom font '{_fontstr}' loaded successfully")
+                else:
+                    raise Exception("No font families found")
+            else:
+                raise Exception("Font file could not be loaded")
+        except Exception as e:
+            print(f"TickerTape: ✗ Custom font loading failed: {e}")
+            print(f"TickerTape: → Using fallback font 'Arial'")
+            print(f"TickerTape: → To use custom fonts, ensure '{custom_font_path}' exists and is accessible")
+            custom_font = QFont("Arial", 15)
         
         self.sport_font = QFont("Roboto", 14, QFont.Weight.ExtraBold)
         # self.game_font = QFont("Roboto", 15, QFont.Weight.Bold)
