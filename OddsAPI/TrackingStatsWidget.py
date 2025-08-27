@@ -301,17 +301,28 @@ class AdvancedStatsWidget(QWidget):
                     self.hide_loading_state()
 
 
-        
-    
+
     def fetch_stuffplus_data(self):
         url = 'https://www.fangraphs.com/leaders/major-league?type=36&pos=all&stats=pit&sortcol=3&sortdir=default&qual=1&pagenum=1&pageitems=2000000000'
         response = requests.get(url)
         if response.status_code != 200:
             raise Exception("Failed to fetch Fangraphs Stuff+ page")
         soup = BeautifulSoup(response.content, 'lxml')
-        table_wrapper = soup.find('div', class_="fg-data-grid table-type").find('div', class_='table-wrapper-inner')
-        dfs = pd.read_html(table_wrapper.encode(), encoding="utf-8")
-        df = dfs[0]
+        
+        # Find the actual table element directly
+        table = soup.find('div', class_="fg-data-grid table-type").find('table')
+        if not table:
+            raise Exception("Could not find Stuff+ data table")
+        
+        # Parse table manually instead of using pd.read_html()
+        headers = [th.get_text(strip=True) for th in table.find('thead').find_all('th')]
+        rows = []
+        for tr in table.find('tbody').find_all('tr'):
+            row = [td.get_text(strip=True) for td in tr.find_all('td')]
+            rows.append(row)
+        
+        # Create DataFrame directly
+        df = pd.DataFrame(rows, columns=headers)
     
         # Note the jenk here, as the headers for these DF's are tilting as all hell
         df = df.loc[:, ~df.columns.str.contains('Line Break', na=False)]
