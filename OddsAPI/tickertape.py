@@ -3,7 +3,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, pyqtPropert
 from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath, QFontDatabase
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 from PyQt6.QtCore import QRectF, QPointF
-from livetape_scraper import scrape_espn_scores 
+from livetape_scraper import scrape_espn_scores, scrape_all_sports 
 import threading
 import platform
 
@@ -589,42 +589,29 @@ class TickerTape(QWidget):
         pass  # No longer automatically load headlines
     
     def load_live_scores(self):
-        """Load MLB scores in background thread (non-blocking)"""
-        print("Loading live MLB scores...")
-        
+        """Load live scores from all major sports in background thread (non-blocking)"""
+        print("Loading live scores from all sports...")
+
         def fetch_scores_background():
             try:
-                scores = scrape_espn_scores()
-                if scores:
-                    # Convert scores to ticker format
-                    score_items = []
-                    for game in scores:
-                        away_team = game['away_team']
-                        home_team = game['home_team']
-                        away_runs = game['away_score']['runs']
-                        home_runs = game['home_score']['runs']
-                        inning = game.get('inning', 'Unknown')
-                        
-                        # Format score display
-                        if inning == 'Final':
-                            score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | Final"
-                        elif inning == 'Pre-Game':
-                            score_text = f"{away_team} vs {home_team} - Starting Soon"
-                        else:
-                            score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | {inning}"
-                        
-                        score_items.append(score_text)
-                    
+                all_sports_scores = scrape_all_sports()
+
+                if all_sports_scores:
                     # Store the data and signal main thread
-                    self.pending_scores = score_items
+                    self.pending_scores = all_sports_scores
                     # Use metaObject().invokeMethod for thread-safe Qt calls
                     QTimer.singleShot(0, self.process_pending_scores)
-                    print(f"Loaded {len(score_items)} MLB games")
+                    total_games = sum(len(sport_data['games']) for sport_data in all_sports_scores.values())
+                    print(f"Loaded {total_games} games across {len(all_sports_scores)} sports")
                 else:
-                    print("No MLB games found")
+                    print("No live games found in any sport")
+                    # CRITICAL FIX: Load headlines even when no live scores exist
+                    QTimer.singleShot(0, self.handle_no_live_scores)
             except Exception as e:
                 print(f"Error loading scores: {e}")
-        
+                # CRITICAL FIX: Load headlines even when error occurs
+                QTimer.singleShot(0, self.handle_no_live_scores)
+
         # Run in background thread
         threading.Thread(target=fetch_scores_background, daemon=True).start()
     
@@ -634,51 +621,105 @@ class TickerTape(QWidget):
             self.add_scores_to_ticker(self.pending_scores)
             delattr(self, 'pending_scores')
     
-    def add_scores_to_ticker(self, score_items):
-        """Add live scores to ticker data (runs on main thread)"""
-        if score_items:
-            print(f"Adding {len(score_items)} scores to ticker...")
-            
+    def add_scores_to_ticker(self, all_sports_scores):
+        """Add live scores for all sports to ticker data (runs on main thread)"""
+        if all_sports_scores:
+            total_games = sum(len(sport_data['games']) for sport_data in all_sports_scores.values())
+            print(f"Adding {total_games} scores from {len(all_sports_scores)} sports to ticker...")
+
             # Remove loading animation data first
             if "" in self.sports_data:
                 del self.sports_data[""]
-            
-            # Add MLB scores at the beginning
-            mlb_config = {
-                "color": QColor("#132448"),
-                "accent": QColor("#BF0D3E"),
-                "icon": "⚾",
-                "games": score_items
+
+            # Sport configurations with colors
+            sport_configs = {
+                "MLB": {"color": QColor("#132448"), "accent": QColor("#BF0D3E")},
+                "NBA": {"color": QColor("#C8102E"), "accent": QColor("#1D428A")},
+                "NFL": {"color": QColor("#013369"), "accent": QColor("#D50A0A")},
+                "NHL": {"color": QColor("#000000"), "accent": QColor("#F99923")}
             }
-            
-            # Always prioritize scores - create new sports data with MLB first
-            new_sports_data = {"MLB": mlb_config}
-            
-            # Add any existing non-MLB sports after
+
+            # Create new sports data with live scores first
+            new_sports_data = {}
+
+            for sport_name, sport_data in all_sports_scores.items():
+                games = sport_data['games']
+                icon = sport_data['icon']
+                config = sport_configs.get(sport_name, {"color": QColor("#2C3E50"), "accent": QColor("#3498DB")})
+
+                # Convert scores to ticker format
+                score_items = []
+                for game in games:
+                    away_team = game['away_team']
+                    home_team = game['home_team']
+                    away_runs = game['away_score']['runs']
+                    home_runs = game['home_score']['runs']
+                    status = game.get('status', 'Unknown')
+
+                    # Format score display based on game status
+                    if status == 'Final':
+                        score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | Final"
+                    elif status == 'Pre-Game' or status == 'Unknown' or 'TBD' in status or away_runs == '-' or home_runs == '-':
+                        # Pre-game: no scores yet or scores are placeholders
+                        score_text = f"{away_team} vs {home_team} - Starting Soon"
+                    else:
+                        # Live game or finished game with status - display status with scores
+                        score_text = f"{away_team} {away_runs} - {home_team} {home_runs} | {status}"
+
+                    score_items.append(score_text)
+
+                new_sports_data[sport_name] = {
+                    "color": config["color"],
+                    "accent": config["accent"],
+                    "icon": icon,
+                    "games": score_items
+                }
+
+            # Add any existing non-score sports after (like PRED)
             for sport, data in self.sports_data.items():
-                if sport != "MLB" and sport != "":
+                if sport not in new_sports_data and sport != "":
                     new_sports_data[sport] = data
-            
+
             self.sports_data = new_sports_data
-            
-            # Reset to show MLB scores first
+
+            # Reset to show first sport
             self.current_sport_index = 0
             self.current_game_index = 0
-            
+
             # Stop loading animation and start ticker
             self.stop_loading_animation()
             if not self.animation_timer.isActive():
                 self.animation_timer.start(16)
             self.data_loaded = True
-            
+
             self.update_current_text()
-            print(f"✓ Live scores added - MLB first with {len(score_items)} games")
+            print(f"✓ Live scores added - {total_games} games across {len(all_sports_scores)} sports")
             print(f"Current sports: {list(self.sports_data.keys())}")
             print(f"Current text: {self.current_text[:50]}...")
-            
+
             # Load headlines after scores are added to ensure proper cycling
             # Give news widget more time to load, then retry if needed
             QTimer.singleShot(5000, self.load_headlines_for_cycling)
+
+    def handle_no_live_scores(self):
+        """Handle case when no live scores exist - load headlines immediately"""
+        print("No live scores found - loading headlines immediately...")
+
+        # Remove loading animation
+        if "" in self.sports_data:
+            del self.sports_data[""]
+
+        # Stop loading animation
+        self.stop_loading_animation()
+
+        # Start animation timer
+        if not self.animation_timer.isActive():
+            self.animation_timer.start(16)
+
+        self.data_loaded = True
+
+        # Load headlines with a short delay to allow news widget to initialize
+        QTimer.singleShot(2000, self.load_headlines_for_cycling)
 
     def load_headlines_for_cycling(self, retry_count=0):
         """Load headlines from news widget for cycling between sports"""
