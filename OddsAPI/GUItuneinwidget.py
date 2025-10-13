@@ -4,7 +4,7 @@ import GUItunein
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, pyqtSlot, QThread
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QScrollBar,
-    QComboBox, QLabel, QPushButton, QLineEdit, QFrame, QListWidgetItem
+    QComboBox, QLabel, QPushButton, QLineEdit, QFrame, QListWidgetItem, QSizePolicy
 )
 import webbrowser
 
@@ -186,13 +186,13 @@ class TuneInWidget(QWidget):
         
         # Super compact layout
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(2, 2, 2, 2)
-        main_layout.setSpacing(2)
+        main_layout.setContentsMargins(1, 1, 1, 1)
+        main_layout.setSpacing(1)
         
         # Compact controls row
         controls_layout = QHBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(2)
+        controls_layout.setSpacing(1)
         
         # League filter dropdown
         self.league_filter = QComboBox()
@@ -215,19 +215,21 @@ class TuneInWidget(QWidget):
         self.refresh_button.setFixedWidth(60)
         controls_layout.addWidget(self.refresh_button)
         
-        # Links list with proper styling and fixed size
+        # Links list with proper styling - let it expand vertically
         self.links_list = QListWidget()
         self.links_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.links_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.links_list.itemDoubleClicked.connect(self.open_stream_link)
-        self.links_list.setFixedHeight(110)
-        
+        # Allow it to expand vertically
+        self.links_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.links_list.setMinimumHeight(80)
+
         # Build the layout
         main_layout.addLayout(controls_layout)
         main_layout.addWidget(self.links_list)
-        
-        # Fixed overall size
-        self.setFixedHeight(140)
+
+        # Remove fixed height - allow widget to expand vertically within constraints
+        # self.setFixedHeight(130)
 
         # Start loading links in background (non-blocking)
         self.start_background_load()

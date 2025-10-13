@@ -20,7 +20,7 @@ from GUIteamnewswidget import TeamNewsWidget
 from GUIbestlineswidget import *
 from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
-from effortcalculator import OddsConverterWidget
+from effortcalculator import CalculatorApp
 from tickertape import TickerTape
 from polymarketquery import fetch_and_process_markets
 from prediction_markets_worker import PredictionMarketsWorker
@@ -305,6 +305,8 @@ class ModernOddsWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         self.layout = QVBoxLayout(main_widget)
+        self.layout.setSpacing(1)  # Minimize spacing between all main layout elements
+        self.layout.setContentsMargins(5, 5, 5, 5)  # Tight margins
         
         # --------- TOP SECTION ---------
         # League selection dropdown
@@ -526,17 +528,22 @@ class ModernOddsWindow(QMainWindow):
         
         self.layout.addLayout(region_ticker_layout)
         
-        # --------- MARKET AND STREAMING SECTION ---------
-        # This is where the key change happens - we put the streaming widget in the same row as the market buttons
-        
-        # Create a horizontal layout for markets and streaming
-        market_streaming_layout = QHBoxLayout()
-        
-        # Left side container for regular markets
-        left_container = QWidget()
-        left_layout = QHBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        
+        # --------- MARKET, SEARCH BAR, AND STREAMING SECTION ---------
+        # Create a horizontal splitter for left side (markets/search) and right side (streaming)
+        controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # LEFT SIDE: Vertical layout for market buttons and search bar
+        left_side_widget = QWidget()
+        left_side_layout = QVBoxLayout(left_side_widget)
+        left_side_layout.setContentsMargins(0, 0, 0, 0)
+        left_side_layout.setSpacing(2)  # Reduced from 5 to 2
+
+        # Market buttons row
+        market_buttons_widget = QWidget()
+        market_buttons_layout = QHBoxLayout(market_buttons_widget)
+        market_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        market_buttons_layout.setSpacing(4)
+
         # Create regular market buttons
         self.market_buttons = {}
         for market in ["h2h", "spreads", "totals"]:
@@ -546,55 +553,43 @@ class ModernOddsWindow(QMainWindow):
             btn.setObjectName(f"market_{market}")
             self.market_buttons[market] = btn
             btn.setStyleSheet(self.BUTTON_STYLE)
-            left_layout.addWidget(btn)
-        
+            market_buttons_layout.addWidget(btn)
+
         # Add fetch button
         self.fetch_odds_button = QPushButton("Fetch Odds 🎰")
         self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)
-        left_layout.addWidget(self.fetch_odds_button)
-        
+        market_buttons_layout.addWidget(self.fetch_odds_button)
+
         # Add props button
         self.props_button = QPushButton("Props ➣➣")
         self.props_button.setObjectName("market_props")
         self.props_button.setEnabled(False)
         self.props_button.setStyleSheet(self.props_button_style)
         self.market_buttons["props"] = self.props_button
-        left_layout.addWidget(self.props_button)
-        
+        market_buttons_layout.addWidget(self.props_button)
+
         # Add Table Tennis Button
         self.tt_button = QPushButton("TT🏓")
         self.tt_button.setObjectName("market_tt")
         self.tt_button.setStyleSheet(self.props_button_style)
-        left_layout.addWidget(self.tt_button)
-        
+        market_buttons_layout.addWidget(self.tt_button)
+
         # Add props availability label
         self.props_availability_label = QLabel("No Props available for this league")
         self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
         self.props_availability_label.setVisible(False)
-        left_layout.addWidget(self.props_availability_label)
-        
-        # Add the left container to the market_streaming_layout
-        market_streaming_layout.addWidget(left_container)
-        
-        # Add a stretch to push everything to the left and right
-        market_streaming_layout.addStretch(1)
-        
-        # Create and configure the TuneInWidget
-        self.tune_in_widget = TuneInWidget()
-        self.tune_in_widget.setVisible(False)  # Hidden by default
-        self.tune_in_widget.setFixedWidth(650)  # Fixed width to make it compact
-        market_streaming_layout.addWidget(self.tune_in_widget)
-        
-        # Add the market_streaming_layout to the main layout
-        self.layout.addLayout(market_streaming_layout)
-        
-        # --------- SEARCH BAR ---------
-        # Create search bar container
+        market_buttons_layout.addWidget(self.props_availability_label)
+
+        market_buttons_layout.addStretch()
+
+        # Add market buttons to left side
+        left_side_layout.addWidget(market_buttons_widget)
+
+        # Search bar
         search_container = QWidget()
         search_layout = QHBoxLayout(search_container)
-        search_layout.setContentsMargins(0, 5, 0, 5)
-        
-        # Create search bar
+        search_layout.setContentsMargins(0, 0, 0, 0)
+
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Filter odds table (team names, markets, etc.)")
         self.search_bar.setStyleSheet("""
@@ -616,11 +611,36 @@ class ModernOddsWindow(QMainWindow):
         self.search_bar.setFixedHeight(28)
         self.search_bar.setMaximumWidth(400)
         search_layout.addWidget(self.search_bar)
-        
-        # Add stretch to push search to the left
         search_layout.addStretch()
-        
-        self.layout.addWidget(search_container)
+
+        # Add search bar to left side
+        left_side_layout.addWidget(search_container)
+        left_side_layout.addStretch()
+
+        # Add left side to splitter
+        controls_streaming_splitter.addWidget(left_side_widget)
+
+        # RIGHT SIDE: Streaming widget (will be shown/hidden)
+        # Create and configure the TuneInWidget
+        self.tune_in_widget = TuneInWidget()
+        self.tune_in_widget.setVisible(False)  # Hidden by default
+        self.tune_in_widget.setFixedWidth(650)
+        # Set a reasonable maximum height (60% of previous size)
+        self.tune_in_widget.setMaximumHeight(120)
+        self.tune_in_widget.setMinimumHeight(100)
+
+        # Add streaming widget to splitter
+        controls_streaming_splitter.addWidget(self.tune_in_widget)
+
+        # Set initial sizes - give most space to left side
+        controls_streaming_splitter.setSizes([1000, 650])
+        controls_streaming_splitter.setCollapsible(0, False)  # Left side can't collapse
+        controls_streaming_splitter.setCollapsible(1, True)  # Right side can collapse
+
+        # Add the splitter to main layout - use addWidget with spacing parameter
+        # Set top margin to 0 to minimize gap from ticker tape
+        controls_streaming_splitter.setContentsMargins(0, 0, 0, 0)
+        self.layout.addWidget(controls_streaming_splitter)
         
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
@@ -1912,7 +1932,7 @@ class ModernOddsWindow(QMainWindow):
                 self.calc_window.close()
             except:
                 pass
-        self.calc_window = OddsConverterWidget()
+        self.calc_window = CalculatorApp()
         self.calc_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.calc_window.show()
     
