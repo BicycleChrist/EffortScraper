@@ -1,5 +1,6 @@
 import csv
 import json
+import orjson
 from py_clob_client.client import ClobClient
 from mmKEY import pmkey
 import pathlib
@@ -11,39 +12,42 @@ def is_cache_fresh(cache_file="markets_cache.json", cache_hours=24):
     try:
         if not pathlib.Path(cache_file).exists():
             return False
-        
-        with open(cache_file, 'r') as f:
-            cache_data = json.load(f)
-        
+
+        # Use orjson to release GIL during parsing
+        with open(cache_file, 'rb') as f:
+            cache_data = orjson.loads(f.read())
+
         cache_time = datetime.fromisoformat(cache_data['timestamp'])
         current_time = datetime.now(timezone.utc)
         hours_old = (current_time - cache_time).total_seconds() / 3600
-        
+
         return hours_old < cache_hours
     except Exception as e:
         print(f"Error checking cache freshness: {e}")
         return False
 
 def load_cached_markets(cache_file="markets_cache.json"):
-    """Load markets from cache file"""
+    """Load markets from cache file with GIL-releasing JSON parser"""
     try:
-        with open(cache_file, 'r') as f:
-            cache_data = json.load(f)
+        # orjson releases GIL during parsing - prevents UI freeze
+        with open(cache_file, 'rb') as f:
+            cache_data = orjson.loads(f.read())
         return cache_data.get('markets', [])
     except Exception as e:
         print(f"Error loading cached markets: {e}")
         return []
 
 def save_markets_cache(markets_list, cache_file="markets_cache.json", cache_hours=24):
-    """Save markets to cache with timestamp"""
+    """Save markets to cache with timestamp - uses orjson for speed"""
     try:
         cache_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "cache_duration_hours": cache_hours,
             "markets": markets_list
         }
-        with open(cache_file, 'w') as f:
-            json.dump(cache_data, f, indent=2)
+        # Use orjson for faster serialization that releases GIL
+        with open(cache_file, 'wb') as f:
+            f.write(orjson.dumps(cache_data))
         print(f"Saved {len(markets_list)} markets to cache")
     except Exception as e:
         print(f"Error saving markets cache: {e}")
@@ -212,22 +216,32 @@ def GetRecentCursor():
 host = "https://clob.polymarket.com"
 chain_id = 137  # Polygon Mainnet
 
-# Initialize the client with API key
-client = ClobClient(
-    host,
-    key=pmkey,
-    chain_id=chain_id
-)
+# Lazy client initialization - only create when needed
+_client = None
+
+def get_client():
+    """Lazy initialization of ClobClient to avoid blocking on module import"""
+    global _client
+    if _client is None:
+        _client = ClobClient(
+            host,
+            key=pmkey,
+            chain_id=chain_id
+        )
+    return _client
 
 
 def FetchMarkets(next_cursor=None, recent_only=True):
     """Fetch markets from Polymarket CLOB API"""
     markets_list = []
-    
+
     if recent_only and next_cursor is None:
         next_cursor = GetRecentCursor()
         print(f"Starting recent_only from: {next_cursor}")
-    
+
+    # Get client lazily (only initialized when actually needed)
+    client = get_client()
+
     while True:
         try:
             print(f"Fetching markets with next_cursor: {next_cursor}")
@@ -252,35 +266,74 @@ def FetchMarkets(next_cursor=None, recent_only=True):
     return markets_list
 
 def get_cached_or_fresh_markets(recent_only=True):
-    """Get markets from cache if fresh, otherwise fetch from API"""
+    """Get markets from cache if fresh, otherwise fetch and process from API
+
+    Returns FILTERED active markets (not raw API response) to reduce memory usage
+    """
     if is_cache_fresh():
-        print("📋 Using cached markets (fresh)")
+        print("📋 Using cached filtered markets (fresh)")
         return load_cached_markets()
     else:
         print("🔄 Cache stale, fetching fresh markets from CLOB API")
-        markets_list = FetchMarkets(recent_only=recent_only)
-        save_markets_cache(markets_list)
-        return markets_list
+        # Fetch raw markets from API
+        raw_markets_list = FetchMarkets(recent_only=recent_only)
+
+        # Filter to active markets BEFORE caching (saves memory and time)
+        print(f"Filtering {len(raw_markets_list)} raw markets to active only...")
+        filtered_markets = process_markets_metadata(raw_markets_list)
+
+        # Cache the FILTERED markets (much smaller than raw)
+        save_markets_cache(filtered_markets)
+        print(f"Cached {len(filtered_markets)} filtered active markets")
+
+        return filtered_markets
 
 
 def process_markets_metadata(markets) -> list[dict]:
     """Process markets metadata without volume data"""
+    import time
+
     wanted_fields = ("question", "description", "tokens", "question_id", "condition_id", "tags")
-    active_markets = [market for market in markets if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
+
+    # MUCH smaller chunks to release GIL frequently and prevent UI freeze
+    active_markets = []
+    chunk_size = 50  # Reduced from 1000 to 50 for more frequent GIL releases
+
+    for i in range(0, len(markets), chunk_size):
+        chunk = markets[i:i + chunk_size]
+        active_chunk = [market for market in chunk if ((market["active"] is True) and (not market["closed"] and (not market["archived"])))]
+        active_markets.extend(active_chunk)
+
+        # Release GIL after EVERY chunk
+        time.sleep(0.0001)  # 0.1ms sleep releases GIL
+
     print(f"Filtered to {len(active_markets)} active markets from {len(markets)} total markets")
-    
-    filtered_data = [
-        { field: market[field] for field in wanted_fields }
-        for market in active_markets
-    ]
-    
-    for market in filtered_data:
+
+    # Process in chunks to release GIL
+    filtered_data = []
+    for i in range(0, len(active_markets), chunk_size):
+        chunk = active_markets[i:i + chunk_size]
+        chunk_data = [
+            { field: market[field] for field in wanted_fields }
+            for market in chunk
+        ]
+        filtered_data.extend(chunk_data)
+
+        # Release GIL after every chunk
+        time.sleep(0.0001)
+
+    # Process market lines in chunks
+    for i, market in enumerate(filtered_data):
         market["lines"] = [ token['outcome'] + ': ' + str(token['price']*100) + '%' for token in market["tokens"] ]
         market["token_ids"] = [token['token_id'] for token in market['tokens']]
-        if market["tags"] is None: 
+        if market["tags"] is None:
             market["tags"] = []
         del market["tokens"]
-    
+
+        # Release GIL more frequently (every 50 items)
+        if i > 0 and i % chunk_size == 0:
+            time.sleep(0.0001)
+
     return filtered_data
 
 def add_volume_data_to_markets(markets, volume_limit=200, cancellation_flag=None) -> list[dict]:
@@ -383,37 +436,38 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-def fetch_and_process_markets(recent_only=True, cancellation_flag=None):
-    """Optimized version using 24hr cache for markets, fresh volume data every run"""
-    # Get markets (cached if fresh, otherwise fetch from API)
-    markets_list = get_cached_or_fresh_markets(recent_only=recent_only)
-    
+def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False):
+    """Optimized version using 24hr cache for filtered markets, fresh volume data every run
+
+    Args:
+        recent_only: Whether to fetch only recent markets
+        cancellation_flag: Dict with 'should_stop' key for cancellation
+        save_full_dump: If True, saves PMdump.json and PMdump_all.json (for manual runs)
+                       If False, skips file writes (for ticker worker to avoid blocking)
+    """
+    # Get FILTERED markets (from cache or fresh from API)
+    # This now returns already-filtered active markets, no need to filter again
+    processed_markets = get_cached_or_fresh_markets(recent_only=recent_only)
+
     # Check for cancellation
-    if cancellation_flag and cancellation_flag.get('should_stop', False):
-        print("🚫 Market fetch cancelled before processing")
-        return []
-    
-    # Process markets metadata (fast operation)
-    processed_markets = process_markets_metadata(markets_list)
-    
-    # Check for cancellation again
     if cancellation_flag and cancellation_flag.get('should_stop', False):
         print("🚫 Market fetch cancelled before volume data")
         return []
-    
+
     # Always fetch fresh volume data (this is what changes frequently)
     print("💰 Fetching fresh volume data...")
     final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
-    
+
     # Check for cancellation before saving
     if cancellation_flag and cancellation_flag.get('should_stop', False):
         print("🚫 Market fetch cancelled before saving")
         return []
-    
-    # Save results
-    WriteJsonDump(final_data)
-    WriteJsonDump(markets_list, "PMdump_all")
-    
+
+    # Only save dumps if explicitly requested (for manual runs, not ticker worker)
+    if save_full_dump:
+        WriteJsonDump(final_data)
+        print("Skipping PMdump_all.json write (not needed for ticker)")
+
     return final_data
 
 def fetch_and_process_markets_legacy(recent_only=True):
@@ -429,12 +483,13 @@ def fetch_and_process_markets_legacy(recent_only=True):
 
 if __name__ == "__main__":
     # Process markets with recent_only=True and volume optimization
-    filtered_data = fetch_and_process_markets(recent_only=True)
-    
+    # Enable save_full_dump for manual runs
+    filtered_data = fetch_and_process_markets(recent_only=True, save_full_dump=True)
+
     print(f"\nProcessed {len(filtered_data)} markets")
     markets_with_volume = [m for m in filtered_data if m.get('total_volume', 0) > 0]
     print(f"Markets with volume: {len(markets_with_volume)}")
-    
+
     # Generate outputs
     GenerateHTML(filtered_data)
     SaveToCSV(filtered_data, "recent_active_markets")
