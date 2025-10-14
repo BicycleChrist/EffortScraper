@@ -6,6 +6,7 @@ from mmKEY import pmkey
 import pathlib
 import requests
 from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 
 def is_cache_fresh(cache_file="markets_cache.json", cache_hours=24):
     """Check if markets cache is still fresh"""
@@ -205,6 +206,113 @@ def get_market_volume_batch(token_ids, cancellation_flag=None):
     
     return volume_map
 
+def scrape_breaking_markets():
+    """
+    Scrape breaking markets from Polymarket's breaking page.
+    Returns list of market question strings found on the page.
+    """
+    url = "https://polymarket.com/breaking"
+    print(f"🌐 Scraping breaking markets from {url}...")
+
+    try:
+        # Use a browser-like user agent to avoid blocks
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        # Parse HTML
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find all market title paragraphs with the specific class structure
+        # Target: <p class="text-[15px] font-medium mb-0.5 text-pretty line-clamp-3 hover:underline underline-offset-2">
+        market_titles = []
+
+        # Look for p tags with these specific classes
+        for p_tag in soup.find_all('p', class_='text-[15px]'):
+            # Check if it has the other required classes
+            classes = p_tag.get('class', [])
+            if ('font-medium' in classes and
+                'mb-0.5' in classes and
+                'text-pretty' in classes and
+                'line-clamp-3' in classes):
+
+                title_text = p_tag.get_text(strip=True)
+                if title_text and len(title_text) > 10:  # Sanity check
+                    market_titles.append(title_text)
+
+        print(f"✅ Found {len(market_titles)} breaking markets")
+        for i, title in enumerate(market_titles[:5], 1):
+            print(f"  {i}. {title[:60]}{'...' if len(title) > 60 else ''}")
+
+        if len(market_titles) > 5:
+            print(f"  ... and {len(market_titles) - 5} more")
+
+        return market_titles
+
+    except requests.RequestException as e:
+        print(f"❌ Error fetching breaking markets page: {e}")
+        return []
+    except Exception as e:
+        print(f"❌ Error parsing breaking markets: {e}")
+        return []
+
+
+def match_breaking_markets_to_tokens(breaking_titles, cached_markets):
+    """
+    Match breaking market titles to cached market data and extract token IDs.
+
+    Args:
+        breaking_titles: List of market question strings from breaking page
+        cached_markets: List of market dicts from cache
+
+    Returns:
+        List of matched market dicts with token_ids
+    """
+    print(f"\n🔍 Matching {len(breaking_titles)} breaking markets against {len(cached_markets)} cached markets...")
+
+    matched_markets = []
+    unmatched_titles = []
+
+    for breaking_title in breaking_titles:
+        # Try exact match first
+        found = False
+        for market in cached_markets:
+            if market.get('question', '') == breaking_title:
+                matched_markets.append(market)
+                found = True
+                print(f"  ✓ Exact match: {breaking_title[:50]}...")
+                break
+
+        if not found:
+            # Try fuzzy match (case-insensitive, strip whitespace)
+            breaking_normalized = breaking_title.lower().strip()
+            for market in cached_markets:
+                market_question = market.get('question', '').lower().strip()
+                if market_question == breaking_normalized:
+                    matched_markets.append(market)
+                    found = True
+                    print(f"  ✓ Fuzzy match: {breaking_title[:50]}...")
+                    break
+
+        if not found:
+            unmatched_titles.append(breaking_title)
+            print(f"  ✗ No match: {breaking_title[:50]}...")
+
+    print(f"\n📊 Matching results:")
+    print(f"  ✓ Matched: {len(matched_markets)} markets")
+    print(f"  ✗ Unmatched: {len(unmatched_titles)} markets")
+
+    if unmatched_titles:
+        print(f"\n⚠️  Unmatched markets (may need to refresh cache):")
+        for title in unmatched_titles[:3]:
+            print(f"    - {title[:60]}{'...' if len(title) > 60 else ''}")
+
+    return matched_markets
+
+
 def GetRecentCursor():
     """Get recent cursor position for tickertape data collection"""
     # Fixed cursor for recent active markets (12 blocks behind current end)
@@ -337,21 +445,21 @@ def process_markets_metadata(markets) -> list[dict]:
     return filtered_data
 
 def add_volume_data_to_markets(markets, volume_limit=200, cancellation_flag=None) -> list[dict]:
-    """Add fresh volume data to markets"""
+    """Add fresh volume data to markets (supports both old and new breaking markets flow)"""
     all_token_ids = []
     for i, market in enumerate(markets):
         if i < volume_limit:
             all_token_ids.extend(market["token_ids"])
-    
-    print(f"Fetching volume data for {len(all_token_ids)} tokens from first {volume_limit} markets...")
+
+    print(f"Fetching volume data for {len(all_token_ids)} tokens from first {min(len(markets), volume_limit)} markets...")
     volume_map = get_market_volume_batch(all_token_ids, cancellation_flag=cancellation_flag)
-    
+
     for i, market in enumerate(markets):
         volume_data = []
         total_volume = 0
         total_volume_24hr = 0
         total_liquidity = 0
-        
+
         if i < volume_limit:
             for token_id in market["token_ids"]:
                 vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
@@ -361,16 +469,58 @@ def add_volume_data_to_markets(markets, volume_limit=200, cancellation_flag=None
                 total_liquidity += float(vol_data['liquidity']) if vol_data['liquidity'] else 0
         else:
             volume_data = [{'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0} for _ in market["token_ids"]]
-        
+
         market["volume_data"] = volume_data
         market["total_volume"] = total_volume
         market["total_volume_24hr"] = total_volume_24hr
         market["total_liquidity"] = total_liquidity
-    
+
     # Sort by volume
     markets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
     print(f"Sorted {len(markets)} markets by volume (highest to lowest)")
-    
+
+    return markets
+
+
+def add_volume_data_to_breaking_markets(markets, cancellation_flag=None) -> list[dict]:
+    """
+    Optimized version: Add volume data ONLY to matched breaking markets.
+    No volume_limit needed since we're only processing ~15-20 markets.
+    """
+    # Collect ALL token IDs from the breaking markets
+    all_token_ids = []
+    for market in markets:
+        all_token_ids.extend(market["token_ids"])
+
+    print(f"💰 Fetching volume data for {len(all_token_ids)} tokens from {len(markets)} breaking markets...")
+    print(f"   (Previously would fetch 400+ tokens - now fetching {len(all_token_ids)}!)")
+
+    # Fetch volume data for all tokens
+    volume_map = get_market_volume_batch(all_token_ids, cancellation_flag=cancellation_flag)
+
+    # Add volume data to each market
+    for market in markets:
+        volume_data = []
+        total_volume = 0
+        total_volume_24hr = 0
+        total_liquidity = 0
+
+        for token_id in market["token_ids"]:
+            vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
+            volume_data.append(vol_data)
+            total_volume += float(vol_data['volume']) if vol_data['volume'] else 0
+            total_volume_24hr += float(vol_data['volume_24hr']) if vol_data['volume_24hr'] else 0
+            total_liquidity += float(vol_data['liquidity']) if vol_data['liquidity'] else 0
+
+        market["volume_data"] = volume_data
+        market["total_volume"] = total_volume
+        market["total_volume_24hr"] = total_volume_24hr
+        market["total_liquidity"] = total_liquidity
+
+    # Sort by volume (highest first)
+    markets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
+    print(f"✅ Sorted {len(markets)} breaking markets by volume")
+
     return markets
 
 def FilterData(markets) -> list[dict]:
@@ -436,17 +586,19 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False):
-    """Optimized version using 24hr cache for filtered markets, fresh volume data every run
+def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False, use_breaking=True):
+    """
+    Optimized version using breaking markets from polymarket.com/breaking page.
 
     Args:
-        recent_only: Whether to fetch only recent markets
+        recent_only: Whether to fetch only recent markets (used as fallback if breaking scrape fails)
         cancellation_flag: Dict with 'should_stop' key for cancellation
-        save_full_dump: If True, saves PMdump.json and PMdump_all.json (for manual runs)
+        save_full_dump: If True, saves PMdump.json (for manual runs)
                        If False, skips file writes (for ticker worker to avoid blocking)
+        use_breaking: If True, scrapes breaking markets page (default, much faster)
+                     If False, uses old behavior (fallback)
     """
-    # Get FILTERED markets (from cache or fresh from API)
-    # This now returns already-filtered active markets, no need to filter again
+    # Get FILTERED markets from cache (metadata only, no volume yet)
     processed_markets = get_cached_or_fresh_markets(recent_only=recent_only)
 
     # Check for cancellation
@@ -454,21 +606,62 @@ def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_ful
         print("🚫 Market fetch cancelled before volume data")
         return []
 
-    # Always fetch fresh volume data (this is what changes frequently)
-    print("💰 Fetching fresh volume data...")
-    final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
+    # NEW APPROACH: Use breaking markets page to identify which markets to fetch
+    if use_breaking:
+        print("\n🚀 Using BREAKING MARKETS approach (optimized)...")
 
-    # Check for cancellation before saving
-    if cancellation_flag and cancellation_flag.get('should_stop', False):
-        print("🚫 Market fetch cancelled before saving")
-        return []
+        # Scrape breaking markets page
+        breaking_titles = scrape_breaking_markets()
 
-    # Only save dumps if explicitly requested (for manual runs, not ticker worker)
-    if save_full_dump:
-        WriteJsonDump(final_data)
-        print("Skipping PMdump_all.json write (not needed for ticker)")
+        if not breaking_titles:
+            print("⚠️  No breaking markets found, falling back to old approach...")
+            use_breaking = False  # Fall through to old approach
+        else:
+            # Match breaking market titles to cached markets
+            matched_markets = match_breaking_markets_to_tokens(breaking_titles, processed_markets)
 
-    return final_data
+            if not matched_markets:
+                print("⚠️  No matches found, falling back to old approach...")
+                use_breaking = False  # Fall through to old approach
+            else:
+                # Check for cancellation
+                if cancellation_flag and cancellation_flag.get('should_stop', False):
+                    print("🚫 Market fetch cancelled after matching")
+                    return []
+
+                # Fetch volume data ONLY for matched breaking markets (much faster!)
+                print(f"\n💰 Fetching volume for {len(matched_markets)} breaking markets only...")
+                print(f"   📉 Token reduction: ~400+ → {sum(len(m['token_ids']) for m in matched_markets)}")
+                final_data = add_volume_data_to_breaking_markets(matched_markets, cancellation_flag=cancellation_flag)
+
+                # Check for cancellation before saving
+                if cancellation_flag and cancellation_flag.get('should_stop', False):
+                    print("🚫 Market fetch cancelled before saving")
+                    return []
+
+                # Only save dumps if explicitly requested
+                if save_full_dump:
+                    WriteJsonDump(final_data)
+
+                return final_data
+
+    # FALLBACK: Old approach if breaking scrape failed
+    if not use_breaking:
+        print("\n📦 Using OLD approach (fallback - slower)...")
+        print("💰 Fetching fresh volume data for first 200 markets...")
+        final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
+
+        # Check for cancellation before saving
+        if cancellation_flag and cancellation_flag.get('should_stop', False):
+            print("🚫 Market fetch cancelled before saving")
+            return []
+
+        # Only save dumps if explicitly requested
+        if save_full_dump:
+            WriteJsonDump(final_data)
+            print("Skipping PMdump_all.json write (not needed for ticker)")
+
+        return final_data
 
 def fetch_and_process_markets_legacy(recent_only=True):
     """Original version without caching - kept for fallback"""
