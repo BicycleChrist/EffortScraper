@@ -30,6 +30,14 @@ def JakePaulAPI(operationName:str, variables:dict = None):
         if (len(missing_vars) > 0): print(f"ERROR: {operationName} requires variables: {missing_vars}"); return None,None;
         query = "query UpcomingEventsConditionalWithPlayers($league: League!, $withPlayers: Boolean!) {  getUpcomingEventsV2(league: $league) {    ...EventInfoData    ... on TeamTournamentEvent {      teams {        ...TeamInfo        __typename      }      __typename    }    ... on TeamVersusEvent {      teams {        ...TeamInfo        __typename      }      __typename    }    ... on IndividualTournamentEvent {      players @include(if: $withPlayers) {        ...PlayerInfoWithProjections        __typename      }      __typename    }    ... on IndividualVersusEvent {      players @include(if: $withPlayers) {        ...PlayerInfoWithProjections        __typename      }      __typename    }    __typename  }}fragment EventInfoData on EventV2 {  id  date  status  sport  league  competitionType  dataFeedSourceIds {    id    source    __typename  }  playerStructure  venueDetails {    name    city    country    __typename  }  headerImage  attributes {    key    value    __typename  }  name  icon  dedicated  __typename}fragment TeamInfo on Team {  id  name  league  sport  icon  color  secondaryColor  largeIcon  __typename}fragment PlayerInfoWithProjections on Player {  ...PlayerInfo  projections {    ...PlayerProjection    __typename  }  __typename}fragment PlayerInfo on Player {  id  firstName  lastName  icon  position  jerseyNumber  attributes {    key    value    __typename  }  __typename}fragment PlayerProjection on Projection {  marketId  marketStatus  isLive  type  label  name  key  order  value  nonRegularPercentage  nonRegularValue  allowedOptions {    marketOptionId    outcome    __typename  }  currentValue  __typename}"
         local_variables_dict = variables
+    elif operationName == "UpcomingEventsAllPlayers":
+        # This query ALWAYS includes full player data for ALL event types
+        req_vars = ["league"]
+        if variables is None: missing_vars = req_vars;
+        else: missing_vars = [reqvar for reqvar in req_vars if reqvar not in variables.keys()];
+        if (len(missing_vars) > 0): print(f"ERROR: {operationName} requires variables: {missing_vars}"); return None,None;
+        query = "query UpcomingEventsAllPlayers($league: League!) {  getUpcomingEventsV2(league: $league) {    ...EventInfoData    ... on TeamTournamentEvent {      teams {        ...TeamInfoWithPlayers        __typename      }      __typename    }    ... on TeamVersusEvent {      teams {        ...TeamInfoWithPlayers        __typename      }      __typename    }    ... on IndividualTournamentEvent {      players {        ...PlayerInfoWithProjections        __typename      }      __typename    }    ... on IndividualVersusEvent {      players {        ...PlayerInfoWithProjections        __typename      }      __typename    }    __typename  }}fragment EventInfoData on EventV2 {  id  date  status  sport  league  competitionType  dataFeedSourceIds {    id    source    __typename  }  playerStructure  venueDetails {    name    city    country    __typename  }  headerImage  attributes {    key    value    __typename  }  name  icon  dedicated  __typename}fragment TeamInfoWithPlayers on Team {  ...TeamInfo  players {    ...PlayerInfoWithProjections    __typename  }  __typename}fragment TeamInfo on Team {  id  name  league  sport  icon  color  secondaryColor  largeIcon  __typename}fragment PlayerInfoWithProjections on Player {  ...PlayerInfo  projections {    ...PlayerProjection    __typename  }  __typename}fragment PlayerInfo on Player {  id  firstName  lastName  icon  position  jerseyNumber  attributes {    key    value    __typename  }  __typename}fragment PlayerProjection on Projection {  marketId  marketStatus  isLive  type  label  name  key  order  value  nonRegularPercentage  nonRegularValue  allowedOptions {    marketOptionId    outcome    __typename  }  playerRecentStats {    stats {      value      matchupDescription      date      __typename    }    averageValue    __typename  }  currentValue  __typename}"
+        local_variables_dict = variables
     else:
         print(f"ERROR: unrecognized operation: {operationName}"); return None,None;
 
@@ -39,7 +47,15 @@ def JakePaulAPI(operationName:str, variables:dict = None):
         "variables": local_variables_dict,
     }
 
-    headers = { "authorization": BETR_AUTH_TOKEN }
+    headers = {
+        "authorization": BETR_AUTH_TOKEN,
+        "fantasy-api-version": "12.0",
+        "fantasy-application-version": "3.30.11",
+        "promotions-api-version": "2.0",
+        "jurisdiction": "AK",
+        "channel": "WEB",
+        "content-type": "application/json"
+    }
     url = "https://api.fantasy.betr.app/graphql"
     response = requests.post(url, headers=headers, json=request)
     content = response.json()
@@ -71,15 +87,76 @@ def MakeRequests(queries:list[str], vars:dict):
     return results
 
 
+def QueryAllLeagues(withPlayers=True):
+    """Query all active leagues for their complete event data."""
+    print("Step 1: Discovering active leagues...")
+    (content, response) = JakePaulAPI("AllLeaguesUpcomingEvents")
+
+    if not content or response.status_code != 200:
+        print("ERROR: Failed to get league list")
+        return {}
+
+    # Extract unique leagues
+    events = content.get("data", {}).get("getUpcomingEventsV2", [])
+    active_leagues = sorted(set(event["league"] for event in events if "league" in event))
+    print(f"Found {len(active_leagues)} active leagues: {', '.join(active_leagues)}\n")
+
+    # Query each league
+    all_results = {}
+    operation = "UpcomingEventsAllPlayers" if withPlayers else "UpcomingEventsConditionalWithPlayers"
+
+    for i, league in enumerate(active_leagues, 1):
+        print(f"[{i}/{len(active_leagues)}] Querying {league}...")
+
+        if withPlayers:
+            query_vars = {"league": league}
+        else:
+            query_vars = {"league": league, "withPlayers": False}
+
+        (content, response) = JakePaulAPI(operation, query_vars)
+
+        if not content or response.status_code != 200:
+            print(f"  ERROR: Failed to retrieve {league}")
+            continue
+
+        events = content.get("data", {}).get("getUpcomingEventsV2", [])
+        print(f"  Retrieved {len(events)} events")
+
+        all_results[league] = content
+        SaveResponse(f"{operation}_{league}", content)
+
+    print(f"\nCompleted: {len(all_results)}/{len(active_leagues)} leagues successfully queried")
+    return all_results
+
+
 if __name__ == "__main__":
-    query_args = { "UpcomingEventsConditionalWithPlayers": { "league":"NBA", "withPlayers":False }}
-    queries = [
-        "TopTenPlayersData",
-        "AllLeaguesUpcomingEvents",
-        "LobbyTrendingEvents",
-        "UpcomingEventsConditionalWithPlayers",
-    ]
-    results = MakeRequests(queries, query_args)
-    SaveResponse("AllResults", results)
-    print("finished ripping Jake Paul's API")
+    import argparse
+    parser = argparse.ArgumentParser(description="Query Betr API")
+    parser.add_argument("--all-leagues", action="store_true",
+                       help="Query all active leagues instead of just CFB")
+    parser.add_argument("--no-players", action="store_true",
+                       help="Exclude player data (faster queries)")
+    parser.add_argument("--legacy", action="store_true",
+                       help="Use original query behavior")
+
+    args = parser.parse_args()
+
+    if args.all_leagues:
+        # New mode: query all leagues
+        withPlayers = not args.no_players
+        all_results = QueryAllLeagues(withPlayers=withPlayers)
+        SaveResponse("AllLeagues_Combined", all_results)
+        print("\nFinished ripping all leagues from Betr API")
+    else:
+        # Original behavior
+        query_args = { "UpcomingEventsConditionalWithPlayers": { "league":"CFB", "withPlayers":False }}
+        queries = [
+            "TopTenPlayersData",
+            "AllLeaguesUpcomingEvents",
+            "LobbyTrendingEvents",
+            "UpcomingEventsConditionalWithPlayers",
+        ]
+        results = MakeRequests(queries, query_args)
+        SaveResponse("AllResults", results)
+        print("finished ripping Jake Paul's API")
 
