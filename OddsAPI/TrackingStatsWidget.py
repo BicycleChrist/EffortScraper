@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QScrollBar, QAbstractItemView, QSplitter, QLineEdit
 )
 import traceback
-
+import time
 import update_importpaths
 from MLBAnalytics import parkfactors
 from MLBpercentilerankings import fetch_leaderboard_data, PITCHER_URL, HITTER_URL
@@ -338,6 +338,7 @@ class AdvancedStatsWidget(QWidget):
 
     
     async def load_stuffplus_data(self):
+        start_time = time.time()
         try:
             if self.current_sport != 'baseball_mlb':
                 return
@@ -349,7 +350,9 @@ class AdvancedStatsWidget(QWidget):
                 df = self.cached_data[cache_key]
             else:
                 df = await asyncio.get_event_loop().run_in_executor(None, self.fetch_stuffplus_data)
+                print(f"Fetch took: {time.time() - start_time:.2f}s")
                 df['type'] = 'Pitcher'
+                print(f"DataFrame prep took: {time.time() - start_time:.2f}s")
                 if df is None or df.empty:
                     raise Exception("Failed to fetch Stuff+ data")
                     
@@ -360,6 +363,8 @@ class AdvancedStatsWidget(QWidget):
             
             # Display the data
             self.display_stats_data(df)
+            print(f"Table display took: {time.time() - start_time:.2f}s")
+
             
             # Highlight pitchers using cached pitcher list
             if self.stored_pitchers is None:
@@ -610,7 +615,7 @@ class AdvancedStatsWidget(QWidget):
         """Load the specified stats data type (NBA only)"""
         if not self.stats_client or self.current_sport != 'basketball_nba':
             return
-        
+
         try:
             # Check cache first
             cache_key = self.get_cache_key()
@@ -619,23 +624,34 @@ class AdvancedStatsWidget(QWidget):
                 df = self.cached_data[cache_key]
             else:
                 df = None
+                # Use run_in_executor to avoid blocking the UI thread
                 if stats_type == "passing":
-                    df = self.stats_client.get_passing_stats()
+                    df = await asyncio.get_event_loop().run_in_executor(
+                        None, self.stats_client.get_passing_stats
+                    )
                 elif stats_type == "rebounding":
-                    df = self.stats_client.get_rebounding_stats()
+                    df = await asyncio.get_event_loop().run_in_executor(
+                        None, self.stats_client.get_rebounding_stats
+                    )
                 elif stats_type == "touches":
-                    df = self.stats_client.get_touches_stats()
+                    df = await asyncio.get_event_loop().run_in_executor(
+                        None, self.stats_client.get_touches_stats
+                    )
                 elif stats_type == "defense":
-                    df = self.stats_client.get_defense_stats()
+                    df = await asyncio.get_event_loop().run_in_executor(
+                        None, self.stats_client.get_defense_stats
+                    )
                 elif stats_type == "traditional":
-                    df = self.stats_client.get_traditional_stats()
-                
+                    df = await asyncio.get_event_loop().run_in_executor(
+                        None, self.stats_client.get_traditional_stats
+                    )
+
                 if df is not None and not df.empty:
                     # Store in cache
                     self.cached_data[cache_key] = df
                     self.cache_timestamp[cache_key] = pd.Timestamp.now()
                     print(f"Cached {stats_type} data at {self.cache_timestamp[cache_key]}")
-            
+
             if df is not None and not df.empty:
                 self.display_stats_data(df)
         except Exception as e:

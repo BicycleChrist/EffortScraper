@@ -15,13 +15,19 @@ class SimpleNBAStatsClient:
     
     # Common request headers to mimic browser behavior
     DEFAULT_HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'referer': 'https://www.nba.com/',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.nba.com/',
+        'Origin': 'https://www.nba.com',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
     }
     
-    def __init__(self, season="2024-25", season_type="Regular Season"):
+    def __init__(self, season="2025-26", season_type="Regular Season"):
         """Initialize the NBA Stats client"""
         self.season = season
         self.season_type = season_type
@@ -206,40 +212,61 @@ class SimpleNBAStatsClient:
         """Fetch data from the NBA API with caching and retry logic"""
         # Generate cache key
         cache_key = f"{url}_{str(params)}"
-        
+
         # Check cache first
         if cache_key in self.cache:
             return self.cache[cache_key]
-        
+
         # Add a small delay to avoid rate limiting
         time.sleep(0.6)
-        
+
         try:
             print(f"Fetching data from: {url}")
-            print(f"With params: {params}")
-            
-            response = requests.get(url, headers=self.DEFAULT_HEADERS, params=params, timeout=10)
-            
+            print(f"Season: {params.get('Season', 'N/A')}, MeasureType: {params.get('PtMeasureType', params.get('MeasureType', 'N/A'))}")
+
+            response = requests.get(url, headers=self.DEFAULT_HEADERS, params=params, timeout=20)
+
             # Print response info for debugging
             print(f"Response status: {response.status_code}")
-            
+
             # Check for successful response
             if response.status_code == 200:
                 data = response.json()
-                
+
+                # Check if we have result sets
+                if not data.get('resultSets') or not data['resultSets']:
+                    print(f"Warning: No result sets in response for season {params.get('Season')}")
+                    return pd.DataFrame()
+
                 # Extract data and create DataFrame
                 result_set = data['resultSets'][0]
+
+                # Check if we have data
+                if not result_set.get('rowSet'):
+                    print(f"Warning: No data in result set for season {params.get('Season')}")
+                    return pd.DataFrame()
+
                 df = pd.DataFrame(result_set['rowSet'], columns=result_set['headers'])
-                
+                print(f"Successfully fetched {len(df)} rows")
+
                 # Cache the result
                 self.cache[cache_key] = df
                 return df
             else:
                 print(f"Error: Received status code {response.status_code}")
+                print(f"Response: {response.text[:200]}")
                 return pd.DataFrame()
-                
+
+        except requests.Timeout:
+            print(f"Error: Request timed out after 20 seconds. The NBA stats API may be slow or down.")
+            return pd.DataFrame()
+        except requests.RequestException as e:
+            print(f"Error fetching data (network issue): {e}")
+            return pd.DataFrame()
         except Exception as e:
             print(f"Error fetching data: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
     
     def save_to_csv(self, df, filename=None):
