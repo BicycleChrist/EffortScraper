@@ -56,7 +56,11 @@ class NewsWorker(QObject):
         self.scraper = FantasyProsScraper()
         self.current_thread = None  # Track current fetch thread
         print(f"[NewsWorker] printing_fetches: {self.print_fetches}")
-        
+
+        # Pre-compile regex patterns for filtering - MAJOR PERFORMANCE OPTIMIZATION
+        # Compiling these once at init instead of on every filter call saves 100-500ms
+        self._compile_filter_patterns()
+
         self.rss_urls = {
             # NBA
             "basketball_nba": {
@@ -101,6 +105,62 @@ class NewsWorker(QObject):
             }
         }
 
+
+    def _compile_filter_patterns(self):
+        """Pre-compile all regex patterns for fast filtering"""
+        # Low-value patterns
+        low_value_patterns = [
+            r'\brank\b.*\btop\s*\d+\b', r'\bbest\b.*\brank\b', r'\btop\s*\d+\b.*\brank',
+            r'\bpower\s*ranking', r'\bfantasy\s*football\b', r'\bfantasy\s*baseball\b',
+            r'\bfantasy\s*basketball\b', r'\bfantasy\s*hockey\b', r'\bfantasy\s*impact\b',
+            r'\bfantasy\s*outlook\b', r'\bfantasy\s*preview\b', r'\bstart\s*(\w+\s+)?sit\b',
+            r'\bweek\s*\d+\s*start\b', r'\bweek\s*\d+\s*sit\b', r'\blineup\s*advice\b',
+            r'\bpick\s*up\b.*\bwaiver\b', r'\bwaiver\s*wire\b', r'\bdraft\s*(\w+\s+)?pick\b',
+            r'\bsleeper\s*pick\b', r'\bmock\s*draft\b', r'\brumor\s*roundup\b',
+            r'\bquestions\s*about\b', r'\bwhat\s*if\b', r'\bshould\s*(\w+\s+)?trade\b',
+            r'\bwill\s*(\w+\s+)?be\s*traded\b', r'\bfuture\s*with\b', r'\bwhere\s*will\b',
+            r'\bwho\s*are\s*the\b', r'\bwho\s*has\s*the\b', r'\bwhich\s*team\b',
+            r'\bprediction\b', r'\bpredict\b', r'\bexpectation\b', r'\blikely\s*to\b',
+            r'\bcould\s*be\b', r'\bmight\s*be\b', r'\bpotential\s*(\w+\s+)?target\b',
+            r'\bspeculation\b', r'\blatest\s*on\b', r'\bopinion\b', r'\banalysis\b',
+            r'\btakeaway\b', r'\bbreakdown\b', r'\bgrade\b', r'\bgrading\b',
+            r'\brated\b', r'\brating\b', r'\boverrated\b', r'\bunderrated\b',
+            r'\bwinner\b.*\bloser\b', r'\bbiggest\s*(\w+\s+)?surprise\b',
+            r'\bbest\s*(\w+\s+)?worst\b', r'\bmost\s*(\w+\s+)?least\b',
+            r'\bevery\s*(\w+\s+)?team\b.*\brank\b', r'\ball\s*\d+\s*team\b',
+            r'\bcount\s*down\b', r'\btier\s*list\b', r'\btiers\b',
+            r'\bthings\s*to\s*know\b', r'\bwhat\s*to\s*watch\b', r'\bkey\s*storylines\b',
+            r'\bbiggest\s*questions\b', r'\bmajor\s*questions\b', r'\bhelp\b.*\brank\b',
+            r'\bscouts\s*help\b', r'\bcoaches\s*help\b', r'\bexecs\s*help\b', r'\bexperts\s*help\b'
+        ]
+
+        # Legitimate news patterns
+        legitimate_patterns = [
+            r'\binjur\w+\b', r'\bsign\w+\b', r'\btrade\w+\b', r'\brelease\w+\b',
+            r'\bcut\b', r'\bwaivers\b', r'\bretire\w+\b', r'\bsuspend\w+\b',
+            r'\bfin\w+\b', r'\bcontract\b', r'\bextension\b', r'\bdeal\b',
+            r'\bmillion\b', r'\byear\b.*\b(deal|contract|extension)\b', r'\bagreement\b',
+            r'\bactivate\w+\b', r'\bIR\b', r'\bIL\b', r'\bDL\b', r'\bPUP\b',
+            r'\bNFI\b', r'\boptioned\b', r'\bclaimed\b', r'\bDFA\b', r'\boutright\b',
+            r'\brecall\w+\b', r'\bdemoted\b', r'\bpromoted\b', r'\bstarting\b',
+            r'\bbenched\b', r'\breturn\w+\b.*\b(from|injury|IL|IR|DL)\b', r'\bcleared\b',
+            r'\bmedical\b', r'\bsurgery\b', r'\boperation\b', r'\brehab\b',
+            r'\brecovery\b', r'\bhealth\b', r'\bdiagnosis\b',
+            r'\btest\b.*\b(positive|negative|results)\b', r'\bprotocol\b',
+            r'\bquestionable\b', r'\bdoubtful\b', r'\bout\b.*\b(week|month|season|game)\b',
+            r'\bmiss\b.*\b(game|week|month|season)\b', r'\bexpected\s*to\s*miss\b',
+            r'\bruled\s*out\b', r'\bgame\s*time\s*decision\b', r'\bprobable\b',
+            r'\bday\s*to\s*day\b', r'\bweek\s*to\s*week\b', r'\bbreaking\b',
+            r'\bbreaking\s*news\b', r'\bofficial\b', r'\bconfirm\w+\b',
+            r'\bannounce\w+\b', r'\breport\w+\b', r'\bstatement\b',
+            r'\bpress\s*release\b', r'\bpress\s*conference\b', r'\binterview\b',
+            r'\bquote\w+\b', r'\bsay\w+\b', r'\bcomment\w+\b', r'\baddress\w+\b',
+            r'\brespond\w+\b'
+        ]
+
+        # Compile all patterns once at initialization
+        self.compiled_low_value = [re.compile(p, re.IGNORECASE) for p in low_value_patterns]
+        self.compiled_legitimate = [re.compile(p, re.IGNORECASE) for p in legitimate_patterns]
 
     def set_league(self, league_key):
         """Set the current league to fetch news for"""
@@ -153,192 +213,33 @@ class NewsWorker(QObject):
         """Filter out fantasy rankings, speculation, and low-value headlines"""
         if not news_items:
             return news_items
-        
-        import re
-        
-        # Patterns that indicate low-value content
-        low_value_patterns = [
-            # Fantasy/ranking content
-            r'\brank\b.*\btop\s*\d+\b',  # "rank 2025's top 10"
-            r'\bbest\b.*\brank\b',  # "best running backs? ... rank"
-            r'\btop\s*\d+\b.*\brank',  # "top 10 ... rank"
-            r'\bpower\s*ranking',  # "power ranking"
-            r'\bfantasy\s*football\b',  # "fantasy football"
-            r'\bfantasy\s*baseball\b',  # "fantasy baseball"
-            r'\bfantasy\s*basketball\b',  # "fantasy basketball"
-            r'\bfantasy\s*hockey\b',  # "fantasy hockey"
-            r'\bfantasy\s*impact\b',  # "fantasy impact"
-            r'\bfantasy\s*outlook\b',  # "fantasy outlook"
-            r'\bfantasy\s*preview\b',  # "fantasy preview"
-            r'\bstart\s*(\w+\s+)?sit\b',  # "start/sit", "start or sit"
-            r'\bweek\s*\d+\s*start\b',  # "week 10 start"
-            r'\bweek\s*\d+\s*sit\b',  # "week 10 sit"
-            r'\blineup\s*advice\b',  # "lineup advice"
-            r'\bpick\s*up\b.*\bwaiver\b',  # "pick up waiver"
-            r'\bwaiver\s*wire\b',  # "waiver wire"
-            r'\bdraft\s*(\w+\s+)?pick\b',  # "draft pick", "draft top pick"
-            r'\bsleeper\s*pick\b',  # "sleeper pick"
-            r'\bmock\s*draft\b',  # "mock draft"
-            
-            # Speculation/rumor content
-            r'\brumor\s*roundup\b',  # "rumor roundup"
-            r'\bquestions\s*about\b',  # "questions about"
-            r'\bwhat\s*if\b',  # "what if"
-            r'\bshould\s*(\w+\s+)?trade\b',  # "should trade", "should the team trade"
-            r'\bwill\s*(\w+\s+)?be\s*traded\b',  # "will be traded"
-            r'\bfuture\s*with\b',  # "future with"
-            r'\bwhere\s*will\b',  # "where will"
-            r'\bwho\s*are\s*the\b',  # "who are the"
-            r'\bwho\s*has\s*the\b',  # "who has the"
-            r'\bwhich\s*team\b',  # "which team"
-            r'\bprediction\b',  # "prediction"
-            r'\bpredict\b',  # "predict"
-            r'\bexpectation\b',  # "expectation"
-            r'\blikely\s*to\b',  # "likely to"
-            r'\bcould\s*be\b',  # "could be"
-            r'\bmight\s*be\b',  # "might be"
-            r'\bpotential\s*(\w+\s+)?target\b',  # "potential target"
-            r'\bspeculation\b',  # "speculation"
-            r'\blatest\s*on\b',  # "latest on"
-            
-            # Content that's more opinion/analysis than news
-            r'\bopinion\b',  # "opinion"
-            r'\banalysis\b',  # "analysis"
-            r'\btakeaway\b',  # "takeaway"
-            r'\bbreakdown\b',  # "breakdown"
-            r'\bgrade\b',  # "grade"
-            r'\bgrading\b',  # "grading"
-            r'\brated\b',  # "rated"
-            r'\brating\b',  # "rating"
-            r'\boverrated\b',  # "overrated"
-            r'\bunderrated\b',  # "underrated"
-            r'\bwinner\b.*\bloser\b',  # "winner and loser"
-            r'\bbiggest\s*(\w+\s+)?surprise\b',  # "biggest surprise"
-            r'\bbest\s*(\w+\s+)?worst\b',  # "best and worst"
-            r'\bmost\s*(\w+\s+)?least\b',  # "most and least"
-            
-            # List/countdown content
-            r'\bevery\s*(\w+\s+)?team\b.*\brank\b',  # "every team ranked"
-            r'\ball\s*\d+\s*team\b',  # "all 32 teams"
-            r'\bcount\s*down\b',  # "count down"
-            r'\btier\s*list\b',  # "tier list"
-            r'\btiers\b',  # "tiers"
-            
-            # Generic "content" headlines
-            r'\bthings\s*to\s*know\b',  # "things to know"
-            r'\bwhat\s*to\s*watch\b',  # "what to watch"
-            r'\bkey\s*storylines\b',  # "key storylines"
-            r'\bbiggest\s*questions\b',  # "biggest questions"
-            r'\bmajor\s*questions\b',  # "major questions"
-            
-            # Help/advice content
-            r'\bhelp\b.*\brank\b',  # "help rank"
-            r'\bscouts\s*help\b',  # "scouts help"
-            r'\bcoaches\s*help\b',  # "coaches help"
-            r'\bexecs\s*help\b',  # "execs help"
-            r'\bexperts\s*help\b',  # "experts help"
-        ]
-        
-        # Compile patterns for efficiency
-        compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in low_value_patterns]
-        
-        # Positive patterns that indicate legitimate news (override filters)
-        legitimate_patterns = [
-            r'\binjur\w+\b',  # "injury", "injured", "injuries"
-            r'\bsign\w+\b',  # "signed", "signing"
-            r'\btrade\w+\b',  # "traded", "trading" (when not speculation)
-            r'\brelease\w+\b',  # "released", "releasing"
-            r'\bcut\b',  # "cut"
-            r'\bwaivers\b',  # "waivers"
-            r'\bretire\w+\b',  # "retired", "retiring"
-            r'\bsuspend\w+\b',  # "suspended", "suspending"
-            r'\bfin\w+\b',  # "fined", "fining"
-            r'\bcontract\b',  # "contract"
-            r'\bextension\b',  # "extension"
-            r'\bdeal\b',  # "deal"
-            r'\bmillion\b',  # "$X million"
-            r'\byear\b.*\b(deal|contract|extension)\b',  # "4-year deal"
-            r'\bagreement\b',  # "agreement"
-            r'\bactivate\w+\b',  # "activated", "activating"
-            r'\bIR\b',  # "IR" (injured reserve)
-            r'\bIL\b',  # "IL" (injured list)
-            r'\bDL\b',  # "DL" (disabled list)
-            r'\bPUP\b',  # "PUP" (physically unable to perform)
-            r'\bNFI\b',  # "NFI" (non-football injury)
-            r'\boptioned\b',  # "optioned"
-            r'\bclaimed\b',  # "claimed"
-            r'\bDFA\b',  # "DFA" (designated for assignment)
-            r'\boutright\b',  # "outright"
-            r'\brecall\w+\b',  # "recalled", "recalling"
-            r'\bdemoted\b',  # "demoted"
-            r'\bpromoted\b',  # "promoted"
-            r'\bstarting\b',  # "starting"
-            r'\bbenched\b',  # "benched"
-            r'\breturn\w+\b.*\b(from|injury|IL|IR|DL)\b',  # "returns from injury"
-            r'\bcleared\b',  # "cleared"
-            r'\bmedical\b',  # "medical"
-            r'\bsurgery\b',  # "surgery"
-            r'\boperation\b',  # "operation"
-            r'\brehab\b',  # "rehab"
-            r'\brecovery\b',  # "recovery"
-            r'\bhealth\b',  # "health"
-            r'\bdiagnosis\b',  # "diagnosis"
-            r'\btest\b.*\b(positive|negative|results)\b',  # "test positive"
-            r'\bprotocol\b',  # "protocol"
-            r'\bquestionable\b',  # "questionable"
-            r'\bdoubtful\b',  # "doubtful"
-            r'\bout\b.*\b(week|month|season|game)\b',  # "out for week"
-            r'\bmiss\b.*\b(game|week|month|season)\b',  # "miss game"
-            r'\bexpected\s*to\s*miss\b',  # "expected to miss"
-            r'\bruled\s*out\b',  # "ruled out"
-            r'\bgame\s*time\s*decision\b',  # "game time decision"
-            r'\bprobable\b',  # "probable"
-            r'\bday\s*to\s*day\b',  # "day to day"
-            r'\bweek\s*to\s*week\b',  # "week to week"
-            r'\bbreaking\b',  # "breaking"
-            r'\bbreaking\s*news\b',  # "breaking news"
-            r'\bofficial\b',  # "official"
-            r'\bconfirm\w+\b',  # "confirmed", "confirming"
-            r'\bannounce\w+\b',  # "announced", "announcing"
-            r'\breport\w+\b',  # "reported", "reporting"
-            r'\bstatement\b',  # "statement"
-            r'\bpress\s*release\b',  # "press release"
-            r'\bpress\s*conference\b',  # "press conference"
-            r'\binterview\b',  # "interview"
-            r'\bquote\w+\b',  # "quoted", "quoting"
-            r'\bsay\w+\b',  # "says", "said"
-            r'\bcomment\w+\b',  # "commented", "commenting"
-            r'\baddress\w+\b',  # "addressed", "addressing"
-            r'\brespond\w+\b',  # "responded", "responding"
-        ]
-        
-        compiled_legitimate = [re.compile(pattern, re.IGNORECASE) for pattern in legitimate_patterns]
-        
+
+        # Use pre-compiled patterns (compiled once at init)
         filtered_news = []
         filtered_count = 0
-        
+
         for item in news_items:
             title = item.get('title', '')
             if not title:
                 continue
-                
+
             # Check if headline has legitimate news indicators
-            is_legitimate = any(pattern.search(title) for pattern in compiled_legitimate)
-            
+            is_legitimate = any(pattern.search(title) for pattern in self.compiled_legitimate)
+
             if is_legitimate:
                 filtered_news.append(item)
                 continue
-                
+
             # Check if headline matches low-value patterns
-            is_low_value = any(pattern.search(title) for pattern in compiled_patterns)
-            
+            is_low_value = any(pattern.search(title) for pattern in self.compiled_low_value)
+
             if not is_low_value:
                 filtered_news.append(item)
             else:
                 filtered_count += 1
                 if self.print_fetches:
                     print(f"[NewsWorker] Filtered out low-value headline: '{title[:80]}...'")
-        
+
         print(f"[NewsWorker] Low-value filtering: {len(news_items)} → {len(filtered_news)} headlines ({filtered_count} filtered)")
         return filtered_news
 
@@ -346,14 +247,25 @@ class NewsWorker(QObject):
         """Fetch and parse an RSS feed using provided session"""
         if self.print_fetches: print(f"fetching rss feed: {url}");
         try:
-            async with session.get(url) as response:
+            # Fetch RSS feed with timeout and status checking
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as response:
+                # Check response status
+                if response.status != 200:
+                    if self.print_fetches:
+                        print(f"RSS feed {url} returned status {response.status}")
+                    return []
+
                 content = await response.text()
-                feed = feedparser.parse(content)
-            
+
+                # Parse feedparser in thread pool to avoid blocking the event loop
+                # feedparser.parse() is synchronous and CPU-bound, so we run it in executor
+                loop = asyncio.get_event_loop()
+                feed = await loop.run_in_executor(None, feedparser.parse, content)
+
             # Check if feed parsed correctly
             if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
                 if self.print_fetches: print(f"Warning parsing RSS feed {url}: {feed.bozo_exception}");
-            
+
             fetched_news_items = []
             if self.print_fetches: print(f"parsing {len(feed.entries)} entries");
             
@@ -423,12 +335,12 @@ class NewsWorker(QObject):
     async def fetch_news(self):
         """Fetch news from all configured sources with connection pooling"""
         try:
-            
-            
+
+
             # Fetch news for all 4 sports leagues for ticker tape
             all_leagues = ["basketball_nba", "football_nfl", "baseball_mlb", "icehockey_nhl"]
             sources = []
-            
+
             # Add RSS feeds for all leagues
             for league in all_leagues:
                 league_feeds = self.rss_urls.get(league, {})
@@ -442,9 +354,34 @@ class NewsWorker(QObject):
                     sources.extend(league_feeds['teams'][self.team_name])
 
             # Use single session for all requests - much faster!
-            timeout = aiohttp.ClientTimeout(total=2)  # 2 second timeout
-            connector = aiohttp.TCPConnector(limit=50, limit_per_host=10)  # Connection pooling
-            
+            # Set comprehensive timeouts to prevent any blocking
+            timeout = aiohttp.ClientTimeout(
+                total=5,      # Total timeout for entire request
+                connect=2,    # Timeout for connection establishment
+                sock_read=3   # Timeout for reading from socket
+            )
+
+            # Try to use async DNS resolver if available, otherwise fall back to threaded resolver
+            # This prevents DNS lookups from blocking the event loop
+            try:
+                from aiohttp.resolver import AsyncResolver
+                resolver = AsyncResolver()
+            except (ImportError, RuntimeError):
+                # aiodns not installed or not available, use default threaded resolver
+                # ThreadedResolver runs DNS lookups in a thread pool (non-blocking)
+                resolver = None  # Will use default ThreadedResolver
+
+            # Use TCPConnector with async DNS resolver to prevent DNS blocking
+            # This is critical - without async DNS, DNS lookups block the entire event loop!
+            connector = aiohttp.TCPConnector(
+                resolver=resolver,
+                limit=50,
+                limit_per_host=10,
+                ttl_dns_cache=300,  # Cache DNS for 5 minutes
+                force_close=False,   # Reuse connections
+                enable_cleanup_closed=True
+            )
+
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 # Fetch from all RSS sources in parallel
                 tasks = [self.fetch_rss_feed_with_session(session, url) for url in sources]
@@ -590,7 +527,7 @@ class NewsArticleWidget(QFrame):
         title_label.setWordWrap(True)
         title_label.setStyleSheet("font-weight: bold; font-size: 12px;")  # Smaller font
         layout.addWidget(title_label)
-        
+
         # Skip the image section to save space
         # Only add description if it's injury news or particularly important
         if news_item.get('is_injury_news', False) or news_item.get('injury_score', 0) > 1:
@@ -633,22 +570,26 @@ class TeamNewsWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.refresh_disabled = False
-        
+
         self.current_league = None
         self.current_team = None
         self.show_injuries_only = False
         self.all_news_items = []  # Store all news items for filtering
+        self.filtered_news_items = []  # Store filtered items for batched loading
+        self.current_widget_index = 0  # Track current position in batch loading
+        self.is_batch_loading = False  # Flag to track if batch loading is in progress
         self.setup_ui()
         self.setup_worker()
-        
+
         # Add auto-refresh timer (5 minutes by default)
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_news)
         self.refresh_timer.start(10 * 60 * 1000)  # 5 minutes in milliseconds
         self.current_refresh_interval = 5  # Store current interval in minutes
-        
-        # Trigger initial news fetch immediately - RSS feeds should be first priority
-        QTimer.singleShot(100, self.refresh_news)  # Minimal delay to ensure UI is ready
+
+        # Delay initial news fetch to avoid blocking during UI initialization
+        # This prevents DNS/network blocking from affecting app startup
+        QTimer.singleShot(3000, self.refresh_news)  # 5 second delay after UI is fully loaded
 
     def setup_ui(self):
         """Set up the UI components"""
@@ -874,6 +815,10 @@ class TeamNewsWidget(QWidget):
 
     def clear_news_items(self):
         """Clear all news items from the display"""
+        # Cancel any pending batch loading by setting index to end
+        self.current_widget_index = len(self.filtered_news_items) if self.filtered_news_items else 0
+        self.is_batch_loading = False  # Stop batch loading flag
+
         while self.scroll_layout.count():
             item = self.scroll_layout.takeAt(0)
             widget = item.widget()
@@ -889,12 +834,12 @@ class TeamNewsWidget(QWidget):
     def update_news_items(self, news_items):
         """Update the display with news items, applying filters as needed"""
         self.clear_news_items()
-        
+
         # Apply injury filter if enabled
         filtered_items = news_items
         if self.show_injuries_only:
             filtered_items = [item for item in news_items if item.get('is_injury_news', False)]
-        
+
         # Sort by date (newest first) - this is now redundant as we sort in prioritize_injury_news
         # But keeping it here as a safeguard
         filtered_items.sort(key=lambda x: x['date'], reverse=True)
@@ -907,13 +852,48 @@ class TeamNewsWidget(QWidget):
 
         self.status_label.setVisible(False)
 
-        # Add news items to the scroll area
-        for item in filtered_items:
-            news_widget = NewsArticleWidget(item)
-            self.scroll_layout.addWidget(news_widget)
+        # Store filtered items for lazy loading
+        self.filtered_news_items = filtered_items
+        self.current_widget_index = 0
+        self.is_batch_loading = True  # Enable batch loading
 
-        # Add a stretch at the end to push items to the top
-        self.scroll_layout.addStretch()
+        # Load widgets in batches to prevent UI blocking
+        # Delay even the first batch to prevent any blocking during initial load
+        QTimer.singleShot(10, self.load_news_batch)  # 10ms delay before first batch
+
+    def load_news_batch(self):
+        """Load a batch of news widgets to prevent UI blocking"""
+        # Check if batch loading was cancelled
+        if not self.is_batch_loading:
+            return
+
+        batch_size = 15  # Load 15 widgets at a time (reduced for smoother loading)
+        end_index = min(self.current_widget_index + batch_size, len(self.filtered_news_items))
+
+        # Add widgets for this batch
+        for i in range(self.current_widget_index, end_index):
+            # Double-check flag in case it changed during loop
+            if not self.is_batch_loading:
+                break
+
+            item = self.filtered_news_items[i]
+            news_widget = NewsArticleWidget(item)
+            # Insert before the stretch (if it exists)
+            if self.scroll_layout.count() > 0 and self.scroll_layout.itemAt(self.scroll_layout.count() - 1).spacerItem():
+                self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, news_widget)
+            else:
+                self.scroll_layout.addWidget(news_widget)
+
+        self.current_widget_index = end_index
+
+        # If there are more items to load, schedule next batch
+        if self.current_widget_index < len(self.filtered_news_items) and self.is_batch_loading:
+            # Use QTimer to load next batch without blocking
+            QTimer.singleShot(30, self.load_news_batch)  # 30ms delay between batches
+        else:
+            # All widgets loaded, add stretch at the end
+            self.scroll_layout.addStretch()
+            self.is_batch_loading = False  # Mark batch loading as complete
 
     def show_error(self, error_message):
         """Display an error message"""

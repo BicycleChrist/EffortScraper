@@ -751,6 +751,8 @@ class ModernOddsWindow(QMainWindow):
 
         # First, create a horizontal splitter for the bottom section
         self.horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Disable opaque resize for smooth dragging with news widget
+        self.horizontal_splitter.setOpaqueResize(False)
 
         # Add the news container to the left side of horizontal splitter
         self.horizontal_splitter.addWidget(self.news_container)
@@ -763,6 +765,8 @@ class ModernOddsWindow(QMainWindow):
 
         # Now create the vertical splitter with tab widget on top and horizontal splitter on bottom
         self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+        # CRITICAL FIX: Disable opaque resize to prevent expensive repaints during drag
+        self.vertical_splitter.setOpaqueResize(False)
         self.vertical_splitter.addWidget(self.tab_widget)
         self.vertical_splitter.addWidget(self.horizontal_splitter)
 
