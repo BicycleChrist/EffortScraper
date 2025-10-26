@@ -24,8 +24,12 @@ from effortcalculator import CalculatorApp
 from tickertape import TickerTape
 from polymarketquery import fetch_and_process_markets
 from prediction_markets_worker import PredictionMarketsWorker
+from LiquidityWidget import ProphetXBrowser
+from prophetx_async import ProphetXWorker
 import feedparser
 import traceback
+import qasync
+import asyncio
   # Use SUPER_KEY since ODDS_API_KEY is commented out
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
@@ -763,11 +767,42 @@ class ModernOddsWindow(QMainWindow):
         # Set initial sizes for horizontal splitter
         self.horizontal_splitter.setSizes([325, 325])  # Equal width initially
 
-        # Now create the vertical splitter with tab widget on top and horizontal splitter on bottom
+        # Create the compact liquidity widget (ProphetX order book browser)
+        self.liquidity_widget = ProphetXBrowser(compact_mode=True)
+        self.liquidity_widget.setMaximumWidth(400)  # Constrain max width to keep it compact
+        self.liquidity_widget.setMinimumWidth(250)  # Allow it to be narrower
+
+        # Initialize ProphetX worker for async data updates
+        # Refresh interval: 20 seconds (more frequent than main odds due to live orderbook changes)
+        self.prophetx_worker = ProphetXWorker(refresh_interval=20)
+        self.prophetx_worker_thread = QThread()
+        self.prophetx_worker.moveToThread(self.prophetx_worker_thread)
+
+        # Connect worker signals
+        self.prophetx_worker.data_ready.connect(self.liquidity_widget.updateEventMarkets)
+        self.prophetx_worker.error_occurred.connect(self.handle_prophetx_error)
+        self.prophetx_worker.status_update.connect(self.handle_prophetx_status)
+        self.prophetx_worker.fetch_requested.connect(self.fetch_prophetx_event)
+
+        # Connect widget's event selection to worker
+        self.liquidity_widget.event_selected.connect(self.on_prophetx_event_selected)
+
+        # Start worker thread (this will start the periodic refresh timer)
+        self.prophetx_worker_thread.started.connect(self.prophetx_worker.start)
+        self.prophetx_worker_thread.start()
+
+        # Create horizontal splitter for odds table + liquidity widget (side-by-side)
+        self.odds_liquidity_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.odds_liquidity_splitter.setOpaqueResize(False)
+        self.odds_liquidity_splitter.addWidget(self.tab_widget)  # Odds table on left
+        self.odds_liquidity_splitter.addWidget(self.liquidity_widget)  # Liquidity widget on right
+        self.odds_liquidity_splitter.setSizes([850, 150])  # ~85% odds table, ~15% liquidity widget
+
+        # Now create the vertical splitter with odds+liquidity on top and horizontal splitter on bottom
         self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
         # CRITICAL FIX: Disable opaque resize to prevent expensive repaints during drag
         self.vertical_splitter.setOpaqueResize(False)
-        self.vertical_splitter.addWidget(self.tab_widget)
+        self.vertical_splitter.addWidget(self.odds_liquidity_splitter)  # Changed from self.tab_widget
         self.vertical_splitter.addWidget(self.horizontal_splitter)
 
         # Set initial sizes for vertical splitter to show more of the tab widget
@@ -1996,6 +2031,40 @@ class ModernOddsWindow(QMainWindow):
         """Handle status updates from prediction markets worker"""
         print(f"Prediction markets status: {status_message}")
 
+    def on_prophetx_event_selected(self, event_id: int):
+        """Handle event selection from liquidity widget - trigger async refresh"""
+        print(f"ProphetX event selected: {event_id}")
+        # Update the worker's current event (this will trigger immediate fetch via signal)
+        self.prophetx_worker.set_event(event_id)
+
+    @qasync.asyncSlot(int)
+    async def fetch_prophetx_event(self, event_id: int):
+        """Fetch ProphetX event data asynchronously in main thread"""
+        try:
+            self.prophetx_worker.status_update.emit(f"Fetching ProphetX event {event_id}...")
+
+            async with aiohttp.ClientSession() as session:
+                from prophetx_async import GetEventMarketsAsync
+                markets_data = await GetEventMarketsAsync(session, event_id)
+
+                if markets_data:
+                    self.prophetx_worker.data_ready.emit(markets_data)
+                    num_markets = len(markets_data.get('data', {}).get('markets', []))
+                    self.prophetx_worker.status_update.emit(f"Updated {num_markets} markets")
+                else:
+                    self.prophetx_worker.error_occurred.emit(f"No data for event {event_id}")
+
+        except Exception as e:
+            self.prophetx_worker.error_occurred.emit(f"Error fetching event: {e}")
+
+    def handle_prophetx_error(self, error_message):
+        """Handle errors from ProphetX worker"""
+        print(f"ProphetX error: {error_message}")
+
+    def handle_prophetx_status(self, status_message):
+        """Handle status updates from ProphetX worker"""
+        print(f"ProphetX status: {status_message}")
+
     def closeEvent(self, event):
         """Clean up when the application is closing"""
         print("Application closing, cleaning up background operations...")
@@ -2004,6 +2073,16 @@ class ModernOddsWindow(QMainWindow):
         if hasattr(self, 'prediction_markets_worker'):
             print("Stopping prediction markets worker...")
             self.prediction_markets_worker.stop()
+
+        # Stop ProphetX worker
+        if hasattr(self, 'prophetx_worker'):
+            print("Stopping ProphetX worker...")
+            self.prophetx_worker.running = False
+            self.prophetx_worker_thread.quit()
+            if not self.prophetx_worker_thread.wait(2000):
+                print("ProphetX worker didn't stop gracefully, terminating...")
+                self.prophetx_worker_thread.terminate()
+                self.prophetx_worker_thread.wait(1000)
 
         # Stop team news widget worker
         if hasattr(self, 'team_news_widget') and hasattr(self.team_news_widget, 'worker_thread'):

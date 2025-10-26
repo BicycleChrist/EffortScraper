@@ -24,27 +24,41 @@ class OrderBookWidget(QWidget):
     Shows bid/ask ladder with liquidity depth similar to Polymarket.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, compact_mode=False):
         super().__init__(parent)
         self.current_market = None
         self.current_line = None
+        self.compact_mode = compact_mode
         self.initUI()
 
     def initUI(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        margins = 2 if self.compact_mode else 0
+        layout.setContentsMargins(margins, margins, margins, margins)
         layout.setSpacing(0)
 
-        # Header showing market info
-        header = self.createHeader()
-        layout.addWidget(header)
+        # Header showing market info (compact in compact mode)
+        if not self.compact_mode:
+            header = self.createHeader()
+            layout.addWidget(header)
+        else:
+            header = self.createCompactHeader()
+            layout.addWidget(header)
 
         # Order book table (all lines displayed)
         self.orderbook_table = QTableWidget()
-        self.orderbook_table.setColumnCount(5)
-        self.orderbook_table.setHorizontalHeaderLabels([
-            "SELECTION", "ODDS", "LIQUIDITY", "CUMULATIVE", "% OF BOOK"
-        ])
+
+        # In compact mode, hide some columns
+        if self.compact_mode:
+            self.orderbook_table.setColumnCount(3)
+            self.orderbook_table.setHorizontalHeaderLabels([
+                "SIDE", "ODDS", "LIQ"
+            ])
+        else:
+            self.orderbook_table.setColumnCount(5)
+            self.orderbook_table.setHorizontalHeaderLabels([
+                "SELECTION", "ODDS", "LIQUIDITY", "CUMULATIVE", "% OF BOOK"
+            ])
 
         # Styling
         self.orderbook_table.setAlternatingRowColors(False)
@@ -55,54 +69,92 @@ class OrderBookWidget(QWidget):
 
         # Set column widths
         header = self.orderbook_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        if self.compact_mode:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        else:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
 
-        # Font - larger size
-        book_font = QFont("Monospace", 14)
+        # Font - smaller in compact mode with better font family
+        font_size = 10 if self.compact_mode else 14
+        book_font = QFont("SF Mono", font_size)
         book_font.setStyleHint(QFont.StyleHint.Monospace)
+        book_font.setWeight(QFont.Weight.Medium)
+        book_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.5)
         self.orderbook_table.setFont(book_font)
 
-        # Row height for liquidity bars - increased
-        self.orderbook_table.verticalHeader().setDefaultSectionSize(50)
+        # Row height - needs to fit font + padding in compact mode
+        row_height = 28 if self.compact_mode else 50
+        self.orderbook_table.verticalHeader().setDefaultSectionSize(row_height)
+
+        # Minimize spacing in compact mode
+        if self.compact_mode:
+            self.orderbook_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+            self.orderbook_table.verticalHeader().setMinimumSectionSize(26)
 
         layout.addWidget(self.orderbook_table)
 
-        # Footer with spread info
-        self.footer_label = QLabel()
-        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.footer_label.setStyleSheet("""
-            QLabel {
-                background-color: #1a1d24;
-                color: #8a92a3;
-                padding: 12px;
-                font-size: 14px;
-                border-top: 1px solid #2a2d34;
-            }
-        """)
-        layout.addWidget(self.footer_label)
+        # Footer with spread info (compact or hidden in compact mode)
+        if not self.compact_mode:
+            self.footer_label = QLabel()
+            self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.footer_label.setStyleSheet("""
+                QLabel {
+                    background-color: #1a1d24;
+                    color: #8a92a3;
+                    padding: 12px;
+                    font-size: 14px;
+                    border-top: 1px solid #2a2d34;
+                }
+            """)
+            layout.addWidget(self.footer_label)
+        else:
+            self.footer_label = QLabel()
+            self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.footer_label.setStyleSheet("""
+                QLabel {
+                    background-color: #1a1d24;
+                    color: #8a92a3;
+                    padding: 2px;
+                    font-size: 8px;
+                    border-top: 1px solid #2a2d34;
+                }
+            """)
+            layout.addWidget(self.footer_label)
 
-        self.setStyleSheet("""
-            QTableWidget {
+        # Styling - compact padding in compact mode
+        padding = "4px 4px" if self.compact_mode else "12px"
+        header_padding = "4px" if self.compact_mode else "12px"
+        header_font_size = "9px" if self.compact_mode else "13px"
+
+        self.setStyleSheet(f"""
+            QTableWidget {{
                 background-color: #0d0f14;
                 border: none;
-                color: #ffffff;
-            }
-            QTableWidget::item {
-                padding: 12px;
+                color: #e8e9ed;
+                gridline-color: transparent;
+            }}
+            QTableWidget::item {{
+                padding: {padding};
                 border: none;
-            }
-            QHeaderView::section {
+                margin: 0px;
+                background-color: rgba(26, 29, 36, 0.3);
+            }}
+            QHeaderView::section {{
                 background-color: #1a1d24;
-                color: #8a92a3;
-                padding: 12px;
+                color: #9ca3af;
+                padding: {header_padding};
                 border: none;
-                font-weight: bold;
-                font-size: 13px;
-            }
+                font-weight: 600;
+                font-size: {header_font_size};
+                letter-spacing: 0.5px;
+                text-transform: uppercase;
+            }}
         """)
 
     def createHeader(self):
@@ -127,6 +179,38 @@ class OrderBookWidget(QWidget):
         self.stake_label = QLabel()
         self.stake_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.stake_label.setStyleSheet("color: #8a92a3; font-size: 13px;")
+        layout.addWidget(self.stake_label)
+
+        return header
+
+    def createCompactHeader(self):
+        """Create compact header for terminal integration"""
+        header = QFrame()
+        header.setStyleSheet("""
+            QFrame {
+                background-color: #1a1d24;
+                border-bottom: 1px solid #2a2d34;
+            }
+            QLabel {
+                color: #ffffff;
+                padding: 1px;
+            }
+        """)
+
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(8)
+
+        self.market_title = QLabel("Select market")
+        self.market_title.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.market_title.setWordWrap(True)
+        layout.addWidget(self.market_title)
+
+        layout.addStretch()
+
+        self.stake_label = QLabel()
+        self.stake_label.setStyleSheet("color: #8a92a3; font-size: 9px; font-weight: bold;")
+        self.stake_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.stake_label)
 
         return header
@@ -266,17 +350,29 @@ class OrderBookWidget(QWidget):
 
     def renderSeparatorRow(self, row: int):
         """Render a separator row between asks and bids showing the spread"""
-        separator = QTableWidgetItem("───── SPREAD ─────")
+        if self.compact_mode:
+            separator = QTableWidgetItem("─ SPREAD ─")
+            font_size = 9
+            row_height = 24
+            colspan = 3
+        else:
+            separator = QTableWidgetItem("───── SPREAD ─────")
+            font_size = 12
+            row_height = 40
+            colspan = 5
+
         separator.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        separator.setFont(QFont("Monospace", 12, QFont.Weight.Bold))
-        separator.setForeground(QColor(100, 150, 255))  # Blue
-        separator.setBackground(QColor(30, 35, 45))
+        sep_font = QFont("SF Mono", font_size, QFont.Weight.Bold)
+        sep_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        separator.setFont(sep_font)
+        separator.setForeground(QColor(96, 165, 250))  # Professional blue
+        separator.setBackground(QColor(31, 41, 55))  # Darker gray-blue
 
         self.orderbook_table.setItem(row, 0, separator)
-        self.orderbook_table.setSpan(row, 0, 1, 5)
+        self.orderbook_table.setSpan(row, 0, 1, colspan)
 
         # Set row height slightly larger for visual separation
-        self.orderbook_table.setRowHeight(row, 40)
+        self.orderbook_table.setRowHeight(row, row_height)
 
     def renderOrderRow(self, row: int, order: Dict, max_stake: float, cumulative: float, total_liquidity: float):
         """Render a single order book row with team/selection, odds, liquidity, cumulative, and percentage"""
@@ -294,18 +390,40 @@ class OrderBookWidget(QWidget):
         # Calculate percentage of total book
         percentage = (value / total_liquidity * 100) if total_liquidity > 0 else 0
 
-        # Create widgets
-        selection_item = self.createSelectionItem(display_name, side_type)
-        odds_widget = self.createLiquidityBarWidget(display_odds, bar_width, side_type)
-        liquidity_item = self.createPlainItem(f"${value:,.2f}")
-        cumulative_item = self.createPlainItem(f"${cumulative:,.2f}")
-        percentage_item = self.createPercentageItem(f"{percentage:.1f}%", percentage)
+        if self.compact_mode:
+            # Compact mode: only 3 columns - SIDE, ODDS, LIQ
+            # Use abbreviated name for side column
+            side_name = order.get('abbreviatedName', display_name)
+            # Shorten even more if too long
+            if len(side_name) > 10:
+                side_name = side_name[:8] + ".."
 
-        self.orderbook_table.setItem(row, 0, selection_item)
-        self.orderbook_table.setCellWidget(row, 1, odds_widget)
-        self.orderbook_table.setItem(row, 2, liquidity_item)
-        self.orderbook_table.setItem(row, 3, cumulative_item)
-        self.orderbook_table.setItem(row, 4, percentage_item)
+            selection_item = self.createSelectionItem(side_name, side_type)
+            odds_widget = self.createLiquidityBarWidget(display_odds, bar_width, side_type)
+
+            # Compact liquidity display
+            if value >= 1000:
+                liquidity_text = f"${value/1000:.1f}k"
+            else:
+                liquidity_text = f"${value:.0f}"
+            liquidity_item = self.createPlainItem(liquidity_text)
+
+            self.orderbook_table.setItem(row, 0, selection_item)
+            self.orderbook_table.setCellWidget(row, 1, odds_widget)
+            self.orderbook_table.setItem(row, 2, liquidity_item)
+        else:
+            # Full mode: all 5 columns
+            selection_item = self.createSelectionItem(display_name, side_type)
+            odds_widget = self.createLiquidityBarWidget(display_odds, bar_width, side_type)
+            liquidity_item = self.createPlainItem(f"${value:,.2f}")
+            cumulative_item = self.createPlainItem(f"${cumulative:,.2f}")
+            percentage_item = self.createPercentageItem(f"{percentage:.1f}%", percentage)
+
+            self.orderbook_table.setItem(row, 0, selection_item)
+            self.orderbook_table.setCellWidget(row, 1, odds_widget)
+            self.orderbook_table.setItem(row, 2, liquidity_item)
+            self.orderbook_table.setItem(row, 3, cumulative_item)
+            self.orderbook_table.setItem(row, 4, percentage_item)
 
     def createLiquidityBarWidget(self, odds: str, bar_width: int, side_type: str) -> QWidget:
         """
@@ -317,37 +435,51 @@ class OrderBookWidget(QWidget):
             side_type: 'ask' or 'bid' for color coding
         """
         widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(12)
+
+        # Adjust layout and font size for compact mode
+        if self.compact_mode:
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(2, 1, 2, 1)
+            layout.setSpacing(2)
+            odds_font_size = 10
+        else:
+            layout = QHBoxLayout(widget)
+            layout.setContentsMargins(8, 4, 8, 4)
+            layout.setSpacing(12)
+            odds_font_size = 16
 
         # Odds label
         odds_label = QLabel(odds)
-        odds_label.setFont(QFont("Monospace", 16, QFont.Weight.Bold))
+        odds_font = QFont("SF Mono", odds_font_size, QFont.Weight.DemiBold)
+        odds_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        odds_label.setFont(odds_font)
 
         if side_type == 'ask':
-            # Red for asks
-            odds_label.setStyleSheet("color: #EF5350;")
-            bar_color = "239, 83, 80"  # Red
+            # Refined red for asks - more professional crimson
+            odds_label.setStyleSheet("color: #f87171; font-weight: 600;")
+            bar_color = "248, 113, 113"  # Softer red
         else:
-            # Green for bids
-            odds_label.setStyleSheet("color: #26A69A;")
-            bar_color = "38, 166, 154"  # Teal/Green
+            # Refined green for bids - professional emerald
+            odds_label.setStyleSheet("color: #34d399; font-weight: 600;")
+            bar_color = "52, 211, 153"  # Softer emerald
 
         layout.addWidget(odds_label)
         layout.addStretch()
 
-        # Apply gradient background based on liquidity
-        # More liquidity = more opaque bar
-        opacity = min(int(bar_width * 0.5), 50)  # Max 50% opacity
+        # Apply refined gradient background based on liquidity
+        # More liquidity = more opaque bar with smoother transitions
+        opacity = min(int(bar_width * 0.35), 35)  # Max 35% opacity for subtlety
+        edge_opacity = max(int(opacity * 0.6), 8)  # Softer edge
         widget.setStyleSheet(f"""
             QWidget {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 rgba({bar_color}, {opacity}),
-                    stop:{bar_width/100:.2f} rgba({bar_color}, {opacity}),
+                    stop:{bar_width/100 * 0.7:.2f} rgba({bar_color}, {opacity}),
+                    stop:{bar_width/100:.2f} rgba({bar_color}, {edge_opacity}),
                     stop:{bar_width/100:.2f} rgba(13, 15, 20, 0),
                     stop:1 rgba(13, 15, 20, 0));
-                border-radius: 3px;
+                border-radius: 4px;
+                border: 1px solid rgba({bar_color}, {min(opacity + 10, 45)});
             }}
         """)
 
@@ -357,12 +489,17 @@ class OrderBookWidget(QWidget):
         """Create selection/team name item with color coding"""
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        item.setFont(QFont("Monospace", 13, QFont.Weight.Bold))
+
+        # Use smaller font in compact mode with better font
+        font_size = 8 if self.compact_mode else 13
+        selection_font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
+        selection_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        item.setFont(selection_font)
 
         if side_type == 'ask':
-            item.setForeground(QColor(239, 83, 80))  # Red for underdogs/positive odds
+            item.setForeground(QColor(252, 165, 165))  # Softer red for underdogs
         else:
-            item.setForeground(QColor(38, 166, 154))  # Green for favorites/negative odds
+            item.setForeground(QColor(110, 231, 183))  # Softer green for favorites
 
         return item
 
@@ -370,23 +507,33 @@ class OrderBookWidget(QWidget):
         """Create plain text table item"""
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        item.setForeground(QColor(200, 200, 200))
-        item.setFont(QFont("Monospace", 13))
+        item.setForeground(QColor(209, 213, 219))  # Professional gray
+
+        # Use smaller font in compact mode with better font
+        font_size = 8 if self.compact_mode else 13
+        plain_font = QFont("SF Mono", font_size, QFont.Weight.Normal)
+        plain_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        item.setFont(plain_font)
         return item
 
     def createPercentageItem(self, text: str, percentage: float) -> QTableWidgetItem:
         """Create percentage item with color intensity based on percentage"""
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        item.setFont(QFont("Monospace", 13, QFont.Weight.Bold))
 
-        # Color code by percentage - higher percentages are brighter
+        # Use smaller font in compact mode with better font
+        font_size = 8 if self.compact_mode else 13
+        pct_font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
+        pct_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        item.setFont(pct_font)
+
+        # Refined color coding - more professional amber/gold tones
         if percentage >= 10:
-            item.setForeground(QColor(255, 200, 50))  # Gold for large orders
+            item.setForeground(QColor(251, 191, 36))  # Professional amber for large orders
         elif percentage >= 5:
-            item.setForeground(QColor(255, 255, 100))  # Yellow for medium orders
+            item.setForeground(QColor(252, 211, 77))  # Lighter amber for medium orders
         else:
-            item.setForeground(QColor(150, 150, 150))  # Gray for small orders
+            item.setForeground(QColor(156, 163, 175))  # Muted gray for small orders
 
         return item
 
@@ -403,25 +550,37 @@ class ProphetXBrowser(QWidget):
     Includes event search, market selection, and order book display.
     """
 
-    def __init__(self, parent=None):
+    # Signal emitted when user selects an event (emits event_id)
+    event_selected = pyqtSignal(int)
+
+    def __init__(self, parent=None, compact_mode=False):
         super().__init__(parent)
         self.all_events = {}
         self.filtered_events = []
         self.current_event_data = None
+        self.current_event_id = None
+        self.compact_mode = compact_mode
         self.initUI()
 
     def initUI(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        margins = 2 if self.compact_mode else 0
+        main_layout.setContentsMargins(margins, margins, margins, margins)
         main_layout.setSpacing(0)
 
-        # Top section: Market selector and order book
-        top_panel = self.createOrderBookPanel()
-        main_layout.addWidget(top_panel, 3)  # Give more space to order book
+        if self.compact_mode:
+            # Compact mode: only show event/market selector and orderbook
+            top_panel = self.createCompactOrderBookPanel()
+            main_layout.addWidget(top_panel)
+        else:
+            # Full mode: show everything
+            # Top section: Market selector and order book
+            top_panel = self.createOrderBookPanel()
+            main_layout.addWidget(top_panel, 3)  # Give more space to order book
 
-        # Bottom section: Event browser
-        bottom_panel = self.createEventBrowserPanel()
-        main_layout.addWidget(bottom_panel, 1)  # Give less space to event list
+            # Bottom section: Event browser
+            bottom_panel = self.createEventBrowserPanel()
+            main_layout.addWidget(bottom_panel, 1)  # Give less space to event list
 
         # Auto-load latest data if available
         self.loadLatestData()
@@ -486,6 +645,86 @@ class ProphetXBrowser(QWidget):
 
         # Order book widget (shows all lines automatically)
         self.orderbook = OrderBookWidget()
+        layout.addWidget(self.orderbook, 1)
+
+        panel.setStyleSheet("background-color: #0d0f14;")
+        return panel
+
+    def createCompactOrderBookPanel(self):
+        """Create compact panel for terminal integration - event/market selector + orderbook only"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setSpacing(1)
+
+        # Create horizontal layout for side-by-side dropdowns
+        dropdown_row = QHBoxLayout()
+        dropdown_row.setSpacing(4)
+
+        # Compact event selector
+        self.event_combo = QComboBox()
+        self.event_combo.currentIndexChanged.connect(self.onCompactEventSelected)
+        self.event_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #1a1d24;
+                border: 1px solid #2a2d34;
+                border-radius: 2px;
+                padding: 2px 4px;
+                color: #ffffff;
+                font-size: 9px;
+                min-height: 18px;
+                max-height: 22px;
+            }
+            QComboBox:hover {
+                border: 1px solid #4a9eff;
+            }
+            QComboBox::drop-down {
+                width: 15px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1a1d24;
+                border: 1px solid #2a2d34;
+                selection-background-color: #2a4a7a;
+                color: #ffffff;
+                font-size: 9px;
+            }
+        """)
+        dropdown_row.addWidget(self.event_combo, 1)
+
+        # Compact market selector
+        self.market_combo = QComboBox()
+        self.market_combo.currentIndexChanged.connect(self.onMarketSelected)
+        self.market_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #1a1d24;
+                border: 1px solid #2a2d34;
+                border-radius: 2px;
+                padding: 2px 4px;
+                color: #ffffff;
+                font-size: 9px;
+                min-height: 18px;
+                max-height: 22px;
+            }
+            QComboBox:hover {
+                border: 1px solid #4a9eff;
+            }
+            QComboBox::drop-down {
+                width: 15px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1a1d24;
+                border: 1px solid #2a2d34;
+                selection-background-color: #2a4a7a;
+                color: #ffffff;
+                font-size: 8px;
+            }
+        """)
+        dropdown_row.addWidget(self.market_combo, 1)
+
+        layout.addLayout(dropdown_row)
+
+        # Order book widget in compact mode
+        self.orderbook = OrderBookWidget(compact_mode=True)
         layout.addWidget(self.orderbook, 1)
 
         panel.setStyleSheet("background-color: #0d0f14;")
@@ -613,13 +852,15 @@ class ProphetXBrowser(QWidget):
         # Sort by stake/volume
         self.filtered_events.sort(key=lambda x: x['metadata'].get('stake', 0), reverse=True)
 
-        # Update list widget
-        self.refreshEventList()
-
-        # Update stats
-        total_events = len(self.filtered_events)
-        total_stake = sum(e['metadata'].get('stake', 0) for e in self.filtered_events)
-        self.stats_label.setText(f"{total_events} events • ${total_stake:,.0f} total volume")
+        # Update UI based on mode
+        if self.compact_mode:
+            self.refreshCompactEventCombo()
+        else:
+            self.refreshEventList()
+            # Update stats
+            total_events = len(self.filtered_events)
+            total_stake = sum(e['metadata'].get('stake', 0) for e in self.filtered_events)
+            self.stats_label.setText(f"{total_events} events • ${total_stake:,.0f} total volume")
 
     def refreshEventList(self):
         """Refresh the event list widget display"""
@@ -643,6 +884,40 @@ class ProphetXBrowser(QWidget):
                 item.setForeground(QColor(200, 200, 200))
 
             self.event_list.addItem(item)
+
+    def refreshCompactEventCombo(self):
+        """Refresh the compact event combo box"""
+        self.event_combo.clear()
+
+        for event in self.filtered_events:
+            metadata = event['metadata']
+            event_name = metadata.get('name', 'Unknown Event')
+            sport = metadata.get('sport', '')
+            stake = metadata.get('stake', 0)
+
+            # Compact display
+            display = f"{event_name} (${stake:,.0f})"
+            self.event_combo.addItem(display, event)
+
+    def onCompactEventSelected(self, index: int):
+        """Handle event selection in compact mode"""
+        if index < 0:
+            return
+
+        event = self.event_combo.itemData(index)
+        if not event:
+            return
+
+        self.current_event_data = event['data']
+        metadata = event['metadata']
+        self.current_event_id = metadata.get('id')
+
+        # Emit signal for external listeners (e.g., worker to refresh data)
+        if self.current_event_id:
+            self.event_selected.emit(self.current_event_id)
+
+        # Populate market selector
+        self.populateMarketSelector()
 
     def filterEvents(self):
         """Filter events based on search text"""
@@ -668,7 +943,7 @@ class ProphetXBrowser(QWidget):
         self.refreshEventList()
 
     def onEventSelected(self, item: QListWidgetItem):
-        """Handle event selection"""
+        """Handle event selection in full mode"""
         event = item.data(Qt.ItemDataRole.UserRole)
         self.current_event_data = event['data']
         metadata = event['metadata']
@@ -683,8 +958,16 @@ class ProphetXBrowser(QWidget):
 
         self.event_header.setText(event_name)
 
-        # Populate market selector - SORTED BY ACTIVE ORDERBOOK LIQUIDITY (highest to lowest)
+        # Populate market selector
+        self.populateMarketSelector()
+
+    def populateMarketSelector(self):
+        """Populate market selector - SORTED BY ACTIVE ORDERBOOK LIQUIDITY (highest to lowest)"""
         self.market_combo.clear()
+
+        if not self.current_event_data:
+            return
+
         markets = self.current_event_data.get('data', {}).get('markets', [])
 
         # Calculate active liquidity for each market
@@ -701,7 +984,13 @@ class ProphetXBrowser(QWidget):
             market_type = market.get('type', '')
             total_stake = market.get('totalStake', 0)
 
-            display = f"{market_name} (${active_liquidity:,.0f} active • ${total_stake:,.0f} total)"
+            if self.compact_mode:
+                # Compact display - shorter format
+                display = f"{market_name} (${active_liquidity:,.0f})"
+            else:
+                # Full display
+                display = f"{market_name} (${active_liquidity:,.0f} active • ${total_stake:,.0f} total)"
+
             self.market_combo.addItem(display, market)
 
     def calculateActiveMarketLiquidity(self, market: Dict) -> float:
@@ -750,6 +1039,26 @@ class ProphetXBrowser(QWidget):
 
         # Display all lines from this market
         self.orderbook.setMarket(market)
+
+    def updateEventMarkets(self, markets_data: Dict):
+        """
+        Update the current event with fresh markets data from async worker.
+
+        Args:
+            markets_data: Fresh markets data from ProphetXQueryAsync
+        """
+        if not markets_data or not self.current_event_id:
+            return
+
+        # Update the stored data
+        if self.current_event_id in self.all_events:
+            self.all_events[self.current_event_id] = markets_data
+
+        # Update current event data
+        self.current_event_data = markets_data
+
+        # Refresh the market selector and orderbook display
+        self.populateMarketSelector()
 
     def refreshData(self):
         """Refresh data from ProphetX API"""
