@@ -12,6 +12,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from Creds import Kalshi_Key
 
+# Valid historical time intervals for kalshi market data: Valid values: 1 (1 minute), 60 (1 hour), 1440 (1 day).
+# Time period length of each candlestick in minutes.
+# When integrating Client TO BE USED WITH histroical odds widget, be cognizant of time intervals between OddsAPI and Kalshi
+# Some markets such as totals or spreads have sub markets  (Alt lines)
+
 class KalshiClient:
     """Client for Kalshi API interactions."""
 
@@ -25,19 +30,28 @@ class KalshiClient:
     GAME_SERIES = {
         # Basketball
         'NBA': 'KXNBAGAME',
+        'NBA': 'KXNBASPREAD',
+        'NBA': 'KXNBATOTAL',
 
+        # Discover how to filter out peoples parlays as Market output becomes too cluttered
         # Football
         'NFL': 'KXNFLGAME',
-        'NFL_SINGLE_PROPS': 'KXMVENFLSINGLEGAME',
-        'NFL_MULTI_PROPS': 'KXMVENFLMULTIGAMEEXTENDED',
+        'NFL': 'KXNFLSPREAD',
+        'NFL': 'KXNFLTOTAL',
+        #'NFL_SINGLE_PROPS': 'KXMVENFLSINGLEGAME',
+        #'NFL_MULTI_PROPS': 'KXMVENFLMULTIGAMEEXTENDED', # You can fade people parlys on here lol, too much output for now
         'NCAAF': 'KXNCAAFGAME',
 
         # Baseball
         'MLB': 'KXMLBGAME',
+        'MLB': 'KXMLBSPREAD',
+        'MLB': 'KXMLBTOTAL',
         'MLB_SERIES': 'KXMLBSERIESGAMETOTAL',
 
         # Hockey
         'NHL': 'KXNHLGAME',
+        'NHL': 'KXNHLSPREAD',
+        'NHL': 'KXNHLTOTAL',
 
         # Soccer
         'EPL': 'KXEPLGAME',  # English Premier League
@@ -203,14 +217,14 @@ class KalshiClient:
 
         return self._make_request("GET", "/markets", params=params)
 
+    # TODO: 'start_ts' and 'end_ts' are actually mandatory, should not have defaults
     def get_market_candlesticks(
         self,
         ticker: str,
         series_ticker: str = None,
         period_interval: int = 1440,
-        start_ts: Optional[int] = None,
-        end_ts: Optional[int] = None,
-        days_back: int = 7
+        start_ts: int = None,
+        end_ts: int = None
     ) -> Dict[str, Any]:
         """
         Get historical candlestick data for a market.
@@ -219,9 +233,8 @@ class KalshiClient:
             ticker: Market ticker
             series_ticker: Series ticker (if None, extracted from market ticker)
             period_interval: Candlestick duration (1=minute, 60=hour, 1440=day)
-            start_ts: Unix timestamp for start (optional)
-            end_ts: Unix timestamp for end (optional)
-            days_back: If start_ts not provided, fetch this many days back
+            start_ts: Unix timestamp for start (not actually optional)
+            end_ts: Unix timestamp for end (not actually optional)
 
         Returns:
             Dictionary with 'ticker' and 'candlesticks' array
@@ -236,13 +249,9 @@ class KalshiClient:
                 series_ticker = parts[0]
             else:
                 raise ValueError(f"Cannot determine series_ticker from {ticker}. Please provide explicitly.")
-
-        # Set default time range if not provided
-        if not end_ts:
-            end_ts = int(time.time())
-        if not start_ts:
-            start_ts = end_ts - (days_back * 24 * 60 * 60)
-
+        
+        assert((start_ts is not None) and (end_ts is not None)), "missing one or more timestamp parameters"
+        
         params = {
             "period_interval": period_interval,
             "start_ts": start_ts,
@@ -292,7 +301,7 @@ class KalshiClient:
         if cursor:
             print(f"\nPagination cursor available: {cursor[:50]}...")
 
-    def print_candlesticks_summary(self, candlesticks_data: Dict[str, Any], max_candles: int = 20):
+    def print_candlesticks_summary(self, candlesticks_data: Dict[str, Any], max_candles: int = 50):
         """
         Pretty print candlestick data.
 

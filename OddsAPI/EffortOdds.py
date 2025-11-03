@@ -662,7 +662,6 @@ class ModernOddsWindow(QMainWindow):
         # Create the team news widget first
         self.team_news_widget = TeamNewsWidget()
         self.team_news_widget.setVisible(False)  # Hidden by default
-        self.team_news_widget.setFixedWidth(650)  # Fixed width
 
         # Set the news widget reference for the ticker tape
         self.ticker_tape.news_widget = self.team_news_widget
@@ -673,7 +672,6 @@ class ModernOddsWindow(QMainWindow):
 
         # Create news container and add the team news widget
         self.news_container = QWidget()
-        self.news_container.setFixedWidth(650)  # Match the width of the widget
         news_container_layout = QVBoxLayout(self.news_container)
         news_container_layout.setContentsMargins(0, 0, 0, 0)  # Zero margins
         news_container_layout.setSpacing(0)  # Zero spacing
@@ -736,7 +734,6 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_container = QWidget()
         historical_odds_layout = QVBoxLayout(self.historical_odds_container)
         historical_odds_layout.setContentsMargins(0, 0, 0, 0)
-        self.historical_odds_container.setFixedWidth(750)
 
         # Create the historical odds widget
         self.historical_odds_widget = HistoricalOddsWidget(SUPER_KEY, 10)
@@ -746,26 +743,19 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_container.setVisible(False)
         self.historical_odds_widget.setVisible(False)
 
-        # Create a container for the bottom right section (best lines + historical odds)
-        right_bottom_container = QWidget()
-        right_bottom_layout = QHBoxLayout(right_bottom_container)
-        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
-        right_bottom_layout.addWidget(self.best_lines_container)
-        right_bottom_layout.addWidget(self.historical_odds_container)
-
         # First, create a horizontal splitter for the bottom section
         self.horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
         # Disable opaque resize for smooth dragging with news widget
-        self.horizontal_splitter.setOpaqueResize(False)
+        self.horizontal_splitter.setOpaqueResize(False) # massive UI lag on resize without this
 
         # Add the news container to the left side of horizontal splitter
         self.horizontal_splitter.addWidget(self.news_container)
 
-        # Add the right bottom container to the right side of horizontal splitter
-        self.horizontal_splitter.addWidget(right_bottom_container)
+        # Add the best lines container to the middle of horizontal splitter
+        self.horizontal_splitter.addWidget(self.best_lines_container)
 
-        # Set initial sizes for horizontal splitter
-        self.horizontal_splitter.setSizes([325, 325])  # Equal width initially
+        # Add the historical odds container to the right side of horizontal splitter
+        self.horizontal_splitter.addWidget(self.historical_odds_container)
 
         # Create the compact liquidity widget (ProphetX order book browser)
         self.liquidity_widget = ProphetXBrowser(compact_mode=True)
@@ -1421,6 +1411,15 @@ class ModernOddsWindow(QMainWindow):
         # Update button text
         if visible:
             self.history_toggle_button.setText("Hide Historical Odds ▲")
+
+            # Load Kalshi events when widget becomes visible (only if not already loaded)
+            if hasattr(self.historical_odds_widget, 'event_selector'):
+                if self.historical_odds_widget.event_selector.count() == 0:
+                    # Load ALL Kalshi sports events
+                    print(f"Loading all Kalshi events...")
+
+                    # Load events asynchronously (passing None loads all sports)
+                    asyncio.create_task(self.historical_odds_widget.load_kalshi_events(sport=None))
         else:
             self.history_toggle_button.setText("Show Historical Odds ▼")
 
