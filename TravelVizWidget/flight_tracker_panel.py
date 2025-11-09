@@ -12,11 +12,11 @@ from data_client import TeamTravelIntelligence
 from database_manager import TeamTravelData, DatabaseManager, TeamInfo
 
 class FlightControlPanel(QWidget):
-    # Style constants
-    HEADER_FONT = QFont("Segoe UI", 5, QFont.Weight.Bold)
-    CONTENT_FONT = QFont("Segoe UI", 6)
-    HEADER_STYLE = "color: #10B981; border: none; background: transparent;"
-    CONTENT_STYLE = "color: #D1D5DB; border: none; background: transparent;"
+    # Style constants - Improved readability
+    HEADER_FONT = QFont("Segoe UI", 7, QFont.Weight.Bold)
+    CONTENT_FONT = QFont("Segoe UI", 8)
+    HEADER_STYLE = "color: #9CA3AF; border: none; background: transparent;"
+    CONTENT_STYLE = "color: #E5E7EB; border: none; background: transparent;"
     MUTED_STYLE = "color: #6B7280; border: none; background: transparent;"
     
     # Signals
@@ -51,13 +51,6 @@ class FlightControlPanel(QWidget):
         self.settings_btn = None
         
         
-        # Upcoming Schedule display
-        self.upcoming_games_list = QListWidget()
-        self.upcoming_days_spin = QSpinBox()
-        self.upcoming_days_spin.setRange(1, 30)
-        self.upcoming_days_spin.setValue(14)
-        self.upcoming_days_spin.setFixedWidth(55)  # Wider to show both digits
-        
         
         # Build UI
         self.setup_ui()
@@ -83,13 +76,10 @@ class FlightControlPanel(QWidget):
         layout.addWidget(selection_frame)
 
         # AMADEUS TRAVEL INTELLIGENCE (includes analysis controls and progress)
+        # Gets ALL remaining space now that Upcoming Games moved to overlay
         intelligence_frame = self.create_intelligence_section()
-        layout.addWidget(intelligence_frame, 3)  # Give it 3 parts of available space
+        layout.addWidget(intelligence_frame, 1)  # Takes all available space with stretch
 
-        # UPCOMING GAMES - No spacing between sections
-        games_frame = self.create_upcoming_games_section()
-        layout.addWidget(games_frame, 2)  # Give it 2 parts of available space
-        
         self.setLayout(layout)
 
     def create_header_section(self) -> QFrame:
@@ -204,19 +194,20 @@ class FlightControlPanel(QWidget):
         self.analysis_progress = QProgressBar()
         self.analysis_progress.setVisible(False)
         self.analysis_progress.setFixedHeight(4)
+        self.analysis_progress.setTextVisible(False)  # Hide percentage text
         layout.addWidget(self.analysis_progress)
         
-        # Route breakdown - more compact
+        # Route breakdown - expanded for more visibility
         self.route_breakdown = QTextEdit()
         self.route_breakdown.setReadOnly(True)
-        self.route_breakdown.setMaximumHeight(70)  # Smaller
-        self.route_breakdown.setFont(QFont("Segoe UI", 7))  # Smaller font
+        self.route_breakdown.setMaximumHeight(100)  # Larger for better readability
+        self.route_breakdown.setFont(QFont("Segoe UI", 8))  # Slightly larger font
         self.route_breakdown.setPlainText("No intelligence data available")
         layout.addWidget(self.route_breakdown)
         
         # Hotel and Flight sections - no spacing between them
-        self.current_hotels_widget = self.create_hotel_section("🏨 CURRENT STAY", "")
-        self.next_hotels_widget = self.create_hotel_section("📍 NEXT DESTINATION", "")
+        self.current_hotels_widget = self.create_hotel_section("CURRENT STAY", "")
+        self.next_hotels_widget = self.create_hotel_section("NEXT DESTINATION", "")
         self.flight_info_widget = self.create_flight_info_section()
         
         # Add to layout with minimal spacing for maximum space efficiency
@@ -227,89 +218,29 @@ class FlightControlPanel(QWidget):
         return group
 
 
-    def create_upcoming_games_section(self) -> QGroupBox:
-        group = QGroupBox("")
-        group.setStyleSheet("""
-            QGroupBox {
-                border: 2px solid #374151;
-                border-radius: 6px;
-                margin-top: 2px;
-                padding-top: 4px;
-                background-color: #111922;
-            }
-        """)
-        layout = QVBoxLayout(group)
-        layout.setSpacing(1)  # Very tight spacing
-        layout.setContentsMargins(4, 1, 4, 4)  # Minimal top margin to move header up
-    
-        # Title and controls on same line to save space
-        header_layout = QHBoxLayout()
-        
-        # Section title
-        title_label = QLabel("UPCOMING GAMES")
-        title_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        title_label.setStyleSheet("color: #10B981;")
-        header_layout.addWidget(title_label)
-        
-        header_layout.addStretch()
-        
-        # Days Ahead control on same line as title
-        days_label = QLabel("Days:")
-        days_label.setFont(self.CONTENT_FONT)
-        header_layout.addWidget(days_label)
-        header_layout.addWidget(self.upcoming_days_spin)
-        
-        layout.addLayout(header_layout)
-    
-        # Game list
-        self.upcoming_games_list.setFont(QFont("Segoe UI", 7))
-        self.upcoming_games_list.setMinimumHeight(120)
-        layout.addWidget(self.upcoming_games_list)
-    
-        # Trigger refresh on spinbox change
-        self.upcoming_days_spin.valueChanged.connect(self.update_upcoming_games)
-    
-        return group
-    
     def create_hotel_section(self, title: str, icon: str) -> QFrame:
-        """Create a compact hotel display section with maximum space efficiency"""
+        """Create a compact hotel display section with clean professional styling"""
         frame = QFrame()
         frame.setVisible(True)
         frame.setStyleSheet("""
             QFrame {
-                background-color: #1F2937;
-                border: 1px solid #374151;
-                border-radius: 4px;
-                margin: 0px;  /* No margin to save space */
+                background-color: transparent;
+                border: none;
+                margin: 0px;
+                padding: 0px;
             }
         """)
-        frame.setMinimumHeight(75)
-        
+        frame.setMinimumHeight(90)
+
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(3, 1, 3, 3)
-        layout.setSpacing(0)
-        
-        # Compact header with thin border - stays visible
-        header_container = QWidget()
-        header_container.setFixedHeight(10)  # Even thinner
-        header_container.setStyleSheet("""
-            QWidget {
-                background-color: #374151;
-                border: 1px solid #4B5563;
-                border-radius: 2px;
-            }
-        """)
-        
-        header_layout = QHBoxLayout(header_container)
-        header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
-        
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(3)
+
+        # Simple text header - no colored bar
         header_label = QLabel(title)
-        header_label.setFont(self.HEADER_FONT)
-        header_label.setStyleSheet(self.HEADER_STYLE)
-        header_layout.addWidget(header_label)
-        header_layout.addStretch()
-        
-        layout.addWidget(header_container)
+        header_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        header_label.setStyleSheet("color: #9CA3AF; border: none; background: transparent;")
+        layout.addWidget(header_label)
         
         # Container for hotel items - custom layout, not list widget
         hotels_container = QWidget()
@@ -332,44 +263,28 @@ class FlightControlPanel(QWidget):
         return frame
     
     def create_flight_info_section(self) -> QFrame:
-        """Create compact flight intelligence section with maximum space efficiency"""
+        """Create compact flight intelligence section with clean professional styling"""
         frame = QFrame()
         frame.setVisible(True)
         frame.setStyleSheet("""
             QFrame {
-                background-color: #1F2937;
-                border: 1px solid #374151;
-                border-radius: 4px;
-                margin: 0px;  /* No margin to save space */
+                background-color: transparent;
+                border: none;
+                margin: 0px;
+                padding: 0px;
             }
         """)
-        frame.setMinimumHeight(80)
-        
+        frame.setMinimumHeight(90)
+
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(3, 1, 3, 3)
-        layout.setSpacing(0)
-        
-        # Compact header with thin border
-        header_container = QWidget()
-        header_container.setFixedHeight(10)  # Even thinner
-        header_container.setStyleSheet("""
-            QWidget {
-                background-color: #374151;
-                border: 1px solid #4B5563;
-                border-radius: 2px;
-            }
-        """)
-        
-        header_layout = QHBoxLayout(header_container)
-        header_layout.setContentsMargins(2, 0, 2, 0)  # Minimal margins
-        
-        header_label = QLabel("✈️ FLIGHT INTELLIGENCE")
-        header_label.setFont(self.HEADER_FONT)
-        header_label.setStyleSheet(self.HEADER_STYLE)
-        header_layout.addWidget(header_label)
-        header_layout.addStretch()
-        
-        layout.addWidget(header_container)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(3)
+
+        # Simple text header - no colored bar
+        header_label = QLabel("FLIGHT INTELLIGENCE")
+        header_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        header_label.setStyleSheet("color: #9CA3AF; border: none; background: transparent;")
+        layout.addWidget(header_label)
         
         # Container for flight items - custom layout, not list widget
         flight_container = QWidget()
@@ -624,56 +539,18 @@ class FlightControlPanel(QWidget):
         self.update_ui_for_league(league)
         self.modeChanged.emit(league)
 
-    def update_upcoming_games(self):
-        """Update the list of upcoming games for selected team"""
-        if not hasattr(self, 'aggregator') or not self.aggregator:
-            return
-    
-        db: DatabaseManager = self.aggregator.db
-        team_id = self.team_combo.currentData()
-        season = self.aggregator.current_season
-        league = self.aggregator.current_league
-    
-        if not team_id or not season:
-            self.upcoming_games_list.clear()
-            return
-    
-        days_ahead = self.upcoming_days_spin.value()
-        cutoff_date = datetime.now() + timedelta(days=days_ahead)
-    
-        games = db.load_games(season, league)
-        upcoming = [
-            g for g in games
-            if datetime.now() <= g.date <= cutoff_date
-               and (g.home_team.team_id == team_id or g.away_team.team_id == team_id)
-        ]
-    
-        # Display in list
-        self.upcoming_games_list.clear()
-        for g in upcoming:
-            vs = f"{g.away_team.abbreviation} @ {g.home_team.abbreviation}"
-            time_str = g.date.strftime("%b %d, %I:%M%p")
-            item = QListWidgetItem(f"{time_str} - {vs}")
-            self.upcoming_games_list.addItem(item)
-    
-        if not upcoming:
-            self.upcoming_games_list.addItem("No upcoming games found")
-
 
     def on_team_selection_changed(self, text: str):
         """Handle team selection change - FIXED version"""
-        
+
         if self.team_combo.count() > 0:
             team_abbr = self.team_combo.currentData()
-            
+
             if team_abbr and team_abbr != "":  # Check for valid team
-                
+
                 # Emit signal for main window
                 self.teamChanged.emit(team_abbr)
-                
-                # Update games for upcoming schedule display
-                self.update_upcoming_games()
-                
+
                 # FIXED: Ensure analyze button is enabled
                 self.analyze_btn.setEnabled(True)
                 self.analyze_btn.setToolTip(f"Analyze travel for {team_abbr}")
@@ -735,22 +612,61 @@ class FlightControlPanel(QWidget):
     def load_teams_for_league(self, teams: List['TeamInfo']):
         """Load teams into the combo box"""
         current_selection = self.team_combo.currentData() if self.team_combo.count() > 0 else None
-        
-        
+
+        # Disconnect signal to prevent triggering during population
+        try:
+            self.team_combo.currentTextChanged.disconnect()
+        except:
+            pass  # Signal might not be connected yet
+
         self.team_combo.clear()
         self.team_combo.addItem("Select Team", "")
-        
+
         for team in sorted(teams, key=lambda t: t.display_name):
             display_text = f"{team.display_name} ({team.abbreviation})"
             team_data_value = team.team_id
-            
+
             self.team_combo.addItem(display_text, team_data_value)
-        
+
         # Restore selection if possible
         if current_selection:
             index = self.team_combo.findData(current_selection)
             if index >= 0:
                 self.team_combo.setCurrentIndex(index)
+
+        # Reconnect the signal
+        self.team_combo.currentTextChanged.connect(self.on_team_selection_changed)
+
+    def update_team_selection_programmatically(self, team_id: str):
+        """Update team selection without triggering signals - used for external synchronization"""
+        try:
+            self.team_combo.currentTextChanged.disconnect()
+        except:
+            pass
+
+        # Find and set the matching team
+        index = -1
+        for i in range(self.team_combo.count()):
+            if self.team_combo.itemData(i) == team_id:
+                index = i
+                break
+
+        if index >= 0:
+            self.team_combo.setCurrentIndex(index)
+            print(f"✅ Control panel team set to: {team_id}")
+
+            # Update analyze button state
+            if team_id and team_id != "":
+                self.analyze_btn.setEnabled(True)
+                self.analyze_btn.setToolTip(f"Analyze travel for {team_id}")
+            else:
+                self.analyze_btn.setEnabled(False)
+                self.analyze_btn.setToolTip("Select a team to analyze")
+        else:
+            print(f"⚠️ Team {team_id} not found in control panel combo")
+
+        # Reconnect signal
+        self.team_combo.currentTextChanged.connect(self.on_team_selection_changed)
 
     def update_intelligence_display(self, intelligence: 'TeamTravelIntelligence'):
         """Update the intelligence display with Amadeus data"""
@@ -887,18 +803,30 @@ class FlightControlPanel(QWidget):
         # Clear existing items
         self.clear_layout(self.flight_info_widget.flight_layout)
         
-        # Add flight info for all routes - we have the space now
-        for i, route in enumerate(intelligence.upcoming_routes):  # Show all routes
+        # Add flight info - improved formatting and readability
+        for i, route in enumerate(intelligence.upcoming_routes[:5]):  # Show top 5 routes
             if route.primary_airport:
                 airport = route.primary_airport
                 venue_name = route.game_data.venue.name if route.game_data else "venue"
-                
-                # Create flight item label with full text - use available horizontal space
-                flight_label = QLabel(f"✈️ {airport.iata_code} ({airport.on_time_probability:.0%}) - {airport.distance_from_venue:.0f}km from {venue_name}")
+
+                # Truncate venue name if too long
+                if len(venue_name) > 25:
+                    venue_name = venue_name[:22] + "..."
+
+                # Create flight item label with improved formatting (no emoji)
+                flight_text = f"• {airport.iata_code} ({airport.on_time_probability:.0%}) - {airport.distance_from_venue:.0f}km from {venue_name}"
+                flight_label = QLabel(flight_text)
                 flight_label.setFont(self.CONTENT_FONT)
                 flight_label.setStyleSheet(self.CONTENT_STYLE)
                 flight_label.setWordWrap(True)  # Allow text to wrap if needed
                 self.flight_info_widget.flight_layout.addWidget(flight_label)
+
+        # Add "more" indicator if there are additional routes
+        if len(intelligence.upcoming_routes) > 5:
+            more_label = QLabel(f"+ {len(intelligence.upcoming_routes)-5} more routes")
+            more_label.setFont(QFont("Segoe UI", 7))
+            more_label.setStyleSheet(self.MUTED_STYLE)
+            self.flight_info_widget.flight_layout.addWidget(more_label)
         
         self.flight_info_widget.setVisible(True)
     
@@ -920,22 +848,23 @@ class FlightControlPanel(QWidget):
             widget.hotels_layout.addWidget(no_data_label)
             return
         
-        # Add hotel items in compact format
-        for hotel in hotels[:3]:  # Show top 3 to fit in space
+        # Add hotel items in clean format with better spacing
+        for hotel in hotels[:4]:  # Show top 4 now that we have more space
             # Truncate long hotel names for space efficiency
-            name = hotel.name[:15] + "..." if len(hotel.name) > 15 else hotel.name
+            name = hotel.name[:25] + "..." if len(hotel.name) > 25 else hotel.name
             stars = self.get_hotel_star_rating(hotel)
-            
-            # Create compact hotel item label
+
+            # Create hotel item label with improved formatting
             hotel_label = QLabel(f"• {name} ({hotel.distance_from_venue:.1f}km) {stars}")
             hotel_label.setFont(self.CONTENT_FONT)
             hotel_label.setStyleSheet(self.CONTENT_STYLE)
+            hotel_label.setWordWrap(False)
             widget.hotels_layout.addWidget(hotel_label)
-        
+
         # Add "more" indicator if there are additional hotels
-        if len(hotels) > 3:
-            more_label = QLabel(f"+ {len(hotels)-3} more hotels")
-            more_label.setFont(QFont("Segoe UI", 5))
+        if len(hotels) > 4:
+            more_label = QLabel(f"+ {len(hotels)-4} more hotels")
+            more_label.setFont(QFont("Segoe UI", 7))
             more_label.setStyleSheet(self.MUTED_STYLE)
             widget.hotels_layout.addWidget(more_label)
     

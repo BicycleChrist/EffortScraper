@@ -19,6 +19,7 @@ from data_client import (ESPNSportsDataAggregator, TeamTravelData, TeamInfo,
                         HotelOption, RouteInsights)
 from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
+from upcoming_games_overlay import UpcomingGamesOverlay
 
 
 class ConfigLoader:
@@ -130,11 +131,18 @@ class SportsTrackerMainWindow(QMainWindow):
         control_widget.setMinimumWidth(350)
         control_widget.setMaximumWidth(500)
         splitter.addWidget(control_widget)
-        
+
         # Globe widget (right side)
         self.globe_widget = FlightGlobeWidget()
         splitter.addWidget(self.globe_widget)
-        
+
+        # Upcoming games overlay (positioned as floating widget over globe)
+        # Will be positioned absolutely in resizeEvent
+        self.games_overlay = UpcomingGamesOverlay(self.globe_widget)
+        self.games_overlay.setFixedHeight(300)
+        self.games_overlay.move(0, 10)  # Initial position at top-left of globe
+        self.games_overlay.raise_()  # Ensure it's on top
+
         # Set splitter proportions (30% control panel, 70% globe)
         splitter.setSizes([400, 1500])
         
@@ -306,6 +314,9 @@ class SportsTrackerMainWindow(QMainWindow):
         # Animation Signals
         self.globe_widget.animationStatusChanged.connect(self.on_animation_status_changed)
         self.globe_widget.animationProgressChanged.connect(self.on_animation_progress_changed)
+
+        # Upcoming games overlay signals
+        self.games_overlay.daysFilterChanged.connect(self.on_overlay_days_changed)
     
     def on_control_panel_team_changed(self, team_abbr: str):
         
@@ -338,6 +349,10 @@ class SportsTrackerMainWindow(QMainWindow):
             season = self.season_combo.currentText()
             if self.sports_aggregator:
                 self.sports_aggregator.load_team_season_schedule(team_abbr, season, self.current_league)
+
+        # Update overlay games
+        if hasattr(self, 'games_overlay'):
+            self.update_overlay_games()
 
 
     def start_amadeus_analysis(self, team_abbr: str, days_ahead: int):
@@ -741,10 +756,6 @@ class SportsTrackerMainWindow(QMainWindow):
                 self.control_panel.team_combo.currentTextChanged.connect(
                     self.control_panel.on_team_selection_changed
                 )
-                
-                # Update upcoming games
-                if hasattr(self.control_panel, 'update_upcoming_games'):
-                    self.control_panel.update_upcoming_games()
         
         # Load team data if needed
         if team_id and self.sports_aggregator:
@@ -752,6 +763,10 @@ class SportsTrackerMainWindow(QMainWindow):
         elif not team_id and self.current_travel_data:
             # Show all teams again
             self.globe_widget.load_flight_data(self.current_travel_data)
+
+        # Update overlay games
+        if hasattr(self, 'games_overlay'):
+            self.update_overlay_games()
     
     def on_animation_status_changed(self, active: bool, team_id: str):
         """Handle animation status changes"""
@@ -765,6 +780,60 @@ class SportsTrackerMainWindow(QMainWindow):
         if segment_info:
             current_segment = segment_info.get('departure_city', '') + " → " + segment_info.get('arrival_city', '')
             self.status_bar.showMessage(f"Animation: {progress*100:.1f}% - {current_segment}")
+
+    def on_overlay_days_changed(self, days: int):
+        """Handle days ahead change from overlay"""
+        # Update games list
+        self.update_overlay_games()
+
+    def update_overlay_games(self):
+        """Update the overlay games list from control panel data"""
+        print(f"\n🔍 update_overlay_games called")
+
+        if not hasattr(self, 'games_overlay') or not self.sports_aggregator:
+            print("   ❌ Missing games_overlay or sports_aggregator")
+            return
+
+        # Get current team selection
+        team_id = self.focus_team_combo.currentData()
+        season = self.season_combo.currentText()
+        days_ahead = self.games_overlay.get_days_ahead()
+
+        print(f"   Team: {team_id}, Season: {season}, Days: {days_ahead}")
+
+        if not team_id or not season:
+            print("   ⚠️ No team or season selected, clearing overlay")
+            self.games_overlay.update_games([])
+            return
+
+        # Get games from database
+        db = self.sports_aggregator.db
+        games = db.load_games(season, self.current_league)
+        print(f"   📊 Loaded {len(games)} total games from DB")
+
+        cutoff_date = datetime.now() + timedelta(days=days_ahead)
+        print(f"   📅 Date range: {datetime.now().strftime('%Y-%m-%d')} to {cutoff_date.strftime('%Y-%m-%d')}")
+
+        # Filter for selected team (case-insensitive comparison)
+        team_id_lower = team_id.lower() if team_id else ""
+        upcoming = [
+            g for g in games
+            if datetime.now() <= g.date <= cutoff_date
+               and (g.home_team.team_id.lower() == team_id_lower or
+                    g.away_team.team_id.lower() == team_id_lower)
+        ]
+
+        print(f"   🎯 Filtered to {len(upcoming)} upcoming games for {team_id}")
+
+        # Format games for display
+        game_strings = []
+        for g in upcoming:
+            vs = f"{g.away_team.abbreviation} @ {g.home_team.abbreviation}"
+            time_str = g.date.strftime("%b %d, %I:%M%p")
+            game_strings.append(f"{time_str} - {vs}")
+
+        print(f"   ✅ Sending {len(game_strings)} formatted games to overlay")
+        self.games_overlay.update_games(game_strings)
     
     def on_season_data_loaded(self, season: str, league: str, game_count: int):
         """Handle season data loaded successfully"""
@@ -772,6 +841,10 @@ class SportsTrackerMainWindow(QMainWindow):
             self.season_status_label.setText(
                 f"{league} {season}: {game_count:,} games, {len(self.current_travel_data):,} travel records"
             )
+
+            # Update overlay games when season data loads
+            if hasattr(self, 'games_overlay'):
+                self.update_overlay_games()
         
         self.load_full_season_btn.setEnabled(True)
         self.load_full_season_btn.setText("Load Full Season")
