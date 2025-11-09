@@ -757,7 +757,7 @@ class AmadeusWorker(QThread):
             now = datetime.now()
             cutoff = now + timedelta(days=self.days_ahead)
             
-            season = self.aggregator.current_season or "2024"
+            season = self.aggregator.current_season or "2025"
             league = self.aggregator.current_league
             
             # Get all travel for this team, then filter by date
@@ -929,8 +929,8 @@ class ESPNScheduleScraper:
         # League-specific URL patterns - MLB requires half parameter, others don't
         self.url_patterns = {
             'MLB': "https://www.espn.com/mlb/team/schedule/_/name/{team}/seasontype/2/half/{half}",
-            'NBA': "https://www.espn.com/nba/team/schedule/_/name/{team}/seasontype/2",
-            'NHL': "https://www.espn.com/nhl/team/schedule/_/name/{team}/seasontype/2"
+            'NBA': "https://www.espn.com/nba/team/schedule/_/name/{team}/season/{year}/seasontype/2",
+            'NHL': "https://www.espn.com/nhl/team/schedule/_/name/{team}/season/{year}/seasontype/2"
         }
         
         self.session = requests.Session()
@@ -1219,23 +1219,33 @@ class ESPNScheduleScraper:
         
         else:  # NBA or NHL - Single schedule page
             try:
-                url = self.url_patterns[league].format(team=team_abbrev)
-                print(f"Scraping {league} {team_abbrev} schedule: {url}")
-                
+                # Determine if we should use season-specific URL or current season URL
+                current_season = self.get_current_season_for_league(league)
+
+                if season == current_season:
+                    # Use simple URL for current season (ESPN default)
+                    url = f"https://www.espn.com/{league.lower()}/team/schedule/_/name/{team_abbrev}/seasontype/2"
+                    print(f"Scraping {league} {team_abbrev} current season ({season}): {url}")
+                else:
+                    # Use season-specific URL for historical data
+                    year = season.split('-')[0] if '-' in season else season
+                    url = self.url_patterns[league].format(team=team_abbrev, year=year)
+                    print(f"Scraping {league} {team_abbrev} historical season ({season}): {url}")
+
                 response = self.session.get(url, timeout=15)
                 response.raise_for_status()
-                
+
                 table_rows = self._parse_schedule_page(response.text, team_abbrev, league, season)
-                
+
                 if table_rows and len(table_rows) > 1:
                     games = self.parse_table_to_games(table_rows, team_abbrev, league, season)
                     all_games.extend(games)
                     print(f"  ✓ Found {len(games)} {league} games")
                 else:
                     print(f"  ✗ No {league} schedule data found")
-                
+
                 time.sleep(0.75)
-                
+
             except requests.exceptions.RequestException as e:
                 print(f"  ✗ Network error scraping {league} {team_abbrev}: {e}")
             except Exception as e:

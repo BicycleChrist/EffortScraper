@@ -462,9 +462,9 @@ class DatabaseManager:
                            at.alternate_color as away_alt_color, at.logo_url as away_logo,
                            at.division as away_division, at.league as away_league,
                            at.conference as away_conference,
-                           v.venue_name as venue_name, v.city as venue_city, v.state as venue_state,
+                           v.name as venue_name, v.city as venue_city, v.state as venue_state,
                            v.country as venue_country, v.latitude, v.longitude,
-                           v.venue_capacity, v.time_zone
+                           v.capacity as venue_capacity, v.timezone as time_zone
                     FROM games g
                     JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
                     JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league
@@ -848,9 +848,9 @@ class DatabaseManager:
                            at.alternate_color as away_alt_color, at.logo_url as away_logo,
                            at.division as away_division, at.league as away_league,
                            at.conference as away_conference,
-                           v.venue_name as venue_name, v.city as venue_city, v.state as venue_state,
+                           v.name as venue_name, v.city as venue_city, v.state as venue_state,
                            v.country as venue_country, v.latitude, v.longitude,
-                           v.venue_capacity, v.time_zone
+                           v.capacity as venue_capacity, v.timezone as time_zone
                     FROM games g
                     JOIN teams ht ON g.home_team_id = ht.team_id AND g.league = ht.league
                     JOIN teams at ON g.away_team_id = at.team_id AND g.league = at.league

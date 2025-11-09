@@ -66,7 +66,7 @@ class ConfigLoader:
         """Check if APIs are configured - ESPN scraping is always available"""
         return True
 
-
+#TODO: Implement logic to switch between in season sports for inital view
 class SportsTrackerMainWindow(QMainWindow):
     """Main window with multi-league ESPN schedule scraping support"""
     
@@ -81,7 +81,7 @@ class SportsTrackerMainWindow(QMainWindow):
         self.data_update_timer = None
         self.current_travel_data = []
         self.all_teams = []
-        self.current_league = "MLB"  # Default league
+        self.current_league = "NHL"  # If Default league is not in season, UI will hang
         self.current_season = str(datetime.now().year)
         
         # Setup UI
@@ -384,7 +384,6 @@ class SportsTrackerMainWindow(QMainWindow):
                 self.control_panel.analysis_progress.setVisible(True)
                 self.control_panel.analysis_progress.setValue(0)
                 self.control_panel.analyze_btn.setEnabled(False)
-                self.control_panel.status_message.setText("Starting Amadeus analysis...")
                 
                 print(f"🔄 Starting analysis for {team_abbr}...")
                 
@@ -601,42 +600,51 @@ class SportsTrackerMainWindow(QMainWindow):
             if self.sports_aggregator and self.sports_aggregator.current_league != self.current_league:
                 print(f"🐛 DEBUG - League mismatch detected! Aggregator: {self.sports_aggregator.current_league}, Window: {self.current_league}")
                 self.sports_aggregator.set_league(self.current_league)
-        
+
             teams = self.sports_aggregator.get_all_teams(self.current_league)
             self.all_teams = teams
-            
+
             print(f"🔄 Populating main window combo with {len(teams)} {self.current_league} teams")
-            
+
+            # Disconnect signal to prevent triggering during population
+            try:
+                self.focus_team_combo.currentTextChanged.disconnect()
+            except:
+                pass  # Signal might not be connected yet
+
             # Clear and repopulate main window combo
             current_selection = self.focus_team_combo.currentData()
             self.focus_team_combo.clear()
             self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
-            
+
             # Add teams sorted by name - USE SAME DATA FORMAT AS CONTROL PANEL
             for team in sorted(teams, key=lambda t: t.display_name):
                 display_text = f"{team.display_name} ({team.abbreviation})"
                 # CRITICAL: Use team.team_id to match control panel
                 self.focus_team_combo.addItem(display_text, team.team_id)
-            
+
             # Restore selection if possible
             if current_selection:
                 index = self.focus_team_combo.findData(current_selection)
                 if index >= 0:
                     self.focus_team_combo.setCurrentIndex(index)
-            
+
+            # Reconnect the signal
+            self.focus_team_combo.currentTextChanged.connect(self.on_focus_team_changed)
+
             # ALSO populate the control panel's team combo with consistent data
             self.control_panel.load_teams_for_league(teams)
-            
+
             print(f"✅ Populated both combo boxes with {len(teams)} {self.current_league} teams")
-            
+
         except Exception as e:
             print(f"❌ Error populating team combo: {e}")
             import traceback
             traceback.print_exc()
-            
+
             self.focus_team_combo.clear()
             self.focus_team_combo.addItem(f"All {self.current_league} Teams", "")
-            
+
             # Also clear control panel combo on error
             if hasattr(self.control_panel, 'team_combo'):
                 self.control_panel.team_combo.clear()
