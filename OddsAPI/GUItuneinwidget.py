@@ -222,7 +222,7 @@ class TuneInWidget(QWidget):
         self.links_list.itemDoubleClicked.connect(self.open_stream_link)
         # Allow it to expand vertically
         self.links_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.links_list.setMinimumHeight(80)
+        self.links_list.setMinimumHeight(100)
 
         # Build the layout
         main_layout.addLayout(controls_layout)
@@ -230,6 +230,9 @@ class TuneInWidget(QWidget):
 
         # Remove fixed height - allow widget to expand vertically within constraints
         # self.setFixedHeight(130)
+
+        # Set size policy to allow vertical expansion
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         # Start loading links in background (non-blocking)
         self.start_background_load()

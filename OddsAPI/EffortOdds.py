@@ -32,12 +32,10 @@ import qasync
 import asyncio
   # Use SUPER_KEY since ODDS_API_KEY is commented out
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
-#TODO: Auto update cuts off last line and errors-out due to progress-bar apparently no longer existing.
-# League market configurations
-#TODO: Toggeling news widget on, off, then on again causes sizing issues
-#TODO: Add in accsessibility for calculator
+#TODO: Auto update cuts off last few market lines??
+#TODO: change layout of stream-links controls from horizontal to vertical - giving more space to the listbox
 
-DEBUG_OUTLINES = True
+DEBUG_OUTLINES = False
 
 MAJOR_PROP_LEAGUES = {
     "basketball_nba": NBA_MARKETS,
@@ -532,7 +530,7 @@ class ModernOddsWindow(QMainWindow):
         # Add some spacing after separator
         region_ticker_layout.addSpacing(15)
 
-        # Right side: Ticker tape and action buttons
+        # Right side: Ticker tape section with controls below
         ticker_section = QWidget()
         ticker_section_layout = QVBoxLayout(ticker_section)
         ticker_section_layout.setContentsMargins(0, 0, 0, 0)
@@ -551,7 +549,18 @@ class ModernOddsWindow(QMainWindow):
         # Delay prediction markets to let RSS feeds fetch first (they're much faster)
         QTimer.singleShot(5000, self.prediction_markets_worker.start)  # 5 second delay
 
-        # Add action buttons below ticker tape (Fetch Odds, Props, TT)
+        # Horizontal splitter for action buttons/search (left) and streaming widget (right)
+        controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
+        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
+
+        # LEFT SIDE: Container for action buttons and search bar
+        controls_container = QWidget()
+        if DEBUG_OUTLINES: controls_container.setStyleSheet(""" QWidget { border: 4px solid #00FFFF; } """);
+        controls_layout = QVBoxLayout(controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(2)
+
+        # Add action buttons (Fetch Odds, Props, TT)
         action_buttons_widget = QWidget()
         if DEBUG_OUTLINES: action_buttons_widget.setStyleSheet(""" QWidget { border: 4px solid #00FF00; } """);
         action_buttons_layout = QHBoxLayout(action_buttons_widget)
@@ -584,9 +593,9 @@ class ModernOddsWindow(QMainWindow):
         action_buttons_layout.addWidget(self.props_availability_label)
 
         action_buttons_layout.addStretch()
-        ticker_section_layout.addWidget(action_buttons_widget)
+        controls_layout.addWidget(action_buttons_widget)
 
-        # Add search bar below action buttons on the right side
+        # Add search bar below action buttons
         search_container = QWidget()
         search_container_layout = QHBoxLayout(search_container)
         search_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -615,48 +624,31 @@ class ModernOddsWindow(QMainWindow):
         search_container_layout.addWidget(self.search_bar)
         search_container_layout.addStretch()
 
-        ticker_section_layout.addWidget(search_container)
+        controls_layout.addWidget(search_container)
+
+        # Add controls container to left side of splitter
+        controls_streaming_splitter.addWidget(controls_container)
+        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
+
+        # RIGHT SIDE: Streaming widget - height should match controls_container
+        self.tune_in_widget = TuneInWidget()
+        self.tune_in_widget.setVisible(False)  # Hidden by default
+        self.tune_in_widget.setFixedWidth(650)
+        # Set maximum height to match the controls container height (not expanding)
+        self.tune_in_widget.setMaximumHeight(100)  # Height of action buttons + search bar
+        controls_streaming_splitter.addWidget(self.tune_in_widget)
+
+        # Configure splitter
+        controls_streaming_splitter.setSizes([1000, 650])
+        controls_streaming_splitter.setCollapsible(0, False)  # Controls can't collapse
+        controls_streaming_splitter.setCollapsible(1, True)  # Streaming widget can collapse
+
+        # Add controls_streaming_splitter to ticker_section
+        ticker_section_layout.addWidget(controls_streaming_splitter)
 
         region_ticker_layout.addWidget(ticker_section, 1)  # Give ticker section stretch
 
         self.layout.addLayout(region_ticker_layout)
-
-        # --------- MARKET, SEARCH BAR, AND STREAMING SECTION ---------
-        # Create a horizontal splitter for left side (markets/search) and right side (streaming)
-        controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
-        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
-        
-        # LEFT SIDE: Vertical layout for market buttons and search bar
-        left_side_widget = QWidget()
-        left_side_layout = QVBoxLayout(left_side_widget)
-        left_side_layout.setContentsMargins(0, 0, 0, 0)
-        left_side_layout.setSpacing(2)  # Reduced from 5 to 2
-        left_side_layout.addStretch()
-
-        # Add left side to splitter
-        controls_streaming_splitter.addWidget(left_side_widget)
-
-        # RIGHT SIDE: Streaming widget (will be shown/hidden)
-        # Create and configure the TuneInWidget
-        self.tune_in_widget = TuneInWidget()
-        self.tune_in_widget.setVisible(False)  # Hidden by default
-        self.tune_in_widget.setFixedWidth(650)
-        # Set a reasonable maximum height (60% of previous size)
-        self.tune_in_widget.setMaximumHeight(120)
-        self.tune_in_widget.setMinimumHeight(100)
-
-        # Add streaming widget to splitter
-        controls_streaming_splitter.addWidget(self.tune_in_widget)
-
-        # Set initial sizes - give most space to left side
-        controls_streaming_splitter.setSizes([1000, 650])
-        controls_streaming_splitter.setCollapsible(0, False)  # Left side can't collapse
-        controls_streaming_splitter.setCollapsible(1, True)  # Right side can collapse
-
-        # Add the splitter to main layout - use addWidget with spacing parameter
-        # Set top margin to 0 to minimize gap from ticker tape
-        controls_streaming_splitter.setContentsMargins(0, 0, 0, 0)
-        self.layout.addWidget(controls_streaming_splitter)
 
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
