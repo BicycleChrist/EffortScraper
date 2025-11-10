@@ -37,7 +37,7 @@ import asyncio
 #TODO: Toggeling news widget on, off, then on again causes sizing issues
 #TODO: Add in accsessibility for calculator
 
-
+DEBUG_OUTLINES = True
 
 MAJOR_PROP_LEAGUES = {
     "basketball_nba": NBA_MARKETS,
@@ -537,6 +537,7 @@ class ModernOddsWindow(QMainWindow):
         ticker_section_layout = QVBoxLayout(ticker_section)
         ticker_section_layout.setContentsMargins(0, 0, 0, 0)
         ticker_section_layout.setSpacing(2)
+        if DEBUG_OUTLINES: ticker_section.setStyleSheet(""" QWidget { border: 4px solid #00FFFF; } """);
 
         # Choose transition style: "flip_card" or "split_reveal"
         self.ticker_tape = TickerTape(transition_style="flip_card")
@@ -552,6 +553,7 @@ class ModernOddsWindow(QMainWindow):
 
         # Add action buttons below ticker tape (Fetch Odds, Props, TT)
         action_buttons_widget = QWidget()
+        if DEBUG_OUTLINES: action_buttons_widget.setStyleSheet(""" QWidget { border: 4px solid #00FF00; } """);
         action_buttons_layout = QHBoxLayout(action_buttons_widget)
         action_buttons_layout.setContentsMargins(0, 0, 0, 0)
         action_buttons_layout.setSpacing(4)
@@ -622,7 +624,8 @@ class ModernOddsWindow(QMainWindow):
         # --------- MARKET, SEARCH BAR, AND STREAMING SECTION ---------
         # Create a horizontal splitter for left side (markets/search) and right side (streaming)
         controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
-
+        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
+        
         # LEFT SIDE: Vertical layout for market buttons and search bar
         left_side_widget = QWidget()
         left_side_layout = QVBoxLayout(left_side_widget)
