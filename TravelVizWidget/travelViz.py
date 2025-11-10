@@ -9,9 +9,9 @@ from datetime import datetime, timedelta
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QSplitter, QStatusBar, QMenuBar, QMenu,
                              QMessageBox, QProgressBar, QLabel, QFileDialog,
-                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton, QInputDialog)
+                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QPushButton, QInputDialog, QSlider, QFrame)
 from PyQt6.QtCore import (Qt, QSettings,pyqtSignal,QThread)
-from PyQt6.QtGui import QAction, QIcon, QFont
+from PyQt6.QtGui import QAction, QIcon, QFont, QVector3D
 
 # Import components
 from data_client import (ESPNSportsDataAggregator, TeamTravelData, TeamInfo, 
@@ -135,6 +135,43 @@ class SportsTrackerMainWindow(QMainWindow):
         # Globe widget (right side)
         self.globe_widget = FlightGlobeWidget()
         splitter.addWidget(self.globe_widget)
+        
+        passive_spin_button = QPushButton(f"passive spin: {('enabled' if self.globe_widget.passive_spin else 'disabled')}")
+        def PassiveSpinToggleCallback(_):
+            self.globe_widget.passive_spin = not self.globe_widget.passive_spin
+            passive_spin_button.setText(f"passive spin: {('enabled' if self.globe_widget.passive_spin else 'disabled')}")
+        passive_spin_button.clicked.connect(PassiveSpinToggleCallback)
+        passive_spin_button.setFixedWidth(150)
+        passive_spin_button.setStyleSheet(""" QPushButton {
+            background-color: rgba(31, 41, 55, 10);
+            color: white;
+        }""")
+
+        slider_label = QLabel("rotation speed: 0.25")
+        slider_label.setFixedWidth(150)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-200, 200)
+        slider.setValue(25)
+        slider.setFixedWidth(150)
+        slider.setStyleSheet(""" QSlider {
+            background-color: rgba(31, 41, 55, 10);
+            color: #10B98110;
+        }""")
+
+        def RotationSliderCallback(slider_val):
+            slider_label.setText(f"rotation speed: {slider_val/100:.3f}")
+            self.globe_widget.passive_rotation_speed = QVector3D(0.05, slider_val/100, 0)
+
+        slider.valueChanged.connect(RotationSliderCallback)
+
+        slider_layout = QVBoxLayout(self.globe_widget)
+        slider_layout.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+        slider_layout.setContentsMargins(10, 10, 0, 0)
+        slider_layout.addWidget(passive_spin_button)
+        slider_layout.addWidget(slider_label)
+        slider_layout.addWidget(slider)
+        
 
         # Upcoming games overlay (positioned as floating widget over globe)
         # Will be positioned absolutely in resizeEvent

@@ -13,7 +13,6 @@ from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
 from pathlib import Path
 import math
 import os
-#TODO: plane looks like its being flown by Denzel off the sauce. 
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences - Essential for UI"""
@@ -28,7 +27,8 @@ class TeamTravelAnimation:
         self.current_segment = 0
         self.segment_progress = 0.0
         self.loop_animation = True
-        
+        self.debug = False
+    
     def build_team_sequence(self, team_id: str, travel_data: List, season_start: datetime = None) -> Dict:
         """Build chronological travel sequence for a team"""
         if season_start is None:
@@ -178,7 +178,7 @@ class TeamTravelAnimation:
                     current_seg['path_3d'], 
                     self.segment_progress
                 )
-                print(f"🛩️ Calculated orientation at progress {self.segment_progress:.3f}")  # Debug
+                if (self.debug): print(f"🛩️ Calculated orientation at progress {self.segment_progress:.3f}");
             except Exception as e:
                 print(f"⚠️ Failed to calculate airplane orientation: {e}")
                 orientation = None
@@ -272,6 +272,7 @@ class FlightGlobeWidget(QOpenGLWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.debug = False # enables prints extra info in terminal
         
         # OpenGL resources
         self.shader_program = None
@@ -306,10 +307,13 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         # Mouse interaction
         self.last_mouse_pos = QPoint()
-        self.is_rotating = False
+        self.is_grabbed = False
         self.rotation_speed = 1.0
         self.rotation_momentum = QVector3D(0, 0, 0)
+        self.passive_spin = True # spins constantly
+        self.passive_rotation_speed = QVector3D(0.05, 0.25, 0)
         self.momentum_decay = 0.95
+        self.sensitivity = 0.25
         
         # Animation and timing
         self.render_timer = QTimer()
@@ -674,7 +678,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             "NHL": {
                 "folder": "nhl_logos",
                 "teams": {
-                    "ana": "Ducks.png", "utah": "Coyotes.png", "bos": "Bruins.png",
+                    "ana": "Ducks.png", "utah": "Mammoth.png", "bos": "Bruins.png",
                     "buf": "Sabres.png", "cgy": "Flames.png", "car": "Hurricanes.png",
                     "chi": "Blackhawks.png", "col": "Avalanche.png", "cbj": "BlueJackets.png",
                     "dal": "Stars.png", "det": "RedWings.png", "edm": "Oilers.png",
@@ -1232,15 +1236,13 @@ class FlightGlobeWidget(QOpenGLWidget):
             else:
                 self.animated_marker_position = None
         
-        # Handle rotation momentum
-        if not self.is_rotating and self.rotation_momentum.length() > 0.01:
-            momentum_rotation = QMatrix4x4()
-            momentum_rotation.rotate(self.rotation_momentum.length(), 
-                                   self.rotation_momentum.normalized())
-            self.rotation_matrix = momentum_rotation * self.rotation_matrix
-            self.rotation_momentum *= self.momentum_decay
-        
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+
+        if (not self.is_grabbed) and self.passive_spin:
+            self.update_rotation()
+        
+        if (not self.is_grabbed) and self.rotation_momentum.length() > 0.01:
+            self.decay_momentum()
         
         model = self.rotation_matrix
         view = QMatrix4x4()
@@ -1501,21 +1503,6 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.release()
     
     
-    
-    
-    # Airplane model logic
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     # Utility Methods
     def infer_league_from_team_id(self, team_id: str) -> Optional[str]:
         """Infer league from team_id pattern like MLB_2025_20250511_bos_kc"""
@@ -1546,13 +1533,13 @@ class FlightGlobeWidget(QOpenGLWidget):
     def mousePressEvent(self, event):
         """Handle mouse press for rotation"""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.is_rotating = True
+            self.is_grabbed = True
             self.last_mouse_pos = event.pos()
             self.rotation_momentum = QVector3D(0, 0, 0)
     
     def mouseMoveEvent(self, event):
         """Handle mouse movement with momentum"""
-        if self.is_rotating:
+        if self.is_grabbed:
             delta = event.pos() - self.last_mouse_pos
             self.update_rotation_with_momentum(delta)
             self.last_mouse_pos = event.pos()
@@ -1560,16 +1547,24 @@ class FlightGlobeWidget(QOpenGLWidget):
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.is_rotating = False
+            self.is_grabbed = False
+    
+    def update_rotation(self):
+        #self.rotation_momentum = self.passive_rotation_speed
+        x_quat = QQuaternion.fromAxisAndAngle(QVector3D(1, 0, 0), self.passive_rotation_speed.x())
+        y_quat = QQuaternion.fromAxisAndAngle(QVector3D(0, 1, 0), self.passive_rotation_speed.y())
+        rotation_quat = y_quat * x_quat
+        rotation_matrix = QMatrix4x4()
+        rotation_matrix.rotate(rotation_quat)
+        self.rotation_matrix = rotation_matrix * self.rotation_matrix
+        self.update()
     
     def update_rotation_with_momentum(self, delta):
         """Update rotation with momentum calculation"""
-        sensitivity = 0.5 * self.rotation_speed
-        
-        x_rotation = delta.y() * sensitivity
-        y_rotation = delta.x() * sensitivity
-        
-        self.rotation_momentum = QVector3D(x_rotation, y_rotation, 0) * 0.1
+        scaled_sensitivity = self.sensitivity * (1.0/(self.zoom_level*self.zoom_level))
+        x_rotation = delta.y() * scaled_sensitivity
+        y_rotation = delta.x() * scaled_sensitivity
+        self.rotation_momentum = QVector3D(x_rotation, y_rotation, 0)
         
         x_quat = QQuaternion.fromAxisAndAngle(QVector3D(1, 0, 0), x_rotation)
         y_quat = QQuaternion.fromAxisAndAngle(QVector3D(0, 1, 0), y_rotation)
@@ -1581,12 +1576,22 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.rotation_matrix = rotation_matrix * self.rotation_matrix
         self.update()
     
+    def decay_momentum(self):
+        momentum_rotation = QMatrix4x4()
+        momentum_rotation.rotate(self.rotation_momentum.length(),
+                                 self.rotation_momentum.normalized())
+        self.rotation_matrix = momentum_rotation * self.rotation_matrix
+        self.rotation_momentum *= self.momentum_decay
+        
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming"""
         delta = event.angleDelta().y()
-        zoom_factor = 1.1 if delta > 0 else 0.9
+        zoom_factor = 1.05 if delta > 0 else 0.95
+        old_zoom = self.zoom_level
         new_zoom = self.zoom_level * zoom_factor
         self.zoom_level = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        if (self.debug and (old_zoom != self.zoom_level)):
+            print(f"zoom level: {self.zoom_level:.3f}x")
         self.update()
     
     def reset_view(self):
@@ -1598,10 +1603,8 @@ class FlightGlobeWidget(QOpenGLWidget):
     
     def resizeGL(self, width, height):
         """Handle window resize"""
-        if height == 0:
-            height = 1
+        if height == 0: height = 1;
         gl.glViewport(0, 0, width, height)
-    
     
     def cleanup_airplane_resources(self):
         """Clean up airplane OpenGL resources"""
