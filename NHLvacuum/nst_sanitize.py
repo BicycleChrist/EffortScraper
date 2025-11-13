@@ -52,6 +52,7 @@ class NSTSanitizer:
             'game_info': {}
         })
         self.session = None
+        self.null_games_by_season = defaultdict(set)  # Track null games per season
 
     def create_session(self):
         """Create requests session with retry logic"""
@@ -59,9 +60,96 @@ class NSTSanitizer:
             self.session = nstparse.create_session()
         return self.session
 
-    def find_corrupted_files(self, season='2023-24'):
+    def load_null_games(self, season):
+        """
+        Load previously identified null games from CSV file
+
+        Args:
+            season: Season string (e.g., '2024-25')
+
+        Returns:
+            set: Set of game IDs to skip
+        """
+        null_games_file = f"null_games_{season}.csv"
+
+        if not os.path.exists(null_games_file):
+            return set()
+
+        try:
+            df = pd.read_csv(null_games_file)
+            null_game_ids = set(df['game_id'].astype(str))
+            print(f"  Loaded {len(null_game_ids)} null games from {null_games_file}")
+            return null_game_ids
+        except Exception as e:
+            print(f"  ⚠ Error loading {null_games_file}: {e}")
+            return set()
+
+    def save_null_games(self, season):
+        """
+        Save corrupted/null games to CSV file for future reference
+
+        Args:
+            season: Season string (e.g., '2024-25')
+        """
+        if season not in self.null_games_by_season or not self.null_games_by_season[season]:
+            print(f"  No null games to save for {season}")
+            return
+
+        null_games_file = f"null_games_{season}.csv"
+
+        # Prepare data for CSV
+        data = []
+        for game_id in sorted(self.null_games_by_season[season]):
+            if game_id in self.games_by_id:
+                game_data = self.games_by_id[game_id]
+                game_info = game_data.get('game_info', {})
+
+                data.append({
+                    'game_id': game_id,
+                    'title': game_info.get('title', 'Unknown'),
+                    'date': game_info.get('date', ''),
+                    'teams': ' vs '.join(sorted(game_data['teams'])),
+                    'corrupted_file_count': len(game_data['files']),
+                    'full_report_url': game_info.get('full_report_url', '')
+                })
+
+        # Save to CSV with UTF-8 encoding
+        df = pd.DataFrame(data)
+        df.to_csv(null_games_file, index=False, encoding='utf-8')
+        print(f"  ✓ Saved {len(data)} null games to {null_games_file}")
+
+    def get_available_seasons(self):
+        """
+        Get list of all available seasons in the nhlteamreports directory
+
+        Returns:
+            list: List of season strings (e.g., ['2022-23', '2023-24', '2024-25'])
+        """
+        seasons = set()
+        season_path = Path(self.base_dir)
+
+        for team_dir in season_path.iterdir():
+            if not team_dir.is_dir():
+                continue
+
+            games_dir = team_dir / 'games'
+            if not games_dir.exists():
+                continue
+
+            # Get all season directories
+            for season_dir in games_dir.iterdir():
+                if season_dir.is_dir() and re.match(r'\d{4}-\d{2}', season_dir.name):
+                    seasons.add(season_dir.name)
+
+        return sorted(list(seasons))
+
+    def find_corrupted_files(self, season='2024-25', skip_known_null_games=True):
         """
         Find all files with '-' in team position or only headers (no data)
+
+        Args:
+            season: Season to scan (e.g., '2024-25')
+            skip_known_null_games: If True, skip games already in null_games_{season}.csv
 
         Returns:
             List of corrupted file paths
@@ -70,7 +158,15 @@ class NSTSanitizer:
         print(f"SCANNING FOR CORRUPTED FILES IN {season} SEASON")
         print(f"{'='*80}\n")
 
-        pattern = re.compile(r'^([A-Z]+)vs([A-Z]+)_(\d+)_(.+)\.csv$')
+        # Load known null games to skip
+        known_null_games = set()
+        if skip_known_null_games:
+            known_null_games = self.load_null_games(season)
+            if known_null_games:
+                print(f"  Skipping {len(known_null_games)} known null games\n")
+
+        # Pattern updated to handle team abbreviations with periods (e.g., S.J, L.A, T.B, N.J)
+        pattern = re.compile(r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_(.+)\.csv$')
         season_path = Path(self.base_dir)
 
         # Scan all team directories
@@ -94,6 +190,10 @@ class NSTSanitizer:
                 if match:
                     team1, team2, game_id, section_info = match.groups()
 
+                    # Skip if this game is already in known null games
+                    if game_id in known_null_games:
+                        continue
+
                     # Check ONLY if section_info starts with "-_" (missing team name)
                     # This is the specific NST bug where team names are missing from HTML
                     is_corrupted = section_info.startswith('-_')
@@ -105,6 +205,10 @@ class NSTSanitizer:
                         self.games_by_id[game_id]['teams'].add(team1)
                         self.games_by_id[game_id]['teams'].add(team2)
                         self.games_by_id[game_id]['files'].append(str(csv_file))
+                        self.games_by_id[game_id]['season'] = season  # Track season
+
+                        # Add to null games for this season
+                        self.null_games_by_season[season].add(game_id)
 
         print(f"✓ Found {len(self.corrupted_files)} corrupted files")
         print(f"✓ Affecting {len(self.games_by_id)} unique games")
@@ -143,7 +247,7 @@ class NSTSanitizer:
 
         print()
 
-    def _get_game_info_from_games_list(self, team_abbr, game_id, season='2023-24'):
+    def _get_game_info_from_games_list(self, team_abbr, game_id, season='2024-25'):
         """Load game information from team's games list CSV"""
         games_list_path = Path(self.base_dir) / team_abbr / 'games' / season / f"{team_abbr}_games_list.csv"
 
@@ -581,14 +685,16 @@ Examples:
                         help='Delete corrupted files without re-scraping')
     parser.add_argument('--fix', action='store_true',
                         help='Delete corrupted files and re-scrape (full fix)')
-    parser.add_argument('--season', type=str, default='2023-24',
-                        help='Season to process (default: 2023-24)')
+    parser.add_argument('--season', type=str, default='all',
+                        help='Season to process (default: all) or specific season like 2024-25')
     parser.add_argument('--delay-min', type=float, default=2.0,
                         help='Minimum delay between games (seconds, default: 2)')
     parser.add_argument('--delay-max', type=float, default=5.0,
                         help='Maximum delay between games (seconds, default: 5)')
     parser.add_argument('--use-standard-parser', action='store_true',
                         help='Use standard parser instead of enhanced parser (not recommended for these games)')
+    parser.add_argument('--force-rescan', action='store_true',
+                        help='Force re-scan of all games, including those in null_games_*.csv files')
 
     args = parser.parse_args()
 
@@ -599,19 +705,65 @@ Examples:
     # Initialize sanitizer
     sanitizer = NSTSanitizer()
 
-    # Step 1: Find corrupted files
-    sanitizer.find_corrupted_files(season=args.season)
+    # Determine which seasons to process
+    if args.season == 'all':
+        seasons = sanitizer.get_available_seasons()
+        if not seasons:
+            print("✗ No seasons found in nhlteamreports/")
+            return
+        print(f"\nProcessing all seasons: {', '.join(seasons)}\n")
+    else:
+        seasons = [args.season]
 
-    if len(sanitizer.corrupted_files) == 0:
-        print("✓ No corrupted files found!")
+    # Process each season
+    for season in seasons:
+        print(f"\n{'='*80}")
+        print(f"PROCESSING SEASON: {season}")
+        print(f"{'='*80}\n")
+
+        # Reset for each season
+        sanitizer.corrupted_files = []
+        sanitizer.games_by_id = defaultdict(lambda: {
+            'teams': set(),
+            'files': [],
+            'game_info': {}
+        })
+
+        # Step 1: Find corrupted files
+        sanitizer.find_corrupted_files(season=season, skip_known_null_games=not args.force_rescan)
+
+        if len(sanitizer.corrupted_files) == 0:
+            print(f"✓ No corrupted files found for {season}!")
+            continue
+
+        # Step 2: Load game metadata
+        sanitizer.load_game_metadata()
+
+        # Step 3: Show summary
+        if args.scan or args.verify or args.delete_only or args.fix:
+            sanitizer.print_summary()
+
+        # Step 4: Save null games to CSV
+        print(f"\n{'='*80}")
+        print(f"SAVING NULL GAMES FOR {season}")
+        print(f"{'='*80}\n")
+        sanitizer.save_null_games(season)
+
+    # After processing all seasons, return if scan only
+    if args.scan:
+        print(f"\n{'='*80}")
+        print("SCAN COMPLETE - Check null_games_*.csv files")
+        print(f"{'='*80}")
         return
 
-    # Step 2: Load game metadata
-    sanitizer.load_game_metadata()
+    # The rest of the logic only applies if processing a single season
+    if len(seasons) > 1:
+        print(f"\n⚠ Additional operations (--verify, --delete-only, --fix) only work with a single season")
+        print(f"   Please specify --season <season> to perform these operations")
+        return
 
-    # Step 3: Show summary
-    if args.scan or args.verify or args.delete_only or args.fix:
-        sanitizer.print_summary()
+    # Continue with single season operations
+    season = seasons[0]
 
     # Step 4: Verify games (optional)
     if args.verify:

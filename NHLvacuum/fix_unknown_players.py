@@ -6,8 +6,17 @@ Fix unknown player IDs by scraping Natural Stat Trick player list
 import sqlite3
 import requests
 import time
+import os
 from bs4 import BeautifulSoup
 import re
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Set to True to fetch fresh player data from Natural Stat Trick
+# Set to False to use existing player_ids.txt file only
+FETCH_NEW_PLAYER_DATA = True
 
 def get_nst_player_ids_for_range(from_season, thru_season):
     """
@@ -128,13 +137,77 @@ def get_nst_player_ids(start_year=2023, end_year=2025, max_iterations=10):
     print(f"TOTAL: Found {len(all_players)} unique players across all seasons")
     print("="*60 + "\n")
 
+    # Save to player_ids.txt with UTF-8 encoding
+    save_player_ids_to_file(all_players)
+
     return all_players
+
+
+def load_player_ids_from_file(filename='player_ids.txt'):
+    """
+    Load player IDs from file
+
+    Args:
+        filename: Input filename (default: player_ids.txt)
+
+    Returns:
+        dict: {player_name: player_id}
+    """
+    if not os.path.exists(filename):
+        print(f"⚠ Warning: {filename} not found. No player IDs loaded.")
+        return {}
+
+    player_map = {}
+
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if ':' in line:
+                    parts = line.rsplit(':', 1)
+                    if len(parts) == 2:
+                        name = parts[0].strip()
+                        player_id = parts[1].strip()
+                        player_map[name] = player_id
+    except Exception as e:
+        print(f"⚠ Error reading {filename}: {e}")
+        return {}
+
+    return player_map
+
+
+def save_player_ids_to_file(player_map, filename='player_ids.txt'):
+    """
+    Save player IDs to file with UTF-8 encoding
+
+    Args:
+        player_map: Dictionary of {player_name: player_id}
+        filename: Output filename (default: player_ids.txt)
+    """
+    print(f"Saving {len(player_map)} player IDs to {filename}...")
+
+    # Sort by player name for consistency
+    sorted_players = sorted(player_map.items(), key=lambda x: x[0])
+
+    # Write with UTF-8 encoding to handle accent marks correctly
+    with open(filename, 'w', encoding='utf-8') as f:
+        for player_name, player_id in sorted_players:
+            f.write(f"{player_name}: {player_id}\n")
+
+    print(f"✓ Saved to {filename}")
+
 
 def fix_unknown_players(db_path='nhl_analytics.db'):
     """Update unknown player IDs in database"""
 
-    # Get player IDs from NST
-    nst_players = get_nst_player_ids()
+    # Get player IDs from NST or load from file
+    if FETCH_NEW_PLAYER_DATA:
+        print("\n→ Fetching fresh player data from Natural Stat Trick...")
+        nst_players = get_nst_player_ids()
+    else:
+        print("\n→ Loading player data from player_ids.txt...")
+        nst_players = load_player_ids_from_file()
+        print(f"✓ Loaded {len(nst_players)} players from file\n")
 
     # Connect to database
     conn = sqlite3.connect(db_path)
@@ -180,8 +253,45 @@ def fix_unknown_players(db_path='nhl_analytics.db'):
 
                 if table == 'line_combinations':
                     # Handle player1_id, player2_id, player3_id
+                    # Strategy: Find and delete line combos with UNKNOWN IDs where a matching combo with real IDs exists
+
+                    # First, find all unique line combos with the old_id
+                    cursor.execute(f"""
+                        SELECT DISTINCT game_id, team_id, situation_id, player1_id, player2_id, player3_id
+                        FROM {table}
+                        WHERE player1_id = ? OR player2_id = ? OR player3_id = ?
+                    """, (old_id, old_id, old_id))
+
+                    old_combos = cursor.fetchall()
+                    deleted_total = 0
+
+                    for game_id, team_id, situation_id, p1, p2, p3 in old_combos:
+                        # Create what the new combo would be after update
+                        new_p1 = nst_id if p1 == old_id else p1
+                        new_p2 = nst_id if p2 == old_id else p2
+                        new_p3 = nst_id if p3 == old_id else p3
+
+                        # Check if this new combo already exists
+                        cursor.execute(f"""
+                            SELECT COUNT(*) FROM {table}
+                            WHERE game_id = ? AND team_id = ? AND situation_id = ?
+                            AND player1_id = ? AND player2_id = ? AND player3_id = ?
+                        """, (game_id, team_id, situation_id, new_p1, new_p2, new_p3))
+
+                        if cursor.fetchone()[0] > 0:
+                            # Duplicate would exist, delete the old one
+                            cursor.execute(f"""
+                                DELETE FROM {table}
+                                WHERE game_id = ? AND team_id = ? AND situation_id = ?
+                                AND player1_id = ? AND player2_id = ? AND player3_id = ?
+                            """, (game_id, team_id, situation_id, p1, p2, p3))
+                            deleted_total += cursor.rowcount
+
+                    if deleted_total > 0:
+                        print(f"    Deleted {deleted_total} duplicate line combos from {table}")
+
+                    # Now safely update all remaining records
                     for col in ['player1_id', 'player2_id', 'player3_id']:
-                        # Just update - line_combinations doesn't have unique constraint issues
                         cursor.execute(f"""
                             UPDATE {table}
                             SET {col} = ?

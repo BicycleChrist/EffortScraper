@@ -20,6 +20,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from queue import Queue
+from functools import lru_cache
+from collections import defaultdict
 
 
 @dataclass
@@ -36,16 +41,18 @@ class GameInfo:
 class NHLDatabaseManager:
     """Manages the NHL analytics SQLite database"""
 
-    def __init__(self, db_path: str = "nhl_analytics.db", player_ids_file: str = "player_ids.txt"):
+    def __init__(self, db_path: str = "nhl_analytics.db", player_ids_file: str = "player_ids.txt", max_workers: int = 10):
         """
         Initialize database manager
 
         Args:
             db_path: Path to SQLite database file
             player_ids_file: Path to player IDs mapping file
+            max_workers: Maximum number of worker threads for parallel processing
         """
         self.db_path = db_path
         self.player_ids_file = player_ids_file
+        self.max_workers = max_workers
         self.conn: Optional[sqlite3.Connection] = None
         self.cursor: Optional[sqlite3.Cursor] = None
 
@@ -53,6 +60,10 @@ class NHLDatabaseManager:
         self.situation_map: Dict[str, int] = {}
         self.team_map: Dict[str, int] = {}
         self.player_map: Dict[Tuple[str, str], str] = {}  # (name, position) -> nhl_player_id
+
+        # Thread-safe locks
+        self._player_map_lock = Lock()
+        self._db_write_lock = Lock()
 
         # NHL player ID mapping (name -> nhl_id)
         self.nhl_player_ids: Dict[str, str] = {}
@@ -80,6 +91,17 @@ class NHLDatabaseManager:
         """Connect to database"""
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
+
+    def _get_thread_connection(self) -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
+        """
+        Create a thread-local database connection
+
+        Returns:
+            Tuple of (connection, cursor)
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        return conn, cursor
 
     def disconnect(self):
         """Disconnect from database"""
@@ -110,19 +132,20 @@ class NHLDatabaseManager:
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
 
-        # Execute schema - split on semicolons but handle them in strings
-        statements = schema_sql.split(';')
-        for statement in statements:
-            statement = statement.strip()
-            if statement:
-                try:
-                    self.cursor.execute(statement)
-                except sqlite3.Error as e:
-                    print(f"Error executing statement: {e}")
-                    print(f"Statement: {statement[:100]}...")
+        # Execute entire schema at once using executescript (handles multi-line statements properly)
+        try:
+            self.cursor.executescript(schema_sql)
+            self.conn.commit()
+            print(f"Database initialized at {self.db_path}")
 
-        self.conn.commit()
-        print(f"Database initialized at {self.db_path}")
+            # Verify tables were created
+            self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = [row[0] for row in self.cursor.fetchall()]
+            print(f"Created {len(tables)} tables: {', '.join(tables)}")
+
+        except sqlite3.Error as e:
+            print(f"Error initializing database: {e}")
+            raise
 
     def populate_reference_data(self):
         """Populate dimension tables with reference data"""
@@ -145,7 +168,8 @@ class NHLDatabaseManager:
             )
 
         # Populate all NHL teams (2024-25 season) in alphabetical order by abbreviation
-        # Note: Using abbreviations WITHOUT periods (N.J -> NJ, S.J -> SJ, etc.)
+        # Note: Include both dotted (L.A, N.J, S.J, T.B) and stripped (LA, NJ, SJ, TB) versions
+        # Files use dotted versions, but parse_filename() strips periods
         nhl_teams = [
             ('ANA', 'Anaheim Ducks'),
             ('ARI', 'Arizona Coyotes'),
@@ -160,20 +184,24 @@ class NHLDatabaseManager:
             ('DET', 'Detroit Red Wings'),
             ('EDM', 'Edmonton Oilers'),
             ('FLA', 'Florida Panthers'),
-            ('LA', 'Los Angeles Kings'),
+            ('LA', 'Los Angeles Kings'),  # Stripped version
+            ('L.A', 'Los Angeles Kings'),  # Dotted version (used in filenames)
             ('MIN', 'Minnesota Wild'),
             ('MTL', 'Montreal Canadiens'),
-            ('NJ', 'New Jersey Devils'),
+            ('NJ', 'New Jersey Devils'),  # Stripped version
+            ('N.J', 'New Jersey Devils'),  # Dotted version (used in filenames)
             ('NSH', 'Nashville Predators'),
             ('NYI', 'New York Islanders'),
             ('NYR', 'New York Rangers'),
             ('OTT', 'Ottawa Senators'),
             ('PHI', 'Philadelphia Flyers'),
             ('PIT', 'Pittsburgh Penguins'),
-            ('SJ', 'San Jose Sharks'),
+            ('SJ', 'San Jose Sharks'),  # Stripped version
+            ('S.J', 'San Jose Sharks'),  # Dotted version (used in filenames)
             ('SEA', 'Seattle Kraken'),
             ('STL', 'St. Louis Blues'),
-            ('TB', 'Tampa Bay Lightning'),
+            ('TB', 'Tampa Bay Lightning'),  # Stripped version
+            ('T.B', 'Tampa Bay Lightning'),  # Dotted version (used in filenames)
             ('TOR', 'Toronto Maple Leafs'),
             ('UTA', 'Utah Hockey Club'),
             ('VAN', 'Vancouver Canucks'),
@@ -199,23 +227,28 @@ class NHLDatabaseManager:
         self.cursor.execute("SELECT team_id, team_abbr FROM teams")
         self.team_map = {abbr: tid for tid, abbr in self.cursor.fetchall()}
 
-    def get_or_create_team(self, team_abbr: str) -> int:
+    def get_or_create_team(self, team_abbr: str, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None) -> int:
         """
         Get team ID from pre-populated teams table
 
         Args:
             team_abbr: Team abbreviation (e.g., 'OTT', 'BOS')
+            conn: Optional database connection (for thread-local use)
+            cursor: Optional database cursor (for thread-local use)
 
         Returns:
             Team ID
         """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         # Check cache first
         if team_abbr in self.team_map:
             return self.team_map[team_abbr]
 
-        # Reload team map if not found
-        self.cursor.execute("SELECT team_id, team_abbr FROM teams")
-        self.team_map = {abbr: tid for tid, abbr in self.cursor.fetchall()}
+        # Reload team map if not found (using provided cursor)
+        use_cursor.execute("SELECT team_id, team_abbr FROM teams")
+        self.team_map = {abbr: tid for tid, abbr in use_cursor.fetchall()}
 
         if team_abbr in self.team_map:
             return self.team_map[team_abbr]
@@ -223,13 +256,15 @@ class NHLDatabaseManager:
         # This shouldn't happen if teams are pre-populated correctly
         raise ValueError(f"Team abbreviation '{team_abbr}' not found in teams table. Please add it to populate_reference_data().")
 
-    def get_or_create_player(self, player_name: str, position: str) -> str:
+    def get_or_create_player(self, player_name: str, position: str, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None) -> str:
         """
-        Get player ID or create if doesn't exist
+        Get player ID or create if doesn't exist (thread-safe)
 
         Args:
             player_name: Player's name
             position: Player position (C, L, R, D, G)
+            conn: Optional database connection (for thread-local use)
+            cursor: Optional database cursor (for thread-local use)
 
         Returns:
             NHL Player ID (string)
@@ -238,8 +273,11 @@ class NHLDatabaseManager:
         player_name = player_name.replace('\xa0', ' ').replace('\u00a0', ' ').strip()
 
         key = (player_name, position)
-        if key in self.player_map:
-            return self.player_map[key]
+
+        # Thread-safe cache check
+        with self._player_map_lock:
+            if key in self.player_map:
+                return self.player_map[key]
 
         # Get NHL player ID from mapping, or generate a placeholder
         nhl_player_id = self.nhl_player_ids.get(player_name)
@@ -248,29 +286,47 @@ class NHLDatabaseManager:
             # If not found, create a placeholder ID (use negative numbers)
             nhl_player_id = f"UNKNOWN_{abs(hash(player_name)) % 1000000}"
             # Only print first few warnings to avoid spam
-            if len([k for k in self.player_map.keys() if 'UNKNOWN' in str(self.player_map[k])]) < 5:
-                print(f"Warning: No NHL ID found for '{player_name}' ({position}), using {nhl_player_id}")
-                print(f"  Debug: Name length={len(player_name)}, repr={repr(player_name)}")
+            with self._player_map_lock:
+                if len([k for k in self.player_map.keys() if 'UNKNOWN' in str(self.player_map[k])]) < 5:
+                    print(f"Warning: No NHL ID found for '{player_name}' ({position}), using {nhl_player_id}")
+                    print(f"  Debug: Name length={len(player_name)}, repr={repr(player_name)}")
+
+        # Use provided connection or default
+        use_cursor = cursor if cursor else self.cursor
+        use_conn = conn if conn else self.conn
 
         # Try to get existing
-        self.cursor.execute(
+        use_cursor.execute(
             "SELECT player_id FROM players WHERE player_id = ?",
             (nhl_player_id,)
         )
-        result = self.cursor.fetchone()
+        result = use_cursor.fetchone()
 
         if not result:
-            # Create new player
-            self.cursor.execute(
-                "INSERT INTO players (player_id, player_name, position) VALUES (?, ?, ?)",
-                (nhl_player_id, player_name, position)
-            )
-            self.conn.commit()
+            # Create new player with write lock
+            with self._db_write_lock:
+                # Double-check after acquiring lock
+                use_cursor.execute(
+                    "SELECT player_id FROM players WHERE player_id = ?",
+                    (nhl_player_id,)
+                )
+                result = use_cursor.fetchone()
 
-        self.player_map[key] = nhl_player_id
+                if not result:
+                    use_cursor.execute(
+                        "INSERT INTO players (player_id, player_name, position) VALUES (?, ?, ?)",
+                        (nhl_player_id, player_name, position)
+                    )
+                    # Don't commit here - let the caller handle commits
+                    # This prevents "database is locked" errors and allows batch operations
+
+        # Thread-safe cache update
+        with self._player_map_lock:
+            self.player_map[key] = nhl_player_id
+
         return nhl_player_id
 
-    def get_or_create_game(self, game_info: GameInfo, game_date: str, season: str = None) -> str:
+    def get_or_create_game(self, game_info: GameInfo, game_date: str, season: str = None, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None) -> str:
         """
         Get game ID or create if doesn't exist
 
@@ -278,25 +334,30 @@ class NHLDatabaseManager:
             game_info: Parsed game information
             game_date: Date of game (YYYY-MM-DD)
             season: Season string (e.g., '2024-2025')
+            conn: Optional database connection (for thread-local use)
+            cursor: Optional database cursor (for thread-local use)
 
         Returns:
             Game ID (TEXT - the actual NHL game ID)
         """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         game_id = game_info.nst_game_id
 
         # Try to get existing game
-        self.cursor.execute(
+        use_cursor.execute(
             "SELECT game_id FROM games WHERE game_id = ?",
             (game_id,)
         )
-        result = self.cursor.fetchone()
+        result = use_cursor.fetchone()
 
         if result:
             return result[0]
 
         # Create new game
-        home_team_id = self.get_or_create_team(game_info.home_team)
-        away_team_id = self.get_or_create_team(game_info.away_team)
+        home_team_id = self.get_or_create_team(game_info.home_team, use_conn, use_cursor)
+        away_team_id = self.get_or_create_team(game_info.away_team, use_conn, use_cursor)
 
         # Derive season from date if not provided
         if season is None:
@@ -308,12 +369,12 @@ class NHLDatabaseManager:
             else:
                 season = f"{year - 1}-{year}"
 
-        self.cursor.execute(
+        use_cursor.execute(
             """INSERT INTO games (game_id, home_team_id, away_team_id, game_date, season)
                VALUES (?, ?, ?, ?, ?)""",
             (game_id, home_team_id, away_team_id, game_date, season)
         )
-        self.conn.commit()
+        use_conn.commit()
         return game_id
 
     @staticmethod
@@ -423,7 +484,7 @@ class NHLDatabaseManager:
         except (ValueError, TypeError):
             return 0
 
-    def import_player_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_player_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """
         Import individual player stats (skaters) from CSV
 
@@ -432,7 +493,12 @@ class NHLDatabaseManager:
             game_id: Game ID (TEXT - actual NHL game ID)
             team_id: Team ID
             situation_id: Situation ID
+            conn: Optional database connection (for thread-local use)
+            cursor: Optional database cursor (for thread-local use)
         """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -443,7 +509,7 @@ class NHLDatabaseManager:
                 if not player_name or not position:
                     continue
 
-                player_id = self.get_or_create_player(player_name, position)
+                player_id = self.get_or_create_player(player_name, position, use_conn, use_cursor)
 
                 # Parse all stats
                 data = {
@@ -483,7 +549,7 @@ class NHLDatabaseManager:
                 }
 
                 # Insert or replace
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO player_game_stats (
                         game_id, player_id, team_id, situation_id,
                         toi_seconds, goals, total_assists, first_assists, second_assists, total_points,
@@ -503,9 +569,9 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_goalie_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_goalie_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """
         Import goaltender stats from CSV
 
@@ -514,7 +580,12 @@ class NHLDatabaseManager:
             game_id: Game ID (TEXT - actual NHL game ID)
             team_id: Team ID
             situation_id: Situation ID
+            conn: Optional database connection (for thread-local use)
+            cursor: Optional database cursor (for thread-local use)
         """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -524,7 +595,7 @@ class NHLDatabaseManager:
                 if not player_name:
                     continue
 
-                player_id = self.get_or_create_player(player_name, 'G')
+                player_id = self.get_or_create_player(player_name, 'G', use_conn, use_cursor)
 
                 data = {
                     'game_id': game_id,
@@ -556,7 +627,7 @@ class NHLDatabaseManager:
                     'avg_goal_distance': self.safe_float(row.get('Avg. Goal Distance', None))
                 }
 
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO goalie_game_stats (
                         game_id, player_id, team_id, situation_id,
                         toi_seconds, shots_against, saves, goals_against, expected_goals_against,
@@ -578,10 +649,13 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_onice_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_onice_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import on-ice stats from CSV"""
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -595,7 +669,7 @@ class NHLDatabaseManager:
                 if not player_name or not position:
                     continue
 
-                player_id = self.get_or_create_player(player_name, position)
+                player_id = self.get_or_create_player(player_name, position, use_conn, use_cursor)
 
                 data = {
                     'game_id': game_id,
@@ -642,7 +716,7 @@ class NHLDatabaseManager:
                     'off_zone_faceoff_pct': self.safe_percentage(row.get('Off. Zone Faceoff %', None))
                 }
 
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO player_onice_stats (
                         game_id, player_id, team_id, situation_id, toi_seconds,
                         cf, ca, cf_pct, cf_pct_rel,
@@ -670,10 +744,13 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_shift_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_shift_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import shift report stats from CSV"""
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -688,7 +765,7 @@ class NHLDatabaseManager:
                 if player_name in ['Forwards', 'Defense']:
                     continue
 
-                player_id = self.get_or_create_player(player_name, position)
+                player_id = self.get_or_create_player(player_name, position, use_conn, use_cursor)
 
                 data = {
                     'game_id': game_id,
@@ -705,7 +782,7 @@ class NHLDatabaseManager:
                     'extra_long_shifts': self.safe_int(row.get('Extra Long', 0))
                 }
 
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO player_shift_stats (
                         game_id, player_id, team_id, situation_id, toi_seconds,
                         shifts, avg_shift_length, shift_std_dev,
@@ -717,10 +794,13 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_forward_lines(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_forward_lines(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import forward line combination stats from CSV"""
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -736,9 +816,9 @@ class NHLDatabaseManager:
                     continue
 
                 # Get player IDs (assume forward position for line combos)
-                p1_id = self.get_or_create_player(p1, 'F')
-                p2_id = self.get_or_create_player(p2, 'F')
-                p3_id = self.get_or_create_player(p3, 'F')
+                p1_id = self.get_or_create_player(p1, 'F', use_conn, use_cursor)
+                p2_id = self.get_or_create_player(p2, 'F', use_conn, use_cursor)
+                p3_id = self.get_or_create_player(p3, 'F', use_conn, use_cursor)
 
                 data = {
                     'game_id': game_id,
@@ -790,7 +870,7 @@ class NHLDatabaseManager:
                     'off_zone_faceoff_pct': self.safe_percentage(row.get('Off. Zone Faceoff %', None))
                 }
 
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO line_combinations (
                         game_id, team_id, situation_id, player1_id, player2_id, player3_id,
                         toi_seconds,
@@ -820,10 +900,13 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_team_overview(self, csv_path: str, game_id: str, team_id: int, situation_id: int):
+    def import_team_overview(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import team overview stats (period by period) from CSV"""
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
 
@@ -869,7 +952,7 @@ class NHLDatabaseManager:
                     'gf_pct': self.safe_percentage(row.get('GF%', None))
                 }
 
-                self.cursor.execute("""
+                use_cursor.execute("""
                     INSERT OR REPLACE INTO team_game_overview (
                         game_id, team_id, situation_id, period, toi_seconds,
                         cf, ca, cf_pct,
@@ -891,54 +974,85 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        self.conn.commit()
+        use_conn.commit()
 
-    def import_csv_file(self, csv_path: str, game_date: str, team_abbr: str = None):
+    def _parse_csv_file_worker(self, csv_path: str, game_date: str, team_abbr: str = None) -> Tuple[bool, str, Optional[Dict]]:
         """
-        Import a single CSV file into the database
+        Worker method to PARSE (not write) a single CSV file
+        Returns the parsed data for later batch insertion
 
         Args:
             csv_path: Path to CSV file
             game_date: Date of game (YYYY-MM-DD format)
             team_abbr: Team abbreviation (extracted from directory path)
+
+        Returns:
+            Tuple of (success, error_message, parsed_data_dict)
         """
-        filename = os.path.basename(csv_path)
-        game_info = self.parse_filename(filename)
+        try:
+            filename = os.path.basename(csv_path)
+            game_info = self.parse_filename(filename)
 
-        if not game_info:
-            print(f"Could not parse filename: {filename}")
-            return
+            if not game_info:
+                return False, f"Could not parse filename: {filename}", None
 
-        # Skip aggregate opponent stats files (e.g., ANAvsOPP_*)
-        if game_info.home_team == 'OPP' or game_info.away_team == 'OPP':
-            return  # Silently skip OPP aggregate files
+            # Skip aggregate opponent stats files (e.g., ANAvsOPP_*)
+            if game_info.home_team == 'OPP' or game_info.away_team == 'OPP':
+                return True, "", None  # Silently skip OPP aggregate files
 
-        # Extract team abbreviation from path if not provided
-        if team_abbr is None:
-            # Path format: nhlteamreports/OTT/games/2025-11-01/...
-            path_parts = Path(csv_path).parts
-            if 'nhlteamreports' in path_parts:
-                idx = path_parts.index('nhlteamreports')
-                if idx + 1 < len(path_parts):
-                    team_abbr = path_parts[idx + 1]
+            # Extract team abbreviation from path if not provided
+            if team_abbr is None:
+                # Path format: nhlteamreports/OTT/games/2025-11-01/...
+                path_parts = Path(csv_path).parts
+                if 'nhlteamreports' in path_parts:
+                    idx = path_parts.index('nhlteamreports')
+                    if idx + 1 < len(path_parts):
+                        team_abbr = path_parts[idx + 1]
 
-        if not team_abbr:
-            print(f"Could not determine team abbreviation for: {csv_path}")
-            return
+            if not team_abbr:
+                return False, f"Could not determine team abbreviation for: {csv_path}", None
 
-        # Get IDs
+            situation_id = self.situation_map.get(game_info.situation)
+
+            if situation_id is None:
+                return False, f"Unknown situation: {game_info.situation}", None
+
+            # Return parsed metadata for batch processing
+            parsed_data = {
+                'csv_path': csv_path,
+                'game_info': game_info,
+                'game_date': game_date,
+                'team_abbr': team_abbr,
+                'situation_id': situation_id,
+                'filename': filename
+            }
+
+            return True, "", parsed_data
+
+        except Exception as e:
+            return False, f"Error parsing {csv_path}: {e}", None
+
+    def _process_parsed_file(self, parsed_data: Dict):
+        """
+        Process a single parsed CSV file and write to database
+        Must be called from main thread with main connection
+
+        Args:
+            parsed_data: Dictionary containing parsed file metadata
+        """
+        csv_path = parsed_data['csv_path']
+        game_info = parsed_data['game_info']
+        game_date = parsed_data['game_date']
+        team_abbr = parsed_data['team_abbr']
+        situation_id = parsed_data['situation_id']
+        filename = parsed_data['filename']
+
+        # Get/create game and team (using main connection)
         game_id = self.get_or_create_game(game_info, game_date)
         team_id = self.get_or_create_team(team_abbr)
-        situation_id = self.situation_map.get(game_info.situation)
-
-        if situation_id is None:
-            print(f"Unknown situation: {game_info.situation}")
-            return
 
         # Determine file type and import accordingly
         category = game_info.category
-
-        # Check if it's a _1 or _2 file
         is_goalie_file = filename.endswith('_2.csv')
         is_player_file = filename.endswith('_1.csv')
 
@@ -955,6 +1069,53 @@ class NHLDatabaseManager:
             self.import_forward_lines(csv_path, game_id, team_id, situation_id)
         elif 'overview' in category:
             self.import_team_overview(csv_path, game_id, team_id, situation_id)
+
+    def import_csv_file(self, csv_path: str, game_date: str, team_abbr: str = None):
+        """
+        Import a single CSV file into the database (single-threaded method)
+
+        Args:
+            csv_path: Path to CSV file
+            game_date: Date of game (YYYY-MM-DD format)
+            team_abbr: Team abbreviation (extracted from directory path)
+        """
+        success, error, parsed_data = self._parse_csv_file_worker(csv_path, game_date, team_abbr)
+        if not success and error:
+            print(error)
+        elif parsed_data:
+            self._process_parsed_file(parsed_data)
+
+    def _get_existing_game_data(self, team_id: int, season: str) -> Dict[Tuple[str, int], bool]:
+        """
+        Get existing game data for a team/season to avoid reimporting
+
+        Args:
+            team_id: Team ID to check
+            season: Season string (e.g., "2024-25")
+
+        Returns:
+            Dictionary mapping (game_id, situation_id) -> True for existing data
+        """
+        existing_data = {}
+
+        # Check if table exists first
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_game_stats'")
+        if not self.cursor.fetchone():
+            # Table doesn't exist yet, return empty dict
+            return existing_data
+
+        # Check for existing player stats
+        self.cursor.execute("""
+            SELECT DISTINCT g.game_id, pgs.situation_id
+            FROM games g
+            JOIN player_game_stats pgs ON g.game_id = pgs.game_id
+            WHERE pgs.team_id = ? AND g.season LIKE ?
+        """, (team_id, f"%{season}%"))
+
+        for game_id, situation_id in self.cursor.fetchall():
+            existing_data[(game_id, situation_id)] = True
+
+        return existing_data
 
     def _load_game_dates_from_list(self, games_list_path: str) -> Dict[str, str]:
         """
@@ -982,12 +1143,14 @@ class NHLDatabaseManager:
 
         return game_dates
 
-    def import_team_directory(self, team_dir: str):
+    def import_team_directory(self, team_dir: str, use_multithreading: bool = True, force_reimport: bool = False):
         """
-        Import all CSV files for a team
+        Import all CSV files for a team (with optional multithreading)
 
         Args:
             team_dir: Path to team directory (e.g., nhlteamreports/OTT)
+            use_multithreading: Whether to use multithreading for CSV imports
+            force_reimport: If True, reimport all files even if they already exist
         """
         # Load situation map if not loaded
         if not self.situation_map:
@@ -1020,36 +1183,124 @@ class NHLDatabaseManager:
                 print(f"Skipping season {season_name}")
                 continue
 
+            # Check what data already exists for this team/season (unless forcing reimport)
+            team_id = self.get_or_create_team(team_abbr)
+            existing_data = {} if force_reimport else self._get_existing_game_data(team_id, season_name)
+
             # Import all CSV files in this season (except games_list)
             csv_files = [f for f in season_dir.glob('*.csv') if 'games_list' not in f.name]
 
-            for csv_file in csv_files:
-                try:
-                    # Parse filename to get game ID
+            if use_multithreading and len(csv_files) > 1:
+                # Filter out files that already exist in database
+                import_tasks = []
+                skipped = 0
+                for csv_file in csv_files:
                     game_info = self.parse_filename(csv_file.name)
                     if not game_info:
                         print(f"Could not parse filename: {csv_file.name}")
                         continue
 
-                    # Look up game date
                     game_date = game_dates_map.get(game_info.nst_game_id)
-
                     if not game_date:
                         print(f"Warning: No date found for game {game_info.nst_game_id} in {csv_file.name}")
                         continue
 
-                    self.import_csv_file(str(csv_file), game_date)
-                except Exception as e:
-                    print(f"Error importing {csv_file.name}: {e}")
+                    # Check if this game/situation combo already exists
+                    situation_id = self.situation_map.get(game_info.situation)
+                    if situation_id and (game_info.nst_game_id, situation_id) in existing_data:
+                        skipped += 1
+                        continue
 
-            print(f"Imported {len(csv_files)} files for {season_name}")
+                    import_tasks.append((str(csv_file), game_date, team_abbr))
 
-    def import_all_teams(self, base_dir: str = 'nhlteamreports'):
+                if skipped > 0:
+                    print(f"  Skipping {skipped}/{len(csv_files)} files (already in database)")
+
+                if not import_tasks:
+                    print(f"  ✓ All {len(csv_files)} files already imported for {season_name}")
+                    continue
+
+                print(f"  Found {len(import_tasks)} new files to import")
+
+                # Phase 1: Parse files in parallel (fast, no DB access)
+                print(f"  Phase 1: Parsing {len(import_tasks)} CSV files in parallel...")
+
+                # Parse files in parallel (no DB writes)
+                parsed_files = []
+                failed = 0
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_file = {
+                        executor.submit(self._parse_csv_file_worker, csv_path, game_date, team_abbr): csv_path
+                        for csv_path, game_date, team_abbr in import_tasks
+                    }
+
+                    for future in as_completed(future_to_file):
+                        csv_path = future_to_file[future]
+                        try:
+                            success, error, parsed_data = future.result()
+                            if success and parsed_data:
+                                parsed_files.append(parsed_data)
+                            elif not success and error:
+                                failed += 1
+                                print(error)
+                        except Exception as e:
+                            failed += 1
+                            print(f"Exception parsing {csv_path}: {e}")
+
+                print(f"  Phase 2: Writing {len(parsed_files)} files to database (sequential)...")
+                # Phase 2: Write to database sequentially (no lock contention!)
+                successful = 0
+                for parsed_data in parsed_files:
+                    try:
+                        self._process_parsed_file(parsed_data)
+                        successful += 1
+                    except Exception as e:
+                        failed += 1
+                        print(f"Error writing {parsed_data['csv_path']}: {e}")
+
+                print(f"Imported {successful}/{len(import_tasks)} files for {season_name} ({failed} failed)")
+            else:
+                # Single-threaded import (original behavior)
+                imported = 0
+                skipped = 0
+                for csv_file in csv_files:
+                    try:
+                        # Parse filename to get game ID
+                        game_info = self.parse_filename(csv_file.name)
+                        if not game_info:
+                            print(f"Could not parse filename: {csv_file.name}")
+                            continue
+
+                        # Look up game date
+                        game_date = game_dates_map.get(game_info.nst_game_id)
+
+                        if not game_date:
+                            print(f"Warning: No date found for game {game_info.nst_game_id} in {csv_file.name}")
+                            continue
+
+                        # Check if this game/situation combo already exists
+                        situation_id = self.situation_map.get(game_info.situation)
+                        if situation_id and (game_info.nst_game_id, situation_id) in existing_data:
+                            skipped += 1
+                            continue
+
+                        self.import_csv_file(str(csv_file), game_date)
+                        imported += 1
+                    except Exception as e:
+                        print(f"Error importing {csv_file.name}: {e}")
+
+                if skipped > 0:
+                    print(f"Skipped {skipped} files (already in database)")
+                print(f"Imported {imported} new files for {season_name}")
+
+    def import_all_teams(self, base_dir: str = 'nhlteamreports', use_multithreading: bool = True, force_reimport: bool = False):
         """
-        Import all teams from the base directory
+        Import all teams from the base directory (with optional multithreading)
 
         Args:
             base_dir: Base directory containing team folders
+            use_multithreading: Whether to use multithreading for imports
+            force_reimport: If True, reimport all files even if they already exist
         """
         base_path = Path(base_dir)
 
@@ -1061,12 +1312,15 @@ class NHLDatabaseManager:
         team_dirs = [d for d in base_path.iterdir() if d.is_dir()]
 
         print(f"Found {len(team_dirs)} team directories")
+        print(f"Multithreading: {'Enabled' if use_multithreading else 'Disabled'}")
+        if use_multithreading:
+            print(f"Max workers: {self.max_workers}")
 
         for team_dir in sorted(team_dirs):
             print(f"\n{'='*60}")
             print(f"Processing team: {team_dir.name}")
             print(f"{'='*60}")
-            self.import_team_directory(str(team_dir))
+            self.import_team_directory(str(team_dir), use_multithreading=use_multithreading, force_reimport=force_reimport)
 
         print("\n" + "="*60)
         print("Import complete!")
@@ -1074,38 +1328,50 @@ class NHLDatabaseManager:
 
 
 def main():
-    """Main entry point"""
-    import argparse
+    """
+    Main entry point - Automatically imports missing data from nhlteamreports/
+    """
     import os
 
-    parser = argparse.ArgumentParser(description='NHL Analytics Database Manager')
-    parser.add_argument('--init', action='store_true', help='Initialize database')
-    parser.add_argument('--import-all', action='store_true', help='Import all teams')
-    parser.add_argument('--import-team', type=str, help='Import specific team (team abbr)')
-    parser.add_argument('--db', type=str, default='nhl_analytics.db', help='Database path')
-    parser.add_argument('--schema', type=str, default='nhl_analytics_schema.sql', help='Schema file path')
+    db_path = 'nhl_analytics.db'
+    schema_path = 'nhl_analytics_schema.sql'
 
-    args = parser.parse_args()
+    print("="*60)
+    print("NHL Analytics Database Import")
+    print("="*60)
 
-    # If no flags provided, auto-init if DB doesn't exist, then import all
-    if not args.init and not args.import_all and not args.import_team:
-        args.init = not os.path.exists(args.db)
-        args.import_all = True
+    # Check if database exists
+    db_exists = os.path.exists(db_path)
 
-    with NHLDatabaseManager(args.db) as db:
-        if args.init:
-            print("Initializing database...")
-            db.initialize_database(args.schema)
+    with NHLDatabaseManager(db_path, max_workers=10) as db:
+        if not db_exists:
+            print("\n→ Database not found, initializing...")
+            db.initialize_database(schema_path)
             db.populate_reference_data()
+            print("✓ Database initialized")
+        else:
+            # Check if tables exist (in case of empty/corrupted DB)
+            db.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_game_stats'")
+            if not db.cursor.fetchone():
+                print("\n→ Database exists but is empty, initializing schema...")
+                db.initialize_database(schema_path)
+                db.populate_reference_data()
+                print("✓ Database initialized")
+            else:
+                print(f"\n→ Using existing database: {db_path}")
+                # Load reference data into memory
+                print("→ Loading reference data...")
+                db.cursor.execute("SELECT situation_id, situation_code FROM situations")
+                db.situation_map = {code: sid for sid, code in db.cursor.fetchall()}
+                db.cursor.execute("SELECT team_id, team_abbr FROM teams")
+                db.team_map = {abbr: tid for tid, abbr in db.cursor.fetchall()}
+                print(f"  Loaded {len(db.situation_map)} situations and {len(db.team_map)} teams")
 
-        if args.import_all:
-            print("Importing all teams...")
-            db.import_all_teams()
+        # Auto-import all new/missing data
+        print("\n→ Checking for new data in nhlteamreports/...")
+        print("  (Only new/missing games will be imported)\n")
 
-        if args.import_team:
-            team_dir = f"nhlteamreports/{args.import_team}"
-            print(f"Importing team: {args.import_team}")
-            db.import_team_directory(team_dir)
+        db.import_all_teams(use_multithreading=True, force_reimport=False)
 
 
 if __name__ == '__main__':
