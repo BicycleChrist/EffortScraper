@@ -139,7 +139,7 @@ class TuneInWidget(QWidget):
         
     def init_ui(self):
         """Initialize the user interface for the widget"""
-        
+
         # Use a style that matches the main application
         self.setStyleSheet("""
             QListWidget {
@@ -150,13 +150,6 @@ class TuneInWidget(QWidget):
                 padding: 2px;
                 font-size: 9pt;
             }
-            QComboBox {
-                border: 1px solid #ced4da;
-                border-radius: 4px;
-                padding: 2px 4px;
-                max-width: 85px;
-                font-size: 9pt;
-            }
             QPushButton {
                 background-color: #007bff;
                 color: white;
@@ -164,79 +157,80 @@ class TuneInWidget(QWidget):
                 border-radius: 4px;
                 padding: 2px 6px;
                 font-size: 9pt;
-                max-width: 60px;
             }
             QPushButton:disabled {
                 background-color: #e9ecef;
                 color: #6c757d;
                 border-color: #dee2e6;
             }
-            QLabel {
-                color: #e0e0e0;
-                font-size: 9pt;
-            }
             QLineEdit {
                 font-size: 9pt;
                 padding: 2px 4px;
                 border: 1px solid #ced4da;
                 border-radius: 4px;
-                max-width: 150px;
+                background-color: #2a2a2a;
+                color: white;
             }
         """)
-        
-        # Super compact layout
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(1, 1, 1, 1)
-        main_layout.setSpacing(1)
-        
-        # Compact controls row
-        controls_layout = QHBoxLayout()
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(1)
-        
-        # League filter dropdown
-        self.league_filter = QComboBox()
-        self.league_filter.addItems(self.league_filter_options)
-        self.league_filter.currentTextChanged.connect(self.filter_links)
-        self.league_filter.setMaximumWidth(85)
-        controls_layout.addWidget(self.league_filter)
-        
 
-        
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Filter...")
-        self.search_box.textChanged.connect(self.filter_links)
-        self.search_box.setMaximumWidth(130)
-        controls_layout.addWidget(self.search_box)
-        
-        # Refresh button (right side)
-        self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self.load_links)
-        self.refresh_button.setFixedWidth(60)
-        controls_layout.addWidget(self.refresh_button)
-        
-        # Links list with proper styling - let it expand vertically
-        self.links_list = QListWidget()
+        # Main layout with tight margins
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Links list - takes up all the space
+        self.links_list = QListWidget(self)
         self.links_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.links_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.links_list.itemDoubleClicked.connect(self.open_stream_link)
-        # Allow it to expand vertically
         self.links_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.links_list.setMinimumHeight(100)
 
-        # Build the layout
-        main_layout.addLayout(controls_layout)
+        # Calculate height for exactly 4 rows (each row ~20px + spacing)
+        row_height = 20
+        visible_rows = 4
+        self.links_list.setFixedHeight(row_height * visible_rows)
+
         main_layout.addWidget(self.links_list)
 
-        # Remove fixed height - allow widget to expand vertically within constraints
-        # self.setFixedHeight(130)
+        # Search box - floating/overlaid at top-right corner
+        self.search_box = QLineEdit(self.links_list)
+        self.search_box.setPlaceholderText("Filter streams...")
+        self.search_box.textChanged.connect(self.filter_links)
+        self.search_box.setFixedSize(200, 24)
+        self.search_box.raise_()  # Ensure it's on top
 
-        # Set size policy to allow vertical expansion
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        # Refresh button - floating/overlaid at bottom-right corner
+        self.refresh_button = QPushButton("Refresh", self.links_list)
+        self.refresh_button.clicked.connect(self.load_links)
+        self.refresh_button.setFixedSize(70, 24)
+        self.refresh_button.raise_()  # Ensure it's on top
+
+        # Fixed height to prevent distortion - reduced for more compact display
+        self.setFixedHeight(80)
+
+        # Set size policy
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         # Start loading links in background (non-blocking)
         self.start_background_load()
-        
+
+    def resizeEvent(self, event):
+        """Reposition floating controls when widget is resized"""
+        super().resizeEvent(event)
+
+        # Get the listbox geometry
+        list_width = self.links_list.width()
+        list_height = self.links_list.height()
+
+        # Position search box at top-right, inside the listbox with small padding from top
+        search_x = list_width - self.search_box.width() - 8
+        self.search_box.move(search_x, 2)  # Small padding from top, stays inside
+
+        # Position refresh button at bottom-right corner with more padding
+        refresh_x = list_width - self.refresh_button.width() - 12  # More padding from right
+        refresh_y = list_height - self.refresh_button.height() - 4
+        self.refresh_button.move(refresh_x, refresh_y)
+
     def start_background_load(self):
         """Start loading streams in background thread"""
         # Stop any existing worker
@@ -321,8 +315,7 @@ class TuneInWidget(QWidget):
 
     @pyqtSlot()
     def filter_links(self):
-        """Filter streams based on selected league and search text"""
-        selected_league = self.league_filter.currentText()
+        """Filter streams based on search text only"""
         search_text = self.search_box.text().lower()
 
         # Build list of (game_name, provider, url) tuples for display
@@ -330,12 +323,6 @@ class TuneInWidget(QWidget):
 
         for game_url, streams in self.all_streams.items():
             game_name = self.extract_game_name(game_url)
-
-            # Apply league filter
-            if selected_league != "All Leagues":
-                keywords = self.league_keywords.get(selected_league, [])
-                if not any(keyword in game_url.lower() for keyword in keywords):
-                    continue
 
             # Apply search filter
             if search_text and search_text not in game_url.lower() and search_text not in game_name.lower():

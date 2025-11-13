@@ -435,15 +435,13 @@ class ModernOddsWindow(QMainWindow):
         region_section_layout.setContentsMargins(0, 0, 0, 0)
         region_section_layout.setSpacing(2)
 
-        region_label = QLabel("Region:")
-        region_section_layout.addWidget(region_label)
-
+        # Region container (label removed)
         region_container = QWidget()
         region_layout = QGridLayout(region_container)
         region_layout.setSpacing(6)
         region_layout.setContentsMargins(0, 2, 0, 0)
 
-        # Define toggle pill style
+        # Define toggle pill style (original sizing)
         toggle_pill_style = """
             QPushButton {
                 background-color: #2C3E50;
