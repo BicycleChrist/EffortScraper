@@ -606,7 +606,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def import_goalie_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """
@@ -686,7 +687,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def import_onice_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import on-ice stats from CSV"""
@@ -781,7 +783,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def import_shift_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import shift report stats from CSV"""
@@ -831,7 +834,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def import_forward_lines(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import forward line combination stats from CSV"""
@@ -937,7 +941,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def import_team_overview(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """Import team overview stats (period by period) from CSV"""
@@ -1011,7 +1016,8 @@ class NHLDatabaseManager:
                     )
                 """, data)
 
-        use_conn.commit()
+        # Don't commit here - let the caller handle batched commits
+        # use_conn.commit()
 
     def _parse_csv_file_worker(self, csv_path: str, game_date: str, team_abbr: str = None, season_code: str = None) -> Tuple[bool, str, Optional[Dict]]:
         """
@@ -1151,12 +1157,14 @@ class NHLDatabaseManager:
             return existing_data
 
         # Check for existing player stats
+        # Handle both season formats: "2022-23" and "2022-2023"
+        season_pattern = season.replace('-', '%')  # Convert "2022-23" to "2022%23" for flexible matching
         self.cursor.execute("""
             SELECT DISTINCT g.game_id, pgs.situation_id
             FROM games g
             JOIN player_game_stats pgs ON g.game_id = pgs.game_id
             WHERE pgs.team_id = ? AND g.season LIKE ?
-        """, (team_id, f"%{season}%"))
+        """, (team_id, f"%{season_pattern}%"))
 
         for game_id, situation_id in self.cursor.fetchall():
             existing_data[(game_id, situation_id)] = True
@@ -1249,6 +1257,17 @@ class NHLDatabaseManager:
             team_id = self.get_or_create_team(team_abbr)
             existing_data = {} if force_reimport else self._get_existing_game_data(team_id, season_name)
 
+            # Quick check: If we have data for all games in this season, skip the entire season
+            if not force_reimport and existing_data:
+                # Count expected games from games_list
+                expected_game_count = len(game_dates_map)
+                # Count unique games we have for this team/season
+                unique_games_in_db = len(set(game_id for game_id, _ in existing_data.keys()))
+
+                if expected_game_count > 0 and unique_games_in_db >= expected_game_count:
+                    print(f"  ✓ All {expected_game_count} games already imported for {season_name} (skipping season)")
+                    continue
+
             # Import all CSV files in this season (except games_list)
             csv_files = [f for f in season_dir.glob('*.csv') if 'games_list' not in f.name]
 
@@ -1313,15 +1332,22 @@ class NHLDatabaseManager:
                             print(f"Exception parsing {csv_path}: {e}")
 
                 print(f"  Phase 2: Writing {len(parsed_files)} files to database (sequential)...")
-                # Phase 2: Write to database sequentially (no lock contention!)
+                # Phase 2: Write to database sequentially with batched commits
                 successful = 0
-                for parsed_data in parsed_files:
+                COMMIT_BATCH_SIZE = 50  # Commit every 50 files to reduce lock contention
+                for i, parsed_data in enumerate(parsed_files):
                     try:
                         self._process_parsed_file(parsed_data)
                         successful += 1
+                        # Batch commits to reduce database locks
+                        if (i + 1) % COMMIT_BATCH_SIZE == 0:
+                            self.conn.commit()
                     except Exception as e:
                         failed += 1
                         print(f"Error writing {parsed_data['csv_path']}: {e}")
+
+                # Final commit for remaining files
+                self.conn.commit()
 
                 print(f"Imported {successful}/{len(import_tasks)} files for {season_name} ({failed} failed)")
             else:
