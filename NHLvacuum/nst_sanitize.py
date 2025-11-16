@@ -155,7 +155,11 @@ class NSTSanitizer:
 
     def find_corrupted_files(self, season='2024-25', skip_known_null_games=True):
         """
-        Find all files with '-' in team position or only headers (no data)
+        Find all files with '-' in team position or games with incomplete data (low table count)
+
+        Corrupted files are identified by:
+        1. Files with '_-_' pattern (missing team names)
+        2. Games with <= 21 tables (incomplete data from exotic venues)
 
         Args:
             season: Season to scan (e.g., '2024-25')
@@ -178,6 +182,9 @@ class NSTSanitizer:
         # Pattern updated to handle team abbreviations with periods (e.g., S.J, L.A, T.B, N.J)
         pattern = re.compile(r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_(.+)\.csv$')
         season_path = Path(self.base_dir)
+
+        # Track game table counts to detect low table count games
+        game_table_counts = defaultdict(int)
 
         # Scan all team directories
         for team_dir in season_path.iterdir():
@@ -204,6 +211,9 @@ class NSTSanitizer:
                     if game_id in known_null_games:
                         continue
 
+                    # Count tables for this game
+                    game_table_counts[game_id] += 1
+
                     # Check ONLY if section_info starts with "-_" (missing team name)
                     # This is the specific NST bug where team names are missing from HTML
                     is_corrupted = section_info.startswith('-_')
@@ -220,7 +230,48 @@ class NSTSanitizer:
                         # Add to null games for this season
                         self.null_games_by_season[season].add(game_id)
 
-        print(f"✓ Found {len(self.corrupted_files)} corrupted files")
+        # Now check for games with low table counts (<=21 tables indicates incomplete data)
+        print(f"  Checking for games with low table counts (<=21 tables)...")
+        low_table_games = 0
+
+        for game_id, table_count in game_table_counts.items():
+            if table_count <= 21 and game_id not in known_null_games:
+                # This game has too few tables - mark as corrupted
+                low_table_games += 1
+
+                # Find all files for this game
+                for team_dir in season_path.iterdir():
+                    if not team_dir.is_dir():
+                        continue
+
+                    games_dir = team_dir / 'games' / season
+                    if not games_dir.exists():
+                        continue
+
+                    for csv_file in games_dir.glob(f'*_{game_id}_*.csv'):
+                        if '_games_list.csv' not in csv_file.name:
+                            match = pattern.match(csv_file.name)
+                            if match:
+                                team1, team2, _, _ = match.groups()
+
+                                # Add to corrupted files if not already there
+                                if csv_file not in self.corrupted_files:
+                                    self.corrupted_files.append(csv_file)
+
+                                    # Track game information
+                                    self.games_by_id[game_id]['teams'].add(team1)
+                                    self.games_by_id[game_id]['teams'].add(team2)
+                                    self.games_by_id[game_id]['files'].append(str(csv_file))
+                                    self.games_by_id[game_id]['season'] = season
+                                    self.games_by_id[game_id]['low_table_count'] = table_count
+
+                                    # Add to null games for this season
+                                    self.null_games_by_season[season].add(game_id)
+
+        if low_table_games > 0:
+            print(f"  ✓ Found {low_table_games} games with incomplete data (<=21 tables)")
+
+        print(f"\n✓ Found {len(self.corrupted_files)} corrupted files total")
         print(f"✓ Affecting {len(self.games_by_id)} unique games")
         print()
 

@@ -11,6 +11,7 @@ import csv
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+#TODO: Shity SQL is causing the DB to only populate with 1 seasons worth of shots
 
 class MoneyPuckTeamImporter:
     """Imports MoneyPuck team game-by-game data"""
@@ -752,6 +753,529 @@ class MoneyPuckPlayerImporter:
         print("="*80)
 
 
+class MoneyPuckOddsImporter:
+    """Imports MoneyPuck betting odds data"""
+
+    DB_PATH = 'nhl_analytics.db'
+    SCHEMA_PATH = 'moneypuck_schema.sql'
+
+    # Sportsbooks to extract from wide-format CSV
+    SPORTSBOOKS = ['betano', 'betmgm', 'bovada', 'draftkings', 'fanduel', 'pinnacle', 'sia']
+
+    @staticmethod
+    def parse_percentage(pct_str: str) -> Optional[float]:
+        """Convert percentage string (e.g., '58.6%') to decimal (0.586)"""
+        if not pct_str or pct_str == '':
+            return None
+        try:
+            # Remove '%' and convert to decimal
+            return float(pct_str.strip().replace('%', '')) / 100.0
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def parse_american_odds(odds_str: str) -> Optional[int]:
+        """Parse American odds string (e.g., '-150', '+125') to integer"""
+        if not odds_str or odds_str == '':
+            return None
+        try:
+            # Remove leading '+' if present, keep '-'
+            return int(odds_str.strip().replace('+', ''))
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def ensure_tables(conn: sqlite3.Connection):
+        """Ensure odds table exists - wide format with one row per game"""
+        cursor = conn.cursor()
+
+        # Create single wide-format game_odds table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS game_odds (
+                game_id TEXT PRIMARY KEY,
+
+                -- MoneyPuck win probabilities
+                mp_away_win_prob REAL,
+                mp_home_win_prob REAL,
+
+                -- Scrape metadata
+                scrape_status TEXT,
+                error_message TEXT,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                -- Betano
+                betano_opening_timestamp TEXT,
+                betano_opening_away_odds INTEGER,
+                betano_opening_home_odds INTEGER,
+                betano_closing_timestamp TEXT,
+                betano_closing_away_odds INTEGER,
+                betano_closing_home_odds INTEGER,
+
+                -- BetMGM
+                betmgm_opening_timestamp TEXT,
+                betmgm_opening_away_odds INTEGER,
+                betmgm_opening_home_odds INTEGER,
+                betmgm_closing_timestamp TEXT,
+                betmgm_closing_away_odds INTEGER,
+                betmgm_closing_home_odds INTEGER,
+
+                -- Bovada
+                bovada_opening_timestamp TEXT,
+                bovada_opening_away_odds INTEGER,
+                bovada_opening_home_odds INTEGER,
+                bovada_closing_timestamp TEXT,
+                bovada_closing_away_odds INTEGER,
+                bovada_closing_home_odds INTEGER,
+
+                -- DraftKings
+                draftkings_opening_timestamp TEXT,
+                draftkings_opening_away_odds INTEGER,
+                draftkings_opening_home_odds INTEGER,
+                draftkings_closing_timestamp TEXT,
+                draftkings_closing_away_odds INTEGER,
+                draftkings_closing_home_odds INTEGER,
+
+                -- FanDuel
+                fanduel_opening_timestamp TEXT,
+                fanduel_opening_away_odds INTEGER,
+                fanduel_opening_home_odds INTEGER,
+                fanduel_closing_timestamp TEXT,
+                fanduel_closing_away_odds INTEGER,
+                fanduel_closing_home_odds INTEGER,
+
+                -- Pinnacle
+                pinnacle_opening_timestamp TEXT,
+                pinnacle_opening_away_odds INTEGER,
+                pinnacle_opening_home_odds INTEGER,
+                pinnacle_closing_timestamp TEXT,
+                pinnacle_closing_away_odds INTEGER,
+                pinnacle_closing_home_odds INTEGER,
+
+                -- SIA
+                sia_opening_timestamp TEXT,
+                sia_opening_away_odds INTEGER,
+                sia_opening_home_odds INTEGER,
+                sia_closing_timestamp TEXT,
+                sia_closing_away_odds INTEGER,
+                sia_closing_home_odds INTEGER,
+
+                FOREIGN KEY (game_id) REFERENCES games(game_id)
+            )
+        """)
+
+        # Create index
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_odds_game ON game_odds(game_id)")
+
+        conn.commit()
+
+    @staticmethod
+    def clear_tables(conn: sqlite3.Connection):
+        """Clear odds table"""
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM game_odds")
+        conn.commit()
+
+    @staticmethod
+    def import_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+        """
+        Import a single odds CSV file (wide format).
+        Returns: (games_imported, games_skipped)
+        """
+        cursor = conn.cursor()
+
+        games_imported = 0
+        games_skipped = 0
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                traditional_game_id = row.get('traditional_game_id', '').strip()
+
+                if not traditional_game_id:
+                    games_skipped += 1
+                    continue
+
+                # Parse MoneyPuck win probabilities
+                mp_away_win_prob = MoneyPuckOddsImporter.parse_percentage(row.get('mp_away_win_prob'))
+                mp_home_win_prob = MoneyPuckOddsImporter.parse_percentage(row.get('mp_home_win_prob'))
+                scrape_status = row.get('scrape_status', '').strip()
+                error_message = row.get('error_message', '').strip()
+
+                # Build the values dict for all columns
+                values_dict = {
+                    'game_id': traditional_game_id,
+                    'mp_away_win_prob': mp_away_win_prob,
+                    'mp_home_win_prob': mp_home_win_prob,
+                    'scrape_status': scrape_status if scrape_status else None,
+                    'error_message': error_message if error_message else None
+                }
+
+                # Parse all sportsbook odds
+                for sportsbook in MoneyPuckOddsImporter.SPORTSBOOKS:
+                    opening_ts = row.get(f'{sportsbook}_opening_timestamp', '').strip()
+                    opening_away = MoneyPuckOddsImporter.parse_american_odds(
+                        row.get(f'{sportsbook}_opening_away_odds', ''))
+                    opening_home = MoneyPuckOddsImporter.parse_american_odds(
+                        row.get(f'{sportsbook}_opening_home_odds', ''))
+                    closing_ts = row.get(f'{sportsbook}_closing_timestamp', '').strip()
+                    closing_away = MoneyPuckOddsImporter.parse_american_odds(
+                        row.get(f'{sportsbook}_closing_away_odds', ''))
+                    closing_home = MoneyPuckOddsImporter.parse_american_odds(
+                        row.get(f'{sportsbook}_closing_home_odds', ''))
+
+                    values_dict[f'{sportsbook}_opening_timestamp'] = opening_ts if opening_ts else None
+                    values_dict[f'{sportsbook}_opening_away_odds'] = opening_away
+                    values_dict[f'{sportsbook}_opening_home_odds'] = opening_home
+                    values_dict[f'{sportsbook}_closing_timestamp'] = closing_ts if closing_ts else None
+                    values_dict[f'{sportsbook}_closing_away_odds'] = closing_away
+                    values_dict[f'{sportsbook}_closing_home_odds'] = closing_home
+
+                # Build INSERT statement
+                columns = list(values_dict.keys())
+                placeholders = ['?' for _ in columns]
+                values = [values_dict[col] for col in columns]
+
+                sql = f"""
+                    INSERT OR REPLACE INTO game_odds ({', '.join(columns)})
+                    VALUES ({', '.join(placeholders)})
+                """
+
+                try:
+                    cursor.execute(sql, values)
+                    games_imported += 1
+                except sqlite3.Error as e:
+                    games_skipped += 1
+                    print(f"Error importing game {traditional_game_id}: {e}")
+
+        conn.commit()
+        return games_imported, games_skipped
+
+    @staticmethod
+    def import_all():
+        """Import all odds CSV files"""
+        conn = sqlite3.connect(MoneyPuckOddsImporter.DB_PATH)
+
+        # Ensure tables exist
+        MoneyPuckOddsImporter.ensure_tables(conn)
+
+        # Clear existing data
+        print("\nClearing existing odds data...")
+        MoneyPuckOddsImporter.clear_tables(conn)
+
+        print("\n" + "="*80)
+        print("IMPORTING MONEYPUCK ODDS DATA")
+        print("="*80 + "\n")
+
+        # Find all odds files (moneypuck_odds_*.csv in current directory)
+        odds_files = sorted(Path('.').glob('moneypuck_odds_*.csv'))
+
+        if not odds_files:
+            print("No moneypuck_odds CSV files found in current directory")
+            conn.close()
+            return
+
+        total_imported = 0
+        total_skipped = 0
+
+        for csv_file in odds_files:
+            season = csv_file.stem.replace('moneypuck_odds_', '')
+            print(f"Importing {season} season odds...", end=' ', flush=True)
+
+            imported, skipped = MoneyPuckOddsImporter.import_csv(str(csv_file), conn)
+            total_imported += imported
+            total_skipped += skipped
+
+            print(f"✓ {imported:,} games imported, {skipped} skipped")
+
+        conn.close()
+
+        # Summary
+        print("\n" + "="*80)
+        print("IMPORT SUMMARY - ODDS")
+        print("="*80)
+        print(f"Total files processed: {len(odds_files)}")
+        print(f"Total games imported: {total_imported:,}")
+        print(f"Total games skipped: {total_skipped:,}")
+        print("="*80)
+
+
+class MoneyPuckShotsImporter:
+    """Imports MoneyPuck shot-level data"""
+
+    DB_PATH = 'nhl_analytics.db'
+    MP_SHOTS_DATA_DIR = 'moneypuck_data'
+    SCHEMA_PATH = 'moneypuck_schema.sql'
+
+    # CSV column → Database column mapping
+    COLUMN_MAP = {
+        # Core identifiers
+        'shotID': 'shot_id',
+        'game_id': 'game_id',
+
+        # Event details
+        'event': 'event',
+        'shotType': 'shot_type',
+        'period': 'period',
+        'time': 'time',
+
+        # Teams and players
+        'teamCode': 'team_code',
+        'shooterPlayerId': 'shooter_player_id',
+        'shooterName': 'shooter_name',
+        'goalieIdForShot': 'goalie_player_id',
+        'goalieNameForShot': 'goalie_name',
+
+        # Shot location
+        'xCordAdjusted': 'x_cord_adjusted',
+        'yCordAdjusted': 'y_cord_adjusted',
+        'shotDistance': 'shot_distance',
+        'shotAngle': 'shot_angle',
+        'shotAngleAdjusted': 'shot_angle_adjusted',
+
+        # Shot outcome
+        'goal': 'goal',
+        'shotWasOnGoal': 'shot_was_on_goal',
+        'shotGeneratedRebound': 'shot_generated_rebound',
+        'shotGoalieFroze': 'shot_goalie_froze',
+        'shotOnEmptyNet': 'shot_on_empty_net',
+        'shotPlayContinuedInZone': 'shot_play_continued_in_zone',
+        'shotPlayContinuedOutsideZone': 'shot_play_continued_outside_zone',
+        'shotPlayStopped': 'shot_play_stopped',
+        'shotRebound': 'shot_rebound',
+        'shotRush': 'shot_rush',
+
+        # Expected values
+        'xGoal': 'x_goal',
+        'xFroze': 'x_froze',
+        'xRebound': 'x_rebound',
+        'xPlayContinuedInZone': 'x_play_continued_in_zone',
+        'xPlayContinuedOutsideZone': 'x_play_continued_outside_zone',
+        'xPlayStopped': 'x_play_stopped',
+        'xShotWasOnGoal': 'x_shot_was_on_goal',
+
+        # Game state
+        'homeTeamCode': 'home_team_code',
+        'awayTeamCode': 'away_team_code',
+        'homeTeamGoals': 'home_team_goals',
+        'awayTeamGoals': 'away_team_goals',
+        'homeSkatersOnIce': 'home_skaters_on_ice',
+        'awaySkatersOnIce': 'away_skaters_on_ice',
+        'homeEmptyNet': 'home_empty_net',
+        'awayEmptyNet': 'away_empty_net',
+        'isHomeTeam': 'is_home_team',
+
+        # Penalty situation
+        'homePenalty1Length': 'home_penalty_1_length',
+        'homePenalty1TimeLeft': 'home_penalty_1_time_left',
+        'awayPenalty1Length': 'away_penalty_1_length',
+        'awayPenalty1TimeLeft': 'away_penalty_1_time_left',
+
+        # Shot context
+        'location': 'location',
+        'offWing': 'off_wing',
+        'shotAnglePlusRebound': 'shot_angle_plus_rebound',
+        'shotAnglePlusReboundSpeed': 'shot_angle_plus_rebound_speed',
+        'shotAngleReboundRoyalRoad': 'shot_angle_rebound_royal_road',
+
+        # Shooter context
+        'shooterLeftRight': 'shooter_left_right',
+        'playerPositionThatDidEvent': 'shooter_position',
+        'shooterTimeOnIce': 'shooter_time_on_ice',
+        'shooterTimeOnIceSinceFaceoff': 'shooter_time_on_ice_since_faceoff',
+
+        # Last event context
+        'lastEventCategory': 'last_event_category',
+        'lastEventTeam': 'last_event_team',
+        'lastEventShotAngle': 'last_event_shot_angle',
+        'lastEventShotDistance': 'last_event_shot_distance',
+        'lastEventxCord_adjusted': 'last_event_x_cord_adjusted',
+        'lastEventyCord_adjusted': 'last_event_y_cord_adjusted',
+        'distanceFromLastEvent': 'distance_from_last_event',
+        'timeSinceLastEvent': 'time_since_last_event',
+        'speedFromLastEvent': 'speed_from_last_event',
+
+        # Shift/change context
+        'timeSinceFaceoff': 'time_since_faceoff',
+        'timeDifferenceSinceChange': 'time_difference_since_change',
+        'timeUntilNextEvent': 'time_until_next_event',
+        'averageRestDifference': 'average_rest_difference',
+
+        # Shooting team TOI metrics
+        'shootingTeamAverageTimeOnIce': 'shooting_team_average_time_on_ice',
+        'shootingTeamAverageTimeOnIceOfDefencemen': 'shooting_team_average_time_on_ice_of_defencemen',
+        'shootingTeamAverageTimeOnIceOfForwards': 'shooting_team_average_time_on_ice_of_forwards',
+        'shootingTeamAverageTimeOnIceSinceFaceoff': 'shooting_team_average_time_on_ice_since_faceoff',
+        'shootingTeamMaxTimeOnIce': 'shooting_team_max_time_on_ice',
+        'shootingTeamMinTimeOnIce': 'shooting_team_min_time_on_ice',
+        'shootingTeamDefencemenOnIce': 'shooting_team_defencemen_on_ice',
+        'shootingTeamForwardsOnIce': 'shooting_team_forwards_on_ice',
+
+        # Defending team TOI metrics
+        'defendingTeamAverageTimeOnIce': 'defending_team_average_time_on_ice',
+        'defendingTeamAverageTimeOnIceOfDefencemen': 'defending_team_average_time_on_ice_of_defencemen',
+        'defendingTeamAverageTimeOnIceOfForwards': 'defending_team_average_time_on_ice_of_forwards',
+        'defendingTeamAverageTimeOnIceSinceFaceoff': 'defending_team_average_time_on_ice_since_faceoff',
+        'defendingTeamMaxTimeOnIce': 'defending_team_max_time_on_ice',
+        'defendingTeamMinTimeOnIce': 'defending_team_min_time_on_ice',
+        'defendingTeamDefencemenOnIce': 'defending_team_defencemen_on_ice',
+        'defendingTeamForwardsOnIce': 'defending_team_forwards_on_ice',
+
+        # Game metadata
+        'season': 'season',
+        'homeTeamWon': 'home_team_won',
+        'isPlayoffGame': 'is_playoff_game',
+    }
+
+    @staticmethod
+    def ensure_tables(conn: sqlite3.Connection):
+        """Ensure MoneyPuck tables exist by running schema file"""
+        schema_path = Path(MoneyPuckShotsImporter.SCHEMA_PATH)
+
+        if not schema_path.exists():
+            print(f"Warning: Schema file not found at {schema_path}")
+            return
+
+        cursor = conn.cursor()
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            schema_sql = f.read()
+            cursor.executescript(schema_sql)
+        conn.commit()
+
+    @staticmethod
+    def clear_table(conn: sqlite3.Connection):
+        """Clear shots table"""
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM mp_shots")
+        conn.commit()
+
+    @staticmethod
+    def import_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+        """Import a single shots CSV file. Returns: (rows_imported, rows_skipped)"""
+        cursor = conn.cursor()
+
+        rows_imported = 0
+        rows_skipped = 0
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            batch = []
+            batch_size = 1000
+
+            for row in reader:
+                shot_id = row.get('shotID')
+                game_id = row.get('game_id')
+
+                if not shot_id or not game_id:
+                    rows_skipped += 1
+                    continue
+
+                db_values = {}
+
+                # Map CSV columns to database columns
+                for csv_col, db_col in MoneyPuckShotsImporter.COLUMN_MAP.items():
+                    if csv_col in row and row[csv_col] not in ('', 'NA', 'NaN'):
+                        value = row[csv_col]
+                        try:
+                            # Attempt numeric conversion
+                            if '.' in str(value):
+                                db_values[db_col] = float(value)
+                            else:
+                                db_values[db_col] = int(value)
+                        except (ValueError, TypeError):
+                            # Keep as string
+                            db_values[db_col] = value
+
+                batch.append(db_values)
+
+                # Insert in batches
+                if len(batch) >= batch_size:
+                    rows_imported += MoneyPuckShotsImporter._insert_batch(cursor, batch)
+                    batch = []
+
+            # Insert remaining rows
+            if batch:
+                rows_imported += MoneyPuckShotsImporter._insert_batch(cursor, batch)
+
+        conn.commit()
+        return rows_imported, rows_skipped
+
+    @staticmethod
+    def _insert_batch(cursor: sqlite3.Cursor, batch: list) -> int:
+        """Insert a batch of rows"""
+        if not batch:
+            return 0
+
+        inserted = 0
+        for db_values in batch:
+            columns = list(db_values.keys())
+            placeholders = ['?' for _ in columns]
+            values = [db_values[col] for col in columns]
+
+            sql = f"""
+                INSERT OR REPLACE INTO mp_shots ({', '.join(columns)})
+                VALUES ({', '.join(placeholders)})
+            """
+
+            try:
+                cursor.execute(sql, values)
+                inserted += 1
+            except sqlite3.Error as e:
+                # Skip this row on error
+                pass
+
+        return inserted
+
+    @staticmethod
+    def import_all():
+        """Import all shots CSV files"""
+        conn = sqlite3.connect(MoneyPuckShotsImporter.DB_PATH)
+
+        # Ensure tables exist
+        MoneyPuckShotsImporter.ensure_tables(conn)
+
+        # Clear existing data
+        print("\nClearing existing shots data...")
+        MoneyPuckShotsImporter.clear_table(conn)
+
+        print("\n" + "="*80)
+        print("IMPORTING MONEYPUCK SHOT DATA")
+        print("="*80 + "\n")
+
+        # Find all shots files
+        shots_files = sorted(Path(MoneyPuckShotsImporter.MP_SHOTS_DATA_DIR).glob('shots_*.csv'))
+
+        if not shots_files:
+            print("No shots files found in moneypuck_data/")
+            conn.close()
+            return
+
+        total_imported = 0
+        total_skipped = 0
+
+        for csv_file in shots_files:
+            season = csv_file.stem.replace('shots_', '')
+            print(f"Importing {season} season shots...", end=' ', flush=True)
+
+            imported, skipped = MoneyPuckShotsImporter.import_csv(str(csv_file), conn)
+            total_imported += imported
+            total_skipped += skipped
+
+            print(f"✓ {imported:,} shots imported")
+
+        conn.close()
+
+        # Summary
+        print("\n" + "="*80)
+        print("IMPORT SUMMARY - SHOTS")
+        print("="*80)
+        print(f"Total files processed: {len(shots_files)}")
+        print(f"Total shots imported: {total_imported:,}")
+        print(f"Total shots skipped: {total_skipped:,}")
+        print("="*80)
+
+
 if __name__ == '__main__':
     import sys
 
@@ -761,12 +1285,26 @@ if __name__ == '__main__':
             MoneyPuckTeamImporter.import_all()
         elif mode == 'players':
             MoneyPuckPlayerImporter.import_all()
+        elif mode == 'shots':
+            MoneyPuckShotsImporter.import_all()
+        elif mode == 'odds':
+            MoneyPuckOddsImporter.import_all()
+        elif mode == 'all':
+            # Import everything
+            MoneyPuckTeamImporter.import_all()
+            MoneyPuckPlayerImporter.import_all()
+            MoneyPuckShotsImporter.import_all()
+            MoneyPuckOddsImporter.import_all()
         else:
-            print("Usage: python mp_import.py [teams|players|all]")
+            print("Usage: python mp_import.py [teams|players|shots|odds|all]")
             print("  teams   - Import only team data")
             print("  players - Import only player data")
+            print("  shots   - Import only shot data")
+            print("  odds    - Import only odds data")
             print("  all     - Import everything (default)")
     else:
-        # Import everything by default
+        # Import everything by default (no args)
         MoneyPuckTeamImporter.import_all()
         MoneyPuckPlayerImporter.import_all()
+        MoneyPuckShotsImporter.import_all()
+        MoneyPuckOddsImporter.import_all()

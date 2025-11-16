@@ -17,11 +17,14 @@ import threading
 # No more Coyotes ):
 #TODO: CANT DO IT; certain games on NST have very limited data due to exotic venue presumably
 # These games are denoted by a "-" in the dataset and should be deleted
+
+# Add in 'ARI' for Coyotes historical data
 nhl_teams = [
     'ANA', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET', 'EDM',
     'FLA', 'L.A', 'MIN', 'MTL', 'NSH', 'N.J', 'NYI', 'NYR', 'OTT', 'PHI', 'PIT', 'S.J',
     'SEA', 'STL', 'T.B', 'TOR', 'UTA', 'VGK', 'WSH', 'WPG', 'VAN'
 ]
+
 
 site_directory_paths = [
     "/playerreport.php",
@@ -407,6 +410,7 @@ def extract_team_abbr_from_name(team_full_name, current_team_abbr):
     # Mapping of common team names to abbreviations
     team_name_map = {
         'Ducks': 'ANA', 'Anaheim': 'ANA',
+        'Coyotes': 'ARI', 'Arizona': 'ARI',  # Arizona Coyotes (moved to Utah in 2024)
         'Bruins': 'BOS', 'Boston': 'BOS',
         'Sabres': 'BUF', 'Buffalo': 'BUF',
         'Flames': 'CGY', 'Calgary': 'CGY',
@@ -433,7 +437,8 @@ def extract_team_abbr_from_name(team_full_name, current_team_abbr):
         'Blues': 'STL', 'St. Louis': 'STL', 'St Louis': 'STL',
         'Lightning': 'T.B', 'Tampa Bay': 'T.B',
         'Maple Leafs': 'TOR', 'Toronto': 'TOR',
-        'Mammoth': 'UTA', 'UTA': 'Mammoth',
+        # Utah team names - all variations map to UTA
+        'Mammoth': 'UTA', 'Utah': 'UTA', 'Utah HC': 'UTA', 'HC': 'UTA',
         'Golden Knights': 'VGK', 'Vegas': 'VGK',
         'Capitals': 'WSH', 'Washington': 'WSH',
         'Jets': 'WPG', 'Winnipeg': 'WPG',
@@ -797,10 +802,10 @@ def extract_table_sections(soup):
 
     return sections
 
-def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
+def is_corrupted_game(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
     """
-    Check if a game has already been scraped by looking for overview files.
-    Checks both teams' directories if opponent is known.
+    Check if a game has corrupted files (identified by '_-_' pattern in filename).
+    Corrupted games have incomplete data on NST (exotic venues, etc.) and should be skipped.
 
     Args:
         game_file_prefix: The game prefix (e.g., "BOSvsVGK_20069")
@@ -809,10 +814,56 @@ def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponen
         opponent_abbr: Opponent team abbreviation (optional)
 
     Returns:
-        True if game already exists, False otherwise
+        True if corrupted game files are found, False otherwise
     """
     base_folder_path = "nhlteamreports"
     games_folder = "games"
+
+    # List of teams to check
+    teams_to_check = []
+    if team_abbr:
+        teams_to_check.append(team_abbr)
+    if opponent_abbr and opponent_abbr != 'OPP':
+        teams_to_check.append(opponent_abbr)
+
+    if not teams_to_check and team_abbr:
+        teams_to_check = [team_abbr]
+
+    # Check for corrupted files (files with '_-_' pattern)
+    for team in teams_to_check:
+        team_games_path = os.path.join(base_folder_path, team, games_folder, season_folder)
+        if os.path.exists(team_games_path):
+            for file in os.listdir(team_games_path):
+                # Extract game_id from filename to match
+                if file.startswith(game_file_prefix) and '_-_' in file:
+                    return True
+
+    return False
+
+def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
+    """
+    Check if a game has already been scraped by looking for any files with the game ID.
+    Checks both teams' directories if opponent is known.
+    Also returns True if the game is corrupted (to skip re-scraping).
+
+    Args:
+        game_file_prefix: The game prefix (e.g., "BOSvsVGK_20069")
+        season_folder: The season folder to check (e.g., '2024-25')
+        team_abbr: Current team abbreviation (optional)
+        opponent_abbr: Opponent team abbreviation (optional)
+
+    Returns:
+        True if game already exists or is corrupted, False otherwise
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+
+    # First check if this is a corrupted game - if so, skip it
+    if is_corrupted_game(game_file_prefix, season_folder, team_abbr, opponent_abbr):
+        return True
+
+    # Extract game_id from prefix (e.g., "BOSvsVGK_20069" -> "20069")
+    game_id = game_file_prefix.split('_')[-1]
 
     # List of teams to check
     teams_to_check = []
@@ -825,14 +876,20 @@ def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponen
     if not teams_to_check and team_abbr:
         teams_to_check = [team_abbr]
 
-    # Check if overview files exist for any of the teams
+    # Check if ANY files exist for this game_id
+    # This handles cases where opponent was previously unknown (saved as "OPP")
+    # or team names have changed (e.g., "Utah HC" -> "Mammoth")
     for team in teams_to_check:
         team_games_path = os.path.join(base_folder_path, team, games_folder, season_folder)
         if os.path.exists(team_games_path):
-            # Look for any overview file with this game prefix
-            # We check for overview files as they're always created for every game
+            # Look for any file containing this game_id
             for file in os.listdir(team_games_path):
-                if file.startswith(game_file_prefix) and 'overview' in file.lower():
+                # Skip the games_list CSV
+                if '_games_list.csv' in file:
+                    continue
+                # Check if this file is for our game_id
+                # Format: TEAMvsOPP_GAMEID_... or TEAMvsTEAM_GAMEID_...
+                if f'_{game_id}_' in file or file.startswith(f'{game_file_prefix}_'):
                     return True
 
     return False
@@ -1088,7 +1145,16 @@ def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, g
                 'sections': cached_sections
             }
 
-            print(f"      ✓ Downloaded {total_tables} tables for {game_file_prefix}")
+            # Check if this is a corrupted game (21 tables or less indicates incomplete data)
+            if total_tables <= 21:
+                print(f"      ⚠ WARNING: Only {total_tables} tables downloaded for {game_file_prefix}")
+                print(f"      ⚠ This indicates incomplete data (exotic venue/corrupted)")
+                print(f"      ⚠ Marking as corrupted and will skip in future scrapes")
+                # Remove from cache so it doesn't get saved to other teams
+                if cache_key in game_cache:
+                    del game_cache[cache_key]
+            else:
+                print(f"      ✓ Downloaded {total_tables} tables for {game_file_prefix}")
 
         # Wait for all writes to complete if threading is enabled
         if use_threading and write_futures:
@@ -1329,7 +1395,7 @@ if __name__ == "__main__":
     # Configuration
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
-    FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    FETCH_NEW_GAME_LISTS = True # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
@@ -1340,7 +1406,7 @@ if __name__ == "__main__":
 
     # Parallel Game Processing
     PARALLEL_GAME_SCRAPING = True  # Enable parallel game scraping (downloads + parsing)
-    SCRAPING_WORKERS = 4 # Number of concurrent game downloads (START WITH 2, increase carefully to avoid rate limits)
+    SCRAPING_WORKERS = 6 # Number of concurrent game downloads (START WITH 2, increase carefully to avoid rate limits)
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
@@ -1349,8 +1415,8 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20232024  # 2024-25 season
-    THRU_SEASON = 20232024  # Through 2025-26 (for current season, this is the "thru" year)
+    FROM_SEASON = 20252026  # 2024-25 season
+    THRU_SEASON = 20252026  # Through 2025-26 (for current season, this is the "thru" year)
     SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections

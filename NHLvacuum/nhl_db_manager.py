@@ -484,6 +484,43 @@ class NHLDatabaseManager:
         except (ValueError, TypeError):
             return 0
 
+    @staticmethod
+    def construct_full_game_id(season_code: str, game_id_suffix: str) -> str:
+        """
+        Construct full 10-digit NHL game ID from season code and game suffix
+
+        NHL game ID format: YYYYTTNNNN (10 digits)
+        - YYYY: Season start year (4 digits)
+        - TT: Game type (02=regular season, 03=playoffs)
+        - NNNN: Game number (4 digits)
+
+        Args:
+            season_code: Season code from NST (e.g., "20242025" or "2024-25")
+            game_id_suffix: Game ID suffix from NST (e.g., "20037" or "20009")
+
+        Returns:
+            Full 10-digit game ID (e.g., "2024020037" or "2022020009")
+
+        Examples:
+            >>> construct_full_game_id("20242025", "20037")
+            "2024020037"
+            >>> construct_full_game_id("2024-25", "20037")
+            "2024020037"
+            >>> construct_full_game_id("2022-23", "20009")
+            "2022020009"
+        """
+        # Extract season start year (first 4 digits)
+        season_year = season_code.replace('-', '')[:4]
+
+        # Game ID suffix contains type + number (e.g., "20037" or "20009")
+        # Pad the suffix to 6 digits to ensure TTNNNN format (type=2 digits, number=4 digits)
+        game_id_suffix_padded = game_id_suffix.zfill(6)
+
+        # Concatenate: YYYY + TTNNNN = 10 digits
+        full_game_id = f"{season_year}{game_id_suffix_padded}"
+
+        return full_game_id
+
     def import_player_stats(self, csv_path: str, game_id: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
         """
         Import individual player stats (skaters) from CSV
@@ -976,7 +1013,7 @@ class NHLDatabaseManager:
 
         use_conn.commit()
 
-    def _parse_csv_file_worker(self, csv_path: str, game_date: str, team_abbr: str = None) -> Tuple[bool, str, Optional[Dict]]:
+    def _parse_csv_file_worker(self, csv_path: str, game_date: str, team_abbr: str = None, season_code: str = None) -> Tuple[bool, str, Optional[Dict]]:
         """
         Worker method to PARSE (not write) a single CSV file
         Returns the parsed data for later batch insertion
@@ -985,6 +1022,7 @@ class NHLDatabaseManager:
             csv_path: Path to CSV file
             game_date: Date of game (YYYY-MM-DD format)
             team_abbr: Team abbreviation (extracted from directory path)
+            season_code: Season code (e.g., "20242025") for constructing full game ID
 
         Returns:
             Tuple of (success, error_message, parsed_data_dict)
@@ -1024,7 +1062,8 @@ class NHLDatabaseManager:
                 'game_date': game_date,
                 'team_abbr': team_abbr,
                 'situation_id': situation_id,
-                'filename': filename
+                'filename': filename,
+                'season_code': season_code  # Pass season code for full game ID construction
             }
 
             return True, "", parsed_data
@@ -1046,6 +1085,12 @@ class NHLDatabaseManager:
         team_abbr = parsed_data['team_abbr']
         situation_id = parsed_data['situation_id']
         filename = parsed_data['filename']
+        season_code = parsed_data.get('season_code')  # May be None for old code paths
+
+        # Construct full 10-digit game ID
+        if season_code:
+            # Update game_info with full game ID
+            game_info.nst_game_id = self.construct_full_game_id(season_code, game_info.nst_game_id)
 
         # Get/create game and team (using main connection)
         game_id = self.get_or_create_game(game_info, game_date)
@@ -1070,7 +1115,7 @@ class NHLDatabaseManager:
         elif 'overview' in category:
             self.import_team_overview(csv_path, game_id, team_id, situation_id)
 
-    def import_csv_file(self, csv_path: str, game_date: str, team_abbr: str = None):
+    def import_csv_file(self, csv_path: str, game_date: str, team_abbr: str = None, season_code: str = None):
         """
         Import a single CSV file into the database (single-threaded method)
 
@@ -1078,8 +1123,9 @@ class NHLDatabaseManager:
             csv_path: Path to CSV file
             game_date: Date of game (YYYY-MM-DD format)
             team_abbr: Team abbreviation (extracted from directory path)
+            season_code: Season code (e.g., "20242025") for constructing full game ID
         """
-        success, error, parsed_data = self._parse_csv_file_worker(csv_path, game_date, team_abbr)
+        success, error, parsed_data = self._parse_csv_file_worker(csv_path, game_date, team_abbr, season_code)
         if not success and error:
             print(error)
         elif parsed_data:
@@ -1117,15 +1163,16 @@ class NHLDatabaseManager:
 
         return existing_data
 
-    def _load_game_dates_from_list(self, games_list_path: str) -> Dict[str, str]:
+    def _load_game_dates_from_list(self, games_list_path: str, season_code: str = None) -> Dict[str, str]:
         """
-        Load game dates from {TEAM}_games_list.csv file
+        Load game dates from {TEAM}_games_list.csv file and construct full game IDs
 
         Args:
             games_list_path: Path to games list CSV
+            season_code: Season code (e.g., "2024-25" or "20242025") - if None, extracted from CSV
 
         Returns:
-            Dictionary mapping game_id to game_date (YYYY-MM-DD)
+            Dictionary mapping FULL 10-digit game_id to game_date (YYYY-MM-DD)
         """
         game_dates = {}
 
@@ -1135,11 +1182,18 @@ class NHLDatabaseManager:
         with open(games_list_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                game_id = row.get('game_id', '').strip()
+                game_id_suffix = row.get('game_id', '').strip()
                 game_date = row.get('date', '').strip()
+                season_from_csv = row.get('season', '').strip()
 
-                if game_id and game_date:
-                    game_dates[game_id] = game_date
+                # Use season from CSV if not provided as parameter
+                if not season_code and season_from_csv:
+                    season_code = season_from_csv
+
+                if game_id_suffix and game_date and season_code:
+                    # Construct full 10-digit game ID
+                    full_game_id = self.construct_full_game_id(season_code, game_id_suffix)
+                    game_dates[full_game_id] = game_date
 
         return game_dates
 
@@ -1174,14 +1228,22 @@ class NHLDatabaseManager:
             season_name = season_dir.name  # e.g., "2024-25"
             print(f"\nProcessing season {season_name}...")
 
-            # Load game dates from games list CSV
+            # Load game dates from games list CSV (now returns full 10-digit game IDs)
             games_list_path = season_dir / f"{team_abbr}_games_list.csv"
-            game_dates_map = self._load_game_dates_from_list(str(games_list_path))
+            game_dates_map = self._load_game_dates_from_list(str(games_list_path), season_code=season_name)
 
             if not game_dates_map:
                 print(f"Warning: Could not load game dates from {games_list_path}")
                 print(f"Skipping season {season_name}")
                 continue
+
+            # Extract season code for constructing full game IDs from filenames
+            # Convert "2024-25" -> "20242025" or use as-is
+            season_code_for_files = season_name.replace('-', '')
+            if len(season_code_for_files) == 6:  # "202425" -> "20242025"
+                year_start = season_code_for_files[:4]
+                year_end = str(int(year_start) + 1)
+                season_code_for_files = year_start + year_end
 
             # Check what data already exists for this team/season (unless forcing reimport)
             team_id = self.get_or_create_team(team_abbr)
@@ -1200,18 +1262,21 @@ class NHLDatabaseManager:
                         print(f"Could not parse filename: {csv_file.name}")
                         continue
 
-                    game_date = game_dates_map.get(game_info.nst_game_id)
+                    # Construct full 10-digit game ID from season + suffix
+                    full_game_id = self.construct_full_game_id(season_code_for_files, game_info.nst_game_id)
+
+                    game_date = game_dates_map.get(full_game_id)
                     if not game_date:
-                        print(f"Warning: No date found for game {game_info.nst_game_id} in {csv_file.name}")
+                        print(f"Warning: No date found for game {full_game_id} in {csv_file.name}")
                         continue
 
                     # Check if this game/situation combo already exists
                     situation_id = self.situation_map.get(game_info.situation)
-                    if situation_id and (game_info.nst_game_id, situation_id) in existing_data:
+                    if situation_id and (full_game_id, situation_id) in existing_data:
                         skipped += 1
                         continue
 
-                    import_tasks.append((str(csv_file), game_date, team_abbr))
+                    import_tasks.append((str(csv_file), game_date, team_abbr, season_code_for_files))
 
                 if skipped > 0:
                     print(f"  Skipping {skipped}/{len(csv_files)} files (already in database)")
@@ -1230,8 +1295,8 @@ class NHLDatabaseManager:
                 failed = 0
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     future_to_file = {
-                        executor.submit(self._parse_csv_file_worker, csv_path, game_date, team_abbr): csv_path
-                        for csv_path, game_date, team_abbr in import_tasks
+                        executor.submit(self._parse_csv_file_worker, csv_path, game_date, team_abbr, season_code): csv_path
+                        for csv_path, game_date, team_abbr, season_code in import_tasks
                     }
 
                     for future in as_completed(future_to_file):
@@ -1271,20 +1336,23 @@ class NHLDatabaseManager:
                             print(f"Could not parse filename: {csv_file.name}")
                             continue
 
-                        # Look up game date
-                        game_date = game_dates_map.get(game_info.nst_game_id)
+                        # Construct full 10-digit game ID
+                        full_game_id = self.construct_full_game_id(season_code_for_files, game_info.nst_game_id)
+
+                        # Look up game date using full game ID
+                        game_date = game_dates_map.get(full_game_id)
 
                         if not game_date:
-                            print(f"Warning: No date found for game {game_info.nst_game_id} in {csv_file.name}")
+                            print(f"Warning: No date found for game {full_game_id} in {csv_file.name}")
                             continue
 
                         # Check if this game/situation combo already exists
                         situation_id = self.situation_map.get(game_info.situation)
-                        if situation_id and (game_info.nst_game_id, situation_id) in existing_data:
+                        if situation_id and (full_game_id, situation_id) in existing_data:
                             skipped += 1
                             continue
 
-                        self.import_csv_file(str(csv_file), game_date)
+                        self.import_csv_file(str(csv_file), game_date, team_abbr, season_code_for_files)
                         imported += 1
                     except Exception as e:
                         print(f"Error importing {csv_file.name}: {e}")
@@ -1325,6 +1393,105 @@ class NHLDatabaseManager:
         print("\n" + "="*60)
         print("Import complete!")
         print("="*60)
+
+    def verify_database_integrity(self, verbose: bool = True) -> Dict[str, any]:
+        """
+        Verify database integrity and game ID format
+
+        Args:
+            verbose: If True, print detailed results
+
+        Returns:
+            Dictionary with verification results
+        """
+        if not self.conn:
+            raise RuntimeError("Not connected to database")
+
+        results = {}
+
+        if verbose:
+            print("\n" + "="*80)
+            print("DATABASE INTEGRITY VERIFICATION")
+            print("="*80 + "\n")
+
+        # Check game ID format
+        self.cursor.execute("""
+            SELECT
+                LENGTH(game_id) as id_length,
+                COUNT(*) as count,
+                MIN(game_id) as min_id,
+                MAX(game_id) as max_id
+            FROM games
+            GROUP BY LENGTH(game_id)
+            ORDER BY id_length
+        """)
+
+        game_id_check = self.cursor.fetchall()
+        results['game_id_lengths'] = game_id_check
+        results['all_ids_correct'] = all(length == 10 for length, _, _, _ in game_id_check)
+
+        if verbose:
+            print("1. Game ID Format:")
+            for length, count, min_id, max_id in game_id_check:
+                status = "✓" if length == 10 else "✗"
+                print(f"   {status} {count:,} games with {length}-digit IDs")
+                if length == 10:
+                    print(f"     Range: {min_id} to {max_id}")
+
+        # Data counts
+        self.cursor.execute("SELECT COUNT(*) FROM games")
+        results['game_count'] = self.cursor.fetchone()[0]
+
+        self.cursor.execute("SELECT COUNT(*) FROM player_game_stats")
+        results['player_stats_count'] = self.cursor.fetchone()[0]
+
+        self.cursor.execute("SELECT COUNT(*) FROM goalie_game_stats")
+        results['goalie_stats_count'] = self.cursor.fetchone()[0]
+
+        # Check if MoneyPuck tables exist
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'mp_%'")
+        mp_tables = [row[0] for row in self.cursor.fetchall()]
+        results['has_moneypuck'] = len(mp_tables) > 0
+
+        if results['has_moneypuck']:
+            self.cursor.execute("SELECT COUNT(*) FROM mp_team_game_stats")
+            results['mp_team_count'] = self.cursor.fetchone()[0]
+
+            self.cursor.execute("SELECT COUNT(*) FROM mp_skater_game_stats")
+            results['mp_skater_count'] = self.cursor.fetchone()[0]
+
+            self.cursor.execute("SELECT COUNT(*) FROM mp_goalie_game_stats")
+            results['mp_goalie_count'] = self.cursor.fetchone()[0]
+
+            # Join test
+            self.cursor.execute("""
+                SELECT COUNT(DISTINCT g.game_id)
+                FROM games g
+                INNER JOIN mp_team_game_stats mp ON g.game_id = mp.game_id
+            """)
+            results['joinable_games'] = self.cursor.fetchone()[0]
+            results['join_percentage'] = (results['joinable_games'] / results['game_count'] * 100) if results['game_count'] > 0 else 0
+
+        if verbose:
+            print(f"\n2. Data Counts:")
+            print(f"   NST Games: {results['game_count']:,}")
+            print(f"   NST Player stats: {results['player_stats_count']:,}")
+            print(f"   NST Goalie stats: {results['goalie_stats_count']:,}")
+
+            if results['has_moneypuck']:
+                print(f"   MoneyPuck team stats: {results['mp_team_count']:,}")
+                print(f"   MoneyPuck skater stats: {results['mp_skater_count']:,}")
+                print(f"   MoneyPuck goalie stats: {results['mp_goalie_count']:,}")
+
+                print(f"\n3. NST + MoneyPuck Join:")
+                if results['joinable_games'] > 0:
+                    print(f"   ✓ {results['joinable_games']:,} games joinable ({results['join_percentage']:.1f}%)")
+                else:
+                    print(f"   ✗ No games can be joined")
+
+            print("\n" + "="*80 + "\n")
+
+        return results
 
 
 def main():
