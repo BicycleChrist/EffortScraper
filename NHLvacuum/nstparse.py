@@ -112,6 +112,15 @@ def create_session():
 _write_lock = threading.Lock()
 _write_executor = None
 
+# Thread-local storage for sessions (each thread gets its own session)
+_thread_local = threading.local()
+
+def get_thread_session():
+    """Get or create a session for the current thread"""
+    if not hasattr(_thread_local, 'session'):
+        _thread_local.session = create_session()
+    return _thread_local.session
+
 def get_write_executor(max_workers=8):
     """Get or create the global write executor"""
     global _write_executor
@@ -124,7 +133,70 @@ def write_csv_threadsafe(df, file_path):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     df.to_csv(file_path, index=False)
 
-# Add polite delays between requests
+def save_table_data(table_data, game_file_prefix, section_name, situation, table_index,
+                    table_list_length, section_label, team_abbr, season_folder,
+                    use_threading, executor, write_futures):
+    """
+    Helper function to save table data (either dict or DataFrame) to appropriate directories.
+    Consolidates duplicate save logic from cache and download paths.
+
+    Returns: number of tables saved
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    tables_saved = 0
+
+    if isinstance(table_data, dict):
+        # Overview section with multiple teams - save each team's data to their directory
+        for team_name, team_df in table_data.items():
+            team_name_abbr = extract_team_abbr_from_name(team_name, team_abbr)
+            if not team_name_abbr:
+                continue
+
+            team_specific_games_path = os.path.join(base_folder_path, team_name_abbr, games_folder, season_folder)
+            os.makedirs(team_specific_games_path, exist_ok=True)
+
+            # Build filename
+            if table_list_length > 1:
+                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}_{table_index+1}.csv"
+            else:
+                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}.csv"
+            file_path = os.path.join(team_specific_games_path, file_name)
+
+            # Write CSV
+            if use_threading and executor:
+                write_futures.append(executor.submit(write_csv_threadsafe, team_df, file_path))
+            else:
+                team_df.to_csv(file_path, index=False)
+            tables_saved += 1
+    else:
+        # Regular table (single DataFrame) - extract team from section label
+        section_team_abbr = extract_team_from_section_label(section_label)
+
+        # Determine save directory
+        if section_team_abbr:
+            save_team_games_path = os.path.join(base_folder_path, section_team_abbr, games_folder, season_folder)
+        else:
+            save_team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+        os.makedirs(save_team_games_path, exist_ok=True)
+
+        # Build filename
+        if table_list_length > 1:
+            file_name = f"{game_file_prefix}_{section_name}_{situation}_{table_index+1}.csv"
+        else:
+            file_name = f"{game_file_prefix}_{section_name}_{situation}.csv"
+        file_path = os.path.join(save_team_games_path, file_name)
+
+        # Write CSV
+        if use_threading and executor:
+            write_futures.append(executor.submit(write_csv_threadsafe, table_data, file_path))
+        else:
+            table_data.to_csv(file_path, index=False)
+        tables_saved += 1
+
+    return tables_saved
+
+# Add  delays between requests
 def respectful_delay():
     """
     Implements a delay between requests to be respectful to the server.
@@ -154,7 +226,7 @@ def get_static_tables(team_abbr, date_folder, session):
             raise Exception("Rate limited (429)")
 
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, 'lxml')
         tables = soup.find_all("table")
 
         os.makedirs(team_folder_path, exist_ok=True)
@@ -207,7 +279,7 @@ def download_charts(base_url, date_folder, session):
         response = session.get(base_url, timeout=30)
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, 'lxml')
         links = [link for link in soup.find_all('a', href=True) if link['href'].endswith('.png')]
 
         print(f"Found {len(links)} PNG files to download")
@@ -254,7 +326,7 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
 
 
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, 'lxml')
 
         # Find the games table
         tables = soup.find_all("table")
@@ -973,69 +1045,24 @@ def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, g
 
         os.makedirs(team_games_path, exist_ok=True)
 
-        # Save cached sections with situations
+        # Save cached sections with situations using helper function
         for section_name, section_data in game_cache[cache_key]['sections'].items():
             for situation, table_list in section_data['situations'].items():
                 for i, table_data in enumerate(table_list):
                     if table_data is not None:
-                        # Check if this is an Overview section with multiple teams (dict)
-                        if isinstance(table_data, dict):
-                            # Overview section - save ALL teams' data to their respective directories
-                            for team_name, team_df in table_data.items():
-                                # Map full team name to abbreviation
-                                team_name_abbr = extract_team_abbr_from_name(team_name, team_abbr)
-
-                                if not team_name_abbr:
-                                    # If we can't map it, skip this team
-                                    continue
-
-                                # Determine the directory for this team
-                                team_specific_games_path = os.path.join(base_folder_path, team_name_abbr, games_folder, season_folder)
-                                os.makedirs(team_specific_games_path, exist_ok=True)
-
-                                # Build file path with team abbreviation
-                                if len(table_list) > 1:
-                                    file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}_{i+1}.csv"
-                                else:
-                                    file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}.csv"
-                                file_path = os.path.join(team_specific_games_path, file_name)
-
-                                if use_threading:
-                                    write_futures.append(executor.submit(write_csv_threadsafe, team_df, file_path))
-                                else:
-                                    team_df.to_csv(file_path, index=False)
-                        else:
-                            # Regular table (single DataFrame)
-                            # Extract team from section label to determine which directory to save to
-                            section_team_abbr = extract_team_from_section_label(section_data['label'])
-
-                            # Determine which directory to save to
-                            if section_team_abbr:
-                                # Save to the team-specific directory
-                                save_team_games_path = os.path.join(base_folder_path, section_team_abbr, games_folder, season_folder)
-                                os.makedirs(save_team_games_path, exist_ok=True)
-                            else:
-                                # Fallback to current team's directory if we can't determine the team
-                                save_team_games_path = team_games_path
-
-                            # Name: GameID_Section_Situation[_TableNum if multiple].csv
-                            if len(table_list) > 1:
-                                file_name = f"{game_file_prefix}_{section_name}_{situation}_{i+1}.csv"
-                            else:
-                                file_name = f"{game_file_prefix}_{section_name}_{situation}.csv"
-                            file_path = os.path.join(save_team_games_path, file_name)
-
-                            if use_threading:
-                                write_futures.append(executor.submit(write_csv_threadsafe, table_data, file_path))
-                            else:
-                                table_data.to_csv(file_path, index=False)
-
+                        save_table_data(
+                            table_data, game_file_prefix, section_name, situation, i,
+                            len(table_list), section_data['label'], team_abbr, season_folder,
+                            use_threading, executor, write_futures
+                        )
         return
 
     # Game not in cache, need to download it
     try:
         print(f"      📥 Downloading {game_file_prefix}")
-        response = session.get(game_url, timeout=30)
+        # Use thread-local session for true parallelism
+        thread_session = get_thread_session()
+        response = thread_session.get(game_url, timeout=30)
 
         # Check for IP ban or rate limiting
         if response.status_code == 403:
@@ -1046,7 +1073,7 @@ def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, g
             raise Exception("Rate limited (429)")
 
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, 'lxml')
 
         # Extract tables grouped by section
         sections = extract_table_sections(soup)
@@ -1073,65 +1100,15 @@ def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, g
                         df = parse_table_with_multiheader(table)
 
                         if df is not None:
-                            # Check if this is an Overview section with multiple teams (returns dict)
-                            if isinstance(df, dict):
-                                # Overview section - save separate file for EACH team to their respective directories
-                                cached_tables.append(df)
+                            # Cache the parsed data
+                            cached_tables.append(df)
 
-                                # Iterate through all teams in the overview data
-                                for team_name, team_df in df.items():
-                                    # Map full team name to abbreviation
-                                    team_name_abbr = extract_team_abbr_from_name(team_name, team_abbr)
-
-                                    if not team_name_abbr:
-                                        # If we can't map it, skip this team
-                                        continue
-
-                                    # Determine the directory for this team
-                                    team_specific_games_path = os.path.join(base_folder_path, team_name_abbr, games_folder, season_folder)
-                                    os.makedirs(team_specific_games_path, exist_ok=True)
-
-                                    # Build file path with team abbreviation
-                                    if len(table_list) > 1:
-                                        file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}_{i+1}.csv"
-                                    else:
-                                        file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}.csv"
-                                    file_path = os.path.join(team_specific_games_path, file_name)
-
-                                    if use_threading:
-                                        write_futures.append(executor.submit(write_csv_threadsafe, team_df, file_path))
-                                    else:
-                                        team_df.to_csv(file_path, index=False)
-                                    total_tables += 1
-                            else:
-                                # Regular table (single DataFrame)
-                                cached_tables.append(df)
-
-                                # Extract team from section label to determine which directory to save to
-                                section_team_abbr = extract_team_from_section_label(section_data['label'])
-
-                                # Determine which directory to save to
-                                if section_team_abbr:
-                                    # Save to the team-specific directory
-                                    save_team_games_path = os.path.join(base_folder_path, section_team_abbr, games_folder, season_folder)
-                                    os.makedirs(save_team_games_path, exist_ok=True)
-                                else:
-                                    # Fallback to current team's directory if we can't determine the team
-                                    save_team_games_path = team_games_path
-
-                                # Build file path
-                                if len(table_list) > 1:
-                                    file_name = f"{game_file_prefix}_{section_name}_{situation}_{i+1}.csv"
-                                else:
-                                    file_name = f"{game_file_prefix}_{section_name}_{situation}.csv"
-                                file_path = os.path.join(save_team_games_path, file_name)
-
-                                # Write CSV (thread-safe if enabled)
-                                if use_threading:
-                                    write_futures.append(executor.submit(write_csv_threadsafe, df, file_path))
-                                else:
-                                    df.to_csv(file_path, index=False)
-                                total_tables += 1
+                            # Save using helper function
+                            total_tables += save_table_data(
+                                df, game_file_prefix, section_name, situation, i,
+                                len(table_list), section_data['label'], team_abbr, season_folder,
+                                use_threading, executor, write_futures
+                            )
 
                     cached_situations[situation] = cached_tables
 
@@ -1156,15 +1133,9 @@ def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, g
             else:
                 print(f"      ✓ Downloaded {total_tables} tables for {game_file_prefix}")
 
-        # Wait for all writes to complete if threading is enabled
-        if use_threading and write_futures:
-            for future in as_completed(write_futures):
-                try:
-                    future.result()  # Raise any exceptions that occurred
-                except Exception as e:
-                    print(f"        ⚠ Write error: {e}")
-
-        time.sleep(random.uniform(2, 5))  # Delay between game reports
+        # NOTE: Write futures will complete asynchronously in the background.
+        # We don't wait for them here to avoid blocking parallel game downloads.
+        # The ThreadPoolExecutor will handle completion tracking.
 
     except Exception as e:
         print(f"      ✗ Error scraping full report for {game_file_prefix}: {e}")
@@ -1343,6 +1314,13 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
             for j, game in enumerate(games_to_process, 1):
                 process_single_game(team, game, j, len(games_to_process))
 
+    # Wait for any remaining write operations to complete
+    if use_threading:
+        write_executor = get_write_executor(max_workers)
+        print("\n⏳ Waiting for remaining file writes to complete...")
+        write_executor.shutdown(wait=True)
+        print("✓ All file writes completed")
+
     print(f"\n=== Game data collection complete ===")
     print(f"    📊 Downloaded {unique_downloads} unique game reports")
     print(f"    💾 Processed {total_saves} games")
@@ -1371,7 +1349,7 @@ def fetch_season_data(start_year, end_year, session):
             response = session.get(url, timeout=30)
 
             if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
+                soup = BeautifulSoup(response.content, 'lxml')
                 tables = soup.find_all("table")
 
                 if tables:
@@ -1395,7 +1373,7 @@ if __name__ == "__main__":
     # Configuration
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
-    FETCH_NEW_GAME_LISTS = True # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
@@ -1415,9 +1393,9 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20252026  # 2024-25 season
-    THRU_SEASON = 20252026  # Through 2025-26 (for current season, this is the "thru" year)
-    SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
+    FROM_SEASON = 20222023  # 2024-25 season
+    THRU_SEASON = 20242025  # Through 2025-26 (for current season, this is the "thru" year)
+    SEASON_TYPE = 3  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections
     session = create_session()
