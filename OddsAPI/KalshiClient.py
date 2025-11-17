@@ -29,42 +29,51 @@ class KalshiClient:
     # Game-level series tickers (for fetching individual game markets)
     GAME_SERIES = {
         # Basketball
-        'NBA': 'KXNBAGAME',
-        'NBA': 'KXNBASPREAD',
-        'NBA': 'KXNBATOTAL',
-
-        # Discover how to filter out peoples parlays as Market output becomes too cluttered
+        'NBA': [
+            'KXNBAGAME',
+            'KXNBASPREAD',
+            'KXNBATOTAL'
+        ],
+    
         # Football
-        'NFL': 'KXNFLGAME',
-        'NFL': 'KXNFLSPREAD',
-        'NFL': 'KXNFLTOTAL',
-        #'NFL_SINGLE_PROPS': 'KXMVENFLSINGLEGAME',
-        #'NFL_MULTI_PROPS': 'KXMVENFLMULTIGAMEEXTENDED', # You can fade people parlys on here lol, too much output for now
-        'NCAAF': 'KXNCAAFGAME',
-
+        'NFL': [
+            'KXNFLGAME',
+            'KXNFLSPREAD',
+            'KXNFLTOTAL'
+        ],
+        # Uncomment if needed:
+        # 'NFL_SINGLE_PROPS': ['KXMVENFLSINGLEGAME'],
+        # 'NFL_MULTI_PROPS': ['KXMVENFLMULTIGAMEEXTENDED'],
+        'NCAAF': ['KXNCAAFGAME'],
+    
         # Baseball
-        'MLB': 'KXMLBGAME',
-        'MLB': 'KXMLBSPREAD',
-        'MLB': 'KXMLBTOTAL',
-        'MLB_SERIES': 'KXMLBSERIESGAMETOTAL',
-
+        'MLB': [
+            'KXMLBGAME',
+            'KXMLBSPREAD',
+            'KXMLBTOTAL'
+        ],
+        'MLB_SERIES': ['KXMLBSERIESGAMETOTAL'],
+    
         # Hockey
-        'NHL': 'KXNHLGAME',
-        'NHL': 'KXNHLSPREAD',
-        'NHL': 'KXNHLTOTAL',
-
+        'NHL': [
+            'KXNHLGAME',
+            'KXNHLSPREAD',
+            'KXNHLTOTAL'
+        ],
+    
         # Soccer
-        'EPL': 'KXEPLGAME',  # English Premier League
-        'UCL': 'KXUCLGAME',  # UEFA Champions League
-        'LA_LIGA': 'KXLALIGAGAME',
-        'BUNDESLIGA': 'KXBUNDESLIGAGAME',
-        'SERIE_A': 'KXSERIEAGAME',
-        'LIGUE_1': 'KXLIGUE1GAME',
-        'MLS': 'KXMLSGAME',
-
+        'EPL': ['KXEPLGAME'],
+        'UCL': ['KXUCLGAME'],
+        'LA_LIGA': ['KXLALIGAGAME'],
+        'BUNDESLIGA': ['KXBUNDESLIGAGAME'],
+        'SERIE_A': ['KXSERIEAGAME'],
+        'LIGUE_1': ['KXLIGUE1GAME'],
+        'MLS': ['KXMLSGAME'],
+    
         # Esports
-        'LOL': 'KXLOLGAMES',  # League of Legends
+        'LOL': ['KXLOLGAMES'],
     }
+
 
     # Human-readable descriptions for each series
     SERIES_DESCRIPTIONS = {
@@ -140,7 +149,8 @@ class KalshiClient:
         status: Optional[str] = None,
         series_ticker: Optional[str] = None,
         with_nested_markets: bool = False,
-        cursor: Optional[str] = None
+        cursor: Optional[str] = None,
+        min_close_ts: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Get list of events from Kalshi.
@@ -151,6 +161,8 @@ class KalshiClient:
             series_ticker: Filter by series ticker
             with_nested_markets: Include markets nested within events
             cursor: Pagination cursor from previous response
+            min_close_ts: Filter events with at least one market with close timestamp
+                         greater than this Unix timestamp (in seconds)
 
         Returns:
             Dictionary with 'events', 'cursor', and optionally 'milestones'
@@ -166,6 +178,8 @@ class KalshiClient:
             params["series_ticker"] = series_ticker
         if cursor:
             params["cursor"] = cursor
+        if min_close_ts is not None:
+            params["min_close_ts"] = min_close_ts
 
         return self._make_request("GET", "/events", params=params)
 
@@ -571,12 +585,14 @@ class KalshiClient:
 
         print("="*80)
 
-    def get_game_events(self, sport: str = 'NBA') -> Dict[str, Any]:
+    def get_game_events(self, sport: str = 'NBA', min_close_ts: Optional[int] = None) -> Dict[str, Any]:
         """
         Get all game events for a specific sport with nested markets.
 
         Args:
             sport: Sport key ('NBA', 'NFL_SINGLE', 'NFL_MULTI', etc.)
+            min_close_ts: Filter events with at least one market with close timestamp
+                         greater than this Unix timestamp (in seconds)
 
         Returns:
             Dictionary with 'events' list and 'count'
@@ -594,7 +610,8 @@ class KalshiClient:
                 status='open',
                 with_nested_markets=True,
                 limit=200,
-                cursor=cursor
+                cursor=cursor,
+                min_close_ts=min_close_ts
             )
 
             events = response.get('events', [])

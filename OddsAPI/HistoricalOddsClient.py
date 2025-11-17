@@ -1227,7 +1227,7 @@ class HistoricalOddsWidget(QWidget):
         self.event_selector.setEnabled(enabled)
         self.market_selector.setEnabled(enabled)
 
-    async def load_unified_events(self, sport='NFL'):
+    async def load_unified_events(self, sport='GAME_SERIES'):
         """
         Load and merge events from both Kalshi and Polymarket.
 
@@ -1391,6 +1391,23 @@ class HistoricalOddsWidget(QWidget):
         try:
             loop = asyncio.get_event_loop()
 
+            # Calculate time thresholds for filtering events
+            # NFL: 1 week ahead, Others: 2 days ahead
+            now_ts = int(datetime.now().timestamp())
+
+            # Determine the appropriate time threshold based on sport
+            def get_max_close_ts(sport_key: str) -> int:
+                """Calculate max close timestamp for event filtering."""
+                # Extract base sport from series ticker
+                base_sport = sport_key.split('KX')[-1][:3] if sport_key.startswith('KX') else sport_key[:3]
+
+                if 'NFL' in sport_key.upper() or sport_key == 'NFL':
+                    # NFL: 1 week ahead
+                    return now_ts + (7 * 24 * 60 * 60)
+                else:
+                    # All other sports: 2 days ahead
+                    return now_ts + (2 * 24 * 60 * 60)
+
             # Fetch events for all sports concurrently
             fetch_tasks = []
             for sport_key in sports_to_load:
@@ -1403,14 +1420,18 @@ class HistoricalOddsWidget(QWidget):
                             series_ticker=s,
                             status='open',
                             with_nested_markets=True,
-                            limit=200
+                            limit=200,
+                            min_close_ts=now_ts  # Filter out already-closed events
                         )
                     )
                 else:
                     # Game series - use get_game_events
                     task = loop.run_in_executor(
                         None,
-                        lambda s=sport_key: self.kalshi_client.kalshi_client.get_game_events(sport=s)
+                        lambda s=sport_key: self.kalshi_client.kalshi_client.get_game_events(
+                            sport=s,
+                            min_close_ts=now_ts  # Filter out already-closed events
+                        )
                     )
                 fetch_tasks.append((sport_key, task))
 
@@ -1420,8 +1441,31 @@ class HistoricalOddsWidget(QWidget):
                 try:
                     events_data = await task
                     events = events_data.get('events', [])
-                    print(f"  {sport_key}: {len(events)} events")
-                    all_events.extend(events)
+
+                    # Filter events by close time based on sport
+                    max_close_ts = get_max_close_ts(sport_key)
+                    filtered_events = []
+                    for event in events:
+                        # Check if any market in the event closes within our time window
+                        markets = event.get('markets', [])
+                        if markets:
+                            # Get the earliest close time among all markets
+                            close_times = [m.get('close_time') for m in markets if m.get('close_time')]
+                            if close_times:
+                                # Parse ISO datetime strings to timestamps
+                                earliest_close_ts = min([
+                                    int(datetime.fromisoformat(ct.replace('Z', '+00:00')).timestamp())
+                                    for ct in close_times
+                                ])
+                                # Include event if it closes within our time window
+                                if earliest_close_ts <= max_close_ts:
+                                    filtered_events.append(event)
+                        else:
+                            # No markets, include anyway (will be filtered later if no data)
+                            filtered_events.append(event)
+
+                    print(f"  {sport_key}: {len(filtered_events)} events (filtered from {len(events)})")
+                    all_events.extend(filtered_events)
                 except Exception as e:
                     print(f"  {sport_key}: Error - {e}")
                     continue
@@ -1540,18 +1584,53 @@ class HistoricalOddsWidget(QWidget):
 
                 if sport == 'NFL':
                     series_to_check = [
+                        # Game lines
                         'KXNFLGAME',           # Moneylines
                         'KXNFLSPREAD',         # Spreads
                         'KXNFLTOTAL',          # Totals
-                        'KXNFLREC',# Player props: Receptions
+                        'KXNFLTEAMTOTAL',      # Team Totals
+                        # Player props
+                        'KXNFLRECYDS',         # Receiving Yards
+                        'KXNFLRSHYDS',         # Rushing Yards
+                        'KXNFLPASSYDS',        # Passing Yards
+                        'KXNFLFIRSTTD',        # First TD scorer
+                        'KXNFLANYTD',          # Anytime TD scorer
+                        'KXNFL2TD',            # Multiple TDs
+                        'KXNFLREC',            # Receptions
                         # Note: KXMVENFLSINGLEGAME contains only user-created parlays, not individual props
                     ]
                 elif sport == 'NBA':
-                    series_to_check = ['KXNBAGAME', 'KXNBASPREAD', 'KXNBATOTAL']
+                    series_to_check = [
+                        # Game lines
+                        'KXNBAGAME',           # Moneylines
+                        'KXNBASPREAD',         # Spreads
+                        'KXNBATOTAL',          # Totals
+                        # Player props
+                        'KXNBAPTS',            # Player Points
+                        'KXNBAAST',            # Player Assists
+                        'KXNBAREB',            # Player Rebounds
+                        'KXNBA3PT',            # Player 3-Pointers
+                    ]
                 elif sport == 'MLB':
-                    series_to_check = ['KXMLBGAME', 'KXMLBSPREAD', 'KXMLBTOTAL']
+                    series_to_check = [
+                        # Game lines
+                        'KXMLBGAME',           # Moneylines
+                        'KXMLBSPREAD',         # Run line (spread)
+                        'KXMLBTOTAL',          # Totals
+                        
+                    ]
                 elif sport == 'NHL':
-                    series_to_check = ['KXNHLGAME', 'KXNHLSPREAD', 'KXNHLTOTAL']
+                    series_to_check = [
+                        # Game lines
+                        'KXNHLGAME',           # Moneylines
+                        'KXNHLSPREAD',         # Puck line (spread)
+                        'KXNHLTOTAL',          # Goal Total
+                        # Player props
+                        'KXNHLGOAL',           # Player Goal (specific count)
+                        'KXNHLANYGOAL',        # Anytime Goalscorer
+                        'KXNHLFIRSTGOAL',      # First Goal
+                        'KXNHLSAVES',          # Goalie Saves
+                    ]
 
                 # Fetch markets from all related series
                 loop = asyncio.get_event_loop()
