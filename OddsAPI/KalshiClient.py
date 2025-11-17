@@ -514,46 +514,45 @@ class KalshiClient:
                 print(f"   ... and {len(markets) - max_per_sport} more {sport} markets\n")
 
     def get_game_markets(self, sport: str = 'NBA') -> List[Dict]:
-        """
-        Get all individual game markets for a specific sport.
+      """
+      Get all individual game markets for a specific sport.
+      Supports multiple series tickers per sport.
+      """
+  
+      series_tickers = self.GAME_SERIES.get(sport)
+      if not series_tickers:
+          raise ValueError(f"Unknown sport '{sport}'. Available: {list(self.GAME_SERIES.keys())}")
+  
+      all_game_markets = []
+  
+      # Loop through all series tickers belonging to this sport
+      for series in series_tickers:
+          cursor = None
+  
+          while True:
+              response = self.get_events(
+                  series_ticker=series,
+                  status='open',
+                  with_nested_markets=True,
+                  limit=200,
+                  cursor=cursor
+              )
+  
+              events = response.get('events', [])
+  
+              # Extract markets from each event
+              for event in events:
+                  for market in event.get('markets', []):
+                      market['event_title'] = event.get('title')
+                      market['event_ticker'] = event.get('event_ticker')
+                      all_game_markets.append(market)
+  
+              cursor = response.get('cursor')
+              if not cursor or len(events) < 200:
+                  break
+  
+      return all_game_markets
 
-        Args:
-            sport: Sport key ('NBA', 'NFL_SINGLE', 'NFL_MULTI', etc.)
-
-        Returns:
-            List of market dictionaries with game details
-        """
-        series_ticker = self.GAME_SERIES.get(sport)
-        if not series_ticker:
-            raise ValueError(f"Unknown sport '{sport}'. Available: {list(self.GAME_SERIES.keys())}")
-
-        all_game_markets = []
-        cursor = None
-
-        while True:
-            response = self.get_events(
-                series_ticker=series_ticker,
-                status='open',
-                with_nested_markets=True,
-                limit=200,
-                cursor=cursor
-            )
-
-            events = response.get('events', [])
-
-            # Extract all markets from all game events
-            for event in events:
-                for market in event.get('markets', []):
-                    # Add event context to each market
-                    market['event_title'] = event.get('title')
-                    market['event_ticker'] = event.get('event_ticker')
-                    all_game_markets.append(market)
-
-            cursor = response.get('cursor')
-            if not cursor or len(events) < 200:
-                break
-
-        return all_game_markets
 
     @classmethod
     def list_available_sports(cls) -> None:
@@ -586,42 +585,40 @@ class KalshiClient:
         print("="*80)
 
     def get_game_events(self, sport: str = 'NBA', min_close_ts: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Get all game events for a specific sport with nested markets.
+      """
+      Get all game events for a specific sport with nested markets.
+      Supports multiple series tickers per sport.
+      """
+  
+      series_tickers = self.GAME_SERIES.get(sport)
+      if not series_tickers:
+          raise ValueError(f"Unknown sport '{sport}'. Available: {list(self.GAME_SERIES.keys())}")
+  
+      all_events = []
+  
+      # Loop through every series ticker for this sport
+      for series in series_tickers:
+          cursor = None
+  
+          while True:
+              response = self.get_events(
+                  series_ticker=series,
+                  status='open',
+                  with_nested_markets=True,
+                  limit=200,
+                  cursor=cursor,
+                  min_close_ts=min_close_ts
+              )
+  
+              events = response.get('events', [])
+              all_events.extend(events)
+  
+              cursor = response.get('cursor')
+              if not cursor or len(events) < 200:
+                  break
+  
+      return {'events': all_events, 'count': len(all_events)}
 
-        Args:
-            sport: Sport key ('NBA', 'NFL_SINGLE', 'NFL_MULTI', etc.)
-            min_close_ts: Filter events with at least one market with close timestamp
-                         greater than this Unix timestamp (in seconds)
-
-        Returns:
-            Dictionary with 'events' list and 'count'
-        """
-        series_ticker = self.GAME_SERIES.get(sport)
-        if not series_ticker:
-            raise ValueError(f"Unknown sport '{sport}'. Available: {list(self.GAME_SERIES.keys())}")
-
-        all_events = []
-        cursor = None
-
-        while True:
-            response = self.get_events(
-                series_ticker=series_ticker,
-                status='open',
-                with_nested_markets=True,
-                limit=200,
-                cursor=cursor,
-                min_close_ts=min_close_ts
-            )
-
-            events = response.get('events', [])
-            all_events.extend(events)
-
-            cursor = response.get('cursor')
-            if not cursor or len(events) < 200:
-                break
-
-        return {'events': all_events, 'count': len(all_events)}
 
 
 def main():
