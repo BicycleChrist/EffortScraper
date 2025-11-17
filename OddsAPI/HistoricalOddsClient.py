@@ -363,6 +363,42 @@ class MarketMatcher:
         return None
 
     @staticmethod
+    def get_market_period(text):
+        """
+        Determine the period/time frame for a market.
+
+        Args:
+            text: Market title or question text
+
+        Returns:
+            'full_game', '1h', '2h', '1q', '2q', '3q', '4q', or None
+        """
+        if not text:
+            return 'full_game'  # Default to full game
+
+        text_lower = text.lower()
+
+        # First half
+        if '1h' in text_lower or 'first half' in text_lower or '1st half' in text_lower or 'half 1' in text_lower:
+            return '1h'
+
+        # Second half
+        if '2h' in text_lower or 'second half' in text_lower or '2nd half' in text_lower or 'half 2' in text_lower:
+            return '2h'
+
+        # Quarters
+        if '1q' in text_lower or 'first quarter' in text_lower or '1st quarter' in text_lower:
+            return '1q'
+        if '2q' in text_lower or 'second quarter' in text_lower or '2nd quarter' in text_lower:
+            return '2q'
+        if '3q' in text_lower or 'third quarter' in text_lower or '3rd quarter' in text_lower:
+            return '3q'
+        if '4q' in text_lower or 'fourth quarter' in text_lower or '4th quarter' in text_lower:
+            return '4q'
+
+        return 'full_game'
+
+    @staticmethod
     def get_market_type(kalshi_title=None, poly_question=None):
         """
         Determine market type from title/question.
@@ -431,20 +467,67 @@ class MarketMatcher:
             # Both are moneyline/winner markets - they match!
             return True
 
-        # Spread: must have same spread value
+        # Spread: must have same spread value, same period, AND same team favored
         if k_type == 'spread':
+            # Check periods match
+            k_period = MarketMatcher.get_market_period(k_title)
+            p_period = MarketMatcher.get_market_period(p_question)
+
+            if k_period != p_period:
+                return False
+
             k_spread = MarketMatcher.extract_spread_value(k_title)
             p_spread = MarketMatcher.extract_spread_value(p_question)
 
-            if k_spread is not None and p_spread is not None:
-                # Allow 0.01 point tolerance for floating point comparison
-                return abs(k_spread - p_spread) < 0.01
-            return False
+            if k_spread is None or p_spread is None:
+                return False
+
+            # Check spread values match
+            if abs(k_spread - p_spread) >= 0.01:
+                return False
+
+            # CRITICAL: Check which team is favored
+            # Kalshi format: "TeamName wins by over X.X points?"
+            # Polymarket format: "Spread: TeamName (-X.X)" or "Spread: TeamName (+X.X)"
+
+            # Extract team from Kalshi title (team mentioned in "X wins by over...")
+            k_team_lower = None
+            if 'wins by' in k_title:
+                # Find team name before "wins by"
+                parts = k_title.split('wins by')
+                if parts:
+                    k_team_lower = parts[0].strip().lower()
+
+            # Extract team from Polymarket question (team with negative spread is favored)
+            p_team_lower = None
+            import re
+            # Match "Spread: TeamName (-X)" format
+            poly_match = re.search(r'spread:\s*([^(]+)\s*\([-+]', p_question.lower())
+            if poly_match:
+                p_team_lower = poly_match.group(1).strip()
+
+            # Both must have identified teams
+            if not k_team_lower or not p_team_lower:
+                return False
+
+            # Normalize team names for comparison
+            # Check if same team is favored (allowing for Dallas/Cowboys, Las Vegas/Raiders differences)
+            from HistoricalOddsClient import EventMatcher
+            teams_match = EventMatcher.teams_match(k_team_lower, p_team_lower)
+
+            return teams_match
 
         # Total: Kalshi has generic "Total Points" title, but value is in ticker
         # Polymarket has specific value in question: "O/U 63.5"
         # KEY: Kalshi uses whole numbers (50, 51), Polymarket uses half-points (50.5, 51.5)
         if k_type == 'total':
+            # Check periods match
+            k_period = MarketMatcher.get_market_period(k_title)
+            p_period = MarketMatcher.get_market_period(p_question)
+
+            if k_period != p_period:
+                return False
+
             # Extract total from Kalshi ticker (e.g., KXNFLTOTAL-25NOV17DALLV-61 -> 61.0)
             k_total = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
             # Extract total from Polymarket question (e.g., "O/U 63.5" -> 63.5)
@@ -670,7 +753,7 @@ class PolymarketHistoricalOddsClient:
             return []
 
     async def get_historical_candlesticks(self, session, token_id, outcome_name,
-                                         start_time, end_time=None, fidelity=60):
+                                         start_time, end_time=None, fidelity=60, market_type=None):
         """
         Fetches historical candlestick data from Polymarket (async, non-blocking).
 
@@ -681,6 +764,7 @@ class PolymarketHistoricalOddsClient:
             start_time: Start time as datetime or ISO string
             end_time: End time as datetime or ISO string
             fidelity: Resolution in minutes (default 60)
+            market_type: Type of market ('moneyline', 'spread', 'total') to set correct market key
 
         Returns:
             List of snapshot dictionaries formatted like TheOddsAPI for compatibility
@@ -741,6 +825,16 @@ class PolymarketHistoricalOddsClient:
                 if american_odds is None:
                     continue
 
+                # Determine correct market key based on market type
+                # Map market_type to TheOddsAPI market keys
+                market_key = 'h2h'  # Default to moneyline
+                if market_type == 'spread':
+                    market_key = 'spreads'
+                elif market_type == 'total':
+                    market_key = 'totals'
+                elif market_type == 'moneyline':
+                    market_key = 'h2h'
+
                 # Format as TheOddsAPI-like snapshot
                 snapshot = {
                     'timestamp': timestamp_dt.isoformat() + 'Z',
@@ -749,7 +843,7 @@ class PolymarketHistoricalOddsClient:
                             'key': 'polymarket',
                             'title': 'Polymarket',
                             'markets': [{
-                                'key': 'h2h',
+                                'key': market_key,
                                 'outcomes': [{
                                     'name': outcome_name,
                                     'price': american_odds,
@@ -805,7 +899,7 @@ class KalshiHistoricalOddsClient:
             return []
 
     async def get_historical_candlesticks(self, session, market_ticker, series_ticker,
-                                         start_time, end_time=None, period_interval=60):
+                                         start_time, end_time=None, period_interval=60, market_type=None):
         """
         Fetches historical candlestick data from Kalshi.
 
@@ -816,6 +910,7 @@ class KalshiHistoricalOddsClient:
             start_time: Start time as datetime or ISO string
             end_time: End time as datetime or ISO string
             period_interval: Candlestick interval in minutes (1, 60, or 1440)
+            market_type: Type of market ('moneyline', 'spread', 'total') to set correct market key
 
         Returns:
             List of snapshot dictionaries formatted like TheOddsAPI for compatibility
@@ -875,31 +970,84 @@ class KalshiHistoricalOddsClient:
                 # The time range will just determine how far back we fetch
                 # But we display everything we get
 
-                # Convert Kalshi price (cents) to American odds
-                american_odds = kalshi_cents_to_american_odds(close_price)
-                if american_odds is None:
-                    continue
+                # Determine correct market key based on market type
+                # Map market_type to TheOddsAPI market keys
+                market_key = 'h2h'  # Default to moneyline
+                if market_type == 'spread':
+                    market_key = 'spreads'
+                elif market_type == 'total':
+                    market_key = 'totals'
+                elif market_type == 'moneyline':
+                    market_key = 'h2h'
 
-                # Format as TheOddsAPI-like snapshot
-                snapshot = {
-                    'timestamp': timestamp_dt.isoformat() + 'Z',
-                    'data': {
-                        'bookmakers': [{
-                            'key': 'kalshi',
-                            'title': 'Kalshi',
-                            'markets': [{
-                                'key': 'h2h',  # Generic market key for moneyline
-                                'outcomes': [{
-                                    'name': market_ticker.split('-')[-1],  # Extract team code
-                                    'price': american_odds,
-                                    'kalshi_cents': close_price,  # Store original for reference
+                # For totals and spreads, Kalshi has YES/NO within single market
+                # YES = Over/Favorite, NO = Under/Underdog
+                # We need to create TWO outcomes per snapshot
+                if market_type in ['total', 'spread']:
+                    # Get YES price (Over/Favorite)
+                    yes_price_cents = close_price
+                    yes_american_odds = kalshi_cents_to_american_odds(yes_price_cents)
+
+                    # Calculate NO price (Under/Underdog) - NO = 100 - YES for binary markets
+                    no_price_cents = 100 - yes_price_cents if yes_price_cents is not None else None
+                    no_american_odds = kalshi_cents_to_american_odds(no_price_cents) if no_price_cents else None
+
+                    if yes_american_odds is None or no_american_odds is None:
+                        continue
+
+                    # Extract the line value from ticker (e.g., "49" from "KXNFLTOTAL-25NOV17DALLV-49")
+                    line_value = market_ticker.split('-')[-1]
+
+                    # Create snapshot with BOTH outcomes
+                    snapshot = {
+                        'timestamp': timestamp_dt.isoformat() + 'Z',
+                        'data': {
+                            'bookmakers': [{
+                                'key': 'kalshi',
+                                'title': 'Kalshi',
+                                'markets': [{
+                                    'key': market_key,
+                                    'outcomes': [
+                                        {
+                                            'name': f'Over {line_value}' if market_type == 'total' else f'{line_value}',
+                                            'price': yes_american_odds,
+                                            'kalshi_cents': yes_price_cents,
+                                        },
+                                        {
+                                            'name': f'Under {line_value}' if market_type == 'total' else f'Not {line_value}',
+                                            'price': no_american_odds,
+                                            'kalshi_cents': no_price_cents,
+                                        }
+                                    ]
                                 }]
                             }]
-                        }]
+                        }
                     }
-                }
+                    snapshots.append(snapshot)
+                else:
+                    # Moneyline - single outcome per market (original behavior)
+                    american_odds = kalshi_cents_to_american_odds(close_price)
+                    if american_odds is None:
+                        continue
 
-                snapshots.append(snapshot)
+                    snapshot = {
+                        'timestamp': timestamp_dt.isoformat() + 'Z',
+                        'data': {
+                            'bookmakers': [{
+                                'key': 'kalshi',
+                                'title': 'Kalshi',
+                                'markets': [{
+                                    'key': market_key,
+                                    'outcomes': [{
+                                        'name': market_ticker.split('-')[-1],  # Extract team code
+                                        'price': american_odds,
+                                        'kalshi_cents': close_price,
+                                    }]
+                                }]
+                            }]
+                        }
+                    }
+                    snapshots.append(snapshot)
 
             print(f"Converted {len(snapshots)} valid snapshots (skipped {skipped_none} with no price, {skipped_time} outside time range)")
             return snapshots
@@ -1391,7 +1539,13 @@ class HistoricalOddsWidget(QWidget):
                 series_to_check = []
 
                 if sport == 'NFL':
-                    series_to_check = ['KXNFLGAME', 'KXNFLSPREAD', 'KXNFLTOTAL', 'KXMVENFLSINGLEGAME']
+                    series_to_check = [
+                        'KXNFLGAME',           # Moneylines
+                        'KXNFLSPREAD',         # Spreads
+                        'KXNFLTOTAL',          # Totals
+                        'KXNFLREC',# Player props: Receptions
+                        # Note: KXMVENFLSINGLEGAME contains only user-created parlays, not individual props
+                    ]
                 elif sport == 'NBA':
                     series_to_check = ['KXNBAGAME', 'KXNBASPREAD', 'KXNBATOTAL']
                 elif sport == 'MLB':
@@ -1499,7 +1653,9 @@ class HistoricalOddsWidget(QWidget):
             unified_markets.append(unified_moneyline)
             print(f"    [MONEYLINE] Combined {len(k_markets_list)} Kalshi markets{' + Polymarket' if poly_moneyline else ''}")
 
-        # Now process non-moneyline markets
+        # Now process non-moneyline markets individually
+        # For spreads, each Kalshi market is independent (not grouped like moneylines)
+        # because Kalshi spread markets are binary: YES = team covers, NO = team doesn't cover
         # First pass: Match Kalshi markets with Polymarket
         if unified_event.has_kalshi():
             for k_idx, k_market in enumerate(kalshi_markets):
@@ -1557,7 +1713,15 @@ class HistoricalOddsWidget(QWidget):
                     if matched_p_market.question and len(matched_p_market.question) > len(k_title):
                         display_name = matched_p_market.question
                     else:
-                        display_name = k_title
+                        # For Kalshi totals, extract the line value from ticker and add to display
+                        if market_type == 'total' and k_ticker:
+                            total_value = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
+                            if total_value:
+                                display_name = f"{k_title.replace('?', '')} O/U {total_value + 0.5}"
+                            else:
+                                display_name = k_title
+                        else:
+                            display_name = k_title
 
                     unified_market = UnifiedMarket(
                         market_type=market_type or 'unknown',
@@ -1574,7 +1738,15 @@ class HistoricalOddsWidget(QWidget):
                     print(f"      → Created unified market: {display_name[:60]}")
                 else:
                     # Kalshi only
-                    display_name = k_title
+                    # For totals, add the line value to display name
+                    if market_type == 'total' and k_ticker:
+                        total_value = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
+                        if total_value:
+                            display_name = f"{k_title.replace('?', '')} O/U {total_value + 0.5}"
+                        else:
+                            display_name = k_title
+                    else:
+                        display_name = k_title
                     unified_market = UnifiedMarket(
                         market_type=market_type or 'unknown',
                         display_name=display_name,
@@ -1830,22 +2002,49 @@ class HistoricalOddsWidget(QWidget):
                         market_subtitle = market.get('yes_sub_title', market.get('subtitle', '')).lower()
                         market_title = market.get('title', '').lower()
 
-                        # Skip if this looks like a parlay (contains multiple "+yes" or player names separated by "yes")
-                        # Count occurrences of "yes" which typically indicates multiple legs
-                        yes_count = market_subtitle.count('+yes')
+                        # Enhanced parlay detection
+                        # Check for multiple "yes" statements (most parlays have multiple "yes X, yes Y" patterns)
+                        yes_count = market_subtitle.count('yes ')
 
-                        # Also check for multiple colons which often separate player props in parlays
+                        # Check for comma-separated player names (e.g., "yes Player1, yes Player2")
+                        comma_count = market_subtitle.count(',')
+
+                        # Check for multiple colons (often separate different prop types in parlays)
                         colon_count = market_subtitle.count(':')
 
-                        # Skip parlays - they have multiple "+yes" or many colons
-                        if yes_count > 1 or colon_count > 2:
+                        # Check for "+" which separates different legs in parlays
+                        plus_count = market_subtitle.count('+')
+
+                        # STRICT FILTERING: Only accept single-player TD scorer props
+                        # Skip if:
+                        # - Multiple "yes" statements (yes Player1, yes Player2)
+                        # - Multiple commas (lists multiple players/props)
+                        # - Multiple colons (combines different prop types)
+                        # - Contains game outcome props mixed with player props (e.g., "yes Player: 50+ and Dallas wins")
+                        is_parlay = (
+                            yes_count > 1 or          # Multiple "yes" = parlay
+                            comma_count > 0 or        # Commas separate legs
+                            colon_count > 1 or        # Multiple colons = multiple prop types
+                            plus_count > 1 or         # Multiple + signs = parlay legs
+                            'over ' in market_subtitle and ':' in market_subtitle  # Game total mixed with player prop
+                        )
+
+                        if is_parlay:
                             continue
 
-                        # Skip if title explicitly mentions multiple outcomes
-                        if any(keyword in market_title for keyword in ['and', ' & ', 'both']):
+                        # Skip if title explicitly mentions multiple outcomes or team outcomes
+                        skip_keywords = ['and', ' & ', 'both', 'wins by', 'spread', 'total points']
+                        if any(keyword in market_title for keyword in skip_keywords):
+                            continue
+                        if any(keyword in market_subtitle for keyword in skip_keywords):
                             continue
 
-                        matching_markets.append(market)
+                        # Only include if this is a simple single-player prop
+                        # Accepted prop types: TD scorer, yards (rushing/receiving/passing), receptions
+                        prop_keywords = ['td', 'touchdown', 'yard', 'reception', 'pass', 'rush', 'receiv']
+
+                        if any(keyword in market_subtitle for keyword in prop_keywords):
+                            matching_markets.append(market)
 
             print(f"Filtered props: {len(matching_markets)} single props (excluded parlays)")
             return matching_markets
@@ -2171,7 +2370,8 @@ class HistoricalOddsWidget(QWidget):
                                     unified_market.kalshi_event_ticker.split('-')[0],
                                     start_time,
                                     end_time,
-                                    period_interval=kalshi_interval_value
+                                    period_interval=kalshi_interval_value,
+                                    market_type=unified_market.market_type  # Pass market type for correct market key
                                 )
                                 all_snapshots.extend(kalshi_snapshots)
                                 print(f"  ✅ Got {len(kalshi_snapshots)} Kalshi snapshots")
@@ -2205,7 +2405,8 @@ class HistoricalOddsWidget(QWidget):
                                         outcome_name,
                                         start_time,
                                         end_time,
-                                        fidelity=60
+                                        fidelity=60,
+                                        market_type=unified_market.market_type  # Pass market type for correct market key
                                     )
                                     all_snapshots.extend(poly_snapshots)
                                     print(f"    ✅ Got {len(poly_snapshots)} snapshots")
