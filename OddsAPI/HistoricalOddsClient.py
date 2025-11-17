@@ -13,6 +13,461 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor
 
 from KalshiClient import KalshiClient
+from polymarket_sports_client import PolymarketSportsClient
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class UnifiedEvent:
+    """Unified event representing a game across multiple prediction markets"""
+    sport: str
+    home_team: str
+    away_team: str
+    start_time: str
+
+    # Kalshi data
+    kalshi_event_ticker: Optional[str] = None
+    kalshi_series_ticker: Optional[str] = None
+    kalshi_markets: Optional[list] = None
+
+    # Polymarket data
+    polymarket_game_id: Optional[str] = None
+    polymarket_title: Optional[str] = None
+    polymarket_markets: Optional[list] = None
+
+    def get_display_title(self):
+        """Get formatted title for display"""
+        sources = []
+        if self.kalshi_event_ticker:
+            sources.append("K")
+        if self.polymarket_game_id:
+            sources.append("P")
+        source_str = f"[{'+'.join(sources)}]" if sources else ""
+        return f"{source_str} {self.away_team} @ {self.home_team}"
+
+    def has_kalshi(self):
+        return self.kalshi_event_ticker is not None
+
+    def has_polymarket(self):
+        return self.polymarket_game_id is not None
+
+
+@dataclass
+class UnifiedMarket:
+    """Unified market representing a specific bet across multiple prediction markets"""
+    market_type: str  # 'moneyline', 'spread', 'total', 'prop'
+    display_name: str
+
+    # Kalshi data - can be a list for moneyline (2 markets, one per team)
+    kalshi_markets: Optional[list] = None  # List of market dicts
+    kalshi_tickers: Optional[list] = None  # List of tickers
+    kalshi_titles: Optional[list] = None   # List of titles
+    kalshi_event_ticker: Optional[str] = None
+
+    # Polymarket data
+    polymarket_market: Optional[object] = None
+    polymarket_id: Optional[str] = None
+    polymarket_question: Optional[str] = None
+    polymarket_game_id: Optional[str] = None
+
+    def has_kalshi(self):
+        return self.kalshi_markets is not None and len(self.kalshi_markets) > 0
+
+    def has_polymarket(self):
+        return self.polymarket_market is not None
+
+    def get_source_indicator(self):
+        """Get [K], [P], or [K+P] indicator"""
+        sources = []
+        if self.has_kalshi():
+            sources.append("K")
+        if self.has_polymarket():
+            sources.append("P")
+        return f"[{'+'.join(sources)}]" if sources else ""
+
+
+class EventMatcher:
+    """Matches sports events across Kalshi and Polymarket APIs"""
+
+    # Team name variations for matching
+    TEAM_ALIASES = {
+        # NFL - All 32 teams
+        'arizona': ['arizona', 'cardinals', 'ari', 'az'],
+        'atlanta': ['atlanta', 'falcons', 'atl'],
+        'baltimore': ['baltimore', 'ravens', 'bal'],
+        'buffalo': ['buffalo', 'bills', 'buf'],
+        'carolina': ['carolina', 'panthers', 'car'],
+        'chicago': ['chicago', 'bears', 'chi'],
+        'cincinnati': ['cincinnati', 'bengals', 'cin'],
+        'cleveland': ['cleveland', 'browns', 'cle'],
+        'dallas': ['dallas', 'cowboys', 'dal'],
+        'denver': ['denver', 'broncos', 'den'],
+        'detroit': ['detroit', 'lions', 'det'],
+        'green bay': ['green bay', 'packers', 'gb'],
+        'houston': ['houston', 'texans', 'hou'],
+        'indianapolis': ['indianapolis', 'colts', 'ind'],
+        'jacksonville': ['jacksonville', 'jaguars', 'jax'],
+        'kansas city': ['kansas city', 'chiefs', 'kc'],
+        'las vegas': ['las vegas', 'raiders', 'lv', 'oak', 'oakland'],
+        'los angeles chargers': ['los angeles chargers', 'la chargers', 'chargers', 'lac'],
+        'los angeles rams': ['los angeles rams', 'la rams', 'rams', 'lar', 'los angeles r'],
+        'miami': ['miami', 'dolphins', 'mia'],
+        'minnesota': ['minnesota', 'vikings', 'min'],
+        'new england': ['new england', 'patriots', 'ne'],
+        'new orleans': ['new orleans', 'saints', 'no'],
+        'new york giants': ['new york giants', 'ny giants', 'giants', 'nyg', 'new york g'],
+        'new york jets': ['new york jets', 'ny jets', 'jets', 'nyj', 'new york j'],
+        'philadelphia': ['philadelphia', 'eagles', 'phi'],
+        'pittsburgh': ['pittsburgh', 'steelers', 'pit'],
+        'san francisco': ['san francisco', '49ers', 'sf'],
+        'seattle': ['seattle', 'seahawks', 'sea'],
+        'tampa bay': ['tampa bay', 'buccaneers', 'bucs', 'tb'],
+        'tennessee': ['tennessee', 'titans', 'ten'],
+        'washington': ['washington', 'commanders', 'wash', 'wsh'],
+
+        # NBA
+        'atlanta hawks': ['atlanta', 'hawks', 'atl'],
+        'boston': ['boston', 'celtics', 'bos'],
+        'brooklyn': ['brooklyn', 'nets', 'bkn'],
+        'charlotte': ['charlotte', 'hornets', 'cha'],
+        'chicago bulls': ['chicago', 'bulls', 'chi'],
+        'cleveland cavaliers': ['cleveland', 'cavaliers', 'cavs', 'cle'],
+        'dallas mavericks': ['dallas', 'mavericks', 'mavs', 'dal'],
+        'denver nuggets': ['denver', 'nuggets', 'den'],
+        'detroit pistons': ['detroit', 'pistons', 'det'],
+        'golden state': ['golden state', 'warriors', 'gsw'],
+        'houston rockets': ['houston', 'rockets', 'hou'],
+        'indiana': ['indiana', 'pacers', 'ind'],
+        'la clippers': ['los angeles clippers', 'la clippers', 'clippers', 'lac'],
+        'la lakers': ['los angeles lakers', 'la lakers', 'lakers', 'lal'],
+        'memphis': ['memphis', 'grizzlies', 'mem'],
+        'milwaukee': ['milwaukee', 'bucks', 'mil'],
+        'new york knicks': ['new york', 'knicks', 'nyk'],
+        'oklahoma city': ['oklahoma city', 'thunder', 'okc'],
+        'orlando': ['orlando', 'magic', 'orl'],
+        'philadelphia 76ers': ['philadelphia', '76ers', 'sixers', 'phi'],
+        'phoenix': ['phoenix', 'suns', 'phx'],
+        'portland': ['portland', 'trail blazers', 'blazers', 'por'],
+        'sacramento': ['sacramento', 'kings', 'sac'],
+        'san antonio': ['san antonio', 'spurs', 'sas'],
+        'toronto raptors': ['toronto', 'raptors', 'tor'],
+        'utah': ['utah', 'jazz', 'uta'],
+
+        # NHL
+        'montreal': ['montreal', 'canadiens', 'habs', 'mtl'],
+        'toronto maple leafs': ['toronto', 'maple leafs', 'leafs', 'tor'],
+        'ottawa': ['ottawa', 'senators', 'sens', 'ott'],
+        'boston bruins': ['boston', 'bruins', 'bos'],
+        'buffalo sabres': ['buffalo', 'sabres', 'buf'],
+
+        # MLB
+        'yankees': ['new york yankees', 'yankees', 'nyy'],
+        'red sox': ['boston red sox', 'red sox', 'bos'],
+        'dodgers': ['los angeles dodgers', 'dodgers', 'lad'],
+    }
+
+    @staticmethod
+    def normalize_team_name(team_name: str) -> str:
+        """Normalize team name for matching"""
+        if not team_name:
+            return ""
+
+        # Convert to lowercase and strip
+        normalized = team_name.lower().strip()
+
+        # Remove common suffixes
+        normalized = re.sub(r'\s+(football|basketball|hockey|baseball)(\s+team)?$', '', normalized)
+
+        # Check aliases - try exact match first, then substring
+        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
+            # Exact match in aliases
+            if normalized in aliases:
+                return canonical
+
+        # If no exact match, try substring matching (more lenient)
+        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
+            # Check if any alias is contained in normalized name
+            for alias in aliases:
+                if alias in normalized and len(alias) >= 3:  # At least 3 chars to avoid false matches
+                    return canonical
+
+        return normalized
+
+    @staticmethod
+    def parse_kalshi_title(title: str) -> tuple[str, str]:
+        """Parse Kalshi event title into (away_team, home_team)"""
+        # Remove suffixes like ": Spread", ": Total Points"
+        base_title = title.split(':')[0].strip()
+
+        if ' at ' in base_title:
+            away, home = base_title.split(' at ', 1)
+            return away.strip(), home.strip()
+        elif ' vs ' in base_title:
+            home, away = base_title.split(' vs ', 1)
+            return away.strip(), home.strip()
+
+        return base_title, base_title
+
+    @staticmethod
+    def parse_polymarket_title(title: str) -> tuple[str, str]:
+        """
+        Parse Polymarket event title into (away_team, home_team)
+
+        Polymarket format: "Team1 vs. Team2" - Team1 is typically listed first
+        but doesn't necessarily indicate home/away. For matching purposes,
+        we treat Team1 as "team A" and Team2 as "team B" since Polymarket
+        doesn't always follow strict home/away conventions.
+        """
+        # Remove any trailing/leading whitespace
+        title = title.strip()
+
+        # Polymarket uses "vs." with period
+        if ' vs. ' in title:
+            parts = title.split(' vs. ', 1)
+            team1 = parts[0].strip()
+            team2 = parts[1].strip()
+            return team1, team2
+        elif ' vs ' in title:
+            parts = title.split(' vs ', 1)
+            team1 = parts[0].strip()
+            team2 = parts[1].strip()
+            return team1, team2
+        elif ' @ ' in title:
+            away, home = title.split(' @ ', 1)
+            return away.strip(), home.strip()
+        elif ' at ' in title:
+            away, home = title.split(' at ', 1)
+            return away.strip(), home.strip()
+
+        # Default: can't parse, return same for both
+        return title, title
+
+    @staticmethod
+    def teams_match(team1: str, team2: str) -> bool:
+        """Check if two team names refer to the same team"""
+        norm1 = EventMatcher.normalize_team_name(team1)
+        norm2 = EventMatcher.normalize_team_name(team2)
+
+        # Exact match
+        if norm1 == norm2:
+            return True
+
+        # Check if one contains the other
+        if norm1 in norm2 or norm2 in norm1:
+            return True
+
+        # Check aliases
+        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
+            if norm1 in aliases and norm2 in aliases:
+                return True
+
+        return False
+
+    @staticmethod
+    def events_match(kalshi_away: str, kalshi_home: str, poly_team1: str, poly_team2: str) -> bool:
+        """
+        Check if Kalshi and Polymarket events represent the same game.
+
+        Since Polymarket doesn't always follow strict home/away conventions,
+        we match if both teams are present regardless of order.
+        """
+        # Check if kalshi_home matches either poly team
+        home_matches_1 = EventMatcher.teams_match(kalshi_home, poly_team1)
+        home_matches_2 = EventMatcher.teams_match(kalshi_home, poly_team2)
+
+        # Check if kalshi_away matches either poly team
+        away_matches_1 = EventMatcher.teams_match(kalshi_away, poly_team1)
+        away_matches_2 = EventMatcher.teams_match(kalshi_away, poly_team2)
+
+        # Match if home and away are both present (in either order)
+        match_order_1 = home_matches_1 and away_matches_2  # home=team1, away=team2
+        match_order_2 = home_matches_2 and away_matches_1  # home=team2, away=team1
+
+        return match_order_1 or match_order_2
+
+
+class MarketMatcher:
+    """Matches individual markets across Kalshi and Polymarket"""
+
+    @staticmethod
+    def extract_spread_value(text):
+        """
+        Extract spread value from market text.
+
+        Examples:
+            Kalshi: "Dallas wins by over 10.5 points?" -> 10.5
+            Polymarket: "Spread: Eagles (-3.5)" -> 3.5
+        """
+        import re
+
+        # Polymarket spread format: "Spread: Team (±X.X)"
+        poly_match = re.search(r'\(([+-]?)(\d+(?:\.\d+)?)\)', text)
+        if poly_match:
+            return float(poly_match.group(2))
+
+        # Kalshi spread format: "Team wins by over X.X points?"
+        kalshi_match = re.search(r'(?:over|under)\s+(\d+(?:\.\d+)?)\s+points?', text.lower())
+        if kalshi_match:
+            return float(kalshi_match.group(1))
+
+        return None
+
+    @staticmethod
+    def extract_total_value(text, ticker=None):
+        """
+        Extract total points value from market text or ticker.
+
+        Examples:
+            Polymarket: "Texas State vs. Arkansas State: O/U 63.5" -> 63.5
+            Kalshi title: "Dallas at Las Vegas: Total Points" -> None (not in title)
+            Kalshi ticker: "KXNFLTOTAL-25NOV17DALLV-61" -> 61.0
+
+        Args:
+            text: Market title/question text
+            ticker: Optional Kalshi ticker to extract value from
+
+        Returns:
+            float or None
+        """
+        import re
+
+        # Polymarket total format: "O/U X.X" or "Over/Under X.X"
+        total_match = re.search(r'o/u\s+(\d+(?:\.\d+)?)', text.lower())
+        if total_match:
+            return float(total_match.group(1))
+
+        # Alternative format
+        total_match = re.search(r'(?:over|under)[/\s]+(\d+(?:\.\d+)?)', text.lower())
+        if total_match:
+            return float(total_match.group(1))
+
+        # Kalshi might have it in title (rare)
+        total_match = re.search(r'total\s+(?:points?\s+)?(?:over|under)?\s*(\d+(?:\.\d+)?)', text.lower())
+        if total_match:
+            return float(total_match.group(1))
+
+        # Kalshi encodes total in ticker: KXNFLTOTAL-25NOV17DALLV-61
+        # The number after the last dash is the total (may include half points like 60H for 60.5)
+        if ticker:
+            ticker_match = re.search(r'-(\d+(?:H)?)$', ticker)
+            if ticker_match:
+                value_str = ticker_match.group(1)
+                # Handle half-point notation: 60H = 60.5
+                if value_str.endswith('H'):
+                    return float(value_str[:-1]) + 0.5
+                else:
+                    return float(value_str)
+
+        return None
+
+    @staticmethod
+    def get_market_type(kalshi_title=None, poly_question=None):
+        """
+        Determine market type from title/question.
+
+        Returns: 'moneyline', 'spread', 'total', 'prop', or None
+        """
+        import re
+
+        text = (kalshi_title or poly_question or '').lower()
+
+        # Spread indicators (check first, more specific)
+        if 'spread' in text or 'wins by' in text or re.search(r'\([+-]\d+', text):
+            return 'spread'
+
+        # Total indicators (check second, also specific)
+        if 'total' in text or 'o/u' in text or 'over/under' in text:
+            return 'total'
+
+        # Props (check before moneyline, more specific)
+        if any(keyword in text for keyword in ['touchdown', 'td', 'yards', 'passing', 'rushing', 'receiving']):
+            return 'prop'
+
+        # Moneyline indicators
+        # Kalshi: "Dallas at Las Vegas Winner?"
+        # Polymarket: "Cowboys vs. Raiders" (just team names with vs/vs./@ separator)
+        if 'winner' in text or 'to win' in text:
+            return 'moneyline'
+
+        # Polymarket moneyline: Simple format with just teams and vs/@ separator
+        # Pattern: "Team1 vs. Team2" or "Team1 vs Team2" or "Team1 @ Team2"
+        if re.match(r'^[a-z\s]+\s+(?:vs\.?|@)\s+[a-z\s]+$', text.strip()):
+            # Make sure it's not a spread or total (those have extra info)
+            if 'spread' not in text and 'o/u' not in text and not re.search(r'\([+-]?\d+', text):
+                return 'moneyline'
+
+        return None
+
+    @staticmethod
+    def markets_match(kalshi_market, poly_market, home_team, away_team):
+        """
+        Check if a Kalshi market and Polymarket market represent the same bet.
+
+        Args:
+            kalshi_market: Kalshi market dict with 'title' key
+            poly_market: Polymarket market object with 'question' attribute
+            home_team: Home team name (normalized)
+            away_team: Away team name (normalized)
+
+        Returns:
+            bool: True if markets match
+        """
+        k_title = kalshi_market.get('title', '').lower()
+        k_ticker = kalshi_market.get('ticker', '')
+        p_question = poly_market.question.lower()
+
+        # Get market types
+        k_type = MarketMatcher.get_market_type(kalshi_title=k_title)
+        p_type = MarketMatcher.get_market_type(poly_question=p_question)
+
+        # Must be same type
+        if k_type != p_type or k_type is None:
+            return False
+
+        # Moneyline: just check it's a winner market
+        if k_type == 'moneyline':
+            # Both are moneyline/winner markets - they match!
+            return True
+
+        # Spread: must have same spread value
+        if k_type == 'spread':
+            k_spread = MarketMatcher.extract_spread_value(k_title)
+            p_spread = MarketMatcher.extract_spread_value(p_question)
+
+            if k_spread is not None and p_spread is not None:
+                # Allow 0.01 point tolerance for floating point comparison
+                return abs(k_spread - p_spread) < 0.01
+            return False
+
+        # Total: Kalshi has generic "Total Points" title, but value is in ticker
+        # Polymarket has specific value in question: "O/U 63.5"
+        # KEY: Kalshi uses whole numbers (50, 51), Polymarket uses half-points (50.5, 51.5)
+        if k_type == 'total':
+            # Extract total from Kalshi ticker (e.g., KXNFLTOTAL-25NOV17DALLV-61 -> 61.0)
+            k_total = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
+            # Extract total from Polymarket question (e.g., "O/U 63.5" -> 63.5)
+            p_total_raw = MarketMatcher.extract_total_value(p_question)
+
+            # Both must have values to match
+            if k_total is not None and p_total_raw is not None:
+                # Polymarket uses half-points (50.5, 51.5), Kalshi uses whole numbers (50, 51)
+                # Round down Polymarket's value to match Kalshi's format
+                # 50.5 -> 50, 51.5 -> 51, etc.
+                import math
+                p_total = math.floor(p_total_raw)
+
+                # Now compare
+                matches = abs(k_total - p_total) < 0.01
+                print(f"          DEBUG Total: K={k_total}, P={p_total_raw} (rounded: {p_total}) -> {'MATCH' if matches else 'NO MATCH'}")
+                return matches
+
+            # If either is missing a value, can't match
+            return False
+
+        # Props: would need more sophisticated matching (not implemented yet)
+        return False
 
 
 def kalshi_cents_to_american_odds(cents):
@@ -180,6 +635,143 @@ class HistoricalOddsClient:
         return {k: sorted(v) for k, v in point_changes.items() if len(v) > 1}
 
 
+class PolymarketHistoricalOddsClient:
+    """Client for fetching historical odds data from Polymarket using PolymarketSportsClient"""
+
+    def __init__(self):
+        self.polymarket_client = PolymarketSportsClient()
+        self.cache = {}
+
+    async def get_sport_games(self, sport: str):
+        """
+        Get all games for a sport from Polymarket (async, non-blocking).
+
+        Args:
+            sport: Sport name (NFL, NBA, NHL, etc.)
+
+        Returns:
+            List of Game objects from PolymarketSportsClient
+        """
+        try:
+            # Use run_in_executor for CPU-bound work to avoid blocking Qt event loop
+            loop = asyncio.get_event_loop()
+            games = await loop.run_in_executor(
+                None,
+                lambda: self.polymarket_client.get_sport_markets(
+                    sport,
+                    limit=50,
+                    include_orderbook=False,  # Skip orderbook for faster loading
+                    include_trades=False      # Skip trades for faster loading
+                )
+            )
+            return games
+        except Exception as e:
+            print(f"Error fetching Polymarket games for {sport}: {e}")
+            return []
+
+    async def get_historical_candlesticks(self, session, token_id, outcome_name,
+                                         start_time, end_time=None, fidelity=60):
+        """
+        Fetches historical candlestick data from Polymarket (async, non-blocking).
+
+        Args:
+            session: aiohttp session for making requests
+            token_id: Polymarket CLOB token ID
+            outcome_name: Name of the outcome (e.g., team name, "Yes", "No")
+            start_time: Start time as datetime or ISO string
+            end_time: End time as datetime or ISO string
+            fidelity: Resolution in minutes (default 60)
+
+        Returns:
+            List of snapshot dictionaries formatted like TheOddsAPI for compatibility
+        """
+        if end_time is None:
+            end_time = datetime.now()
+        elif isinstance(end_time, str):
+            end_time = datetime.fromisoformat(end_time.replace('Z', ''))
+
+        if isinstance(start_time, str):
+            start_time = datetime.fromisoformat(start_time.replace('Z', ''))
+
+        print(f"Fetching Polymarket price history from {start_time} to {end_time}")
+        print(f"Token: {token_id}, Outcome: {outcome_name}, Fidelity: {fidelity} minutes")
+
+        try:
+            # Use aiohttp session for truly async HTTP request
+            url = "https://clob.polymarket.com/prices-history"
+            params = {
+                'market': token_id,
+                'startTs': int(start_time.timestamp()),
+                'endTs': int(end_time.timestamp()),
+                'fidelity': fidelity
+            }
+
+            async with session.get(url, params=params, timeout=15) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    print(f"Error fetching Polymarket history: {response.status} - {error_text}")
+                    return []
+
+                data = await response.json()
+                history = data.get('history', [])
+
+            print(f"Retrieved {len(history)} price points from Polymarket")
+
+            # Convert Polymarket format to TheOddsAPI-like snapshot format
+            snapshots = []
+
+            for point in history:
+                timestamp = point.get('t')  # Unix timestamp
+                price = point.get('p')  # Price (0-1 decimal or 0-100 cents)
+
+                if timestamp is None or price is None:
+                    continue
+
+                # Convert timestamp
+                timestamp_dt = datetime.fromtimestamp(timestamp)
+
+                # Convert Polymarket price to cents if needed (0-1 → 0-100)
+                if price <= 1.0:
+                    price_cents = price * 100
+                else:
+                    price_cents = price
+
+                # Convert to American odds
+                american_odds = kalshi_cents_to_american_odds(price_cents)
+                if american_odds is None:
+                    continue
+
+                # Format as TheOddsAPI-like snapshot
+                snapshot = {
+                    'timestamp': timestamp_dt.isoformat() + 'Z',
+                    'data': {
+                        'bookmakers': [{
+                            'key': 'polymarket',
+                            'title': 'Polymarket',
+                            'markets': [{
+                                'key': 'h2h',
+                                'outcomes': [{
+                                    'name': outcome_name,
+                                    'price': american_odds,
+                                    'polymarket_price': price,  # Store original
+                                }]
+                            }]
+                        }]
+                    }
+                }
+
+                snapshots.append(snapshot)
+
+            print(f"Converted {len(snapshots)} valid snapshots")
+            return snapshots
+
+        except Exception as e:
+            print(f"Error fetching Polymarket price history: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+
 class KalshiHistoricalOddsClient:
     """Client for fetching historical odds data from Kalshi API"""
 
@@ -331,19 +923,30 @@ class HistoricalOddsWidget(QWidget):
         self.away_team = None
         self.api_key = api_key
 
-        # Initialize both clients
+        # Initialize all three clients
         self.theoddsapi_client = HistoricalOddsClient(self.api_key, interval_minutes)
         self.kalshi_client = KalshiHistoricalOddsClient(api_key=kalshi_api_key)
+        self.polymarket_client = PolymarketHistoricalOddsClient()
 
         # Default to Kalshi as primary
         self.client = self.kalshi_client
-        self.data_source = 'kalshi'  # 'kalshi' or 'theoddsapi'
+        self.data_source = 'kalshi'  # 'kalshi', 'polymarket', or 'theoddsapi'
 
         # Kalshi-specific attributes
         self.kalshi_event_ticker = None
         self.kalshi_series_ticker = None
         self.kalshi_market_ticker = None
         self.kalshi_available_markets = []
+
+        # Polymarket-specific attributes
+        self.polymarket_game = None
+        self.polymarket_market = None
+        self.polymarket_token_id = None
+        self.polymarket_outcome_name = None
+
+        # Unified event attributes
+        self.current_unified_event = None  # Currently selected UnifiedEvent
+        self.selected_market_data = None  # Currently selected market data dict
 
         self.bookmaker_visible = {}
         self.current_snapshots = []
@@ -370,7 +973,7 @@ class HistoricalOddsWidget(QWidget):
         header_layout.addWidget(self.title_label)
         header_layout.addStretch(1)
 
-        # Event selector for Kalshi (populated dynamically)
+        # Event selector - shows unified events from both sources
         self.event_label = QLabel("Event:")
         self.event_selector = QComboBox()
         self.event_selector.setMinimumWidth(200)
@@ -475,6 +1078,137 @@ class HistoricalOddsWidget(QWidget):
         self.plot_widget.setEnabled(enabled)
         self.event_selector.setEnabled(enabled)
         self.market_selector.setEnabled(enabled)
+
+    async def load_unified_events(self, sport='NFL'):
+        """
+        Load and merge events from both Kalshi and Polymarket.
+
+        Args:
+            sport: Sport key ('NFL', 'NBA', 'MLB', 'NHL')
+        """
+        print(f"\n{'='*80}")
+        print(f"Loading unified events for {sport}")
+        print(f"{'='*80}\n")
+
+        # Map sport to the MONEYLINE series (base games only)
+        KALSHI_MONEYLINE_SERIES = {
+            'NFL': 'KXNFLGAME',
+            'NBA': 'KXNBAGAME',
+            'MLB': 'KXMLBGAME',
+            'NHL': 'KXNHLGAME',
+            'NCAAF': 'KXNCAAFGAME',
+        }
+
+        series_ticker = KALSHI_MONEYLINE_SERIES.get(sport)
+        if not series_ticker:
+            print(f"⚠️  No Kalshi moneyline series found for {sport}")
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # Fetch from both sources concurrently
+        print("Fetching from Kalshi and Polymarket in parallel...")
+
+        # Fetch Kalshi moneyline events only (base games)
+        def fetch_kalshi_moneylines():
+            cursor = None
+            events = []
+            while True:
+                response = self.kalshi_client.kalshi_client.get_events(
+                    series_ticker=series_ticker,
+                    limit=200,
+                    cursor=cursor
+                )
+                events.extend(response.get('events', []))
+                cursor = response.get('cursor')
+                if not cursor:
+                    break
+            return {'events': events, 'count': len(events)}
+
+        kalshi_task = loop.run_in_executor(None, fetch_kalshi_moneylines)
+        polymarket_task = self.polymarket_client.get_sport_games(sport)
+
+        kalshi_data, polymarket_games = await asyncio.gather(kalshi_task, polymarket_task)
+
+        kalshi_events = kalshi_data.get('events', [])
+        print(f"✅ Kalshi: {len(kalshi_events)} events")
+        print(f"✅ Polymarket: {len(polymarket_games)} games")
+
+        # Create unified events by matching
+        unified_events = []
+        matched_poly_ids = set()
+
+        # First pass: match Kalshi events with Polymarket
+        for k_event in kalshi_events:
+            k_title = k_event.get('title', '')
+            k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
+
+            # Try to find matching Polymarket game
+            matched_poly_game = None
+            for p_game in polymarket_games:
+                if p_game.id in matched_poly_ids:
+                    continue
+
+                p_title = p_game.title
+                p_away, p_home = EventMatcher.parse_polymarket_title(p_title)
+
+                if EventMatcher.events_match(k_away, k_home, p_away, p_home):
+                    matched_poly_game = p_game
+                    matched_poly_ids.add(p_game.id)
+                    break
+
+            # Create unified event
+            unified_event = UnifiedEvent(
+                sport=sport,
+                home_team=k_home,
+                away_team=k_away,
+                start_time=k_event.get('strike_date', ''),
+                kalshi_event_ticker=k_event.get('event_ticker'),
+                kalshi_series_ticker=k_event.get('series_ticker'),
+                kalshi_markets=k_event.get('markets', [])
+            )
+
+            if matched_poly_game:
+                unified_event.polymarket_game_id = matched_poly_game.id
+                unified_event.polymarket_title = matched_poly_game.title
+                unified_event.polymarket_markets = matched_poly_game.markets
+                print(f"  [K+P] Matched: {k_home} vs {k_away}")
+            else:
+                print(f"  [K  ] No Polymarket match: {k_home} vs {k_away}")
+
+            unified_events.append(unified_event)
+
+        # Second pass: add unmatched Polymarket games
+        for p_game in polymarket_games:
+            if p_game.id not in matched_poly_ids:
+                p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
+                unified_event = UnifiedEvent(
+                    sport=sport,
+                    home_team=p_home,
+                    away_team=p_away,
+                    start_time=p_game.start_time,
+                    polymarket_game_id=p_game.id,
+                    polymarket_title=p_game.title,
+                    polymarket_markets=p_game.markets
+                )
+                unified_events.append(unified_event)
+                print(f"  [  P] Polymarket only: {p_home} vs {p_away}")
+
+        print(f"\n📊 Total unified events: {len(unified_events)}")
+
+        # Populate event selector
+        self.event_selector.blockSignals(True)
+        self.event_selector.clear()
+
+        for event in unified_events:
+            display_title = event.get_display_title()
+            self.event_selector.addItem(display_title, userData=event)
+
+        self.event_selector.blockSignals(False)
+
+        # Auto-select first event
+        if unified_events:
+            await self.on_event_changed()
 
     async def load_kalshi_events(self, sport=None):
         """
@@ -616,6 +1350,298 @@ class HistoricalOddsWidget(QWidget):
             print(f"Error loading Kalshi events: {e}")
             import traceback
             traceback.print_exc()
+
+    async def load_markets_for_unified_event(self, unified_event: UnifiedEvent):
+        """
+        Load markets from both Kalshi and Polymarket for a unified event.
+
+        Args:
+            unified_event: UnifiedEvent containing data from both sources
+        """
+        print(f"\nLoading markets for unified event: {unified_event.away_team} @ {unified_event.home_team}")
+
+        # Block signals to prevent triggering during population
+        self.market_selector.blockSignals(True)
+        self.market_selector.clear()
+
+        # Store the current unified event
+        self.current_unified_event = unified_event
+
+        # Collect all markets from both sources
+        all_markets = []
+
+        # === KALSHI MARKETS ===
+        if unified_event.has_kalshi():
+            print(f"  Loading Kalshi markets...")
+
+            # Check if markets are already loaded, if not fetch them
+            kalshi_markets = unified_event.kalshi_markets or []
+
+            if not kalshi_markets:
+                # Markets not loaded yet - fetch them from all related series
+                print(f"    Fetching markets from Kalshi API...")
+                ticker_parts = unified_event.kalshi_event_ticker.split('-')
+                if len(ticker_parts) >= 2:
+                    ticker_id = '-'.join(ticker_parts[1:])
+                else:
+                    ticker_id = unified_event.kalshi_event_ticker
+
+                # Determine sport and construct series tickers to check
+                sport = unified_event.sport
+                series_to_check = []
+
+                if sport == 'NFL':
+                    series_to_check = ['KXNFLGAME', 'KXNFLSPREAD', 'KXNFLTOTAL', 'KXMVENFLSINGLEGAME']
+                elif sport == 'NBA':
+                    series_to_check = ['KXNBAGAME', 'KXNBASPREAD', 'KXNBATOTAL']
+                elif sport == 'MLB':
+                    series_to_check = ['KXMLBGAME', 'KXMLBSPREAD', 'KXMLBTOTAL']
+                elif sport == 'NHL':
+                    series_to_check = ['KXNHLGAME', 'KXNHLSPREAD', 'KXNHLTOTAL']
+
+                # Fetch markets from all related series
+                loop = asyncio.get_event_loop()
+                for series in series_to_check:
+                    if series.startswith('KXMVE'):
+                        # Props series - fetch by team names
+                        try:
+                            props_markets = await self._fetch_props_markets_for_teams(
+                                series, unified_event.home_team, unified_event.away_team
+                            )
+                            if props_markets:
+                                kalshi_markets.extend(props_markets)
+                                print(f"      {series}: {len(props_markets)} markets")
+                        except Exception as e:
+                            pass  # No props available
+                    else:
+                        # Standard series - use ticker pattern
+                        try:
+                            markets = await loop.run_in_executor(
+                                None,
+                                lambda s=series, t=ticker_id: self._fetch_event_markets_sync(s, t)
+                            )
+                            if markets:
+                                kalshi_markets.extend(markets)
+                                print(f"      {series}: {len(markets)} markets")
+                        except Exception as e:
+                            pass  # Series doesn't exist
+
+                # Cache the fetched markets in the unified event
+                unified_event.kalshi_markets = kalshi_markets
+
+        # Get Polymarket markets
+        poly_markets = []
+        if unified_event.has_polymarket():
+            print(f"  Loading Polymarket markets...")
+            poly_markets = unified_event.polymarket_markets or []
+            print(f"  Found {len(poly_markets)} Polymarket markets:")
+            for pm in poly_markets:
+                pm_type = MarketMatcher.get_market_type(poly_question=pm.question)
+                print(f"    - {pm.question} (type: {pm_type})")
+
+        # === MATCH MARKETS ACROSS SOURCES ===
+        unified_markets = []
+        matched_poly_indices = set()
+        matched_kalshi_indices = set()
+
+        # Special handling for moneyline: Group both Kalshi moneyline markets together
+        # Kalshi has 2 markets (one per team), Polymarket has 1 market (with 2 outcomes)
+        moneyline_markets_kalshi = []
+        if unified_event.has_kalshi():
+            for idx, k_market in enumerate(kalshi_markets):
+                k_type = MarketMatcher.get_market_type(kalshi_title=k_market.get('title', ''))
+                if k_type == 'moneyline':
+                    moneyline_markets_kalshi.append((idx, k_market))
+
+        # Create unified moneyline market if we have Kalshi moneylines
+        if moneyline_markets_kalshi:
+            # Find matching Polymarket moneyline
+            poly_moneyline = None
+            poly_moneyline_idx = None
+            for p_idx, p_market in enumerate(poly_markets):
+                if MarketMatcher.get_market_type(poly_question=p_market.question) == 'moneyline':
+                    poly_moneyline = p_market
+                    poly_moneyline_idx = p_idx
+                    matched_poly_indices.add(p_idx)
+                    break
+
+            # Extract all Kalshi moneyline markets
+            k_markets_list = [m[1] for m in moneyline_markets_kalshi]
+            k_tickers_list = [m[1].get('ticker') for m in moneyline_markets_kalshi]
+            k_titles_list = [m[1].get('title', '') for m in moneyline_markets_kalshi]
+
+            # Mark these Kalshi markets as matched
+            for idx, _ in moneyline_markets_kalshi:
+                matched_kalshi_indices.add(idx)
+
+            # Get event ticker from first market
+            first_ticker = k_tickers_list[0]
+            if first_ticker and '-' in first_ticker:
+                k_event_ticker = first_ticker.rsplit('-', 1)[0]
+            else:
+                k_event_ticker = first_ticker or unified_event.kalshi_event_ticker
+
+            # Create unified moneyline market
+            display_name = poly_moneyline.question if poly_moneyline else k_titles_list[0]
+
+            unified_moneyline = UnifiedMarket(
+                market_type='moneyline',
+                display_name=display_name,
+                kalshi_markets=k_markets_list,
+                kalshi_tickers=k_tickers_list,
+                kalshi_titles=k_titles_list,
+                kalshi_event_ticker=k_event_ticker,
+                polymarket_market=poly_moneyline,
+                polymarket_id=poly_moneyline.id if poly_moneyline else None,
+                polymarket_question=poly_moneyline.question if poly_moneyline else None,
+                polymarket_game_id=unified_event.polymarket_game_id if poly_moneyline else None
+            )
+            unified_markets.append(unified_moneyline)
+            print(f"    [MONEYLINE] Combined {len(k_markets_list)} Kalshi markets{' + Polymarket' if poly_moneyline else ''}")
+
+        # Now process non-moneyline markets
+        # First pass: Match Kalshi markets with Polymarket
+        if unified_event.has_kalshi():
+            for k_idx, k_market in enumerate(kalshi_markets):
+                # Skip if already matched (moneylines)
+                if k_idx in matched_kalshi_indices:
+                    continue
+                k_title = k_market.get('title', '')
+                k_ticker = k_market.get('ticker')
+
+                # CRITICAL FIX: Extract event ticker from the market ticker
+                # Market ticker format: KXNFLSPREAD-25NOV23TBLA-TB6
+                # Event ticker should be: KXNFLSPREAD-25NOV23TBLA (everything before last dash)
+                if k_ticker and '-' in k_ticker:
+                    ticker_parts = k_ticker.rsplit('-', 1)  # Split from right, only once
+                    k_event_ticker = ticker_parts[0]  # Everything except the market suffix
+                else:
+                    k_event_ticker = k_ticker or unified_event.kalshi_event_ticker
+
+                # Try to find matching Polymarket market
+                matched_p_market = None
+                matched_p_idx = None
+
+                k_type = MarketMatcher.get_market_type(kalshi_title=k_title)
+                print(f"    Kalshi: {k_title[:60]} (type: {k_type}, ticker: {k_ticker})")
+
+                for p_idx, p_market in enumerate(poly_markets):
+                    if p_idx in matched_poly_indices:
+                        continue
+
+                    p_type = MarketMatcher.get_market_type(poly_question=p_market.question)
+
+                    # Use MarketMatcher to check if these represent the same bet
+                    matches = MarketMatcher.markets_match(
+                        k_market, p_market,
+                        unified_event.home_team,
+                        unified_event.away_team
+                    )
+
+                    if matches:
+                        matched_p_market = p_market
+                        matched_p_idx = p_idx
+                        matched_poly_indices.add(p_idx)
+                        print(f"      ✅ MATCHED with Polymarket: {p_market.question[:60]}")
+                        break
+                    else:
+                        # Debug: show why it didn't match
+                        if k_type == p_type and p_idx < 3:  # Only show first few attempts
+                            print(f"        ❌ No match with: {p_market.question[:50]} (same type: {k_type})")
+
+                # Determine market type and display name
+                market_type = k_type
+
+                if matched_p_market:
+                    # Both sources available - use Polymarket's more descriptive name if available
+                    if matched_p_market.question and len(matched_p_market.question) > len(k_title):
+                        display_name = matched_p_market.question
+                    else:
+                        display_name = k_title
+
+                    unified_market = UnifiedMarket(
+                        market_type=market_type or 'unknown',
+                        display_name=display_name,
+                        kalshi_markets=[k_market],  # Single market in a list
+                        kalshi_tickers=[k_ticker],
+                        kalshi_titles=[k_title],
+                        kalshi_event_ticker=k_event_ticker,
+                        polymarket_market=matched_p_market,
+                        polymarket_id=matched_p_market.id,
+                        polymarket_question=matched_p_market.question,
+                        polymarket_game_id=unified_event.polymarket_game_id
+                    )
+                    print(f"      → Created unified market: {display_name[:60]}")
+                else:
+                    # Kalshi only
+                    display_name = k_title
+                    unified_market = UnifiedMarket(
+                        market_type=market_type or 'unknown',
+                        display_name=display_name,
+                        kalshi_markets=[k_market],  # Single market in a list
+                        kalshi_tickers=[k_ticker],
+                        kalshi_titles=[k_title],
+                        kalshi_event_ticker=k_event_ticker
+                    )
+                    print(f"      → Kalshi only market")
+
+                unified_markets.append(unified_market)
+
+        # Second pass: Add unmatched Polymarket markets
+        if unified_event.has_polymarket():
+            for p_idx, p_market in enumerate(poly_markets):
+                if p_idx not in matched_poly_indices:
+                    # Polymarket only
+                    p_question = p_market.question
+                    market_type = MarketMatcher.get_market_type(poly_question=p_question)
+
+                    unified_market = UnifiedMarket(
+                        market_type=market_type or 'unknown',
+                        display_name=p_question,
+                        polymarket_market=p_market,
+                        polymarket_id=p_market.id,
+                        polymarket_question=p_question,
+                        polymarket_game_id=unified_event.polymarket_game_id
+                    )
+                    unified_markets.append(unified_market)
+
+        # Sort markets: matched first, then by type, then by name
+        # Order:
+        #   1. Matched markets (has both Kalshi and Polymarket) - priority 0
+        #   2. Single-source markets - priority 1
+        # Within each priority group, sort by: moneyline, spread, total, props, unknown
+        type_order = {'moneyline': 0, 'spread': 1, 'total': 2, 'prop': 3, 'unknown': 4}
+
+        def sort_key(m):
+            # Priority 0 for matched markets, 1 for single-source
+            has_both = 0 if (m.has_kalshi() and m.has_polymarket()) else 1
+            market_type_order = type_order.get(m.market_type, 4)
+            return (has_both, market_type_order, m.display_name)
+
+        unified_markets.sort(key=sort_key)
+
+        # Populate market selector
+        for unified_market in unified_markets:
+            source_indicator = unified_market.get_source_indicator()
+            display_text = f"{source_indicator} {unified_market.display_name}"
+            self.market_selector.addItem(display_text, userData=unified_market)
+
+        self.market_selector.blockSignals(False)
+
+        print(f"  Loaded {len(unified_markets)} unified markets")
+        kalshi_count = sum(1 for m in unified_markets if m.has_kalshi())
+        poly_count = sum(1 for m in unified_markets if m.has_polymarket())
+        both_count = sum(1 for m in unified_markets if m.has_kalshi() and m.has_polymarket())
+        print(f"    Kalshi: {kalshi_count}, Polymarket: {poly_count}, Both: {both_count}")
+
+        # Enable widget if we have markets
+        if unified_markets:
+            self.set_enabled(True)
+            # Auto-select first market
+            await self.on_market_changed()
+        else:
+            # No markets available - keep disabled
+            self.set_enabled(False)
 
     async def load_all_markets_for_event(self, base_event_ticker, base_title, home_team, away_team):
         """
@@ -931,16 +1957,30 @@ class HistoricalOddsWidget(QWidget):
 
     @qasync.asyncSlot()
     async def on_event_changed(self):
-        """Handle event selector change (Kalshi only)"""
-        if self.data_source != 'kalshi':
-            return
-
+        """Handle event selector change - supports unified events from both sources"""
         selected_index = self.event_selector.currentIndex()
         if selected_index < 0:
             return
 
         event_data = self.event_selector.itemData(selected_index)
-        if event_data:
+        if not event_data:
+            return
+
+        # Check if this is a UnifiedEvent object
+        if isinstance(event_data, UnifiedEvent):
+            unified_event = event_data
+            print(f"\nEvent changed to: {unified_event.get_display_title()}")
+            print(f"  Kalshi: {'✓' if unified_event.has_kalshi() else '✗'}")
+            print(f"  Polymarket: {'✓' if unified_event.has_polymarket() else '✗'}")
+
+            # Populate market selector with markets from both sources
+            await self.load_markets_for_unified_event(unified_event)
+
+        else:
+            # Legacy Kalshi-only format: (event_ticker, series_ticker, base_title)
+            if self.data_source != 'kalshi':
+                return
+
             event_ticker, series_ticker, base_title = event_data
 
             # Remove sport prefix from display title
@@ -967,16 +2007,58 @@ class HistoricalOddsWidget(QWidget):
 
     @qasync.asyncSlot()
     async def on_market_changed(self):
-        """Handle market selector change (Kalshi only)"""
-        if self.data_source != 'kalshi':
-            return
-
+        """Handle market selector change - supports both Kalshi and Polymarket"""
         selected_index = self.market_selector.currentIndex()
         if selected_index < 0:
             return
 
-        market_ticker = self.market_selector.itemData(selected_index)
-        if market_ticker:
+        market_data = self.market_selector.itemData(selected_index)
+        if not market_data:
+            return
+
+        # Check if this is a UnifiedMarket object
+        if isinstance(market_data, UnifiedMarket):
+            unified_market = market_data
+            self.current_unified_market = unified_market
+
+            # Show what sources are available
+            source_info = []
+            if unified_market.has_kalshi():
+                source_info.append("Kalshi")
+                # Store first ticker for legacy compatibility (some code may still use it)
+                self.kalshi_market_ticker = unified_market.kalshi_tickers[0] if unified_market.kalshi_tickers else None
+            if unified_market.has_polymarket():
+                source_info.append("Polymarket")
+
+            print(f"Market changed to: [{' + '.join(source_info)}] {unified_market.display_name}")
+
+            # Reload data for new market
+            if self._load_task and not self._load_task.done():
+                self._load_task.cancel()
+            self._load_task = asyncio.create_task(self.load_data())
+
+        # Check if this is the old dict format (dict with 'source' key)
+        elif isinstance(market_data, dict) and 'source' in market_data:
+            self.selected_market_data = market_data
+            source = market_data['source']
+
+            if source == 'kalshi':
+                self.kalshi_market_ticker = market_data['ticker']
+                print(f"Market changed to: [Kalshi] {market_data['title']}")
+            elif source == 'polymarket':
+                print(f"Market changed to: [Polymarket] {market_data['question']}")
+
+            # Reload data for new market
+            if self._load_task and not self._load_task.done():
+                self._load_task.cancel()
+            self._load_task = asyncio.create_task(self.load_data())
+
+        else:
+            # Legacy Kalshi-only format (just the ticker string)
+            if self.data_source != 'kalshi':
+                return
+
+            market_ticker = market_data
             self.kalshi_market_ticker = market_ticker
             print(f"Market changed to: {market_ticker}")
 
@@ -1026,9 +2108,187 @@ class HistoricalOddsWidget(QWidget):
         self.refresh_timer.stop()
         print("Live updates disabled")
 
+    async def load_unified_market_data(self):
+        """
+        Load historical data for a unified market (can be from Kalshi, Polymarket, or both).
+        Handles both UnifiedMarket objects and legacy dict format.
+        """
+        # Determine which format we're using
+        unified_market = None
+        selected_market_data = None
+
+        if hasattr(self, 'current_unified_market') and self.current_unified_market:
+            unified_market = self.current_unified_market
+        elif hasattr(self, 'selected_market_data') and self.selected_market_data:
+            selected_market_data = self.selected_market_data
+        else:
+            print("No market selected")
+            return
+
+        # Calculate time range
+        end_time = datetime.now()
+        start_time = self.calculate_start_time(end_time)
+        kalshi_interval_value = int(self.kalshi_interval.currentText().removesuffix('m'))
+
+        self.progress_bar.setValue(10)
+        self.refresh_button.setEnabled(False)
+
+        # Remove "no data" message if it exists
+        try:
+            self.plot_widget.removeItem(self.no_data_text)
+        except:
+            pass
+
+        try:
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=60)
+
+            all_snapshots = []
+
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                # === UNIFIED MARKET PATH (NEW) ===
+                if unified_market:
+                    print(f"\n{'='*80}")
+                    print(f"Loading unified market data")
+                    print(f"Market: {unified_market.display_name}")
+                    print(f"Sources: {unified_market.get_source_indicator()}")
+                    print(f"Time range: {start_time} to {end_time}")
+                    print(f"{'='*80}\n")
+
+                    # Fetch from Kalshi if available (may be multiple markets for moneyline)
+                    if unified_market.has_kalshi():
+                        for idx, k_ticker in enumerate(unified_market.kalshi_tickers):
+                            try:
+                                k_title = unified_market.kalshi_titles[idx]
+                                print(f"Fetching Kalshi data for: {k_title}")
+                                print(f"  Ticker: {k_ticker}")
+                                print(f"  Event ticker: {unified_market.kalshi_event_ticker}")
+                                print(f"  Series: {unified_market.kalshi_event_ticker.split('-')[0]}")
+
+                                kalshi_snapshots = await self.kalshi_client.get_historical_candlesticks(
+                                    session,
+                                    k_ticker,
+                                    unified_market.kalshi_event_ticker.split('-')[0],
+                                    start_time,
+                                    end_time,
+                                    period_interval=kalshi_interval_value
+                                )
+                                all_snapshots.extend(kalshi_snapshots)
+                                print(f"  ✅ Got {len(kalshi_snapshots)} Kalshi snapshots")
+                            except Exception as e:
+                                print(f"  ❌ Error fetching Kalshi data: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+                    # Fetch from Polymarket if available (may have multiple outcomes)
+                    if unified_market.has_polymarket():
+                        try:
+                            market_obj = unified_market.polymarket_market
+                            print(f"Fetching Polymarket data for: {market_obj.question}")
+
+                            if market_obj.outcome_prices and len(market_obj.clob_token_ids) > 0:
+                                # Fetch data for ALL outcomes (e.g., both teams for moneyline)
+                                for outcome_idx, token_id in enumerate(market_obj.clob_token_ids):
+                                    # Get the outcome name from the market's outcomes list
+                                    if hasattr(market_obj, 'outcomes') and outcome_idx < len(market_obj.outcomes):
+                                        outcome_name = market_obj.outcomes[outcome_idx]
+                                    else:
+                                        # Fallback to using question
+                                        outcome_name = f"{market_obj.question} - Outcome {outcome_idx + 1}"
+
+                                    print(f"  Outcome {outcome_idx + 1}: {outcome_name}")
+                                    print(f"    Token ID: {token_id}")
+
+                                    poly_snapshots = await self.polymarket_client.get_historical_candlesticks(
+                                        session,
+                                        token_id,
+                                        outcome_name,
+                                        start_time,
+                                        end_time,
+                                        fidelity=60
+                                    )
+                                    all_snapshots.extend(poly_snapshots)
+                                    print(f"    ✅ Got {len(poly_snapshots)} snapshots")
+                            else:
+                                print("  ⚠️  No token IDs available for Polymarket market")
+                        except Exception as e:
+                            print(f"  ❌ Error fetching Polymarket data: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                # === LEGACY DICT PATH (OLD) ===
+                elif selected_market_data:
+                    source = selected_market_data['source']
+                    print(f"\n{'='*80}")
+                    print(f"Loading market data from: {source}")
+                    print(f"Time range: {start_time} to {end_time}")
+                    print(f"{'='*80}\n")
+
+                    if source == 'kalshi':
+                        snapshots = await self.kalshi_client.get_historical_candlesticks(
+                            session,
+                            selected_market_data['ticker'],
+                            selected_market_data['event_ticker'].split('-')[0],
+                            start_time,
+                            end_time,
+                            period_interval=kalshi_interval_value
+                        )
+                        all_snapshots = snapshots
+
+                    elif source == 'polymarket':
+                        market_obj = selected_market_data['market_obj']
+                        if market_obj.outcome_prices and len(market_obj.clob_token_ids) > 0:
+                            token_id = market_obj.clob_token_ids[0]
+                            outcome_name = market_obj.question.split('?')[0].strip()
+
+                            snapshots = await self.polymarket_client.get_historical_candlesticks(
+                                session,
+                                token_id,
+                                outcome_name,
+                                start_time,
+                                end_time,
+                                fidelity=60
+                            )
+                            all_snapshots = snapshots
+                        else:
+                            print("⚠️  No token IDs available for this Polymarket market")
+
+            self.progress_bar.setValue(50)
+            print(f"Total snapshots received: {len(all_snapshots)}")
+            snapshots = all_snapshots
+
+            if snapshots:
+                self.current_snapshots = snapshots
+                # Process UI updates
+                await asyncio.gather(
+                    self.update_bookmaker_toggles(snapshots),
+                    self.update_plot(snapshots)
+                )
+                self.progress_bar.setValue(100)
+            else:
+                print("No data returned")
+                self.progress_bar.setValue(0)
+
+        except Exception as e:
+            print(f"Error loading unified market data: {e}")
+            import traceback
+            traceback.print_exc()
+            self.progress_bar.setValue(0)
+        finally:
+            self.refresh_button.setEnabled(True)
+
     async def load_data(self):
-        """Load historical odds data and populate the graph"""
-        # Validate required data based on source
+        """Load historical odds data and populate the graph - supports both Kalshi and Polymarket"""
+
+        # Check if we have a unified market (new path with UnifiedMarket object)
+        if hasattr(self, 'current_unified_market') and self.current_unified_market:
+            return await self.load_unified_market_data()
+
+        # Check if we have a unified event with market data (dict-based path)
+        if hasattr(self, 'selected_market_data') and self.selected_market_data:
+            return await self.load_unified_market_data()
+
+        # Legacy validation for old Kalshi-only path
         if self.data_source == 'kalshi':
             if not all([self.kalshi_event_ticker, self.kalshi_series_ticker, self.kalshi_market_ticker]):
                 print("Missing required Kalshi market info")
