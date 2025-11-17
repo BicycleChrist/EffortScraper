@@ -45,7 +45,31 @@ class UnifiedEvent:
         if self.polymarket_game_id:
             sources.append("P")
         source_str = f"[{'+'.join(sources)}]" if sources else ""
-        return f"{source_str} {self.away_team} @ {self.home_team}"
+
+        # Format the date if available
+        date_str = ""
+        if self.start_time:
+            try:
+                # Both Kalshi and Polymarket use ISO format with timestamp
+                # Kalshi: "2023-11-07T05:31:56Z"
+                # Polymarket: "2025-01-15T19:00:00Z"
+                from datetime import datetime
+                if 'T' in self.start_time:
+                    dt = datetime.fromisoformat(self.start_time.replace('Z', ''))
+                    date_str = dt.strftime("%m/%d %I:%M%p")
+                # Fallback for date-only format (shouldn't happen but just in case)
+                else:
+                    dt = datetime.fromisoformat(self.start_time)
+                    date_str = dt.strftime("%m/%d")
+            except:
+                # If parsing fails, just skip the date
+                pass
+
+        # Build display string: [K+P] [NFL] 01/15 7:00PM Away @ Home
+        sport_tag = f"[{self.sport}]" if self.sport else ""
+        date_tag = f"{date_str} " if date_str else ""
+
+        return f"{source_str} {sport_tag} {date_tag}{self.away_team} @ {self.home_team}"
 
     def has_kalshi(self):
         return self.kalshi_event_ticker is not None
@@ -1213,10 +1237,13 @@ class HistoricalOddsWidget(QWidget):
         self.set_enabled(False)
 
         # Add initial "no data" message
-        self.no_data_text = pg.TextItem("Select a market to view historical odds",
+        self.no_data_text = pg.TextItem("Loading events...",
                                       anchor=(0.5, 0.5))
         self.plot_widget.addItem(self.no_data_text)
         self.no_data_text.setPos(0.5, 0.5)
+
+        # Load all sports on initialization
+        QTimer.singleShot(100, lambda: asyncio.create_task(self.load_all_sports()))
 
     def set_enabled(self, enabled):
         """Enable or disable the widget controls"""
@@ -1227,7 +1254,152 @@ class HistoricalOddsWidget(QWidget):
         self.event_selector.setEnabled(enabled)
         self.market_selector.setEnabled(enabled)
 
-    async def load_unified_events(self, sport='GAME_SERIES'):
+    async def load_all_sports(self):
+        """Load events from all 4 major sports (NFL, NBA, MLB, NHL)"""
+        print(f"\n{'='*80}")
+        print(f"Loading all sports events...")
+        print(f"{'='*80}\n")
+
+        all_unified_events = []
+
+        # Load events from all 4 major sports
+        for sport in ['NFL', 'NBA', 'MLB', 'NHL']:
+            print(f"\nLoading {sport}...")
+            events = await self._load_unified_events_for_sport(sport)
+            all_unified_events.extend(events)
+
+        print(f"\n📊 Total events loaded from all sports: {len(all_unified_events)}")
+
+        # Populate event selector with all events
+        self.event_selector.blockSignals(True)
+        self.event_selector.clear()
+
+        for event in all_unified_events:
+            display_title = event.get_display_title()
+            self.event_selector.addItem(display_title, userData=event)
+
+        self.event_selector.blockSignals(False)
+
+        # Enable controls
+        self.set_enabled(True)
+
+        # Update the no data message
+        if all_unified_events:
+            self.no_data_text.setText("Select an event to view historical odds")
+        else:
+            self.no_data_text.setText("No events available")
+
+    async def _load_unified_events_for_sport(self, sport):
+        """
+        Load and merge events from both Kalshi and Polymarket for a single sport.
+        Returns list of UnifiedEvent objects.
+
+        Args:
+            sport: Sport key ('NFL', 'NBA', 'MLB', 'NHL')
+        """
+        # Map sport to the MONEYLINE series (base games only)
+        KALSHI_MONEYLINE_SERIES = {
+            'NFL': 'KXNFLGAME',
+            'NBA': 'KXNBAGAME',
+            'MLB': 'KXMLBGAME',
+            'NHL': 'KXNHLGAME',
+            'NCAAF': 'KXNCAAFGAME',
+        }
+
+        series_ticker = KALSHI_MONEYLINE_SERIES.get(sport)
+        if not series_ticker:
+            print(f"⚠️  No Kalshi moneyline series found for {sport}")
+            return []
+
+        loop = asyncio.get_event_loop()
+
+        # Fetch from both sources concurrently
+        print(f"  Fetching {sport} from Kalshi and Polymarket in parallel...")
+
+        # Fetch Kalshi moneyline events only (base games)
+        def fetch_kalshi_moneylines():
+            cursor = None
+            events = []
+            while True:
+                response = self.kalshi_client.kalshi_client.get_events(
+                    series_ticker=series_ticker,
+                    limit=200,
+                    cursor=cursor
+                )
+                events.extend(response.get('events', []))
+                cursor = response.get('cursor')
+                if not cursor:
+                    break
+            return {'events': events, 'count': len(events)}
+
+        kalshi_task = loop.run_in_executor(None, fetch_kalshi_moneylines)
+        polymarket_task = self.polymarket_client.get_sport_games(sport)
+
+        kalshi_data, polymarket_games = await asyncio.gather(kalshi_task, polymarket_task)
+
+        kalshi_events = kalshi_data.get('events', [])
+        print(f"  ✅ Kalshi: {len(kalshi_events)} events")
+        print(f"  ✅ Polymarket: {len(polymarket_games)} games")
+
+        # Create unified events by matching
+        unified_events = []
+        matched_poly_ids = set()
+
+        # First pass: match Kalshi events with Polymarket
+        for k_event in kalshi_events:
+            k_title = k_event.get('title', '')
+            k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
+
+            # Try to find matching Polymarket game
+            matched_poly_game = None
+            for p_game in polymarket_games:
+                if p_game.id in matched_poly_ids:
+                    continue
+
+                p_title = p_game.title
+                p_away, p_home = EventMatcher.parse_polymarket_title(p_title)
+
+                if EventMatcher.events_match(k_away, k_home, p_away, p_home):
+                    matched_poly_game = p_game
+                    matched_poly_ids.add(p_game.id)
+                    break
+
+            # Create unified event
+            unified_event = UnifiedEvent(
+                sport=sport,
+                home_team=k_home,
+                away_team=k_away,
+                start_time=k_event.get('strike_date', ''),
+                kalshi_event_ticker=k_event.get('event_ticker'),
+                kalshi_series_ticker=k_event.get('series_ticker'),
+                kalshi_markets=k_event.get('markets', [])
+            )
+
+            if matched_poly_game:
+                unified_event.polymarket_game_id = matched_poly_game.id
+                unified_event.polymarket_title = matched_poly_game.title
+                unified_event.polymarket_markets = matched_poly_game.markets
+
+            unified_events.append(unified_event)
+
+        # Second pass: add unmatched Polymarket games
+        for p_game in polymarket_games:
+            if p_game.id not in matched_poly_ids:
+                p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
+                unified_event = UnifiedEvent(
+                    sport=sport,
+                    home_team=p_home,
+                    away_team=p_away,
+                    start_time=p_game.start_time,
+                    polymarket_game_id=p_game.id,
+                    polymarket_title=p_game.title,
+                    polymarket_markets=p_game.markets
+                )
+                unified_events.append(unified_event)
+
+        return unified_events
+
+    async def load_unified_events(self, sport= None):
         """
         Load and merge events from both Kalshi and Polymarket.
 
