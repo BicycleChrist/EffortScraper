@@ -7,10 +7,18 @@ Supports fetching events, markets, and historical candlestick data.
 
 import requests
 import hashlib
+import json
+import threading
+import traceback
 import time
+import base64
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
-from Creds import Kalshi_Key
+from typing import Optional, Dict, List, Any, Callable, Iterable, Optional
+from Creds import Kalshi_Key, Kalshi_Private_Key
+import websocket
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from PyQt6.QtCore import QObject, pyqtSignal
 
 # Valid historical time intervals for kalshi market data: Valid values: 1 (1 minute), 60 (1 hour), 1440 (1 day).
 # Time period length of each candlestick in minutes.
@@ -618,6 +626,244 @@ class KalshiClient:
                   break
   
       return {'events': all_events, 'count': len(all_events)}
+
+class KalshiStreamClient(QObject):
+    connected = pyqtSignal()
+    disconnected = pyqtSignal()
+    error = pyqtSignal(object)
+    raw_message = pyqtSignal(object)
+    tick = pyqtSignal(object)
+
+    def __init__(
+        self,
+        url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2",
+        reconnect: bool = True,
+        reconnect_backoff_max: int = 60,
+        ping_interval: int = 30,
+        on_message_callback: Optional[Callable[[dict], None]] = None,
+    ):
+        """
+        WebSocket streaming client for Kalshi with PyQt6 signals.
+        Private key + API key ID are imported directly from Creds.py
+        """
+
+        super().__init__()
+
+        self.api_key_id = Kalshi_Key  # This is actually the API Key ID (UUID)
+        self.private_key_pem = Kalshi_Private_Key
+
+        # Load the PEM private key from the triple-quoted string
+        self._private_key = serialization.load_pem_private_key(
+            self.private_key_pem.encode(),
+            password=None
+        )
+
+        self.url = url
+        self.reconnect = reconnect
+        self.reconnect_backoff_max = reconnect_backoff_max
+        self.ping_interval = ping_interval
+        self._on_message_callback = on_message_callback
+
+        self._ws_app: Optional[websocket.WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._subscriptions = set()
+        self._is_running = False
+        self._running_lock = threading.Lock()
+        self._message_id = 1
+
+    # -------------------------------------------------------------------
+    # PUBLIC API
+    # -------------------------------------------------------------------
+    def start(self):
+        """Start WebSocket thread."""
+        with self._running_lock:
+            if self._is_running:
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run_forever,
+                name="KalshiWS",
+                daemon=True
+            )
+            self._thread.start()
+            self._is_running = True
+
+    def stop(self):
+        """Stop WebSocket thread + connection."""
+        self._stop_event.set()
+        self.reconnect = False
+        if self._ws_app:
+            try:
+                self._ws_app.close()
+            except Exception:
+                pass
+
+        if self._thread:
+            self._thread.join(timeout=5)
+
+        with self._running_lock:
+            self._is_running = False
+
+    def send(self, message: str):
+        """Send a raw JSON string to the WebSocket."""
+        if (
+            self._ws_app
+            and getattr(self._ws_app, "sock", None)
+            and self._ws_app.sock.connected
+        ):
+            try:
+                self._ws_app.send(message)
+            except Exception as e:
+                self.error.emit({"action": "send_failed", "exception": e})
+        else:
+            self.error.emit({"action": "not_connected"})
+
+    # -------------------------------------------------------------------
+    # AUTHENTICATION (WebSocket headers)
+    # -------------------------------------------------------------------
+    def _build_ws_headers(self) -> list:
+        """
+        Build Kalshi-required WS authentication headers.
+        RSA signature generated from private key imported from Creds.py.
+        """
+
+        timestamp = str(int(time.time() * 1000))
+        path = "/trade-api/ws/v2"
+        string_to_sign = timestamp + "GET" + path
+
+        signature = self._private_key.sign(
+            string_to_sign.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        signature_b64 = base64.b64encode(signature).decode("utf-8")
+
+        headers = [
+            f"KALSHI-ACCESS-KEY: {self.api_key_id}",
+            f"KALSHI-ACCESS-SIGNATURE: {signature_b64}",
+            f"KALSHI-ACCESS-TIMESTAMP: {timestamp}",
+        ]
+
+        return headers
+
+    # -------------------------------------------------------------------
+    # SUBSCRIPTION PAYLOADS
+    # -------------------------------------------------------------------
+    def _msg_id(self):
+        mid = self._message_id
+        self._message_id += 1
+        return mid
+
+    def build_subscribe(self, channels: Iterable[str], market_tickers=None):
+        params = {"channels": list(channels)}
+        if market_tickers:
+            params["market_tickers"] = list(market_tickers)
+
+        return {
+            "id": self._msg_id(),
+            "cmd": "subscribe",
+            "params": params
+        }
+
+    def build_unsubscribe(self, channels: Iterable[str], market_tickers=None):
+        params = {"channels": list(channels)}
+        if market_tickers:
+            params["market_tickers"] = list(market_tickers)
+
+        return {
+            "id": self._msg_id(),
+            "cmd": "unsubscribe",
+            "params": params
+        }
+
+    def subscribe(self, channels, tickers=None):
+        self._subscriptions.add((tuple(channels), tuple(tickers) if tickers else None))
+        self.send(json.dumps(self.build_subscribe(channels, tickers)))
+
+    def unsubscribe(self, channels, tickers=None):
+        self._subscriptions.discard((tuple(channels), tuple(tickers) if tickers else None))
+        self.send(json.dumps(self.build_unsubscribe(channels, tickers)))
+
+    # Convenience helpers
+    def subscribe_ticker(self, tickers):
+        self.subscribe(["ticker"], tickers)
+
+    def subscribe_orderbook(self, tickers):
+        self.subscribe(["orderbook_delta"], tickers)
+
+    # -------------------------------------------------------------------
+    # INTERNAL THREAD LOOP
+    # -------------------------------------------------------------------
+    def _run_forever(self):
+        backoff = 1.0
+
+        while not self._stop_event.is_set():
+            try:
+                self._ws_app = websocket.WebSocketApp(
+                    self.url,
+                    header=self._build_ws_headers(),
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+
+                self._ws_app.run_forever(
+                    ping_interval=self.ping_interval, ping_timeout=10
+                )
+
+            except Exception as ex:
+                self.error.emit({"action": "run_exception", "exception": ex})
+
+            if self._stop_event.is_set() or not self.reconnect:
+                break
+
+            time.sleep(backoff)
+            backoff = min(backoff * 2, self.reconnect_backoff_max)
+
+        self._ws_app = None
+        self._is_running = False
+
+    # -------------------------------------------------------------------
+    # CALLBACKS
+    # -------------------------------------------------------------------
+    def _on_open(self, ws):
+        self.connected.emit()
+        # Re-subscribe old channels
+        try:
+            for ch_tuple, tickers in self._subscriptions:
+                ws.send(json.dumps(self.build_subscribe(ch_tuple, tickers)))
+        except Exception as ex:
+            self.error.emit({"action": "resubscribe_fail", "exception": ex})
+
+    def _on_message(self, ws, message: str):
+        try:
+            msg = json.loads(message)
+        except Exception:
+            msg = message
+
+        self.raw_message.emit(msg)
+
+        if self._on_message_callback:
+            try:
+                self._on_message_callback(msg)
+            except Exception as ex:
+                self.error.emit({"action": "callback_fail", "exception": ex})
+
+        # Emit tick messages
+        if isinstance(msg, dict) and msg.get("type") == "ticker":
+            self.tick.emit(msg)
+
+    def _on_error(self, ws, error):
+        self.error.emit({"action": "ws_error", "error": error})
+
+    def _on_close(self, ws, code, reason):
+        self.disconnected.emit()
 
 
 

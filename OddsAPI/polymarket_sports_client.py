@@ -229,7 +229,7 @@ class PolymarketSportsClient:
             slug=event.get('slug', ''),
             description=event.get('description', ''),
             sport=sport,
-            start_time=event.get('startDate', ''),
+            start_time=event.get('startTime', ''),  # Actual game start time (UTC)
             end_time=event.get('endDate', ''),
             volume=float(event.get('volume', 0)),
             volume_24hr=float(event.get('volume24hr', 0)),

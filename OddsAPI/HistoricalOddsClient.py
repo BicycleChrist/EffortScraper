@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QColor
 
-from KalshiClient import KalshiClient
+from KalshiClient import KalshiClient, KalshiStreamClient
 from polymarket_sports_client import PolymarketSportsClient
 import re
 from dataclasses import dataclass
@@ -51,15 +51,31 @@ class UnifiedEvent:
         if self.start_time:
             try:
                 # Both Kalshi and Polymarket use ISO format with timestamp
-                # Kalshi: "2023-11-07T05:31:56Z" (strike_date field)
-                # Polymarket: "2025-01-15T19:00:00Z" (start_time field)
-                from datetime import datetime
+                # Kalshi: "2023-11-07T05:31:56Z" (has 'Z' suffix)
+                # Polymarket: "2025-11-25T00:00:00" (no 'Z', but is UTC)
+                from datetime import datetime, timezone
                 if 'T' in self.start_time:
                     # Parse ISO datetime - handle both with and without 'Z' suffix
-                    dt_str = self.start_time.replace('Z', '+00:00') if self.start_time.endswith('Z') else self.start_time
+                    if self.start_time.endswith('Z'):
+                        dt_str = self.start_time.replace('Z', '+00:00')
+                    elif '+' not in self.start_time and self.start_time.count(':') >= 2:
+                        # No timezone specified, assume UTC (common for Polymarket)
+                        dt_str = self.start_time + '+00:00'
+                    else:
+                        dt_str = self.start_time
+
                     dt = datetime.fromisoformat(dt_str)
-                    # Format as MM/DD HH:MMam/pm
-                    date_str = dt.strftime("%m/%d %I:%M%p").lstrip('0').replace(' 0', ' ')
+
+                    # Only convert to local time if we have actual time info (not just date)
+                    # Kalshi events parsed from ticker are midnight UTC (date only)
+                    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                        # This is likely a date-only field (from Kalshi ticker)
+                        # Don't convert timezone - just show the date
+                        date_str = dt.strftime("%m/%d").lstrip('0')
+                    else:
+                        # This has actual time info (from Polymarket) - convert to local
+                        dt_local = dt.astimezone()
+                        date_str = dt_local.strftime("%m/%d %I:%M%p").lstrip('0').replace(' 0', ' ')
                 # Fallback for date-only format (shouldn't happen but just in case)
                 else:
                     dt = datetime.fromisoformat(self.start_time)
@@ -1212,6 +1228,11 @@ class HistoricalOddsWidget(QWidget):
         self.refresh_timer.timeout.connect(self.on_auto_refresh)
         self.refresh_interval_ms = 60000  # 60 seconds
 
+        # Kalshi WebSocket for live odds updates
+        self.kalshi_stream_client = None
+        self.websocket_enabled = False  # Toggle for websocket vs polling
+        self._initialize_kalshi_websocket()
+
         self.init_ui()
 
     def init_ui(self):
@@ -1326,6 +1347,129 @@ class HistoricalOddsWidget(QWidget):
         # Load all sports on initialization
         QTimer.singleShot(100, lambda: asyncio.create_task(self.load_all_sports()))
 
+    def _initialize_kalshi_websocket(self):
+        """Initialize Kalshi WebSocket client for live odds updates"""
+        try:
+            self.kalshi_stream_client = KalshiStreamClient()
+
+            # Connect signals
+            self.kalshi_stream_client.connected.connect(self._on_websocket_connected)
+            self.kalshi_stream_client.disconnected.connect(self._on_websocket_disconnected)
+            self.kalshi_stream_client.error.connect(self._on_websocket_error)
+            self.kalshi_stream_client.tick.connect(self._on_websocket_tick)
+
+            print("✅ Kalshi WebSocket client initialized (not started)")
+        except Exception as e:
+            print(f"⚠️  Failed to initialize Kalshi WebSocket: {e}")
+            self.kalshi_stream_client = None
+
+    def _on_websocket_connected(self):
+        """Handle WebSocket connection"""
+        print("🔌 Kalshi WebSocket connected")
+        # Re-subscribe to current market if any
+        if self.kalshi_market_ticker and self.websocket_enabled:
+            self._subscribe_to_current_market()
+
+    def _on_websocket_disconnected(self):
+        """Handle WebSocket disconnection"""
+        print("🔌 Kalshi WebSocket disconnected")
+
+    def _on_websocket_error(self, error_data):
+        """Handle WebSocket error"""
+        print(f"⚠️  Kalshi WebSocket error: {error_data}")
+
+    def _on_websocket_tick(self, tick_data):
+        """
+        Handle incoming tick data from Kalshi WebSocket
+
+        Tick format:
+        {
+            "type": "ticker",
+            "msg": {
+                "market_ticker": "...",
+                "yes_price": 0.52,
+                "no_price": 0.48,
+                "timestamp": 1234567890
+            }
+        }
+        """
+        try:
+            msg = tick_data.get('msg', {})
+            market_ticker = msg.get('market_ticker')
+
+            # Only process if it's for the current market
+            if market_ticker != self.kalshi_market_ticker:
+                return
+
+            yes_price = msg.get('yes_price')
+            timestamp = msg.get('timestamp')
+
+            if yes_price is not None and timestamp:
+                # Update plot with new data point
+                # Convert cents to dollars and then to American odds
+                price_dollars = yes_price
+                if 0 < price_dollars < 1:
+                    # Convert probability to American odds
+                    if price_dollars >= 0.5:
+                        american_odds = -100 * (price_dollars / (1 - price_dollars))
+                    else:
+                        american_odds = 100 * ((1 - price_dollars) / price_dollars)
+
+                    print(f"📊 Live update: {market_ticker} = ${price_dollars:.2f} ({american_odds:+.0f})")
+                    # TODO: Add this point to the plot
+                    # This would require extending the existing plot data
+
+        except Exception as e:
+            print(f"Error processing websocket tick: {e}")
+
+    def _subscribe_to_current_market(self):
+        """Subscribe to live updates for the currently selected Kalshi market"""
+        if not self.kalshi_stream_client or not self.kalshi_market_ticker:
+            return
+
+        try:
+            print(f"📡 Subscribing to live updates for {self.kalshi_market_ticker}")
+            self.kalshi_stream_client.subscribe_ticker([self.kalshi_market_ticker])
+        except Exception as e:
+            print(f"Failed to subscribe to market: {e}")
+
+    def _unsubscribe_from_current_market(self):
+        """Unsubscribe from the current market"""
+        if not self.kalshi_stream_client or not self.kalshi_market_ticker:
+            return
+
+        try:
+            print(f"📡 Unsubscribing from {self.kalshi_market_ticker}")
+            self.kalshi_stream_client.unsubscribe(["ticker"], [self.kalshi_market_ticker])
+        except Exception as e:
+            print(f"Failed to unsubscribe: {e}")
+
+    def enable_websocket_updates(self, enable: bool = True):
+        """
+        Enable or disable WebSocket live updates
+
+        Args:
+            enable: True to use WebSocket, False to use polling
+        """
+        self.websocket_enabled = enable
+
+        if enable:
+            if self.kalshi_stream_client and not self.kalshi_stream_client._is_running:
+                print("🚀 Starting Kalshi WebSocket...")
+                self.kalshi_stream_client.start()
+                # Subscribe to current market if any
+                if self.kalshi_market_ticker:
+                    self._subscribe_to_current_market()
+            # Stop polling timer
+            self.refresh_timer.stop()
+        else:
+            if self.kalshi_stream_client:
+                print("🛑 Stopping Kalshi WebSocket...")
+                self.kalshi_stream_client.stop()
+            # Resume polling if enabled
+            if self.auto_refresh_enabled and self.data_source == 'kalshi':
+                self.refresh_timer.start(self.refresh_interval_ms)
+
     def set_enabled(self, enabled):
         """Enable or disable the widget controls"""
         self.time_range.setEnabled(enabled)
@@ -1343,7 +1487,7 @@ class HistoricalOddsWidget(QWidget):
 
         # Configuration for filtering past events
         SHOW_PAST_EVENTS = False  # Set to True to show all events including past ones
-        PAST_EVENT_CUTOFF_HOURS = 12  # Keep events from last N hours (to include live/recent games)
+        PAST_EVENT_CUTOFF_HOURS = 36  # Keep events from last N hours (generous to handle midnight UTC parsing)
 
         all_unified_events = []
 
@@ -1371,9 +1515,17 @@ class HistoricalOddsWidget(QWidget):
                         # Parse the event start time
                         event_dt = datetime.fromisoformat(event.start_time.replace('Z', '+00:00'))
 
-                        # Keep event if it's in the future or within the cutoff window
-                        if event_dt >= cutoff:
-                            filtered_events.append(event)
+                        # If time is exactly midnight (00:00:00), this likely means we only have
+                        # the date (from Kalshi ticker parsing). Add 24 hours buffer for such events.
+                        if event_dt.hour == 0 and event_dt.minute == 0 and event_dt.second == 0:
+                            # For midnight times, add 24 hours to account for games later in the day
+                            event_dt_adjusted = event_dt + timedelta(hours=24)
+                            if event_dt_adjusted >= cutoff:
+                                filtered_events.append(event)
+                        else:
+                            # For events with actual time info, use standard cutoff
+                            if event_dt >= cutoff:
+                                filtered_events.append(event)
                     except Exception as e:
                         # If we can't parse the date, include it to be safe
                         print(f"⚠️  Could not parse date for {event.away_team} @ {event.home_team}: {event.start_time}")
@@ -1508,9 +1660,9 @@ class HistoricalOddsWidget(QWidget):
                 unified_event.polymarket_game_id = matched_poly_game.id
                 unified_event.polymarket_title = matched_poly_game.title
                 unified_event.polymarket_markets = matched_poly_game.markets
-                # Only use Polymarket's start_time as fallback if Kalshi doesn't have one
-                # Kalshi's parsed date from ticker is more accurate for game date
-                if not unified_event.start_time and matched_poly_game.start_time:
+                # Prefer Polymarket's start_time as it includes actual time of day
+                # Kalshi's parsed date from ticker only has date (set to midnight UTC)
+                if matched_poly_game.start_time:
                     unified_event.start_time = matched_poly_game.start_time
 
             unified_events.append(unified_event)
@@ -1672,7 +1824,7 @@ class HistoricalOddsWidget(QWidget):
         print(f"\n📊 Total unified events: {len(unified_events)}")
 
         # Filter out past events if configured to do so
-        SHOW_PAST_EVENTS = False  # Set to True to show all events including past ones
+        SHOW_PAST_EVENTS = True  # Set to True to show all events including past ones
         PAST_EVENT_CUTOFF_HOURS = 12  # Keep events from last N hours (to include live/recent games)
 
         if not SHOW_PAST_EVENTS:
@@ -2674,6 +2826,12 @@ class HistoricalOddsWidget(QWidget):
 
             print(f"Market changed to: [{' + '.join(source_info)}] {unified_market.display_name}")
 
+            # Handle WebSocket subscription for Kalshi markets
+            if self.websocket_enabled and unified_market.has_kalshi():
+                self._unsubscribe_from_current_market()
+                # Market ticker is already set above, now subscribe
+                self._subscribe_to_current_market()
+
             # Reload data for new market
             if self._load_task and not self._load_task.done():
                 self._load_task.cancel()
@@ -2687,6 +2845,12 @@ class HistoricalOddsWidget(QWidget):
             if source == 'kalshi':
                 self.kalshi_market_ticker = market_data['ticker']
                 print(f"Market changed to: [Kalshi] {market_data['title']}")
+
+                # Handle WebSocket subscription
+                if self.websocket_enabled:
+                    self._unsubscribe_from_current_market()
+                    self._subscribe_to_current_market()
+
             elif source == 'polymarket':
                 print(f"Market changed to: [Polymarket] {market_data['question']}")
 
@@ -2703,6 +2867,11 @@ class HistoricalOddsWidget(QWidget):
             market_ticker = market_data
             self.kalshi_market_ticker = market_ticker
             print(f"Market changed to: {market_ticker}")
+
+            # Handle WebSocket subscription
+            if self.websocket_enabled:
+                self._unsubscribe_from_current_market()
+                self._subscribe_to_current_market()
 
             # Reload data for new market
             if self._load_task and not self._load_task.done():
