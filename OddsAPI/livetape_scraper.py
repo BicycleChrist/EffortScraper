@@ -408,6 +408,19 @@ def get_top_players_nba(stats_data):
         'home_team': {'players': []}
     }
 
+    def safe_int(value, default=0):
+        """Safely convert string to int, handling non-numeric values"""
+        if not value:
+            return default
+        try:
+            # Handle empty strings, "Has not entered game", etc.
+            cleaned_value = value.strip()
+            if not cleaned_value or not cleaned_value.replace('-', '').isdigit():
+                return default
+            return int(cleaned_value)
+        except (ValueError, TypeError):
+            return default
+
     for team_key, display_key in [('away_team_stats', 'away_team'), ('home_team_stats', 'home_team')]:
         team_stats = stats_data.get(team_key, {})
 
@@ -416,12 +429,12 @@ def get_top_players_nba(stats_data):
         scored_players = []
 
         for player in all_players:
-            pts = int(player['stats'].get('PTS', '0') or '0')
-            reb = int(player['stats'].get('REB', '0') or '0')
-            ast = int(player['stats'].get('AST', '0') or '0')
+            pts = safe_int(player['stats'].get('PTS', '0'))
+            reb = safe_int(player['stats'].get('REB', '0'))
+            ast = safe_int(player['stats'].get('AST', '0'))
             score = pts * 10 + reb * 3 + ast * 5  # Weighted scoring
 
-            if pts > 0:
+            if pts > 0:  # Only include players who actually scored
                 scored_players.append((player, score))
 
         scored_players.sort(key=lambda x: x[1], reverse=True)
