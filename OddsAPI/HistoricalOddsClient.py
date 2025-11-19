@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-
+#TODO: Refactor TEAM_ALIASES dict so each league; everything is under the NFL right now LOL
 @dataclass
 class UnifiedEvent:
     """Unified event representing a game across multiple prediction markets"""
@@ -176,9 +176,8 @@ class EventMatcher:
         return f"{year}-{month}-{day}T00:00:00Z"
 
     # Team name variations for matching
-    TEAM_ALIASES = {
-        # NFL - All 32 teams
-        # City names included - cross-sport conflicts OK since we only match within same sport
+    TEAM_ALIASES_BY_SPORT = {
+    'NFL': {
         'arizona cardinals': ['arizona', 'cardinals', 'ari', 'az'],
         'atlanta falcons': ['atlanta', 'falcons', 'atl'],
         'baltimore ravens': ['baltimore', 'ravens', 'bal'],
@@ -210,9 +209,10 @@ class EventMatcher:
         'seattle seahawks': ['seattle', 'seahawks', 'sea'],
         'tampa bay buccaneers': ['tampa bay', 'buccaneers', 'bucs', 'tb'],
         'tennessee titans': ['tennessee', 'titans', 'ten'],
-        'washington commanders': ['washington', 'commanders', 'wash', 'wsh'],
+        'washington commanders': ['washington', 'commanders', 'wash', 'wsh']
+    },
 
-        # NBA
+    'NBA': {
         'atlanta hawks': ['atlanta', 'hawks', 'atl'],
         'boston celtics': ['boston', 'celtics', 'bos'],
         'brooklyn nets': ['brooklyn', 'nets', 'bkn'],
@@ -225,11 +225,13 @@ class EventMatcher:
         'golden state warriors': ['golden state', 'warriors', 'gsw'],
         'houston rockets': ['houston', 'rockets', 'hou'],
         'indiana pacers': ['indiana', 'pacers', 'ind'],
-        'la clippers': ['los angeles clippers', 'la clippers', 'clippers', 'lac'],
-        'la lakers': ['los angeles lakers', 'la lakers', 'lakers', 'lal'],
+        'la clippers': ['los angeles clippers', 'la clippers', 'clippers', 'lac', 'los angeles c', 'la c'],
+        'la lakers': ['los angeles lakers', 'la lakers', 'lakers', 'lal', 'los angeles l', 'la l'],
         'memphis grizzlies': ['memphis', 'grizzlies', 'mem'],
         'milwaukee bucks': ['milwaukee', 'bucks', 'mil'],
-        'new york knicks': ['new york', 'knicks', 'nyk'],
+        'minnesota timberwolves': ['minnesota', 'timberwolves', 'wolves', 'min'],
+        'new orleans pelicans': ['new orleans', 'pelicans', 'no'],
+        'new york knicks': ['new york', 'knicks', 'nyk', 'new york k'],
         'oklahoma city thunder': ['oklahoma city', 'thunder', 'okc'],
         'orlando magic': ['orlando', 'magic', 'orl'],
         'philadelphia 76ers': ['philadelphia', '76ers', 'sixers', 'phi'],
@@ -238,10 +240,11 @@ class EventMatcher:
         'sacramento kings': ['sacramento', 'kings', 'sac'],
         'san antonio spurs': ['san antonio', 'spurs', 'sas'],
         'toronto raptors': ['toronto', 'raptors', 'tor'],
-        'utah jazz': ['utah', 'jazz', 'uta'],
+        'utah jazz': ['utah', 'jazz', 'uta', 'utah j'],
+        'washington wizards': ['washington', 'wizards', 'wash', 'wsh']
+    },
 
-        # NHL - All 32 teams (Metropolitan, Atlantic, Central, Pacific)
-        # Includes bare city names since NFL/NBA conflicts have been resolved
+    'NHL': {
         # Metropolitan Division
         'carolina hurricanes': ['carolina', 'hurricanes', 'canes', 'car'],
         'columbus blue jackets': ['columbus', 'blue jackets', 'jackets', 'cbj'],
@@ -281,17 +284,46 @@ class EventMatcher:
         'seattle kraken': ['seattle', 'kraken', 'sea'],
         'utah hockey club': ['utah', 'uta'],
         'vancouver canucks': ['vancouver', 'canucks', 'nucks', 'van'],
-        'vegas golden knights': ['vegas', 'las vegas', 'golden knights', 'knights', 'vgk'],
+        'vegas golden knights': ['vegas', 'las vegas', 'golden knights', 'knights', 'vgk']
+    },
 
-        # MLB
-        'yankees': ['new york yankees', 'yankees', 'nyy'],
-        'red sox': ['boston red sox', 'red sox', 'bos'],
-        'dodgers': ['los angeles dodgers', 'dodgers', 'lad'],
+    'MLB': {
+        'arizona diamondbacks': ['arizona', 'diamondbacks', 'd-backs', 'ari'],
+        'atlanta braves': ['atlanta', 'braves', 'atl'],
+        'baltimore orioles': ['baltimore', 'orioles', 'bal'],
+        'boston red sox': ['boston', 'red sox', 'bos'],
+        'chicago white sox': ['chicago white sox', 'white sox', 'cws'],
+        'chicago cubs': ['chicago cubs', 'cubs', 'chc'],
+        'cincinnati reds': ['cincinnati', 'reds', 'cin'],
+        'cleveland guardians': ['cleveland', 'guardians', 'cle'],
+        'colorado rockies': ['colorado', 'rockies', 'col'],
+        'detroit tigers': ['detroit', 'tigers', 'det'],
+        'houston astros': ['houston', 'astros', 'hou'],
+        'kansas city royals': ['kansas city', 'royals', 'kc'],
+        'los angeles angels': ['los angeles angels', 'la angels', 'angels', 'laa'],
+        'los angeles dodgers': ['los angeles dodgers', 'la dodgers', 'dodgers', 'lad'],
+        'miami marlins': ['miami', 'marlins', 'mia'],
+        'milwaukee brewers': ['milwaukee', 'brewers', 'mil'],
+        'minnesota twins': ['minnesota', 'twins', 'min'],
+        'new york yankees': ['new york yankees', 'ny yankees', 'yankees', 'nyy'],
+        'new york mets': ['new york mets', 'ny mets', 'mets', 'nym'],
+        'oakland athletics': ['oakland', 'athletics', 'a\'s', 'oak'],
+        'philadelphia phillies': ['philadelphia', 'phillies', 'phi'],
+        'pittsburgh pirates': ['pittsburgh', 'pirates', 'pit'],
+        'san diego padres': ['san diego', 'padres', 'sd'],
+        'san francisco giants': ['san francisco', 'giants', 'sf'],
+        'seattle mariners': ['seattle', 'mariners', 'sea'],
+        'st. louis cardinals': ['st. louis', 'st louis', 'cardinals', 'stl'],
+        'tampa bay rays': ['tampa bay', 'rays', 'tb'],
+        'texas rangers': ['texas', 'rangers', 'tex'],
+        'toronto blue jays': ['toronto', 'blue jays', 'jays', 'tor'],
+        'washington nationals': ['washington', 'nationals', 'wash', 'wsh']
     }
+}
 
     @staticmethod
-    def normalize_team_name(team_name: str) -> str:
-        """Normalize team name for matching"""
+    def normalize_team_name(team_name: str, sport: str = None) -> str:
+        """Normalize team name for matching with sport-specific aliases"""
         if not team_name:
             return ""
 
@@ -301,18 +333,33 @@ class EventMatcher:
         # Remove common suffixes
         normalized = re.sub(r'\s+(football|basketball|hockey|baseball)(\s+team)?$', '', normalized)
 
-        # Check aliases - try exact match first, then substring
-        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
-            # Exact match in aliases
-            if normalized in aliases:
-                return canonical
+        # If we know the sport, use sport-specific aliases
+        if sport and sport in EventMatcher.TEAM_ALIASES_BY_SPORT:
+            sport_aliases = EventMatcher.TEAM_ALIASES_BY_SPORT[sport]
 
-        # If no exact match, try substring matching (more lenient)
-        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
-            # Check if any alias is contained in normalized name
-            for alias in aliases:
-                if alias in normalized and len(alias) >= 3:  # At least 3 chars to avoid false matches
+            # Check aliases - try exact match first, then substring
+            for canonical, aliases in sport_aliases.items():
+                # Exact match in aliases
+                if normalized in aliases:
                     return canonical
+
+            # If no exact match, try substring matching
+            for canonical, aliases in sport_aliases.items():
+                for alias in aliases:
+                    if alias in normalized and len(alias) >= 3:
+                        return canonical
+
+        # Fallback: check all sports (less precise but better than nothing)
+        for sport_key, sport_aliases in EventMatcher.TEAM_ALIASES_BY_SPORT.items():
+            for canonical, aliases in sport_aliases.items():
+                if normalized in aliases:
+                    return canonical
+
+            # Substring fallback across all sports
+            for canonical, aliases in sport_aliases.items():
+                for alias in aliases:
+                    if alias in normalized and len(alias) >= 3:
+                        return canonical
 
         return normalized
 
@@ -366,10 +413,10 @@ class EventMatcher:
         return title, title
 
     @staticmethod
-    def teams_match(team1: str, team2: str) -> bool:
-        """Check if two team names refer to the same team"""
-        norm1 = EventMatcher.normalize_team_name(team1)
-        norm2 = EventMatcher.normalize_team_name(team2)
+    def teams_match(team1: str, team2: str, sport: str = None) -> bool:
+        """Check if two team names refer to the same team with sport context"""
+        norm1 = EventMatcher.normalize_team_name(team1, sport)
+        norm2 = EventMatcher.normalize_team_name(team2, sport)
 
         # Exact match
         if norm1 == norm2:
@@ -379,15 +426,17 @@ class EventMatcher:
         if norm1 in norm2 or norm2 in norm1:
             return True
 
-        # Check aliases
-        for canonical, aliases in EventMatcher.TEAM_ALIASES.items():
-            if norm1 in aliases and norm2 in aliases:
-                return True
+        # Check aliases with sport context
+        if sport and sport in EventMatcher.TEAM_ALIASES_BY_SPORT:
+            sport_aliases = EventMatcher.TEAM_ALIASES_BY_SPORT[sport]
+            for canonical, aliases in sport_aliases.items():
+                if norm1 in aliases and norm2 in aliases:
+                    return True
 
         return False
 
     @staticmethod
-    def events_match(kalshi_away: str, kalshi_home: str, poly_team1: str, poly_team2: str) -> bool:
+    def events_match(kalshi_away: str, kalshi_home: str, poly_team1: str, poly_team2: str, sport: str = None) -> bool:
         """
         Check if Kalshi and Polymarket events represent the same game.
 
@@ -395,12 +444,12 @@ class EventMatcher:
         we match if both teams are present regardless of order.
         """
         # Check if kalshi_home matches either poly team
-        home_matches_1 = EventMatcher.teams_match(kalshi_home, poly_team1)
-        home_matches_2 = EventMatcher.teams_match(kalshi_home, poly_team2)
+        home_matches_1 = EventMatcher.teams_match(kalshi_home, poly_team1, sport)
+        home_matches_2 = EventMatcher.teams_match(kalshi_home, poly_team2, sport)
 
         # Check if kalshi_away matches either poly team
-        away_matches_1 = EventMatcher.teams_match(kalshi_away, poly_team1)
-        away_matches_2 = EventMatcher.teams_match(kalshi_away, poly_team2)
+        away_matches_1 = EventMatcher.teams_match(kalshi_away, poly_team1, sport)
+        away_matches_2 = EventMatcher.teams_match(kalshi_away, poly_team2, sport)
 
         # Match if home and away are both present (in either order)
         match_order_1 = home_matches_1 and away_matches_2  # home=team1, away=team2
@@ -558,7 +607,7 @@ class MarketMatcher:
         return None
 
     @staticmethod
-    def markets_match(kalshi_market, poly_market, home_team, away_team):
+    def markets_match(kalshi_market, poly_market, home_team, away_team, sport=None):
         """
         Check if a Kalshi market and Polymarket market represent the same bet.
 
@@ -578,7 +627,6 @@ class MarketMatcher:
         # Get market types
         k_type = MarketMatcher.get_market_type(kalshi_title=k_title)
         p_type = MarketMatcher.get_market_type(poly_question=p_question)
-
         # Must be same type
         if k_type != p_type or k_type is None:
             return False
@@ -631,10 +679,8 @@ class MarketMatcher:
             if not k_team_lower or not p_team_lower:
                 return False
 
-            # Normalize team names for comparison
-            # Check if same team is favored (allowing for Dallas/Cowboys, Las Vegas/Raiders differences)
-            from HistoricalOddsClient import EventMatcher
-            teams_match = EventMatcher.teams_match(k_team_lower, p_team_lower)
+            # Normalize team names for comparison with sport context
+            teams_match = EventMatcher.teams_match(k_team_lower, p_team_lower, sport)
 
             return teams_match
 
@@ -670,7 +716,7 @@ class MarketMatcher:
             # If either is missing a value, can't match
             return False
 
-        # Props: would need more sophisticated matching (not implemented yet)
+    # Props: would need more sophisticated matching (not implemented yet)
         return False
 
 
@@ -1272,7 +1318,7 @@ class HistoricalOddsWidget(QWidget):
         self.time_range.setFixedWidth(60)
         self.time_range.currentIndexChanged.connect(self.on_time_range_changed)
         header_layout.addWidget(self.time_range)
-        
+
         # TODO: only display for kalshi datasource
         self.kalshi_interval = QComboBox()
         self.kalshi_interval.addItems([f"{M}m" for M in (1, 60, 1440)])
@@ -1636,7 +1682,7 @@ class HistoricalOddsWidget(QWidget):
                 p_title = p_game.title
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_title)
 
-                if EventMatcher.events_match(k_away, k_home, p_away, p_home):
+                if EventMatcher.events_match(k_away, k_home, p_away, p_home, sport):
                     matched_poly_game = p_game
                     matched_poly_ids.add(p_game.id)
                     break
@@ -2133,7 +2179,7 @@ class HistoricalOddsWidget(QWidget):
                         'KXMLBGAME',           # Moneylines
                         'KXMLBSPREAD',         # Run line (spread)
                         'KXMLBTOTAL',          # Totals
-                        
+
                     ]
                 elif sport == 'NHL':
                     series_to_check = [
@@ -2286,7 +2332,8 @@ class HistoricalOddsWidget(QWidget):
                     matches = MarketMatcher.markets_match(
                         k_market, p_market,
                         unified_event.home_team,
-                        unified_event.away_team
+                        unified_event.away_team,
+                        unified_event.sport
                     )
 
                     if matches:
