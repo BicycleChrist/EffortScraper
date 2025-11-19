@@ -51,21 +51,25 @@ class UnifiedEvent:
         if self.start_time:
             try:
                 # Both Kalshi and Polymarket use ISO format with timestamp
-                # Kalshi: "2023-11-07T05:31:56Z"
-                # Polymarket: "2025-01-15T19:00:00Z"
+                # Kalshi: "2023-11-07T05:31:56Z" (strike_date field)
+                # Polymarket: "2025-01-15T19:00:00Z" (start_time field)
                 from datetime import datetime
                 if 'T' in self.start_time:
-                    dt = datetime.fromisoformat(self.start_time.replace('Z', ''))
-                    date_str = dt.strftime("%m/%d %I:%M%p")
+                    # Parse ISO datetime - handle both with and without 'Z' suffix
+                    dt_str = self.start_time.replace('Z', '+00:00') if self.start_time.endswith('Z') else self.start_time
+                    dt = datetime.fromisoformat(dt_str)
+                    # Format as MM/DD HH:MMam/pm
+                    date_str = dt.strftime("%m/%d %I:%M%p").lstrip('0').replace(' 0', ' ')
                 # Fallback for date-only format (shouldn't happen but just in case)
                 else:
                     dt = datetime.fromisoformat(self.start_time)
-                    date_str = dt.strftime("%m/%d")
-            except:
+                    date_str = dt.strftime("%m/%d").lstrip('0')
+            except Exception as e:
                 # If parsing fails, just skip the date
+                # Could happen with malformed timestamps
                 pass
 
-        # Build display string: [K+P] [NFL] 01/15 7:00PM Away @ Home
+        # Build display string: [K+P] [NFL] 1/15 7:00PM Away @ Home
         sport_tag = f"[{self.sport}]" if self.sport else ""
         date_tag = f"{date_str} " if date_str else ""
 
@@ -115,76 +119,153 @@ class UnifiedMarket:
 class EventMatcher:
     """Matches sports events across Kalshi and Polymarket APIs"""
 
+    @staticmethod
+    def parse_kalshi_event_date(event_ticker: str) -> str:
+        """
+        Parse game date from Kalshi event ticker.
+
+        Format: KXNHLGAME-25NOV20OTTANA -> 2025-11-20T00:00:00Z
+        Format: KXNFLGAME-24NOV21MIABUF -> 2024-11-21T00:00:00Z
+
+        Args:
+            event_ticker: Kalshi event ticker string
+
+        Returns:
+            ISO 8601 datetime string, or empty string if parsing fails
+        """
+        import re
+        from datetime import datetime
+
+        # Pattern: series-YYMONDDteams
+        # Example: KXNHLGAME-25NOV20OTTANA
+        match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})', event_ticker)
+        if not match:
+            return ''
+
+        year_short, month_abbr, day = match.groups()
+
+        # Convert 2-digit year to 4-digit (20XX range)
+        year = f"20{year_short}"
+
+        # Month abbreviations
+        months = {
+            'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+            'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+            'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+        }
+
+        month = months.get(month_abbr, '01')
+
+        # Return as ISO datetime (using midnight UTC as we don't have exact time)
+        return f"{year}-{month}-{day}T00:00:00Z"
+
     # Team name variations for matching
     TEAM_ALIASES = {
         # NFL - All 32 teams
-        'arizona': ['arizona', 'cardinals', 'ari', 'az'],
-        'atlanta': ['atlanta', 'falcons', 'atl'],
-        'baltimore': ['baltimore', 'ravens', 'bal'],
-        'buffalo': ['buffalo', 'bills', 'buf'],
-        'carolina': ['carolina', 'panthers', 'car'],
-        'chicago': ['chicago', 'bears', 'chi'],
-        'cincinnati': ['cincinnati', 'bengals', 'cin'],
-        'cleveland': ['cleveland', 'browns', 'cle'],
-        'dallas': ['dallas', 'cowboys', 'dal'],
-        'denver': ['denver', 'broncos', 'den'],
-        'detroit': ['detroit', 'lions', 'det'],
-        'green bay': ['green bay', 'packers', 'gb'],
-        'houston': ['houston', 'texans', 'hou'],
-        'indianapolis': ['indianapolis', 'colts', 'ind'],
-        'jacksonville': ['jacksonville', 'jaguars', 'jax'],
-        'kansas city': ['kansas city', 'chiefs', 'kc'],
-        'las vegas': ['las vegas', 'raiders', 'lv', 'oak', 'oakland'],
+        # City names included - cross-sport conflicts OK since we only match within same sport
+        'arizona cardinals': ['arizona', 'cardinals', 'ari', 'az'],
+        'atlanta falcons': ['atlanta', 'falcons', 'atl'],
+        'baltimore ravens': ['baltimore', 'ravens', 'bal'],
+        'buffalo bills': ['buffalo', 'bills', 'buf'],
+        'carolina panthers': ['carolina', 'panthers', 'car'],
+        'chicago bears': ['chicago', 'bears', 'chi'],
+        'cincinnati bengals': ['cincinnati', 'bengals', 'cin'],
+        'cleveland browns': ['cleveland', 'browns', 'cle'],
+        'dallas cowboys': ['dallas', 'cowboys', 'dal'],
+        'denver broncos': ['denver', 'broncos', 'den'],
+        'detroit lions': ['detroit', 'lions', 'det'],
+        'green bay packers': ['green bay', 'packers', 'gb'],
+        'houston texans': ['houston', 'texans', 'hou'],
+        'indianapolis colts': ['indianapolis', 'colts', 'ind'],
+        'jacksonville jaguars': ['jacksonville', 'jaguars', 'jax'],
+        'kansas city chiefs': ['kansas city', 'chiefs', 'kc'],
+        'las vegas raiders': ['las vegas', 'raiders', 'lv', 'oak', 'oakland'],
         'los angeles chargers': ['los angeles chargers', 'la chargers', 'chargers', 'lac'],
         'los angeles rams': ['los angeles rams', 'la rams', 'rams', 'lar', 'los angeles r'],
-        'miami': ['miami', 'dolphins', 'mia'],
-        'minnesota': ['minnesota', 'vikings', 'min'],
-        'new england': ['new england', 'patriots', 'ne'],
-        'new orleans': ['new orleans', 'saints', 'no'],
+        'miami dolphins': ['miami', 'dolphins', 'mia'],
+        'minnesota vikings': ['minnesota', 'vikings', 'min'],
+        'new england patriots': ['new england', 'patriots', 'ne'],
+        'new orleans saints': ['new orleans', 'saints', 'no'],
         'new york giants': ['new york giants', 'ny giants', 'giants', 'nyg', 'new york g'],
         'new york jets': ['new york jets', 'ny jets', 'jets', 'nyj', 'new york j'],
-        'philadelphia': ['philadelphia', 'eagles', 'phi'],
-        'pittsburgh': ['pittsburgh', 'steelers', 'pit'],
-        'san francisco': ['san francisco', '49ers', 'sf'],
-        'seattle': ['seattle', 'seahawks', 'sea'],
-        'tampa bay': ['tampa bay', 'buccaneers', 'bucs', 'tb'],
-        'tennessee': ['tennessee', 'titans', 'ten'],
-        'washington': ['washington', 'commanders', 'wash', 'wsh'],
+        'philadelphia eagles': ['philadelphia', 'eagles', 'phi'],
+        'pittsburgh steelers': ['pittsburgh', 'steelers', 'pit'],
+        'san francisco 49ers': ['san francisco', '49ers', 'sf'],
+        'seattle seahawks': ['seattle', 'seahawks', 'sea'],
+        'tampa bay buccaneers': ['tampa bay', 'buccaneers', 'bucs', 'tb'],
+        'tennessee titans': ['tennessee', 'titans', 'ten'],
+        'washington commanders': ['washington', 'commanders', 'wash', 'wsh'],
 
         # NBA
         'atlanta hawks': ['atlanta', 'hawks', 'atl'],
-        'boston': ['boston', 'celtics', 'bos'],
-        'brooklyn': ['brooklyn', 'nets', 'bkn'],
-        'charlotte': ['charlotte', 'hornets', 'cha'],
+        'boston celtics': ['boston', 'celtics', 'bos'],
+        'brooklyn nets': ['brooklyn', 'nets', 'bkn'],
+        'charlotte hornets': ['charlotte', 'hornets', 'cha'],
         'chicago bulls': ['chicago', 'bulls', 'chi'],
         'cleveland cavaliers': ['cleveland', 'cavaliers', 'cavs', 'cle'],
         'dallas mavericks': ['dallas', 'mavericks', 'mavs', 'dal'],
         'denver nuggets': ['denver', 'nuggets', 'den'],
         'detroit pistons': ['detroit', 'pistons', 'det'],
-        'golden state': ['golden state', 'warriors', 'gsw'],
+        'golden state warriors': ['golden state', 'warriors', 'gsw'],
         'houston rockets': ['houston', 'rockets', 'hou'],
-        'indiana': ['indiana', 'pacers', 'ind'],
+        'indiana pacers': ['indiana', 'pacers', 'ind'],
         'la clippers': ['los angeles clippers', 'la clippers', 'clippers', 'lac'],
         'la lakers': ['los angeles lakers', 'la lakers', 'lakers', 'lal'],
-        'memphis': ['memphis', 'grizzlies', 'mem'],
-        'milwaukee': ['milwaukee', 'bucks', 'mil'],
+        'memphis grizzlies': ['memphis', 'grizzlies', 'mem'],
+        'milwaukee bucks': ['milwaukee', 'bucks', 'mil'],
         'new york knicks': ['new york', 'knicks', 'nyk'],
-        'oklahoma city': ['oklahoma city', 'thunder', 'okc'],
-        'orlando': ['orlando', 'magic', 'orl'],
+        'oklahoma city thunder': ['oklahoma city', 'thunder', 'okc'],
+        'orlando magic': ['orlando', 'magic', 'orl'],
         'philadelphia 76ers': ['philadelphia', '76ers', 'sixers', 'phi'],
-        'phoenix': ['phoenix', 'suns', 'phx'],
-        'portland': ['portland', 'trail blazers', 'blazers', 'por'],
-        'sacramento': ['sacramento', 'kings', 'sac'],
-        'san antonio': ['san antonio', 'spurs', 'sas'],
+        'phoenix suns': ['phoenix', 'suns', 'phx'],
+        'portland trail blazers': ['portland', 'trail blazers', 'blazers', 'por'],
+        'sacramento kings': ['sacramento', 'kings', 'sac'],
+        'san antonio spurs': ['san antonio', 'spurs', 'sas'],
         'toronto raptors': ['toronto', 'raptors', 'tor'],
-        'utah': ['utah', 'jazz', 'uta'],
+        'utah jazz': ['utah', 'jazz', 'uta'],
 
-        # NHL
-        'montreal': ['montreal', 'canadiens', 'habs', 'mtl'],
-        'toronto maple leafs': ['toronto', 'maple leafs', 'leafs', 'tor'],
-        'ottawa': ['ottawa', 'senators', 'sens', 'ott'],
+        # NHL - All 32 teams (Metropolitan, Atlantic, Central, Pacific)
+        # Includes bare city names since NFL/NBA conflicts have been resolved
+        # Metropolitan Division
+        'carolina hurricanes': ['carolina', 'hurricanes', 'canes', 'car'],
+        'columbus blue jackets': ['columbus', 'blue jackets', 'jackets', 'cbj'],
+        'new jersey devils': ['new jersey', 'devils', 'njd', 'nj'],
+        'new york islanders': ['new york i', 'new york islanders', 'ny islanders', 'islanders', 'isles', 'nyi'],
+        'new york rangers': ['new york r', 'new york rangers', 'ny rangers', 'rangers', 'nyr'],
+        'philadelphia flyers': ['philadelphia', 'flyers', 'phi'],
+        'pittsburgh penguins': ['pittsburgh', 'penguins', 'pens', 'pit'],
+        'washington capitals': ['washington', 'capitals', 'caps', 'wsh', 'was'],
+
+        # Atlantic Division
         'boston bruins': ['boston', 'bruins', 'bos'],
         'buffalo sabres': ['buffalo', 'sabres', 'buf'],
+        'detroit red wings': ['detroit', 'red wings', 'wings', 'det'],
+        'florida panthers': ['florida', 'panthers', 'fla'],
+        'montreal canadiens': ['montreal', 'canadiens', 'habs', 'mtl'],
+        'ottawa senators': ['ottawa', 'senators', 'sens', 'ott'],
+        'tampa bay lightning': ['tampa bay', 'lightning', 'bolts', 'tb', 'tbl'],
+        'toronto maple leafs': ['toronto', 'maple leafs', 'leafs', 'tor'],
+
+        # Central Division
+        'arizona coyotes': ['arizona', 'coyotes', 'yotes', 'ari'],
+        'chicago blackhawks': ['chicago', 'blackhawks', 'hawks', 'chi'],
+        'colorado avalanche': ['colorado', 'avalanche', 'avs', 'col'],
+        'dallas stars': ['dallas', 'stars', 'dal'],
+        'minnesota wild': ['minnesota', 'wild', 'min'],
+        'nashville predators': ['nashville', 'predators', 'preds', 'nsh'],
+        'st. louis blues': ['st. louis', 'st louis', 'blues', 'stl'],
+        'winnipeg jets': ['winnipeg', 'jets', 'wpg'],
+
+        # Pacific Division
+        'anaheim ducks': ['anaheim', 'ducks', 'ana'],
+        'calgary flames': ['calgary', 'flames', 'cgy'],
+        'edmonton oilers': ['edmonton', 'oilers', 'edm'],
+        'los angeles kings': ['los angeles', 'la', 'kings', 'lak'],
+        'san jose sharks': ['san jose', 'sharks', 'sjs', 'sj'],
+        'seattle kraken': ['seattle', 'kraken', 'sea'],
+        'utah hockey club': ['utah', 'uta'],
+        'vancouver canucks': ['vancouver', 'canucks', 'nucks', 'van'],
+        'vegas golden knights': ['vegas', 'las vegas', 'golden knights', 'knights', 'vgk'],
 
         # MLB
         'yankees': ['new york yankees', 'yankees', 'nyy'],
@@ -1260,6 +1341,10 @@ class HistoricalOddsWidget(QWidget):
         print(f"Loading all sports events...")
         print(f"{'='*80}\n")
 
+        # Configuration for filtering past events
+        SHOW_PAST_EVENTS = False  # Set to True to show all events including past ones
+        PAST_EVENT_CUTOFF_HOURS = 12  # Keep events from last N hours (to include live/recent games)
+
         all_unified_events = []
 
         # Load events from all 4 major sports
@@ -1269,6 +1354,40 @@ class HistoricalOddsWidget(QWidget):
             all_unified_events.extend(events)
 
         print(f"\n📊 Total events loaded from all sports: {len(all_unified_events)}")
+
+        # Filter out past events if configured to do so
+        if not SHOW_PAST_EVENTS:
+            from datetime import datetime, timezone, timedelta
+
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=PAST_EVENT_CUTOFF_HOURS)
+
+            original_count = len(all_unified_events)
+            filtered_events = []
+
+            for event in all_unified_events:
+                if event.start_time:
+                    try:
+                        # Parse the event start time
+                        event_dt = datetime.fromisoformat(event.start_time.replace('Z', '+00:00'))
+
+                        # Keep event if it's in the future or within the cutoff window
+                        if event_dt >= cutoff:
+                            filtered_events.append(event)
+                    except Exception as e:
+                        # If we can't parse the date, include it to be safe
+                        print(f"⚠️  Could not parse date for {event.away_team} @ {event.home_team}: {event.start_time}")
+                        filtered_events.append(event)
+                else:
+                    # If no start_time, include it to be safe
+                    filtered_events.append(event)
+
+            all_unified_events = filtered_events
+            filtered_count = original_count - len(all_unified_events)
+
+            if filtered_count > 0:
+                print(f"🗑️  Filtered out {filtered_count} past events (older than {PAST_EVENT_CUTOFF_HOURS} hours)")
+            print(f"📊 Showing {len(all_unified_events)} events")
 
         # Populate event selector with all events
         self.event_selector.blockSignals(True)
@@ -1317,6 +1436,7 @@ class HistoricalOddsWidget(QWidget):
         print(f"  Fetching {sport} from Kalshi and Polymarket in parallel...")
 
         # Fetch Kalshi moneyline events only (base games)
+        # Filter for only active/open events
         def fetch_kalshi_moneylines():
             cursor = None
             events = []
@@ -1324,7 +1444,8 @@ class HistoricalOddsWidget(QWidget):
                 response = self.kalshi_client.kalshi_client.get_events(
                     series_ticker=series_ticker,
                     limit=200,
-                    cursor=cursor
+                    cursor=cursor,
+                    status='open'  # Only get open (active) events
                 )
                 events.extend(response.get('events', []))
                 cursor = response.get('cursor')
@@ -1338,8 +1459,12 @@ class HistoricalOddsWidget(QWidget):
         kalshi_data, polymarket_games = await asyncio.gather(kalshi_task, polymarket_task)
 
         kalshi_events = kalshi_data.get('events', [])
-        print(f"  ✅ Kalshi: {len(kalshi_events)} events")
-        print(f"  ✅ Polymarket: {len(polymarket_games)} games")
+
+        # Filter Polymarket games to only include active (not closed) games
+        active_polymarket_games = [g for g in polymarket_games if g.active and not g.closed]
+
+        print(f"  ✅ Kalshi: {len(kalshi_events)} open events")
+        print(f"  ✅ Polymarket: {len(active_polymarket_games)} active games (filtered from {len(polymarket_games)} total)")
 
         # Create unified events by matching
         unified_events = []
@@ -1352,7 +1477,7 @@ class HistoricalOddsWidget(QWidget):
 
             # Try to find matching Polymarket game
             matched_poly_game = None
-            for p_game in polymarket_games:
+            for p_game in active_polymarket_games:
                 if p_game.id in matched_poly_ids:
                     continue
 
@@ -1365,12 +1490,16 @@ class HistoricalOddsWidget(QWidget):
                     break
 
             # Create unified event
+            # Parse start_time from event_ticker since strike_date doesn't exist
+            event_ticker = k_event.get('event_ticker', '')
+            start_time = EventMatcher.parse_kalshi_event_date(event_ticker)
+
             unified_event = UnifiedEvent(
                 sport=sport,
                 home_team=k_home,
                 away_team=k_away,
-                start_time=k_event.get('strike_date', ''),
-                kalshi_event_ticker=k_event.get('event_ticker'),
+                start_time=start_time,
+                kalshi_event_ticker=event_ticker,
                 kalshi_series_ticker=k_event.get('series_ticker'),
                 kalshi_markets=k_event.get('markets', [])
             )
@@ -1379,11 +1508,15 @@ class HistoricalOddsWidget(QWidget):
                 unified_event.polymarket_game_id = matched_poly_game.id
                 unified_event.polymarket_title = matched_poly_game.title
                 unified_event.polymarket_markets = matched_poly_game.markets
+                # Only use Polymarket's start_time as fallback if Kalshi doesn't have one
+                # Kalshi's parsed date from ticker is more accurate for game date
+                if not unified_event.start_time and matched_poly_game.start_time:
+                    unified_event.start_time = matched_poly_game.start_time
 
             unified_events.append(unified_event)
 
         # Second pass: add unmatched Polymarket games
-        for p_game in polymarket_games:
+        for p_game in active_polymarket_games:
             if p_game.id not in matched_poly_ids:
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
                 unified_event = UnifiedEvent(
@@ -1396,6 +1529,10 @@ class HistoricalOddsWidget(QWidget):
                     polymarket_markets=p_game.markets
                 )
                 unified_events.append(unified_event)
+
+        # Sort events by start_time (chronological order)
+        # Events without start_time go to the end
+        unified_events.sort(key=lambda e: e.start_time if e.start_time else 'Z' * 30)
 
         return unified_events
 
@@ -1430,6 +1567,7 @@ class HistoricalOddsWidget(QWidget):
         print("Fetching from Kalshi and Polymarket in parallel...")
 
         # Fetch Kalshi moneyline events only (base games)
+        # Filter for only active/open events
         def fetch_kalshi_moneylines():
             cursor = None
             events = []
@@ -1437,7 +1575,8 @@ class HistoricalOddsWidget(QWidget):
                 response = self.kalshi_client.kalshi_client.get_events(
                     series_ticker=series_ticker,
                     limit=200,
-                    cursor=cursor
+                    cursor=cursor,
+                    status='open'  # Only get open (active) events
                 )
                 events.extend(response.get('events', []))
                 cursor = response.get('cursor')
@@ -1451,8 +1590,12 @@ class HistoricalOddsWidget(QWidget):
         kalshi_data, polymarket_games = await asyncio.gather(kalshi_task, polymarket_task)
 
         kalshi_events = kalshi_data.get('events', [])
-        print(f"✅ Kalshi: {len(kalshi_events)} events")
-        print(f"✅ Polymarket: {len(polymarket_games)} games")
+
+        # Filter Polymarket games to only include active (not closed) games
+        active_polymarket_games = [g for g in polymarket_games if g.active and not g.closed]
+
+        print(f"✅ Kalshi: {len(kalshi_events)} open events")
+        print(f"✅ Polymarket: {len(active_polymarket_games)} active games (filtered from {len(polymarket_games)} total)")
 
         # Create unified events by matching
         unified_events = []
@@ -1465,7 +1608,7 @@ class HistoricalOddsWidget(QWidget):
 
             # Try to find matching Polymarket game
             matched_poly_game = None
-            for p_game in polymarket_games:
+            for p_game in active_polymarket_games:
                 if p_game.id in matched_poly_ids:
                     continue
 
@@ -1478,12 +1621,16 @@ class HistoricalOddsWidget(QWidget):
                     break
 
             # Create unified event
+            # Parse start_time from event_ticker since strike_date doesn't exist
+            event_ticker = k_event.get('event_ticker', '')
+            start_time = EventMatcher.parse_kalshi_event_date(event_ticker)
+
             unified_event = UnifiedEvent(
                 sport=sport,
                 home_team=k_home,
                 away_team=k_away,
-                start_time=k_event.get('strike_date', ''),
-                kalshi_event_ticker=k_event.get('event_ticker'),
+                start_time=start_time,
+                kalshi_event_ticker=event_ticker,
                 kalshi_series_ticker=k_event.get('series_ticker'),
                 kalshi_markets=k_event.get('markets', [])
             )
@@ -1492,6 +1639,10 @@ class HistoricalOddsWidget(QWidget):
                 unified_event.polymarket_game_id = matched_poly_game.id
                 unified_event.polymarket_title = matched_poly_game.title
                 unified_event.polymarket_markets = matched_poly_game.markets
+                # Only use Polymarket's start_time as fallback if Kalshi doesn't have one
+                # Kalshi's parsed date from ticker is more accurate for game date
+                if not unified_event.start_time and matched_poly_game.start_time:
+                    unified_event.start_time = matched_poly_game.start_time
                 print(f"  [K+P] Matched: {k_home} vs {k_away}")
             else:
                 print(f"  [K  ] No Polymarket match: {k_home} vs {k_away}")
@@ -1499,7 +1650,7 @@ class HistoricalOddsWidget(QWidget):
             unified_events.append(unified_event)
 
         # Second pass: add unmatched Polymarket games
-        for p_game in polymarket_games:
+        for p_game in active_polymarket_games:
             if p_game.id not in matched_poly_ids:
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
                 unified_event = UnifiedEvent(
@@ -1514,7 +1665,48 @@ class HistoricalOddsWidget(QWidget):
                 unified_events.append(unified_event)
                 print(f"  [  P] Polymarket only: {p_home} vs {p_away}")
 
+        # Sort events by start_time (chronological order)
+        # Events without start_time go to the end
+        unified_events.sort(key=lambda e: e.start_time if e.start_time else 'Z' * 30)
+
         print(f"\n📊 Total unified events: {len(unified_events)}")
+
+        # Filter out past events if configured to do so
+        SHOW_PAST_EVENTS = False  # Set to True to show all events including past ones
+        PAST_EVENT_CUTOFF_HOURS = 12  # Keep events from last N hours (to include live/recent games)
+
+        if not SHOW_PAST_EVENTS:
+            from datetime import datetime, timezone, timedelta
+
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=PAST_EVENT_CUTOFF_HOURS)
+
+            original_count = len(unified_events)
+            filtered_events = []
+
+            for event in unified_events:
+                if event.start_time:
+                    try:
+                        # Parse the event start time
+                        event_dt = datetime.fromisoformat(event.start_time.replace('Z', '+00:00'))
+
+                        # Keep event if it's in the future or within the cutoff window
+                        if event_dt >= cutoff:
+                            filtered_events.append(event)
+                    except Exception as e:
+                        # If we can't parse the date, include it to be safe
+                        print(f"⚠️  Could not parse date for {event.away_team} @ {event.home_team}: {event.start_time}")
+                        filtered_events.append(event)
+                else:
+                    # If no start_time, include it to be safe
+                    filtered_events.append(event)
+
+            unified_events = filtered_events
+            filtered_count = original_count - len(unified_events)
+
+            if filtered_count > 0:
+                print(f"🗑️  Filtered out {filtered_count} past events (older than {PAST_EVENT_CUTOFF_HOURS} hours)")
+            print(f"📊 Showing {len(unified_events)} events")
 
         # Populate event selector
         self.event_selector.blockSignals(True)
