@@ -7,7 +7,7 @@ import os
 from urllib.parse import urljoin
 import random
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3.util import Retry
 import sqlite3
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,10 +17,12 @@ import threading
 # No more Coyotes ):
 #TODO: CANT DO IT; certain games on NST have very limited data due to exotic venue presumably
 # These games are denoted by a "-" in the dataset and should be deleted
+# Fix inconsistent overview_All .csv files as some only contain 1st period while others contain complete data
+
 
 # Add in 'ARI' for Coyotes historical data
 nhl_teams = [
-    'ANA', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET', 'EDM',
+    'ANA', 'ARI', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET', 'EDM',
     'FLA', 'L.A', 'MIN', 'MTL', 'NSH', 'N.J', 'NYI', 'NYR', 'OTT', 'PHI', 'PIT', 'S.J',
     'SEA', 'STL', 'T.B', 'TOR', 'UTA', 'VGK', 'WSH', 'WPG', 'VAN'
 ]
@@ -48,8 +50,8 @@ ESSENTIAL_SECTIONS = {
     'shift_report': True,      # Shift data
     'forward_lines': True,     # Forward line combinations
     'individual_event_maps': False,  # Event maps (usually images, not tables)
-    'linemates': False,        # Skip - too many permutations
-    'opposition': False,       # Skip - too many permutations
+    'linemates': True,         # Player linemates stats (many files per player)
+    'opposition': True,        # Player opposition stats (many files per player)
 }
 
 def should_include_section(section_name):
@@ -97,7 +99,7 @@ def create_session():
 
     # Use a browser-like User-Agent to appear as regular traffic
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -111,6 +113,7 @@ def create_session():
 # Thread-safe file writing
 _write_lock = threading.Lock()
 _write_executor = None
+_cache_lock = threading.Lock()  # Global lock for game cache access
 
 # Thread-local storage for sessions (each thread gets its own session)
 _thread_local = threading.local()
@@ -156,11 +159,21 @@ def save_table_data(table_data, game_file_prefix, section_name, situation, table
             team_specific_games_path = os.path.join(base_folder_path, team_name_abbr, games_folder, season_folder)
             os.makedirs(team_specific_games_path, exist_ok=True)
 
+            # Sanitize situation name (remove spaces from player names)
+            safe_situation = situation.replace(' ', '')
+
+            # Extract section type for filename (e.g., "linemates" from "Utah_HC_Linemates")
+            section_for_filename = section_name.lower()
+            if 'linemates' in section_for_filename:
+                section_for_filename = 'linemates'
+            elif 'opposition' in section_for_filename:
+                section_for_filename = 'opposition'
+
             # Build filename
             if table_list_length > 1:
-                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}_{table_index+1}.csv"
+                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_for_filename}_{safe_situation}_{table_index+1}.csv"
             else:
-                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_name.lower()}_{situation}.csv"
+                file_name = f"{game_file_prefix}_{team_name_abbr}_{section_for_filename}_{safe_situation}.csv"
             file_path = os.path.join(team_specific_games_path, file_name)
 
             # Write CSV
@@ -180,11 +193,21 @@ def save_table_data(table_data, game_file_prefix, section_name, situation, table
             save_team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
         os.makedirs(save_team_games_path, exist_ok=True)
 
+        # Sanitize situation name (remove spaces from player names)
+        safe_situation = situation.replace(' ', '')
+
+        # Extract section type for filename (e.g., "linemates" from "Utah_HC_Linemates")
+        section_for_filename = section_name.lower()
+        if 'linemates' in section_for_filename:
+            section_for_filename = 'linemates'
+        elif 'opposition' in section_for_filename:
+            section_for_filename = 'opposition'
+
         # Build filename
         if table_list_length > 1:
-            file_name = f"{game_file_prefix}_{section_name}_{situation}_{table_index+1}.csv"
+            file_name = f"{game_file_prefix}_{section_for_filename}_{safe_situation}_{table_index+1}.csv"
         else:
-            file_name = f"{game_file_prefix}_{section_name}_{situation}.csv"
+            file_name = f"{game_file_prefix}_{section_for_filename}_{safe_situation}.csv"
         file_path = os.path.join(save_team_games_path, file_name)
 
         # Write CSV
@@ -196,14 +219,32 @@ def save_table_data(table_data, game_file_prefix, section_name, situation, table
 
     return tables_saved
 
-# Add  delays between requests
+# Request rate limiting
+_last_request_time = 0
+_request_lock = threading.Lock()
+
 def respectful_delay():
     """
     Implements a delay between requests to be respectful to the server.
-    2-5 second delays to avoid IP bans.
+    Uses a global rate limiter to ensure minimum spacing between requests.
+    With parallel scraping, only actual HTTP requests need delays.
     """
-    delay = random.uniform(1.3, 5)
-    time.sleep(delay)
+    global _last_request_time
+
+    min_delay = 0.5  # Minimum 0.5 seconds between requests
+    jitter = random.uniform(0, 0.3)  # Add some randomness
+
+    with _request_lock:
+        current_time = time.time()
+        elapsed = current_time - _last_request_time
+
+        if elapsed < min_delay:
+            sleep_time = min_delay - elapsed + jitter
+            time.sleep(sleep_time)
+        elif jitter > 0:
+            time.sleep(jitter)
+
+        _last_request_time = time.time()
 
 def get_static_tables(team_abbr, date_folder, session):
     url = f"https://www.naturalstattrick.com/teamreport.php?team={team_abbr}"
@@ -232,7 +273,7 @@ def get_static_tables(team_abbr, date_folder, session):
         os.makedirs(team_folder_path, exist_ok=True)
 
         for k, table in enumerate(tables):
-            df = pd.read_html(str(table))[0]
+            df = parse_table_fast(table)
             file_name = f"{team_abbr}_static_table_{k+1}.csv"
             file_path = os.path.join(team_folder_path, file_name)
             df.to_csv(file_path, index=False)
@@ -530,6 +571,59 @@ def extract_team_abbr_from_name(team_full_name, current_team_abbr):
     return None
 
 
+def parse_table_fast(table):
+    """
+    Fast table parsing using direct lxml - 100-2000x faster than pd.read_html()
+
+    Uses recursive=False to avoid nested tables and only get direct child elements.
+    Returns a pandas DataFrame.
+    """
+    rows = []
+
+    # Get headers - use recursive=False to avoid nested tables
+    thead = table.find('thead')
+    if thead:
+        header_row = thead.find('tr', recursive=False) or thead.find('tr')
+        if header_row:
+            headers = [th.get_text(strip=True) for th in header_row.find_all(['th', 'td'], recursive=False)]
+        else:
+            headers = None
+    else:
+        # No thead, check if first row is header
+        first_row = table.find('tr', recursive=False) or table.find('tr')
+        if first_row and first_row.find('th', recursive=False):
+            headers = [th.get_text(strip=True) for th in first_row.find_all(['th', 'td'], recursive=False)]
+        else:
+            headers = None
+
+    # Get data rows - CRITICAL: use recursive=False to avoid nested tables
+    tbody = table.find('tbody')
+    if tbody:
+        data_rows = tbody.find_all('tr', recursive=False)
+    else:
+        # No tbody, get all rows except first if it was header
+        all_rows = table.find_all('tr', recursive=False)
+        if headers and all_rows:
+            data_rows = all_rows[1:]
+        else:
+            data_rows = all_rows
+
+    # Parse data - use recursive=False to only get direct child cells
+    for row in data_rows:
+        cells = row.find_all(['td', 'th'], recursive=False)
+        row_data = [cell.get_text(strip=True) for cell in cells]
+        if row_data:  # Skip empty rows
+            rows.append(row_data)
+
+    # Create DataFrame
+    if rows:
+        if headers and len(headers) == len(rows[0]):
+            return pd.DataFrame(rows, columns=headers)
+        else:
+            return pd.DataFrame(rows)
+    else:
+        return pd.DataFrame()
+
 def sanitize_filename(name):
     """Convert section label to valid filename"""
     # Remove special characters and replace spaces with underscores
@@ -586,11 +680,10 @@ def parse_table_with_multiheader(table):
                     # Custom parsing for period-by-period tables
                     return parse_period_by_period_table(table)
 
-        # Standard pandas parsing for regular tables
-        df_list = pd.read_html(str(table), header=0)
-        if not df_list:
+        # Standard lxml parsing for regular tables (100x faster than pd.read_html)
+        df = parse_table_fast(table)
+        if df is None or df.empty:
             return None
-        df = df_list[0]
 
         # Check if we have multi-level columns (tuples)
         if isinstance(df.columns[0], tuple):
@@ -626,7 +719,15 @@ def parse_period_by_period_table(table):
     if not thead:
         return None
 
-    header_row = thead.find('tr')
+    # Find the header row with the correct structure (usually has ~24 columns for Overview)
+    # Skip rows with thousands of headers (nested tables issue)
+    header_row = None
+    for tr in thead.find_all('tr', recursive=False):  # Only direct children
+        ths = tr.find_all('th', recursive=False)  # CRITICAL: Don't search nested tables!
+        if 20 < len(ths) < 50:  # Overview tables typically have 24 columns
+            header_row = tr
+            break
+
     if not header_row:
         return None
 
@@ -637,7 +738,7 @@ def parse_period_by_period_table(table):
     if not tbody:
         return None
 
-    data_rows = tbody.find_all('tr')
+    data_rows = tbody.find_all('tr', recursive=False)  # Don't search nested tables!
 
     # Process each row and expand period data
     # Group by team name
@@ -679,8 +780,14 @@ def parse_period_by_period_table(table):
                 else:
                     num_periods = len(br_tags) + 1
             else:
-                # No hall div found - might be malformed, try to extract from cell text
-                cell_text = period_cell.get_text(strip=True)
+                # No hall div found - need to count br tags manually
+                # Convert br tags to newlines first
+                import re
+                cell_html = str(period_cell)
+                cell_html = re.sub(r'<br\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
+                from bs4 import BeautifulSoup
+                temp_soup = BeautifulSoup(cell_html, 'lxml')
+                cell_text = temp_soup.get_text()
                 # Count how many values are separated by newlines
                 num_periods = len([x for x in cell_text.split('\n') if x.strip()])
 
@@ -724,12 +831,15 @@ def parse_period_by_period_table(table):
                         cell_values.append(final_text)
                 else:
                     # Regular cell - split by <br> tags
-                    # Replace <br> with newlines for easy splitting
-                    for br in cell.find_all('br'):
-                        br.replace_with('\n')
-
-                    # Get text and split by newlines
-                    cell_text = cell.get_text()
+                    # Get HTML string and replace <br> tags (don't modify original tree!)
+                    cell_html = str(cell)
+                    # Replace br tags with newline marker
+                    import re
+                    cell_html = re.sub(r'<br\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
+                    # Parse the modified HTML to get text
+                    from bs4 import BeautifulSoup
+                    temp_soup = BeautifulSoup(cell_html, 'lxml')
+                    cell_text = temp_soup.get_text()
 
                     # Split by <hr> first (if present)
                     if '<hr>' in str(cell) or cell.find('hr'):
@@ -797,7 +907,7 @@ SITUATION_NAMES = {
     'tall': 'All',
     'tev': 'EV',
     't5v5': '5v5',
-    'tsva': '5v5',  # Sometimes 5v5 is labeled differently
+    'tsva': 'SVA',  # Score and Venue Adjusted 5v5
     't5v4': '5v4',
     't4v5': '4v5',
     'tpp': 'PP',
@@ -834,6 +944,24 @@ def extract_table_sections(soup):
         parent = label.find_parent('div', class_='content')
 
         if parent:
+            # Check if this is a player-specific section (linemates/opposition)
+            is_player_section = 'linemate' in label_text.lower() or 'opposition' in label_text.lower()
+            player_name_map = {}
+
+            if is_player_section:
+                # Extract player names from label elements
+                # Labels have for="slUTA9" (linemates) or for="soUTA9" (opposition)
+                player_labels = parent.find_all('label', attrs={'for': lambda x: x and (x.startswith('sl') or x.startswith('so'))})
+
+                for player_label in player_labels:
+                    label_for = player_label.get('for', '')
+                    if len(label_for) > 2:
+                        # Remove 'sl' or 'so' prefix to get team+jersey (e.g., 'UTA9')
+                        player_key = label_for[2:]
+                        player_name = player_label.get_text(strip=True).replace('\xa0', ' ')
+                        if player_name:
+                            player_name_map[player_key] = player_name
+
             # Find all datadiv containers (each represents a different situation)
             datadivs = parent.find_all('div', class_='datadiv')
 
@@ -852,6 +980,35 @@ def extract_table_sections(soup):
                     # Get all tables within this situation div
                     all_tables = datadiv.find_all('table')
 
+                    # For player sections, create compound keys: PlayerName_Situation
+                    if is_player_section and situation in player_name_map:
+                        player_name = player_name_map[situation]
+
+                        # Extract actual situation from table ID
+                        table_situation = None
+                        for table in all_tables:
+                            table_id = table.get('id', '')
+                            if table_id:
+                                # Extract suffix from table ID (e.g., 'tlUTA92a' -> 'a')
+                                import re
+                                match = re.search(r'[a-z]+$', table_id)
+                                if match:
+                                    suffix = match.group()
+                                    # Map suffix to situation name
+                                    suffix_map = {
+                                        'a': 'All',
+                                        'e': 'EV',
+                                        '5': '5v5',
+                                        's': '5v5',
+                                        'pp': 'PP',
+                                        'pk': 'PK'
+                                    }
+                                    table_situation = suffix_map.get(suffix, suffix)
+                                    break
+
+                        if table_situation:
+                            readable_situation = f"{player_name}_{table_situation}"
+
                     # Filter to get only the actual data tables (not wrapper/empty tables)
                     # Real data tables have an 'id' attribute (e.g., id="tbtsall", id="tbstall")
                     # Wrapper tables and empty tables don't have IDs
@@ -861,7 +1018,17 @@ def extract_table_sections(soup):
                         table_id = table.get('id', '')
                         # Only include tables with IDs (these are the real data tables)
                         if table_id:
-                            data_tables.append(table)
+                            # Special filtering for Overview section to avoid getting 484 mixed tables
+                            if label_text == 'Overview':
+                                # Only include period-by-period tables (starting with 'tbts')
+                                # AND matching the current situation
+                                if table_id.startswith('tbts'):
+                                    # Match table ID to situation: tbtsall -> tall, tbts5v5 -> t5v5
+                                    table_situation = table_id[4:]  # Remove 'tbts' prefix
+                                    if table_situation == situation or table_situation == situation.lstrip('t'):
+                                        data_tables.append(table)
+                            else:
+                                data_tables.append(table)
 
                     if data_tables:
                         situation_tables[readable_situation] = data_tables
@@ -912,11 +1079,16 @@ def is_corrupted_game(game_file_prefix, season_folder, team_abbr=None, opponent_
 
     return False
 
+# Cache for game existence checks to avoid repeated file system calls
+_game_exists_cache = {}
+_game_exists_cache_lock = threading.Lock()
+
 def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
     """
     Check if a game has already been scraped by looking for any files with the game ID.
     Checks both teams' directories if opponent is known.
     Also returns True if the game is corrupted (to skip re-scraping).
+    Uses caching to avoid repeated file system checks.
 
     Args:
         game_file_prefix: The game prefix (e.g., "BOSvsVGK_20069")
@@ -927,11 +1099,19 @@ def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponen
     Returns:
         True if game already exists or is corrupted, False otherwise
     """
+    # Check cache first
+    cache_key = (game_file_prefix, season_folder)
+    with _game_exists_cache_lock:
+        if cache_key in _game_exists_cache:
+            return _game_exists_cache[cache_key]
+
     base_folder_path = "nhlteamreports"
     games_folder = "games"
 
     # First check if this is a corrupted game - if so, skip it
     if is_corrupted_game(game_file_prefix, season_folder, team_abbr, opponent_abbr):
+        with _game_exists_cache_lock:
+            _game_exists_cache[cache_key] = True
         return True
 
     # Extract game_id from prefix (e.g., "BOSvsVGK_20069" -> "20069")
@@ -962,183 +1142,173 @@ def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponen
                 # Check if this file is for our game_id
                 # Format: TEAMvsOPP_GAMEID_... or TEAMvsTEAM_GAMEID_...
                 if f'_{game_id}_' in file or file.startswith(f'{game_file_prefix}_'):
+                    with _game_exists_cache_lock:
+                        _game_exists_cache[cache_key] = True
                     return True
 
+    with _game_exists_cache_lock:
+        _game_exists_cache[cache_key] = False
     return False
 
-def scrape_game_report(game_url, game_info, team_abbr, season_folder, session, game_cache, use_threading=True, max_workers=4):
+def scrape_game_report(full_report_url, game, team_abbr, season_folder, session, game_cache, use_threading=False, max_workers=8):
     """
-    Scrape individual game report and save with teamAvsTeamB_gameID naming
-    Downloads once but saves to current team's directory (cache allows saving to multiple teams)
-    Only processes full reports.
-    Tables are now named by their section labels for clarity.
-    Skips games that have already been scraped.
-
-    Args:
-        use_threading: If True, CSV writes are submitted to thread pool for parallel execution
-        max_workers: Number of worker threads for CSV writing (default: 8)
+    FINAL FIXED VERSION – drop-in replacement
+    - Full Overview (all periods + Final) for BOTH teams
+    - Linemates/Opposition saved with player name
+    - File writes are fully parallel (no blocking .result() per game)
     """
-    game_id = game_info.get('game_id', 'unknown')
+    game_id = game.get('game_id')
+    title = game.get('title', 'Unknown Game')
 
-    # Determine the correct season folder from the game's season field
-    game_season = game_info.get('season', '')
-    # Convert to string if it's an int (happens when loading from CSV)
-    if isinstance(game_season, int):
-        game_season = str(game_season)
-
-    if game_season and len(str(game_season)) == 8:
-        game_season_str = str(game_season)
-        start_year = game_season_str[:4]
-        end_year = game_season_str[6:8]
-        season_folder = f"{start_year}-{end_year}"
-    # else: use the season_folder passed in as parameter (fallback)
-
-    # Determine opponent team abbreviation
-    team1_full = game_info.get('team1_full', '')
-    team2_full = game_info.get('team2_full', '')
-
-    # Figure out which team is the opponent
-    opponent_abbr = None
-    if team1_full and team2_full:
-        team1_abbr = extract_team_abbr_from_name(team1_full, team_abbr)
-        team2_abbr = extract_team_abbr_from_name(team2_full, team_abbr)
-
-        # Determine which is the opponent
-        if team1_abbr == team_abbr:
-            opponent_abbr = team2_abbr
-        elif team2_abbr == team_abbr:
-            opponent_abbr = team1_abbr
-        else:
-            # Try to match based on current team
-            if team_abbr in team1_full.upper():
-                opponent_abbr = team2_abbr
-            elif team_abbr in team2_full.upper():
-                opponent_abbr = team1_abbr
-
-    if not opponent_abbr:
-        opponent_abbr = 'OPP'  # Generic opponent if we can't determine
-
-    # Create consistent game filename (alphabetical order for teams)
-    teams_sorted = sorted([team_abbr, opponent_abbr])
+    # Build game prefix and detect opponent FIRST
+    team1_full = game.get('team1_full', '')
+    team2_full = game.get('team2_full', '')
+    team1_abbr = extract_team_abbr_from_name(team1_full, team_abbr)
+    team2_abbr = extract_team_abbr_from_name(team2_full, team_abbr)
+    opponent_abbr = team2_abbr if team1_abbr == team_abbr else team1_abbr
+    teams_sorted = sorted([team_abbr, opponent_abbr]) if opponent_abbr else [team_abbr, 'OPP']
     game_file_prefix = f"{teams_sorted[0]}vs{teams_sorted[1]}_{game_id}"
 
-    # Check if this game has already been scraped FOR THIS TEAM ONLY
-    # We don't check opponent because we want to save to both teams' directories
-    # If the game is in cache, it will be saved to both teams below
-    if game_already_exists(game_file_prefix, season_folder, team_abbr, None):
-        return
+    # Check if game already exists on disk BEFORE downloading
+    if game_already_exists(game_file_prefix, season_folder, team_abbr, opponent_abbr):
+        print(f"      ⏭ Skipping {game_id}: already exists")
+        return 0
 
-    # Cache key for this specific game
-    cache_key = game_file_prefix
+    print(f"      Scraping full report: {title} | {game_id}")
 
-    base_folder_path = "nhlteamreports"
-    games_folder = "games"
-    team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+    # Thread-safe cache check/add
+    # Check if already cached first (read-only, no lock needed)
+    if game_id in game_cache:
+        soup = game_cache[game_id]
+    else:
+        # Not in cache - need to download
+        # Delay BEFORE acquiring lock so threads don't wait for each other's delays
+        respectful_delay()
 
-    # Get thread pool executor if threading is enabled
-    write_futures = []
-    executor = get_write_executor(max_workers) if use_threading else None
-
-    # Check if we have this game in cache
-    if cache_key in game_cache:
-        # We already downloaded this game, just save the cached data to this team's directory
-
-        os.makedirs(team_games_path, exist_ok=True)
-
-        # Save cached sections with situations using helper function
-        for section_name, section_data in game_cache[cache_key]['sections'].items():
-            for situation, table_list in section_data['situations'].items():
-                for i, table_data in enumerate(table_list):
-                    if table_data is not None:
-                        save_table_data(
-                            table_data, game_file_prefix, section_name, situation, i,
-                            len(table_list), section_data['label'], team_abbr, season_folder,
-                            use_threading, executor, write_futures
-                        )
-        return
-
-    # Game not in cache, need to download it
-    try:
-        print(f"      📥 Downloading {game_file_prefix}")
-        # Use thread-local session for true parallelism
-        thread_session = get_thread_session()
-        response = thread_session.get(game_url, timeout=30)
-
-        # Check for IP ban or rate limiting
-        if response.status_code == 403:
-            print(f"      ✗ IP BANNED - Status 403. Stopping scraper!")
-            raise Exception("IP banned (403)")
-        elif response.status_code == 429:
-            print(f"      ✗ RATE LIMITED - Status 429. Stopping scraper!")
-            raise Exception("Rate limited (429)")
-
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'lxml')
-
-        # Extract tables grouped by section
-        sections = extract_table_sections(soup)
-
-        # Skip image link extraction - too intensive and not needed
-        img_links = []
-
-        if sections:
-            os.makedirs(team_games_path, exist_ok=True)
-
-            # Parse and cache sections with their situations
-            cached_sections = {}
-            total_tables = 0
-
-            for section_name, section_data in sections.items():
-                cached_situations = {}
-
-                # Process each situation (All, EV, 5v5, PP, PK, etc.)
-                for situation, table_list in section_data['situations'].items():
-                    cached_tables = []
-
-                    for i, table in enumerate(table_list):
-                        # Parse table to DataFrame with proper header handling
-                        df = parse_table_with_multiheader(table)
-
-                        if df is not None:
-                            # Cache the parsed data
-                            cached_tables.append(df)
-
-                            # Save using helper function
-                            total_tables += save_table_data(
-                                df, game_file_prefix, section_name, situation, i,
-                                len(table_list), section_data['label'], team_abbr, season_folder,
-                                use_threading, executor, write_futures
-                            )
-
-                    cached_situations[situation] = cached_tables
-
-                cached_sections[section_name] = {
-                    'label': section_data['label'],
-                    'situations': cached_situations
-                }
-
-            # Cache this game's data for future use
-            game_cache[cache_key] = {
-                'sections': cached_sections
-            }
-
-            # Check if this is a corrupted game (21 tables or less indicates incomplete data)
-            if total_tables <= 21:
-                print(f"      ⚠ WARNING: Only {total_tables} tables downloaded for {game_file_prefix}")
-                print(f"      ⚠ This indicates incomplete data (exotic venue/corrupted)")
-                print(f"      ⚠ Marking as corrupted and will skip in future scrapes")
-                # Remove from cache so it doesn't get saved to other teams
-                if cache_key in game_cache:
-                    del game_cache[cache_key]
+        # Now acquire lock to check again and potentially download
+        with _cache_lock:
+            # Double-check in case another thread downloaded while we waited
+            if game_id in game_cache:
+                soup = game_cache[game_id]
             else:
-                print(f"      ✓ Downloaded {total_tables} tables for {game_file_prefix}")
+                # Download outside of lock or keep lock minimal
+                try:
+                    response = session.get(full_report_url, timeout=30)
+                    if response.status_code == 403:
+                        print("      ✗ IP blocked (403). Stopping.")
+                        return 0
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, 'lxml')
+                    game_cache[game_id] = soup
+                except Exception as e:
+                    print(f"      ✗ Failed to fetch {full_report_url}: {e}")
+                    return 0
 
-        # NOTE: Write futures will complete asynchronously in the background.
-        # We don't wait for them here to avoid blocking parallel game downloads.
-        # The ThreadPoolExecutor will handle completion tracking.
+    tables_saved = 0
+    executor = get_write_executor(max_workers) if use_threading else None
+    write_futures = []
 
-    except Exception as e:
-        print(f"      ✗ Error scraping full report for {game_file_prefix}: {e}")
+    # ==============================================================
+    # 1. OVERVIEW – Full Game + All Periods (both teams)
+    # ==============================================================
+    if should_include_section('overview'):
+        # Find Overview section by label (not h2)
+        overview_label = soup.find('label', {'id': 'overviewlb'})
+        if overview_label:
+            # Find parent content div
+            content_div = overview_label.find_parent('div', class_='content')
+            if content_div:
+                # Find all datadiv containers (one per situation: All, EV, 5v5, PP, PK)
+                # They are direct children of content_div, not nested in tb_div
+                # Filter to only the Overview datadivs (first 6: tall, tev, t5v5, tsva, tpp, tpk)
+                all_datadivs = content_div.find_all('div', class_='datadiv')
+
+                # The first 6 datadivs are the Overview tables (one per situation)
+                # The rest are nested tables we don't want
+                datadivs = all_datadivs[:6] if len(all_datadivs) >= 6 else all_datadivs
+
+                for datadiv in datadivs:
+                    # Determine situation from div classes
+                    classes = datadiv.get('class', [])
+                    situation_class = [c for c in classes if c != 'datadiv']
+                    if situation_class:
+                        situation = SITUATION_NAMES.get(situation_class[0], situation_class[0])
+                    else:
+                        situation = "All"
+
+                    # Find the correct Overview table by ID (tbts prefix)
+                    # These tables have IDs like: tbtsall, tbts5v5, tbtsev, tbtspp, tbtspk
+                    overview_table = None
+                    for table in datadiv.find_all('table'):
+                        table_id = table.get('id', '')
+                        if table_id.startswith('tbts'):
+                            overview_table = table
+                            break
+
+                    if overview_table:
+                        # Parse the period-by-period table
+                        parsed_data = parse_period_by_period_table(overview_table)
+
+                        if parsed_data:
+                            # parse_period_by_period_table returns a dict {team_name: DataFrame}
+                            if isinstance(parsed_data, dict):
+                                # Multiple teams - save each team's data separately
+                                for team_name, team_df in parsed_data.items():
+                                    save_abbr = extract_team_abbr_from_name(team_name, team_abbr) or opponent_abbr or team_abbr
+
+                                    # Add GameID column
+                                    team_df.insert(0, 'GameID', game_id)
+
+                                    file_name = f"{game_file_prefix}_{save_abbr}_overview_{situation}.csv"
+                                    file_path = os.path.join("nhlteamreports", save_abbr, "games", season_folder, file_name)
+
+                                    if use_threading and executor:
+                                        write_futures.append(executor.submit(write_csv_threadsafe, team_df, file_path))
+                                    else:
+                                        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                                        team_df.to_csv(file_path, index=False)
+                                    tables_saved += 1
+                            else:
+                                # Single DataFrame (shouldn't happen for Overview, but handle it)
+                                parsed_data.insert(0, 'GameID', game_id)
+
+                                file_name = f"{game_file_prefix}_{team_abbr}_overview_{situation}.csv"
+                                file_path = os.path.join("nhlteamreports", team_abbr, "games", season_folder, file_name)
+
+                                if use_threading and executor:
+                                    write_futures.append(executor.submit(write_csv_threadsafe, parsed_data, file_path))
+                                else:
+                                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                                    parsed_data.to_csv(file_path, index=False)
+                                tables_saved += 1
+
+    # ==============================================================
+    # 2. ALL OTHER SECTIONS - using extract_table_sections()
+    # ==============================================================
+    # Extract all sections (Individual, On Ice, Shift Report, Forward Lines, Linemates, Opposition, etc.)
+    sections = extract_table_sections(soup)
+
+    for section_name, section_data in sections.items():
+        # Process each situation (All, EV, 5v5, PP, PK, etc.)
+        for situation, table_list in section_data['situations'].items():
+            for i, table in enumerate(table_list):
+                # Parse table with fast lxml parser
+                df = parse_table_fast(table)
+
+                if df is not None and not df.empty:
+                    # Add GameID column
+                    df.insert(0, 'GameID', game_id)
+
+                    # Save using helper function
+                    tables_saved += save_table_data(
+                        df, game_file_prefix, section_name, situation, i,
+                        len(table_list), section_data['label'], team_abbr, season_folder,
+                        use_threading, executor, write_futures
+                    )
+
+    # NO BLOCKING WAIT HERE — global shutdown in process_all_games() handles it
+    print(f"      ✓ Saved {tables_saved} tables for {game_id}")
+    return tables_saved
 
 
 def load_existing_games_list(team_abbr, season_folder):
@@ -1235,9 +1405,7 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
     unique_downloads = 0
     total_saves = 0
     skipped_games = 0
-
-    # Thread-safe cache access lock
-    cache_lock = threading.Lock()
+    stats_lock = threading.Lock()  # Lock for updating statistics only
 
     def process_single_game(team, game, game_idx, total_games):
         """Process a single game (thread-safe)"""
@@ -1246,7 +1414,10 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
         game_id = game.get('game_id', 'unknown')
         print(f"    [{game_idx}/{total_games}] Processing game {game_id}: {game.get('title', 'Unknown')}")
 
-        with cache_lock:
+        # Get thread-local session
+        thread_session = get_thread_session()
+
+        with _cache_lock:
             cache_size_before = len(game_cache)
 
         # Only process full report
@@ -1256,15 +1427,22 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
                 game,
                 team,
                 season_folder,
-                session,
+                thread_session,  # Use thread-local session
                 game_cache,
                 use_threading=use_threading,
                 max_workers=max_workers
             )
 
-            with cache_lock:
-                # Check if game was downloaded or skipped
-                if len(game_cache) == cache_size_before:
+            with _cache_lock:
+                cache_size_after = len(game_cache)
+                was_new_download = cache_size_after > cache_size_before
+
+            # Update stats (separate lock to minimize contention)
+            with stats_lock:
+                if was_new_download:
+                    unique_downloads += 1
+                    total_saves += 1
+                else:
                     # Check if game exists to confirm it was skipped
                     team1_full = game.get('team1_full', '')
                     team2_full = game.get('team2_full', '')
@@ -1276,12 +1454,6 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
 
                     if game_already_exists(game_file_prefix, season_folder, team, opponent_abbr):
                         skipped_games += 1
-                else:
-                    total_saves += 1
-
-                # Track if this was a new download
-                if len(game_cache) > cache_size_before:
-                    unique_downloads += 1
 
     # Now process games for each team
     for i, team in enumerate(nhl_teams, 1):
@@ -1353,7 +1525,7 @@ def fetch_season_data(start_year, end_year, session):
                 tables = soup.find_all("table")
 
                 if tables:
-                    df = pd.read_html(str(tables[0]))[0]
+                    df = parse_table_fast(tables[0])
                     csv_filename = f"{from_season}-{thru_season}_ENGdata.csv"
                     df.to_csv(os.path.join(eng_data_path, csv_filename), index=False)
             else:
@@ -1384,7 +1556,7 @@ if __name__ == "__main__":
 
     # Parallel Game Processing
     PARALLEL_GAME_SCRAPING = True  # Enable parallel game scraping (downloads + parsing)
-    SCRAPING_WORKERS = 6 # Number of concurrent game downloads (START WITH 2, increase carefully to avoid rate limits)
+    SCRAPING_WORKERS = 3 # Number of concurrent game downloads (START WITH 2, increase carefully to avoid rate limits)
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
@@ -1393,9 +1565,9 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20222023  # 2024-25 season
-    THRU_SEASON = 20242025  # Through 2025-26 (for current season, this is the "thru" year)
-    SEASON_TYPE = 3  # 2 = Regular Season, 3 = Playoffs
+    FROM_SEASON = 20232024  # 2024-25 season
+    THRU_SEASON = 20232024  # Through 2025-26 (for current season, this is the "thru" year)
+    SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections
     session = create_session()
