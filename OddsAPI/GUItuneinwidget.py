@@ -94,9 +94,10 @@ class TuneInWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        # URLs to be parsed (totalsportek main page)
+        # URLs to be parsed (streaming aggregator main pages)
         self.urls = [
-            "https://today.totalsportek.army/",
+            "https://www.nflbite.is/",          # NFL games with 10-15 streams each
+            "https://today.totalsportek.army/", # Multi-sport aggregator
         ]
 
         # League names for filtering
@@ -274,6 +275,13 @@ class TuneInWidget(QWidget):
         self.all_streams = all_streams
         print(f"Loaded {len(all_streams)} games with streams")
 
+        # If no streams found, use game URLs directly as stream links
+        if not all_streams and self.all_game_urls:
+            print(f"No individual streams found, using {len(self.all_game_urls)} game page URLs as links")
+            # Create a single "Stream Page" entry for each game URL
+            for game_url in self.all_game_urls:
+                self.all_streams[game_url] = [{'provider': 'Stream Page', 'url': game_url}]
+
         # Filter and display links
         self.filter_links()
 
@@ -296,14 +304,22 @@ class TuneInWidget(QWidget):
         
     def extract_game_name(self, game_url):
         """Extract readable game name from URL"""
-        # URL format: https://totalsportek.army/game/team1-vs-team2/ID/
         try:
             parts = game_url.rstrip('/').split('/')
+
+            # Totalsportek format: https://totalsportek.army/game/team1-vs-team2/ID/
             if len(parts) >= 5 and parts[-3] == 'game':
+                game_name = parts[-2].replace('-', ' ').title()
+                return game_name
+
+            # NFLbite/NBABite/etc format: https://www.nflbite.is/Team1-vs-Team2/ID
+            # The team names are in the second-to-last segment
+            if len(parts) >= 2 and parts[-1].isnumeric():
                 game_name = parts[-2].replace('-', ' ').title()
                 return game_name
         except:
             pass
+
         return game_url
 
     @pyqtSlot(QListWidgetItem)
