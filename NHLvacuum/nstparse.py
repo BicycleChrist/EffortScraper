@@ -17,8 +17,7 @@ import threading
 # No more Coyotes ):
 #TODO: CANT DO IT; certain games on NST have very limited data due to exotic venue presumably
 # These games are denoted by a "-" in the dataset and should be deleted
-# Fix inconsistent overview_All .csv files as some only contain 1st period while others contain complete data
-
+#TODO: Prevent opposition parsing from saving duplicate .csv's with player name and jersey number
 
 # Add in 'ARI' for Coyotes historical data
 nhl_teams = [
@@ -83,6 +82,25 @@ def should_include_section(section_name):
     # Default: include if we don't recognize it (safer)
     return True
 
+# Pool of realistic User-Agents (recent browsers, common OS versions)
+USER_AGENTS = [
+    # Chrome on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    # Chrome on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    # Firefox on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+    # Firefox on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0',
+    # Safari on macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+    # Edge on Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+]
+
 # Create a session with retry strategy and proper headers
 def create_session():
     session = requests.Session()
@@ -90,22 +108,33 @@ def create_session():
         total=3,
         read=3,
         connect=3,
-        backoff_factor=0.3,
-        status_forcelist=(500, 502, 504)
+        backoff_factor=0.5,  # Increased from 0.3 to be more respectful
+        status_forcelist=(500, 502, 504, 429)  # Added 429 (rate limit)
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
 
-    # Use a browser-like User-Agent to appear as regular traffic
+    # Randomize User-Agent from pool of realistic browsers
+    user_agent = random.choice(USER_AGENTS)
+
+    # Use comprehensive browser-like headers
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'User-Agent': user_agent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
         'DNT': '1',
         'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+        'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"'
     })
 
     return session
@@ -219,30 +248,57 @@ def save_table_data(table_data, game_file_prefix, section_name, situation, table
 
     return tables_saved
 
-# Request rate limiting
+# Request rate limiting with adaptive backoff
 _last_request_time = 0
 _request_lock = threading.Lock()
+_consecutive_429s = 0  # Track rate limit responses
+_backoff_multiplier = 1.0  # Dynamic backoff multiplier
 
-def respectful_delay():
+def respectful_delay(is_429=False):
     """
     Implements a delay between requests to be respectful to the server.
-    Uses a global rate limiter to ensure minimum spacing between requests.
+    Uses a global rate limiter with adaptive backoff for rate limit responses.
     With parallel scraping, only actual HTTP requests need delays.
-    """
-    global _last_request_time
 
-    min_delay = 0.5  # Minimum 0.5 seconds between requests
-    jitter = random.uniform(0, 0.3)  # Add some randomness
+    Args:
+        is_429: True if the last request got a 429 response (rate limited)
+    """
+    global _last_request_time, _consecutive_429s, _backoff_multiplier
+
+    # Base delays: configurable based on DELAY_SECONDS global
+    try:
+        from __main__ import DELAY_SECONDS
+        min_delay = float(DELAY_SECONDS)
+        # Scale jitter proportionally (3-10% of base delay)
+        max_jitter = max(0.3, min(min_delay * 0.1, 10.0))
+    except (ImportError, AttributeError):
+        # Fallback if called outside main (conservative default)
+        min_delay = 10.0
+        max_jitter = 1.0
 
     with _request_lock:
+        # Adaptive backoff for 429 responses
+        if is_429:
+            _consecutive_429s += 1
+            # Exponential backoff: 2x, 4x, 8x, etc. (capped at 16x)
+            _backoff_multiplier = min(2.0 ** _consecutive_429s, 16.0)
+            print(f"    ⚠ Rate limited! Backing off {_backoff_multiplier}x (consecutive 429s: {_consecutive_429s})")
+        else:
+            # Gradually reduce backoff when successful
+            if _consecutive_429s > 0:
+                _consecutive_429s = max(0, _consecutive_429s - 1)
+                _backoff_multiplier = max(1.0, _backoff_multiplier * 0.5)
+
+        # Calculate delay with backoff and jitter
+        jitter = random.uniform(0, max_jitter)
+        effective_delay = (min_delay * _backoff_multiplier) + jitter
+
         current_time = time.time()
         elapsed = current_time - _last_request_time
 
-        if elapsed < min_delay:
-            sleep_time = min_delay - elapsed + jitter
+        if elapsed < effective_delay:
+            sleep_time = effective_delay - elapsed
             time.sleep(sleep_time)
-        elif jitter > 0:
-            time.sleep(jitter)
 
         _last_request_time = time.time()
 
@@ -253,17 +309,22 @@ def get_static_tables(team_abbr, date_folder, session):
     team_folder_path = os.path.join(base_folder_path, team_abbr, general_data_folder, date_folder)
 
     try:
+        # Add Referer header to appear like normal browsing
+        headers = {'Referer': 'https://www.naturalstattrick.com/'}
+
         print(f"Fetching data for {team_abbr}...")
-        response = session.get(url, timeout=30)
+        response = session.get(url, headers=headers, timeout=30)
 
         # Check for IP ban or rate limiting
         if response.status_code == 403:
             print(f"✗ IP BANNED or ACCESS FORBIDDEN - Status 403")
             print(f"  Your IP may be temporarily blocked. Wait 24 hours or use a different IP.")
+            respectful_delay(is_429=True)  # Trigger backoff even for 403
             raise Exception("IP banned (403)")
         elif response.status_code == 429:
             print(f"✗ RATE LIMITED - Status 429")
-            print(f"  Too many requests. Increase delay or wait before retrying.")
+            print(f"  Too many requests. Backing off...")
+            respectful_delay(is_429=True)  # Trigger adaptive backoff
             raise Exception("Rate limited (429)")
 
         response.raise_for_status()
@@ -279,7 +340,7 @@ def get_static_tables(team_abbr, date_folder, session):
             df.to_csv(file_path, index=False)
 
         # Be respectful - add delay after successful request
-        respectful_delay()
+        respectful_delay(is_429=False)
 
     except requests.exceptions.RequestException as e:
         print(f"✗ Error accessing data for {team_abbr}: {e}")
@@ -362,9 +423,21 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
     games_folder = "games"
 
     try:
-        print(f"  Fetching games list for {team_abbr}...")
-        response = session.get(url, timeout=30)
+        # Add Referer to look like normal navigation
+        headers = {'Referer': 'https://www.naturalstattrick.com/'}
 
+        print(f"  Fetching games list for {team_abbr}...")
+        response = session.get(url, headers=headers, timeout=30)
+
+        # Handle rate limiting
+        if response.status_code == 429:
+            print(f"  ⚠ Rate limited on games list. Backing off...")
+            respectful_delay(is_429=True)
+            return []
+        elif response.status_code == 403:
+            print(f"  ⚠ Access forbidden (403). IP may be blocked.")
+            respectful_delay(is_429=True)
+            return []
 
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'lxml')
@@ -508,7 +581,7 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
             if total_new_games == 0:
                 print(f"    ℹ No new games to add for {team_abbr}")
 
-        respectful_delay()
+        respectful_delay(is_429=False)
         return games_data
 
     except Exception as e:
@@ -696,211 +769,152 @@ def parse_table_with_multiheader(table):
         print(f"        ⚠ Warning: Failed to parse table: {e}")
         return None
 
+def extract_cell_values(cell):
+    """
+    Extract multiple values from a cell separated by <br> and <hr> tags.
+
+    Example:
+    <td>20:00<br>20:00<br>20:00<br><hr>60:00</td>
+    Returns: ['20:00', '20:00', '20:00', '60:00']
+    """
+    # Get HTML string
+    cell_html = str(cell)
+
+    # Replace <br> tags with newlines
+    import re
+    cell_html = re.sub(r'<br\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
+
+    # Replace <hr> with newline
+    cell_html = re.sub(r'<hr\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
+
+    # Parse to extract text
+    from bs4 import BeautifulSoup
+    temp_soup = BeautifulSoup(cell_html, 'lxml')
+    cell_text = temp_soup.get_text()
+
+    # Split by newlines and filter
+    values = [v.strip() for v in cell_text.split('\n') if v.strip()]
+
+    return values
+
 def parse_period_by_period_table(table):
     """
-    Parse tables where cells contain period-by-period data split by <br/> tags.
+    Parse NST overview tables where cells contain period-by-period data split by <br/> tags.
     Expands these into separate rows for each period and splits by team.
 
     Returns a dictionary: {team_name: DataFrame} for Overview tables with multiple teams.
-    For other period-by-period tables, returns a single DataFrame.
+
+    Structure:
+    - Header row with column names
+    - Data rows: one per team
+    - Each cell (except first) contains period-by-period data:
+      Value1<br>Value2<br>Value3<br><hr>FinalValue
 
     Example HTML structure (Overview section):
     Row 1:
-      <td>Ducks</td>
+      <td>Kings</td>
       <td><div class="hall">1<br>2<br>3<br><hr></div>Final</td>
-      <td>17:10<br>16:00<br>16:42<br><hr>49:52</td>
+      <td>20:00<br>20:00<br>20:00<br><hr>60:00</td>
       ... (more cells with same pattern)
 
     This becomes separate DataFrames for each team with rows:
       Period 1, Period 2, Period 3, Final (with corresponding values from each cell)
     """
-    # Extract headers
+    # Get headers
     thead = table.find('thead')
     if not thead:
         return None
 
-    # Find the header row with the correct structure (usually has ~24 columns for Overview)
-    # Skip rows with thousands of headers (nested tables issue)
-    header_row = None
-    for tr in thead.find_all('tr', recursive=False):  # Only direct children
-        ths = tr.find_all('th', recursive=False)  # CRITICAL: Don't search nested tables!
-        if 20 < len(ths) < 50:  # Overview tables typically have 24 columns
-            header_row = tr
-            break
-
+    header_row = thead.find('tr')
     if not header_row:
         return None
 
     headers = [th.get_text(strip=True) for th in header_row.find_all('th')]
 
-    # Extract data rows
+    # Get data rows
     tbody = table.find('tbody')
     if not tbody:
         return None
 
-    data_rows = tbody.find_all('tr', recursive=False)  # Don't search nested tables!
+    data_rows = tbody.find_all('tr', recursive=False)
 
-    # Process each row and expand period data
-    # Group by team name
     teams_data = {}
 
     for row in data_rows:
-        cells = row.find_all('td')
+        cells = row.find_all('td', recursive=False)
         if not cells:
             continue
 
-        # Extract team name (first cell)
+        # First cell is team name
         team_name = cells[0].get_text(strip=True)
-
-        if not team_name:  # Skip empty rows
+        if not team_name:
             continue
 
-        # Determine number of periods by examining the second cell (Period column)
-        # which has <div class="hall"> containing period labels
-        num_periods = 0
-        if len(cells) > 1:
-            period_cell = cells[1]
-            hall_div = period_cell.find('div', class_='hall')
-            if hall_div:
-                # Count <br> tags to determine number of periods
-                # HTML shows: 1<br>2<br>3<br><hr> = 3 periods + Final
-                br_tags = hall_div.find_all('br')
-                # Number of periods = number of <br> tags before <hr>
-                hr_tag = hall_div.find('hr')
-                if hr_tag:
-                    # Count br tags before hr
-                    num_periods_before_hr = 0
-                    for elem in hall_div.children:
-                        if elem.name == 'hr':
-                            break
-                        if elem.name == 'br':
-                            num_periods_before_hr += 1
-                    # Number of values = br_count + 1 (for first value) + 1 (for Final)
-                    num_periods = num_periods_before_hr + 2
-                else:
-                    num_periods = len(br_tags) + 1
-            else:
-                # No hall div found - need to count br tags manually
-                # Convert br tags to newlines first
-                import re
-                cell_html = str(period_cell)
-                cell_html = re.sub(r'<br\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
-                from bs4 import BeautifulSoup
-                temp_soup = BeautifulSoup(cell_html, 'lxml')
-                cell_text = temp_soup.get_text()
-                # Count how many values are separated by newlines
-                num_periods = len([x for x in cell_text.split('\n') if x.strip()])
+        # Extract period labels from the Period column (second cell)
+        period_cell = cells[1]
+        period_labels = []
 
+        # Check for hall div (contains period numbers)
+        hall_div = period_cell.find('div', class_='hall')
+        if hall_div:
+            # Get text content and split
+            hall_text = hall_div.get_text(separator='\n', strip=True)
+            period_labels = [p.strip() for p in hall_text.split('\n') if p.strip() and p.strip() != '']
+
+            # Get "Final" text after hall div
+            final_text = ''
+            for sibling in hall_div.next_siblings:
+                if sibling.name is None:  # Text node
+                    text = str(sibling).strip()
+                    if text:
+                        final_text = text
+                        break
+
+            if final_text:
+                period_labels.append(final_text)
+        else:
+            # No hall div - extract from cell directly
+            cell_text = period_cell.get_text(separator='\n', strip=True)
+            period_labels = [p.strip() for p in cell_text.split('\n') if p.strip() and p.strip() != '']
+
+        num_periods = len(period_labels)
         if num_periods == 0:
-            # Can't determine structure, skip this row
             continue
 
-        # Initialize team data list if not exists
-        if team_name not in teams_data:
-            teams_data[team_name] = []
+        # Initialize list to hold rows for this team
+        team_rows = []
 
-        # Extract values for each period from all cells
+        # For each period, extract values from all columns
         for period_idx in range(num_periods):
-            row_data = [team_name]  # Start with team name
+            row_data = {}
 
-            for cell_idx, cell in enumerate(cells[1:], 1):  # Skip first cell (team)
-                # Split cell content by <br> tags and <hr>
-                cell_values = []
+            # Add Period column
+            row_data['Period'] = period_labels[period_idx]
 
-                # Check if cell has <div class="hall">
-                hall_div = cell.find('div', class_='hall')
+            # Process each data column
+            for col_idx in range(2, len(cells)):  # Skip team name and Period
+                if col_idx - 1 >= len(headers):  # Safety check
+                    break
 
-                if hall_div:
-                    # Extract values from hall div (period labels column)
-                    for content in hall_div.children:
-                        if content.name == 'br':
-                            continue
-                        elif content.name == 'hr':
-                            break
-                        else:
-                            text = str(content).strip()
-                            if text:
-                                cell_values.append(text)
+                header = headers[col_idx]
+                cell = cells[col_idx]
 
-                    # Get the "Final" text (after </div>)
-                    final_text = ''
-                    for sibling in hall_div.next_siblings:
-                        if sibling.name is None:  # Text node
-                            final_text += str(sibling).strip()
-                    if final_text:
-                        cell_values.append(final_text)
-                else:
-                    # Regular cell - split by <br> tags
-                    # Get HTML string and replace <br> tags (don't modify original tree!)
-                    cell_html = str(cell)
-                    # Replace br tags with newline marker
-                    import re
-                    cell_html = re.sub(r'<br\s*/?>', '\n', cell_html, flags=re.IGNORECASE)
-                    # Parse the modified HTML to get text
-                    from bs4 import BeautifulSoup
-                    temp_soup = BeautifulSoup(cell_html, 'lxml')
-                    cell_text = temp_soup.get_text()
-
-                    # Split by <hr> first (if present)
-                    if '<hr>' in str(cell) or cell.find('hr'):
-                        # Split before and after <hr>
-                        parts = cell_text.split('\n')
-                        final_val = None
-                        period_vals = []
-
-                        # Find where the hr would be (after the last period value)
-                        for i, part in enumerate(parts):
-                            part = part.strip()
-                            if part:
-                                # Check if this is after the hr
-                                # The hr appears after the period values
-                                period_vals.append(part)
-
-                        # Last value is the Final
-                        if period_vals:
-                            final_val = period_vals[-1]
-                            period_vals = period_vals[:-1]
-                            cell_values = period_vals + [final_val]
-                        else:
-                            cell_values = period_vals
-                    else:
-                        # Just split by newlines
-                        cell_values = [part.strip() for part in cell_text.split('\n') if part.strip()]
+                # Extract values from cell using helper function
+                cell_values = extract_cell_values(cell)
 
                 # Get value for this period
                 if period_idx < len(cell_values):
-                    row_data.append(cell_values[period_idx])
+                    row_data[header] = cell_values[period_idx]
                 else:
-                    row_data.append('')
+                    row_data[header] = ''
 
-            teams_data[team_name].append(row_data)
+            team_rows.append(row_data)
 
-    # Create DataFrames for each team
-    if teams_data:
-        if len(teams_data) == 1:
-            # Single team - return just the DataFrame
-            team_name = list(teams_data.keys())[0]
-            df = pd.DataFrame(teams_data[team_name], columns=headers)
-            # Remove the team name column (first column)
-            if len(df.columns) > 0 and df.columns[0] == '':
-                df = df.iloc[:, 1:]
-            return df
-        else:
-            # Multiple teams - return dict of DataFrames
-            result = {}
-            for team_name, rows in teams_data.items():
-                df = pd.DataFrame(rows, columns=headers)
-                # Remove the team name column (first column)
-                if len(df.columns) > 0:
-                    df = df.iloc[:, 1:]
-                # Remove trailing empty rows
-                df = df.dropna(how='all')
-                # Remove rows where all values (except Period) are empty or NaN
-                df = df[df.iloc[:, 1:].notna().any(axis=1)]
-                result[team_name] = df
-            return result
+        # Convert to DataFrame
+        df = pd.DataFrame(team_rows)
+        teams_data[team_name] = df
 
-    return None
+    return teams_data if teams_data else None
 
 # Mapping of situation classes to readable names
 SITUATION_NAMES = {
@@ -1183,7 +1197,7 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
     else:
         # Not in cache - need to download
         # Delay BEFORE acquiring lock so threads don't wait for each other's delays
-        respectful_delay()
+        respectful_delay(is_429=False)
 
         # Now acquire lock to check again and potentially download
         with _cache_lock:
@@ -1191,12 +1205,21 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
             if game_id in game_cache:
                 soup = game_cache[game_id]
             else:
-                # Download outside of lock or keep lock minimal
+                # Download with proper headers
                 try:
-                    response = session.get(full_report_url, timeout=30)
+                    # Add Referer to mimic clicking from game list
+                    headers = {'Referer': 'https://www.naturalstattrick.com/games.php'}
+                    response = session.get(full_report_url, headers=headers, timeout=30)
+
                     if response.status_code == 403:
                         print("      ✗ IP blocked (403). Stopping.")
+                        respectful_delay(is_429=True)
                         return 0
+                    elif response.status_code == 429:
+                        print("      ✗ Rate limited (429). Backing off.")
+                        respectful_delay(is_429=True)
+                        return 0
+
                     response.raise_for_status()
                     soup = BeautifulSoup(response.content, 'lxml')
                     game_cache[game_id] = soup
@@ -1249,6 +1272,9 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
                         # Parse the period-by-period table
                         parsed_data = parse_period_by_period_table(overview_table)
 
+                        if parsed_data is None:
+                            print(f"      ⚠ WARNING: parse_period_by_period_table returned None for game {game_id} situation {situation}")
+
                         if parsed_data:
                             # parse_period_by_period_table returns a dict {team_name: DataFrame}
                             if isinstance(parsed_data, dict):
@@ -1285,10 +1311,15 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
     # ==============================================================
     # 2. ALL OTHER SECTIONS - using extract_table_sections()
     # ==============================================================
-    # Extract all sections (Individual, On Ice, Shift Report, Forward Lines, Linemates, Opposition, etc.)
+    # Extract all sections EXCEPT Overview (Individual, On Ice, Shift Report, Forward Lines, Linemates, Opposition, etc.)
+    # Overview is already handled in Section 1 above
     sections = extract_table_sections(soup)
 
     for section_name, section_data in sections.items():
+        # Skip Overview section - it's already processed in Section 1
+        if 'overview' in section_name.lower():
+            continue
+
         # Process each situation (All, EV, 5v5, PP, PK, etc.)
         for situation, table_list in section_data['situations'].items():
             for i, table in enumerate(table_list):
@@ -1359,6 +1390,58 @@ def load_all_existing_games(team_abbr):
         print(f"  ✓ Loaded total of {len(all_games)} games across {len(season_folders)} seasons for {team_abbr}")
 
     return all_games
+
+def count_complete_games(season_folder=None):
+    """
+    Count games with complete data (≥400 files per game).
+
+    Args:
+        season_folder: If provided, only count games in this season folder.
+                      If None, count across all seasons.
+
+    Returns:
+        Tuple of (complete_count, incomplete_count, total_count)
+    """
+    from collections import defaultdict
+
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    EXPECTED_MIN_FILES = 400
+
+    # Build index of all game files
+    game_files_count = defaultdict(int)
+
+    for team in nhl_teams:
+        if season_folder:
+            # Count only for specific season
+            season_path = os.path.join(base_folder_path, team, games_folder, season_folder)
+            if os.path.exists(season_path):
+                for filename in os.listdir(season_path):
+                    if filename.endswith('.csv') and '_games_list.csv' not in filename:
+                        # Extract game ID from filename
+                        parts = filename.split('_')
+                        if len(parts) >= 2:
+                            game_id = parts[1]
+                            game_files_count[game_id] += 1
+        else:
+            # Count across all seasons
+            team_games_base = os.path.join(base_folder_path, team, games_folder)
+            if os.path.exists(team_games_base):
+                for season in os.listdir(team_games_base):
+                    season_path = os.path.join(team_games_base, season)
+                    if os.path.isdir(season_path):
+                        for filename in os.listdir(season_path):
+                            if filename.endswith('.csv') and '_games_list.csv' not in filename:
+                                parts = filename.split('_')
+                                if len(parts) >= 2:
+                                    game_id = parts[1]
+                                    game_files_count[game_id] += 1
+
+    complete = sum(1 for count in game_files_count.values() if count >= EXPECTED_MIN_FILES)
+    incomplete = sum(1 for count in game_files_count.values() if count < EXPECTED_MIN_FILES)
+    total = len(game_files_count)
+
+    return complete, incomplete, total
 
 def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2):
     """
@@ -1498,6 +1581,28 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
     print(f"    💾 Processed {total_saves} games")
     print(f"    ⏭ Skipped {skipped_games} already-scraped games")
     print(f"    {total_saves - unique_downloads} ")
+
+    # Count complete games
+    print(f"\n=== Data Completeness Analysis ===")
+
+    # Current season stats
+    complete_current, incomplete_current, total_current = count_complete_games(season_folder)
+    print(f"\n📁 Current Season ({season_folder}):")
+    print(f"    ✓ Complete games (≥400 files): {complete_current}")
+    print(f"    ⚠ Incomplete games (<400 files): {incomplete_current}")
+    print(f"    📊 Total games: {total_current}")
+    if total_current > 0:
+        print(f"    📈 Completion rate: {complete_current/total_current*100:.1f}%")
+
+    # All seasons stats
+    complete_all, incomplete_all, total_all = count_complete_games(None)
+    print(f"\n📚 All Seasons (Entire Dataset):")
+    print(f"    ✓ Complete games (≥400 files): {complete_all}")
+    print(f"    ⚠ Incomplete games (<400 files): {incomplete_all}")
+    print(f"    📊 Total games: {total_all}")
+    if total_all > 0:
+        print(f"    📈 Completion rate: {complete_all/total_all*100:.1f}%")
+
     print("===========================================\n")
 
 
@@ -1542,10 +1647,34 @@ def fetch_season_data(start_year, end_year, session):
 # Main execution logic
 if __name__ == "__main__":
 
+    # ========================================================================
+    # ROBOTS.TXT COMPLIANCE SETTINGS
+    # ========================================================================
+    # Site robots.txt: Crawl-delay: 240s, Disallows: /game.php (for all user agents)
+    # Note: /game.php is allowed for Googlebot, suggesting some access is OK
+    #
+    # SCRAPING PATTERN:
+    # - games.php: Called once per team (32 times total) - ALLOWED for Googlebot
+    # - game.php: Called once per game (~7,872 for 3 seasons) - DISALLOWED for bots
+    #
+    # REALISTIC OPTIONS (balancing speed vs ban risk):
+    # 1. STRICT (240s):     ~15 games/hour  → 22 days for 3 seasons (no ban risk)
+    # 2. MODERATE (30s):    ~120 games/hour → 2.75 days (low ban risk)
+    # 3. RELAXED (10s):     ~360 games/hour → 22 hours (medium ban risk)
+    # 4. AGGRESSIVE (3s):   ~1200 games/hour → 6.5 hours (high ban risk)
+    # 5. VERY AGGRESSIVE (1s): ~3600 games/hour → 2.2 hours (very high ban risk)
+    #
+    # RECOMMENDATION: Start with MODERATE (30s) or RELAXED (10s)
+    # ========================================================================
+
+    # Delay configuration (in seconds)
+    DELAY_SECONDS = 10  # Start with 10s - adjust based on whether you get banned
+    # Options: 240 (strict), 30 (moderate), 10 (relaxed), 3 (aggressive), 1 (very aggressive)
+
     # Configuration
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
-    FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    FETCH_NEW_GAME_LISTS = True # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
@@ -1555,8 +1684,11 @@ if __name__ == "__main__":
     MAX_WORKERS = 8  # Number of concurrent file writes (4-8 recommended)
 
     # Parallel Game Processing
-    PARALLEL_GAME_SCRAPING = True  # Enable parallel game scraping (downloads + parsing)
-    SCRAPING_WORKERS = 3 # Number of concurrent game downloads (START WITH 2, increase carefully to avoid rate limits)
+    # NOTE: Parallel scraping with delays is OK since each thread has its own delay
+    # The global rate limiter ensures minimum spacing between ANY requests
+    # However, more workers = more simultaneous connections = higher detection risk
+    PARALLEL_GAME_SCRAPING = False  # Set to True for faster scraping (higher ban risk)
+    SCRAPING_WORKERS = 1 # Start with 1; can try 2 if 10s+ delay and no bans
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
@@ -1592,7 +1724,24 @@ if __name__ == "__main__":
         season_folder = f"{season_start}-{str(season_start + 1)[-2:]}"
 
     print(f"\n📁 Using season folder: {season_folder}")
-    print(f"   (based on FROM_SEASON={FROM_SEASON}, THRU_SEASON={THRU_SEASON})\n")
+    print(f"   (based on FROM_SEASON={FROM_SEASON}, THRU_SEASON={THRU_SEASON})")
+
+    # Display rate limiting info
+    print(f"\n⏱️  Rate Limiting Configuration:")
+    print(f"   Delay per request: {DELAY_SECONDS}s")
+    print(f"   Parallel workers: {SCRAPING_WORKERS}")
+    games_per_hour = int(3600 / DELAY_SECONDS * SCRAPING_WORKERS)
+    print(f"   Estimated rate: ~{games_per_hour} games/hour")
+
+    # Estimate total time if scraping all games
+    if SCRAPE_GAMES and not FETCH_NEW_GAME_LISTS:
+        approx_games = 246 * len(nhl_teams)  # Rough estimate
+        hours_needed = approx_games / games_per_hour
+        if hours_needed < 24:
+            print(f"   Estimated time for {approx_games} games: ~{hours_needed:.1f} hours")
+        else:
+            print(f"   Estimated time for {approx_games} games: ~{hours_needed/24:.1f} days")
+    print()
 
     try:
         if SCRAPE_TEAM_REPORTS:
