@@ -1,3 +1,10 @@
+"""
+Natural Stat Trick (NST) Game Data Scraper
+===========================================
+Scrapes detailed NHL game data from naturalstattrick.com
+Saves ~400-450 CSV files per game split between both teams (~200-225 per team)
+"""
+
 import requests
 import time
 from datetime import datetime
@@ -13,20 +20,58 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-# Note that Overview section is split into two tr classes "odd" and "even"
-# No more Coyotes ):
-#TODO: CANT DO IT; certain games on NST have very limited data due to exotic venue presumably
-# These games are denoted by a "-" in the dataset and should be deleted
-#TODO: Prevent opposition parsing from saving duplicate .csv's with player name and jersey number
+# ============================================================================
+# CONFIGURATION AND CONSTANTS
+# ============================================================================
 
-# Add in 'ARI' for Coyotes historical data
+# NHL Teams - Include 'ARI' for Coyotes historical data
 nhl_teams = [
     'ANA', 'ARI', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET', 'EDM',
     'FLA', 'L.A', 'MIN', 'MTL', 'NSH', 'N.J', 'NYI', 'NYR', 'OTT', 'PHI', 'PIT', 'S.J',
     'SEA', 'STL', 'T.B', 'TOR', 'UTA', 'VGK', 'WSH', 'WPG', 'VAN'
 ]
 
+# Mapping of full team names to abbreviations
+# Used for converting team names from game reports to team codes
+TEAM_NAME_MAP = {
+    'Ducks': 'ANA', 'Anaheim': 'ANA',
+    'Coyotes': 'ARI', 'Arizona': 'ARI',  # Arizona Coyotes (moved to Utah in 2024)
+    'Bruins': 'BOS', 'Boston': 'BOS',
+    'Sabres': 'BUF', 'Buffalo': 'BUF',
+    'Flames': 'CGY', 'Calgary': 'CGY',
+    'Hurricanes': 'CAR', 'Carolina': 'CAR',
+    'Blackhawks': 'CHI', 'Chicago': 'CHI',
+    'Avalanche': 'COL', 'Colorado': 'COL',
+    'Blue Jackets': 'CBJ', 'Columbus': 'CBJ',
+    'Stars': 'DAL', 'Dallas': 'DAL',
+    'Red Wings': 'DET', 'Detroit': 'DET',
+    'Oilers': 'EDM', 'Edmonton': 'EDM',
+    'Panthers': 'FLA', 'Florida': 'FLA',
+    'Kings': 'L.A', 'Los Angeles': 'L.A',
+    'Wild': 'MIN', 'Minnesota': 'MIN',
+    'Canadiens': 'MTL', 'Montreal': 'MTL', 'Montréal': 'MTL',
+    'Predators': 'NSH', 'Nashville': 'NSH',
+    'Devils': 'N.J', 'New Jersey': 'N.J',
+    'Islanders': 'NYI', 'NY Islanders': 'NYI',
+    'Rangers': 'NYR', 'NY Rangers': 'NYR',
+    'Senators': 'OTT', 'Ottawa': 'OTT',
+    'Flyers': 'PHI', 'Philadelphia': 'PHI',
+    'Penguins': 'PIT', 'Pittsburgh': 'PIT',
+    'Sharks': 'S.J', 'San Jose': 'S.J',
+    'Kraken': 'SEA', 'Seattle': 'SEA',
+    'Blues': 'STL', 'St. Louis': 'STL', 'St Louis': 'STL',
+    'Lightning': 'T.B', 'Tampa Bay': 'T.B',
+    'Maple Leafs': 'TOR', 'Toronto': 'TOR',
+    # Utah team names - all variations map to UTA
+    'Mammoth': 'UTA', 'Utah': 'UTA', 'Utah HC': 'UTA', 'HC': 'UTA',
+    'Golden Knights': 'VGK', 'Vegas': 'VGK',
+    'Capitals': 'WSH', 'Washington': 'WSH',
+    'Jets': 'WPG', 'Winnipeg': 'WPG',
+    'Canucks': 'VAN', 'Vancouver': 'VAN'
+}
 
+
+# Site paths to exclude from scraping
 site_directory_paths = [
     "/playerreport.php",
     "/gameflow.php",
@@ -40,7 +85,7 @@ site_directory_paths = [
     "/DataTables-1.10.3/"
 ]
 
-# Scraping configuration - sections to include
+# Sections to scrape (each generates multiple files per game)
 ESSENTIAL_SECTIONS = {
     'overview': True,           # Game summary stats
     'power_plays': True,        # Power play stats
@@ -52,6 +97,10 @@ ESSENTIAL_SECTIONS = {
     'linemates': True,         # Player linemates stats (many files per player)
     'opposition': True,        # Player opposition stats (many files per player)
 }
+
+# ============================================================================
+# HTTP SESSION AND RATE LIMITING
+# ============================================================================
 
 def should_include_section(section_name):
     """Determine if a section should be scraped based on configuration"""
@@ -302,6 +351,10 @@ def respectful_delay(is_429=False):
 
         _last_request_time = time.time()
 
+# ============================================================================
+# LEGACY/OPTIONAL SCRAPERS (Controlled by config flags)
+# ============================================================================
+
 def get_static_tables(team_abbr, date_folder, session):
     url = f"https://www.naturalstattrick.com/teamreport.php?team={team_abbr}"
     base_folder_path = "nhlteamreports"
@@ -399,6 +452,10 @@ def download_charts(base_url, date_folder, session):
 
     except Exception as e:
         print(f"✗ Error downloading charts: {e}")
+
+# ============================================================================
+# GAME LIST MANAGEMENT
+# ============================================================================
 
 def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseason=None, stype=2):
     """
@@ -512,6 +569,9 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
             if len(cells) > 3:
                 game_info['stats'] = [cell.get_text(strip=True) for cell in cells[3:]]
 
+            # Initialize missing_data flag (0 = has data, 1 = missing/incomplete data)
+            game_info['missing_data'] = 0
+
             games_data.append(game_info)
 
         # Group games by their actual season and save to appropriate folders
@@ -590,59 +650,23 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
 
 
 def extract_team_abbr_from_name(team_full_name, current_team_abbr):
-    """
-    Try to extract team abbreviation from full team name
-    """
-    # Mapping of common team names to abbreviations
-    team_name_map = {
-        'Ducks': 'ANA', 'Anaheim': 'ANA',
-        'Coyotes': 'ARI', 'Arizona': 'ARI',  # Arizona Coyotes (moved to Utah in 2024)
-        'Bruins': 'BOS', 'Boston': 'BOS',
-        'Sabres': 'BUF', 'Buffalo': 'BUF',
-        'Flames': 'CGY', 'Calgary': 'CGY',
-        'Hurricanes': 'CAR', 'Carolina': 'CAR',
-        'Blackhawks': 'CHI', 'Chicago': 'CHI',
-        'Avalanche': 'COL', 'Colorado': 'COL',
-        'Blue Jackets': 'CBJ', 'Columbus': 'CBJ',
-        'Stars': 'DAL', 'Dallas': 'DAL',
-        'Red Wings': 'DET', 'Detroit': 'DET',
-        'Oilers': 'EDM', 'Edmonton': 'EDM',
-        'Panthers': 'FLA', 'Florida': 'FLA',
-        'Kings': 'L.A', 'Los Angeles': 'L.A',
-        'Wild': 'MIN', 'Minnesota': 'MIN',
-        'Canadiens': 'MTL', 'Montreal': 'MTL', 'Montréal': 'MTL',
-        'Predators': 'NSH', 'Nashville': 'NSH',
-        'Devils': 'N.J', 'New Jersey': 'N.J',
-        'Islanders': 'NYI', 'NY Islanders': 'NYI',
-        'Rangers': 'NYR', 'NY Rangers': 'NYR',
-        'Senators': 'OTT', 'Ottawa': 'OTT',
-        'Flyers': 'PHI', 'Philadelphia': 'PHI',
-        'Penguins': 'PIT', 'Pittsburgh': 'PIT',
-        'Sharks': 'S.J', 'San Jose': 'S.J',
-        'Kraken': 'SEA', 'Seattle': 'SEA',
-        'Blues': 'STL', 'St. Louis': 'STL', 'St Louis': 'STL',
-        'Lightning': 'T.B', 'Tampa Bay': 'T.B',
-        'Maple Leafs': 'TOR', 'Toronto': 'TOR',
-        # Utah team names - all variations map to UTA
-        'Mammoth': 'UTA', 'Utah': 'UTA', 'Utah HC': 'UTA', 'HC': 'UTA',
-        'Golden Knights': 'VGK', 'Vegas': 'VGK',
-        'Capitals': 'WSH', 'Washington': 'WSH',
-        'Jets': 'WPG', 'Winnipeg': 'WPG',
-        'Canucks': 'VAN', 'Vancouver': 'VAN'
-    }
-
+    """Extract team abbreviation from full team name using TEAM_NAME_MAP"""
     # Check each part of the team name
     for part in team_full_name.split():
-        if part in team_name_map:
-            return team_name_map[part]
+        if part in TEAM_NAME_MAP:
+            return TEAM_NAME_MAP[part]
 
     # Check full name
-    if team_full_name in team_name_map:
-        return team_name_map[team_full_name]
+    if team_full_name in TEAM_NAME_MAP:
+        return TEAM_NAME_MAP[team_full_name]
 
     # If we can't determine, return None
     return None
 
+
+# ============================================================================
+# HTML PARSING (Core parsing logic - DO NOT MODIFY)
+# ============================================================================
 
 def parse_table_fast(table):
     """
@@ -1055,114 +1079,13 @@ def extract_table_sections(soup):
 
     return sections
 
-def is_corrupted_game(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
-    """
-    Check if a game has corrupted files (identified by '_-_' pattern in filename).
-    Corrupted games have incomplete data on NST (exotic venues, etc.) and should be skipped.
+# OLD GAME-SKIPPING LOGIC REMOVED
+# Functions is_corrupted_game() and game_already_exists() removed
+# These will be replaced with new robust logic
 
-    Args:
-        game_file_prefix: The game prefix (e.g., "BOSvsVGK_20069")
-        season_folder: The season folder to check (e.g., '2024-25')
-        team_abbr: Current team abbreviation (optional)
-        opponent_abbr: Opponent team abbreviation (optional)
-
-    Returns:
-        True if corrupted game files are found, False otherwise
-    """
-    base_folder_path = "nhlteamreports"
-    games_folder = "games"
-
-    # List of teams to check
-    teams_to_check = []
-    if team_abbr:
-        teams_to_check.append(team_abbr)
-    if opponent_abbr and opponent_abbr != 'OPP':
-        teams_to_check.append(opponent_abbr)
-
-    if not teams_to_check and team_abbr:
-        teams_to_check = [team_abbr]
-
-    # Check for corrupted files (files with '_-_' pattern)
-    for team in teams_to_check:
-        team_games_path = os.path.join(base_folder_path, team, games_folder, season_folder)
-        if os.path.exists(team_games_path):
-            for file in os.listdir(team_games_path):
-                # Extract game_id from filename to match
-                if file.startswith(game_file_prefix) and '_-_' in file:
-                    return True
-
-    return False
-
-# Cache for game existence checks to avoid repeated file system calls
-_game_exists_cache = {}
-_game_exists_cache_lock = threading.Lock()
-
-def game_already_exists(game_file_prefix, season_folder, team_abbr=None, opponent_abbr=None):
-    """
-    Check if a game has already been scraped by looking for any files with the game ID.
-    Checks both teams' directories if opponent is known.
-    Also returns True if the game is corrupted (to skip re-scraping).
-    Uses caching to avoid repeated file system checks.
-
-    Args:
-        game_file_prefix: The game prefix (e.g., "BOSvsVGK_20069")
-        season_folder: The season folder to check (e.g., '2024-25')
-        team_abbr: Current team abbreviation (optional)
-        opponent_abbr: Opponent team abbreviation (optional)
-
-    Returns:
-        True if game already exists or is corrupted, False otherwise
-    """
-    # Check cache first
-    cache_key = (game_file_prefix, season_folder)
-    with _game_exists_cache_lock:
-        if cache_key in _game_exists_cache:
-            return _game_exists_cache[cache_key]
-
-    base_folder_path = "nhlteamreports"
-    games_folder = "games"
-
-    # First check if this is a corrupted game - if so, skip it
-    if is_corrupted_game(game_file_prefix, season_folder, team_abbr, opponent_abbr):
-        with _game_exists_cache_lock:
-            _game_exists_cache[cache_key] = True
-        return True
-
-    # Extract game_id from prefix (e.g., "BOSvsVGK_20069" -> "20069")
-    game_id = game_file_prefix.split('_')[-1]
-
-    # List of teams to check
-    teams_to_check = []
-    if team_abbr:
-        teams_to_check.append(team_abbr)
-    if opponent_abbr and opponent_abbr != 'OPP':
-        teams_to_check.append(opponent_abbr)
-
-    # If we don't have specific teams, just check the current team
-    if not teams_to_check and team_abbr:
-        teams_to_check = [team_abbr]
-
-    # Check if ANY files exist for this game_id
-    # This handles cases where opponent was previously unknown (saved as "OPP")
-    # or team names have changed (e.g., "Utah HC" -> "Mammoth")
-    for team in teams_to_check:
-        team_games_path = os.path.join(base_folder_path, team, games_folder, season_folder)
-        if os.path.exists(team_games_path):
-            # Look for any file containing this game_id
-            for file in os.listdir(team_games_path):
-                # Skip the games_list CSV
-                if '_games_list.csv' in file:
-                    continue
-                # Check if this file is for our game_id
-                # Format: TEAMvsOPP_GAMEID_... or TEAMvsTEAM_GAMEID_...
-                if f'_{game_id}_' in file or file.startswith(f'{game_file_prefix}_'):
-                    with _game_exists_cache_lock:
-                        _game_exists_cache[cache_key] = True
-                    return True
-
-    with _game_exists_cache_lock:
-        _game_exists_cache[cache_key] = False
-    return False
+# ============================================================================
+# GAME SCRAPING
+# ============================================================================
 
 def scrape_game_report(full_report_url, game, team_abbr, season_folder, session, game_cache, use_threading=False, max_workers=8):
     """
@@ -1183,10 +1106,6 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
     teams_sorted = sorted([team_abbr, opponent_abbr]) if opponent_abbr else [team_abbr, 'OPP']
     game_file_prefix = f"{teams_sorted[0]}vs{teams_sorted[1]}_{game_id}"
 
-    # Check if game already exists on disk BEFORE downloading
-    if game_already_exists(game_file_prefix, season_folder, team_abbr, opponent_abbr):
-        print(f"      ⏭ Skipping {game_id}: already exists")
-        return 0
 
     print(f"      Scraping full report: {title} | {game_id}")
 
@@ -1368,6 +1287,10 @@ def load_all_existing_games(team_abbr):
     """
     Load existing games lists from ALL season folders for a team
     Returns a combined list of all games
+
+    NOTE: This function is not currently used in the main scraping flow.
+    Use load_existing_games_list(team_abbr, season_folder) instead to load
+    games from a specific season only.
     """
     base_folder_path = "nhlteamreports"
     games_folder = "games"
@@ -1391,62 +1314,192 @@ def load_all_existing_games(team_abbr):
 
     return all_games
 
-def count_complete_games(season_folder=None):
+# ============================================================================
+# GAME FILTERING AND DETECTION
+# ============================================================================
+
+def mark_game_missing_data(team_abbr, season_folder, game_id):
     """
-    Count games with complete data (≥400 files per game).
+    Mark a game as having missing/incomplete data in the team's games_list CSV.
+    This prevents the scraper from repeatedly attempting to scrape games with no data.
 
     Args:
-        season_folder: If provided, only count games in this season folder.
-                      If None, count across all seasons.
+        team_abbr: Team abbreviation (e.g., 'ANA')
+        season_folder: Season folder (e.g., '2023-24')
+        game_id: Game ID to mark (e.g., '20100')
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+    games_list_file = os.path.join(team_games_path, f"{team_abbr}_games_list.csv")
+
+    if not os.path.exists(games_list_file):
+        print(f"      ⚠ Cannot mark game {game_id} as missing: games_list file not found for {team_abbr} {season_folder}")
+        return
+
+    try:
+        df = pd.read_csv(games_list_file)
+
+        # Add missing_data column if it doesn't exist
+        if 'missing_data' not in df.columns:
+            df.insert(df.columns.get_loc('stats') if 'stats' in df.columns else len(df.columns),
+                     'missing_data', 0)
+
+        # Mark the game as missing data
+        game_id_str = str(game_id)
+        mask = df['game_id'].astype(str) == game_id_str
+
+        if mask.any():
+            df.loc[mask, 'missing_data'] = 1
+            df.to_csv(games_list_file, index=False)
+            print(f"      ℹ Marked game {game_id} as missing data for {team_abbr}")
+        else:
+            print(f"      ⚠ Game {game_id} not found in {team_abbr} games_list")
+
+    except Exception as e:
+        print(f"      ✗ Error marking game {game_id} as missing data: {e}")
+
+
+def build_scraped_games_set(season_folder):
+    """
+    Build a set of game IDs to skip (already scraped OR marked as missing data).
+    Single filesystem scan with O(1) lookup time.
+
+    Strategy:
+    1. Any game with 150+ files (across all teams) is considered "scraped"
+    2. Any game marked with missing_data=1 in games_list CSV is skipped
+
+    Args:
+        season_folder: The season folder to scan (e.g., '2023-24')
 
     Returns:
-        Tuple of (complete_count, incomplete_count, total_count)
+        Set of game IDs that should be skipped (e.g., {'20001', '20002', ...})
     """
-    from collections import defaultdict
+    from collections import Counter
 
     base_folder_path = "nhlteamreports"
     games_folder = "games"
-    EXPECTED_MIN_FILES = 400
+    game_file_counts = Counter()
+    missing_data_games = set()
 
-    # Build index of all game files
-    game_files_count = defaultdict(int)
+    print(f"  🔍 Scanning for already-scraped and missing-data games in {season_folder}...")
 
+    # Single pass through all team folders
     for team in nhl_teams:
-        if season_folder:
-            # Count only for specific season
-            season_path = os.path.join(base_folder_path, team, games_folder, season_folder)
-            if os.path.exists(season_path):
-                for filename in os.listdir(season_path):
-                    if filename.endswith('.csv') and '_games_list.csv' not in filename:
-                        # Extract game ID from filename
-                        parts = filename.split('_')
-                        if len(parts) >= 2:
-                            game_id = parts[1]
-                            game_files_count[game_id] += 1
-        else:
-            # Count across all seasons
-            team_games_base = os.path.join(base_folder_path, team, games_folder)
-            if os.path.exists(team_games_base):
-                for season in os.listdir(team_games_base):
-                    season_path = os.path.join(team_games_base, season)
-                    if os.path.isdir(season_path):
-                        for filename in os.listdir(season_path):
-                            if filename.endswith('.csv') and '_games_list.csv' not in filename:
-                                parts = filename.split('_')
-                                if len(parts) >= 2:
-                                    game_id = parts[1]
-                                    game_files_count[game_id] += 1
+        team_games_path = os.path.join(base_folder_path, team, games_folder, season_folder)
 
-    complete = sum(1 for count in game_files_count.values() if count >= EXPECTED_MIN_FILES)
-    incomplete = sum(1 for count in game_files_count.values() if count < EXPECTED_MIN_FILES)
-    total = len(game_files_count)
+        if not os.path.exists(team_games_path):
+            continue
 
-    return complete, incomplete, total
+        # Check games_list for missing_data flags
+        games_list_file = os.path.join(team_games_path, f"{team}_games_list.csv")
+        if os.path.exists(games_list_file):
+            try:
+                df = pd.read_csv(games_list_file)
+                if 'missing_data' in df.columns:
+                    # Add games with missing_data=1 to the skip set
+                    missing_games = df[df['missing_data'] == 1]['game_id'].astype(str).tolist()
+                    missing_data_games.update(missing_games)
+            except Exception as e:
+                print(f"    ⚠ Error reading {team} games_list: {e}")
+
+        # Count files per game_id
+        for filename in os.listdir(team_games_path):
+            if filename.endswith('.csv') and '_games_list' not in filename:
+                parts = filename.split('_')
+                if len(parts) >= 2 and parts[1].isdigit():
+                    game_id = parts[1]
+                    game_file_counts[game_id] += 1
+
+    # Games with 150+ files are considered scraped (conservative threshold)
+    # Typical complete games have 193-239 files per team, 400-450 total
+    THRESHOLD = 150
+    scraped_games = {
+        game_id for game_id, count in game_file_counts.items()
+        if count >= THRESHOLD
+    }
+
+    # Combine both sets: scraped games + missing data games
+    games_to_skip = scraped_games | missing_data_games
+
+    print(f"  ✓ Found {len(scraped_games)} already-scraped games")
+    if missing_data_games:
+        print(f"  ✓ Found {len(missing_data_games)} games marked as missing data")
+    print(f"  📊 Total games to skip: {len(games_to_skip)}")
+    if game_file_counts:
+        print(f"  📊 File count summary: {len(game_file_counts)} unique games, "
+              f"{sum(game_file_counts.values())} total files")
+
+    return games_to_skip
+
+
+def _process_single_game(team, game, game_idx, total_games, season_folder, game_cache,
+                         use_threading, max_workers, stats_dict, stats_lock):
+    """
+    Process a single game (thread-safe helper for process_all_games)
+
+    Args:
+        team: Team abbreviation
+        game: Game dict with game_id, title, full_report_url
+        game_idx: Current game index (for display)
+        total_games: Total number of games (for display)
+        season_folder: Season folder name (e.g., '2023-24')
+        game_cache: Shared game cache dict
+        use_threading: Enable threaded CSV writing
+        max_workers: Number of CSV write threads
+        stats_dict: Shared stats dictionary with keys: unique_downloads, total_saves, skipped_games
+        stats_lock: Threading lock for stats updates
+    """
+    game_id = game.get('game_id', 'unknown')
+    print(f"    [{game_idx}/{total_games}] Processing game {game_id}: {game.get('title', 'Unknown')}")
+
+    # Get thread-local session
+    thread_session = get_thread_session()
+
+    with _cache_lock:
+        cache_size_before = len(game_cache)
+
+    # Only process full report
+    if 'full_report_url' in game:
+        tables_saved = scrape_game_report(
+            game['full_report_url'],
+            game,
+            team,
+            season_folder,
+            thread_session,
+            game_cache,
+            use_threading=use_threading,
+            max_workers=max_workers
+        )
+
+        with _cache_lock:
+            cache_size_after = len(game_cache)
+            was_new_download = cache_size_after > cache_size_before
+
+        # Check if this game has no data (corrupted/incomplete)
+        # If we got 0 tables, mark it as missing data to avoid future attempts
+        if tables_saved == 0:
+            mark_game_missing_data(team, season_folder, game_id)
+
+        # Update stats (separate lock to minimize contention)
+        with stats_lock:
+            if was_new_download:
+                stats_dict['unique_downloads'] += 1
+            if tables_saved > 0:
+                stats_dict['total_saves'] += 1
+
+
+# ============================================================================
+# MAIN ORCHESTRATION
+# ============================================================================
+
 
 def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2):
     """
     Process all games for all teams, using cache to avoid duplicate downloads
     but saving to each team's directory - ONLY FULL REPORTS
+
+    Memory-optimized version with batching to prevent unbounded cache growth.
 
     Args:
         season_folder: Folder name based on season (e.g., '2024-25' for 2024-25 season)
@@ -1467,8 +1520,8 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
         print(f"Season range: {fromseason} to {thruseason}")
         print(f"Season type: {'Regular Season' if stype == 2 else 'Playoffs'}\n")
 
-    # Cache to store downloaded game data
-    game_cache = {}
+    # Memory optimization: Process in batches to prevent cache from growing too large
+    BATCH_SIZE = 100  # Process 100 games at a time before clearing cache
 
     # First, collect all games from all teams
     all_games_by_team = {}
@@ -1479,66 +1532,28 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
             games_data = get_games_list(team, season_folder, session, fromseason=fromseason, thruseason=thruseason, stype=stype)
             all_games_by_team[team] = games_data
     else:
-        print("Using existing game lists from ALL season CSV files...\n")
+        print(f"Using existing game lists from {season_folder} CSV files...\n")
         for team in nhl_teams:
-            games_data = load_all_existing_games(team)
+            # Load only the specified season, not all seasons
+            games_data = load_existing_games_list(team, season_folder)
             all_games_by_team[team] = games_data
 
+    # Build set of already-scraped games ONCE before processing
+    print("\n" + "="*60)
+    print("Building scraped games cache...")
+    print("="*60)
+    scraped_games_set = build_scraped_games_set(season_folder)
+    print("="*60 + "\n")
+
     # Track total unique games and total saves
-    unique_downloads = 0
-    total_saves = 0
-    skipped_games = 0
+    stats_dict = {
+        'unique_downloads': 0,
+        'total_saves': 0,
+        'skipped_games': 0
+    }
     stats_lock = threading.Lock()  # Lock for updating statistics only
 
-    def process_single_game(team, game, game_idx, total_games):
-        """Process a single game (thread-safe)"""
-        nonlocal unique_downloads, total_saves, skipped_games
-
-        game_id = game.get('game_id', 'unknown')
-        print(f"    [{game_idx}/{total_games}] Processing game {game_id}: {game.get('title', 'Unknown')}")
-
-        # Get thread-local session
-        thread_session = get_thread_session()
-
-        with _cache_lock:
-            cache_size_before = len(game_cache)
-
-        # Only process full report
-        if 'full_report_url' in game:
-            scrape_game_report(
-                game['full_report_url'],
-                game,
-                team,
-                season_folder,
-                thread_session,  # Use thread-local session
-                game_cache,
-                use_threading=use_threading,
-                max_workers=max_workers
-            )
-
-            with _cache_lock:
-                cache_size_after = len(game_cache)
-                was_new_download = cache_size_after > cache_size_before
-
-            # Update stats (separate lock to minimize contention)
-            with stats_lock:
-                if was_new_download:
-                    unique_downloads += 1
-                    total_saves += 1
-                else:
-                    # Check if game exists to confirm it was skipped
-                    team1_full = game.get('team1_full', '')
-                    team2_full = game.get('team2_full', '')
-                    team1_abbr = extract_team_abbr_from_name(team1_full, team)
-                    team2_abbr = extract_team_abbr_from_name(team2_full, team)
-                    opponent_abbr = team1_abbr if team1_abbr != team else team2_abbr
-                    teams_sorted = sorted([team, opponent_abbr]) if opponent_abbr else [team, 'OPP']
-                    game_file_prefix = f"{teams_sorted[0]}vs{teams_sorted[1]}_{game_id}"
-
-                    if game_already_exists(game_file_prefix, season_folder, team, opponent_abbr):
-                        skipped_games += 1
-
-    # Now process games for each team
+    # Now process games for each team with batching
     for i, team in enumerate(nhl_teams, 1):
         print(f"\n[{i}/{len(nhl_teams)}] Processing games for {team}")
 
@@ -1546,63 +1561,92 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
         if not games_data:
             continue
 
+        # Filter out already-scraped games using the set
+        games_to_process = [
+            game for game in games_data
+            if str(game.get('game_id', '')) not in scraped_games_set
+        ]
+
+        skipped_count = len(games_data) - len(games_to_process)
+        if skipped_count > 0:
+            print(f"  ⭐ Skipped {skipped_count} already-scraped games")
+
+        if not games_to_process:
+            print(f"  ✓ All games already scraped for {team}")
+            continue
+
         # Limit number of games if specified
-        games_to_process = games_data[:max_games] if max_games else games_data
+        if max_games:
+            games_to_process = games_to_process[:max_games]
 
-        if parallel_scraping:
-            # Parallel processing with ThreadPoolExecutor
-            print(f"  Using {scraping_workers} parallel workers")
-            with ThreadPoolExecutor(max_workers=scraping_workers, thread_name_prefix=f'scraper_{team}') as executor:
-                futures = []
-                for j, game in enumerate(games_to_process, 1):
-                    future = executor.submit(process_single_game, team, game, j, len(games_to_process))
-                    futures.append(future)
+        total_team_games = len(games_to_process)
+        print(f"  📊 {total_team_games} games to scrape")
 
-                # Wait for all to complete
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        print(f"      ✗ Error processing game: {e}")
-        else:
-            # Sequential processing (original)
-            for j, game in enumerate(games_to_process, 1):
-                process_single_game(team, game, j, len(games_to_process))
+        # Process games in batches to manage memory
+        for batch_start in range(0, total_team_games, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_team_games)
+            batch_games = games_to_process[batch_start:batch_end]
 
-    # Wait for any remaining write operations to complete
+            print(f"  📦 Processing batch {batch_start//BATCH_SIZE + 1}/{(total_team_games + BATCH_SIZE - 1)//BATCH_SIZE} (games {batch_start+1}-{batch_end}/{total_team_games})")
+
+            # Create a fresh cache for this batch
+            game_cache = {}
+
+            if parallel_scraping:
+                # Parallel processing with ThreadPoolExecutor
+                print(f"  Using {scraping_workers} parallel workers")
+                with ThreadPoolExecutor(max_workers=scraping_workers, thread_name_prefix=f'scraper_{team}') as executor:
+                    futures = []
+                    for j, game in enumerate(batch_games, 1):
+                        # Calculate global game index for display
+                        global_idx = batch_start + j
+                        future = executor.submit(_process_single_game, team, game, global_idx, total_team_games,
+                                                season_folder, game_cache, use_threading, max_workers,
+                                                stats_dict, stats_lock)
+                        futures.append(future)
+
+                    # Wait for all to complete
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f"      ✗ Error processing game: {e}")
+            else:
+                # Sequential processing
+                for j, game in enumerate(batch_games, 1):
+                    # Calculate global game index for display
+                    global_idx = batch_start + j
+                    _process_single_game(team, game, global_idx, total_team_games,
+                                        season_folder, game_cache, use_threading, max_workers,
+                                        stats_dict, stats_lock)
+
+            # Flush write operations for this batch
+            if use_threading:
+                write_executor = get_write_executor(max_workers)
+                print(f"  ⏳ Flushing writes for batch {batch_start//BATCH_SIZE + 1}...")
+                write_executor.shutdown(wait=True)
+                # Recreate executor for next batch
+                global _write_executor
+                _write_executor = None
+
+            # Clear the cache after batch completion to free memory
+            cache_size = len(game_cache)
+            game_cache.clear()
+            print(f"  🧹 Cleared cache ({cache_size} games freed from memory)")
+
+    # Final cleanup - ensure all writes are complete
     if use_threading:
-        write_executor = get_write_executor(max_workers)
-        print("\n⏳ Waiting for remaining file writes to complete...")
-        write_executor.shutdown(wait=True)
-        print("✓ All file writes completed")
+        # Executor should already be shut down from last batch, but check
+        if _write_executor is not None:
+            print("\n⏳ Waiting for final file writes to complete...")
+            _write_executor.shutdown(wait=True)
+            print("✓ All file writes completed")
 
     print(f"\n=== Game data collection complete ===")
-    print(f"    📊 Downloaded {unique_downloads} unique game reports")
-    print(f"    💾 Processed {total_saves} games")
-    print(f"    ⏭ Skipped {skipped_games} already-scraped games")
-    print(f"    {total_saves - unique_downloads} ")
-
-    # Count complete games
-    print(f"\n=== Data Completeness Analysis ===")
-
-    # Current season stats
-    complete_current, incomplete_current, total_current = count_complete_games(season_folder)
-    print(f"\n📁 Current Season ({season_folder}):")
-    print(f"    ✓ Complete games (≥400 files): {complete_current}")
-    print(f"    ⚠ Incomplete games (<400 files): {incomplete_current}")
-    print(f"    📊 Total games: {total_current}")
-    if total_current > 0:
-        print(f"    📈 Completion rate: {complete_current/total_current*100:.1f}%")
-
-    # All seasons stats
-    complete_all, incomplete_all, total_all = count_complete_games(None)
-    print(f"\n📚 All Seasons (Entire Dataset):")
-    print(f"    ✓ Complete games (≥400 files): {complete_all}")
-    print(f"    ⚠ Incomplete games (<400 files): {incomplete_all}")
-    print(f"    📊 Total games: {total_all}")
-    if total_all > 0:
-        print(f"    📈 Completion rate: {complete_all/total_all*100:.1f}%")
-
+    print(f"    📊 Downloaded {stats_dict['unique_downloads']} unique game reports")
+    print(f"    💾 Processed {stats_dict['total_saves']} games")
+    print(f"    ⭐ Skipped {stats_dict['skipped_games']} already-scraped games")
+    print(f"    🔄 Cache reuses: {stats_dict['total_saves'] - stats_dict['unique_downloads']}")
     print("===========================================\n")
 
 
@@ -1674,7 +1718,7 @@ if __name__ == "__main__":
     # Configuration
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
-    FETCH_NEW_GAME_LISTS = True # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
