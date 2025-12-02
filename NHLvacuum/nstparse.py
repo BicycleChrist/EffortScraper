@@ -322,7 +322,7 @@ def respectful_delay(is_429=False):
         max_jitter = max(0.3, min(min_delay * 0.1, 10.0))
     except (ImportError, AttributeError):
         # Fallback if called outside main (conservative default)
-        min_delay = 10.0
+        min_delay = 15.0
         max_jitter = 1.0
 
     with _request_lock:
@@ -571,6 +571,8 @@ def get_games_list(team_abbr, season_folder, session, fromseason=None, thruseaso
 
             # Initialize missing_data flag (0 = has data, 1 = missing/incomplete data)
             game_info['missing_data'] = 0
+            # Initialize connection_timeout flag (0 = no timeout, 1 = connection timeout/403/404)
+            game_info['connection_timeout'] = 0
 
             games_data.append(game_info)
 
@@ -1133,17 +1135,28 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
                     if response.status_code == 403:
                         print("      ✗ IP blocked (403). Stopping.")
                         respectful_delay(is_429=True)
-                        return 0
+                        # Mark as connection timeout and return special code
+                        mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        return -1  # Return -1 to indicate connection timeout
+                    elif response.status_code == 404:
+                        print("      ✗ Game not found (404).")
+                        mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        return -1  # Return -1 to indicate connection timeout
                     elif response.status_code == 429:
                         print("      ✗ Rate limited (429). Backing off.")
                         respectful_delay(is_429=True)
-                        return 0
+                        mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        return -1  # Return -1 to indicate connection timeout
 
                     response.raise_for_status()
                     soup = BeautifulSoup(response.content, 'lxml')
                     game_cache[game_id] = soup
                 except Exception as e:
                     print(f"      ✗ Failed to fetch {full_report_url}: {e}")
+                    # Check if it's a connection-related error
+                    if '403' in str(e) or '404' in str(e) or '429' in str(e) or 'timeout' in str(e).lower():
+                        mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        return -1  # Return -1 to indicate connection timeout
                     return 0
 
     tables_saved = 0
@@ -1360,6 +1373,48 @@ def mark_game_missing_data(team_abbr, season_folder, game_id):
         print(f"      ✗ Error marking game {game_id} as missing data: {e}")
 
 
+def mark_game_connection_timeout(team_abbr, season_folder, game_id):
+    """
+    Mark a game as having connection timeout (403/404) in the team's games_list CSV.
+    This prevents the scraper from repeatedly attempting to scrape games that fail due to connection issues.
+
+    Args:
+        team_abbr: Team abbreviation (e.g., 'ANA')
+        season_folder: Season folder (e.g., '2023-24')
+        game_id: Game ID to mark (e.g., '20100')
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+    games_list_file = os.path.join(team_games_path, f"{team_abbr}_games_list.csv")
+
+    if not os.path.exists(games_list_file):
+        print(f"      ⚠ Cannot mark game {game_id} as connection timeout: games_list file not found for {team_abbr} {season_folder}")
+        return
+
+    try:
+        df = pd.read_csv(games_list_file)
+
+        # Add connection_timeout column if it doesn't exist
+        if 'connection_timeout' not in df.columns:
+            df.insert(df.columns.get_loc('stats') if 'stats' in df.columns else len(df.columns),
+                     'connection_timeout', 0)
+
+        # Mark the game as connection timeout
+        game_id_str = str(game_id)
+        mask = df['game_id'].astype(str) == game_id_str
+
+        if mask.any():
+            df.loc[mask, 'connection_timeout'] = 1
+            df.to_csv(games_list_file, index=False)
+            print(f"      ℹ Marked game {game_id} as connection timeout for {team_abbr}")
+        else:
+            print(f"      ⚠ Game {game_id} not found in {team_abbr} games_list")
+
+    except Exception as e:
+        print(f"      ✗ Error marking game {game_id} as connection timeout: {e}")
+
+
 def build_scraped_games_set(season_folder):
     """
     Build a set of game IDs to skip (already scraped OR marked as missing data).
@@ -1477,9 +1532,13 @@ def _process_single_game(team, game, game_idx, total_games, season_folder, game_
             was_new_download = cache_size_after > cache_size_before
 
         # Check if this game has no data (corrupted/incomplete)
-        # If we got 0 tables, mark it as missing data to avoid future attempts
+        # If we got 0 tables AND it's not a connection timeout (return code -1), mark it as missing data
+        # Connection timeouts return -1 and are already marked by scrape_game_report
         if tables_saved == 0:
             mark_game_missing_data(team, season_folder, game_id)
+        elif tables_saved == -1:
+            # Connection timeout - already marked by scrape_game_report, don't mark as missing_data
+            tables_saved = 0  # Reset to 0 for stats tracking
 
         # Update stats (separate lock to minimize contention)
         with stats_lock:
@@ -1712,7 +1771,7 @@ if __name__ == "__main__":
     # ========================================================================
 
     # Delay configuration (in seconds)
-    DELAY_SECONDS = 10  # Start with 10s - adjust based on whether you get banned
+    DELAY_SECONDS = 7  # Start with 10s - adjust based on whether you get banned
     # Options: 240 (strict), 30 (moderate), 10 (relaxed), 3 (aggressive), 1 (very aggressive)
 
     # Configuration
@@ -1741,8 +1800,8 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20232024  # 2024-25 season
-    THRU_SEASON = 20232024  # Through 2025-26 (for current season, this is the "thru" year)
+    FROM_SEASON = 20242025  # 2024-25 season
+    THRU_SEASON = 20242025  # Through 2025-26 (for current season, this is the "thru" year)
     SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections
