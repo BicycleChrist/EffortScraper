@@ -1327,6 +1327,51 @@ def load_all_existing_games(team_abbr):
 
     return all_games
 
+def load_missing_data_games(team_abbr, season_folder):
+    """
+    Load games that are marked with missing_data=1 from a team's games_list CSV.
+    These are games that previously failed to scrape or had incomplete data.
+
+    Args:
+        team_abbr: Team abbreviation (e.g., 'OTT')
+        season_folder: Season folder (e.g., '2024-25')
+
+    Returns:
+        List of game dicts that have missing_data=1
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+    games_list_file = os.path.join(team_games_path, f"{team_abbr}_games_list.csv")
+
+    if not os.path.exists(games_list_file):
+        print(f"  ⚠ No games_list file found for {team_abbr} {season_folder}")
+        return []
+
+    try:
+        df = pd.read_csv(games_list_file)
+
+        # Check if missing_data column exists
+        if 'missing_data' not in df.columns:
+            print(f"  ℹ No missing_data column in {team_abbr} {season_folder} games_list")
+            return []
+
+        # Filter to only games with missing_data=1
+        missing_games_df = df[df['missing_data'] == 1]
+
+        if len(missing_games_df) == 0:
+            return []
+
+        # Convert DataFrame to list of dicts
+        missing_games = missing_games_df.to_dict('records')
+        print(f"  ✓ Found {len(missing_games)} games with missing data for {team_abbr} {season_folder}")
+
+        return missing_games
+
+    except Exception as e:
+        print(f"  ✗ Error loading missing games for {team_abbr} {season_folder}: {e}")
+        return []
+
 # ============================================================================
 # GAME FILTERING AND DETECTION
 # ============================================================================
@@ -1371,6 +1416,44 @@ def mark_game_missing_data(team_abbr, season_folder, game_id):
 
     except Exception as e:
         print(f"      ✗ Error marking game {game_id} as missing data: {e}")
+
+
+def clear_game_missing_data_flag(team_abbr, season_folder, game_id):
+    """
+    Clear the missing_data flag for a game that has been successfully scraped.
+    Sets missing_data=0 for the specified game.
+
+    Args:
+        team_abbr: Team abbreviation (e.g., 'ANA')
+        season_folder: Season folder (e.g., '2023-24')
+        game_id: Game ID to clear flag for (e.g., '20100')
+    """
+    base_folder_path = "nhlteamreports"
+    games_folder = "games"
+    team_games_path = os.path.join(base_folder_path, team_abbr, games_folder, season_folder)
+    games_list_file = os.path.join(team_games_path, f"{team_abbr}_games_list.csv")
+
+    if not os.path.exists(games_list_file):
+        return
+
+    try:
+        df = pd.read_csv(games_list_file)
+
+        # Only proceed if missing_data column exists
+        if 'missing_data' not in df.columns:
+            return
+
+        # Clear the missing_data flag
+        game_id_str = str(game_id)
+        mask = df['game_id'].astype(str) == game_id_str
+
+        if mask.any():
+            df.loc[mask, 'missing_data'] = 0
+            df.to_csv(games_list_file, index=False)
+            print(f"      ✓ Cleared missing_data flag for game {game_id} ({team_abbr})")
+
+    except Exception as e:
+        print(f"      ⚠ Error clearing missing_data flag for game {game_id}: {e}")
 
 
 def mark_game_connection_timeout(team_abbr, season_folder, game_id):
@@ -1539,6 +1622,9 @@ def _process_single_game(team, game, game_idx, total_games, season_folder, game_
         elif tables_saved == -1:
             # Connection timeout - already marked by scrape_game_report, don't mark as missing_data
             tables_saved = 0  # Reset to 0 for stats tracking
+        elif tables_saved > 0:
+            # Successfully scraped - clear any existing missing_data flag
+            clear_game_missing_data_flag(team, season_folder, game_id)
 
         # Update stats (separate lock to minimize contention)
         with stats_lock:
@@ -1553,7 +1639,7 @@ def _process_single_game(team, game, game_idx, total_games, season_folder, game_
 # ============================================================================
 
 
-def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2):
+def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2, scrape_missing_only=False):
     """
     Process all games for all teams, using cache to avoid duplicate downloads
     but saving to each team's directory - ONLY FULL REPORTS
@@ -1572,6 +1658,7 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
         max_workers: Number of threads for CSV writing
         parallel_scraping: Enable parallel game downloads/parsing
         scraping_workers: Number of concurrent game scrapes (be conservative!)
+        scrape_missing_only: If True, only scrape games marked with missing_data=1
     """
     print("\n=== Starting game-by-game data collection (Full Reports Only) ===\n")
 
@@ -1585,7 +1672,13 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
     # First, collect all games from all teams
     all_games_by_team = {}
 
-    if fetch_new_lists:
+    if scrape_missing_only:
+        print(f"Loading games with missing data from {season_folder} CSV files...\n")
+        for team in nhl_teams:
+            # Load only games marked with missing_data=1
+            games_data = load_missing_data_games(team, season_folder)
+            all_games_by_team[team] = games_data
+    elif fetch_new_lists:
         print("Fetching new game lists from website...\n")
         for team in nhl_teams:
             games_data = get_games_list(team, season_folder, session, fromseason=fromseason, thruseason=thruseason, stype=stype)
@@ -1598,11 +1691,21 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
             all_games_by_team[team] = games_data
 
     # Build set of already-scraped games ONCE before processing
-    print("\n" + "="*60)
-    print("Building scraped games cache...")
-    print("="*60)
-    scraped_games_set = build_scraped_games_set(season_folder)
-    print("="*60 + "\n")
+    # Skip this step if we're only scraping missing data games
+    if not scrape_missing_only:
+        print("\n" + "="*60)
+        print("Building scraped games cache...")
+        print("="*60)
+        scraped_games_set = build_scraped_games_set(season_folder)
+        print("="*60 + "\n")
+    else:
+        # When scraping missing data, we want to re-scrape those games
+        # So we don't skip any games based on existing data
+        scraped_games_set = set()
+        print("\n" + "="*60)
+        print("Scraping mode: MISSING DATA ONLY")
+        print("Will attempt to re-scrape all games marked with missing_data=1")
+        print("="*60 + "\n")
 
     # Track total unique games and total saves
     stats_dict = {
@@ -1778,6 +1881,7 @@ if __name__ == "__main__":
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
     FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    SCRAPE_MISSING_DATA_GAMES = False # Set to True to retry scraping games marked with missing_data=1
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
@@ -1791,7 +1895,7 @@ if __name__ == "__main__":
     # The global rate limiter ensures minimum spacing between ANY requests
     # However, more workers = more simultaneous connections = higher detection risk
     PARALLEL_GAME_SCRAPING = False  # Set to True for faster scraping (higher ban risk)
-    SCRAPING_WORKERS = 1 # Start with 1; can try 2 if 10s+ delay and no bans
+    SCRAPING_WORKERS = 2 # Start with 1; can try 2 if 10s+ delay and no bans
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
@@ -1800,8 +1904,8 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20242025  # 2024-25 season
-    THRU_SEASON = 20242025  # Through 2025-26 (for current season, this is the "thru" year)
+    FROM_SEASON = 20222023  # 2024-25 season
+    THRU_SEASON = 20222023  # Through 2025-26 (for current season, this is the "thru" year)
     SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections
@@ -1865,7 +1969,8 @@ if __name__ == "__main__":
                 use_threading=USE_MULTITHREADING,
                 max_workers=MAX_WORKERS,
                 parallel_scraping=PARALLEL_GAME_SCRAPING,
-                scraping_workers=SCRAPING_WORKERS
+                scraping_workers=SCRAPING_WORKERS,
+                scrape_missing_only=SCRAPE_MISSING_DATA_GAMES
             )
 
         if SCRAPE_CHARTS:
