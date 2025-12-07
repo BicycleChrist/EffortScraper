@@ -898,4 +898,27 @@ NST_playerids = {
     "Zach Whitecloud": "8480727",
     "Zack MacEwen": "8479772",
     "Zemgus Girgensons": "8476878",
+
+    # ADDED - Previously missing players (2025-11-06)
+    "Andre Lee": "8482645",
+    "Erik Portillo": "8481750",
+    "Ivan Ivan": "8482461",
+    "Jack St. Ivany": "8482244",
+    "Jakob Pelletier": "8481596",
+    "Jere Innala": "8482804",
+    "Juha Jaaska": "8482803",
+    "Keaton Middleton": "8480074",
+    "Kevin Rooney": "8478483",
+    "Matt Stienburg": "8482846",
+    "Mikael Pyyhtia": "8482227",
+    "Nikolai Kovalenko": "8482741",
+    "Nolan Allan": "8481751",
+    "Tanner Laczynski": "8479332",
+    "Ville Heinola": "8481519",
+    "Zack Ostapchuk": "8483484",
+
+    # Aliases for name variations
+    "Nicolas Aube-Kubel": "8477979",  # Also "Nicolas Aube - Kubel"
+    "Nick Paul": "8477426",  # Also "Nicholas Paul"
+    "Patrick Maroon": "8474034",  # Also "Pat Maroon"
 }

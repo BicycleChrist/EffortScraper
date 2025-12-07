@@ -34,8 +34,9 @@ nhl_teams = [
 # Mapping of full team names to abbreviations
 # Used for converting team names from game reports to team codes
 TEAM_NAME_MAP = {
+    # Original Mappings
     'Ducks': 'ANA', 'Anaheim': 'ANA',
-    'Coyotes': 'ARI', 'Arizona': 'ARI',  # Arizona Coyotes (moved to Utah in 2024)
+    'Coyotes': 'ARI', 'Arizona': 'ARI',
     'Bruins': 'BOS', 'Boston': 'BOS',
     'Sabres': 'BUF', 'Buffalo': 'BUF',
     'Flames': 'CGY', 'Calgary': 'CGY',
@@ -47,27 +48,72 @@ TEAM_NAME_MAP = {
     'Red Wings': 'DET', 'Detroit': 'DET',
     'Oilers': 'EDM', 'Edmonton': 'EDM',
     'Panthers': 'FLA', 'Florida': 'FLA',
-    'Kings': 'L.A', 'Los Angeles': 'L.A',
+    # LA Kings
+    'Kings': 'L.A', 'Los Angeles': 'L.A', 'LA': 'L.A', 'L.A': 'L.A', 'LAK': 'L.A',
     'Wild': 'MIN', 'Minnesota': 'MIN',
     'Canadiens': 'MTL', 'Montreal': 'MTL', 'Montréal': 'MTL',
     'Predators': 'NSH', 'Nashville': 'NSH',
-    'Devils': 'N.J', 'New Jersey': 'N.J',
+    # NJ Devils
+    'Devils': 'N.J', 'New Jersey': 'N.J', 'NJ': 'N.J', 'N.J': 'N.J', 'NJD': 'N.J',
     'Islanders': 'NYI', 'NY Islanders': 'NYI',
     'Rangers': 'NYR', 'NY Rangers': 'NYR',
     'Senators': 'OTT', 'Ottawa': 'OTT',
     'Flyers': 'PHI', 'Philadelphia': 'PHI',
     'Penguins': 'PIT', 'Pittsburgh': 'PIT',
-    'Sharks': 'S.J', 'San Jose': 'S.J',
+    # SJ Sharks
+    'Sharks': 'S.J', 'San Jose': 'S.J', 'SJ': 'S.J', 'S.J': 'S.J', 'SJS': 'S.J',
     'Kraken': 'SEA', 'Seattle': 'SEA',
     'Blues': 'STL', 'St. Louis': 'STL', 'St Louis': 'STL',
-    'Lightning': 'T.B', 'Tampa Bay': 'T.B',
+    # TB Lightning
+    'Lightning': 'T.B', 'Tampa Bay': 'T.B', 'TB': 'T.B', 'T.B': 'T.B', 'TBL': 'T.B',
     'Maple Leafs': 'TOR', 'Toronto': 'TOR',
-    # Utah team names - all variations map to UTA
+    # Utah team names
     'Mammoth': 'UTA', 'Utah': 'UTA', 'Utah HC': 'UTA', 'HC': 'UTA',
     'Golden Knights': 'VGK', 'Vegas': 'VGK',
     'Capitals': 'WSH', 'Washington': 'WSH',
     'Jets': 'WPG', 'Winnipeg': 'WPG',
-    'Canucks': 'VAN', 'Vancouver': 'VAN'
+    'Canucks': 'VAN', 'Vancouver': 'VAN',
+
+    # New Lowercase Mappings
+    'ducks': 'ANA', 'anaheim': 'ANA',
+    'coyotes': 'ARI', 'arizona': 'ARI',
+    'bruins': 'BOS', 'boston': 'BOS',
+    'sabres': 'BUF', 'buffalo': 'BUF', # Requested: "sabers" (corrected to "sabres") and "buffalo"
+    'flames': 'CGY', 'calgary': 'CGY',
+    'hurricanes': 'CAR', 'carolina': 'CAR',
+    'blackhawks': 'CHI', 'chicago': 'CHI',
+    'avalanche': 'COL', 'colorado': 'COL',
+    'blue jackets': 'CBJ', 'columbus': 'CBJ',
+    'stars': 'DAL', 'dallas': 'DAL',
+    'red wings': 'DET', 'detroit': 'DET',
+    'oilers': 'EDM', 'edmonton': 'EDM',
+    'panthers': 'FLA', 'florida': 'FLA',
+    # LA Kings (lowercase)
+    'kings': 'L.A', 'los angeles': 'L.A', 'la': 'L.A', 'lak': 'L.A',
+    'wild': 'MIN', 'minnesota': 'MIN',
+    'canadiens': 'MTL', 'montreal': 'MTL', 'montréal': 'MTL',
+    'predators': 'NSH', 'nashville': 'NSH',
+    # NJ Devils (lowercase)
+    'devils': 'N.J', 'new jersey': 'N.J', 'nj': 'N.J', 'njd': 'N.J', # Requested: "devils" and "new jersey"
+    'islanders': 'NYI', 'ny islanders': 'NYI',
+    'rangers': 'NYR', 'ny rangers': 'NYR',
+    'senators': 'OTT', 'ottawa': 'OTT',
+    'flyers': 'PHI', 'philadelphia': 'PHI',
+    'penguins': 'PIT', 'pittsburgh': 'PIT',
+    # SJ Sharks (lowercase)
+    'sharks': 'S.J', 'san jose': 'S.J', 'sj': 'S.J', 'sjs': 'S.J',
+    'kraken': 'SEA', 'seattle': 'SEA',
+    'blues': 'STL', 'st. louis': 'STL', 'st louis': 'STL',
+    # TB Lightning (lowercase)
+    'lightning': 'T.B', 'tampa bay': 'T.B', 'tb': 'T.B', 'tbl': 'T.B',
+    'maple leafs': 'TOR', 'toronto': 'TOR',
+    # Utah team names (lowercase)
+    'mammoth': 'UTA', 'utah': 'UTA', 'utah hc': 'UTA', 'hc': 'UTA',
+    'golden knights': 'VGK', 'vegas': 'VGK',
+    'capitals': 'WSH', 'washington': 'WSH',
+    'jets': 'WPG', 'winnipeg': 'WPG',
+    'canucks': 'VAN', 'vancouver': 'VAN',
+
 }
 
 
@@ -192,6 +238,10 @@ def create_session():
 _write_lock = threading.Lock()
 _write_executor = None
 _cache_lock = threading.Lock()  # Global lock for game cache access
+
+# Stop flag for 403/404 errors
+_stop_scraping = False
+_stop_lock = threading.Lock()
 
 # Thread-local storage for sessions (each thread gets its own session)
 _thread_local = threading.local()
@@ -1096,6 +1146,8 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
     - Linemates/Opposition saved with player name
     - File writes are fully parallel (no blocking .result() per game)
     """
+    global _stop_scraping
+
     game_id = game.get('game_id')
     title = game.get('title', 'Unknown Game')
 
@@ -1133,14 +1185,20 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
                     response = session.get(full_report_url, headers=headers, timeout=30)
 
                     if response.status_code == 403:
-                        print("      ✗ IP blocked (403). Stopping.")
+                        print("      ✗ IP blocked (403). Stopping scraper.")
                         respectful_delay(is_429=True)
                         # Mark as connection timeout and return special code
                         mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        # Set global stop flag
+                        with _stop_lock:
+                            _stop_scraping = True
                         return -1  # Return -1 to indicate connection timeout
                     elif response.status_code == 404:
-                        print("      ✗ Game not found (404).")
+                        print("      ✗ Game not found (404). Stopping scraper.")
                         mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        # Set global stop flag
+                        with _stop_lock:
+                            _stop_scraping = True
                         return -1  # Return -1 to indicate connection timeout
                     elif response.status_code == 429:
                         print("      ✗ Rate limited (429). Backing off.")
@@ -1156,6 +1214,11 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
                     # Check if it's a connection-related error
                     if '403' in str(e) or '404' in str(e) or '429' in str(e) or 'timeout' in str(e).lower():
                         mark_game_connection_timeout(team_abbr, season_folder, game_id)
+                        # Set stop flag for 403/404
+                        if '403' in str(e) or '404' in str(e):
+                            with _stop_lock:
+                                _stop_scraping = True
+                            print(f"      ✗ Stopping scraper due to {e}")
                         return -1  # Return -1 to indicate connection timeout
                     return 0
 
@@ -1588,6 +1651,13 @@ def _process_single_game(team, game, game_idx, total_games, season_folder, game_
         stats_dict: Shared stats dictionary with keys: unique_downloads, total_saves, skipped_games
         stats_lock: Threading lock for stats updates
     """
+    # Check stop flag before processing
+    global _stop_scraping
+    with _stop_lock:
+        if _stop_scraping:
+            print(f"    ⚠ Skipping game {game.get('game_id', 'unknown')} - scraper stopped due to 403/404")
+            return
+
     game_id = game.get('game_id', 'unknown')
     print(f"    [{game_idx}/{total_games}] Processing game {game_id}: {game.get('title', 'Unknown')}")
 
@@ -1639,7 +1709,7 @@ def _process_single_game(team, game, game_idx, total_games, season_folder, game_
 # ============================================================================
 
 
-def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2, scrape_missing_only=False):
+def process_all_games(season_folder, session, max_games=None, fetch_new_lists=True, fromseason=None, thruseason=None, stype=2, use_threading=False, max_workers=8, parallel_scraping=False, scraping_workers=2, scrape_missing_only=False, csv_file_path=None):
     """
     Process all games for all teams, using cache to avoid duplicate downloads
     but saving to each team's directory - ONLY FULL REPORTS
@@ -1659,6 +1729,7 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
         parallel_scraping: Enable parallel game downloads/parsing
         scraping_workers: Number of concurrent game scrapes (be conservative!)
         scrape_missing_only: If True, only scrape games marked with missing_data=1
+        csv_file_path: If provided, load games from this CSV file instead
     """
     print("\n=== Starting game-by-game data collection (Full Reports Only) ===\n")
 
@@ -1672,7 +1743,10 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
     # First, collect all games from all teams
     all_games_by_team = {}
 
-    if scrape_missing_only:
+    if csv_file_path:
+        # Load games from CSV file (for missing goalie data, etc.)
+        all_games_by_team = load_games_from_csv(csv_file_path)
+    elif scrape_missing_only:
         print(f"Loading games with missing data from {season_folder} CSV files...\n")
         for team in nhl_teams:
             # Load only games marked with missing_data=1
@@ -1717,6 +1791,13 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
 
     # Now process games for each team with batching
     for i, team in enumerate(nhl_teams, 1):
+        # Check stop flag at team level
+        global _stop_scraping
+        with _stop_lock:
+            if _stop_scraping:
+                print(f"\n⚠ Scraper stopped due to 403/404 error. Exiting...")
+                break
+
         print(f"\n[{i}/{len(nhl_teams)}] Processing games for {team}")
 
         games_data = all_games_by_team.get(team, [])
@@ -1746,6 +1827,12 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
 
         # Process games in batches to manage memory
         for batch_start in range(0, total_team_games, BATCH_SIZE):
+            # Check stop flag before each batch
+            with _stop_lock:
+                if _stop_scraping:
+                    print(f"  ⚠ Stopping batch processing for {team} due to 403/404 error")
+                    break
+
             batch_end = min(batch_start + BATCH_SIZE, total_team_games)
             batch_games = games_to_process[batch_start:batch_end]
 
@@ -1805,6 +1892,9 @@ def process_all_games(season_folder, session, max_games=None, fetch_new_lists=Tr
             print("✓ All file writes completed")
 
     print(f"\n=== Game data collection complete ===")
+    with _stop_lock:
+        if _stop_scraping:
+            print(f"    ⚠ STOPPED EARLY due to 403/404 error")
     print(f"    📊 Downloaded {stats_dict['unique_downloads']} unique game reports")
     print(f"    💾 Processed {stats_dict['total_saves']} games")
     print(f"    ⭐ Skipped {stats_dict['skipped_games']} already-scraped games")
@@ -1850,6 +1940,85 @@ def fetch_season_data(start_year, end_year, session):
 
     print("\n=== Historical data collection complete ===\n")
 
+
+def load_games_from_csv(csv_path='missing_goalie_data.csv'):
+    """
+    Load games from missing_goalie_data.csv file and organize by team.
+
+    Returns:
+        dict: Dictionary mapping team abbreviations to lists of game dictionaries
+    """
+    import pandas as pd
+
+    if not os.path.exists(csv_path):
+        print(f"✗ File not found: {csv_path}")
+        return {}
+
+    print(f"\n{'='*80}")
+    print(f"LOADING GAMES FROM {csv_path}")
+    print(f"{'='*80}")
+
+    df = pd.read_csv(csv_path)
+    print(f"Total games in CSV: {len(df)}")
+
+    # Organize games by team (both home and away)
+    games_by_team = {}
+
+    # Reverse lookup map: abbreviation -> full team name
+    abbr_to_name = {}
+    for name, abbr in TEAM_NAME_MAP.items():
+        if abbr not in abbr_to_name and not name.isupper():  # Get the first proper name, not the abbr
+            abbr_to_name[abbr] = name
+
+    for _, row in df.iterrows():
+        full_game_id = str(row['game_id'])
+        nst_url = row['nst_url']
+        game_date = row['game_date']
+        home_team = row['home_team']
+        away_team = row['away_team']
+
+        # Convert full game_id (2022020188) to NST format (20188)
+        # NST format: remove season year prefix and game type, keep just the game number
+        # Full: SSSSTTGGGG (2022020188) -> NST: TGGGG (20188)
+        if len(full_game_id) == 10:
+            nst_game_id = full_game_id[4:]  # Strip first 4 chars (season year), keep type+number
+        else:
+            nst_game_id = full_game_id  # Already in short format or invalid
+
+        # Get full team names for proper opponent detection
+        home_team_full = abbr_to_name.get(home_team, home_team)
+        away_team_full = abbr_to_name.get(away_team, away_team)
+
+        # Create game dict in the format expected by scrape_game_report
+        game_dict = {
+            'game_id': nst_game_id,  # Use NST short format to match existing files
+            'title': f"{away_team_full} @ {home_team_full}, {game_date}",
+            'full_report_url': nst_url,
+            'date': game_date,
+            'team1_full': home_team_full,  # Add team names for opponent detection
+            'team2_full': away_team_full
+        }
+
+        # Add to home team's list
+        if home_team not in games_by_team:
+            games_by_team[home_team] = []
+        games_by_team[home_team].append(game_dict)
+
+        # Add to away team's list
+        if away_team not in games_by_team:
+            games_by_team[away_team] = []
+        games_by_team[away_team].append(game_dict)
+
+    # Print summary
+    print(f"\nGames organized by team:")
+    for team in sorted(games_by_team.keys()):
+        print(f"  {team}: {len(games_by_team[team])} games")
+
+    print(f"{'='*80}\n")
+
+    return games_by_team
+
+
 # Main execution logic
 if __name__ == "__main__":
 
@@ -1882,6 +2051,8 @@ if __name__ == "__main__":
     SCRAPE_GAMES = True # Gather game level data
     FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_MISSING_DATA_GAMES = False # Set to True to retry scraping games marked with missing_data=1
+    SCRAPE_FROM_CSV = False # Set to True to scrape games from missing_goalie_data.csv
+    CSV_FILE_PATH = 'missing_goalie_data.csv' # Path to CSV file with missing games
     SCRAPE_CHARTS = False  # Set to False since charts might be blocked
     SCRAPE_HISTORICAL = False
     MAX_GAMES_PER_TEAM = None  # Set to a number like 5 for testing, None for all games
@@ -1895,7 +2066,7 @@ if __name__ == "__main__":
     # The global rate limiter ensures minimum spacing between ANY requests
     # However, more workers = more simultaneous connections = higher detection risk
     PARALLEL_GAME_SCRAPING = False  # Set to True for faster scraping (higher ban risk)
-    SCRAPING_WORKERS = 2 # Start with 1; can try 2 if 10s+ delay and no bans
+    SCRAPING_WORKERS = 4 # Start with 1; can try 2 if 10s+ delay and no bans
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
@@ -1904,8 +2075,8 @@ if __name__ == "__main__":
     #   2024-25 season: FROM_SEASON = 20242025, THRU_SEASON = 20252026
     #   2023-24 season: FROM_SEASON = 20232024, THRU_SEASON = 20242025
     #   2022-23 season: FROM_SEASON = 20222023, THRU_SEASON = 20232024
-    FROM_SEASON = 20222023  # 2024-25 season
-    THRU_SEASON = 20222023  # Through 2025-26 (for current season, this is the "thru" year)
+    FROM_SEASON = 20252026  # 2024-25 season
+    THRU_SEASON = 20252026  # Through 2025-26 (for current season, this is the "thru" year)
     SEASON_TYPE = 2  # 2 = Regular Season, 3 = Playoffs
 
     # Create a session to reuse connections
@@ -1970,7 +2141,8 @@ if __name__ == "__main__":
                 max_workers=MAX_WORKERS,
                 parallel_scraping=PARALLEL_GAME_SCRAPING,
                 scraping_workers=SCRAPING_WORKERS,
-                scrape_missing_only=SCRAPE_MISSING_DATA_GAMES
+                scrape_missing_only=SCRAPE_MISSING_DATA_GAMES,
+                csv_file_path=CSV_FILE_PATH if SCRAPE_FROM_CSV else None
             )
 
         if SCRAPE_CHARTS:

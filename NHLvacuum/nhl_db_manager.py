@@ -25,7 +25,7 @@ from threading import Lock
 from queue import Queue
 from functools import lru_cache
 from collections import defaultdict
-
+from nstparse import TEAM_NAME_MAP
 
 @dataclass
 class GameInfo:
@@ -36,7 +36,10 @@ class GameInfo:
     team_name: str
     category: str
     situation: str
+    player_name: Optional[str] = None  # For linemates/opposition files
 
+
+# Initialize DB first :sqlite3 nhl_analytics.db < full_schema.sql
 
 class NHLDatabaseManager:
     """Manages the NHL analytics SQLite database"""
@@ -67,6 +70,8 @@ class NHLDatabaseManager:
 
         # NHL player ID mapping (name -> nhl_id)
         self.nhl_player_ids: Dict[str, str] = {}
+        # Clean name mapping (normalized -> original name) for filename matching
+        self.nhl_player_ids_clean: Dict[str, str] = {}
         self._load_nhl_player_ids()
 
     def _load_nhl_player_ids(self):
@@ -84,13 +89,25 @@ class NHLDatabaseManager:
                         name = parts[0].strip()
                         nhl_id = parts[1].strip()
                         self.nhl_player_ids[name] = nhl_id
+                        
+                        # Create normalized key: lowercase, remove spaces and dots
+                        # e.g., "Shane Pinto" -> "shanepinto", "T.J. Oshie" -> "tjoshie"
+                        clean_name = name.lower().replace(' ', '').replace('.', '')
+                        self.nhl_player_ids_clean[clean_name] = name
 
         print(f"Loaded {len(self.nhl_player_ids)} NHL player ID mappings")
 
     def connect(self):
-        """Connect to database"""
+        """Connect to database and load lookup maps"""
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
+
+        # Load situation and team maps
+        self.cursor.execute("SELECT situation_id, situation_code FROM situations")
+        self.situation_map = {code: sid for sid, code in self.cursor.fetchall()}
+
+        self.cursor.execute("SELECT team_id, team_abbr FROM teams")
+        self.team_map = {abbr: tid for tid, abbr in self.cursor.fetchall()}
 
     def _get_thread_connection(self) -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
         """
@@ -158,7 +175,8 @@ class NHLDatabaseManager:
             ('All', 'All Situations', 'All game situations combined'),
             ('EV', 'Even Strength', 'All even strength situations'),
             ('PP', 'Power Play', 'Team has more skaters (typically 5v4)'),
-            ('PK', 'Penalty Kill', 'Team has fewer skaters (typically 4v5)')
+            ('PK', 'Penalty Kill', 'Team has fewer skaters (typically 4v5)'),
+            ('SVA', 'Score/Venue Adjusted', 'Not exactly a situation but will be treated as such due to similarty of data')
         ]
 
         for code, name, desc in situations:
@@ -227,12 +245,12 @@ class NHLDatabaseManager:
         self.cursor.execute("SELECT team_id, team_abbr FROM teams")
         self.team_map = {abbr: tid for tid, abbr in self.cursor.fetchall()}
 
-    def get_or_create_team(self, team_abbr: str, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None) -> int:
+    def get_or_create_team(self, team_abbr: str, conn: sqlite3.Connection = None, cursor:      sqlite3.Cursor = None) -> int:
         """
         Get team ID from pre-populated teams table
 
         Args:
-            team_abbr: Team abbreviation (e.g., 'OTT', 'BOS')
+            team_abbr: Team abbreviation (e.g., 'OTT', 'BOS', 'N.J', 'S.J', 'L.A', 'T.B')
             conn: Optional database connection (for thread-local use)
             cursor: Optional database cursor (for thread-local use)
 
@@ -242,19 +260,23 @@ class NHLDatabaseManager:
         use_conn = conn if conn else self.conn
         use_cursor = cursor if cursor else self.cursor
 
-        # Check cache first
-        if team_abbr in self.team_map:
-            return self.team_map[team_abbr]
+        # Normalize team abbreviation (remove periods for consistency)
+        # N.J -> NJ, S.J -> SJ, L.A -> LA, T.B -> TB
+        team_abbr_normalized = team_abbr.replace('.', '')
+
+        # Check cache first (using normalized abbreviation)
+        if team_abbr_normalized in self.team_map:
+            return self.team_map[team_abbr_normalized]
 
         # Reload team map if not found (using provided cursor)
         use_cursor.execute("SELECT team_id, team_abbr FROM teams")
         self.team_map = {abbr: tid for tid, abbr in use_cursor.fetchall()}
 
-        if team_abbr in self.team_map:
-            return self.team_map[team_abbr]
+        if team_abbr_normalized in self.team_map:
+            return self.team_map[team_abbr_normalized]
 
         # This shouldn't happen if teams are pre-populated correctly
-        raise ValueError(f"Team abbreviation '{team_abbr}' not found in teams table. Please add it to populate_reference_data().")
+        raise ValueError(f"Team abbreviation '{team_abbr}' (normalized: '{team_abbr_normalized}') not      found in teams table. Please add it to populate_reference_data().")
 
     def get_or_create_player(self, player_name: str, position: str, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None) -> str:
         """
@@ -381,9 +403,16 @@ class NHLDatabaseManager:
     def parse_filename(filename: str) -> Optional[GameInfo]:
         """
         Parse CSV filename to extract game information
+        Now handles both team abbreviations AND full team names using TEAM_NAME_MAP
 
-        Format: {AWAY}vs{HOME}_{GAMEID}_{TEAM}_{CATEGORY}_{SITUATION}.csv
+        Formats:
+        1. Standard: {AWAY}vs{HOME}_{GAMEID}_{TEAM}_{CATEGORY}_{SITUATION}[_1|_2].csv
         Example: BOSvsOTT_20149_Senators_Individual_5v5_1.csv
+        Example: BOSvsOTT_20149_OTT_Individual_5v5_1.csv
+        2. Linemates: {AWAY}vs{HOME}_{GAMEID}_linemates_{PLAYER}_{SITUATION}.csv
+        Example: ANAvsBOS_20081_linemates_TrentFrederic_All.csv
+        3. Opposition: {AWAY}vs{HOME}_{GAMEID}_opposition_{PLAYER}_{SITUATION}.csv
+        Example: ANAvsBOS_20081_opposition_BOS11.csv
 
         Args:
             filename: CSV filename
@@ -394,33 +423,92 @@ class NHLDatabaseManager:
         # Remove .csv extension
         name = filename.replace('.csv', '')
 
-        # Pattern: {AWAY}vs{HOME}_{GAMEID}_{TEAM}_{CATEGORY}_{SITUATION}[_1|_2]
-        # Updated to handle team abbrs with periods (N.J, S.J, L.A, T.B)
-        pattern = r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_([A-Za-z\.]+)_(.+?)_([A-Za-z0-9]+)(?:_([12]))?$'
-        match = re.match(pattern, name)
+        # Check for linemates pattern first
+        linemates_pattern = r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_linemates_(.+?)_([A-Za-z0-9]+)$'
+        match = re.match(linemates_pattern, name)
+        if match:
+            away, home, game_id, player_name, situation = match.groups()
+            away = away.replace('.', '')
+            home = home.replace('.', '')
+            return GameInfo(
+                away_team=away,
+                home_team=home,
+                nst_game_id=game_id,
+                team_name=None,  # Will be extracted from directory
+                category='linemates',
+                situation=situation,
+                player_name=player_name
+            )
+
+        # Check for opposition pattern
+        opposition_pattern = r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_opposition_(.+?)_([A-Za-z0-9]+)$'
+        match = re.match(opposition_pattern, name)
+        if match:
+            away, home, game_id, player_name, situation = match.groups()
+            away = away.replace('.', '')
+            home = home.replace('.', '')
+            return GameInfo(
+                away_team=away,
+                home_team=home,
+                nst_game_id=game_id,
+                team_name=None,  # Will be extracted from directory
+                category='opposition',
+                situation=situation,
+                player_name=player_name
+            )
+
+        # Standard pattern: {AWAY}vs{HOME}_{GAMEID}_{TEAM}_{CATEGORY}_{SITUATION}[_1|_2]
+        # Updated to handle both abbreviations AND full team names
+        # Match team abbreviations (2-4 chars with optional periods) OR full team names (word characters)
+        standard_pattern = r'^([A-Z][A-Z\.]+)vs([A-Z][A-Z\.]+)_(\d+)_([A-Za-z\._ ]+?)_(.+?)_([A-Za-z0-9]+)(?:_([12]))?$'
+        match = re.match(standard_pattern, name)
 
         if not match:
             return None
 
         away, home, game_id, team, category_part, situation, file_type = match.groups()
 
-        # Normalize team abbreviations (remove periods for consistency)
+        # Normalize away/home team abbreviations (remove periods for consistency)
         # N.J -> NJ, S.J -> SJ, L.A -> LA, T.B -> TB
         away = away.replace('.', '')
         home = home.replace('.', '')
-        team = team.replace('.', '')
 
-        # Reconstruct category (may have underscores)
-        # The category is everything between team name and situation
-        # e.g., "Individual", "Forward_Lines", "On_Ice", "Shift_Report"
+        # Handle team name/abbreviation conversion
+        # The team field can be either:
+        # 1. An abbreviation like "OTT" or "BOS"
+        # 2. A full team name like "Senators" or "Bruins"
+    # Handle team name/abbreviation conversion
+        team_normalized = team.replace('.', '').strip()
+
+        # Create case-insensitive lookup
+        team_map_lower = {k.lower(): v for k, v in TEAM_NAME_MAP.items()}
+
+        # Try to convert team name to abbreviation (case-insensitive)
+        if team_normalized.lower() in team_map_lower:
+            team_abbr = team_map_lower[team_normalized.lower()]
+        elif team_normalized.upper() in [abbr.upper() for abbr in TEAM_NAME_MAP.values()]:
+            team_abbr = team_normalized
+        else:
+            # Check multi-word team names
+            team_parts = team_normalized.split()
+            team_abbr = None
+            for part in team_parts:
+                if part.lower() in team_map_lower:
+                    team_abbr = team_map_lower[part.lower()]
+                    break
+
+            if not team_abbr:
+                team_abbr = team_normalized
+
         return GameInfo(
             away_team=away,
             home_team=home,
             nst_game_id=game_id,
-            team_name=team,
+            team_name=team_abbr,
             category=category_part,
             situation=situation
         )
+
 
     @staticmethod
     def time_to_seconds(time_str: str) -> Optional[float]:
@@ -1019,6 +1107,240 @@ class NHLDatabaseManager:
         # Don't commit here - let the caller handle batched commits
         # use_conn.commit()
 
+    def import_linemate_stats(self, csv_path: str, game_id: str, player_name: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
+        """
+        Import player linemate stats from CSV
+        Tracks performance with each specific teammate
+
+        Args:
+            csv_path: Path to CSV file
+            game_id: Game ID
+            player_name: Name of player being analyzed (from filename)
+            team_id: Team ID
+            situation_id: Situation ID
+            conn: Optional database connection
+            cursor: Optional database cursor
+        """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            # Get player ID from filename player name (lookup in DB or create)
+            # Try to resolve normalized name from filename (e.g. "ShanePinto") to real name (e.g. "Shane Pinto")
+            clean_name = player_name.lower().replace(' ', '').replace('.', '')
+            if clean_name in self.nhl_player_ids_clean:
+                player_name = self.nhl_player_ids_clean[clean_name]
+
+            # Extract position from first row if available, default to 'F'
+            player_id = self.get_or_create_player(player_name, 'F', use_conn, use_cursor)
+
+            for row in reader:
+                linemate_name = row.get('Player', '').strip()
+                linemate_position = row.get('Position', '').strip()
+
+                if not linemate_name or not linemate_position:
+                    continue
+
+                linemate_id = self.get_or_create_player(linemate_name, linemate_position, use_conn, use_cursor)
+
+                data = {
+                    'game_id': game_id,
+                    'player_id': player_id,
+                    'linemate_id': linemate_id,
+                    'team_id': team_id,
+                    'situation_id': situation_id,
+                    'toi_seconds': self.time_to_seconds(row.get('TOI', '')),
+                    'cf': self.safe_int(row.get('CF', 0)),
+                    'ca': self.safe_int(row.get('CA', 0)),
+                    'cf_pct_with': self.safe_percentage(row.get('CF% With', None)),
+                    'cf_pct_without': self.safe_percentage(row.get('CF% Without', None)),
+                    'ff': self.safe_int(row.get('FF', 0)),
+                    'fa': self.safe_int(row.get('FA', 0)),
+                    'ff_pct_with': self.safe_percentage(row.get('FF% With', None)),
+                    'ff_pct_without': self.safe_percentage(row.get('FF% Without', None)),
+                    'sf': self.safe_int(row.get('SF', 0)),
+                    'sa': self.safe_int(row.get('SA', 0)),
+                    'sf_pct_with': self.safe_percentage(row.get('SF% With', None)),
+                    'sf_pct_without': self.safe_percentage(row.get('SF% Without', None)),
+                    'gf': self.safe_int(row.get('GF', 0)),
+                    'ga': self.safe_int(row.get('GA', 0)),
+                    'gf_pct_with': self.safe_percentage(row.get('GF% With', None)),
+                    'gf_pct_without': self.safe_percentage(row.get('GF% Without', None)),
+                    'xgf': self.safe_float(row.get('xGF', 0)),
+                    'xga': self.safe_float(row.get('xGA', 0)),
+                    'xgf_pct_with': self.safe_percentage(row.get('xGF% With', None)),
+                    'xgf_pct_without': self.safe_percentage(row.get('xGF% Without', None)),
+                    'scf': self.safe_int(row.get('SCF', 0)),
+                    'sca': self.safe_int(row.get('SCA', 0)),
+                    'scf_pct': self.safe_percentage(row.get('SCF%', None)),
+                    'scf_pct_rel': self.safe_percentage(row.get('SCF% Rel', None)),
+                    'hdcf': self.safe_int(row.get('HDCF', 0)),
+                    'hdca': self.safe_int(row.get('HDCA', 0)),
+                    'hdcf_pct': self.safe_percentage(row.get('HDCF%', None)),
+                    'hdcf_pct_rel': self.safe_percentage(row.get('HDCF% Rel', None)),
+                    'off_zone_shift_starts': self.safe_int(row.get('Off. Zone Shift Starts', 0)),
+                    'neu_zone_shift_starts': self.safe_int(row.get('Neu. Zone Shift Starts', 0)),
+                    'def_zone_shift_starts': self.safe_int(row.get('Def. Zone Shift Starts', 0)),
+                    'otf_shift_starts': self.safe_int(row.get('On the Fly Shift Starts', 0)),
+                    'off_zone_shift_start_pct': self.safe_percentage(row.get('Off. Zone Shift Start %', None)),
+                    'off_zone_faceoffs': self.safe_int(row.get('Off. Zone Faceoffs', 0)),
+                    'neu_zone_faceoffs': self.safe_int(row.get('Neu. Zone Faceoffs', 0)),
+                    'def_zone_faceoffs': self.safe_int(row.get('Def. Zone Faceoffs', 0)),
+                    'off_zone_faceoff_pct': self.safe_percentage(row.get('Off. Zone Faceoff %', None))
+                }
+
+                use_cursor.execute("""
+                    INSERT OR REPLACE INTO player_linemate_stats (
+                        game_id, player_id, linemate_id, team_id, situation_id,
+                        toi_seconds, cf, ca, cf_pct_with, cf_pct_without,
+                        ff, fa, ff_pct_with, ff_pct_without,
+                        sf, sa, sf_pct_with, sf_pct_without,
+                        gf, ga, gf_pct_with, gf_pct_without,
+                        xgf, xga, xgf_pct_with, xgf_pct_without,
+                        scf, sca, scf_pct, scf_pct_rel,
+                        hdcf, hdca, hdcf_pct, hdcf_pct_rel,
+                        off_zone_shift_starts, neu_zone_shift_starts, def_zone_shift_starts, otf_shift_starts, off_zone_shift_start_pct,
+                        off_zone_faceoffs, neu_zone_faceoffs, def_zone_faceoffs, off_zone_faceoff_pct
+                    ) VALUES (
+                        :game_id, :player_id, :linemate_id, :team_id, :situation_id,
+                        :toi_seconds, :cf, :ca, :cf_pct_with, :cf_pct_without,
+                        :ff, :fa, :ff_pct_with, :ff_pct_without,
+                        :sf, :sa, :sf_pct_with, :sf_pct_without,
+                        :gf, :ga, :gf_pct_with, :gf_pct_without,
+                        :xgf, :xga, :xgf_pct_with, :xgf_pct_without,
+                        :scf, :sca, :scf_pct, :scf_pct_rel,
+                        :hdcf, :hdca, :hdcf_pct, :hdcf_pct_rel,
+                        :off_zone_shift_starts, :neu_zone_shift_starts, :def_zone_shift_starts, :otf_shift_starts, :off_zone_shift_start_pct,
+                        :off_zone_faceoffs, :neu_zone_faceoffs, :def_zone_faceoffs, :off_zone_faceoff_pct
+                    )
+                """, data)
+
+    def import_opposition_stats(self, csv_path: str, game_id: str, player_name: str, team_id: int, situation_id: int, conn: sqlite3.Connection = None, cursor: sqlite3.Cursor = None):
+        """
+        Import player opposition stats from CSV
+        Tracks performance against each specific opponent
+
+        Args:
+            csv_path: Path to CSV file
+            game_id: Game ID
+            player_name: Name of player being analyzed (from filename)
+            team_id: Player's team ID
+            situation_id: Situation ID
+            conn: Optional database connection
+            cursor: Optional database cursor
+        """
+        use_conn = conn if conn else self.conn
+        use_cursor = cursor if cursor else self.cursor
+
+        # Determine opponent team from game
+        use_cursor.execute("""
+            SELECT home_team_id, away_team_id
+            FROM games
+            WHERE game_id = ?
+        """, (game_id,))
+        game_result = use_cursor.fetchone()
+
+        if not game_result:
+            print(f"Warning: Game {game_id} not found in database")
+            return
+
+        home_team_id, away_team_id = game_result
+        opponent_team_id = away_team_id if team_id == home_team_id else home_team_id
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            # Try to resolve normalized name from filename (e.g. "ShanePinto") to real name (e.g. "Shane Pinto")
+            clean_name = player_name.lower().replace(' ', '').replace('.', '')
+            if clean_name in self.nhl_player_ids_clean:
+                player_name = self.nhl_player_ids_clean[clean_name]
+
+            player_id = self.get_or_create_player(player_name, 'F', use_conn, use_cursor)
+
+            for row in reader:
+                opponent_name = row.get('Player', '').strip()
+                opponent_position = row.get('Position', '').strip()
+
+                if not opponent_name or not opponent_position:
+                    continue
+
+                opponent_id = self.get_or_create_player(opponent_name, opponent_position, use_conn, use_cursor)
+
+                data = {
+                    'game_id': game_id,
+                    'player_id': player_id,
+                    'opponent_id': opponent_id,
+                    'team_id': team_id,
+                    'opponent_team_id': opponent_team_id,
+                    'situation_id': situation_id,
+                    'toi_seconds': self.time_to_seconds(row.get('TOI', '')),
+                    'cf': self.safe_int(row.get('CF', 0)),
+                    'ca': self.safe_int(row.get('CA', 0)),
+                    'cf_pct_with': self.safe_percentage(row.get('CF% With', None)),
+                    'cf_pct_without': self.safe_percentage(row.get('CF% Without', None)),
+                    'ff': self.safe_int(row.get('FF', 0)),
+                    'fa': self.safe_int(row.get('FA', 0)),
+                    'ff_pct_with': self.safe_percentage(row.get('FF% With', None)),
+                    'ff_pct_without': self.safe_percentage(row.get('FF% Without', None)),
+                    'sf': self.safe_int(row.get('SF', 0)),
+                    'sa': self.safe_int(row.get('SA', 0)),
+                    'sf_pct_with': self.safe_percentage(row.get('SF% With', None)),
+                    'sf_pct_without': self.safe_percentage(row.get('SF% Without', None)),
+                    'gf': self.safe_int(row.get('GF', 0)),
+                    'ga': self.safe_int(row.get('GA', 0)),
+                    'gf_pct_with': self.safe_percentage(row.get('GF% With', None)),
+                    'gf_pct_without': self.safe_percentage(row.get('GF% Without', None)),
+                    'xgf': self.safe_float(row.get('xGF', 0)),
+                    'xga': self.safe_float(row.get('xGA', 0)),
+                    'xgf_pct_with': self.safe_percentage(row.get('xGF% With', None)),
+                    'xgf_pct_without': self.safe_percentage(row.get('xGF% Without', None)),
+                    'scf': self.safe_int(row.get('SCF', 0)),
+                    'sca': self.safe_int(row.get('SCA', 0)),
+                    'scf_pct': self.safe_percentage(row.get('SCF%', None)),
+                    'scf_pct_rel': self.safe_percentage(row.get('SCF% Rel', None)),
+                    'hdcf': self.safe_int(row.get('HDCF', 0)),
+                    'hdca': self.safe_int(row.get('HDCA', 0)),
+                    'hdcf_pct': self.safe_percentage(row.get('HDCF%', None)),
+                    'hdcf_pct_rel': self.safe_percentage(row.get('HDCF% Rel', None)),
+                    'off_zone_shift_starts': self.safe_int(row.get('Off. Zone Shift Starts', 0)),
+                    'neu_zone_shift_starts': self.safe_int(row.get('Neu. Zone Shift Starts', 0)),
+                    'def_zone_shift_starts': self.safe_int(row.get('Def. Zone Shift Starts', 0)),
+                    'otf_shift_starts': self.safe_int(row.get('On the Fly Shift Starts', 0)),
+                    'off_zone_shift_start_pct': self.safe_percentage(row.get('Off. Zone Shift Start %', None)),
+                    'off_zone_faceoffs': self.safe_int(row.get('Off. Zone Faceoffs', 0)),
+                    'neu_zone_faceoffs': self.safe_int(row.get('Neu. Zone Faceoffs', 0)),
+                    'def_zone_faceoffs': self.safe_int(row.get('Def. Zone Faceoffs', 0)),
+                    'off_zone_faceoff_pct': self.safe_percentage(row.get('Off. Zone Faceoff %', None))
+                }
+
+                use_cursor.execute("""
+                    INSERT OR REPLACE INTO player_opposition_stats (
+                        game_id, player_id, opponent_id, team_id, opponent_team_id, situation_id,
+                        toi_seconds, cf, ca, cf_pct_with, cf_pct_without,
+                        ff, fa, ff_pct_with, ff_pct_without,
+                        sf, sa, sf_pct_with, sf_pct_without,
+                        gf, ga, gf_pct_with, gf_pct_without,
+                        xgf, xga, xgf_pct_with, xgf_pct_without,
+                        scf, sca, scf_pct, scf_pct_rel,
+                        hdcf, hdca, hdcf_pct, hdcf_pct_rel,
+                        off_zone_shift_starts, neu_zone_shift_starts, def_zone_shift_starts, otf_shift_starts, off_zone_shift_start_pct,
+                        off_zone_faceoffs, neu_zone_faceoffs, def_zone_faceoffs, off_zone_faceoff_pct
+                    ) VALUES (
+                        :game_id, :player_id, :opponent_id, :team_id, :opponent_team_id, :situation_id,
+                        :toi_seconds, :cf, :ca, :cf_pct_with, :cf_pct_without,
+                        :ff, :fa, :ff_pct_with, :ff_pct_without,
+                        :sf, :sa, :sf_pct_with, :sf_pct_without,
+                        :gf, :ga, :gf_pct_with, :gf_pct_without,
+                        :xgf, :xga, :xgf_pct_with, :xgf_pct_without,
+                        :scf, :sca, :scf_pct, :scf_pct_rel,
+                        :hdcf, :hdca, :hdcf_pct, :hdcf_pct_rel,
+                        :off_zone_shift_starts, :neu_zone_shift_starts, :def_zone_shift_starts, :otf_shift_starts, :off_zone_shift_start_pct,
+                        :off_zone_faceoffs, :neu_zone_faceoffs, :def_zone_faceoffs, :off_zone_faceoff_pct
+                    )
+                """, data)
+
     def _parse_csv_file_worker(self, csv_path: str, game_date: str, team_abbr: str = None, season_code: str = None) -> Tuple[bool, str, Optional[Dict]]:
         """
         Worker method to PARSE (not write) a single CSV file
@@ -1104,21 +1426,34 @@ class NHLDatabaseManager:
 
         # Determine file type and import accordingly
         category = game_info.category
+        category_lower = category.lower()
         is_goalie_file = filename.endswith('_2.csv')
         is_player_file = filename.endswith('_1.csv')
 
-        if 'Individual' in category:
+        if category == 'linemates':
+            # NEW: Linemate stats files
+            if not game_info.player_name:
+                print(f"Warning: No player name found for linemates file: {filename}")
+                return
+            self.import_linemate_stats(csv_path, game_id, game_info.player_name, team_id, situation_id)
+        elif category == 'opposition':
+            # NEW: Opposition stats files
+            if not game_info.player_name:
+                print(f"Warning: No player name found for opposition file: {filename}")
+                return
+            self.import_opposition_stats(csv_path, game_id, game_info.player_name, team_id, situation_id)
+        elif 'individual' in category_lower:
             if is_goalie_file:
                 self.import_goalie_stats(csv_path, game_id, team_id, situation_id)
             elif is_player_file:
                 self.import_player_stats(csv_path, game_id, team_id, situation_id)
-        elif 'On' in category and 'Ice' in category:
+        elif 'on' in category_lower and 'ice' in category_lower:
             self.import_onice_stats(csv_path, game_id, team_id, situation_id)
-        elif 'Shift' in category:
+        elif 'shift' in category_lower:
             self.import_shift_stats(csv_path, game_id, team_id, situation_id)
-        elif 'Forward' in category and 'Lines' in category:
+        elif 'forward' in category_lower and 'lines' in category_lower:
             self.import_forward_lines(csv_path, game_id, team_id, situation_id)
-        elif 'overview' in category:
+        elif 'overview' in category_lower:
             self.import_team_overview(csv_path, game_id, team_id, situation_id)
 
     def import_csv_file(self, csv_path: str, game_date: str, team_abbr: str = None, season_code: str = None):
@@ -1527,38 +1862,62 @@ def main():
     import os
 
     db_path = 'nhl_analytics.db'
-    schema_path = 'nhl_analytics_schema.sql'
+    schema_path = 'full_schema.sql'
 
     print("="*60)
     print("NHL Analytics Database Import")
     print("="*60)
 
-    # Check if database exists
+    # Check if database file exists physically
     db_exists = os.path.exists(db_path)
 
     with NHLDatabaseManager(db_path, max_workers=10) as db:
+        # Case 1: No file exists at all
         if not db_exists:
             print("\n→ Database not found, initializing...")
             db.initialize_database(schema_path)
             db.populate_reference_data()
             print("✓ Database initialized")
+
+        # Case 2: File exists (check validity)
         else:
-            # Check if tables exist (in case of empty/corrupted DB)
+            # Check if key tables actually exist
             db.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='player_game_stats'")
             if not db.cursor.fetchone():
-                print("\n→ Database exists but is empty, initializing schema...")
+                print("\n→ Database exists but is empty/uninitialized, running schema...")
                 db.initialize_database(schema_path)
                 db.populate_reference_data()
                 print("✓ Database initialized")
             else:
                 print(f"\n→ Using existing database: {db_path}")
-                # Load reference data into memory
-                print("→ Loading reference data...")
+
+            # Attempt to load reference data
+            print("→ Loading reference data...")
+            db.cursor.execute("SELECT situation_id, situation_code FROM situations")
+            db.situation_map = {code: sid for sid, code in db.cursor.fetchall()}
+
+            db.cursor.execute("SELECT team_id, team_abbr FROM teams")
+            db.team_map = {abbr: tid for tid, abbr in db.cursor.fetchall()}
+
+            # === FIX START: Safety check for empty reference tables ===
+            if not db.team_map or not db.situation_map:
+                print("! Warning: Reference tables found empty (0 teams/situations). Repopulating...")
+                db.populate_reference_data()
+
+                # Reload maps after population
                 db.cursor.execute("SELECT situation_id, situation_code FROM situations")
                 db.situation_map = {code: sid for sid, code in db.cursor.fetchall()}
+
                 db.cursor.execute("SELECT team_id, team_abbr FROM teams")
                 db.team_map = {abbr: tid for tid, abbr in db.cursor.fetchall()}
-                print(f"  Loaded {len(db.situation_map)} situations and {len(db.team_map)} teams")
+            # === FIX END ===
+
+            print(f"  Loaded {len(db.situation_map)} situations and {len(db.team_map)} teams")
+
+        # Double check before proceeding
+        if 'ANA' not in db.team_map and 'ANA' not in db.team_map.values():
+             print("\nCRITICAL ERROR: Teams still not loaded. Please delete nhl_analytics.db and run again.")
+             return
 
         # Auto-import all new/missing data
         print("\n→ Checking for new data in nhlteamreports/...")

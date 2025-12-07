@@ -8,6 +8,8 @@ import sqlite3
 import time
 import csv
 import os
+import shutil
+import pandas as pd
 from pathlib import Path
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,7 +24,7 @@ MP_GOALIE_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/r
 OUTPUT_DIR = Path("moneypuck_data")
 
 
-def download_file(url: str, output_path: Path, description: str = "", max_retries: int = 3, skip_existing: bool = False) -> bool:
+def download_file(url: str, output_path: Path, description: str = "", max_retries: int = 3, skip_existing: bool = False) -> tuple[bool, int]:
     """Download a file from URL to output path with retry logic and caching
 
     Args:
@@ -33,13 +35,13 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
         skip_existing: Skip download if file already exists (default: False - always refresh)
 
     Returns:
-        True if download succeeded or file was cached, False otherwise
+        Tuple of (success: bool, status_code: int)
     """
 
     # Check if file already exists (caching)
     if skip_existing and output_path.exists() and output_path.stat().st_size > 100:
         print(f"⊙ Cached: {description or output_path.name}")
-        return True
+        return True, 200
 
     for attempt in range(max_retries):
         try:
@@ -58,6 +60,10 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
                 time.sleep(wait_time)
                 continue
 
+            # Return 404 immediately without retry
+            if response.status_code == 404:
+                return False, 404
+
             response.raise_for_status()
 
             # Check if we got valid CSV data
@@ -66,10 +72,10 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
                 with open(output_path, 'wb') as f:
                     f.write(response.content)
                 print(f"✓ Downloaded: {description or output_path.name}")
-                return True
+                return True, 200
             else:
                 print(f"✗ Empty/invalid response for: {description or output_path.name}")
-                return False
+                return False, response.status_code
 
         except requests.exceptions.Timeout:
             wait_time = 2 ** attempt
@@ -84,10 +90,55 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
                 time.sleep(wait_time)
             else:
                 print(f"✗ Failed after {max_retries} attempts: {description or output_path.name}: {e}")
-                return False
+                return False, 0
 
     print(f"✗ Failed after {max_retries} attempts: {description or output_path.name}")
-    return False
+    return False, 0
+
+
+def concatenate_split_team_files(team_dir: Path, team: str, mp_team_old: str, mp_team_new: str):
+    """Concatenate old and new team CSV files into one unified file
+
+    Args:
+        team_dir: Directory containing team CSV files
+        team: Standard team abbreviation (e.g., 'SJ')
+        mp_team_old: Old MoneyPuck abbreviation without period (e.g., 'SJS')
+        mp_team_new: New MoneyPuck abbreviation with period (e.g., 'S.J')
+    """
+    old_file = team_dir / f"{mp_team_old}_temp.csv"
+    new_file = team_dir / f"{mp_team_new}_temp.csv"
+    output_file = team_dir / f"{mp_team_new}.csv"
+
+    # Check if both files exist
+    if not old_file.exists() or not new_file.exists():
+        print(f"⚠ Cannot concatenate {team}: Missing old or new file")
+        return False
+
+    try:
+        # Read both CSV files
+        df_old = pd.read_csv(old_file)  # Larger file: 2008-2020
+        df_new = pd.read_csv(new_file)  # Smaller file: 2020-current
+
+        # Append new data to old data (new data goes at the bottom)
+        df_combined = pd.concat([df_old, df_new], ignore_index=True)
+
+        # Sort by season and game date if those columns exist
+        if 'season' in df_combined.columns:
+            df_combined = df_combined.sort_values('season')
+
+        # Save combined file with the NEW abbreviation (with period)
+        df_combined.to_csv(output_file, index=False)
+
+        # Remove temporary files
+        old_file.unlink()
+        new_file.unlink()
+
+        print(f"✓ Concatenated {team}: {len(df_old)} + {len(df_new)} = {len(df_combined)} rows → {mp_team_new}.csv")
+        return True
+
+    except Exception as e:
+        print(f"✗ Error concatenating {team} files: {e}")
+        return False
 
 
 def get_teams_from_db(db_path: str = "nhl_analytics.db") -> List[str]:
@@ -103,26 +154,47 @@ def get_teams_from_db(db_path: str = "nhl_analytics.db") -> List[str]:
     return teams
 
 
-def get_players_from_db(db_path: str = "nhl_analytics.db") -> dict:
-    """Get all players from database, separated by position"""
+def get_players_from_file(file_path: str = "player_ids.txt") -> dict:
+    """Get all players from player_ids.txt file
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    File format: "Player Name: player_id [G]"
+    - [G] suffix indicates a goalie (optional)
+    - Players without [G] are treated as skaters
 
-    # Get all players except unknowns
-    cursor.execute("""
-        SELECT DISTINCT player_id, player_name, position
-        FROM players
-        WHERE player_id NOT LIKE 'UNKNOWN%'
-        ORDER BY player_name
-    """)
+    Returns:
+        dict with 'goalies' and 'skaters' keys, each containing list of (player_id, name) tuples
+    """
 
-    players = cursor.fetchall()
-    conn.close()
+    goalies = []
+    skaters = []
 
-    # Separate goalies from skaters
-    goalies = [(pid, name) for pid, name, pos in players if pos == 'G']
-    skaters = [(pid, name) for pid, name, pos in players if pos != 'G']
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+
+                # Parse "Player Name: player_id [G]" format
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    name = parts[0].strip()
+                    rest = parts[1].strip()
+
+                    # Check for position indicator
+                    is_goalie = rest.endswith('[G]')
+
+                    # Extract player_id (remove position indicator if present)
+                    if is_goalie:
+                        player_id = rest.replace('[G]', '').strip()
+                        goalies.append((player_id, name))
+                    else:
+                        player_id = rest
+                        skaters.append((player_id, name))
+
+    except FileNotFoundError:
+        print(f"Warning: {file_path} not found. Please run playeridextract.py first.")
+        return {'goalies': [], 'skaters': []}
 
     return {
         'goalies': goalies,
@@ -140,27 +212,51 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
     team_dir = output_dir / "teams"
     team_dir.mkdir(parents=True, exist_ok=True)
 
-    # MoneyPuck uses periods for some teams
+    # MoneyPuck changed abbreviations mid-way for these teams
+    # Map: team -> (old_abbr_for_historical_data, new_abbr_with_period)
     team_abbr_map = {
-        'LA': 'L.A',
-        'NJ': 'N.J',
-        'SJ': 'S.J',
-        'TB': 'T.B'
+        'LA': ('LAK', 'L.A'),    # Old: LAK (2008-2020), New: L.A (2020-current)
+        'NJ': ('NJD', 'N.J'),    # Old: NJD (2008-2020), New: N.J (2020-current)
+        'SJ': ('SJS', 'S.J'),    # Old: SJS (2008-2020), New: S.J (2020-current)
+        'TB': ('TBL', 'T.B')     # Old: TBL (2008-2020), New: T.B (2020-current)
     }
 
     success_count = 0
     failed_count = 0
+    concat_teams = []  # Teams that need concatenation
     lock = threading.Lock()
 
     def download_team(team: str) -> Tuple[bool, str]:
-        """Download a single team's data"""
-        mp_team = team_abbr_map.get(team, team)
-        url = MP_TEAM_URL.format(team=mp_team)
-        output_path = team_dir / f"{team}.csv"
+        """Download a single team's data (handles split files for LA, SJ, TB, NJ)"""
 
-        result = download_file(url, output_path, f"{team} team data", skip_existing=skip_existing)
-        time.sleep(0.1)  # Small delay to avoid overwhelming server
-        return result, team
+        # Check if this team has split files
+        if team in team_abbr_map:
+            old_abbr, new_abbr = team_abbr_map[team]
+
+            # Download OLD abbreviation file (larger file: 2008-2020)
+            url_old = MP_TEAM_URL.format(team=old_abbr)
+            output_path_old = team_dir / f"{old_abbr}_temp.csv"
+            result_old, _ = download_file(url_old, output_path_old, f"{team} (historical: {old_abbr})", skip_existing=skip_existing)
+            time.sleep(0.1)
+
+            # Download NEW abbreviation file (smaller file: 2020-current)
+            url_new = MP_TEAM_URL.format(team=new_abbr)
+            output_path_new = team_dir / f"{new_abbr}_temp.csv"
+            result_new, _ = download_file(url_new, output_path_new, f"{team} (recent: {new_abbr})", skip_existing=skip_existing)
+            time.sleep(0.1)
+
+            # Both files needed for concatenation
+            if result_old and result_new:
+                return True, team  # Will concatenate later
+            else:
+                return False, team
+        else:
+            # Standard download for teams without split files
+            url = MP_TEAM_URL.format(team=team)
+            output_path = team_dir / f"{team}.csv"
+            result, _ = download_file(url, output_path, f"{team} team data", skip_existing=skip_existing)
+            time.sleep(0.1)
+            return result, team
 
     # Use ThreadPoolExecutor for parallel downloads
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -171,14 +267,35 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
             with lock:
                 if success:
                     success_count += 1
+                    # Mark teams that need concatenation
+                    if team in team_abbr_map:
+                        concat_teams.append(team)
                 else:
                     failed_count += 1
 
     print(f"\nTeam Data: {success_count} succeeded, {failed_count} failed")
 
+    # Concatenate split files
+    if concat_teams:
+        print(f"\n{'='*60}")
+        print(f"Concatenating Split Team Files ({len(concat_teams)} teams)")
+        print(f"{'='*60}\n")
 
-def download_player_data(players: dict, output_dir: Path, limit: int = None, max_workers: int = None, skip_existing: bool = False):
-    """Download MoneyPuck player data using threading"""
+        concat_success = 0
+        for team in concat_teams:
+            old_abbr, new_abbr = team_abbr_map[team]
+            if concatenate_split_team_files(team_dir, team, old_abbr, new_abbr):
+                concat_success += 1
+
+        print(f"\nConcatenation: {concat_success}/{len(concat_teams)} successful")
+
+
+def download_player_data(players: dict, output_dir: Path, limit: int = None, max_workers: int = None, skip_existing: bool = False) -> Set[str]:
+    """Download MoneyPuck player data using threading
+
+    Returns:
+        Set of player IDs that 404'd on skater endpoint (assumed to be goalies)
+    """
 
     skaters = players['skaters'][:limit] if limit else players['skaters']
     goalies = players['goalies'][:limit] if limit else players['goalies']
@@ -193,17 +310,18 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
 
     success_count = 0
     failed_count = 0
+    not_found_players = set()  # Track 404'd player IDs
     lock = threading.Lock()
 
-    def download_skater(player_data: Tuple[str, str]) -> Tuple[bool, str]:
+    def download_skater(player_data: Tuple[str, str]) -> Tuple[bool, str, int]:
         """Download a single skater's data"""
         player_id, name = player_data
         url = MP_SKATER_URL.format(player_id=player_id)
         output_path = skater_dir / f"{player_id}.csv"
 
-        result = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
+        result, status_code = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
         time.sleep(0.05)  # Small delay to avoid overwhelming server
-        return result, name
+        return result, player_id, status_code
 
     # Use ThreadPoolExecutor for parallel downloads
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -211,19 +329,24 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
 
         completed = 0
         for future in as_completed(futures):
-            success, name = future.result()
+            success, player_id, status_code = future.result()
             with lock:
                 completed += 1
                 if success:
                     success_count += 1
                 else:
                     failed_count += 1
+                    # Track 404s - these are likely goalies
+                    if status_code == 404:
+                        not_found_players.add(player_id)
 
                 # Show progress every 50 downloads
                 if completed % 50 == 0:
                     print(f"Progress: {completed}/{len(skaters)} skaters processed...")
 
     print(f"\nSkater Data: {success_count} succeeded, {failed_count} failed")
+    if not_found_players:
+        print(f"  → {len(not_found_players)} players not found (likely goalies)")
 
     # Download goalies
     print(f"\n{'='*60}")
@@ -242,7 +365,7 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
         url = MP_GOALIE_URL.format(player_id=player_id)
         output_path = goalie_dir / f"{player_id}.csv"
 
-        result = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
+        result, _ = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
         time.sleep(0.05)  # Small delay to avoid overwhelming server
         return result, name
 
@@ -265,6 +388,70 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
                     print(f"Progress: {completed}/{len(goalies)} goalies processed...")
 
     print(f"\nGoalie Data: {success_count} succeeded, {failed_count} failed")
+
+    return not_found_players
+
+
+def update_player_ids_with_goalies(player_ids_file: str, goalie_ids: Set[str]) -> int:
+    """Update player_ids.txt to mark goalies with [G] indicator
+
+    Args:
+        player_ids_file: Path to player_ids.txt
+        goalie_ids: Set of player IDs that are goalies
+
+    Returns:
+        Number of players marked as goalies
+    """
+    if not goalie_ids:
+        return 0
+
+    # Create backup
+    backup_file = f"{player_ids_file}.backup"
+    shutil.copy(player_ids_file, backup_file)
+    print(f"\n{'='*60}")
+    print(f"Updating {player_ids_file} with goalie markers")
+    print(f"Backup created: {backup_file}")
+    print(f"{'='*60}\n")
+
+    # Read current file
+    updated_lines = []
+    goalies_marked = 0
+
+    with open(player_ids_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or ':' not in line:
+                continue
+
+            # Parse "Player Name: player_id" or "Player Name: player_id [G]"
+            parts = line.split(':', 1)
+            if len(parts) != 2:
+                continue
+
+            name = parts[0].strip()
+            rest = parts[1].strip()
+
+            # Skip if already marked as goalie
+            if rest.endswith('[G]'):
+                updated_lines.append(line)
+                continue
+
+            player_id = rest.strip()
+
+            # Mark as goalie if in the 404 list
+            if player_id in goalie_ids:
+                updated_lines.append(f"{name}: {player_id} [G]")
+                goalies_marked += 1
+            else:
+                updated_lines.append(line)
+
+    # Write updated file
+    with open(player_ids_file, 'w', encoding='utf-8') as f:
+        for line in updated_lines:
+            f.write(line + '\n')
+
+    print(f"✓ Marked {goalies_marked} new players as goalies")
+    return goalies_marked
 
 
 def main():
@@ -307,8 +494,13 @@ def main():
 
     # Download players
     if not args.teams_only:
-        players = get_players_from_db(args.db)
-        download_player_data(players, output_dir, limit=args.limit, max_workers=args.threads, skip_existing=skip_existing)
+        player_ids_file = "player_ids.txt"
+        players = get_players_from_file(player_ids_file)
+        goalie_404s = download_player_data(players, output_dir, limit=args.limit, max_workers=args.threads, skip_existing=skip_existing)
+
+        # Update player_ids.txt with newly identified goalies
+        if goalie_404s:
+            update_player_ids_with_goalies(player_ids_file, goalie_404s)
 
     print(f"\n{'='*60}")
     print(f"Download complete! Data saved to: {output_dir}")

@@ -10,8 +10,7 @@ import sqlite3
 import csv
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-
-#TODO: Shity SQL is causing the DB to only populate with 1 seasons worth of shots
+# Goalie data not being imported
 
 class MoneyPuckTeamImporter:
     """Imports MoneyPuck team game-by-game data"""
@@ -35,6 +34,10 @@ class MoneyPuckTeamImporter:
         'N.J': 'NJ',
         'S.J': 'SJ',
         'T.B': 'TB',
+        'LAK': 'LA',
+        'SJS': 'SJ',
+        'TBL': 'TB',
+        'NJD': 'NJ',
     }
 
     # CSV column → Database column mapping
@@ -361,6 +364,10 @@ class MoneyPuckPlayerImporter:
         'N.J': 'NJ',
         'S.J': 'SJ',
         'T.B': 'TB',
+        'LAK': 'LA',
+        'SJS': 'SJ',
+        'TBL': 'TB',
+        'NJD': 'NJ',
     }
 
     # SKATER Column mapping
@@ -543,15 +550,26 @@ class MoneyPuckPlayerImporter:
         conn.commit()
 
     @staticmethod
+    def get_or_create_player(cursor: sqlite3.Cursor, player_id: str, name: str, position: str):
+        """Ensure player exists in database, create if not"""
+        cursor.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+        if cursor.fetchone():
+            return
+
+        # Insert new player
+        try:
+            cursor.execute(
+                "INSERT INTO players (player_id, player_name, position) VALUES (?, ?, ?)",
+                (player_id, name, position)
+            )
+        except sqlite3.Error as e:
+            print(f"Error creating player {name} ({player_id}): {e}")
+
+    @staticmethod
     def import_skater_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
         """Import a single skater CSV file"""
         cursor = conn.cursor()
         player_id = Path(csv_path).stem
-
-        # Verify player exists
-        cursor.execute("SELECT COUNT(*) FROM players WHERE player_id = ?", (player_id,))
-        if cursor.fetchone()[0] == 0:
-            return 0, 0
 
         rows_imported = 0
         rows_skipped = 0
@@ -560,6 +578,12 @@ class MoneyPuckPlayerImporter:
             reader = csv.DictReader(f)
 
             for row in reader:
+                # Ensure player exists using data from first row
+                name = row.get('name')
+                position = row.get('position')
+                if name and position:
+                    MoneyPuckPlayerImporter.get_or_create_player(cursor, player_id, name, position)
+
                 game_id = row.get('gameId')
                 mp_situation = row.get('situation')
                 team_abbr = row.get('playerTeam')
@@ -615,11 +639,6 @@ class MoneyPuckPlayerImporter:
         cursor = conn.cursor()
         player_id = Path(csv_path).stem
 
-        # Verify player exists
-        cursor.execute("SELECT COUNT(*) FROM players WHERE player_id = ? AND position = 'G'", (player_id,))
-        if cursor.fetchone()[0] == 0:
-            return 0, 0
-
         rows_imported = 0
         rows_skipped = 0
 
@@ -627,6 +646,12 @@ class MoneyPuckPlayerImporter:
             reader = csv.DictReader(f)
 
             for row in reader:
+                # Ensure player exists using data from first row
+                name = row.get('name')
+                position = row.get('position')
+                if name and position:
+                    MoneyPuckPlayerImporter.get_or_create_player(cursor, player_id, name, position)
+
                 game_id = row.get('gameId')
                 mp_situation = row.get('situation')
                 team_abbr = row.get('playerTeam')
@@ -1165,11 +1190,23 @@ class MoneyPuckShotsImporter:
 
             for row in reader:
                 shot_id = row.get('shotID')
-                game_id = row.get('game_id')
+                game_id = row.get('game_id')  # Short format (e.g., "20001")
+                season = row.get('season')    # Year (e.g., "2024")
 
-                if not shot_id or not game_id:
+                if not shot_id or not game_id or not season:
                     rows_skipped += 1
                     continue
+
+                # Convert short game_id to traditional format
+                # Regular season: season + "02" + game_id (e.g., "2024" + "02" + "20001" = "2024020001")
+                # Playoffs: season + "03" + game_id (e.g., "2024" + "03" + "30111" = "2024030111")
+                game_id_str = str(game_id)
+                if game_id_str.startswith('3'):
+                    # Playoff game
+                    traditional_game_id = f"{season}03{game_id_str[1:]}"
+                else:
+                    # Regular season game (starts with 2)
+                    traditional_game_id = f"{season}02{game_id_str[1:]}"
 
                 db_values = {}
 
@@ -1177,6 +1214,10 @@ class MoneyPuckShotsImporter:
                 for csv_col, db_col in MoneyPuckShotsImporter.COLUMN_MAP.items():
                     if csv_col in row and row[csv_col] not in ('', 'NA', 'NaN'):
                         value = row[csv_col]
+                        # Override game_id with traditional format
+                        if db_col == 'game_id':
+                            db_values[db_col] = traditional_game_id
+                            continue
                         try:
                             # Attempt numeric conversion
                             if '.' in str(value):

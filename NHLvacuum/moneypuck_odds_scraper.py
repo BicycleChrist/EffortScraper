@@ -6,6 +6,7 @@ Scrapes opening and closing odds from MoneyPuck preview pages.
 
 import csv
 import logging
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -595,6 +596,76 @@ def load_game_ids(csv_file: str) -> List[Tuple[str, str, str]]:
     return games
 
 
+def load_playoff_games_from_db(db_path: str, season: Optional[str] = None) -> List[Tuple[str, str, str]]:
+    """
+    Load playoff game IDs directly from the database.
+    Playoff games have game_id with format YYYY03XXXX where the '03' indicates playoffs.
+    Regular season games use '02', preseason uses '01', all-star is '04'.
+
+    Args:
+        db_path: Path to the nhl_analytics.db database
+        season: Optional season filter (e.g., "2024-2025"). If None, loads all playoff games.
+
+    Returns:
+        List of tuples: (traditional_game_id, game_id, season)
+    """
+    games = []
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        if season:
+            # Extract the first year from the season (e.g., "2024" from "2024-2025")
+            year_prefix = season.split('-')[0]
+            query = """
+                SELECT game_id, season
+                FROM games
+                WHERE game_id LIKE ?
+                AND season = ?
+                ORDER BY game_id
+            """
+            # Pattern: year + '03' + any 4 digits (e.g., '202403____')
+            pattern = f"{year_prefix}03%"
+            cursor.execute(query, (pattern, season))
+        else:
+            # Load all playoff games
+            # Use SUBSTR to check positions 5-6 are '03'
+            query = """
+                SELECT game_id, season
+                FROM games
+                WHERE SUBSTR(game_id, 5, 2) = '03'
+                ORDER BY game_id
+            """
+            cursor.execute(query)
+
+        rows = cursor.fetchall()
+
+        for row in rows:
+            game_id_full = row[0]  # e.g., "2024030176"
+            season_val = row[1]    # e.g., "2024-2025"
+
+            # The traditional_game_id is the same as game_id from the database
+            traditional_game_id = game_id_full
+
+            # For consistency with CSV format, we might want a simplified game_id
+            # Extract the last 5 digits (e.g., "30176" from "2024030176")
+            simplified_game_id = game_id_full[-5:]
+
+            games.append((
+                traditional_game_id,
+                simplified_game_id,
+                season_val
+            ))
+
+        logger.info(f"Loaded {len(games)} playoff games from database" +
+                   (f" for season {season}" if season else ""))
+
+    finally:
+        conn.close()
+
+    return games
+
+
 def save_results(results: List[GameLine], output_file: str):
     """
     Save scraping results to CSV file in wide format.
@@ -835,14 +906,16 @@ def rescrape_missing_games(csv_file: str, max_workers: int = 4,
     logger.info(f"Updated {len(missing_games)} games in {csv_file}")
 
 
-def scrape_season(csv_file: str, output_file: str, max_workers: int = 10,
+def scrape_season(csv_file: Optional[str] = None, games_list: Optional[List[Tuple[str, str, str]]] = None,
+                  output_file: str = None, max_workers: int = 10,
                   headless: bool = True, delay: float = 0.33, max_retries: int = 3,
                   timeout: int = 20):
     """
     Scrape all games from a season using multithreading.
 
     Args:
-        csv_file: Path to CSV file with game IDs
+        csv_file: Path to CSV file with game IDs (optional if games_list provided)
+        games_list: List of game tuples (traditional_game_id, game_id, season) (optional if csv_file provided)
         output_file: Path to output CSV file
         max_workers: Maximum number of concurrent threads
         headless: Whether to run browser in headless mode
@@ -850,10 +923,17 @@ def scrape_season(csv_file: str, output_file: str, max_workers: int = 10,
         max_retries: Maximum number of retry attempts for failed requests
         timeout: Timeout in seconds for element waits (page load timeout is 2x this)
     """
-    logger.info(f"Starting scrape of {csv_file}")
+    if csv_file:
+        logger.info(f"Starting scrape of {csv_file}")
+        games = load_game_ids(csv_file)
+    elif games_list:
+        logger.info(f"Starting scrape of {len(games_list)} games from provided list")
+        games = games_list
+    else:
+        raise ValueError("Either csv_file or games_list must be provided")
+
     logger.info(f"Max workers: {max_workers}, Headless: {headless}, Delay: {delay}s, Max retries: {max_retries}, Timeout: {timeout}s")
 
-    games = load_game_ids(csv_file)
     results = []
 
     scraper = MoneyPuckScraper(headless=headless, max_retries=max_retries, timeout=timeout)
@@ -913,10 +993,14 @@ if __name__ == '__main__':
     import glob
 
     parser = argparse.ArgumentParser(description='Scrape MoneyPuck game lines')
-    parser.add_argument('--season', type=str, default=None,
+    parser.add_argument('--season', type=str, default='2025-26', # set to current season
                         help='Specific season to scrape (e.g., 2023-24). If not specified, scrapes all available seasons.')
     parser.add_argument('--rescrape-missing', type=str, default=None,
                         help='Rescrape games with missing team data from existing CSV file (e.g., moneypuck_odds_2025-26.csv)')
+    parser.add_argument('--playoffs', action='store_true',
+                        help='Scrape playoff games from database instead of regular season games from CSV')
+    parser.add_argument('--db-path', type=str, default='nhl_analytics.db',
+                        help='Path to nhl_analytics.db database (default: nhl_analytics.db)')
     parser.add_argument('--workers', type=int, default=4,
                         help='Number of concurrent threads (default: 4)')
     parser.add_argument('--delay', type=float, default=0.5,
@@ -950,7 +1034,56 @@ if __name__ == '__main__':
         )
         exit(0)
 
-    # Find all available season files
+    # Handle playoff mode
+    if args.playoffs:
+        logger.info("=" * 60)
+        logger.info("PLAYOFF MODE - Loading games from database")
+        logger.info("=" * 60)
+
+        # Check database exists
+        if not Path(args.db_path).exists():
+            logger.error(f"Database not found: {args.db_path}")
+            exit(1)
+
+        # Load playoff games
+        playoff_games = load_playoff_games_from_db(args.db_path, season=args.season)
+
+        if not playoff_games:
+            logger.error(f"No playoff games found in database" +
+                        (f" for season {args.season}" if args.season else ""))
+            exit(1)
+
+        # Determine output filename
+        if args.season:
+            output_file = f"moneypuck_odds_{args.season}_playoffs.csv"
+            season_label = args.season
+        else:
+            output_file = "moneypuck_odds_all_playoffs.csv"
+            season_label = "all seasons"
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"STARTING PLAYOFF SCRAPE: {season_label}")
+        logger.info(f"Found {len(playoff_games)} playoff games")
+        logger.info("=" * 60)
+
+        scrape_season(
+            games_list=playoff_games,
+            output_file=output_file,
+            max_workers=args.workers,
+            headless=not args.no_headless,
+            delay=args.delay,
+            max_retries=args.retries,
+            timeout=args.timeout
+        )
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("PLAYOFF SCRAPE COMPLETE")
+        logger.info("=" * 60)
+        exit(0)
+
+    # Regular season mode - find all available season files
     season_files = sorted(glob.glob("unique_game_ids_20*.csv"))
 
     if not season_files:
