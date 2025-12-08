@@ -27,6 +27,7 @@ from functools import lru_cache
 from collections import defaultdict
 from nstparse import TEAM_NAME_MAP
 
+#TODO: Fix UTF-8 encoding BS for player names with accent marks
 @dataclass
 class GameInfo:
     """Parsed game information from filename"""
@@ -1755,6 +1756,160 @@ class NHLDatabaseManager:
         print("Import complete!")
         print("="*60)
 
+    def import_specific_games(self, games_metadata: List[Dict], base_dir: str = 'nhlteamreports', use_multithreading: bool = True):
+        """
+        Import specific games based on metadata (game_id, home_team, away_team, season).
+        This bypasses the full directory scan for efficiency.
+
+        Args:
+            games_metadata: List of dicts containing:
+                - game_id: Full 10-digit game ID (e.g., "2024020484")
+                - home_team: Home team abbreviation
+                - away_team: Away team abbreviation
+                - season: Season string (e.g., "2024-25")
+            base_dir: Base directory containing team folders
+            use_multithreading: Whether to use multithreading for CSV imports
+        """
+        if not games_metadata:
+            print("No specific games provided for import.")
+            return
+
+        # Load situation map if not loaded
+        if not self.situation_map:
+            self.cursor.execute("SELECT situation_id, situation_code FROM situations")
+            self.situation_map = {code: sid for sid, code in self.cursor.fetchall()}
+
+        import_tasks = []
+        print(f"Preparing to import {len(games_metadata)} specific games...")
+
+        for game in games_metadata:
+            game_id = game['game_id']
+            home_team = game['home_team']
+            away_team = game['away_team']
+            season = game['season']
+            
+            # Extract game suffix (last 5 digits) for filename matching
+            # e.g., 2024020484 -> 20484
+            if len(game_id) == 10:
+                game_suffix = game_id[5:]
+            else:
+                print(f"Skipping invalid game_id format: {game_id}")
+                continue
+
+            # Define search paths (both home and away team directories)
+            teams_to_check = [home_team, away_team]
+            
+            # Normalize season format for path (ensure YYYY-YY)
+            # If it comes as YYYYYYYY (20242025), convert to 2024-25
+            if len(season) == 8 and season.isdigit():
+                season_path_name = f"{season[:4]}-{season[6:]}"
+            else:
+                season_path_name = season
+
+            season_code_for_files = season.replace('-', '') # For scraper/importer logic (20242025)
+            if len(season_code_for_files) == 6:
+                 year_start = season_code_for_files[:4]
+                 year_end = str(int(year_start) + 1)
+                 season_code_for_files = year_start + year_end
+
+            # Find matching files
+            found_files = False
+            for team_abbr in teams_to_check:
+                if not team_abbr: continue
+                
+                # Construct path: nhlteamreports/{TEAM}/games/{SEASON}/*_{SUFFIX}_*.csv
+                # Use glob to match
+                search_path = Path(base_dir) / team_abbr / 'games' / season_path_name
+                
+                if not search_path.exists():
+                    # Try alternate season format if directory not found (e.g. 20242025)
+                    search_path_alt = Path(base_dir) / team_abbr / 'games' / season_code_for_files
+                    if search_path_alt.exists():
+                        search_path = search_path_alt
+                    else:
+                        # print(f"  Warning: Path not found: {search_path}")
+                        continue
+
+                # Glob for files containing the suffix
+                # Pattern: *_{SUFFIX}_*.csv
+                # Note: Suffix alone might match unrelated files if short, but 5 digits is usually safe
+                # Better pattern: *_{SUFFIX}_*.csv
+                for csv_file in search_path.glob(f"*_{game_suffix}_*.csv"):
+                    # Import task: (csv_path, game_date, team_abbr, season_code)
+                    # We need game_date. We can query it from DB or pass it in metadata.
+                    # Assuming metadata has it or we can parse/dummy it (importer uses it for DB lookup)
+                    # The importer needs date mainly to create the game record if missing.
+                    # Let's assume metadata has 'game_date'
+                    game_date = game.get('game_date')
+                    if not game_date:
+                         # Try to find games_list.csv to lookup date?
+                         # Or just rely on what we have. If DB entry exists, date is ignored.
+                         # If DB entry missing, we need date.
+                         pass
+
+                    import_tasks.append((str(csv_file), game_date, team_abbr, season_code_for_files))
+                    found_files = True
+            
+            if not found_files:
+                print(f"  Warning: No files found for game {game_id} ({season}) in {base_dir}")
+
+        if not import_tasks:
+            print("No files found to import.")
+            return
+
+        print(f"Found {len(import_tasks)} CSV files to import.")
+
+        # Execute imports
+        if use_multithreading and len(import_tasks) > 1:
+            print(f"  Phase 1: Parsing {len(import_tasks)} CSV files in parallel...")
+            parsed_files = []
+            failed = 0
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_file = {
+                    executor.submit(self._parse_csv_file_worker, csv_path, game_date, team_abbr, season_code): csv_path
+                    for csv_path, game_date, team_abbr, season_code in import_tasks
+                }
+
+                for future in as_completed(future_to_file):
+                    csv_path = future_to_file[future]
+                    try:
+                        success, error, parsed_data = future.result()
+                        if success and parsed_data:
+                            parsed_files.append(parsed_data)
+                        elif not success and error:
+                            failed += 1
+                            print(error)
+                    except Exception as e:
+                        failed += 1
+                        print(f"Exception parsing {csv_path}: {e}")
+
+            print(f"  Phase 2: Writing {len(parsed_files)} files to database (sequential)...")
+            successful = 0
+            COMMIT_BATCH_SIZE = 50
+            for i, parsed_data in enumerate(parsed_files):
+                try:
+                    self._process_parsed_file(parsed_data)
+                    successful += 1
+                    if (i + 1) % COMMIT_BATCH_SIZE == 0:
+                        self.conn.commit()
+                except Exception as e:
+                    failed += 1
+                    print(f"Error writing {parsed_data['csv_path']}: {e}")
+
+            self.conn.commit()
+            print(f"Imported {successful} files ({failed} failed)")
+        else:
+            # Sequential
+            imported = 0
+            for csv_path, game_date, team_abbr, season_code in import_tasks:
+                try:
+                    self.import_csv_file(csv_path, game_date, team_abbr, season_code)
+                    imported += 1
+                except Exception as e:
+                    print(f"Error importing {csv_path}: {e}")
+            print(f"Imported {imported} files")
+
     def verify_database_integrity(self, verbose: bool = True) -> Dict[str, any]:
         """
         Verify database integrity and game ID format
@@ -1859,8 +2014,6 @@ def main():
     """
     Main entry point - Automatically imports missing data from nhlteamreports/
     """
-    import os
-
     db_path = 'nhl_analytics.db'
     schema_path = 'full_schema.sql'
 

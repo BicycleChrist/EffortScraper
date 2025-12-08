@@ -9,7 +9,7 @@ Contains separate classes for team and player imports.
 import sqlite3
 import csv
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set
 # Goalie data not being imported
 
 class MoneyPuckTeamImporter:
@@ -231,7 +231,7 @@ class MoneyPuckTeamImporter:
         conn.commit()
 
     @staticmethod
-    def import_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+    def import_csv(csv_path: str, conn: sqlite3.Connection, game_ids: Optional[Set[str]] = None) -> Tuple[int, int]:
         """Import a single team CSV file. Returns: (rows_imported, rows_skipped)"""
         cursor = conn.cursor()
 
@@ -249,6 +249,11 @@ class MoneyPuckTeamImporter:
 
             for row in reader:
                 game_id = row.get('gameId')
+                
+                # Filter by game_id if provided
+                if game_ids is not None and game_id not in game_ids:
+                    continue
+
                 mp_situation = row.get('situation')
 
                 if not game_id or not mp_situation:
@@ -295,7 +300,7 @@ class MoneyPuckTeamImporter:
         return rows_imported, rows_skipped
 
     @staticmethod
-    def import_all():
+    def import_all(game_ids: Optional[Set[str]] = None):
         """Import all team CSV files"""
         conn = sqlite3.connect(MoneyPuckTeamImporter.DB_PATH)
         cursor = conn.cursor()
@@ -307,11 +312,14 @@ class MoneyPuckTeamImporter:
         MoneyPuckTeamImporter.ensure_other_situation(cursor)
         conn.commit()
 
-        # Clear existing data
-        MoneyPuckTeamImporter.clear_table(conn)
+        # Clear existing data ONLY if not filtering by game_ids
+        if game_ids is None:
+            MoneyPuckTeamImporter.clear_table(conn)
 
         print("\n" + "="*80)
         print("IMPORTING MONEYPUCK TEAM DATA")
+        if game_ids:
+            print(f"Filtering for {len(game_ids)} specific games")
         print("="*80 + "\n")
 
         team_files = sorted(Path(MoneyPuckTeamImporter.MP_TEAM_DATA_DIR).glob('*.csv'))
@@ -321,13 +329,13 @@ class MoneyPuckTeamImporter:
 
         for csv_file in team_files:
             team_abbr = csv_file.stem
-            print(f"Importing {team_abbr}...", end=' ')
+            # print(f"Importing {team_abbr}...", end=' ')
 
-            imported, skipped = MoneyPuckTeamImporter.import_csv(str(csv_file), conn)
+            imported, skipped = MoneyPuckTeamImporter.import_csv(str(csv_file), conn, game_ids)
             total_imported += imported
             total_skipped += skipped
 
-            print(f"✓ {imported} rows imported, {skipped} skipped")
+            # print(f"✓ {imported} rows imported, {skipped} skipped")
 
         conn.close()
 
@@ -566,7 +574,7 @@ class MoneyPuckPlayerImporter:
             print(f"Error creating player {name} ({player_id}): {e}")
 
     @staticmethod
-    def import_skater_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+    def import_skater_csv(csv_path: str, conn: sqlite3.Connection, game_ids: Optional[Set[str]] = None) -> Tuple[int, int]:
         """Import a single skater CSV file"""
         cursor = conn.cursor()
         player_id = Path(csv_path).stem
@@ -578,6 +586,12 @@ class MoneyPuckPlayerImporter:
             reader = csv.DictReader(f)
 
             for row in reader:
+                game_id = row.get('gameId')
+                
+                # Filter by game_id if provided
+                if game_ids is not None and game_id not in game_ids:
+                    continue
+
                 # Ensure player exists using data from first row
                 name = row.get('name')
                 position = row.get('position')
@@ -634,7 +648,7 @@ class MoneyPuckPlayerImporter:
         return rows_imported, rows_skipped
 
     @staticmethod
-    def import_goalie_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+    def import_goalie_csv(csv_path: str, conn: sqlite3.Connection, game_ids: Optional[Set[str]] = None) -> Tuple[int, int]:
         """Import a single goalie CSV file"""
         cursor = conn.cursor()
         player_id = Path(csv_path).stem
@@ -646,6 +660,12 @@ class MoneyPuckPlayerImporter:
             reader = csv.DictReader(f)
 
             for row in reader:
+                game_id = row.get('gameId')
+                
+                # Filter by game_id if provided
+                if game_ids is not None and game_id not in game_ids:
+                    continue
+
                 # Ensure player exists using data from first row
                 name = row.get('name')
                 position = row.get('position')
@@ -710,18 +730,21 @@ class MoneyPuckPlayerImporter:
         return rows_imported, rows_skipped
 
     @staticmethod
-    def import_all():
+    def import_all(game_ids: Optional[Set[str]] = None):
         """Import all skater and goalie data"""
         conn = sqlite3.connect(MoneyPuckPlayerImporter.DB_PATH)
 
         # Ensure tables exist
         MoneyPuckPlayerImporter.ensure_tables(conn)
 
-        # Clear existing data
-        MoneyPuckPlayerImporter.clear_tables(conn)
+        # Clear existing data ONLY if not filtering
+        if game_ids is None:
+            MoneyPuckPlayerImporter.clear_tables(conn)
 
         print("\n" + "="*80)
         print("IMPORTING MONEYPUCK SKATER DATA")
+        if game_ids:
+            print(f"Filtering for {len(game_ids)} specific games")
         print("="*80 + "\n")
 
         skater_files = sorted(Path(MoneyPuckPlayerImporter.MP_SKATER_DATA_DIR).glob('*.csv'))
@@ -730,7 +753,7 @@ class MoneyPuckPlayerImporter:
         skaters_processed = 0
 
         for i, csv_file in enumerate(skater_files, 1):
-            imported, skipped = MoneyPuckPlayerImporter.import_skater_csv(str(csv_file), conn)
+            imported, skipped = MoneyPuckPlayerImporter.import_skater_csv(str(csv_file), conn, game_ids)
             if imported > 0 or skipped > 0:
                 skaters_processed += 1
                 total_skater_imported += imported
@@ -753,7 +776,7 @@ class MoneyPuckPlayerImporter:
         goalies_processed = 0
 
         for csv_file in goalie_files:
-            imported, skipped = MoneyPuckPlayerImporter.import_goalie_csv(str(csv_file), conn)
+            imported, skipped = MoneyPuckPlayerImporter.import_goalie_csv(str(csv_file), conn, game_ids)
             if imported > 0 or skipped > 0:
                 goalies_processed += 1
                 total_goalie_imported += imported
@@ -901,7 +924,7 @@ class MoneyPuckOddsImporter:
         conn.commit()
 
     @staticmethod
-    def import_csv(csv_path: str, conn: sqlite3.Connection) -> Tuple[int, int]:
+    def import_csv(csv_path: str, conn: sqlite3.Connection, game_ids: Optional[Set[str]] = None) -> Tuple[int, int]:
         """
         Import a single odds CSV file (wide format).
         Returns: (games_imported, games_skipped)
@@ -919,6 +942,10 @@ class MoneyPuckOddsImporter:
 
                 if not traditional_game_id:
                     games_skipped += 1
+                    continue
+                    
+                # Filter by game_id if provided
+                if game_ids is not None and traditional_game_id not in game_ids:
                     continue
 
                 # Parse MoneyPuck win probabilities
@@ -977,19 +1004,22 @@ class MoneyPuckOddsImporter:
         return games_imported, games_skipped
 
     @staticmethod
-    def import_all():
+    def import_all(game_ids: Optional[Set[str]] = None):
         """Import all odds CSV files"""
         conn = sqlite3.connect(MoneyPuckOddsImporter.DB_PATH)
 
         # Ensure tables exist
         MoneyPuckOddsImporter.ensure_tables(conn)
 
-        # Clear existing data
-        print("\nClearing existing odds data...")
-        MoneyPuckOddsImporter.clear_tables(conn)
+        # Clear existing data ONLY if not filtering
+        if game_ids is None:
+            print("\nClearing existing odds data...")
+            MoneyPuckOddsImporter.clear_tables(conn)
 
         print("\n" + "="*80)
         print("IMPORTING MONEYPUCK ODDS DATA")
+        if game_ids:
+            print(f"Filtering for {len(game_ids)} specific games")
         print("="*80 + "\n")
 
         # Find all odds files (moneypuck_odds_*.csv in current directory)
@@ -1007,7 +1037,7 @@ class MoneyPuckOddsImporter:
             season = csv_file.stem.replace('moneypuck_odds_', '')
             print(f"Importing {season} season odds...", end=' ', flush=True)
 
-            imported, skipped = MoneyPuckOddsImporter.import_csv(str(csv_file), conn)
+            imported, skipped = MoneyPuckOddsImporter.import_csv(str(csv_file), conn, game_ids)
             total_imported += imported
             total_skipped += skipped
 
