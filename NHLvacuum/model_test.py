@@ -51,14 +51,19 @@ STATS_PATH = "advanced_standardize_stats_v6.npz"
 RANDOM_SEED = None
 
 DEFAULT_EPOCHS = 600
-DEFAULT_BATCH = 128
+DEFAULT_BATCH = 64
 DEFAULT_LR = 0.0005
-DEFAULT_HIDDEN = 512
+DEFAULT_HIDDEN = 128
 DEFAULT_N_SIMS = 5000
 
 EMPTY_NET_MULTIPLIER_FOR = 5.0
 EMPTY_NET_MULTIPLIER_AGAINST = 2.5
 
+# ---------------------------
+# Global Helpers
+# ---------------------------
+def norm(s):
+    return s.replace('.', '').upper()
 
 # ---------------------------
 # Situation Helper
@@ -268,8 +273,27 @@ def process_advanced_metrics(con) -> pd.DataFrame:
     df['roll_md_save_pct'] = grp['md_save_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     df['roll_block_rate'] = grp['block_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
 
+    # --- Trend Features (Short & Long Term) ---
+    # Short term (Last 3) - Hot/Cold streaks
+    df['roll3_sh_pct'] = grp['sh_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    df['roll3_sa_corsi_pct'] = grp['sa_corsi_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    df['roll3_hd_save_pct'] = grp['hd_save_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    
+    # Long term (Last 20) - Structural strength
+    df['roll20_sh_pct'] = grp['sh_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+    df['roll20_sa_corsi_pct'] = grp['sa_corsi_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+    df['roll20_hd_save_pct'] = grp['hd_save_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+
+    # Update new_features list to include these
+    trend_features = [
+        'roll3_sh_pct', 'roll3_sa_corsi_pct', 'roll3_hd_save_pct',
+        'roll20_sh_pct', 'roll20_sa_corsi_pct', 'roll20_hd_save_pct'
+    ]
+    
+    final_cols = new_features + trend_features
+
     # Fill with league averages
-    for col in new_features:
+    for col in final_cols:
         # For calculated percentages, the base col is just the name without 'roll_'
         # For raw counts (hits, freeze, rebounds, pen_diff), the base col matches the column created above
         base_col_map = {
@@ -288,97 +312,216 @@ def process_advanced_metrics(con) -> pd.DataFrame:
             'roll_block_rate': 'block_rate'
         }
         
-        base_col = base_col_map.get(col, col.replace('roll_', ''))
+        base_col = base_col_map.get(col, col.replace('roll_', '').replace('roll3_', '').replace('roll20_', ''))
         if base_col in df.columns:
             league_avg = df[base_col].mean()
             df[col] = df[col].fillna(league_avg if not np.isnan(league_avg) else 0.0)
         else:
             df[col] = df[col].fillna(0.0)
 
-    return df[['game_id', 'team_id'] + new_features]
+    # After all calculations and fills, for debugging team 28
+    return df[['game_id', 'team_id'] + final_cols]
 
 
-# royal road filling in for rush rate
-# rush rate is another deprecated column with 450 instances in around 400k shots in the DB
+def get_team_map(con):
+    """
+    Returns a dictionary mapping various team codes (L.A, LAK, etc.) to internal team_id.
+    """
+    teams_df = pd.read_sql_query("SELECT team_id, team_abbr FROM teams", con)
+    mapping = {abbr.upper(): tid for tid, abbr in zip(teams_df['team_id'], teams_df['team_abbr'])}
+    
+    # Add MoneyPuck/NHL specific overrides
+    overrides = {
+        'L.A': mapping.get('LA'), 'LAK': mapping.get('LA'),
+        'N.J': mapping.get('NJ'), 'NJD': mapping.get('NJ'),
+        'S.J': mapping.get('SJ'), 'SJS': mapping.get('SJ'),
+        'T.B': mapping.get('TB'), 'TBL': mapping.get('TB'),
+        'UTA': mapping.get('UTA'), 'ARI': mapping.get('ARI'), # Utah/Arizona
+        'VGK': mapping.get('VGK'), 'SEA': mapping.get('SEA')
+    }
+    # Update mapping with overrides (filtering out Nones)
+    for k, v in overrides.items():
+        if v is not None:
+            mapping[k] = v
+            
+    return mapping
+
 def process_shot_metrics(con) -> pd.DataFrame:
-    # 1. Fetch raw shot data
-    # Filter in SQL for 5v5 and regulation/OT (period <= 3)
+    # 1. Fetch raw shot data (All situations or 5v5? Let's use All for volume)
+    # Using period <= 4 (Regulation + OT)
     shots_query = """
     SELECT game_id, team_code,
-           shot_distance as dist,
-           CASE WHEN COALESCE(shot_angle_rebound_royal_road, 0) = 1 THEN 1 ELSE 0 END as royal
+           shot_distance,
+           shot_angle,
+           shot_type,
+           shot_generated_rebound,
+           shot_rush,
+           off_wing,
+           shot_was_on_goal,
+           goal
     FROM mp_shots
-    WHERE home_skaters_on_ice = 5 AND away_skaters_on_ice = 5 AND period <= 3
+    WHERE period <= 4
     """
     df_shots = pd.read_sql_query(shots_query, con)
 
     if df_shots.empty:
-        df = pd.DataFrame(columns=['game_id', 'team_id', 'roll_dist', 'roll_royal_rate'])
-        df['roll_dist'] = 35.0
-        df['roll_royal_rate'] = 0.08
-        return df
+        return pd.DataFrame(columns=['game_id', 'team_id'])
 
-    # 2. Fetch teams for mapping
-    teams_df = pd.read_sql_query("SELECT team_id, team_abbr FROM teams", con)
-
-    # 3. Normalize team codes in shots data to match teams table
-    # Create mapping dictionary
-    # Standardize to uppercase and strip
-    # Handle MoneyPuck specific mappings
-    team_map = {abbr.upper(): tid for tid, abbr in zip(teams_df['team_id'], teams_df['team_abbr'])}
-
-    # Add specific overrides
-    # LAK->LA, NJD->NJ, SJS->SJ, TBL->TB
-    # Find IDs for standard abbrs
-    la_id = team_map.get('LA')
-    nj_id = team_map.get('NJ')
-    sj_id = team_map.get('SJ')
-    tb_id = team_map.get('TB')
-
-    if la_id: team_map['LAK'] = la_id
-    if nj_id: team_map['NJD'] = nj_id
-    if sj_id: team_map['SJS'] = sj_id
-    if tb_id: team_map['TBL'] = tb_id
-
-    # Clean shot team codes
+    # 2. Map Teams
+    team_map = get_team_map(con)
     df_shots['team_code_clean'] = df_shots['team_code'].astype(str).str.upper().str.strip()
-
-    # Map to team_id
     df_shots['team_id'] = df_shots['team_code_clean'].map(team_map)
-
-    # Drop shots where team mapping failed (should be rare/none)
     df_shots = df_shots.dropna(subset=['team_id'])
     df_shots['team_id'] = df_shots['team_id'].astype(int)
 
+    # 3. Create Indicators
+    df_shots['is_wrist'] = (df_shots['shot_type'] == 'WRIST').astype(int)
+    df_shots['is_slap'] = (df_shots['shot_type'] == 'SLAP').astype(int)
+    df_shots['is_snap'] = (df_shots['shot_type'] == 'SNAP').astype(int)
+    df_shots['is_backhand'] = (df_shots['shot_type'] == 'BACK').astype(int)
+    df_shots['is_tip'] = (df_shots['shot_type'] == 'TIP').astype(int) # 'DEFL' or 'TIP'? MP uses 'TIP' usually. 
+    # Check distinct shot_type if unsure, but this is a good start.
+
     # 4. Aggregate
     df_agg = df_shots.groupby(['game_id', 'team_id']).agg(
-        shots=('dist', 'count'),
-        dist=('dist', 'mean'),
-        royal=('royal', 'sum')
+        shots_total=('shot_distance', 'count'),
+        avg_dist=('shot_distance', 'mean'),
+        avg_angle=('shot_angle', lambda x: x.abs().mean()),
+        cnt_wrist=('is_wrist', 'sum'),
+        cnt_slap=('is_slap', 'sum'),
+        cnt_snap=('is_snap', 'sum'),
+        cnt_backhand=('is_backhand', 'sum'),
+        cnt_tip=('is_tip', 'sum'),
+        cnt_rebound=('shot_generated_rebound', 'sum'),
+        cnt_rush=('shot_rush', 'sum'),
+        cnt_off_wing=('off_wing', 'sum')
     ).reset_index()
 
-    # Filter min shots
-    df_agg = df_agg[df_agg['shots'] >= 10].copy()
+    # We do NOT return rolling averages here anymore. We return RAW stats.
+    # The central manager will handle rolling.
+    return df_agg
 
-    if df_agg.empty:
-        df = pd.DataFrame(columns=['game_id', 'team_id', 'roll_dist', 'roll_royal_rate'])
-        return df
 
-    # 5. Calculate rolling metrics
-    df_agg['royal_rate'] = df_agg['royal'] / df_agg['shots']
-    df_agg = df_agg.sort_values(['team_id', 'game_id'])
-    grp = df_agg.groupby('team_id')
+def process_skater_aggregates(con) -> pd.DataFrame:
+    """
+    Aggregates skater stats to team level (e.g. Top 3 F xG).
+    """
+    # Use All Situations
+    all_id = get_situation_id(con)
+    
+    query = f"""
+    SELECT game_id, team_id, player_id, mp_position, mp_i_f_xgoals, mp_i_f_goals
+    FROM mp_skater_game_stats
+    WHERE situation_id = {all_id}
+    """
+    df = pd.read_sql_query(query, con)
+    
+    if df.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id'])
+        
+    # Standardize Positions
+    # MP positions: 'C', 'L', 'R', 'D'
+    df['pos_group'] = df['mp_position'].map({'C': 'F', 'L': 'F', 'R': 'F', 'D': 'D'}).fillna('F')
+    
+    # Sort by xG descending per game/team/pos
+    df = df.sort_values(['game_id', 'team_id', 'pos_group', 'mp_i_f_xgoals'], ascending=[True, True, True, False])
+    
+    # Group by game/team/pos to pick top N
+    # This is slightly complex in pandas without rank, but let's try rank
+    df['rank'] = df.groupby(['game_id', 'team_id', 'pos_group']).cumcount() + 1
+    
+    # Define aggregations
+    # Top 3 F
+    top3f = df[(df['pos_group'] == 'F') & (df['rank'] <= 3)].groupby(['game_id', 'team_id'])['mp_i_f_xgoals'].sum().reset_index(name='top3_f_xg')
+    
+    # Top 2 D
+    top2d = df[(df['pos_group'] == 'D') & (df['rank'] <= 2)].groupby(['game_id', 'team_id'])['mp_i_f_xgoals'].sum().reset_index(name='top2_d_xg')
+    
+    # Bottom 6 F (Rank 7-12)
+    bot6f = df[(df['pos_group'] == 'F') & (df['rank'] >= 7) & (df['rank'] <= 12)].groupby(['game_id', 'team_id'])['mp_i_f_xgoals'].sum().reset_index(name='bot6_f_xg')
+    
+    # Finishing: Top 3 F Goals - xG
+    top3f_finish = df[(df['pos_group'] == 'F') & (df['rank'] <= 3)].groupby(['game_id', 'team_id']).apply(
+        lambda x: (x['mp_i_f_goals'] - x['mp_i_f_xgoals']).sum()
+    ).reset_index(name='top3_f_finish')
+    
+    # Merge all
+    out = top3f
+    out = pd.merge(out, top2d, on=['game_id', 'team_id'], how='outer')
+    out = pd.merge(out, bot6f, on=['game_id', 'team_id'], how='outer')
+    out = pd.merge(out, top3f_finish, on=['game_id', 'team_id'], how='outer')
+    
+    return out.fillna(0)
 
-    df_agg['roll_dist'] = grp['dist'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df_agg['roll_royal_rate'] = grp['royal_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+# --- New: Define all expected edge columns for consistency ---
+EVENT_TYPES = ['hit', 'giveaway', 'takeaway', 'blocked_shot', 'missed_shot']
+ZONES = ['d', 'n', 'o', 'u'] # d=defensive, n=neutral, o=offensive, u=unknown
 
-    # Fill NaNs
-    mean_dist = df_agg['dist'].mean()
-    mean_royal = df_agg['royal_rate'].mean()
-    df_agg['roll_dist'] = df_agg['roll_dist'].fillna(mean_dist if not np.isnan(mean_dist) else 35.0)
-    df_agg['roll_royal_rate'] = df_agg['roll_royal_rate'].fillna(mean_royal if not np.isnan(mean_royal) else 0.08)
+ALL_EXPECTED_EDGE_COLUMNS = []
+for event_type in EVENT_TYPES:
+    for zone in ZONES:
+        ALL_EXPECTED_EDGE_COLUMNS.append(f"edge_{event_type}_{zone}")
+# --- End new section ---
 
-    return df_agg[['game_id', 'team_id', 'roll_dist', 'roll_royal_rate']]
+# ... (rest of the file) ...
+
+def process_edge_metrics(con) -> pd.DataFrame:
+    # Optimized query: Aggregate in SQL to reduce data transfer and memory usage
+    query = """
+    SELECT 
+        CAST(game_id AS TEXT) as game_id, 
+        event_type,
+        COALESCE(zone_code, 'U') as zone_code,
+        eventOwnerTeamId as nhl_api_team_id
+    FROM edge_pbp_events
+    WHERE eventOwnerTeamId IS NOT NULL
+      AND event_type IN ('hit', 'giveaway', 'takeaway', 'blocked-shot', 'missed-shot')
+    """
+    
+    try:
+        df_events = pd.read_sql_query(query, con)
+    except Exception as e:
+        print(f"Warning: Could not fetch EDGE stats: {e}")
+        return pd.DataFrame(columns=['game_id', 'team_id'] + ALL_EXPECTED_EDGE_COLUMNS)
+    
+    if df_events.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id'] + ALL_EXPECTED_EDGE_COLUMNS)
+
+    # Map NHL API IDs to Internal IDs
+    teams_map_query = "SELECT NHL_TEAM_ID, team_id FROM teams WHERE NHL_TEAM_ID IS NOT NULL"
+    api_to_internal = pd.read_sql_query(teams_map_query, con).set_index('NHL_TEAM_ID')['team_id'].to_dict()
+            
+    df_events['team_id'] = df_events['nhl_api_team_id'].map(api_to_internal)
+    df_events = df_events.dropna(subset=['team_id'])
+    df_events['team_id'] = df_events['team_id'].astype(int)
+
+    # Process metrics
+    # normalize event_type: blocked-shot -> blocked_shot
+    df_events['norm_event'] = df_events['event_type'].str.replace('-', '_')
+    df_events['norm_zone'] = df_events['zone_code'].str.lower()
+    df_events['metric'] = 'edge_' + df_events['norm_event'] + '_' + df_events['norm_zone']
+
+    # Aggregate
+    agg = df_events.groupby(['game_id', 'team_id', 'metric']).size().reset_index(name='val')
+
+    # Pivot
+    pivot = agg.pivot_table(
+        index=['game_id', 'team_id'],
+        columns='metric',
+        values='val',
+        fill_value=0
+    ).reset_index()
+    
+    # Ensure types
+    pivot['game_id'] = pivot['game_id'].astype(str)
+    pivot['team_id'] = pivot['team_id'].astype(int)
+
+    # Ensure all expected edge columns are present
+    for col in ALL_EXPECTED_EDGE_COLUMNS:
+        if col not in pivot.columns:
+            pivot[col] = 0
+    
+    return pivot[['game_id', 'team_id'] + ALL_EXPECTED_EDGE_COLUMNS]
 
 
 # ---------------------------
@@ -549,12 +692,19 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     LEFT JOIN mp_team_game_stats m ON m.game_id = t.game_id AND m.team_id = t.team_id AND m.situation_id = {ALL_ID}
     """
     df = pd.read_sql_query(base, con)
+    # print(f"DEBUG: get_base_team_stats initial df size: {len(df)}")
+    # if not df.empty:
+    #      print(f"DEBUG: 2025020450 in base df? { '2025020450' in df['game_id'].astype(str).values }")
+
     df['mp_game_date'] = pd.to_datetime(df['mp_game_date'])
 
     for func in [process_special_teams, process_goalie_metrics, process_nst_metrics,
-                  process_shot_metrics, process_advanced_metrics]:
+                  process_shot_metrics, process_advanced_metrics, process_edge_metrics]:
         extra = func(con)
         if not extra.empty:
+            # if func.__name__ == 'process_edge_metrics':
+            #     pass
+            
             df = pd.merge(df, extra, on=['game_id', 'team_id'], how='left')
 
     con.close()
@@ -563,11 +713,18 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     df = df.sort_values(['team_id', 'mp_game_date'])
 
     grp = df.groupby('team_id')
-    for c in ['xgf', 'xga', 'pens']:
+    for c in ['xgf', 'xga', 'pens', 'goals_for']:
+        # Standard 10-game rolling
         df[f'roll_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-        # FIXED: Fill NaNs with league average to prevent propagation
+        
+        # Trend rolling (3 and 20)
+        df[f'roll3_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+        df[f'roll20_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+        
+        # Fill NaNs
         league_avg = df[c].mean()
-        df[f'roll_{c}'] = df[f'roll_{c}'].fillna(league_avg if not np.isnan(league_avg) else 0.0)
+        for prefix in ['roll_', 'roll3_', 'roll20_']:
+            df[f'{prefix}{c}'] = df[f'{prefix}{c}'].fillna(league_avg if not np.isnan(league_avg) else 0.0)
 
     df['prev_date'] = grp['mp_game_date'].shift(1)
     df['rest_days'] = (df['mp_game_date'] - df['prev_date']).dt.days.fillna(2).clip(0, 10)
@@ -588,6 +745,12 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     # Rename home_mp_game_date back to mp_game_date for consistency
     if 'home_mp_game_date' in final.columns:
         final = final.rename(columns={'home_mp_game_date': 'mp_game_date'})
+
+    # DEBUG: Check edge_giveaway_d for team 12
+    if 'away_edge_giveaway_d' in final.columns:
+        edm_debug = final[final['away_team_id'] == 12]
+        if not edm_debug.empty:
+            print(f"DEBUG: get_base_team_stats away_edge_giveaway_d for team 12:\n{edm_debug[['game_id', 'mp_game_date', 'away_edge_giveaway_d']].tail()}")
 
     return final.dropna(subset=['goals_home', 'goals_away']).reset_index(drop=True)
 
@@ -723,21 +886,35 @@ def get_latest_stats_for_manual(db_path):
     df = get_base_team_stats(db_path, use_complete_games_filter=False)
     # Sort by mp_game_date (now preserved in final output)
     df = df.sort_values('mp_game_date')
+    
+    # print(f"DEBUG: get_latest_stats df columns sample: {[c for c in df.columns if 'give' in c]}")
 
     # Get latest for home teams - select home_team_id, mp_game_date, and all home_ columns
     home_cols = ['home_team_id', 'mp_game_date'] + [c for c in df.columns if c.startswith('home_') and c != 'home_team_id']
     home_latest = df[home_cols].copy()
+    
+    # Filter out games with no stats (using xgf > 0 as proxy)
+    if 'home_xgf' in home_latest.columns:
+         home_latest = home_latest[home_latest['home_xgf'] > 0]
+         
     home_latest = home_latest.drop_duplicates('home_team_id', keep='last')
     # Rename columns: home_team_id -> team_id, keep mp_game_date, strip home_ prefix from rest
-    new_home_cols = ['team_id', 'mp_game_date'] + [c.replace('home_', '') for c in home_cols[2:]]
+    # Use slicing [5:] to remove 'home_' prefix safely (avoiding replace() issues with substrings like 'home_' inside column names)
+    new_home_cols = ['team_id', 'mp_game_date'] + [c[5:] for c in home_cols[2:]]
     home_latest.columns = new_home_cols
 
     # Get latest for away teams
     away_cols = ['away_team_id', 'mp_game_date'] + [c for c in df.columns if c.startswith('away_') and c != 'away_team_id']
     away_latest = df[away_cols].copy()
+    
+    # Filter out games with no stats
+    if 'away_xgf' in away_latest.columns:
+         away_latest = away_latest[away_latest['away_xgf'] > 0]
+
     away_latest = away_latest.drop_duplicates('away_team_id', keep='last')
     # Rename columns: away_team_id -> team_id, keep mp_game_date, strip away_ prefix from rest
-    new_away_cols = ['team_id', 'mp_game_date'] + [c.replace('away_', '') for c in away_cols[2:]]
+    # Use slicing [5:] to remove 'away_' prefix safely (avoiding replace() issues with substrings like 'away_' inside column names e.g. 'giveaway_d')
+    new_away_cols = ['team_id', 'mp_game_date'] + [c[5:] for c in away_cols[2:]]
     away_latest.columns = new_away_cols
 
     # Combine and keep most recent
@@ -745,6 +922,7 @@ def get_latest_stats_for_manual(db_path):
     latest = combined.drop_duplicates('team_id', keep='last')
 
     teams = pd.read_sql_query("SELECT team_id, team_abbr FROM teams", sqlite3.connect(db_path))
+    teams['normalized_abbr'] = teams['team_abbr'].apply(lambda x: norm(x))
     latest = pd.merge(teams, latest, on='team_id', how='left').fillna(0)
     latest['mp_game_date'] = pd.to_datetime(latest['mp_game_date'])
     return latest
@@ -763,10 +941,18 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     feats = np.load("feature_list.npz")['features'].tolist()
 
     latest = get_latest_stats_for_manual(db)
-    latest['norm'] = latest['team_abbr'].apply(norm)
 
-    h_row = latest[latest['norm'] == h_norm].iloc[0]
-    a_row = latest[latest['norm'] == a_norm].iloc[0]
+    h_candidates = latest[latest['normalized_abbr'] == h_norm]
+    if h_candidates.empty:
+        print(f"Error: Home team '{h_norm}' not found.")
+        return
+    h_row = h_candidates.sort_values('roll_goals_for', ascending=False).iloc[0]
+
+    a_candidates = latest[latest['normalized_abbr'] == a_norm]
+    if a_candidates.empty:
+        print(f"Error: Away team '{a_norm}' not found.")
+        return
+    a_row = a_candidates.sort_values('roll_goals_for', ascending=False).iloc[0]
 
     # Calculate rest days from game date
     if (date_str is not None):
