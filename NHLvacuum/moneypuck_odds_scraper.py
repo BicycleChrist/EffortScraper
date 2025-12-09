@@ -11,8 +11,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 from datetime import datetime
+import argparse
+import glob
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -21,6 +23,10 @@ from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# Import game list generation functions
+from game_list import scrape_season_game_ids
+
 
 
 # Configure logging
@@ -781,129 +787,80 @@ def save_results(results: List[GameLine], output_file: str):
     logger.info(f"Saved {len(games_dict)} games ({len(results)} total sportsbook entries) to {output_file}")
 
 
-def identify_missing_games(csv_file: str) -> List[Tuple[str, str, str]]:
+def update_unique_game_ids(season: str) -> str:
     """
-    Identify games with missing team data from existing CSV.
+    Update the unique_game_ids CSV file for a given season.
 
     Args:
-        csv_file: Path to existing moneypuck_odds CSV file
+        season: Season string (e.g., "2024-25")
 
     Returns:
-        List of tuples: (traditional_game_id, game_id, season) for games missing team data
+        Path to the updated CSV file
     """
-    missing_games = []
-    with open(csv_file, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Check if away_team and home_team are empty
-            if not row['away_team'] or not row['home_team']:
-                missing_games.append((
-                    row['traditional_game_id'],
-                    row['game_id'],
-                    row['season']
-                ))
+    # Extract start year from season string
+    start_year = int(season.split('-')[0])
 
-    logger.info(f"Found {len(missing_games)} games with missing team data in {csv_file}")
-    return missing_games
+    logger.info(f"Updating unique game IDs for season {season}...")
+
+    # Use game_list.py logic to scrape and save
+    df = scrape_season_game_ids(start_year)
+
+    output_file = f"unique_game_ids_{season}.csv"
+    logger.info(f"Updated {output_file} with {len(df)} games")
+
+    return output_file
 
 
-def rescrape_missing_games(csv_file: str, max_workers: int = 4,
-                          headless: bool = True, delay: float = 0.5,
-                          max_retries: int = 3, timeout: int = 20):
+def get_scraped_game_ids(moneypuck_csv: str) -> Set[str]:
     """
-    Rescrape games with missing team data and update the CSV file.
+    Get set of traditional_game_ids that have already been scraped.
 
     Args:
-        csv_file: Path to existing moneypuck_odds CSV file to update
-        max_workers: Maximum number of concurrent threads
-        headless: Whether to run browser in headless mode
-        delay: Delay between requests (seconds)
-        max_retries: Maximum number of retry attempts
-        timeout: Timeout in seconds for element waits
+        moneypuck_csv: Path to existing moneypuck_odds CSV file
+
+    Returns:
+        Set of traditional_game_ids that exist in the file
     """
-    logger.info(f"Rescaping missing games from {csv_file}")
+    if not Path(moneypuck_csv).exists():
+        logger.info(f"File {moneypuck_csv} does not exist, will scrape all games")
+        return set()
 
-    # Identify missing games
-    missing_games = identify_missing_games(csv_file)
-
-    if not missing_games:
-        logger.info("No missing games found. Nothing to rescrape.")
-        return
-
-    # Scrape missing games
-    scraper = MoneyPuckScraper(headless=headless, max_retries=max_retries, timeout=timeout)
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_game = {
-            executor.submit(scraper.scrape_game, trad_id, game_id, season): (trad_id, game_id, season)
-            for trad_id, game_id, season in missing_games
-        }
-
-        for i, future in enumerate(as_completed(future_to_game), 1):
-            trad_id, game_id, season = future_to_game[future]
-            try:
-                game_lines = future.result()
-                results.extend(game_lines)
-
-                success_count = sum(1 for gl in game_lines if gl.scrape_status == 'success')
-                logger.info(f"Progress: {i}/{len(missing_games)} - Game {trad_id}: {success_count}/{len(game_lines)} sportsbooks successful")
-            except Exception as e:
-                logger.error(f"Unexpected error for game {trad_id}: {e}")
-                results.append(GameLine(
-                    game_id=game_id,
-                    traditional_game_id=trad_id,
-                    season=season,
-                    sportsbook='unknown',
-                    scrape_status='error',
-                    error_message=str(e)
-                ))
-
-            if i < len(missing_games):
-                time.sleep(delay)
-
-    # Load existing data
-    existing_data = {}
-    with open(csv_file, 'r') as f:
+    scraped_ids = set()
+    with open(moneypuck_csv, 'r') as f:
         reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
         for row in reader:
-            game_key = (row['game_id'], row['traditional_game_id'], row['season'])
-            existing_data[game_key] = row
+            scraped_ids.add(row['traditional_game_id'])
 
-    # Update with new results
-    for result in results:
-        game_key = (result.game_id, result.traditional_game_id, result.season)
-        if game_key in existing_data:
-            row = existing_data[game_key]
-            # Update team data
-            if result.away_team:
-                row['away_team'] = result.away_team
-            if result.home_team:
-                row['home_team'] = result.home_team
-            if result.mp_away_win_prob:
-                row['mp_away_win_prob'] = result.mp_away_win_prob
-            if result.mp_home_win_prob:
-                row['mp_home_win_prob'] = result.mp_home_win_prob
+    logger.info(f"Found {len(scraped_ids)} already scraped games in {moneypuck_csv}")
+    return scraped_ids
 
-            # Update sportsbook data
-            if result.sportsbook and result.sportsbook != 'unknown':
-                sb = result.sportsbook
-                row[f'{sb}_opening_timestamp'] = result.opening_timestamp or ''
-                row[f'{sb}_opening_away_odds'] = result.opening_away_odds or ''
-                row[f'{sb}_opening_home_odds'] = result.opening_home_odds or ''
-                row[f'{sb}_closing_timestamp'] = result.closing_timestamp or ''
-                row[f'{sb}_closing_away_odds'] = result.closing_away_odds or ''
-                row[f'{sb}_closing_home_odds'] = result.closing_home_odds or ''
 
-    # Write back to file
-    with open(csv_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for game_key in sorted(existing_data.keys()):
-            writer.writerow(existing_data[game_key])
+def identify_missing_games_from_lists(unique_game_ids_csv: str, moneypuck_odds_csv: str) -> List[Tuple[str, str, str]]:
+    """
+    Identify games that are in unique_game_ids but not yet in moneypuck_odds.
 
-    logger.info(f"Updated {len(missing_games)} games in {csv_file}")
+    Args:
+        unique_game_ids_csv: Path to unique_game_ids CSV file
+        moneypuck_odds_csv: Path to moneypuck_odds CSV file
+
+    Returns:
+        List of tuples: (traditional_game_id, game_id, season) for missing games
+    """
+    # Get already scraped games
+    scraped_ids = get_scraped_game_ids(moneypuck_odds_csv)
+
+    # Load all games from unique_game_ids
+    all_games = load_game_ids(unique_game_ids_csv)
+
+    # Filter to only those not yet scraped
+    missing_games = [
+        (trad_id, game_id, season)
+        for trad_id, game_id, season in all_games
+        if trad_id not in scraped_ids
+    ]
+
+    logger.info(f"Found {len(missing_games)} games to scrape (not yet in {moneypuck_odds_csv})")
+    return missing_games
 
 
 def scrape_season(csv_file: Optional[str] = None, games_list: Optional[List[Tuple[str, str, str]]] = None,
@@ -989,14 +946,12 @@ def scrape_season(csv_file: Optional[str] = None, games_list: Optional[List[Tupl
 
 
 if __name__ == '__main__':
-    import argparse
-    import glob
 
     parser = argparse.ArgumentParser(description='Scrape MoneyPuck game lines')
     parser.add_argument('--season', type=str, default='2025-26', # set to current season
                         help='Specific season to scrape (e.g., 2023-24). If not specified, scrapes all available seasons.')
-    parser.add_argument('--rescrape-missing', type=str, default=None,
-                        help='Rescrape games with missing team data from existing CSV file (e.g., moneypuck_odds_2025-26.csv)')
+    parser.add_argument('--update-season', action='store_true',
+                        help='Update unique_game_ids for the season, then scrape only games not yet in moneypuck_odds CSV')
     parser.add_argument('--playoffs', action='store_true',
                         help='Scrape playoff games from database instead of regular season games from CSV')
     parser.add_argument('--db-path', type=str, default='nhl_analytics.db',
@@ -1014,24 +969,143 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # If rescrape-missing mode, handle it and exit
-    if args.rescrape_missing:
-        if not Path(args.rescrape_missing).exists():
-            logger.error(f"File not found: {args.rescrape_missing}")
+    # If update-season mode, handle it and exit
+    if args.update_season:
+        if not args.season:
+            logger.error("--season is required when using --update-season")
             exit(1)
 
         logger.info("=" * 60)
-        logger.info(f"RESCRAPING MISSING GAMES MODE")
+        logger.info(f"UPDATE SEASON MODE - Season {args.season}")
         logger.info("=" * 60)
 
-        rescrape_missing_games(
-            csv_file=args.rescrape_missing,
-            max_workers=args.workers,
-            headless=not args.no_headless,
-            delay=args.delay,
-            max_retries=args.retries,
-            timeout=args.timeout
-        )
+        # Step 1: Update unique_game_ids
+        unique_game_ids_file = update_unique_game_ids(args.season)
+
+        # Step 2: Identify missing games
+        moneypuck_odds_file = f"moneypuck_odds_{args.season}.csv"
+        missing_games = identify_missing_games_from_lists(unique_game_ids_file, moneypuck_odds_file)
+
+        if not missing_games:
+            logger.info("No missing games to scrape. All games in unique_game_ids are already in moneypuck_odds.")
+            exit(0)
+
+        logger.info(f"Found {len(missing_games)} games to scrape")
+
+        # Step 3: Scrape missing games
+        scraper = MoneyPuckScraper(headless=not args.no_headless, max_retries=args.retries, timeout=args.timeout)
+        results = []
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_game = {
+                executor.submit(scraper.scrape_game, trad_id, game_id, season): (trad_id, game_id, season)
+                for trad_id, game_id, season in missing_games
+            }
+
+            for i, future in enumerate(as_completed(future_to_game), 1):
+                trad_id, game_id, season = future_to_game[future]
+                try:
+                    game_lines = future.result()
+                    results.extend(game_lines)
+
+                    success_count = sum(1 for gl in game_lines if gl.scrape_status == 'success')
+                    logger.info(f"Progress: {i}/{len(missing_games)} - Game {trad_id}: {success_count}/{len(game_lines)} sportsbooks successful")
+                except Exception as e:
+                    logger.error(f"Unexpected error for game {trad_id}: {e}")
+                    results.append(GameLine(
+                        game_id=game_id,
+                        traditional_game_id=trad_id,
+                        season=season,
+                        sportsbook='unknown',
+                        scrape_status='error',
+                        error_message=str(e)
+                    ))
+
+                if i < len(missing_games):
+                    time.sleep(args.delay)
+
+        # Step 4: Merge with existing data or create new file
+        if Path(moneypuck_odds_file).exists():
+            # Load existing data
+            existing_data = {}
+            with open(moneypuck_odds_file, 'r') as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    game_key = (row['game_id'], row['traditional_game_id'], row['season'])
+                    existing_data[game_key] = row
+
+            # Add new results
+            # Group new results by game
+            new_games_dict = {}
+            all_sportsbooks = set()
+
+            for result in results:
+                game_key = (result.game_id, result.traditional_game_id, result.season)
+
+                if game_key not in new_games_dict:
+                    new_games_dict[game_key] = {
+                        'game_id': result.game_id,
+                        'traditional_game_id': result.traditional_game_id,
+                        'season': result.season,
+                        'away_team': result.away_team,
+                        'home_team': result.home_team,
+                        'mp_away_win_prob': result.mp_away_win_prob,
+                        'mp_home_win_prob': result.mp_home_win_prob,
+                        'scrape_status': result.scrape_status,
+                        'error_message': result.error_message,
+                        'sportsbooks': {}
+                    }
+
+                if result.sportsbook and result.sportsbook != 'unknown':
+                    all_sportsbooks.add(result.sportsbook)
+                    new_games_dict[game_key]['sportsbooks'][result.sportsbook] = {
+                        'opening_timestamp': result.opening_timestamp,
+                        'opening_away_odds': result.opening_away_odds,
+                        'opening_home_odds': result.opening_home_odds,
+                        'closing_timestamp': result.closing_timestamp,
+                        'closing_away_odds': result.closing_away_odds,
+                        'closing_home_odds': result.closing_home_odds
+                    }
+
+            # Convert new games to row format
+            for game_key, game_data in new_games_dict.items():
+                row = {field: '' for field in fieldnames}
+                row['game_id'] = game_data['game_id']
+                row['traditional_game_id'] = game_data['traditional_game_id']
+                row['season'] = game_data['season']
+                row['away_team'] = game_data['away_team'] or ''
+                row['home_team'] = game_data['home_team'] or ''
+                row['mp_away_win_prob'] = game_data['mp_away_win_prob'] or ''
+                row['mp_home_win_prob'] = game_data['mp_home_win_prob'] or ''
+                row['scrape_status'] = game_data['scrape_status']
+                row['error_message'] = game_data['error_message'] or ''
+
+                for sportsbook, sb_data in game_data['sportsbooks'].items():
+                    row[f'{sportsbook}_opening_timestamp'] = sb_data['opening_timestamp'] or ''
+                    row[f'{sportsbook}_opening_away_odds'] = sb_data['opening_away_odds'] or ''
+                    row[f'{sportsbook}_opening_home_odds'] = sb_data['opening_home_odds'] or ''
+                    row[f'{sportsbook}_closing_timestamp'] = sb_data['closing_timestamp'] or ''
+                    row[f'{sportsbook}_closing_away_odds'] = sb_data['closing_away_odds'] or ''
+                    row[f'{sportsbook}_closing_home_odds'] = sb_data['closing_home_odds'] or ''
+
+                existing_data[game_key] = row
+
+            # Write merged data back
+            with open(moneypuck_odds_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for game_key in sorted(existing_data.keys()):
+                    writer.writerow(existing_data[game_key])
+
+            logger.info(f"Merged {len(new_games_dict)} new games into {moneypuck_odds_file}")
+        else:
+            # No existing file, just save new results
+            save_results(results, moneypuck_odds_file)
+
+        logger.info("=" * 60)
+        logger.info("UPDATE SEASON MODE COMPLETE")
+        logger.info("=" * 60)
         exit(0)
 
     # Handle playoff mode
