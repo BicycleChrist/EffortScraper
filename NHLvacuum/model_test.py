@@ -122,42 +122,63 @@ def process_special_teams(con) -> pd.DataFrame:
 def process_goalie_metrics(con) -> pd.DataFrame:
     all_id = get_situation_id(con)
 
-    # Try NST first (preferred source)
+    # Get per-goalie data (needed for GHSF calculation)
     nst_query = f"""
-    SELECT game_id, team_id,
-           SUM(COALESCE(expected_goals_against - goals_against, 0)) as gsax
+    SELECT game_id, team_id, player_id,
+           COALESCE(expected_goals_against - goals_against, 0) as gsax
     FROM goalie_game_stats WHERE situation_id = {all_id}
-    GROUP BY game_id, team_id
     """
     nst_df = pd.read_sql_query(nst_query, con)
 
-    # Get MP goalie data as fallback (columns: mp_xgoals_against, mp_goals_against)
+    # Get MP goalie data as fallback
     mp_query = f"""
-    SELECT game_id, team_id,
-           SUM(COALESCE(mp_xgoals_against - mp_goals_against, 0)) as gsax
+    SELECT game_id, team_id, player_id,
+           COALESCE(mp_xgoals_against - mp_goals_against, 0) as gsax
     FROM mp_goalie_game_stats WHERE situation_id = {all_id}
-    GROUP BY game_id, team_id
     """
     mp_df = pd.read_sql_query(mp_query, con)
 
     # Combine: use NST where available, fall back to MP
     if not nst_df.empty and not mp_df.empty:
-        # Mark sources
         nst_df['source'] = 'NST'
         mp_df['source'] = 'MP'
-        # Concatenate and keep first occurrence (NST preferred)
-        df = pd.concat([nst_df, mp_df]).drop_duplicates(subset=['game_id', 'team_id'], keep='first')
+        df = pd.concat([nst_df, mp_df]).drop_duplicates(subset=['game_id', 'team_id', 'player_id'], keep='first')
     elif not nst_df.empty:
         df = nst_df
     elif not mp_df.empty:
         df = mp_df
     else:
-        return pd.DataFrame(columns=['game_id', 'team_id', 'roll_gsax'])
+        return pd.DataFrame(columns=['game_id', 'team_id', 'roll_gsax', 'ghsf'])
 
-    df = df.sort_values(['team_id', 'game_id'])
-    df['roll_gsax'] = df.groupby('team_id')['gsax'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_gsax'] = df['roll_gsax'].fillna(0.0)
-    return df[['game_id', 'team_id', 'roll_gsax']]
+    # Sort by player and game for per-goalie rolling calculations
+    df = df.sort_values(['player_id', 'game_id'])
+    grp_goalie = df.groupby('player_id')
+
+    # GHSF (Goalie Hot Streak Factor): Trend / Volatility
+    # Calculate recent 3-game vs prior 3-game trend
+    df['gsax_recent3'] = grp_goalie['gsax'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    df['gsax_prior3'] = grp_goalie['gsax'].transform(lambda x: x.shift(4).rolling(3, min_periods=1).mean())
+    df['gsax_trend'] = df['gsax_recent3'] - df['gsax_prior3']
+
+    # Calculate volatility (std dev over last 5 games)
+    df['gsax_volatility'] = grp_goalie['gsax'].transform(lambda x: x.shift(1).rolling(5, min_periods=2).std())
+
+    # GHSF = Trend / (Volatility + epsilon)
+    df['ghsf'] = df['gsax_trend'] / (df['gsax_volatility'] + 0.1)
+    df['ghsf'] = df['ghsf'].fillna(0.0).clip(-5, 5)  # Cap extreme values
+
+    # Aggregate to team level (primary goalie's metrics)
+    # Use the goalie with most recent action or highest TOI if available
+    team_df = df.sort_values(['team_id', 'game_id']).groupby(['game_id', 'team_id']).first().reset_index()
+
+    # Standard team-level rolling GSAx
+    team_df = team_df.sort_values(['team_id', 'game_id'])
+    team_df['roll_gsax'] = team_df.groupby('team_id')['gsax'].transform(
+        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+    )
+    team_df['roll_gsax'] = team_df['roll_gsax'].fillna(0.0)
+
+    return team_df[['game_id', 'team_id', 'roll_gsax', 'ghsf']]
 
 
 
@@ -172,8 +193,10 @@ def process_nst_metrics(con) -> pd.DataFrame:
     """
     df = pd.read_sql_query(query, con)
     if df.empty:
-        df = pd.DataFrame(columns=['game_id', 'team_id', 'roll_hdcf_share'])
+        df = pd.DataFrame(columns=['game_id', 'team_id', 'roll_hdcf_share', 'roll3_hdcf_share', 'hdsm'])
         df['roll_hdcf_share'] = 0.5
+        df['roll3_hdcf_share'] = 0.5
+        df['hdsm'] = 0.0
         return df
 
     # Calculate hdcf_share for each team
@@ -181,17 +204,28 @@ def process_nst_metrics(con) -> pd.DataFrame:
 
     # Sort and calculate rolling average
     df = df.sort_values(['team_id', 'game_id'])
-    df['roll_hdcf_share'] = df.groupby('team_id')['hdcf_share'].transform(
+    grp = df.groupby('team_id')
+
+    # Standard 10-game rolling
+    df['roll_hdcf_share'] = grp['hdcf_share'].transform(
         lambda x: x.shift(1).rolling(10, min_periods=1).mean()
     )
+
+    # HDSM (High-Danger Shot Momentum): 3-game vs 10-game differential
+    df['roll3_hdcf_share'] = grp['hdcf_share'].transform(
+        lambda x: x.shift(1).rolling(3, min_periods=1).mean()
+    )
+    df['hdsm'] = df['roll3_hdcf_share'] - df['roll_hdcf_share']
 
     # Fill NaNs with league average
     league_avg = df['hdcf_share'].mean()
     df['roll_hdcf_share'] = df['roll_hdcf_share'].fillna(league_avg if not np.isnan(league_avg) else 0.5)
+    df['roll3_hdcf_share'] = df['roll3_hdcf_share'].fillna(league_avg if not np.isnan(league_avg) else 0.5)
+    df['hdsm'] = df['hdsm'].fillna(0.0)
 
     # Return relevant columns directly
     # The main data pipeline matches these to games based on (game_id, team_id)
-    return df[['game_id', 'team_id', 'roll_hdcf_share']]
+    return df[['game_id', 'team_id', 'roll_hdcf_share', 'roll3_hdcf_share', 'hdsm']]
 
 
 # NEW: Advanced MoneyPuck features for better predictions
@@ -453,6 +487,125 @@ def process_skater_aggregates(con) -> pd.DataFrame:
     
     return out.fillna(0)
 
+
+def process_linemate_synergy(con) -> pd.DataFrame:
+    """
+    LSS (Linemate Synergy Score)
+    Measures line chemistry by comparing performance WITH vs WITHOUT linemates
+    """
+    # Use 5v5 situation for most stable line combinations
+    query = """
+    SELECT situation_id FROM situations WHERE situation_code = '5v5' LIMIT 1
+    """
+    result = pd.read_sql_query(query, con)
+    if result.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id', 'lss'])
+
+    fv5_id = int(result.iloc[0]['situation_id'])
+
+    # Get linemate stats for recent games
+    linemate_query = f"""
+    SELECT
+        l.game_id,
+        l.player_id,
+        l.linemate_id,
+        l.team_id,
+        l.toi_seconds,
+        COALESCE(l.cf_pct_with, 0.5) as cf_pct_with,
+        COALESCE(l.cf_pct_without, 0.5) as cf_pct_without,
+        COALESCE(l.xgf_pct_with, 0.5) as xgf_pct_with,
+        COALESCE(l.xgf_pct_without, 0.5) as xgf_pct_without
+    FROM player_linemate_stats l
+    WHERE l.situation_id = {fv5_id}
+      AND l.toi_seconds > 60
+    """
+    df = pd.read_sql_query(linemate_query, con)
+
+    if df.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id', 'lss'])
+
+    # Calculate synergy score for each player-linemate pair
+    # Synergy = (CF% WITH - CF% WITHOUT) + (xGF% WITH - xGF% WITHOUT)
+    df['synergy_score'] = (
+        (df['cf_pct_with'] - df['cf_pct_without']) +
+        (df['xgf_pct_with'] - df['xgf_pct_without'])
+    )
+
+    # Weight by TOI (more ice time together = more reliable signal)
+    df['weighted_synergy'] = df['synergy_score'] * df['toi_seconds']
+
+    # For each player in each game, average synergy with their top linemates
+    player_game_synergy = df.groupby(['game_id', 'team_id', 'player_id']).agg(
+        total_toi=('toi_seconds', 'sum'),
+        weighted_synergy_sum=('weighted_synergy', 'sum')
+    ).reset_index()
+
+    player_game_synergy['player_lss'] = (
+        player_game_synergy['weighted_synergy_sum'] /
+        (player_game_synergy['total_toi'] + 1.0)
+    )
+
+    # Aggregate to team level: average LSS of top 6 players by TOI
+    # Sort by TOI and take top 6 per game/team
+    player_game_synergy = player_game_synergy.sort_values(
+        ['game_id', 'team_id', 'total_toi'],
+        ascending=[True, True, False]
+    )
+    player_game_synergy['rank'] = player_game_synergy.groupby(['game_id', 'team_id']).cumcount() + 1
+
+    top6 = player_game_synergy[player_game_synergy['rank'] <= 6]
+    team_lss = top6.groupby(['game_id', 'team_id'])['player_lss'].mean().reset_index(name='lss')
+
+    # Fill missing values with 0 (neutral chemistry)
+    team_lss['lss'] = team_lss['lss'].fillna(0.0).clip(-0.3, 0.3)  # Cap extreme values
+
+    return team_lss[['game_id', 'team_id', 'lss']]
+
+
+def process_opposition_adjusted_xg(con) -> pd.DataFrame:
+    """
+    OSA_xG (Opposition Strength Adjusted Expected Goals)
+    Adjusts team xG by opponent's defensive quality
+    """
+    all_id = get_situation_id(con)
+
+    # Get team defensive quality (xGA/60 over recent games)
+    query = f"""
+    SELECT game_id, team_id,
+           COALESCE(mp_xgoals_against, 0) as xga,
+           COALESCE(mp_ice_time, 1) as toi
+    FROM mp_team_game_stats
+    WHERE situation_id = {all_id}
+    """
+    df = pd.read_sql_query(query, con)
+
+    if df.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id', 'opp_xg_suppression'])
+
+    # Calculate xGA per 60 minutes (toi is in seconds)
+    df['xga_per_60'] = (df['xga'] / (df['toi'] + 1)) * 3600
+
+    # Sort and calculate rolling average defensive quality
+    df = df.sort_values(['team_id', 'game_id'])
+    df['roll_xga_per_60'] = df.groupby('team_id')['xga_per_60'].transform(
+        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+    )
+
+    # Calculate league average for normalization
+    league_avg_xga_60 = df['xga_per_60'].mean()
+    df['roll_xga_per_60'] = df['roll_xga_per_60'].fillna(league_avg_xga_60 if not np.isnan(league_avg_xga_60) else 2.5)
+
+    # Suppression factor: Team_xGA_60 / League_Avg
+    # Lower value = better defense (suppresses opponent xG more)
+    # Factor > 1 means bad defense (inflates opponent xG)
+    df['opp_xg_suppression'] = df['roll_xga_per_60'] / (league_avg_xga_60 + 0.001)
+
+    # Clip to reasonable range (0.7 to 1.3 = 70% to 130% of league average)
+    df['opp_xg_suppression'] = df['opp_xg_suppression'].clip(0.7, 1.3)
+
+    return df[['game_id', 'team_id', 'opp_xg_suppression']]
+
+
 # --- New: Define all expected edge columns for consistency ---
 EVENT_TYPES = ['hit', 'giveaway', 'takeaway', 'blocked_shot', 'missed_shot']
 ZONES = ['d', 'n', 'o', 'u'] # d=defensive, n=neutral, o=offensive, u=unknown
@@ -699,7 +852,8 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     df['mp_game_date'] = pd.to_datetime(df['mp_game_date'])
 
     for func in [process_special_teams, process_goalie_metrics, process_nst_metrics,
-                  process_shot_metrics, process_advanced_metrics, process_edge_metrics]:
+                  process_shot_metrics, process_advanced_metrics, process_edge_metrics,
+                  process_opposition_adjusted_xg, process_linemate_synergy]:
         extra = func(con)
         if not extra.empty:
             # if func.__name__ == 'process_edge_metrics':
@@ -737,6 +891,28 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
 
     final = pd.merge(home, away, on='game_id')
     # final['rest_diff'] = final['home_rest'] - final['away_rest']
+
+    # STED (Special Teams Efficiency Differential): Matchup-specific ST advantage
+    # Only calculate if special teams columns exist
+    if 'home_roll_pp_xg60' in final.columns and 'away_roll_pk_xga60' in final.columns:
+        final['home_sted'] = (
+            (final['home_roll_pp_xg60'] - final['away_roll_pk_xga60']) +
+            (final['away_roll_pp_xg60'] - final['home_roll_pk_xga60'])
+        )
+        final['away_sted'] = -final['home_sted']
+    else:
+        final['home_sted'] = 0.0
+        final['away_sted'] = 0.0
+
+    # OSA_xG (Opposition-Adjusted xG): Adjust raw xG by opponent defensive quality
+    if 'home_roll_xgf' in final.columns and 'away_opp_xg_suppression' in final.columns:
+        # Home team's xG adjusted by away team's defensive strength
+        final['home_osa_xg'] = final['home_roll_xgf'] * final['away_opp_xg_suppression']
+        # Away team's xG adjusted by home team's defensive strength
+        final['away_osa_xg'] = final['away_roll_xgf'] * final['home_opp_xg_suppression']
+    else:
+        final['home_osa_xg'] = final.get('home_roll_xgf', 0.0)
+        final['away_osa_xg'] = final.get('away_roll_xgf', 0.0)
 
     # Keep home_mp_game_date for forecasting (renamed from mp_game_date during home_ prefix)
     drop = [c for c in final.columns if any(x in c for x in ['side', 'prev_date', 'team_id_x', 'team_id_y', 'away_mp_game_date'])]
@@ -825,7 +1001,8 @@ update = jax.jit(lambda p, x, y, lr: ({k: p[k] - lr * jax.grad(loss_fn)(p, x, y)
 
 
 def get_features(df):
-    exclude = ['game_id', 'goals_home', 'goals_away', 'h_odd', 'a_odd', 'mp_game_date']
+    exclude = ['game_id', 'goals_home', 'goals_away', 'h_odd', 'a_odd', 'mp_game_date',
+               'home_ghsf', 'away_ghsf', 'home_lss', 'away_lss', 'home_sted', 'away_sted']
     return [c for c in df.columns if c not in exclude]
 
 
