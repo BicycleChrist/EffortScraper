@@ -1059,7 +1059,7 @@ class MoneyPuckShotsImporter:
     """Imports MoneyPuck shot-level data"""
 
     DB_PATH = 'nhl_analytics.db'
-    MP_SHOTS_DATA_DIR = 'moneypuck_data'
+    MP_SHOTS_DATA_DIR = 'moneypuck_data/shots'
     SCHEMA_PATH = 'moneypuck_schema.sql'
 
     # CSV column → Database column mapping
@@ -1299,26 +1299,45 @@ class MoneyPuckShotsImporter:
         return inserted
 
     @staticmethod
-    def import_all():
-        """Import all shots CSV files"""
+    def import_all(season: Optional[int] = None):
+        """
+        Import shots CSV files.
+
+        Args:
+            season: Optional season year to import (e.g., 2025 for shots_2025.csv).
+                   If None, imports all seasons and clears the table first.
+                   If specified, only imports that season (updates existing data).
+        """
         conn = sqlite3.connect(MoneyPuckShotsImporter.DB_PATH)
 
         # Ensure tables exist
         MoneyPuckShotsImporter.ensure_tables(conn)
 
-        # Clear existing data
-        print("\nClearing existing shots data...")
-        MoneyPuckShotsImporter.clear_table(conn)
+        # Only clear table if doing a full import (no season specified)
+        if season is None:
+            print("\nClearing existing shots data...")
+            MoneyPuckShotsImporter.clear_table(conn)
 
         print("\n" + "="*80)
-        print("IMPORTING MONEYPUCK SHOT DATA")
+        if season:
+            print(f"IMPORTING MONEYPUCK SHOT DATA - {season-1}-{season} SEASON")
+        else:
+            print("IMPORTING MONEYPUCK SHOT DATA - ALL SEASONS")
         print("="*80 + "\n")
 
-        # Find all shots files
-        shots_files = sorted(Path(MoneyPuckShotsImporter.MP_SHOTS_DATA_DIR).glob('shots_*.csv'))
+        # Find shots files
+        if season:
+            # Import only the specified season
+            shots_files = list(Path(MoneyPuckShotsImporter.MP_SHOTS_DATA_DIR).glob(f'shots_{season}.csv'))
+        else:
+            # Import all seasons
+            shots_files = sorted(Path(MoneyPuckShotsImporter.MP_SHOTS_DATA_DIR).glob('shots_*.csv'))
 
         if not shots_files:
-            print("No shots files found in moneypuck_data/")
+            if season:
+                print(f"No shots file found for season {season}")
+            else:
+                print(f"No shots files found in {MoneyPuckShotsImporter.MP_SHOTS_DATA_DIR}/")
             conn.close()
             return
 
@@ -1326,8 +1345,8 @@ class MoneyPuckShotsImporter:
         total_skipped = 0
 
         for csv_file in shots_files:
-            season = csv_file.stem.replace('shots_', '')
-            print(f"Importing {season} season shots...", end=' ', flush=True)
+            season_str = csv_file.stem.replace('shots_', '')
+            print(f"Importing {season_str} season shots...", end=' ', flush=True)
 
             imported, skipped = MoneyPuckShotsImporter.import_csv(str(csv_file), conn)
             total_imported += imported

@@ -427,7 +427,7 @@ def process_shot_metrics(con) -> pd.DataFrame:
         cnt_backhand=('is_backhand', 'sum'),
         cnt_tip=('is_tip', 'sum'),
         cnt_rebound=('shot_generated_rebound', 'sum'),
-        cnt_rush=('shot_rush', 'sum'),
+        # cnt_rush=('shot_rush', 'sum'), #TODO: Find replace metric for rush chances as this coloumn is all nans
         cnt_off_wing=('off_wing', 'sum')
     ).reset_index()
 
@@ -606,15 +606,37 @@ def process_opposition_adjusted_xg(con) -> pd.DataFrame:
     return df[['game_id', 'team_id', 'opp_xg_suppression']]
 
 
-# --- New: Define all expected edge columns for consistency ---
-EVENT_TYPES = ['hit', 'giveaway', 'takeaway', 'blocked_shot', 'missed_shot']
-ZONES = ['d', 'n', 'o', 'u'] # d=defensive, n=neutral, o=offensive, u=unknown
+# --- Define valid edge columns (removing nonsensical combinations) ---
+# Only include features that make hockey sense:
+# - blocked_shot: only defensive zone (not n, o, u)
+# - giveaway: all zones except unknown (d, n, o)
+# - hit: all zones except unknown (d, n, o)
+# - missed_shot: only offensive zone (not d, n, u)
+# - takeaway: all zones except unknown (d, n, o)
 
-ALL_EXPECTED_EDGE_COLUMNS = []
-for event_type in EVENT_TYPES:
-    for zone in ZONES:
-        ALL_EXPECTED_EDGE_COLUMNS.append(f"edge_{event_type}_{zone}")
-# --- End new section ---
+ALL_EXPECTED_EDGE_COLUMNS = [
+    # Blocked shots - only defensive zone
+    'edge_blocked_shot_d',
+
+    # Giveaways - all zones except unknown
+    'edge_giveaway_d',
+    'edge_giveaway_n',
+    'edge_giveaway_o',
+
+    # Hits - all zones except unknown
+    'edge_hit_d',
+    'edge_hit_n',
+    'edge_hit_o',
+
+    # Missed shots - only offensive zone
+    'edge_missed_shot_o',
+
+    # Takeaways - all zones except unknown
+    'edge_takeaway_d',
+    'edge_takeaway_n',
+    'edge_takeaway_o',
+]
+# --- End edge column definitions ---
 
 # ... (rest of the file) ...
 
@@ -870,15 +892,41 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     for c in ['xgf', 'xga', 'pens', 'goals_for']:
         # Standard 10-game rolling
         df[f'roll_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-        
+
         # Trend rolling (3 and 20)
         df[f'roll3_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
         df[f'roll20_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
-        
+
         # Fill NaNs
         league_avg = df[c].mean()
         for prefix in ['roll_', 'roll3_', 'roll20_']:
             df[f'{prefix}{c}'] = df[f'{prefix}{c}'].fillna(league_avg if not np.isnan(league_avg) else 0.0)
+
+    # Apply rolling averages to edge_giveaway and edge_blocked_shot features
+    # These need 3-game and 10-game rolling averages
+    # Only process valid features (as defined in ALL_EXPECTED_EDGE_COLUMNS)
+    edge_cols_to_roll = []
+    for event_type in ['giveaway', 'blocked_shot']:
+        for zone in ['d', 'n', 'o']:  # Exclude 'u' (unknown)
+            col_name = f'edge_{event_type}_{zone}'
+            # Additional validation: only include if it's in our whitelist
+            if col_name in ALL_EXPECTED_EDGE_COLUMNS and col_name in df.columns:
+                edge_cols_to_roll.append(col_name)
+
+    for c in edge_cols_to_roll:
+        # 3-game rolling average
+        df[f'roll3_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+
+        # 10-game rolling average
+        df[f'roll10_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+
+        # Fill NaNs with league average
+        league_avg = df[c].mean()
+        df[f'roll3_{c}'] = df[f'roll3_{c}'].fillna(league_avg if not np.isnan(league_avg) else 0.0)
+        df[f'roll10_{c}'] = df[f'roll10_{c}'].fillna(league_avg if not np.isnan(league_avg) else 0.0)
+
+        # Replace the raw single-game value with the 10-game rolling average as the default
+        df[c] = df[f'roll10_{c}']
 
     df['prev_date'] = grp['mp_game_date'].shift(1)
     df['rest_days'] = (df['mp_game_date'] - df['prev_date']).dt.days.fillna(2).clip(0, 10)
@@ -922,11 +970,23 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     if 'home_mp_game_date' in final.columns:
         final = final.rename(columns={'home_mp_game_date': 'mp_game_date'})
 
-    # DEBUG: Check edge_giveaway_d for team 12
+    # DEBUG: Check edge_giveaway_d and edge_blocked_shot_d rolling averages for team 12
     if 'away_edge_giveaway_d' in final.columns:
         edm_debug = final[final['away_team_id'] == 12]
         if not edm_debug.empty:
-            print(f"DEBUG: get_base_team_stats away_edge_giveaway_d for team 12:\n{edm_debug[['game_id', 'mp_game_date', 'away_edge_giveaway_d']].tail()}")
+            debug_cols = ['game_id', 'mp_game_date', 'away_edge_giveaway_d']
+            if 'away_roll3_edge_giveaway_d' in final.columns:
+                debug_cols.append('away_roll3_edge_giveaway_d')
+            if 'away_roll10_edge_giveaway_d' in final.columns:
+                debug_cols.append('away_roll10_edge_giveaway_d')
+            if 'away_edge_blocked_shot_d' in final.columns:
+                debug_cols.append('away_edge_blocked_shot_d')
+            if 'away_roll3_edge_blocked_shot_d' in final.columns:
+                debug_cols.append('away_roll3_edge_blocked_shot_d')
+            if 'away_roll10_edge_blocked_shot_d' in final.columns:
+                debug_cols.append('away_roll10_edge_blocked_shot_d')
+            print(f"DEBUG: get_base_team_stats edge features for team 12 (DET):")
+            print(edm_debug[debug_cols].tail())
 
     return final.dropna(subset=['goals_home', 'goals_away']).reset_index(drop=True)
 

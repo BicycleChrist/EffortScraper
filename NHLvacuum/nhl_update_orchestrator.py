@@ -744,9 +744,16 @@ class NHLUpdateOrchestrator:
             os.remove(temp_players_file)
             logger.info("Removed temporary player list file.")
 
+        # Download shots data for current season (updated daily)
+        # Shots file uses start year of season (e.g., 20252026 season -> shots_2025.zip)
+        current_season_code = self._get_current_season_code()
+        shots_season_year = int(current_season_code[:4])  # Extract start year (e.g., 20252026 -> 2025)
+        logger.info(f"Downloading shots data for {shots_season_year}-{shots_season_year+1} season...")
+        moneypuck_downloader.download_shots_data(shots_season_year, output_dir)
+
         # 2. Import Data
         logger.info("Importing MoneyPuck data...")
-        
+
         # Set DB path for importers
         mp_import.MoneyPuckTeamImporter.DB_PATH = self.db_path
         mp_import.MoneyPuckPlayerImporter.DB_PATH = self.db_path
@@ -760,8 +767,10 @@ class NHLUpdateOrchestrator:
         # Run imports with filter
         mp_import.MoneyPuckTeamImporter.import_all(game_ids=game_ids_to_import)
         mp_import.MoneyPuckPlayerImporter.import_all(game_ids=game_ids_to_import)
-        # Note: Shots import is skipped by default as it's very large and not strictly "game stats"
-        # mp_import.MoneyPuckShotsImporter.import_all()
+
+        # Import current season shots data (updates existing data)
+        logger.info(f"Importing shots data for {shots_season_year-1}-{shots_season_year} season...")
+        mp_import.MoneyPuckShotsImporter.import_all(season=shots_season_year)
 
         duration = (datetime.now() - start_time).total_seconds()
 
@@ -851,8 +860,7 @@ class NHLUpdateOrchestrator:
         # 1. Collect Data
         collector = collect_edge_stats.EdgeStatsCollector(
             output_dir="EdgeStats",
-            db_path=self.db_path,
-            verbose=True
+            db_path=self.db_path
         )
         
         # Determine current season code dynamically
@@ -877,7 +885,7 @@ class NHLUpdateOrchestrator:
         
         # 2. Import Data
         logger.info("Importing EDGE data (PBP only for selected games)...")
-        importer = nhl_edge_importer.NHLEdgeImporter(db_path=self.db_path, verbose=True)
+        importer = nhl_edge_importer.NHLEdgeImporter(db_path=self.db_path)
         importer.connect()
         try:
             edge_dir = Path("EdgeStats")
