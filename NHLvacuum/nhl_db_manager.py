@@ -27,6 +27,10 @@ from functools import lru_cache
 from collections import defaultdict
 from nstparse import TEAM_NAME_MAP
 
+
+# print db schema: sqlite3 nhl_analytics.db .schema >> full_schema.sql
+# Delete "OPP" files from nhlteamreports
+
 #TODO: Fix UTF-8 encoding BS for player names with accent marks
 @dataclass
 class GameInfo:
@@ -1248,7 +1252,15 @@ class NHLDatabaseManager:
             return
 
         home_team_id, away_team_id = game_result
-        opponent_team_id = away_team_id if team_id == home_team_id else home_team_id
+
+        # Determine opponent - only if current team is actually in this game
+        if team_id == home_team_id:
+            opponent_team_id = away_team_id
+        elif team_id == away_team_id:
+            opponent_team_id = home_team_id
+        else:
+            print(f"Warning: Team {team_id} not found in game {game_id} (home: {home_team_id}, away: {away_team_id})")
+            return
 
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)

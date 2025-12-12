@@ -514,18 +514,43 @@ class NHLUpdateOrchestrator:
         session = nstparse.create_session()
         game_cache = {}
         scraped_games_count = 0
-        
+
         # Get list of already downloaded games to avoid re-scraping
         downloaded_game_ids = self.get_downloaded_nst_games()
-        
+
         # Determine current season code dynamically for fallback
         current_season_code = self._get_current_season_code()
+
+        # Update games_list for all affected teams before scraping
+        if games_to_scrape:
+            logger.info("Updating games_list files for affected teams...")
+            teams_to_update = set()
+            for game in games_to_scrape:
+                if game.home_team:
+                    teams_to_update.add(game.home_team)
+                if game.away_team:
+                    teams_to_update.add(game.away_team)
+
+            for team in teams_to_update:
+                try:
+                    # Fetch and update games list from NST for this team
+                    # Use current season code for the date range
+                    nstparse.get_games_list(
+                        team_abbr=team,
+                        season_folder=f"{current_season_code[:4]}-{current_season_code[6:]}",
+                        session=session,
+                        fromseason=current_season_code,
+                        thruseason=current_season_code,
+                        stype=2  # Regular season
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not update games_list for {team}: {e}")
 
         games_to_actually_scrape = []
         for game in games_to_scrape:
             if game.game_id not in downloaded_game_ids or force_reimport:
                 games_to_actually_scrape.append(game)
-        
+
         if not games_to_actually_scrape:
             logger.info("No games need active scraping.")
         else:

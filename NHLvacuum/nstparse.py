@@ -372,7 +372,7 @@ def respectful_delay(is_429=False):
         max_jitter = max(0.3, min(min_delay * 0.1, 10.0))
     except (ImportError, AttributeError):
         # Fallback if called outside main (conservative default)
-        min_delay = 15.0
+        min_delay = 5
         max_jitter = 1.0
 
     with _request_lock:
@@ -1156,7 +1156,16 @@ def scrape_game_report(full_report_url, game, team_abbr, season_folder, session,
     team2_full = game.get('team2_full', '')
     team1_abbr = extract_team_abbr_from_name(team1_full, team_abbr)
     team2_abbr = extract_team_abbr_from_name(team2_full, team_abbr)
-    opponent_abbr = team2_abbr if team1_abbr == team_abbr else team1_abbr
+
+    # Determine opponent - only if current team is actually in this game
+    if team1_abbr == team_abbr:
+        opponent_abbr = team2_abbr
+    elif team2_abbr == team_abbr:
+        opponent_abbr = team1_abbr
+    else:
+        # Neither team matches - this game doesn't involve the current team
+        opponent_abbr = None
+
     teams_sorted = sorted([team_abbr, opponent_abbr]) if opponent_abbr else [team_abbr, 'OPP']
     game_file_prefix = f"{teams_sorted[0]}vs{teams_sorted[1]}_{game_id}"
 
@@ -2043,13 +2052,13 @@ if __name__ == "__main__":
     # ========================================================================
 
     # Delay configuration (in seconds)
-    DELAY_SECONDS = 7  # Start with 10s - adjust based on whether you get banned
+    DELAY_SECONDS = 3  # Start with 10s - adjust based on whether you get banned
     # Options: 240 (strict), 30 (moderate), 10 (relaxed), 3 (aggressive), 1 (very aggressive)
 
     # Configuration
     SCRAPE_TEAM_REPORTS = False # Team lvl overview for a season
     SCRAPE_GAMES = True # Gather game level data
-    FETCH_NEW_GAME_LISTS = False # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
+    FETCH_NEW_GAME_LISTS = True # Set to True to add new games to existing games lists (SCARPE_GAMES must also be true)
     SCRAPE_MISSING_DATA_GAMES = False # Set to True to retry scraping games marked with missing_data=1
     SCRAPE_FROM_CSV = False # Set to True to scrape games from missing_goalie_data.csv
     CSV_FILE_PATH = 'missing_goalie_data.csv' # Path to CSV file with missing games
@@ -2065,8 +2074,8 @@ if __name__ == "__main__":
     # NOTE: Parallel scraping with delays is OK since each thread has its own delay
     # The global rate limiter ensures minimum spacing between ANY requests
     # However, more workers = more simultaneous connections = higher detection risk
-    PARALLEL_GAME_SCRAPING = False  # Set to True for faster scraping (higher ban risk)
-    SCRAPING_WORKERS = 4 # Start with 1; can try 2 if 10s+ delay and no bans
+    PARALLEL_GAME_SCRAPING = True  # Set to True for faster scraping (higher ban risk)
+    SCRAPING_WORKERS = 8 # Start with 1; can try 2 if 10s+ delay and no bans
 
     # Season Configuration
     # Format: YYYYYYYY (e.g., 20242025 = 2024-25 season)
