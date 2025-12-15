@@ -48,16 +48,19 @@ import jax.numpy as jnp
 DEFAULT_DB_PATH = "./nhl_analytics.db"
 MODEL_PARAMS_PATH = "advanced_model_params_v6.npz"
 STATS_PATH = "advanced_standardize_stats_v6.npz"
+CALIBRATION_PATH = "model_calibration_v6.npz"
 RANDOM_SEED = None
 
-DEFAULT_EPOCHS = 600
+DEFAULT_EPOCHS = 1000
 DEFAULT_BATCH = 64
 DEFAULT_LR = 0.0005
-DEFAULT_HIDDEN = 128
+DEFAULT_HIDDEN = 192
 DEFAULT_N_SIMS = 5000
+# the number of hidden neurons needs to be greater than the number of features, otherwise it has to compress / bottleneck them.
+# but increasing it requires more training data to effectively fill the parameters.
 
-EMPTY_NET_MULTIPLIER_FOR = 5.0
-EMPTY_NET_MULTIPLIER_AGAINST = 2.5
+EMPTY_NET_MULTIPLIER_FOR = 2.0
+EMPTY_NET_MULTIPLIER_AGAINST = 1.5
 
 # ---------------------------
 # Global Helpers
@@ -615,7 +618,7 @@ def process_skater_aggregates(con) -> pd.DataFrame:
     
     # Finishing: Top 3 F Goals - xG
     top3f_finish = df[(df['pos_group'] == 'F') & (df['rank'] <= 3)].groupby(['game_id', 'team_id']).apply(
-        lambda x: (x['mp_i_f_goals'] - x['mp_i_f_xgoals']).sum()
+        lambda x: (x['mp_i_f_goals'] - x['mp_i_f_xgoals']).sum(), include_groups=False
     ).reset_index(name='top3_f_finish')
     
     # Merge all
@@ -690,7 +693,7 @@ def process_skater_chemistry(con) -> pd.DataFrame:
         lambda x: pd.Series({
             'linemate_xgf_boost': np.average(x['avg_xgf_diff'], weights=x['total_toi']),
             'linemate_hdcf_synergy': np.average(x['sum_hdcf_rate'], weights=x['total_toi'])
-        })
+        }), include_groups=False
     ).reset_index()
     
     # --- Defense: Top 1 Partner ---
@@ -704,7 +707,7 @@ def process_skater_chemistry(con) -> pd.DataFrame:
         team_def = defs.groupby(['game_id', 'team_id']).apply(
             lambda x: pd.Series({
                 'dpair_xgf_boost': np.average(x['avg_xgf_diff'], weights=x['total_toi'])
-            })
+            }), include_groups=False
         ).reset_index()
     else:
         team_def = pd.DataFrame(columns=['game_id', 'team_id', 'dpair_xgf_boost'])
@@ -770,6 +773,9 @@ def process_matchup_metrics(con) -> pd.DataFrame:
     top5_opps['is_elite'] = True
     
     df = pd.merge(df, top5_opps, on=['game_id', 'team_id', 'opponent_id'], how='left')
+    
+    # fixes "Warning: Downcasting object dtype arrays on .fillna is deprecated"
+    pd.set_option('future.no_silent_downcasting', True)
     df['is_elite'] = df['is_elite'].fillna(False)
     
     df['xgf_diff'] = df['xgf_pct_with'] - df['xgf_pct_without']
@@ -779,7 +785,8 @@ def process_matchup_metrics(con) -> pd.DataFrame:
     elite_matchups = df[df['is_elite']]
     if not elite_matchups.empty:
         suppression = elite_matchups.groupby(['game_id', 'team_id']).apply(
-            lambda x: np.average(x['xgf_diff'], weights=x['toi_seconds'])
+            lambda x: np.average(x['xgf_diff'], weights=x['toi_seconds']),
+          include_groups=False
         ).reset_index(name='suppression_factor')
     else:
         suppression = pd.DataFrame(columns=['game_id', 'team_id', 'suppression_factor'])
@@ -1390,24 +1397,6 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     if 'home_mp_game_date' in final.columns:
         final = final.rename(columns={'home_mp_game_date': 'mp_game_date'})
 
-    # DEBUG: Check edge_giveaway_d and edge_blocked_shot_d rolling averages for team 12
-    if 'away_edge_giveaway_d' in final.columns:
-        edm_debug = final[final['away_team_id'] == 12]
-        if not edm_debug.empty:
-            debug_cols = ['game_id', 'mp_game_date', 'away_edge_giveaway_d']
-            if 'away_roll3_edge_giveaway_d' in final.columns:
-                debug_cols.append('away_roll3_edge_giveaway_d')
-            if 'away_roll10_edge_giveaway_d' in final.columns:
-                debug_cols.append('away_roll10_edge_giveaway_d')
-            if 'away_edge_blocked_shot_d' in final.columns:
-                debug_cols.append('away_edge_blocked_shot_d')
-            if 'away_roll3_edge_blocked_shot_d' in final.columns:
-                debug_cols.append('away_roll3_edge_blocked_shot_d')
-            if 'away_roll10_edge_blocked_shot_d' in final.columns:
-                debug_cols.append('away_roll10_edge_blocked_shot_d')
-            print(f"DEBUG: get_base_team_stats edge features for team 12 (DET):")
-            print(edm_debug[debug_cols].tail())
-
     return final.dropna(subset=['goals_home', 'goals_away']).reset_index(drop=True)
 
 
@@ -1459,32 +1448,101 @@ def init_params(key, d_in, hidden):
     W2 = jax.random.normal(k2, (hidden, hidden)) * jnp.sqrt(2.0 / hidden)
     b2 = jnp.zeros(hidden)
     W3 = jax.random.normal(k3, (hidden, 2)) * 0.05
-    b3 = jnp.full(2, 3.0)
+    b3 = jnp.full(2, 2.5)
     return {'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2, 'W3': W3, 'b3': b3}
 
 
-@jax.jit
-def forward(p, x):
+def forward(p, x, training=False, rng_key=None, dropout_rate=0.2):
+    """
+    Forward pass through the network with optional dropout.
+
+    Args:
+        p: Parameters dict
+        x: Input features
+        training: Boolean - if True, applies dropout
+        rng_key: JAX random key (required if training=True and dropout_rate > 0)
+        dropout_rate: Dropout probability (default 0.2 = 20%)
+    """
     h = jax.nn.elu(x @ p['W1'] + p['b1'])
+
+    # Apply dropout to first hidden layer
+    if training and dropout_rate > 0.0 and rng_key is not None:
+        key1, key2 = jax.random.split(rng_key)
+        keep_prob = 1.0 - dropout_rate
+        mask1 = jax.random.bernoulli(key1, keep_prob, h.shape)
+        h = jnp.where(mask1, h / keep_prob, 0.0)
+    else:
+        key2 = rng_key
+
     h = jax.nn.elu(h @ p['W2'] + p['b2'])
+
+    # Apply dropout to second hidden layer
+    if training and dropout_rate > 0.0 and key2 is not None:
+        keep_prob = 1.0 - dropout_rate
+        mask2 = jax.random.bernoulli(key2, keep_prob, h.shape)
+        h = jnp.where(mask2, h / keep_prob, 0.0)
+
     return jax.nn.softplus(h @ p['W3'] + p['b3']) + 1e-6
 
 
-@jax.jit
-def loss_fn(p, x, y):
-    lam = forward(p, x)
-    lam = jnp.clip(lam, 0.2, 30.0)
+def loss_fn(p, x, y, training=False, rng_key=None, dropout_rate=0.2):
+    """Loss function with optional dropout during training."""
+    lam = forward(p, x, training=training, rng_key=rng_key, dropout_rate=dropout_rate)
+    lam = jnp.clip(lam, 0.5, 5.0)
     return jnp.mean(lam - y * jnp.log(lam)) + 2e-5 * jnp.sum(p['W3'] ** 2)
 
 
-update = jax.jit(lambda p, x, y, lr: ({k: p[k] - lr * jax.grad(loss_fn)(p, x, y)[k] for k in p}, loss_fn(p, x, y)))
+def update_step(p, x, y, lr, rng_key, dropout_rate):
+    """Single training step with dropout."""
+    # Compute loss and gradients with dropout enabled
+    loss_and_grad = jax.value_and_grad(lambda params: loss_fn(params, x, y, training=True, rng_key=rng_key, dropout_rate=dropout_rate))
+    loss, grads = loss_and_grad(p)
+    # Update parameters
+    new_params = {k: p[k] - lr * grads[k] for k in p}
+    return new_params, loss
+
+
+# JIT compile the update step for speed
+update_step = jax.jit(update_step, static_argnums=(5,))  # static_argnums for dropout_rate
 
 
 def get_features(df):
-    exclude = ['game_id', 'goals_home', 'goals_away', 'h_odd', 'a_odd', 'mp_game_date',
+    # Meta columns to always exclude
+    exclude_meta = ['game_id', 'goals_home', 'goals_away', 'h_odd', 'a_odd', 'mp_game_date',
                'home_ghsf', 'away_ghsf', 'home_lss', 'away_lss', 'home_sted', 'away_sted',
-               'home_goalie_player_id', 'away_goalie_player_id', 'primary_goalie_id']
-    return [c for c in df.columns if c not in exclude]
+               #'home_goalie_player_id', 'away_goalie_player_id', 'primary_goalie_id'
+    ]
+    
+    features = []
+    for c in df.columns:
+        if c in exclude_meta:
+            continue
+            
+        # Strip prefix to check the base feature nature
+        base_c = c.replace('home_', '').replace('away_', '')
+        
+        # 1. KEEP Rolling averages (Historical data)
+        if base_c.startswith('roll'):
+            features.append(c)
+            continue
+            
+        # 2. KEEP Computed Historical Metrics
+        # - rest: derived from schedule (known pre-game)
+        # - osa_xg: derived from rolling xG * rolling suppression (known pre-game)
+        # - hdsm: derived from roll3 - roll10 (known pre-game)
+        # - opp_xg_suppression: derived from rolling xGA (known pre-game)
+        # - sted: derived from rolling special teams (known pre-game)
+        if base_c in ['rest', 'osa_xg', 'hdsm', 'opp_xg_suppression', 'sted']:
+            features.append(c)
+            continue
+            
+        # 3. EXCLUDE Everything else (Raw Game Stats)
+        # This drops: xgf, xga, pens, goals_for, shots_total, avg_dist, avg_angle,
+        # cnt_*, edge_* (raw), rush_attempts_for, etc.
+        # These are "Post-Game" stats and constitute data leakage if used for prediction.
+        pass
+        
+    return features
 
 
 # ---------------------------
@@ -1505,30 +1563,119 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
     feats = get_features(df)
     print("using features: "); print(feats);
     X_df = standardize_data(df, feats, STATS_PATH, 'train')
-    X = jnp.array(X_df.values)
-    Y = jnp.array(df[['goals_home', 'goals_away']].values)
+    X_all = jnp.array(X_df.values)
+    Y_all = jnp.array(df[['goals_home', 'goals_away']].values)
 
-    steps = max(1, len(X) // batch)
-    print(f"\nTraining on {len(X)} games | {len(feats)} features")
-
+    # Validation Split (10%)
+    val_size = int(len(X_all) * 0.10)
+    train_size = len(X_all) - val_size
+    
+    # Shuffle before split
     key = jax.random.PRNGKey(seed)
+    perm = jax.random.permutation(key, len(X_all))
+    X_all, Y_all = X_all[perm], Y_all[perm]
+    
+    X, X_val = X_all[:train_size], X_all[train_size:]
+    Y, Y_val = Y_all[:train_size], Y_all[train_size:]
+    
+    steps = max(1, len(X) // batch)
+    print(f"\nTraining on {len(X)} games | Validation on {len(X_val)} games | {len(feats)} features")
+
     params = init_params(key, len(feats), hidden)
+    
+    best_val_loss = float('inf')
+    best_params = None
+    patience_counter = 0
+
+    # Default dropout rate
+    dropout_rate = 0.2
 
     for e in range(epochs):
-        perm = jax.random.permutation(key, len(X))
+        # Generate new random key for this epoch
+        key, subkey = jax.random.split(key)
+        perm = jax.random.permutation(subkey, len(X))
         X, Y = X[perm], Y[perm]
         loss_sum = 0.0
+
+        # Train Loop
         for i in range(steps):
             xb = X[i * batch:(i + 1) * batch]
             yb = Y[i * batch:(i + 1) * batch]
-            params, l = update(params, xb, yb, lr)
-            loss_sum += l
-        if e % 100 == 0 or e == epochs - 1:
-            print(f"Epoch {e:3d} | Loss {loss_sum / steps:.4f}")
 
-    print("saving...")
-    np.savez(MODEL_PARAMS_PATH, **{k: np.array(v) for k, v in params.items()})
+            # Generate unique random key for dropout in this batch
+            key, dropout_key = jax.random.split(key)
+            params, l = update_step(params, xb, yb, lr, dropout_key, dropout_rate)
+            loss_sum += l
+
+        # Validation & Logging
+        if e % 10 == 0 or e == epochs - 1:
+            # Full validation pass WITHOUT dropout (training=False)
+            val_loss = loss_fn(params, X_val, Y_val, training=False, rng_key=None, dropout_rate=0.0)
+            train_loss = loss_sum / steps
+            
+            improved = ""
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_params = params
+                improved = "*" # Indicator of new best model
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            print(f"Epoch {e:3d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} {improved}")
+            
+            # Optional: Simple Early Stopping check
+            # if patience_counter > 50:
+            #     print("Early stopping triggered.")
+            #     break
+
+    print(f"\nBest Validation Loss: {best_val_loss:.4f}")
+    print("saving best model...")
+    if best_params is not None:
+        np.savez(MODEL_PARAMS_PATH, **{k: np.array(v) for k, v in best_params.items()})
+    else:
+        # Fallback if weirdly nothing improved (unlikely)
+        np.savez(MODEL_PARAMS_PATH, **{k: np.array(v) for k, v in params.items()})
+
     np.savez("feature_list.npz", features=np.array(feats))
+
+    # Calculate calibration factor on validation set
+    print("\nCalculating calibration factor on validation set...")
+    final_params = best_params if best_params is not None else params
+    # Forward pass WITHOUT dropout for calibration
+    val_predictions = forward(final_params, X_val, training=False, rng_key=None, dropout_rate=0.0)
+
+    # Calculate predicted average goals per team
+    predicted_home_avg = float(jnp.mean(val_predictions[:, 0]))
+    predicted_away_avg = float(jnp.mean(val_predictions[:, 1]))
+    predicted_total_avg = predicted_home_avg + predicted_away_avg
+
+    # Calculate actual average goals per team from validation set
+    actual_home_avg = float(jnp.mean(Y_val[:, 0]))
+    actual_away_avg = float(jnp.mean(Y_val[:, 1]))
+    actual_total_avg = actual_home_avg + actual_away_avg
+
+    # Calculate calibration factors
+    calibration_factor_home = actual_home_avg / max(predicted_home_avg, 0.1)
+    calibration_factor_away = actual_away_avg / max(predicted_away_avg, 0.1)
+    calibration_factor_total = actual_total_avg / max(predicted_total_avg, 0.1)
+
+    print(f"Validation Set Statistics:")
+    print(f"  Actual:    Home {actual_home_avg:.3f} | Away {actual_away_avg:.3f} | Total {actual_total_avg:.3f}")
+    print(f"  Predicted: Home {predicted_home_avg:.3f} | Away {predicted_away_avg:.3f} | Total {predicted_total_avg:.3f}")
+    print(f"  Calibration Factors: Home {calibration_factor_home:.4f} | Away {calibration_factor_away:.4f} | Total {calibration_factor_total:.4f}")
+
+    # Save calibration factors
+    np.savez(CALIBRATION_PATH,
+             calibration_factor_home=calibration_factor_home,
+             calibration_factor_away=calibration_factor_away,
+             calibration_factor_total=calibration_factor_total,
+             actual_home_avg=actual_home_avg,
+             actual_away_avg=actual_away_avg,
+             predicted_home_avg=predicted_home_avg,
+             predicted_away_avg=predicted_away_avg)
+    print(f"Calibration factors saved to {CALIBRATION_PATH}")
+
     print("Model saved.")
 
 
@@ -1539,6 +1686,15 @@ def american_to_prob(o):
     else:
         return abs(o) / (abs(o) + 100)
 
+
+def lookup_player_id(player_name: str, db_conn) -> int:
+    print(f"playerID lookup for: '{player_name}'")
+    query = f""" SELECT "player_id","player_name" FROM "main"."players" WHERE "player_name" LIKE '%{player_name}%' ESCAPE '\\' """ # LIMIT 1
+    result = pd.read_sql_query(query, db_conn)
+    print(f"results:\n{result}")
+    player_id = result.get("player_id")[0]
+    # TODO: if player_id is None???
+    return player_id
 
 def get_latest_stats_for_manual(db_path):
     """
@@ -1649,7 +1805,7 @@ def get_latest_stats_for_manual(db_path):
     return latest
 
 
-def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a_odd, n_sims, home_goalie_id=None, away_goalie_id=None):
+def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a_odd, n_sims, home_goalie_id=None, away_goalie_id=None, use_calibration=True):
     if not os.path.exists(MODEL_PARAMS_PATH):
         print("No model – train first.")
         return
@@ -1781,9 +1937,31 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
 
     X = standardize_data(pd.DataFrame([matchup])[feats], feats, STATS_PATH, 'predict')
     lam = forward(params, jnp.array(X.values))[0]
-    lh, la = float(lam[0]), float(lam[1])
+    lh_raw, la_raw = float(lam[0]), float(lam[1])
 
-    print(f"\nProjected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+    # Load and apply calibration factors
+    if use_calibration and os.path.exists(CALIBRATION_PATH):
+        cal_data = np.load(CALIBRATION_PATH)
+        cal_factor_home = float(cal_data['calibration_factor_home'])
+        cal_factor_away = float(cal_data['calibration_factor_away'])
+        cal_factor_total = float(cal_data['calibration_factor_total'])
+
+        # Apply calibration
+        lh = lh_raw * cal_factor_home
+        la = la_raw * cal_factor_away
+
+        print(f"\nRaw Predicted Rates → {h_row['team_abbr']} {lh_raw:.2f} | {a_row['team_abbr']} {la_raw:.2f} (Total: {lh_raw + la_raw:.2f})")
+        print(f"Calibration Applied → {h_row['team_abbr']} {cal_factor_home:.4f} | {a_row['team_abbr']} {cal_factor_away:.4f}")
+        print(f"Calibrated Rates    → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f} (Total: {lh + la:.2f})\n")
+    elif not use_calibration:
+        lh, la = lh_raw, la_raw
+        print(f"\n⚠️  Calibration disabled - using raw predictions")
+        print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+    else:
+        lh, la = lh_raw, la_raw
+        print(f"\n⚠️  No calibration file found - using raw predictions")
+        print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+
     print(f"Simulating {n_sims:,} games...\n{'=' * 60}")
 
     # according to Gemini:
@@ -1814,10 +1992,57 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     final_a = cur_a + np.random.poisson(ra)
     total = final_h + final_a
 
+    # --- SIMULATION OVERVIEW ---
     print(f"{h_row['team_abbr']} {np.mean(final_h):.2f} – {a_row['team_abbr']} {np.mean(final_a):.2f}  |  Total {np.mean(total):.2f}")
-    print(f"Win Probability → {h_row['team_abbr']}: {100 * np.mean(final_h > final_a):.1f}%   |   {a_row['team_abbr']}: {100 * np.mean(final_a > final_h):.1f}%  |  ties: {100 * np.mean(final_a == final_h):.1f}%")
+    
+    win_h = np.mean(final_h > final_a)
+    win_a = np.mean(final_a > final_h)
+    ties = np.mean(final_h == final_a)
+    
+    print(f"Win Probability → {h_row['team_abbr']}: {100 * win_h:.1f}%   |   {a_row['team_abbr']}: {100 * win_a:.1f}%  |  ties: {100 * ties:.1f}%")
     print(f"Puckline (-1.5) → {h_row['team_abbr']}: {100 * np.mean(final_h - final_a >= 2):.1f}%   |   {a_row['team_abbr']}: {100 * np.mean(final_a - final_h >= 2):.1f}%")
     print(f"Over 6.5: {100 * np.mean(total > 6.5):.1f}%   |   Under 6.5: {100 * np.mean(total <= 6.5):.1f}%")
+    
+    # 1. Most Likely Scores
+    print("\nMost Likely Scores:")
+    score_counts = pd.DataFrame({'h': final_h, 'a': final_a}).groupby(['h', 'a']).size().reset_index(name='count')
+    score_counts['prob'] = score_counts['count'] / n_sims
+    top_scores = score_counts.sort_values('count', ascending=False).head(5)
+    
+    for _, row in top_scores.iterrows():
+        print(f"  {h_row['team_abbr']} {int(row['h'])} - {int(row['a'])} {a_row['team_abbr']}  ({row['prob']*100:.1f}%)")
+
+    # 2. Projected Period Scoring (Approximation)
+    # h60 is 40 mins (P1+P2), h18 is 18 mins (P3ish), + EN time
+    # Approx: P1 = h60/2, P2 = h60/2, P3 = h18 + EN
+    p1_h, p1_a = np.mean(h60)/2, np.mean(a60)/2
+    p2_h, p2_a = np.mean(h60)/2, np.mean(a60)/2
+    p3_h, p3_a = np.mean(h18) + np.mean(np.random.poisson(rh)), np.mean(a18) + np.mean(np.random.poisson(ra))
+    
+    print(f"\nProjected Scoring by Period (Approx):")
+    print(f"  P1: {h_row['team_abbr']} {p1_h:.2f} - {p1_a:.2f} {a_row['team_abbr']}")
+    print(f"  P2: {h_row['team_abbr']} {p2_h:.2f} - {p2_a:.2f} {a_row['team_abbr']}")
+    print(f"  P3: {h_row['team_abbr']} {p3_h:.2f} - {p3_a:.2f} {a_row['team_abbr']}")
+
+    # 3. Win Margin Distribution (ASCII)
+    print("\nWin Margin Distribution:")
+    margins = final_h - final_a
+    # Bins: <-2, -2, -1, 0, 1, 2, >2
+    dist = {
+        f"{a_row['team_abbr']} by 3+": np.mean(margins <= -3),
+        f"{a_row['team_abbr']} by 2 ": np.mean(margins == -2),
+        f"{a_row['team_abbr']} by 1 ": np.mean(margins == -1),
+        "Tie      ": np.mean(margins == 0),
+        f"{h_row['team_abbr']} by 1 ": np.mean(margins == 1),
+        f"{h_row['team_abbr']} by 2 ": np.mean(margins == 2),
+        f"{h_row['team_abbr']} by 3+": np.mean(margins >= 3),
+    }
+    
+    for label, prob in dist.items():
+        bar_len = int(prob * 50) # Scale: 50 chars = 100%
+        bar = '#' * bar_len
+        print(f"  {label}: {bar} ({prob*100:.1f}%)")
+
     print('=' * 60)
 
 
@@ -1852,17 +2077,28 @@ Examples:
     p.add_argument("--n_sims", type=int, default=DEFAULT_N_SIMS, help=f"Monte Carlo simulations (default: {DEFAULT_N_SIMS})")
     
     # NEW: Goalie override arguments
-    p.add_argument("--home-goalie", type=str, help="Home team starting goalie player_id (manual mode)")
-    p.add_argument("--away-goalie", type=str, help="Away team starting goalie player_id (manual mode)")
-    
+    p.add_argument("--home-goalie", type=str, help="Home team starting goalie (manual mode)")
+    p.add_argument("--away-goalie", type=str, help="Away team starting goalie (manual mode)")
+
+    # Calibration toggle
+    p.add_argument("--no-calibration", dest='use_calibration', action='store_false',
+                   help="Disable calibration and use raw model predictions (manual mode)")
+
     rest_days_args = p.add_mutually_exclusive_group()
     rest_days_args.add_argument("--date", type=str, help="calculate rest-days from Game date YYYY-MM-DD (manual mode)")
     rest_days_args.add_argument("--today", dest="date", action="store_const", const=str(datetime.datetime.now().date()), help="use today's date for rest-diff calculations")
     rest_days_args.add_argument("--rest", type=int, nargs=2, default=[2,2], help="number of rest days - home/away (default: 2/2)")
 
-    p.set_defaults(use_filter=True)
+    p.set_defaults(use_filter=True, use_calibration=True)
     a = p.parse_args()
-
+    
+    home_goalie_id = None
+    away_goalie_id = None
+    db_conn = sqlite3.connect(a.db)
+    if (a.home_goalie is not None): home_goalie_id = lookup_player_id(a.home_goalie, db_conn);
+    if (a.away_goalie is not None): away_goalie_id = lookup_player_id(a.away_goalie, db_conn);
+    db_conn.close()
+    
     if a.mode == 'train':
         print("\n" + "=" * 70)
         print("NHL MODEL TRAINING")
@@ -1874,7 +2110,8 @@ Examples:
 
         train(a.db, a.epochs, a.batch, a.lr, a.hidden, RANDOM_SEED, use_complete_games_filter=a.use_filter)
     elif a.mode == 'manual':
-        manual_forecast(a.db, a.home, a.away, a.date, a.rest[0], a.rest[1], 
+        manual_forecast(a.db, a.home, a.away, a.date, a.rest[0], a.rest[1],
                        a.h_odds, a.a_odds, a.n_sims,
-                       home_goalie_id=getattr(a, 'home_goalie', None),
-                       away_goalie_id=getattr(a, 'away_goalie', None))
+                       home_goalie_id=home_goalie_id,
+                       away_goalie_id=away_goalie_id,
+                       use_calibration=a.use_calibration)
