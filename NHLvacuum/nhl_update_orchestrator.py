@@ -29,6 +29,7 @@ import glob
 
 # Import data collectors and importers
 import nstparse
+from nstparse import TEAM_NAME_MAP
 import nhl_db_manager
 import moneypuck_downloader
 import mp_import
@@ -108,6 +109,35 @@ class NHLUpdateOrchestrator:
         # Track results
         self.results: List[UpdateResult] = []
 
+    @staticmethod
+    def convert_nhl_api_abbrev_to_nst(abbrev: str) -> str:
+        """
+        Convert NHL API team abbreviation to NST format.
+        NHL API uses LAK, TBL, NJD, SJS but NST uses L.A, T.B, N.J, S.J
+
+        Args:
+            abbrev: NHL API team abbreviation (e.g., "LAK", "TBL")
+
+        Returns:
+            NST-formatted team abbreviation (e.g., "L.A", "T.B")
+        """
+        if not abbrev:
+            return abbrev
+
+        # Use the TEAM_NAME_MAP from nstparse to convert
+        # First try direct lookup (handles case-insensitive)
+        nst_abbrev = TEAM_NAME_MAP.get(abbrev)
+        if nst_abbrev:
+            return nst_abbrev
+
+        # Also try lowercase version
+        nst_abbrev = TEAM_NAME_MAP.get(abbrev.lower())
+        if nst_abbrev:
+            return nst_abbrev
+
+        # If no mapping found, return original (most teams don't need conversion)
+        return abbrev
+
     def connect(self):
         """Connect to the database"""
         self.conn = sqlite3.connect(self.db_path)
@@ -162,13 +192,18 @@ class NHLUpdateOrchestrator:
                             season_int = str(game['season'])
                             season_str = f"{season_int[:4]}-{season_int[6:]}"
 
+                            # Convert NHL API abbreviations to NST format
+                            # NHL API uses LAK, TBL, NJD, SJS but NST uses L.A, T.B, N.J, S.J
+                            away_abbrev = self.convert_nhl_api_abbrev_to_nst(game['awayTeam']['abbrev'])
+                            home_abbrev = self.convert_nhl_api_abbrev_to_nst(game['homeTeam']['abbrev'])
+
                             game_data = {
                                 'game_id': str(game['id']),
                                 'game_date': schedule['date'],  # YYYY-MM-DD from schedule response
                                 'season': season_str,
                                 'game_type': game['gameType'],
-                                'away_team': game['awayTeam']['abbrev'],
-                                'home_team': game['homeTeam']['abbrev'],
+                                'away_team': away_abbrev,
+                                'home_team': home_abbrev,
                                 'game_state': game['gameState']
                             }
                             games.append(game_data)
