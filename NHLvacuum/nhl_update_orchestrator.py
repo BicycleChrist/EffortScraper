@@ -197,6 +197,17 @@ class NHLUpdateOrchestrator:
                             away_abbrev = self.convert_nhl_api_abbrev_to_nst(game['awayTeam']['abbrev'])
                             home_abbrev = self.convert_nhl_api_abbrev_to_nst(game['homeTeam']['abbrev'])
 
+                            # Extract full team names for NST scraping
+                            # Use commonName (e.g., "Bruins", "Kings") which works with TEAM_NAME_MAP
+                            away_common = game['awayTeam'].get('commonName', {}).get('default', '')
+                            home_common = game['homeTeam'].get('commonName', {}).get('default', '')
+                            away_place = game['awayTeam'].get('placeName', {}).get('default', '')
+                            home_place = game['homeTeam'].get('placeName', {}).get('default', '')
+
+                            # Full name format: "PlaceName CommonName" (e.g., "Boston Bruins")
+                            away_full = f"{away_place} {away_common}".strip() if away_place or away_common else ""
+                            home_full = f"{home_place} {home_common}".strip() if home_place or home_common else ""
+
                             game_data = {
                                 'game_id': str(game['id']),
                                 'game_date': schedule['date'],  # YYYY-MM-DD from schedule response
@@ -204,6 +215,8 @@ class NHLUpdateOrchestrator:
                                 'game_type': game['gameType'],
                                 'away_team': away_abbrev,
                                 'home_team': home_abbrev,
+                                'away_team_full': away_full,
+                                'home_team_full': home_full,
                                 'game_state': game['gameState']
                             }
                             games.append(game_data)
@@ -337,14 +350,14 @@ class NHLUpdateOrchestrator:
             if not game_row:
                 # Game not in database yet - try to get info from known_games_map
                 game_info = known_games_map.get(game_id, {})
-                
+
                 games_to_update.append(GameToUpdate(
                     game_id=game_id,
                     game_date=game_info.get('game_date', ""),
                     home_team=game_info.get('home_team', ""),
                     away_team=game_info.get('away_team', ""),
-                    home_team_full="", # Full names are not in api_games, will be fetched from DB later
-                    away_team_full="",
+                    home_team_full=game_info.get('home_team_full', ""),
+                    away_team_full=game_info.get('away_team_full', ""),
                     season=game_info.get('season', "")
                 ))
                 continue
