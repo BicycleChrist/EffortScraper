@@ -40,7 +40,7 @@ import jax.numpy as jnp
 
 # Train command: python model_test.py --db ./nhl_analytics.db --mode train --epochs 400
 # Simulation command: python model_test.py --mode manual --home DAL --away EDM --date 2025-12-04  --n_sims 250000
-
+# Insane validation loss with this seed: 1951054394 ; statistical magic?
 
 # ---------------------------
 # Config & Constants
@@ -53,14 +53,14 @@ RANDOM_SEED = None
 
 DEFAULT_EPOCHS = 1000
 DEFAULT_BATCH = 64
-DEFAULT_LR = 0.0005
+DEFAULT_LR = 0.001
 DEFAULT_HIDDEN = 192
 DEFAULT_N_SIMS = 5000
 # the number of hidden neurons needs to be greater than the number of features, otherwise it has to compress / bottleneck them.
 # but increasing it requires more training data to effectively fill the parameters.
 
-EMPTY_NET_MULTIPLIER_FOR = 2.0
-EMPTY_NET_MULTIPLIER_AGAINST = 1.5
+EMPTY_NET_MULTIPLIER_FOR = 1.5
+EMPTY_NET_MULTIPLIER_AGAINST = 1.25
 
 # ---------------------------
 # Global Helpers
@@ -148,6 +148,9 @@ def identify_starting_goalie(con) -> pd.DataFrame:
     
     try:
         nst_df = pd.read_sql_query(nst_query, con)
+        # Clean player_id: remove " [G]" or similar
+        if not nst_df.empty:
+             nst_df['player_id'] = nst_df['player_id'].astype(str).str.replace(r' \[.*\]', '', regex=True).str.strip()
     except Exception:
         nst_df = pd.DataFrame()
 
@@ -220,6 +223,8 @@ def process_goalie_metrics(con) -> pd.DataFrame:
     WHERE situation_id = {all_id}
     """
     nst_df = pd.read_sql_query(nst_query, con)
+    if not nst_df.empty:
+         nst_df['player_id'] = nst_df['player_id'].astype(str).str.replace(r' \[.*\]', '', regex=True).str.strip()
 
     # 2. Get MP goalie data (for RCR and HD_GSAx)
     mp_query = f"""
@@ -235,6 +240,8 @@ def process_goalie_metrics(con) -> pd.DataFrame:
     WHERE situation_id = {all_id}
     """
     mp_df = pd.read_sql_query(mp_query, con)
+    if not mp_df.empty:
+         mp_df['player_id'] = mp_df['player_id'].astype(str).str.strip()
 
     # 3. Merge NST + MP data
     if not nst_df.empty and not mp_df.empty:
@@ -1526,6 +1533,11 @@ def get_features(df):
             features.append(c)
             continue
             
+        # 1b. KEEP Goalie Rolling averages & Metrics
+        if base_c.startswith('goalie_roll') or base_c == 'goalie_ghsf':
+            features.append(c)
+            continue
+            
         # 2. KEEP Computed Historical Metrics
         # - rest: derived from schedule (known pre-game)
         # - osa_xg: derived from rolling xG * rolling suppression (known pre-game)
@@ -1566,7 +1578,7 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
     X_all = jnp.array(X_df.values)
     Y_all = jnp.array(df[['goals_home', 'goals_away']].values)
 
-    # Validation Split (10%)
+    # Validation Split: percent of games 
     val_size = int(len(X_all) * 0.10)
     train_size = len(X_all) - val_size
     
@@ -1858,6 +1870,10 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
         print(f"Using primary starter for {a_norm}: {away_goalie_id}")
     else:
         print(f"User-specified goalie for {a_norm}: {away_goalie_id}")
+        
+    # Clean IDs for lookup
+    if home_goalie_id: home_goalie_id = str(home_goalie_id).replace(' [G]', '').strip()
+    if away_goalie_id: away_goalie_id = str(away_goalie_id).replace(' [G]', '').strip()
         
     print("\n")
 
