@@ -49,11 +49,11 @@ DEFAULT_DB_PATH = "./nhl_analytics.db"
 MODEL_PARAMS_PATH = "advanced_model_params_v6.npz"
 STATS_PATH = "advanced_standardize_stats_v6.npz"
 CALIBRATION_PATH = "model_calibration_v6.npz"
-RANDOM_SEED = None
+RANDOM_SEED = 1951054394
 
 DEFAULT_EPOCHS = 1000
 DEFAULT_BATCH = 64
-DEFAULT_LR = 0.001
+DEFAULT_LR = 0.005
 DEFAULT_HIDDEN = 192
 DEFAULT_N_SIMS = 5000
 # the number of hidden neurons needs to be greater than the number of features, otherwise it has to compress / bottleneck them.
@@ -84,6 +84,8 @@ def process_special_teams(con) -> pd.DataFrame:
     SELECT game_id, team_id, situation_code,
            SUM(COALESCE(mp_score_venue_adjusted_xgoals_for, mp_xgoals_for, 0)) as xg_for,
            SUM(COALESCE(mp_score_venue_adjusted_xgoals_against, mp_xgoals_against, 0)) as xg_against,
+           SUM(COALESCE(mp_goals_for, 0)) as goals_for,
+           SUM(COALESCE(mp_goals_against, 0)) as goals_against,
            SUM(mp_ice_time) as toi
     FROM mp_team_game_stats mp
     JOIN situations s ON mp.situation_id = s.situation_id
@@ -92,31 +94,39 @@ def process_special_teams(con) -> pd.DataFrame:
     """
     df = pd.read_sql_query(query, con)
     if df.empty:
-        return pd.DataFrame(columns=['game_id', 'team_id', 'roll_pp_xg60', 'roll_pk_xga60', 'roll_pk_xgf60'])
+        return pd.DataFrame(columns=['game_id', 'team_id', 'roll_pp_xg60', 'roll_pk_xga60', 'roll_pk_xgf60', 'roll_pp_efficiency', 'roll_pk_g60'])
 
     pp = df[df['situation_code'] == 'PP'].copy()
     pk = df[df['situation_code'] == 'PK'].copy()
 
     # Calculate Rates
     pp['pp_xg60'] = pp['xg_for'] / (pp['toi'] / 60 + 0.2)
+    pp['pp_efficiency'] = pp['goals_for'] / (pp['toi'] / 60 + 0.2) # PP Goals per 60
+    
     pk['pk_xga60'] = pk['xg_against'] / (pk['toi'] / 60 + 0.2)
     pk['pk_xgf60'] = pk['xg_for'] / (pk['toi'] / 60 + 0.2)
+    pk['pk_g60'] = pk['goals_against'] / (pk['toi'] / 60 + 0.2) # PK Goals Against per 60
 
     pp = pp.sort_values(['team_id', 'game_id'])
     pk = pk.sort_values(['team_id', 'game_id'])
 
     # Rolling
     pp['roll_pp_xg60'] = pp.groupby('team_id')['pp_xg60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
+    pp['roll_pp_efficiency'] = pp.groupby('team_id')['pp_efficiency'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
+    
     pk['roll_pk_xga60'] = pk.groupby('team_id')['pk_xga60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
     pk['roll_pk_xgf60'] = pk.groupby('team_id')['pk_xgf60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
+    pk['roll_pk_g60'] = pk.groupby('team_id')['pk_g60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
 
     # Merge
-    out = pd.merge(pp[['game_id', 'team_id', 'roll_pp_xg60']],
-                   pk[['game_id', 'team_id', 'roll_pk_xga60', 'roll_pk_xgf60']],
+    out = pd.merge(pp[['game_id', 'team_id', 'roll_pp_xg60', 'roll_pp_efficiency']],
+                   pk[['game_id', 'team_id', 'roll_pk_xga60', 'roll_pk_xgf60', 'roll_pk_g60']],
                    on=['game_id', 'team_id'], how='outer').fillna(0.0)
                    
     # Fill defaults if missing (league avg approx)
     if out['roll_pp_xg60'].mean() == 0: out['roll_pp_xg60'] = 7.0
+    if out['roll_pp_efficiency'].mean() == 0: out['roll_pp_efficiency'] = 7.0 # Approx 7 goals/60 on PP
+    if out['roll_pk_g60'].mean() == 0: out['roll_pk_g60'] = 7.0
     
     return out
 
@@ -405,7 +415,13 @@ def process_advanced_metrics(con) -> pd.DataFrame:
            COALESCE(mp_medium_danger_shots_against, 0) as md_shots_against,
            COALESCE(mp_medium_danger_goals_against, 0) as md_goals_against,
            COALESCE(mp_blocked_shot_attempts_for, 0) as blocks_for,
-           COALESCE(mp_shot_attempts_against, 0) as corsi_against_raw
+           COALESCE(mp_shot_attempts_against, 0) as corsi_against_raw,
+           
+           -- New Pressure Metrics
+           COALESCE(mp_play_continued_in_zone_for, 0) as play_cont_zone,
+           COALESCE(mp_play_continued_outside_zone_for, 0) as play_cont_out,
+           COALESCE(mp_play_continued_in_zone_against, 0) as play_cont_zone_ag,
+           COALESCE(mp_shot_attempts_for, 0) as raw_attempts_for
     FROM mp_team_game_stats
     WHERE situation_id = {all_id}
     """
@@ -414,7 +430,8 @@ def process_advanced_metrics(con) -> pd.DataFrame:
     new_features = ['roll_hd_shot_pct', 'roll_sh_pct', 'roll_rebound_xgf', 'roll_fo_pct', 'roll_sa_corsi_pct',
                     'roll_freeze_ag', 'roll_pen_diff',
                     'roll_flurry_delta', 'roll_hd_finish_pct', 'roll_hd_save_pct', 
-                    'roll_md_finish_pct', 'roll_md_save_pct', 'roll_block_rate']
+                    'roll_md_finish_pct', 'roll_md_save_pct', 'roll_block_rate',
+                    'roll_pressure_rate', 'roll_dzone_clearance_rate']
 
     if df.empty:
         return pd.DataFrame(columns=['game_id', 'team_id'] + new_features)
@@ -433,6 +450,14 @@ def process_advanced_metrics(con) -> pd.DataFrame:
     df['md_finish_pct'] = df['md_goals_for'] / (df['md_shots_for'] + 0.1)
     df['md_save_pct'] = 1.0 - (df['md_goals_against'] / (df['md_shots_against'] + 0.1))
     df['block_rate'] = df['blocks_for'] / (df['corsi_against_raw'] + 0.1)
+
+    # Pressure Metrics Calculations
+    # Pressure Rate: % of attempts that result in sustained pressure
+    df['pressure_rate'] = df['play_cont_zone'] / (df['raw_attempts_for'] + 0.1)
+    
+    # D-Zone Clearance Rate: % of events where we clear the zone vs getting hemmed in
+    # Denominator: Successful Clears + Failed Clears (Sustained Pressure Against)
+    df['dzone_clearance_rate'] = df['play_cont_out'] / (df['play_cont_out'] + df['play_cont_zone_ag'] + 0.1)
 
     df = df.sort_values(['team_id', 'game_id'])
     grp = df.groupby('team_id')
@@ -455,6 +480,10 @@ def process_advanced_metrics(con) -> pd.DataFrame:
     df['roll_md_finish_pct'] = grp['md_finish_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     df['roll_md_save_pct'] = grp['md_save_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     df['roll_block_rate'] = grp['block_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    
+    # Pressure Rolling
+    df['roll_pressure_rate'] = grp['pressure_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    df['roll_dzone_clearance_rate'] = grp['dzone_clearance_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
 
     # --- Trend Features (Short & Long Term) ---
     # Short term (Last 3) - Hot/Cold streaks
@@ -492,7 +521,9 @@ def process_advanced_metrics(con) -> pd.DataFrame:
             'roll_hd_save_pct': 'hd_save_pct',
             'roll_md_finish_pct': 'md_finish_pct',
             'roll_md_save_pct': 'md_save_pct',
-            'roll_block_rate': 'block_rate'
+            'roll_block_rate': 'block_rate',
+            'roll_pressure_rate': 'pressure_rate',
+            'roll_dzone_clearance_rate': 'dzone_clearance_rate'
         }
         
         base_col = base_col_map.get(col, col.replace('roll_', '').replace('roll3_', '').replace('roll20_', ''))
@@ -1323,7 +1354,7 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     df = df.sort_values(['team_id', 'mp_game_date'])
 
     grp = df.groupby('team_id')
-    for c in ['xgf', 'xga', 'pens', 'goals_for', 'rush_attempts_for']:
+    for c in ['xgf', 'xga', 'pens', 'goals_for', 'rush_attempts_for', 'avg_dist', 'avg_angle']:
         # Standard 10-game rolling
         df[f'roll_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
 
@@ -1579,7 +1610,7 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
     Y_all = jnp.array(df[['goals_home', 'goals_away']].values)
 
     # Validation Split: percent of games 
-    val_size = int(len(X_all) * 0.10)
+    val_size = int(len(X_all) * 0.01)
     train_size = len(X_all) - val_size
     
     # Shuffle before split
