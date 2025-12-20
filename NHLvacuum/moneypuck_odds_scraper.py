@@ -803,9 +803,9 @@ def update_unique_game_ids(season: str) -> str:
     logger.info(f"Updating unique game IDs for season {season}...")
 
     # Use game_list.py logic to scrape and save
-    df = scrape_season_game_ids(start_year)
+    # scrape_season_game_ids now returns (dataframe, filename)
+    df, output_file = scrape_season_game_ids(start_year)
 
-    output_file = f"unique_game_ids_{season}.csv"
     logger.info(f"Updated {output_file} with {len(df)} games")
 
     return output_file
@@ -1157,53 +1157,52 @@ if __name__ == '__main__':
         logger.info("=" * 60)
         exit(0)
 
-    # Regular season mode - find all available season files
-    season_files = sorted(glob.glob("unique_game_ids_20*.csv"))
-
-    if not season_files:
-        logger.error("No unique_game_ids CSV files found in current directory")
-        exit(1)
-
-    # Filter for seasons 2023-24 onwards (when MoneyPuck started including this data)
-    valid_seasons = []
-    for file in season_files:
-        # Extract season from filename (e.g., "unique_game_ids_2023-24.csv")
-        filename = Path(file).stem
-        if '_full' in filename or '_missing' in filename:
-            continue  # Skip the _full and _missing variants
-
-        # Extract year from filename
-        season_part = filename.replace('unique_game_ids_', '')
-
-        # Only process 2023-24 and later
-        if season_part >= '2023-24':
-            valid_seasons.append((season_part, file))
-
-    if not valid_seasons:
-        logger.error("No valid season files found (2023-24 or later)")
-        exit(1)
-
-    # If specific season requested, filter to just that one
+    # Regular season mode - determine which seasons to scrape
     if args.season:
-        valid_seasons = [s for s in valid_seasons if s[0] == args.season]
-        if not valid_seasons:
-            logger.error(f"Season file not found: unique_game_ids_{args.season}.csv")
+        # Specific season requested
+        seasons_to_scrape = [args.season]
+    else:
+        # Find all existing season files to determine available seasons
+        season_files = sorted(glob.glob("unique_game_ids_20*.csv"))
+
+        if not season_files:
+            logger.error("No unique_game_ids CSV files found. Please specify a season with --season")
+            exit(1)
+
+        # Extract season strings from filenames
+        seasons_to_scrape = []
+        for file in season_files:
+            filename = Path(file).stem
+            if '_full' in filename or '_missing' in filename:
+                continue  # Skip variants
+
+            season_part = filename.replace('unique_game_ids_', '')
+            # Only process 2023-24 and later (when MoneyPuck started including this data)
+            if season_part >= '2023-24':
+                seasons_to_scrape.append(season_part)
+
+        if not seasons_to_scrape:
+            logger.error("No valid season files found (2023-24 or later)")
             exit(1)
 
     logger.info("=" * 60)
-    logger.info(f"Found {len(valid_seasons)} season(s) to scrape:")
-    for season, file in valid_seasons:
-        logger.info(f"  - {season}: {file}")
+    logger.info(f"Found {len(seasons_to_scrape)} season(s) to scrape:")
+    for season in seasons_to_scrape:
+        logger.info(f"  - {season}")
     logger.info("=" * 60)
 
     # Scrape each season
-    for season, input_file in valid_seasons:
-        output_file = f"moneypuck_odds_{season}.csv"
-
+    for season in seasons_to_scrape:
         logger.info("")
         logger.info("=" * 60)
         logger.info(f"STARTING SEASON: {season}")
         logger.info("=" * 60)
+
+        # Always update unique_game_ids file first to ensure fresh data
+        logger.info(f"Updating unique_game_ids for {season}...")
+        input_file = update_unique_game_ids(season)
+
+        output_file = f"moneypuck_odds_{season}.csv"
 
         scrape_season(
             csv_file=input_file,
