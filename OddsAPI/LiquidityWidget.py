@@ -7,15 +7,213 @@ Professional PyQt6 widget for viewing ProphetX exchange order books
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
-    QSplitter, QFrame, QComboBox, QHeaderView
+    QSplitter, QFrame, QComboBox, QHeaderView, QGraphicsOpacityEffect,
+    QStackedWidget
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF
+from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QLinearGradient, QRadialGradient, QPainterPath
 import json
+import math
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 import ProphetXQuery
+
+
+class OrderBookLoadingOverlay(QWidget):
+    """
+    Animated loading overlay for orderbook widget.
+    Features a sophisticated scanning/pulsing effect with particle-like elements.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setStyleSheet("background: transparent;")
+
+        # Animation state
+        self.scan_offset = 0.0
+        self.pulse_phase = 0.0
+        self.particle_phase = 0.0
+        self.glow_intensity = 0.0
+
+        # Fake orderbook rows for skeleton effect
+        self.skeleton_rows = 12
+
+        # Timer for animation (~60fps)
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(self._updateAnimation)
+
+        # Status text
+        self.status_text = "Fetching live orderbook..."
+
+    def start(self, status_text: str = "Fetching live orderbook..."):
+        """Start the loading animation"""
+        self.status_text = status_text
+        self.scan_offset = 0.0
+        self.pulse_phase = 0.0
+        self.show()
+        self.raise_()
+        self.animation_timer.start(16)  # ~60fps
+
+    def stop(self):
+        """Stop the loading animation"""
+        self.animation_timer.stop()
+        self.hide()
+
+    def _updateAnimation(self):
+        """Update animation state each frame"""
+        self.scan_offset = (self.scan_offset + 3) % (self.height() + 100)
+        self.pulse_phase = (self.pulse_phase + 0.08) % (2 * math.pi)
+        self.particle_phase = (self.particle_phase + 0.03) % (2 * math.pi)
+        self.glow_intensity = 0.5 + 0.5 * math.sin(self.pulse_phase)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+
+        # Semi-transparent dark background
+        painter.fillRect(self.rect(), QColor(13, 15, 20, 230))
+
+        # Draw skeleton orderbook rows
+        self._drawSkeletonRows(painter, w, h)
+
+        # Draw scanning line effect
+        self._drawScanLine(painter, w, h)
+
+        # Draw central glow orb
+        self._drawGlowOrb(painter, w, h)
+
+        # Draw status text
+        self._drawStatusText(painter, w, h)
+
+        # Draw floating particles
+        self._drawParticles(painter, w, h)
+
+    def _drawSkeletonRows(self, painter: QPainter, w: int, h: int):
+        """Draw faint skeleton orderbook rows that pulse"""
+        row_height = 28
+        start_y = 60  # Below header area
+
+        for i in range(self.skeleton_rows):
+            y = start_y + i * row_height
+            if y > h - 40:
+                break
+
+            # Alternating bid/ask colors with pulse
+            phase_offset = i * 0.3
+            alpha = int(20 + 15 * math.sin(self.pulse_phase + phase_offset))
+
+            if i < self.skeleton_rows // 2:
+                # Ask side (red tint)
+                color = QColor(248, 113, 113, alpha)
+            else:
+                # Bid side (green tint)
+                color = QColor(52, 211, 153, alpha)
+
+            # Draw row background
+            painter.fillRect(10, y, w - 20, row_height - 2, color)
+
+            # Draw fake content bars
+            bar_alpha = int(30 + 20 * math.sin(self.pulse_phase + phase_offset + 0.5))
+            painter.fillRect(15, y + 8, 50, 12, QColor(255, 255, 255, bar_alpha))
+            painter.fillRect(75, y + 8, 80, 12, QColor(255, 255, 255, bar_alpha))
+            painter.fillRect(w - 70, y + 8, 50, 12, QColor(255, 255, 255, bar_alpha))
+
+    def _drawScanLine(self, painter: QPainter, w: int, h: int):
+        """Draw animated scanning line that sweeps down"""
+        scan_y = self.scan_offset
+
+        # Create gradient for scan line
+        gradient = QLinearGradient(0, scan_y - 50, 0, scan_y + 50)
+        gradient.setColorAt(0.0, QColor(74, 158, 255, 0))
+        gradient.setColorAt(0.4, QColor(74, 158, 255, 100))
+        gradient.setColorAt(0.5, QColor(74, 158, 255, 200))
+        gradient.setColorAt(0.6, QColor(74, 158, 255, 100))
+        gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
+
+        painter.fillRect(0, int(scan_y - 50), w, 100, gradient)
+
+        # Bright center line
+        painter.setPen(QPen(QColor(74, 158, 255, 255), 2))
+        painter.drawLine(0, int(scan_y), w, int(scan_y))
+
+    def _drawGlowOrb(self, painter: QPainter, w: int, h: int):
+        """Draw central pulsing glow orb"""
+        center_x, center_y = w // 2, h // 2
+
+        # Outer glow
+        outer_radius = 60 + 20 * self.glow_intensity
+        gradient = QRadialGradient(center_x, center_y, outer_radius)
+        gradient.setColorAt(0.0, QColor(74, 158, 255, int(80 * self.glow_intensity)))
+        gradient.setColorAt(0.5, QColor(74, 158, 255, int(40 * self.glow_intensity)))
+        gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
+
+        painter.setBrush(gradient)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPointF(center_x, center_y), outer_radius, outer_radius)
+
+        # Inner bright core
+        inner_radius = 8 + 4 * self.glow_intensity
+        gradient2 = QRadialGradient(center_x, center_y, inner_radius)
+        gradient2.setColorAt(0.0, QColor(255, 255, 255, 255))
+        gradient2.setColorAt(0.5, QColor(74, 158, 255, 200))
+        gradient2.setColorAt(1.0, QColor(74, 158, 255, 0))
+
+        painter.setBrush(gradient2)
+        painter.drawEllipse(QPointF(center_x, center_y), inner_radius, inner_radius)
+
+        # Rotating arc around the orb
+        arc_radius = 30 + 10 * self.glow_intensity
+        painter.setPen(QPen(QColor(74, 158, 255, 180), 3))
+        arc_angle = int(self.pulse_phase * 180 / math.pi * 2) % 360
+        painter.drawArc(
+            int(center_x - arc_radius), int(center_y - arc_radius),
+            int(arc_radius * 2), int(arc_radius * 2),
+            arc_angle * 16, 90 * 16
+        )
+
+    def _drawStatusText(self, painter: QPainter, w: int, h: int):
+        """Draw status text below the glow orb"""
+        font = QFont("SF Mono", 11, QFont.Weight.DemiBold)
+        painter.setFont(font)
+
+        # Pulsing text alpha
+        text_alpha = int(180 + 75 * math.sin(self.pulse_phase))
+        painter.setPen(QColor(200, 210, 220, text_alpha))
+
+        text_rect = QRectF(0, h // 2 + 50, w, 30)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self.status_text)
+
+        # Animated dots
+        dots = "." * (1 + int(self.pulse_phase / (math.pi / 2)) % 4)
+        dots_rect = QRectF(0, h // 2 + 75, w, 20)
+        painter.drawText(dots_rect, Qt.AlignmentFlag.AlignCenter, dots)
+
+    def _drawParticles(self, painter: QPainter, w: int, h: int):
+        """Draw floating particle effects"""
+        center_x, center_y = w // 2, h // 2
+        num_particles = 8
+
+        for i in range(num_particles):
+            angle = (2 * math.pi * i / num_particles) + self.particle_phase
+            radius = 80 + 20 * math.sin(self.particle_phase * 2 + i)
+
+            px = center_x + radius * math.cos(angle)
+            py = center_y + radius * math.sin(angle)
+
+            # Particle glow
+            particle_alpha = int(100 + 50 * math.sin(self.particle_phase + i * 0.5))
+            gradient = QRadialGradient(px, py, 8)
+            gradient.setColorAt(0.0, QColor(74, 158, 255, particle_alpha))
+            gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
+
+            painter.setBrush(gradient)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(px, py), 8, 8)
 
 
 class OrderBookWidget(QWidget):
@@ -29,7 +227,32 @@ class OrderBookWidget(QWidget):
         self.current_market = None
         self.current_line = None
         self.compact_mode = compact_mode
+        self.is_loading = False
         self.initUI()
+        self._setupLoadingOverlay()
+
+    def _setupLoadingOverlay(self):
+        """Setup the loading overlay widget"""
+        self.loading_overlay = OrderBookLoadingOverlay(self)
+        self.loading_overlay.hide()
+        self.loading_overlay.setGeometry(self.rect())
+
+    def resizeEvent(self, event):
+        """Ensure loading overlay stays the right size"""
+        super().resizeEvent(event)
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.setGeometry(self.rect())
+
+    def showLoading(self, status_text: str = "Fetching live orderbook..."):
+        """Show the loading overlay with animation"""
+        self.is_loading = True
+        self.loading_overlay.setGeometry(self.rect())
+        self.loading_overlay.start(status_text)
+
+    def hideLoading(self):
+        """Hide the loading overlay"""
+        self.is_loading = False
+        self.loading_overlay.stop()
 
     def initUI(self):
         layout = QVBoxLayout(self)
@@ -553,6 +776,13 @@ class ProphetXBrowser(QWidget):
     # Signal emitted when user selects an event (emits event_id)
     event_selected = pyqtSignal(int)
 
+    # Signal emitted on startup to request fresh data fetch (emits nothing)
+    # Connect this to trigger a full ProphetX scrape
+    refresh_all_requested = pyqtSignal()
+
+    # Signal emitted when loading state changes (emits is_loading bool)
+    loading_state_changed = pyqtSignal(bool)
+
     def __init__(self, parent=None, compact_mode=False):
         super().__init__(parent)
         self.all_events = {}
@@ -560,6 +790,8 @@ class ProphetXBrowser(QWidget):
         self.current_event_data = None
         self.current_event_id = None
         self.compact_mode = compact_mode
+        self._initial_load_complete = False
+        self._pending_fresh_fetch = False
         self.initUI()
 
     def initUI(self):
@@ -582,8 +814,10 @@ class ProphetXBrowser(QWidget):
             bottom_panel = self.createEventBrowserPanel()
             main_layout.addWidget(bottom_panel, 1)  # Give less space to event list
 
-        # Auto-load latest data if available
-        self.loadLatestData()
+        # Don't auto-load stale data - instead request fresh fetch
+        # The parent widget should connect to refresh_all_requested and trigger a fresh scrape
+        # For now, load stale data as fallback but mark as pending refresh
+        self._loadInitialData()
 
     def createOrderBookPanel(self):
         """Create top panel with event header, market selector and order book"""
@@ -799,8 +1033,105 @@ class ProphetXBrowser(QWidget):
         panel.setStyleSheet("background-color: #0d0f14;")
         return panel
 
+    def _loadInitialData(self):
+        """
+        Initial data load on startup.
+        Shows loading animation and requests fresh data fetch.
+        Falls back to stale JSON if available while waiting.
+        """
+        # Show loading state immediately
+        self.showLoading("Initializing ProphetX...")
+        self._pending_fresh_fetch = True
+
+        # Load stale data as fallback (populates event list but orderbook stays in loading)
+        self._loadStaleDataAsFallback()
+
+        # Request fresh data fetch - parent widget should connect to this signal
+        # Use a short delay to let the UI settle before emitting
+        QTimer.singleShot(100, self._requestFreshData)
+
+    def _requestFreshData(self):
+        """Emit signal to request fresh data fetch"""
+        self.refresh_all_requested.emit()
+
+    def _loadStaleDataAsFallback(self):
+        """Load stale JSON data to populate event list (but don't populate orderbook yet)"""
+        dump_dir = Path.cwd() / "prophetx_dumps"
+        if not dump_dir.exists():
+            return
+
+        # Find latest combined data file
+        combined_files = list(dump_dir.glob("all_markets_combined_*.json"))
+        if not combined_files:
+            return
+
+        latest_file = max(combined_files, key=lambda p: p.stat().st_mtime)
+        self._loadDataFromFileWithoutOrderbook(latest_file)
+
+    def _loadDataFromFileWithoutOrderbook(self, filepath: Path):
+        """Load ProphetX data from JSON file but don't populate orderbook (it's loading)"""
+        try:
+            with open(filepath, 'r') as f:
+                self.all_events = json.load(f)
+
+            # Only populate the event list, not the orderbook
+            self._populateEventListOnly()
+
+        except Exception as e:
+            print(f"Error loading fallback data: {e}")
+
+    def _populateEventListOnly(self):
+        """Populate only the event selector/list without touching the orderbook"""
+        self.filtered_events = []
+
+        for event_id, event_data in self.all_events.items():
+            metadata = event_data.get('event_metadata', {})
+
+            event_name = metadata.get('name', 'Unknown Event')
+            sport = metadata.get('sport', 'Unknown')
+            stake = metadata.get('stake', 0)
+            tournament = metadata.get('tournament', '')
+
+            display_text = f"{event_name}\n{sport}"
+            if tournament:
+                display_text += f" • {tournament}"
+            display_text += f" • ${stake:,.0f} volume"
+
+            self.filtered_events.append({
+                'id': event_id,
+                'metadata': metadata,
+                'data': event_data,
+                'display': display_text
+            })
+
+        # Sort by stake/volume
+        self.filtered_events.sort(key=lambda x: x['metadata'].get('stake', 0), reverse=True)
+
+        # Update UI based on mode
+        if self.compact_mode:
+            self.refreshCompactEventCombo()
+        else:
+            self.refreshEventList()
+            total_events = len(self.filtered_events)
+            total_stake = sum(e['metadata'].get('stake', 0) for e in self.filtered_events)
+            self.stats_label.setText(f"{total_events} events • ${total_stake:,.0f} total volume")
+
+    def showLoading(self, status_text: str = "Fetching live orderbook..."):
+        """Show loading animation on the orderbook"""
+        if hasattr(self, 'orderbook'):
+            self.orderbook.showLoading(status_text)
+        self.loading_state_changed.emit(True)
+
+    def hideLoading(self):
+        """Hide loading animation on the orderbook"""
+        if hasattr(self, 'orderbook'):
+            self.orderbook.hideLoading()
+        self._pending_fresh_fetch = False
+        self._initial_load_complete = True
+        self.loading_state_changed.emit(False)
+
     def loadLatestData(self):
-        """Load the most recent ProphetX data dump"""
+        """Load the most recent ProphetX data dump (legacy method for compatibility)"""
         dump_dir = Path.cwd() / "prophetx_dumps"
         if not dump_dir.exists():
             return
@@ -908,16 +1239,23 @@ class ProphetXBrowser(QWidget):
         if not event:
             return
 
-        self.current_event_data = event['data']
         metadata = event['metadata']
-        self.current_event_id = metadata.get('id')
+        new_event_id = metadata.get('id')
+
+        # Show loading when selecting a different event
+        if new_event_id != self.current_event_id:
+            event_name = metadata.get('name', 'event')
+            self.showLoading(f"Fetching {event_name}...")
+
+        self.current_event_data = event['data']
+        self.current_event_id = new_event_id
 
         # Emit signal for external listeners (e.g., worker to refresh data)
         if self.current_event_id:
             self.event_selected.emit(self.current_event_id)
 
-        # Populate market selector
-        self.populateMarketSelector()
+        # Don't populate market selector yet - wait for fresh data
+        # The updateEventMarkets method will be called when fresh data arrives
 
     def filterEvents(self):
         """Filter events based on search text"""
@@ -945,8 +1283,16 @@ class ProphetXBrowser(QWidget):
     def onEventSelected(self, item: QListWidgetItem):
         """Handle event selection in full mode"""
         event = item.data(Qt.ItemDataRole.UserRole)
-        self.current_event_data = event['data']
         metadata = event['metadata']
+        new_event_id = metadata.get('id')
+
+        # Show loading when selecting a different event
+        if new_event_id != self.current_event_id:
+            event_name = metadata.get('name', 'event')
+            self.showLoading(f"Fetching {event_name}...")
+
+        self.current_event_data = event['data']
+        self.current_event_id = new_event_id
 
         # Update header
         event_name = metadata.get('name', 'Unknown Event')
@@ -958,8 +1304,12 @@ class ProphetXBrowser(QWidget):
 
         self.event_header.setText(event_name)
 
-        # Populate market selector
-        self.populateMarketSelector()
+        # Emit signal for external listeners (e.g., worker to refresh data)
+        if self.current_event_id:
+            self.event_selected.emit(self.current_event_id)
+
+        # Don't populate market selector yet - wait for fresh data
+        # The updateEventMarkets method will be called when fresh data arrives
 
     def populateMarketSelector(self):
         """Populate market selector - SORTED BY ACTIVE ORDERBOOK LIQUIDITY (highest to lowest)"""
@@ -1043,22 +1393,59 @@ class ProphetXBrowser(QWidget):
     def updateEventMarkets(self, markets_data: Dict):
         """
         Update the current event with fresh markets data from async worker.
+        This is called when fresh data arrives - hides loading and displays fresh orderbook.
 
         Args:
             markets_data: Fresh markets data from ProphetXQueryAsync
         """
-        if not markets_data or not self.current_event_id:
+        if not markets_data:
+            # Data fetch failed - hide loading but show error state
+            self.hideLoading()
             return
 
-        # Update the stored data
-        if self.current_event_id in self.all_events:
-            self.all_events[self.current_event_id] = markets_data
+        # If no event is selected yet, this might be the initial load
+        # In that case, also update the event list with fresh data
+        if not self.current_event_id:
+            # This is fresh data for potentially multiple events
+            # Update all_events if we received a full dump
+            if isinstance(markets_data, dict) and 'data' not in markets_data:
+                # This looks like a full events dump
+                self.all_events = markets_data
+                self._populateEventListOnly()
+            self.hideLoading()
+            return
+
+        # Store currently selected market name to restore after refresh
+        current_market_name = None
+        current_index = self.market_combo.currentIndex()
+        if current_index >= 0:
+            current_market = self.market_combo.itemData(current_index)
+            if current_market:
+                current_market_name = current_market.get('name')
+
+        # Update the stored data for this event
+        event_id_str = str(self.current_event_id)
+        if event_id_str in self.all_events:
+            self.all_events[event_id_str] = markets_data
+        else:
+            self.all_events[event_id_str] = markets_data
 
         # Update current event data
         self.current_event_data = markets_data
 
         # Refresh the market selector and orderbook display
         self.populateMarketSelector()
+
+        # Restore previously selected market if it still exists
+        if current_market_name:
+            for i in range(self.market_combo.count()):
+                market = self.market_combo.itemData(i)
+                if market and market.get('name') == current_market_name:
+                    self.market_combo.setCurrentIndex(i)
+                    break
+
+        # Hide loading animation - fresh data is now displayed
+        self.hideLoading()
 
     def refreshData(self):
         """Refresh data from ProphetX API"""

@@ -770,6 +770,9 @@ class ModernOddsWindow(QMainWindow):
         # Connect widget's event selection to worker
         self.liquidity_widget.event_selected.connect(self.on_prophetx_event_selected)
 
+        # Connect widget's refresh all request to trigger initial fresh fetch
+        self.liquidity_widget.refresh_all_requested.connect(self.on_prophetx_refresh_all_requested)
+
         # Start worker thread (this will start the periodic refresh timer)
         self.prophetx_worker_thread.started.connect(self.prophetx_worker.start)
         self.prophetx_worker_thread.start()
@@ -882,6 +885,9 @@ class ModernOddsWindow(QMainWindow):
         # Update splits data when league changes
         if hasattr(self, 'best_lines_widget'):
             self.best_lines_widget.set_sport(sport_key)
+
+        # Historical odds widget is self-contained and handles its own sport selection
+
         return
 
     def handle_region_change(self, region):
@@ -1405,14 +1411,8 @@ class ModernOddsWindow(QMainWindow):
         if visible:
             self.history_toggle_button.setText("Hide Historical Odds ▲")
 
-            # Load Kalshi events when widget becomes visible (only if not already loaded)
-            if hasattr(self.historical_odds_widget, 'event_selector'):
-                if self.historical_odds_widget.event_selector.count() == 0:
-                    # Load ALL Kalshi sports events
-                    print(f"Loading all Kalshi events...")
-
-                    # Load events asynchronously (passing None loads all sports)
-                    asyncio.create_task(self.historical_odds_widget.load_kalshi_events(sport=None))
+            # Historical odds widget handles its own sport selection
+            # No need to load events here - widget is self-contained
         else:
             self.history_toggle_button.setText("Show Historical Odds ▼")
 
@@ -2029,6 +2029,55 @@ class ModernOddsWindow(QMainWindow):
         # Update the worker's current event (this will trigger immediate fetch via signal)
         self.prophetx_worker.set_event(event_id)
 
+    @qasync.asyncSlot()
+    async def on_prophetx_refresh_all_requested(self):
+        """
+        Handle request for fresh ProphetX data on startup.
+        Triggers a full async scrape of all ProphetX markets.
+        """
+        print("ProphetX refresh all requested - starting fresh scrape...")
+        self.liquidity_widget.showLoading("Scraping ProphetX markets...")
+
+        try:
+            # Import the async scraping function
+            from prophetx_async import FetchAllEventsAsync
+
+            # Fetch all events fresh
+            all_markets = await FetchAllEventsAsync(save_combined=True)
+
+            if all_markets:
+                # Update the widget with fresh data
+                self.liquidity_widget.all_events = all_markets
+                self.liquidity_widget._populateEventListOnly()
+
+                # Auto-select the first event if available
+                if self.liquidity_widget.filtered_events:
+                    first_event = self.liquidity_widget.filtered_events[0]
+                    event_id = first_event['metadata'].get('id')
+                    if event_id:
+                        # Set the combo box to first event (will trigger event selection)
+                        self.liquidity_widget.event_combo.setCurrentIndex(0)
+                else:
+                    self.liquidity_widget.hideLoading()
+
+                print(f"ProphetX fresh scrape complete: {len(all_markets)} events")
+            else:
+                print("ProphetX fresh scrape returned no data")
+                self.liquidity_widget.hideLoading()
+
+        except ImportError as e:
+            # FetchAllEventsAsync might not exist, fall back to selecting first event from stale data
+            print(f"FetchAllEventsAsync not available ({e}), using stale data...")
+            if self.liquidity_widget.filtered_events:
+                self.liquidity_widget.event_combo.setCurrentIndex(0)
+            else:
+                self.liquidity_widget.hideLoading()
+
+        except Exception as e:
+            print(f"Error during ProphetX refresh: {e}")
+            traceback.print_exc()
+            self.liquidity_widget.hideLoading()
+
     @qasync.asyncSlot(int)
     async def fetch_prophetx_event(self, event_id: int):
         """Fetch ProphetX event data asynchronously in main thread"""
@@ -2052,6 +2101,9 @@ class ModernOddsWindow(QMainWindow):
     def handle_prophetx_error(self, error_message):
         """Handle errors from ProphetX worker"""
         print(f"ProphetX error: {error_message}")
+        # Hide loading on error so user isn't stuck with loading animation
+        if hasattr(self, 'liquidity_widget'):
+            self.liquidity_widget.hideLoading()
 
     def handle_prophetx_status(self, status_message):
         """Handle status updates from ProphetX worker"""
