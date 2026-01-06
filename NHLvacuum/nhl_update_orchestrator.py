@@ -805,8 +805,9 @@ class NHLUpdateOrchestrator:
             temp_players_file = None
 
         # Download (this refreshes the files)
+        # Use conservative thread counts to avoid rate limiting
         moneypuck_downloader.download_team_data(teams, output_dir, max_workers=4, skip_existing=False)
-        goalie_404s = moneypuck_downloader.download_player_data(players_dict, output_dir, max_workers=8, skip_existing=False)
+        goalie_404s = moneypuck_downloader.download_player_data(players_dict, output_dir, max_workers=3, skip_existing=False)
         
         # Update master file with any newly discovered goalies
         if goalie_404s:

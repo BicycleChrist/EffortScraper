@@ -10,10 +10,12 @@ import csv
 import os
 import shutil
 import pandas as pd
+import zipfile
 from pathlib import Path
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from collections import deque
 
 # MoneyPuck URL templates
 MP_TEAM_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/teams/{team}.csv"
@@ -22,6 +24,40 @@ MP_GOALIE_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/r
 
 # Output directory
 OUTPUT_DIR = Path("moneypuck_data")
+
+
+class RateLimiter:
+    """Global rate limiter to control request frequency across all threads"""
+
+    def __init__(self, requests_per_second: float = 5.0):
+        """
+        Initialize rate limiter
+
+        Args:
+            requests_per_second: Maximum number of requests per second (default: 5.0)
+        """
+        self.min_interval = 1.0 / requests_per_second  # Minimum time between requests
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        """Wait if necessary to respect rate limit"""
+        with self.lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+
+            if time_since_last < self.min_interval:
+                sleep_time = self.min_interval - time_since_last
+                time.sleep(sleep_time)
+
+            self.last_request_time = time.time()
+
+
+# Global rate limiter instance
+# Conservative 5 req/sec default to avoid overwhelming MoneyPuck servers
+# If you still experience rate limiting, reduce to 3.0 or lower
+# If no issues occur, you can cautiously increase to 8.0-10.0
+_rate_limiter = RateLimiter(requests_per_second=5.0)
 
 
 def download_file(url: str, output_path: Path, description: str = "", max_retries: int = 3, skip_existing: bool = False) -> tuple[bool, int]:
@@ -45,6 +81,9 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
 
     for attempt in range(max_retries):
         try:
+            # Apply global rate limiting before making request
+            _rate_limiter.wait()
+
             response = requests.get(url, timeout=30)
 
             # Handle rate limiting (429) or server errors (5xx)
@@ -237,13 +276,11 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
             url_old = MP_TEAM_URL.format(team=old_abbr)
             output_path_old = team_dir / f"{old_abbr}_temp.csv"
             result_old, _ = download_file(url_old, output_path_old, f"{team} (historical: {old_abbr})", skip_existing=skip_existing)
-            time.sleep(0.1)
 
             # Download NEW abbreviation file (smaller file: 2020-current)
             url_new = MP_TEAM_URL.format(team=new_abbr)
             output_path_new = team_dir / f"{new_abbr}_temp.csv"
             result_new, _ = download_file(url_new, output_path_new, f"{team} (recent: {new_abbr})", skip_existing=skip_existing)
-            time.sleep(0.1)
 
             # Both files needed for concatenation
             if result_old and result_new:
@@ -255,7 +292,6 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
             url = MP_TEAM_URL.format(team=team)
             output_path = team_dir / f"{team}.csv"
             result, _ = download_file(url, output_path, f"{team} team data", skip_existing=skip_existing)
-            time.sleep(0.1)
             return result, team
 
     # Use ThreadPoolExecutor for parallel downloads
@@ -320,10 +356,10 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
         output_path = skater_dir / f"{player_id}.csv"
 
         result, status_code = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
-        time.sleep(0.05)  # Small delay to avoid overwhelming server
         return result, player_id, status_code
 
-    # Use ThreadPoolExecutor for parallel downloads
+    # First pass: Download with normal concurrency
+    failed_skaters = []  # Track failed downloads for retry
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(download_skater, player): player for player in skaters}
 
@@ -339,10 +375,32 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
                     # Track 404s - these are likely goalies
                     if status_code == 404:
                         not_found_players.add(player_id)
+                    else:
+                        # Non-404 failures go to retry queue (rate limiting, timeouts, etc.)
+                        failed_skaters.append(futures[future])
 
                 # Show progress every 50 downloads
                 if completed % 50 == 0:
                     print(f"Progress: {completed}/{len(skaters)} skaters processed...")
+
+    # Retry failed downloads with reduced concurrency (single-threaded)
+    if failed_skaters:
+        print(f"\n⟳ Retrying {len(failed_skaters)} failed downloads with reduced concurrency...")
+        retry_success = 0
+        retry_failed = 0
+
+        for player_data in failed_skaters:
+            success, player_id, status_code = download_skater(player_data)
+            if success:
+                retry_success += 1
+                success_count += 1
+                failed_count -= 1
+            else:
+                retry_failed += 1
+                if status_code == 404:
+                    not_found_players.add(player_id)
+
+        print(f"⟳ Retry results: {retry_success} succeeded, {retry_failed} still failed")
 
     print(f"\nSkater Data: {success_count} succeeded, {failed_count} failed")
     if not_found_players:
@@ -359,37 +417,97 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
     success_count = 0
     failed_count = 0
 
-    def download_goalie(player_data: Tuple[str, str]) -> Tuple[bool, str]:
+    def download_goalie(player_data: Tuple[str, str]) -> Tuple[bool, str, str]:
         """Download a single goalie's data"""
         player_id, name = player_data
         url = MP_GOALIE_URL.format(player_id=player_id)
         output_path = goalie_dir / f"{player_id}.csv"
 
-        result, _ = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
-        time.sleep(0.05)  # Small delay to avoid overwhelming server
-        return result, name
+        result, status_code = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
+        return result, player_id, name
 
-    # Use ThreadPoolExecutor for parallel downloads
+    # First pass: Download with normal concurrency
+    failed_goalies = []  # Track failed downloads for retry
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(download_goalie, player): player for player in goalies}
 
         completed = 0
         for future in as_completed(futures):
-            success, name = future.result()
+            success, player_id, name = future.result()
             with lock:
                 completed += 1
                 if success:
                     success_count += 1
                 else:
                     failed_count += 1
+                    # Add to retry queue (non-404 failures)
+                    failed_goalies.append(futures[future])
 
                 # Show progress every 10 downloads (fewer goalies typically)
                 if completed % 10 == 0:
                     print(f"Progress: {completed}/{len(goalies)} goalies processed...")
 
+    # Retry failed downloads with reduced concurrency (single-threaded)
+    if failed_goalies:
+        print(f"\n⟳ Retrying {len(failed_goalies)} failed goalie downloads with reduced concurrency...")
+        retry_success = 0
+        retry_failed = 0
+
+        for player_data in failed_goalies:
+            success, player_id, name = download_goalie(player_data)
+            if success:
+                retry_success += 1
+                success_count += 1
+                failed_count -= 1
+            else:
+                retry_failed += 1
+
+        print(f"⟳ Retry results: {retry_success} succeeded, {retry_failed} still failed")
+
     print(f"\nGoalie Data: {success_count} succeeded, {failed_count} failed")
 
     return not_found_players
+
+
+def download_shots_data(season: int, output_dir: Path) -> bool:
+    """Download and extract MoneyPuck shots data for a specific season
+
+    Args:
+        season: Season year (e.g., 2025 for 2025-26 season)
+        output_dir: Directory to save the extracted CSV
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    print(f"\n{'='*60}")
+    print(f"Downloading Shots Data for {season}-{season+1} season")
+    print(f"{'='*60}\n")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    url = f"https://peter-tanner.com/moneypuck/downloads/shots_{season}.zip"
+    zip_path = output_dir / f"shots_{season}.zip"
+
+    try:
+        # Download the ZIP file
+        success, _ = download_file(url, zip_path, f"shots_{season}.zip")
+        if not success:
+            print(f"✗ Failed to download shots data for {season}")
+            return False
+
+        # Extract the CSV directly to output_dir (overwrites existing file)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(output_dir)
+
+        # Remove the ZIP file after extraction
+        zip_path.unlink()
+
+        print(f"✓ Extracted shots data to {output_dir}")
+        return True
+
+    except Exception as e:
+        print(f"✗ Error processing shots data: {e}")
+        return False
 
 
 def update_player_ids_with_goalies(player_ids_file: str, goalie_ids: Set[str]) -> int:
@@ -458,9 +576,11 @@ def main():
     """Main entry point"""
     import argparse
 
-    # Get CPU count for default thread count (cpu_count - 1)
+    # Get CPU count for default thread count
+    # Use conservative defaults to avoid rate limiting: 3 for players, 4 for teams
     cpu_count = os.cpu_count() or 1
-    default_threads = max(1, cpu_count - 1)
+    default_player_threads = min(3, cpu_count)  # Conservative: max 3 threads for players
+    default_team_threads = min(4, cpu_count)    # Teams are less restrictive
 
     parser = argparse.ArgumentParser(description='Download MoneyPuck game-by-game data')
     parser.add_argument('--teams-only', action='store_true', help='Download only team data')
@@ -468,8 +588,8 @@ def main():
     parser.add_argument('--limit', type=int, help='Limit number of players to download (for testing)')
     parser.add_argument('--output', type=str, default='moneypuck_data', help='Output directory')
     parser.add_argument('--db', type=str, default='nhl_analytics.db', help='Database path')
-    parser.add_argument('--threads', type=int, default=default_threads, help=f'Number of concurrent download threads (default: {default_threads})')
-    parser.add_argument('--team-threads', type=int, default=default_threads, help=f'Number of threads for team downloads (default: {default_threads})')
+    parser.add_argument('--threads', type=int, default=default_player_threads, help=f'Number of concurrent download threads for players (default: {default_player_threads}, reduced to avoid rate limiting)')
+    parser.add_argument('--team-threads', type=int, default=default_team_threads, help=f'Number of threads for team downloads (default: {default_team_threads})')
     parser.add_argument('--use-cache', action='store_true', help='Skip downloading files that already exist (use for testing only)')
 
     args = parser.parse_args()
