@@ -2055,8 +2055,10 @@ class ModernOddsWindow(QMainWindow):
                     first_event = self.liquidity_widget.filtered_events[0]
                     event_id = first_event['metadata'].get('id')
                     if event_id:
-                        # Set the combo box to first event (will trigger event selection)
+                        # Set combo to first event and manually trigger selection
+                        # (setCurrentIndex alone may not fire signal if index is already 0)
                         self.liquidity_widget.event_combo.setCurrentIndex(0)
+                        self.liquidity_widget.onCompactEventSelected(0)
                 else:
                     self.liquidity_widget.hideLoading()
 
@@ -2147,22 +2149,27 @@ class ModernOddsWindow(QMainWindow):
 
 
 
-async def main():
+def main():
     app = QApplication([])
 
+    # Create qasync event loop FIRST, before any async operations
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
     window = ModernOddsWindow()
-    await window.initialize()
+
+    # Run initialization within the qasync event loop
+    loop.run_until_complete(window.initialize())
+
     window.show()
 
     app.dumpObjectTree()
     app.dumpObjectInfo()
 
-    loop = qasync.QEventLoop(app)
-    asyncio.set_event_loop(loop) # not necessary?
-    loop.run_forever() # Run event loop
-    return
+    # Run the event loop (handles both Qt and asyncio)
+    with loop:
+        loop.run_forever()
 
 
 if __name__ == "__main__":
-
-    asyncio.run(main(), debug=False)
+    main()
