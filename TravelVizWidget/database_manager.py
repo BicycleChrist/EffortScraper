@@ -88,7 +88,8 @@ class DatabaseManager:
     """Manages SQLite database for multi-league sports schedule and travel data"""
     
     def __init__(self, db_path: str = "sports_data.db"):
-        self.db_path = Path(db_path)
+        # Store as absolute path string for thread-safe database access
+        self.db_path = str(Path(db_path).absolute())
         self.db_version = "2.0"  # Updated for multi-league support
         self.setup_logging()
         self.init_database()
@@ -101,8 +102,11 @@ class DatabaseManager:
     def init_database(self):
         """Initialize database with required tables and indexes"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute("PRAGMA foreign_keys = ON")
+                # Enable WAL mode for better concurrent read/write performance
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
                 
                 # Metadata table for tracking data freshness and versions
                 conn.execute("""
@@ -735,7 +739,7 @@ class DatabaseManager:
                 stats['travel_by_league'] = league_travel
                 
                 # Database size
-                stats['db_size_mb'] = self.db_path.stat().st_size / (1024 * 1024)
+                stats['db_size_mb'] = Path(self.db_path).stat().st_size / (1024 * 1024)
                 
                 # Latest data
                 cursor = conn.execute("SELECT MAX(last_updated) FROM season_cache")

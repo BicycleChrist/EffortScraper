@@ -20,7 +20,9 @@ from data_client import (ESPNSportsDataAggregator, TeamTravelData, TeamInfo,
 from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
 from upcoming_games_overlay import UpcomingGamesOverlay
-
+from weather_overlay import WeatherOverlay
+from live_flight_tracker import RealTimeFlightTracker, DirectFlightTracker
+from venue_tooltip import VenueTooltip
 
 class ConfigLoader:
     """Load API configuration from files"""
@@ -85,11 +87,17 @@ class SportsTrackerMainWindow(QMainWindow):
         self.current_league = "NHL"  # If Default league is not in season, UI will hang
         self.current_season = str(datetime.now().year)
 
+        # Live flight tracker
+        self.flight_tracker = None
+        self.direct_tracker = None
+        self.live_tracking_active = False
+
         # Setup UI
         self.setup_ui()
         self.setup_menu()
         self.setup_status_bar()
         self.setup_sports_system()
+        self.setup_live_flight_tracker()
         self.connect_signals()
 
         # Sync dropdown and Default league
@@ -179,6 +187,17 @@ class SportsTrackerMainWindow(QMainWindow):
         self.games_overlay.setFixedHeight(300)
         self.games_overlay.move(0, 10)  # Initial position at top-left of globe
         self.games_overlay.raise_()  # Ensure it's on top
+
+        # Weather overlay (positioned on right side of globe)
+        self.weather_overlay = WeatherOverlay(self.globe_widget)
+        self.weather_overlay.setFixedHeight(350)
+        self.weather_overlay.move(self.globe_widget.width() - 30, 10)
+        self.weather_overlay.raise_()
+        self.weather_overlay.venueSelected.connect(self.on_weather_venue_selected)
+        self.weather_overlay.visibilityChanged.connect(self.on_weather_overlay_toggled)
+
+        # Venue tooltip for marker clicks
+        self.venue_tooltip = VenueTooltip(self)
 
         # Set splitter proportions (30% control panel, 70% globe)
         splitter.setSizes([400, 1500])
@@ -330,6 +349,290 @@ class SportsTrackerMainWindow(QMainWindow):
         # Give control panel access to aggregator for distance calculations
         self.control_panel.aggregator = self.sports_aggregator
 
+    def setup_live_flight_tracker(self):
+        """Setup the real-time flight tracking system"""
+        if not self.sports_aggregator:
+            print("⚠️  Cannot setup flight tracker - sports aggregator not initialized")
+            return
+
+        api_keys = self.config_loader.get_api_keys()
+
+        try:
+            # Create the flight tracker with the database from sports_aggregator
+            self.flight_tracker = RealTimeFlightTracker(
+                db=self.sports_aggregator.db,
+                api_keys=api_keys,
+                league=self.current_league
+            )
+
+            # Connect tracker signals to handlers
+            self.flight_tracker.flightDetected.connect(self.on_flight_detected)
+            self.flight_tracker.flightUpdated.connect(self.on_flight_updated)
+            self.flight_tracker.flightLanded.connect(self.on_flight_landed)
+            self.flight_tracker.statusUpdate.connect(self.on_tracker_status)
+
+            print("✅ Live flight tracker initialized")
+
+        except Exception as e:
+            print(f"⚠️  Failed to initialize flight tracker: {e}")
+            self.flight_tracker = None
+
+        # Setup direct flight tracker (for tail number/callsign tracking)
+        try:
+            from PyQt6.QtCore import Qt
+            self.direct_tracker = DirectFlightTracker()
+            # Use QueuedConnection to ensure signals from worker thread are processed in main thread
+            self.direct_tracker.flightFound.connect(
+                self.on_direct_flight_found, Qt.ConnectionType.QueuedConnection)
+            self.direct_tracker.flightUpdated.connect(
+                self.on_direct_flight_updated, Qt.ConnectionType.QueuedConnection)
+            self.direct_tracker.flightLost.connect(
+                self.on_direct_flight_lost, Qt.ConnectionType.QueuedConnection)
+            self.direct_tracker.statusUpdate.connect(
+                self.on_tracker_status, Qt.ConnectionType.QueuedConnection)
+            print("✅ Direct flight tracker initialized")
+        except Exception as e:
+            print(f"⚠️  Failed to initialize direct flight tracker: {e}")
+            import traceback
+            traceback.print_exc()
+            self.direct_tracker = None
+
+    def start_live_tracking(self):
+        """Start the live flight tracking"""
+        if not self.flight_tracker:
+            self.status_bar.showMessage("Flight tracker not available", 3000)
+            return
+
+        if self.live_tracking_active:
+            self.status_bar.showMessage("Live tracking already active", 3000)
+            return
+
+        # Clear any previously displayed flights
+        self.globe_widget.clear_live_flights()
+
+        # Update tracker league if it changed
+        if self.flight_tracker.league != self.current_league:
+            self.flight_tracker.set_league(self.current_league)
+
+        # Start the tracker immediately - API check happens in background thread
+        self.flight_tracker.start()
+        self.live_tracking_active = True
+        self.status_bar.showMessage(f"🛫 Starting {self.current_league} flight tracking...", 3000)
+
+        # Update menu action state
+        if hasattr(self, 'start_tracking_action'):
+            self.start_tracking_action.setEnabled(False)
+        if hasattr(self, 'stop_tracking_action'):
+            self.stop_tracking_action.setEnabled(True)
+
+    def stop_live_tracking(self):
+        """Stop the live flight tracking"""
+        if not self.flight_tracker or not self.live_tracking_active:
+            return
+
+        self.flight_tracker.stop()
+        self.flight_tracker.wait()  # Wait for thread to finish
+        self.live_tracking_active = False
+
+        # Clear live flights from globe
+        self.globe_widget.clear_live_flights()
+
+        self.status_bar.showMessage("🛑 Live flight tracking stopped", 3000)
+
+        # Update menu action state
+        if hasattr(self, 'start_tracking_action'):
+            self.start_tracking_action.setEnabled(True)
+        if hasattr(self, 'stop_tracking_action'):
+            self.stop_tracking_action.setEnabled(False)
+
+    def on_flight_detected(self, flight_data: dict):
+        """Handle newly detected flight"""
+        self.globe_widget.add_live_flight(flight_data)
+
+        # Show notification in status bar
+        team_id = flight_data.get('team_id', 'Unknown')
+        callsign = flight_data.get('callsign', flight_data['icao24'])
+        confidence = flight_data.get('confidence', 0)
+        self.status_bar.showMessage(
+            f"✈️ New flight: {team_id} - {callsign} ({confidence}% confidence)", 5000
+        )
+
+    def on_flight_updated(self, flight_data: dict):
+        """Handle flight position update"""
+        self.globe_widget.update_live_flight(flight_data)
+
+    def on_flight_landed(self, icao24: str):
+        """Handle flight landing/disappearing"""
+        self.globe_widget.remove_live_flight(icao24)
+
+    def on_tracker_status(self, message: str):
+        """Handle status updates from tracker"""
+        # Show in status bar (brief messages)
+        self.status_bar.showMessage(message, 3000)
+
+    def on_direct_flight_found(self, flight_data: dict):
+        """Handle aircraft found by direct tracker"""
+        self.globe_widget.add_live_flight(flight_data)
+        label = flight_data.get('label', flight_data.get('registration', 'Unknown'))
+        self.status_bar.showMessage(f"🎯 Found: {label}", 5000)
+
+    def on_direct_flight_updated(self, flight_data: dict):
+        """Handle position update from direct tracker"""
+        self.globe_widget.update_live_flight(flight_data)
+
+    def on_direct_flight_lost(self, identifier: str):
+        """Handle aircraft lost by direct tracker"""
+        self.globe_widget.remove_live_flight(identifier)
+
+    def show_track_aircraft_dialog(self):
+        """Show dialog to add aircraft to tracking watchlist"""
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QComboBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Track Aircraft")
+        dialog.setMinimumWidth(350)
+
+        layout = QFormLayout(dialog)
+
+        # Identifier input
+        identifier_input = QLineEdit()
+        identifier_input.setPlaceholderText("e.g., N801DM, DAL123, a801dm")
+        layout.addRow("Identifier:", identifier_input)
+
+        # Type selector
+        type_combo = QComboBox()
+        type_combo.addItem("Callsign (e.g., SWA2294, DAL123)", "callsign")
+        type_combo.addItem("Tail Number (e.g., N801DM, N8882Q)", "registration")
+        type_combo.addItem("ICAO24 Hex (e.g., ac3e3a)", "hex")
+        layout.addRow("Type:", type_combo)
+
+        # Auto-detect type based on input
+        def auto_detect_type():
+            text = identifier_input.text().strip().upper()
+            if not text:
+                return
+            # Tail numbers start with N (US) or C- (Canada) followed by numbers/letters
+            if text.startswith('N') and len(text) >= 5 and text[1:2].isdigit():
+                type_combo.setCurrentIndex(1)  # Registration
+            # Hex codes are 6 chars, all hex digits
+            elif len(text) == 6 and all(c in '0123456789ABCDEF' for c in text):
+                type_combo.setCurrentIndex(2)  # Hex
+            # Otherwise assume callsign (airline code + number)
+            elif any(c.isdigit() for c in text) and any(c.isalpha() for c in text):
+                type_combo.setCurrentIndex(0)  # Callsign
+
+        identifier_input.textChanged.connect(auto_detect_type)
+
+        # Label input
+        label_input = QLineEdit()
+        label_input.setPlaceholderText("e.g., Mavericks Charter (optional)")
+        layout.addRow("Label:", label_input)
+
+        # Team association (optional)
+        team_combo = QComboBox()
+        team_combo.addItem("None", "")
+        for team in sorted(self.all_teams, key=lambda t: t.display_name):
+            team_combo.addItem(f"{team.display_name} ({team.abbreviation})", team.team_id)
+        layout.addRow("Team:", team_combo)
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            identifier = identifier_input.text().strip()
+            if not identifier:
+                QMessageBox.warning(self, "Error", "Please enter an identifier")
+                return
+
+            identifier_type = type_combo.currentData()
+            label = label_input.text().strip() or identifier
+            team_id = team_combo.currentData() or None
+
+            if self.direct_tracker:
+                self.direct_tracker.add_to_watchlist(
+                    identifier=identifier,
+                    identifier_type=identifier_type,
+                    label=label,
+                    team_id=team_id
+                )
+
+                # Start tracking if not already running
+                if not self.direct_tracker.isRunning():
+                    self.direct_tracker.start()
+                    self.status_bar.showMessage(f"🎯 Started tracking: {label}", 3000)
+                else:
+                    self.status_bar.showMessage(f"🎯 Added to watchlist: {label}", 3000)
+            else:
+                QMessageBox.warning(self, "Error", "Direct flight tracker not available")
+
+    def show_watchlist_dialog(self):
+        """Show current watchlist and allow management"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QDialogButtonBox, QListWidgetItem
+
+        if not self.direct_tracker:
+            QMessageBox.warning(self, "Error", "Direct flight tracker not available")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Flight Watchlist")
+        dialog.setMinimumWidth(400)
+        dialog.setMinimumHeight(300)
+
+        layout = QVBoxLayout(dialog)
+
+        # List widget
+        list_widget = QListWidget()
+
+        watchlist = self.direct_tracker.get_watchlist()
+        if not watchlist:
+            item = QListWidgetItem("No aircraft in watchlist")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            list_widget.addItem(item)
+        else:
+            for entry in watchlist:
+                status = "✈️ ACTIVE" if entry['is_active'] else "📡 Searching"
+                team_str = f" [{entry['team_id']}]" if entry['team_id'] else ""
+                item_text = f"{status} {entry['label']}{team_str}\n   {entry['type']}: {entry['identifier']}"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.ItemDataRole.UserRole, entry['identifier'])
+                list_widget.addItem(item)
+
+        layout.addWidget(list_widget)
+
+        # Buttons
+        buttons = QDialogButtonBox()
+        remove_btn = buttons.addButton("Remove Selected", QDialogButtonBox.ButtonRole.ActionRole)
+        clear_btn = buttons.addButton("Clear All", QDialogButtonBox.ButtonRole.DestructiveRole)
+        close_btn = buttons.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+
+        def remove_selected():
+            current = list_widget.currentItem()
+            if current:
+                identifier = current.data(Qt.ItemDataRole.UserRole)
+                if identifier:
+                    self.direct_tracker.remove_from_watchlist(identifier)
+                    list_widget.takeItem(list_widget.row(current))
+
+        def clear_all():
+            self.direct_tracker.clear_watchlist()
+            self.globe_widget.clear_live_flights()
+            list_widget.clear()
+            item = QListWidgetItem("No aircraft in watchlist")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            list_widget.addItem(item)
+
+        remove_btn.clicked.connect(remove_selected)
+        clear_btn.clicked.connect(clear_all)
+        close_btn.clicked.connect(dialog.reject)
+
+        layout.addWidget(buttons)
+        dialog.exec()
+
     def connect_signals(self):
         """Connect UI signals"""
         # Season controls
@@ -347,6 +650,7 @@ class SportsTrackerMainWindow(QMainWindow):
 
         # Globe widget signals
         self.globe_widget.locationSelected.connect(self.on_location_selected)
+        self.globe_widget.markerClicked.connect(self.on_marker_clicked)
 
         # Animation Signals
         self.globe_widget.animationStatusChanged.connect(self.on_animation_status_changed)
@@ -466,6 +770,12 @@ class SportsTrackerMainWindow(QMainWindow):
         # Update sports aggregator
         if self.sports_aggregator:
             self.sports_aggregator.set_league(league)
+
+        # Update flight tracker league
+        if self.flight_tracker:
+            self.flight_tracker.set_league(league)
+            # Clear current flights when switching leagues
+            self.globe_widget.clear_live_flights()
 
         # Update UI elements
         self.league_status_label.setText(league)
@@ -633,6 +943,10 @@ class SportsTrackerMainWindow(QMainWindow):
         self.season_status_label.setText(f"Today: {game_count} games ({leagues_str})")
         print(f"Displaying {game_count} games today across {leagues_str}")
         print(f"Created {len(stacked_markers)} markers with league context")
+
+        # Populate weather overlay with today's game venues
+        if hasattr(self, 'weather_overlay'):
+            self.update_weather_venues()  # No season = use today's games
 
 
     def synchronize_league_state(self):
@@ -883,10 +1197,69 @@ class SportsTrackerMainWindow(QMainWindow):
             if hasattr(self, 'games_overlay'):
                 self.update_overlay_games()
 
+            # Update weather overlay with venue data
+            if hasattr(self, 'weather_overlay'):
+                self.update_weather_venues(season)
+
         self.load_full_season_btn.setEnabled(True)
         self.load_full_season_btn.setText("Load Full Season")
         self.load_current_week_btn.setEnabled(True)
         self.load_current_week_btn.setText("Current Week")
+
+    def update_weather_venues(self, season: str = None):
+        """Update weather overlay with unique venue data from current games"""
+        print(f"🌤️ update_weather_venues called with season={season}")
+
+        if not hasattr(self, 'weather_overlay') or not self.sports_aggregator:
+            print("❌ update_weather_venues: missing weather_overlay or sports_aggregator")
+            return
+
+        venues_seen = set()
+        venues = []
+        cutoff_date = datetime.now() + timedelta(days=7)
+
+        if season:
+            # Load from specific season
+            db = self.sports_aggregator.db
+            games = db.load_games(season, self.current_league)
+            upcoming = [g for g in games if datetime.now() <= g.date <= cutoff_date]
+            print(f"   Found {len(upcoming)} upcoming games in season {season}")
+        else:
+            # Use today's games from all leagues (startup mode)
+            todays_games = self.get_todays_games()
+            upcoming = [g['game'] for g in todays_games]
+            print(f"   Using {len(upcoming)} today's games for weather venues")
+
+        # Extract unique venues from games
+        for game in upcoming:
+            venue = game.venue
+            venue_id = venue.venue_id
+
+            if venue_id in venues_seen:
+                continue
+            venues_seen.add(venue_id)
+
+            # Use venue's coordinates directly if available, otherwise try globe lookup
+            if venue.latitude and venue.longitude:
+                venues.append({
+                    'id': venue_id,
+                    'name': f"{venue.name} ({venue.city})",
+                    'lat': venue.latitude,
+                    'lon': venue.longitude
+                })
+            else:
+                # Fallback to globe widget's city data
+                coords = self.globe_widget.get_city_coordinates(venue.city)
+                if coords:
+                    venues.append({
+                        'id': venue_id,
+                        'name': f"{venue.name} ({venue.city})",
+                        'lat': coords[0],
+                        'lon': coords[1]
+                    })
+
+        print(f"   Passing {len(venues)} venues to weather overlay")
+        self.weather_overlay.load_venues(venues[:10])  # Limit to 10 venues
 
     def force_refresh_season_data(self):
         """Force refresh current season data"""
@@ -1034,7 +1407,8 @@ class SportsTrackerMainWindow(QMainWindow):
         # Data menu
         data_menu = menubar.addMenu("Data")
         animation_menu = menubar.addMenu("Animation")
-        league_menu = menubar.addMenu("League")  # New league menu
+        tracking_menu = menubar.addMenu("Live Tracking")
+        league_menu = menubar.addMenu("League")
 
         # League selection actions
         mlb_action = QAction("Switch to MLB", self)
@@ -1064,6 +1438,36 @@ class SportsTrackerMainWindow(QMainWindow):
         stop_animation_action.setShortcut("Esc")
         stop_animation_action.triggered.connect(self.globe_widget.stop_team_animation)
         animation_menu.addAction(stop_animation_action)
+
+        # Live tracking actions
+        self.start_tracking_action = QAction("Start Live Tracking", self)
+        self.start_tracking_action.setShortcut("Ctrl+T")
+        self.start_tracking_action.triggered.connect(self.start_live_tracking)
+        tracking_menu.addAction(self.start_tracking_action)
+
+        self.stop_tracking_action = QAction("Stop Live Tracking", self)
+        self.stop_tracking_action.setShortcut("Ctrl+Shift+T")
+        self.stop_tracking_action.triggered.connect(self.stop_live_tracking)
+        self.stop_tracking_action.setEnabled(False)  # Disabled until tracking starts
+        tracking_menu.addAction(self.stop_tracking_action)
+
+        tracking_menu.addSeparator()
+
+        # Direct flight tracking (by tail number, callsign, etc.)
+        track_aircraft_action = QAction("Track Aircraft...", self)
+        track_aircraft_action.setShortcut("Ctrl+F")
+        track_aircraft_action.triggered.connect(self.show_track_aircraft_dialog)
+        tracking_menu.addAction(track_aircraft_action)
+
+        show_watchlist_action = QAction("Show Watchlist", self)
+        show_watchlist_action.triggered.connect(self.show_watchlist_dialog)
+        tracking_menu.addAction(show_watchlist_action)
+
+        tracking_menu.addSeparator()
+
+        clear_flights_action = QAction("Clear All Flights", self)
+        clear_flights_action.triggered.connect(self.globe_widget.clear_live_flights)
+        tracking_menu.addAction(clear_flights_action)
 
         # Season data actions
         load_season_action = QAction("Load Full Season", self)
@@ -1104,6 +1508,16 @@ class SportsTrackerMainWindow(QMainWindow):
         cities_action.setChecked(True)
         cities_action.triggered.connect(self.toggle_team_cities)
         view_menu.addAction(cities_action)
+
+        view_menu.addSeparator()
+
+        day_night_action = QAction("Day/Night Cycle", self)
+        day_night_action.setCheckable(True)
+        day_night_action.setChecked(False)
+        day_night_action.triggered.connect(self.toggle_day_night)
+        view_menu.addAction(day_night_action)
+
+        view_menu.addSeparator()
 
         reset_view_action = QAction("Reset View", self)
         reset_view_action.setShortcut("R")
@@ -1186,7 +1600,7 @@ class SportsTrackerMainWindow(QMainWindow):
         # Update globe widget
         self.globe_widget.load_flight_data(travel_data)
 
-        # NEW: Update control panel with travel data
+        # Update control panel with travel data
         self.control_panel.update_travel_data(travel_data)
 
         # Update status
@@ -1239,6 +1653,20 @@ class SportsTrackerMainWindow(QMainWindow):
         """Handle location selection on globe"""
         self.status_bar.showMessage(f"Location: {location_name} ({lat:.2f}, {lon:.2f})", 5000)
 
+    def on_marker_clicked(self, marker_id: str, marker_data: dict):
+        """Handle marker click on globe - show venue tooltip"""
+        # Get cursor position for tooltip placement
+        cursor_pos = self.globe_widget.mapToGlobal(self.globe_widget.mapFromGlobal(
+            self.globe_widget.cursor().pos()
+        ))
+
+        # Show tooltip with marker info
+        self.venue_tooltip.show_marker(marker_data, cursor_pos)
+
+        # Update status bar
+        city = marker_data.get('city_name', marker_data.get('city', ''))
+        self.status_bar.showMessage(f"Selected: {marker_id} - {city}", 3000)
+
     def toggle_travel_paths(self, checked: bool):
         """Toggle travel path display"""
         current_options = (checked, True, True, True)  # paths, cities, schedule, labels
@@ -1248,6 +1676,29 @@ class SportsTrackerMainWindow(QMainWindow):
         """Toggle team cities display"""
         current_options = (True, checked, True, True)
         self.globe_widget.set_display_options(*current_options)
+
+    def toggle_day_night(self, checked: bool):
+        """Toggle day/night cycle visualization"""
+        self.globe_widget.show_day_night = checked
+        self.globe_widget.update()
+
+    def on_weather_venue_selected(self, lat: float, lon: float, venue_name: str):
+        """Handle venue selection from weather overlay - center globe on venue"""
+        self.globe_widget.center_on_location(lat, lon)
+        self.status_bar.showMessage(f"Centered on {venue_name}", 3000)
+
+    def on_weather_overlay_toggled(self, is_expanded: bool):
+        """Reposition weather overlay when it expands/collapses"""
+        if not hasattr(self, 'weather_overlay') or not hasattr(self, 'globe_widget'):
+            return
+
+        globe_width = self.globe_widget.width()
+        overlay_width = self.weather_overlay.width()
+
+        # Position so right edge aligns with globe right edge
+        new_x = globe_width - overlay_width
+        self.weather_overlay.move(new_x, 10)
+        print(f"🌤️ Weather overlay repositioned: expanded={is_expanded}, x={new_x}, width={overlay_width}")
 
     def export_travel_data(self):
         """Export current travel data"""
@@ -1291,6 +1742,36 @@ class SportsTrackerMainWindow(QMainWindow):
         QMessageBox.about(self, "Giving it my all, maximum effort",
                          "travelViz, an Effort Odds widget"
                          )
+
+    def resizeEvent(self, event):
+        """Handle window resize - reposition overlays"""
+        super().resizeEvent(event)
+
+        # Reposition weather overlay to right side of globe
+        if hasattr(self, 'weather_overlay') and hasattr(self, 'globe_widget'):
+            globe_width = self.globe_widget.width()
+            overlay_width = self.weather_overlay.width()
+            self.weather_overlay.move(globe_width - overlay_width, 10)
+
+    def closeEvent(self, event):
+        """Handle window close - cleanup resources"""
+        # Stop flight tracker if running
+        if self.flight_tracker and self.live_tracking_active:
+            print("🛑 Stopping flight tracker on exit...")
+            self.flight_tracker.stop()
+            self.flight_tracker.wait(5000)  # Wait up to 5 seconds
+
+        # Stop direct flight tracker if running
+        if hasattr(self, 'direct_tracker') and self.direct_tracker and self.direct_tracker.isRunning():
+            print("🛑 Stopping direct flight tracker on exit...")
+            self.direct_tracker.stop()
+            self.direct_tracker.wait(5000)
+
+        # Clean up weather overlay
+        if hasattr(self, 'weather_overlay'):
+            self.weather_overlay.cleanup()
+
+        event.accept()
 
 
 def main():

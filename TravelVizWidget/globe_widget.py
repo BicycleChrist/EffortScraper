@@ -31,16 +31,13 @@ class TeamTravelAnimation:
     
     def build_team_sequence(self, team_id: str, travel_data: List, season_start: datetime = None) -> Dict:
         """Build chronological travel sequence for a team"""
-        if season_start is None:
-            season_start = datetime(datetime.now().year, 3, 1)
-        
-        today = datetime.now()
-        
+        # NOTE: travel_data is already filtered by season when loaded from the database
+        # We don't need additional date filtering here - just filter by team
+
         # Filter and sort team travel by date
-        team_travel = [t for t in travel_data 
-                      if hasattr(t, 'team_id') and t.team_id.upper() == team_id.upper() 
-                      and hasattr(t, 'travel_date') and t.travel_date
-                      and season_start <= t.travel_date <= today]
+        team_travel = [t for t in travel_data
+                      if hasattr(t, 'team_id') and t.team_id.upper() == team_id.upper()
+                      and hasattr(t, 'travel_date') and t.travel_date]
         
         team_travel.sort(key=lambda x: x.travel_date)
         
@@ -87,8 +84,8 @@ class TeamTravelAnimation:
             'total_distance': total_distance,
             'total_duration': total_duration,
             'games_count': len(segments),
-            'season_start': season_start,
-            'last_update': today
+            'season_start': season_start if season_start else (team_travel[0].travel_date if team_travel else None),
+            'last_update': datetime.now()
         }
         
         self.team_sequences[team_id] = sequence
@@ -261,6 +258,49 @@ class TeamTravelAnimation:
         return path_points
 
 
+class ContrailManager:
+    """Manages contrail/wake effects behind animated planes"""
+
+    def __init__(self, max_points: int = 150, max_age: float = 2.5):
+        self.position_history = []  # List of (position_tuple, timestamp)
+        self.max_points = max_points
+        self.max_age = max_age
+
+    def add_position(self, position: tuple, current_time: float):
+        """Add new position to contrail history"""
+        if not position or len(position) != 3:
+            return
+
+        self.position_history.append((position, current_time))
+
+        # Remove expired points (older than max_age)
+        cutoff_time = current_time - self.max_age
+        self.position_history = [
+            (pos, t) for pos, t in self.position_history
+            if t > cutoff_time
+        ][-self.max_points:]
+
+    def get_render_data(self, current_time: float):
+        """Get vertex data for rendering: [x, y, z, age] per point"""
+        if not self.position_history:
+            return None
+
+        data = []
+        for pos, timestamp in self.position_history:
+            age = current_time - timestamp
+            data.extend([pos[0], pos[1], pos[2], age])
+
+        return np.array(data, dtype=np.float32)
+
+    def clear(self):
+        """Clear contrail history"""
+        self.position_history.clear()
+
+    def has_data(self) -> bool:
+        """Check if there's contrail data to render"""
+        return len(self.position_history) > 0
+
+
 class FlightGlobeWidget(QOpenGLWidget):
     """3D Globe Widget for sports team travel visualization - Simplified"""
     
@@ -269,6 +309,7 @@ class FlightGlobeWidget(QOpenGLWidget):
     flightSelected = pyqtSignal(str)
     animationStatusChanged = pyqtSignal(bool, str)
     animationProgressChanged = pyqtSignal(float, dict)
+    markerClicked = pyqtSignal(str, dict)  # marker_id, marker_data
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -325,7 +366,10 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.travel_data = []
         self.travel_paths = []
         self.team_city_markers = []
-        
+
+        # Live flight tracking
+        self.live_flights = {}  # icao24 -> flight_data dict
+
         # Team travel animation system (Required by UI)
         self.travel_animation = TeamTravelAnimation(self)
         self.animated_marker_position = None
@@ -340,7 +384,14 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.show_travel_paths = True
         self.show_team_cities = True
         self.show_atmosphere = True
-        
+        self.show_day_night = False  # Default to original shadow rendering
+        self.terminator_width = 0.1
+
+        # Contrail system
+        self.contrail_manager = ContrailManager()
+        self.contrail_shader = None
+        self.show_contrails = True
+
         # OpenGL state tracking
         self.gl_initialized = False
         
@@ -537,10 +588,23 @@ class FlightGlobeWidget(QOpenGLWidget):
         else:
             print("❌ Failed to load Airplane shader files")
             self.airplane_shader = None
-        
 
+        # Contrail shader
+        contrail_vertex = self.load_shader_from_file(shader_dir / "contrail.vert")
+        contrail_fragment = self.load_shader_from_file(shader_dir / "contrail.frag")
 
-
+        if contrail_vertex and contrail_fragment:
+            self.contrail_shader = QOpenGLShaderProgram()
+            self.contrail_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, contrail_vertex)
+            self.contrail_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, contrail_fragment)
+            if not self.contrail_shader.link():
+                print("❌ Failed to link Contrail shader")
+                self.contrail_shader = None
+            else:
+                print("✅ Contrail shader linked successfully")
+        else:
+            print("⚠️  Contrail shader files not found (optional feature)")
+            self.contrail_shader = None
 
     def setup_earth_texture(self):
         """Load Earth texture"""
@@ -952,16 +1016,16 @@ class FlightGlobeWidget(QOpenGLWidget):
     def refresh_todays_games(self):
         """Refresh today's games display - can be called from UI"""
         self.display_todays_games_startup()
-    
+
     # Main Data Loading and Visualization
     def load_flight_data(self, travel_data: List):
         """Load sports team travel data"""
         self.travel_data = travel_data
         self.generate_enhanced_visualizations()
-        
+
         # Add today's games as split cube markers
         self.display_todays_games_startup()
-        
+
         self.update()
     
     def generate_enhanced_visualizations(self):
@@ -1233,8 +1297,15 @@ class FlightGlobeWidget(QOpenGLWidget):
             if animation_state:
                 self.animated_marker_position = animation_state
                 self.animationProgressChanged.emit(animation_state['progress'], animation_state['segment'])
+                # Feed position to contrail manager
+                if self.show_contrails and animation_state.get('position'):
+                    self.contrail_manager.add_position(animation_state['position'], self.animation_time)
             else:
                 self.animated_marker_position = None
+        else:
+            # Clear contrails when animation stops
+            if self.contrail_manager.has_data():
+                self.contrail_manager.clear()
         
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
@@ -1255,35 +1326,190 @@ class FlightGlobeWidget(QOpenGLWidget):
         normal_matrix = model.normalMatrix()
         
         self.render_earth(mvp, model, normal_matrix)
-        
+
+        # Render travel visualization
         if self.show_travel_paths:
             self.render_travel_paths(mvp)
-        
+
         if self.show_team_cities:
             self.render_markers(mvp, model)
-    
+
+        # Render contrails behind animated planes
+        if self.show_contrails and self.show_travel_animation:
+            self.render_contrails(mvp)
+
+        # Render live flights (always on top)
+        if self.live_flights:
+            self.render_live_flights(mvp)
+            # Render 2D labels for live flights
+            self.render_flight_labels(mvp)
+
+    def render_flight_labels(self, mvp: QMatrix4x4):
+        """Render 2D team labels above live flight planes"""
+        if not self.live_flights:
+            return
+
+        from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush
+        from PyQt6.QtCore import Qt, QPoint
+
+        # Begin QPainter for 2D overlay
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Font setup
+        label_font = QFont("Arial", 10, QFont.Weight.Bold)
+        painter.setFont(label_font)
+
+        for icao24, flight_data in self.live_flights.items():
+            try:
+                lat = flight_data['latitude']
+                lon = flight_data['longitude']
+                altitude_ft = flight_data.get('altitude_ft', 35000)
+                team_id = flight_data.get('team_id')
+                confidence = flight_data.get('confidence', 50)
+                aircraft_type = flight_data.get('aircraft_type', '')
+
+                if not team_id:
+                    continue  # Skip flights without team assignment
+
+                # Convert to 3D position (same as render_live_flights)
+                altitude_scale = 1.0 + (altitude_ft / 40000.0) * 0.12
+                pos_3d = self.lat_lon_to_3d(lat, lon, altitude_scale + 0.02)  # Slightly above plane
+
+                # Project 3D to 2D screen coordinates
+                screen_pos = self.project_to_screen(pos_3d, mvp)
+                if screen_pos is None:
+                    continue
+
+                x, y = screen_pos
+
+                # Skip if off-screen
+                if x < 0 or x > self.width() or y < 0 or y > self.height():
+                    continue
+
+                # Get team color
+                team_color = self.get_team_color(team_id.upper())
+                qcolor = QColor(int(team_color[0]*255), int(team_color[1]*255), int(team_color[2]*255))
+
+                # Draw background pill
+                label_text = f"{team_id.upper()}"
+                conf_text = f"{confidence}%"
+
+                metrics = painter.fontMetrics()
+                text_width = metrics.horizontalAdvance(label_text)
+                text_height = metrics.height()
+
+                pill_width = text_width + 16
+                pill_height = text_height + 8
+                pill_x = int(x - pill_width / 2)
+                pill_y = int(y - pill_height - 10)  # Above the plane
+
+                # Background
+                painter.setPen(QPen(qcolor.darker(150), 2))
+                painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+                painter.drawRoundedRect(pill_x, pill_y, pill_width, pill_height, 4, 4)
+
+                # Team text
+                painter.setPen(QPen(qcolor))
+                painter.drawText(pill_x + 8, pill_y + text_height, label_text)
+
+                # Confidence below (smaller)
+                small_font = QFont("Arial", 8)
+                painter.setFont(small_font)
+                conf_color = QColor(100, 255, 100) if confidence >= 80 else QColor(255, 200, 100)
+                painter.setPen(QPen(conf_color))
+                painter.drawText(int(x - 15), int(y + 5), conf_text)
+                painter.setFont(label_font)  # Reset font
+
+            except Exception as e:
+                continue
+
+        painter.end()
+
+    def project_to_screen(self, pos_3d: tuple, mvp: QMatrix4x4) -> tuple:
+        """Project 3D world position to 2D screen coordinates"""
+        from PyQt6.QtGui import QVector4D
+
+        # Convert to homogeneous coordinates
+        pos_4d = QVector4D(pos_3d[0], pos_3d[1], pos_3d[2], 1.0)
+
+        # Apply MVP transformation
+        clip = mvp * pos_4d
+
+        # Check if behind camera
+        if clip.w() <= 0:
+            return None
+
+        # Perspective divide to get NDC
+        ndc_x = clip.x() / clip.w()
+        ndc_y = clip.y() / clip.w()
+        ndc_z = clip.z() / clip.w()
+
+        # Check if in front of camera (NDC z should be in [-1, 1])
+        if ndc_z < -1 or ndc_z > 1:
+            return None
+
+        # Convert NDC to screen coordinates
+        screen_x = (ndc_x + 1) * 0.5 * self.width()
+        screen_y = (1 - ndc_y) * 0.5 * self.height()  # Y is flipped
+
+        return (screen_x, screen_y)
+
+    def calculate_sun_direction(self) -> QVector3D:
+        """Calculate sun direction based on current UTC time for day/night cycle"""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        day_of_year = now.timetuple().tm_yday
+        hour = now.hour + now.minute / 60.0 + now.second / 3600.0
+
+        # Solar declination angle (varies -23.45 to +23.45 degrees over the year)
+        declination = -23.45 * math.cos(math.radians(360.0 / 365.0 * (day_of_year + 10)))
+
+        # Hour angle: sun moves 15 degrees per hour, solar noon at 0 degrees longitude
+        hour_angle = (hour - 12) * 15
+
+        # Convert to 3D direction vector
+        dec_rad = math.radians(declination)
+        ha_rad = math.radians(hour_angle)
+
+        # Sun direction in world coordinates (Y-up coordinate system)
+        x = math.cos(dec_rad) * math.cos(ha_rad)
+        y = math.sin(dec_rad)
+        z = -math.cos(dec_rad) * math.sin(ha_rad)
+
+        return QVector3D(x, y, z).normalized()
+
     def render_earth(self, mvp, model, normal_matrix):
-        """Render Earth sphere"""
+        """Render Earth sphere with day/night cycle"""
         if not self.shader_program or not self.vao:
             return
-        
+
         self.shader_program.bind()
-        
+
         self.shader_program.setUniformValue("mvp", mvp)
         self.shader_program.setUniformValue("model", model)
         self.shader_program.setUniformValue("normalMatrix", normal_matrix)
-        
+
+        # Day/night cycle uniforms
+        self.shader_program.setUniformValue("showDayNight", self.show_day_night)
+        if self.show_day_night:
+            sun_dir = self.calculate_sun_direction()
+            self.shader_program.setUniformValue("sunDirection", sun_dir)
+            self.shader_program.setUniformValue("terminatorWidth", self.terminator_width)
+
+        # Fallback light direction for non-day/night mode
         light_direction = QVector3D(1.0, 0.3, 0.5).normalized()
         self.shader_program.setUniformValue("lightDir", light_direction)
         self.shader_program.setUniformValue("showAtmosphere", self.show_atmosphere)
-        
+
         if self.earth_texture:
             self.earth_texture.bind(0)
             self.shader_program.setUniformValue("earthTexture", 0)
-        
+
         gl.glBindVertexArray(self.vao)
         gl.glDrawElements(gl.GL_TRIANGLES, len(self.indices), gl.GL_UNSIGNED_INT, None)
-        
+
         self.shader_program.release()
     
     def render_travel_paths(self, mvp):
@@ -1327,7 +1553,54 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         self.travel_shader.release()
         gl.glDisable(gl.GL_LINE_SMOOTH)
-    
+
+    def render_contrails(self, mvp):
+        """Render contrail/wake effects behind animated planes"""
+        if not self.show_contrails or not self.contrail_shader:
+            return
+        if not self.contrail_manager.has_data():
+            return
+
+        data = self.contrail_manager.get_render_data(self.animation_time)
+        if data is None or len(data) == 0:
+            return
+
+        # Setup blending for additive glow effect
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE)
+        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+        gl.glDisable(gl.GL_DEPTH_TEST)  # Contrails visible through globe
+
+        self.contrail_shader.bind()
+        self.contrail_shader.setUniformValue("mvp", mvp)
+        self.contrail_shader.setUniformValue("maxAge", self.contrail_manager.max_age)
+        self.contrail_shader.setUniformValue("contrailColor", QVector3D(0.85, 0.9, 1.0))
+
+        # Create dynamic VAO/VBO for contrail points
+        vao = gl.glGenVertexArrays(1)
+        vbo = gl.glGenBuffers(1)
+
+        gl.glBindVertexArray(vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_DYNAMIC_DRAW)
+
+        stride = 4 * 4  # 4 floats per vertex (x, y, z, age)
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(0))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 1, gl.GL_FLOAT, gl.GL_FALSE, stride, gl.GLvoidp(12))
+
+        gl.glDrawArrays(gl.GL_POINTS, 0, len(data) // 4)
+
+        # Cleanup
+        gl.glDeleteBuffers(1, [vbo])
+        gl.glDeleteVertexArrays(1, [vao])
+
+        self.contrail_shader.release()
+        gl.glDisable(gl.GL_PROGRAM_POINT_SIZE)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
     def render_markers(self, mvp, model):
         """Render team markers with airplane for animation"""
         
@@ -1447,6 +1720,12 @@ class FlightGlobeWidget(QOpenGLWidget):
                 use_texture = True
                 if is_animated:
                     team_color = (1.0, 0.8, 0.2)  # Special color for animated markers
+                elif marker_type == 'live_flight_confirmed':
+                    team_color = (0.2, 1.0, 0.4)  # Bright green for confirmed flights
+                elif marker_type == 'live_flight_likely':
+                    team_color = (1.0, 0.9, 0.2)  # Yellow for likely flights
+                elif marker_type == 'live_flight_possible':
+                    team_color = (1.0, 0.6, 0.2)  # Orange for possible flights
                 else:
                     team_color = self.get_team_color(team_id.upper()) if team_id else (1.0, 0.4, 0.1)
             
@@ -1529,10 +1808,113 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.travel_data = temp_data
         self.update()
     
+    # Raycasting for Click Detection
+    def screen_to_ray(self, screen_x: int, screen_y: int):
+        """Convert screen coordinates to world ray (origin, direction)"""
+        width = self.width()
+        height = self.height()
+
+        # Normalize screen coordinates to NDC (-1 to 1)
+        ndc_x = (2.0 * screen_x / width) - 1.0
+        ndc_y = 1.0 - (2.0 * screen_y / height)
+
+        # Recreate the matrices from paintGL
+        view = QMatrix4x4()
+        view.lookAt(QVector3D(0, 0, 3 / self.zoom_level), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
+
+        projection = QMatrix4x4()
+        aspect_ratio = width / max(height, 1)
+        projection.perspective(45.0, aspect_ratio, 0.1, 100.0)
+
+        # Inverse matrices
+        inv_projection, proj_ok = projection.inverted()
+        inv_view, view_ok = view.inverted()
+        inv_model, model_ok = self.rotation_matrix.inverted()
+
+        if not (proj_ok and view_ok and model_ok):
+            return None, None
+
+        # Near and far points in NDC
+        near_ndc = QVector4D(ndc_x, ndc_y, -1.0, 1.0)
+        far_ndc = QVector4D(ndc_x, ndc_y, 1.0, 1.0)
+
+        # Transform to world space
+        near_clip = inv_projection * near_ndc
+        far_clip = inv_projection * far_ndc
+
+        # Perspective divide
+        near_eye = QVector4D(near_clip.x() / near_clip.w(), near_clip.y() / near_clip.w(),
+                            near_clip.z() / near_clip.w(), 1.0)
+        far_eye = QVector4D(far_clip.x() / far_clip.w(), far_clip.y() / far_clip.w(),
+                           far_clip.z() / far_clip.w(), 1.0)
+
+        near_world = inv_model * inv_view * near_eye
+        far_world = inv_model * inv_view * far_eye
+
+        origin = QVector3D(near_world.x(), near_world.y(), near_world.z())
+        direction = QVector3D(
+            far_world.x() - near_world.x(),
+            far_world.y() - near_world.y(),
+            far_world.z() - near_world.z()
+        ).normalized()
+
+        return origin, direction
+
+    def ray_sphere_intersect(self, origin: QVector3D, direction: QVector3D,
+                            sphere_center: QVector3D, radius: float):
+        """Check if ray intersects sphere, return distance or None"""
+        oc = origin - sphere_center
+        a = QVector3D.dotProduct(direction, direction)
+        b = 2.0 * QVector3D.dotProduct(oc, direction)
+        c = QVector3D.dotProduct(oc, oc) - radius * radius
+
+        discriminant = b * b - 4 * a * c
+        if discriminant < 0:
+            return None
+
+        t = (-b - math.sqrt(discriminant)) / (2.0 * a)
+        return t if t > 0 else None
+
+    def find_clicked_marker(self, screen_x: int, screen_y: int):
+        """Find which marker (if any) was clicked"""
+        ray_result = self.screen_to_ray(screen_x, screen_y)
+        if ray_result[0] is None:
+            return None
+
+        origin, direction = ray_result
+        closest_marker = None
+        closest_distance = float('inf')
+        hit_radius = 0.045  # Marker hit detection radius
+
+        # Check team city markers
+        for marker in self.team_city_markers:
+            pos = marker.get('position')
+            if not pos:
+                continue
+
+            sphere_center = QVector3D(pos[0], pos[1], pos[2])
+            distance = self.ray_sphere_intersect(origin, direction, sphere_center, hit_radius)
+
+            if distance is not None and distance < closest_distance:
+                closest_distance = distance
+                closest_marker = marker
+
+        return closest_marker
+
     # Mouse Interaction Methods
     def mousePressEvent(self, event):
-        """Handle mouse press for rotation"""
+        """Handle mouse press for rotation and marker selection"""
         if event.button() == Qt.MouseButton.LeftButton:
+            # Check for marker click first
+            clicked_marker = self.find_clicked_marker(event.pos().x(), event.pos().y())
+
+            if clicked_marker:
+                # Emit signal with marker data
+                marker_id = clicked_marker.get('team_id', clicked_marker.get('city_name', 'unknown'))
+                self.markerClicked.emit(marker_id, clicked_marker)
+                return  # Don't start globe rotation
+
+            # No marker clicked - start rotation
             self.is_grabbed = True
             self.last_mouse_pos = event.pos()
             self.rotation_momentum = QVector3D(0, 0, 0)
@@ -1600,7 +1982,18 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.zoom_level = 1.0
         self.rotation_momentum = QVector3D(0, 0, 0)
         self.update()
-    
+
+    def center_on_location(self, lat: float, lon: float):
+        """Center the globe view on a specific latitude/longitude"""
+        # Convert lat/lon to rotation angles
+        # Longitude controls Y-axis rotation (horizontal spin)
+        # Latitude controls X-axis rotation (tilt)
+        self.rotation_matrix = QMatrix4x4()
+        self.rotation_matrix.rotate(-lat, 1, 0, 0)  # Tilt for latitude
+        self.rotation_matrix.rotate(-lon - 90, 0, 1, 0)  # Spin for longitude
+        self.rotation_momentum = QVector3D(0, 0, 0)
+        self.update()
+
     def resizeGL(self, width, height):
         """Handle window resize"""
         if height == 0: height = 1;
@@ -1611,11 +2004,211 @@ class FlightGlobeWidget(QOpenGLWidget):
         if hasattr(self, 'airplane_vao') and self.airplane_vao:
             gl.glDeleteVertexArrays(1, [self.airplane_vao])
             self.airplane_vao = 0
-        
+
         if hasattr(self, 'airplane_vbo') and self.airplane_vbo:
             gl.glDeleteBuffers(1, [self.airplane_vbo])
             self.airplane_vbo = 0
-    
+
+    # ============== Live Flight Tracking Methods ==============
+
+    def add_live_flight(self, flight_data: dict):
+        """Add a new live flight to the globe"""
+        icao24 = flight_data['icao24']
+        self.live_flights[icao24] = flight_data
+
+        if self.debug:
+            label = flight_data.get('label', flight_data.get('callsign', icao24))
+            print(f"🛫 Added live flight: {label}")
+
+        self.update()  # Trigger redraw
+
+    def update_live_flight(self, flight_data: dict):
+        """Update position of an existing live flight"""
+        icao24 = flight_data['icao24']
+
+        if icao24 in self.live_flights:
+            # Update flight data
+            self.live_flights[icao24] = flight_data
+
+            if self.debug:
+                lat = flight_data['latitude']
+                lon = flight_data['longitude']
+                alt = flight_data.get('altitude_ft', 0)
+                print(f"📍 Updated flight {icao24}: ({lat:.2f}, {lon:.2f}) @ {alt:.0f}ft")
+
+            self.update()  # Trigger redraw
+
+    def remove_live_flight(self, icao24: str):
+        """Remove a live flight from the globe (landed or out of range)"""
+        if icao24 in self.live_flights:
+            del self.live_flights[icao24]
+
+            if self.debug:
+                print(f"🛬 Removed live flight: {icao24}")
+
+            self.update()  # Trigger redraw
+
+    def clear_live_flights(self):
+        """Clear all live flights"""
+        self.live_flights.clear()
+
+        if self.debug:
+            print("🧹 Cleared all live flights")
+
+        self.update()  # Trigger redraw
+
+    def render_live_flights(self, mvp):
+        """Render all tracked live flights as airplanes"""
+        if not self.live_flights:
+            return
+
+        if not self.plane_model or not self.plane_model.is_ready():
+            # Fallback: render as simple markers if airplane model not loaded
+            self.render_live_flights_as_markers(mvp)
+            return
+
+        import math
+        from PyQt6.QtGui import QVector3D, QMatrix4x4
+
+        # Render each live flight with airplane model
+        for icao24, flight_data in self.live_flights.items():
+            try:
+                lat = flight_data['latitude']
+                lon = flight_data['longitude']
+                altitude_ft = flight_data.get('altitude_ft', 35000)
+                heading = flight_data.get('heading', 0)
+                team_id = flight_data.get('team_id')
+
+                # Convert to 3D position (higher altitude for live flights)
+                # Scale altitude: ground = 1.0, 40000ft = 1.12
+                altitude_scale = 1.0 + (altitude_ft / 40000.0) * 0.12
+                position_3d = self.lat_lon_to_3d(lat, lon, altitude_scale)
+
+                # Calculate orientation matrix from heading
+                heading_rad = math.radians(heading)
+
+                # Position normal (points away from earth center) - this is "up" on the globe surface
+                up = QVector3D(*position_3d).normalized()
+
+                # Calculate east direction at this point (perpendicular to up and world Y)
+                world_up = QVector3D(0, 1, 0)
+
+                # Handle poles (where up is parallel to world_up)
+                if abs(QVector3D.dotProduct(up, world_up)) > 0.999:
+                    east = QVector3D(1, 0, 0)
+                else:
+                    east = QVector3D.crossProduct(world_up, up).normalized()
+
+                # North direction on the surface (perpendicular to both up and east)
+                north = QVector3D.crossProduct(up, east).normalized()
+
+                # Calculate forward direction based on heading (clockwise from north)
+                forward = (
+                    north * math.cos(heading_rad) +
+                    east * math.sin(heading_rad)
+                ).normalized()
+
+                # Right direction for proper orientation
+                right = QVector3D.crossProduct(forward, up).normalized()
+
+                # Recalculate up to ensure perfect orthogonality
+                up = QVector3D.crossProduct(right, forward).normalized()
+
+                # Build orientation matrix - MUST match _create_flight_orientation format
+                # Airplane model: +X forward (nose), +Y up, +Z right
+                from PyQt6.QtGui import QVector4D
+                orientation = QMatrix4x4()
+                orientation.setRow(0, QVector4D(forward.x(), up.x(), right.x(), 0.0))
+                orientation.setRow(1, QVector4D(forward.y(), up.y(), right.y(), 0.0))
+                orientation.setRow(2, QVector4D(forward.z(), up.z(), right.z(), 0.0))
+                orientation.setRow(3, QVector4D(0.0, 0.0, 0.0, 1.0))
+
+                # Get team color for high-confidence flights
+                confidence = flight_data.get('confidence', 50)
+                team_color = None
+                if team_id and confidence >= 65:
+                    team_color = self.get_team_color(team_id.upper())
+
+                # Create animation state dict for render_animated_airplane
+                animation_state = {
+                    'position': position_3d,
+                    'orientation': orientation,
+                    'team_id': team_id,
+                    'team_color': team_color,
+                    'confidence': confidence,
+                    'is_live_flight': True
+                }
+
+                # Render airplane using existing method
+                self.plane_model.render_animated_airplane(animation_state, mvp)
+
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠️  Error rendering live flight {icao24}: {e}")
+                continue
+
+    def render_live_flights_as_markers(self, mvp):
+        """Fallback: render live flights as colored cube markers when airplane model unavailable"""
+        if not self.marker_shader or not self.live_flights:
+            return
+
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+        self.marker_shader.bind()
+        self.marker_shader.setUniformValue("mvp", mvp)
+        self.marker_shader.setUniformValue("time", self.animation_time)
+
+        for icao24, flight_data in self.live_flights.items():
+            try:
+                lat = flight_data['latitude']
+                lon = flight_data['longitude']
+                altitude_ft = flight_data.get('altitude_ft', 35000)
+                team_id = flight_data.get('team_id')
+                confidence = flight_data.get('confidence', 50)
+
+                # Slightly elevated position based on altitude
+                altitude_scale = 1.0 + (altitude_ft / 40000.0) * 0.12
+                position_3d = self.lat_lon_to_3d(lat, lon, altitude_scale)
+
+                # Determine marker type based on confidence
+                if confidence >= 80:
+                    marker_type = 'live_flight_confirmed'
+                elif confidence >= 65:
+                    marker_type = 'live_flight_likely'
+                else:
+                    marker_type = 'live_flight_possible'
+
+                # Try to infer league from team_id if available
+                league = None
+                if team_id:
+                    league = self.infer_league_from_team_id(team_id)
+
+                # Create marker dict for rendering
+                live_marker = {
+                    'position': position_3d,
+                    'team_id': team_id or icao24,
+                    'league': league or '',
+                    'size': 3.0 + (confidence / 50.0),  # Larger for higher confidence
+                    'type': marker_type,
+                    'is_live_flight': True,
+                    'icao24': icao24,
+                    'confidence': confidence
+                }
+
+                # Render with faster rotation to indicate live tracking
+                self.render_single_marker(live_marker, rotation_speed=2.5)
+
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠️  Error rendering live flight marker {icao24}: {e}")
+                continue
+
+        self.marker_shader.release()
+
+    # ============== End Live Flight Tracking Methods ==============
+
     def closeEvent(self, event):
         """Clean up OpenGL resources"""
         if self.gl_initialized:
@@ -1902,29 +2495,46 @@ class PlaneModel:
                 self.vbo is not None and 
                 self.geometry.geometry_data is not None)
     
-    def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4, 
+    def render_animated_airplane(self, animation_state: Dict, mvp: QMatrix4x4,
                                shader_program=None) -> bool:
-        """Optimized rendering method - uses pre-calculated orientation"""
+        """Optimized rendering method - uses pre-calculated orientation and team color"""
         if not self.is_ready() or not animation_state:
             return False
-        
+
         # Get pre-calculated position and orientation
         position = animation_state.get('position')
         orientation = animation_state.get('orientation')
-        
+
         if not position:
             return False
-        
+
         # Use identity matrix if no orientation provided (fallback)
         if orientation is None:
             orientation = QMatrix4x4()
-        
+
+        # Get team color if available
+        team_color = animation_state.get('team_color')
+        confidence = animation_state.get('confidence', 50)
+
+        # Blend team color with base gray based on confidence
+        if team_color and confidence >= 65:
+            # Higher confidence = more team color
+            blend = min(1.0, (confidence - 50) / 50.0)  # 0-1 scale from 50-100%
+            base = self.airplane_color
+            color = (
+                base[0] * (1 - blend) + team_color[0] * blend,
+                base[1] * (1 - blend) + team_color[1] * blend,
+                base[2] * (1 - blend) + team_color[2] * blend
+            )
+        else:
+            color = self.airplane_color
+
         # Create transformation matrix (cached if state unchanged)
         model_matrix = self._get_cached_transform_matrix(position, orientation)
         final_mvp = mvp * model_matrix
-        
-        # Render airplane
-        return self._render_airplane(final_mvp, model_matrix)
+
+        # Render airplane with color
+        return self._render_airplane(final_mvp, model_matrix, color)
     
     def calculate_smooth_orientation_from_path(self, path_points: List, segment_progress: float) -> QMatrix4x4:
         """Calculate smooth orientation using curve tangent (called from animation)"""
@@ -2167,23 +2777,26 @@ class PlaneModel:
         print("✅ Airplane OpenGL buffers created")
         return True
     
-    def _render_airplane(self, mvp: QMatrix4x4, model: QMatrix4x4) -> bool:
-        """Internal rendering method"""
+    def _render_airplane(self, mvp: QMatrix4x4, model: QMatrix4x4, color: tuple = None) -> bool:
+        """Internal rendering method with optional team color"""
         shader = self.parent_widget.airplane_shader
         if not shader:
             return False
-        
+
+        # Use passed color or default
+        render_color = color if color else self.airplane_color
+
         # Temporarily disable face culling for debugging
         gl.glDisable(gl.GL_CULL_FACE)
-        
+
         shader.bind()
-        
+
         try:
             shader.setUniformValue("mvp", mvp)
             shader.setUniformValue("model", model)
             shader.setUniformValue("normalMatrix", model.normalMatrix())
             shader.setUniformValue("lightDir", QVector3D(1.0, 0.3, 0.5).normalized())
-            shader.setUniformValue("airplaneColor", QVector3D(*self.airplane_color))
+            shader.setUniformValue("airplaneColor", QVector3D(*render_color))
             
             # Render
             gl.glBindVertexArray(self.vao)

@@ -59,8 +59,9 @@ DEFAULT_N_SIMS = 5000
 # the number of hidden neurons needs to be greater than the number of features, otherwise it has to compress / bottleneck them.
 # but increasing it requires more training data to effectively fill the parameters.
 
-EMPTY_NET_MULTIPLIER_FOR = 1.5
-EMPTY_NET_MULTIPLIER_AGAINST = 1.25
+# Historical values: 3.0, 2.17
+EMPTY_NET_MULTIPLIER_FOR = 3.0
+EMPTY_NET_MULTIPLIER_AGAINST = 2.17
 
 # ---------------------------
 # Global Helpers
@@ -1393,6 +1394,41 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
         # Replace the raw single-game value with the 10-game rolling average as the default
         df[c] = df[f'roll10_{c}']
 
+    # CONSOLIDATED EDGE FEATURES: Combine zone-specific features into more robust metrics
+    # This reduces feature count while preserving signal
+
+    # Giveaway consolidation: total + defensive zone ratio (d-zone giveaways are more costly)
+    giveaway_cols = ['edge_giveaway_d', 'edge_giveaway_n', 'edge_giveaway_o']
+    if all(c in df.columns for c in giveaway_cols):
+        # Total giveaways (using 10-game rolling values)
+        df['roll_edge_giveaway_total'] = (
+            df['roll10_edge_giveaway_d'] +
+            df['roll10_edge_giveaway_n'] +
+            df['roll10_edge_giveaway_o']
+        )
+        # D-zone giveaway percentage (higher = worse, more costly turnovers)
+        df['roll_edge_giveaway_dzone_pct'] = df['roll10_edge_giveaway_d'] / (df['roll_edge_giveaway_total'] + 0.1)
+
+        # Also create 3-game versions for trend detection
+        df['roll3_edge_giveaway_total'] = (
+            df['roll3_edge_giveaway_d'] +
+            df['roll3_edge_giveaway_n'] +
+            df['roll3_edge_giveaway_o']
+        )
+    else:
+        df['roll_edge_giveaway_total'] = 0.0
+        df['roll_edge_giveaway_dzone_pct'] = 0.0
+        df['roll3_edge_giveaway_total'] = 0.0
+
+    # Blocked shot consolidation: keep d-zone as primary (that's where blocks matter most)
+    # and rename for clarity
+    if 'roll10_edge_blocked_shot_d' in df.columns:
+        df['roll_edge_dzone_blocks'] = df['roll10_edge_blocked_shot_d']
+        df['roll3_edge_dzone_blocks'] = df['roll3_edge_blocked_shot_d']
+    else:
+        df['roll_edge_dzone_blocks'] = 0.0
+        df['roll3_edge_dzone_blocks'] = 0.0
+
     df['prev_date'] = grp['mp_game_date'].shift(1)
     df['rest_days'] = (df['mp_game_date'] - df['prev_date']).dt.days.fillna(2).clip(0, 10)
 
@@ -1426,6 +1462,32 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     else:
         final['home_osa_xg'] = final.get('home_roll_xgf', 0.0)
         final['away_osa_xg'] = final.get('away_roll_xgf', 0.0)
+
+    # GOALIE QUALITY DIFFERENTIAL: Direct matchup comparison (boosted signal)
+    # These features capture the goalie matchup advantage directly
+    GOALIE_BOOST_FACTOR = 2.0  # Amplify goalie signal relative to other features
+
+    if 'home_goalie_roll_gsax' in final.columns and 'away_goalie_roll_gsax' in final.columns:
+        # GSAx differential: positive = home goalie is better
+        final['goalie_gsax_diff'] = (final['home_goalie_roll_gsax'] - final['away_goalie_roll_gsax']) * GOALIE_BOOST_FACTOR
+        # HD GSAx differential: high-danger save quality comparison
+        final['goalie_hd_gsax_diff'] = (final['home_goalie_roll_hd_gsax'] - final['away_goalie_roll_hd_gsax']) * GOALIE_BOOST_FACTOR
+        # Combined goalie quality score (weighted average of metrics)
+        final['home_goalie_quality'] = (
+            final['home_goalie_roll_gsax'] * 0.4 +
+            final['home_goalie_roll_hd_gsax'] * 0.4 +
+            (1.0 - final['home_goalie_roll_rcr']) * 0.2  # Lower RCR = more consistent = better
+        ) * GOALIE_BOOST_FACTOR
+        final['away_goalie_quality'] = (
+            final['away_goalie_roll_gsax'] * 0.4 +
+            final['away_goalie_roll_hd_gsax'] * 0.4 +
+            (1.0 - final['away_goalie_roll_rcr']) * 0.2
+        ) * GOALIE_BOOST_FACTOR
+    else:
+        final['goalie_gsax_diff'] = 0.0
+        final['goalie_hd_gsax_diff'] = 0.0
+        final['home_goalie_quality'] = 0.0
+        final['away_goalie_quality'] = 0.0
 
     # Keep home_mp_game_date for forecasting (renamed from mp_game_date during home_ prefix)
     drop = [c for c in final.columns if any(x in c for x in ['side', 'prev_date', 'team_id_x', 'team_id_y', 'away_mp_game_date'])]
@@ -1487,7 +1549,10 @@ def init_params(key, d_in, hidden):
     b2 = jnp.zeros(hidden)
     W3 = jax.random.normal(k3, (hidden, 2)) * 0.05
     b3 = jnp.full(2, 2.5)
-    return {'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2, 'W3': W3, 'b3': b3}
+
+    params = {'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2, 'W3': W3, 'b3': b3}
+
+    return params
 
 
 def forward(p, x, training=False, rng_key=None, dropout_rate=0.2):
@@ -1527,11 +1592,56 @@ def loss_fn(p, x, y, training=False, rng_key=None, dropout_rate=0.2):
     """Loss function with optional dropout during training."""
     lam = forward(p, x, training=training, rng_key=rng_key, dropout_rate=dropout_rate)
     lam = jnp.clip(lam, 0.5, 5.0)
-    return jnp.mean(lam - y * jnp.log(lam)) + 2e-5 * jnp.sum(p['W3'] ** 2)
+    l2_reg = jnp.sum(p['W1'] ** 2) + jnp.sum(p['W2'] ** 2) + jnp.sum(p['W3'] ** 2)
+    return jnp.mean(lam - y * jnp.log(lam)) + 2e-5 * l2_reg
+
+
+def adam_update(params, grads, adam_state, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    """Adam optimizer update step."""
+    t = adam_state['t'] + 1
+    m = adam_state['m']
+    v = adam_state['v']
+
+    new_m = {}
+    new_v = {}
+    new_params = {}
+
+    for key in params:
+        # Update biased first moment estimate
+        new_m[key] = beta1 * m[key] + (1 - beta1) * grads[key]
+
+        # Update biased second moment estimate
+        new_v[key] = beta2 * v[key] + (1 - beta2) * (grads[key] ** 2)
+
+        # Bias correction
+        m_hat = new_m[key] / (1 - beta1 ** t)
+        v_hat = new_v[key] / (1 - beta2 ** t)
+
+        # Update parameters
+        new_params[key] = params[key] - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+
+    new_adam_state = {'m': new_m, 'v': new_v, 't': t}
+
+    return new_params, new_adam_state
+
+
+def cosine_decay_schedule(epoch, total_epochs, lr_max, lr_min=1e-6, warmup_epochs=10):
+    """
+    Cosine annealing with warmup.
+    - Warmup: Linear increase from lr_min to lr_max over warmup_epochs
+    - Decay: Cosine decay from lr_max to lr_min over remaining epochs
+    """
+    if epoch < warmup_epochs:
+        # Linear warmup
+        return lr_min + (lr_max - lr_min) * (epoch / warmup_epochs)
+    else:
+        # Cosine decay
+        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return lr_min + 0.5 * (lr_max - lr_min) * (1 + jnp.cos(jnp.pi * progress))
 
 
 def update_step(p, x, y, lr, rng_key, dropout_rate):
-    """Single training step with dropout."""
+    """Single training step with dropout (vanilla SGD)."""
     # Compute loss and gradients with dropout enabled
     loss_and_grad = jax.value_and_grad(lambda params: loss_fn(params, x, y, training=True, rng_key=rng_key, dropout_rate=dropout_rate))
     loss, grads = loss_and_grad(p)
@@ -1542,6 +1652,24 @@ def update_step(p, x, y, lr, rng_key, dropout_rate):
 
 # JIT compile the update step for speed
 update_step = jax.jit(update_step, static_argnums=(5,))  # static_argnums for dropout_rate
+
+
+def update_step_adam(params, adam_state, x, y, lr, rng_key, dropout_rate, beta1=0.9, beta2=0.999):
+    """Single training step with Adam optimizer."""
+    # Compute loss and gradients with dropout enabled
+    loss_and_grad = jax.value_and_grad(
+        lambda p: loss_fn(p, x, y, training=True, rng_key=rng_key, dropout_rate=dropout_rate)
+    )
+    loss, grads = loss_and_grad(params)
+
+    # Adam update
+    new_params, new_adam_state = adam_update(params, grads, adam_state, lr, beta1, beta2)
+
+    return new_params, new_adam_state, loss
+
+
+# JIT compile Adam update step (note: adam_state is now part of the function signature)
+update_step_adam = jax.jit(update_step_adam, static_argnums=(6,))  # static for dropout_rate
 
 
 def get_features(df):
@@ -1560,7 +1688,21 @@ def get_features(df):
         base_c = c.replace('home_', '').replace('away_', '')
         
         # 1. KEEP Rolling averages (Historical data)
+        # EXCEPTION: Exclude zone-specific EDGE features in favor of consolidated versions
         if base_c.startswith('roll'):
+            # Skip zone-specific edge features (e.g., roll3_edge_giveaway_d, roll10_edge_giveaway_n)
+            # These are replaced by consolidated features: roll_edge_giveaway_total, roll_edge_giveaway_dzone_pct
+            zone_specific_patterns = ['edge_giveaway_d', 'edge_giveaway_n', 'edge_giveaway_o',
+                                       'edge_blocked_shot_d', 'edge_hit_', 'edge_takeaway_', 'edge_missed_shot_']
+            is_zone_specific = any(pattern in base_c for pattern in zone_specific_patterns)
+
+            # Keep consolidated edge features
+            is_consolidated_edge = any(pattern in base_c for pattern in
+                                       ['edge_giveaway_total', 'edge_giveaway_dzone_pct', 'edge_dzone_blocks'])
+
+            if is_zone_specific and not is_consolidated_edge:
+                continue  # Skip zone-specific, use consolidated instead
+
             features.append(c)
             continue
             
@@ -1575,7 +1717,10 @@ def get_features(df):
         # - hdsm: derived from roll3 - roll10 (known pre-game)
         # - opp_xg_suppression: derived from rolling xGA (known pre-game)
         # - sted: derived from rolling special teams (known pre-game)
-        if base_c in ['rest', 'osa_xg', 'hdsm', 'opp_xg_suppression', 'sted']:
+        # - goalie_gsax_diff, goalie_hd_gsax_diff: goalie matchup differentials (known pre-game)
+        # - goalie_quality: composite goalie quality score (known pre-game)
+        if base_c in ['rest', 'osa_xg', 'hdsm', 'opp_xg_suppression', 'sted',
+                      'goalie_gsax_diff', 'goalie_hd_gsax_diff', 'goalie_quality']:
             features.append(c)
             continue
             
@@ -1609,18 +1754,18 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
     X_all = jnp.array(X_df.values)
     Y_all = jnp.array(df[['goals_home', 'goals_away']].values)
 
-    # Validation Split: percent of games 
-    val_size = int(len(X_all) * 0.01)
+    # Validation Split: 15% of games for more stable metrics
+    val_size = int(len(X_all) * 0.08 )
     train_size = len(X_all) - val_size
-    
+
     # Shuffle before split
     key = jax.random.PRNGKey(seed)
     perm = jax.random.permutation(key, len(X_all))
     X_all, Y_all = X_all[perm], Y_all[perm]
-    
+
     X, X_val = X_all[:train_size], X_all[train_size:]
     Y, Y_val = Y_all[:train_size], Y_all[train_size:]
-    
+
     steps = max(1, len(X) // batch)
     print(f"\nTraining on {len(X)} games | Validation on {len(X_val)} games | {len(feats)} features")
 
@@ -1634,6 +1779,9 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
     dropout_rate = 0.2
 
     for e in range(epochs):
+        # Calculate learning rate for this epoch
+        current_lr = cosine_decay_schedule(e, epochs, lr_max=lr, lr_min=1e-6, warmup_epochs=10)
+
         # Generate new random key for this epoch
         key, subkey = jax.random.split(key)
         perm = jax.random.permutation(subkey, len(X))
@@ -1647,7 +1795,7 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
 
             # Generate unique random key for dropout in this batch
             key, dropout_key = jax.random.split(key)
-            params, l = update_step(params, xb, yb, lr, dropout_key, dropout_rate)
+            params, l = update_step(params, xb, yb, current_lr, dropout_key, dropout_rate)
             loss_sum += l
 
         # Validation & Logging
@@ -1665,12 +1813,12 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
             else:
                 patience_counter += 1
 
-            print(f"Epoch {e:3d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} {improved}")
-            
-            # Optional: Simple Early Stopping check
-            # if patience_counter > 50:
-            #     print("Early stopping triggered.")
-            #     break
+            print(f"Epoch {e:3d} | LR {current_lr:.6f} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f} {improved}")
+
+            # Early Stopping: Stop if no improvement for 100 epochs
+            if patience_counter > 100:
+                print(f"Early stopping triggered at epoch {e}. No improvement for 100 epochs.")
+                break
 
     print(f"\nBest Validation Loss: {best_val_loss:.4f}")
     print("saving best model...")
@@ -1721,6 +1869,8 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True):
 
     print("Model saved.")
 
+    return best_val_loss
+
 
 def american_to_prob(o):
     o = float(o)
@@ -1730,14 +1880,66 @@ def american_to_prob(o):
         return abs(o) / (abs(o) + 100)
 
 
-def lookup_player_id(player_name: str, db_conn) -> int:
+def lookup_player_id(player_name: str, db_conn, is_goalie: bool = True) -> str:
+    """
+    Look up a player ID by name. When is_goalie=True (default), queries goalie_game_stats
+    to ensure only actual goaltenders are returned.
+
+    Args:
+        player_name: Full name ("Dustin Wolf") or last name ("Wolf")
+        db_conn: SQLite database connection
+        is_goalie: If True, only return goaltenders (via goalie_game_stats table)
+
+    Returns:
+        Player ID string (with [G] suffix for goalies)
+    """
     print(f"playerID lookup for: '{player_name}'")
-    query = f""" SELECT "player_id","player_name" FROM "main"."players" WHERE "player_name" LIKE '%{player_name}%' ESCAPE '\\' """ # LIMIT 1
+
+    search_name = player_name.strip().replace("'", "''")
+
+    if is_goalie:
+        # Query only goalies by using goalie_game_stats table
+        query = f"""
+            SELECT DISTINCT p.player_id, p.player_name
+            FROM goalie_game_stats g
+            JOIN players p ON g.player_id = p.player_id
+            WHERE p.player_name LIKE '%{search_name}%' ESCAPE '\\'
+            ORDER BY
+                CASE WHEN LOWER(p.player_name) = LOWER('{search_name}') THEN 0 ELSE 1 END,
+                p.player_name
+        """
+    else:
+        query = f"""
+            SELECT player_id, player_name
+            FROM players
+            WHERE player_name LIKE '%{search_name}%' ESCAPE '\\'
+        """
+
     result = pd.read_sql_query(query, db_conn)
     print(f"results:\n{result}")
-    player_id = result.get("player_id")[0]
-    # TODO: if player_id is None???
-    return player_id
+
+    if result.empty:
+        print(f"ERROR: No {'goalie' if is_goalie else 'player'} found matching '{player_name}'")
+        raise ValueError(f"No {'goalie' if is_goalie else 'player'} found matching '{player_name}'")
+
+    if len(result) > 1:
+        # Check for exact match
+        exact = result[result['player_name'].str.lower() == search_name.lower()]
+        if len(exact) == 1:
+            player_id = exact['player_id'].iloc[0]
+            print(f"  Exact match: {exact['player_name'].iloc[0]}")
+            return f"{player_id} [G]" if is_goalie else player_id
+
+        # Multiple matches - need disambiguation
+        print(f"ERROR: Multiple {'goalies' if is_goalie else 'players'} match '{player_name}':")
+        for _, row in result.iterrows():
+            print(f"    - {row['player_name']} (ID: {row['player_id']})")
+        print(f"  Please specify full name, e.g.: --home-goalie \"{result['player_name'].iloc[0]}\"")
+        raise ValueError(f"Ambiguous: multiple matches for '{player_name}'")
+
+    player_id = result['player_id'].iloc[0]
+    print(f"  Found: {result['player_name'].iloc[0]} ({player_id})")
+    return f"{player_id} [G]" if is_goalie else player_id
 
 def get_latest_stats_for_manual(db_path):
     """
@@ -1976,7 +2178,32 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
             matchup[f] = american_to_prob(a_odd or -110)
         else:
             matchup[f] = 0.0
-    
+
+    # Calculate goalie differential features (must be done after matchup is populated)
+    GOALIE_BOOST_FACTOR = 2.0  # Must match the factor used in training data
+
+    # Get goalie values from matchup (already populated above)
+    home_gsax = matchup.get('home_goalie_roll_gsax', 0.0)
+    away_gsax = matchup.get('away_goalie_roll_gsax', 0.0)
+    home_hd_gsax = matchup.get('home_goalie_roll_hd_gsax', 0.0)
+    away_hd_gsax = matchup.get('away_goalie_roll_hd_gsax', 0.0)
+    home_rcr = matchup.get('home_goalie_roll_rcr', 0.82)  # Default to league avg
+    away_rcr = matchup.get('away_goalie_roll_rcr', 0.82)
+
+    # Compute differential features
+    if 'goalie_gsax_diff' in feats:
+        matchup['goalie_gsax_diff'] = (home_gsax - away_gsax) * GOALIE_BOOST_FACTOR
+    if 'goalie_hd_gsax_diff' in feats:
+        matchup['goalie_hd_gsax_diff'] = (home_hd_gsax - away_hd_gsax) * GOALIE_BOOST_FACTOR
+    if 'home_goalie_quality' in feats:
+        matchup['home_goalie_quality'] = (
+            home_gsax * 0.4 + home_hd_gsax * 0.4 + (1.0 - home_rcr) * 0.2
+        ) * GOALIE_BOOST_FACTOR
+    if 'away_goalie_quality' in feats:
+        matchup['away_goalie_quality'] = (
+            away_gsax * 0.4 + away_hd_gsax * 0.4 + (1.0 - away_rcr) * 0.2
+        ) * GOALIE_BOOST_FACTOR
+
     print("matchup")
     for (k,v) in matchup.items():
       print(f"  {k}: {v}")
