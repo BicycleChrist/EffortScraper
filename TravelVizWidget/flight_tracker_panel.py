@@ -522,6 +522,20 @@ class FlightControlPanel(QWidget):
         if hasattr(self, 'flight_info_widget'):
             self.flight_info_widget.setObjectName("flight_section")
 
+    def set_league(self, league: str):
+        """Set league programmatically and update UI"""
+        if league not in ["MLB", "NBA", "NHL"]:
+            return
+
+        self.current_league = league
+        
+        # Update button states
+        self.mlb_btn.setChecked(league == "MLB")
+        self.nba_btn.setChecked(league == "NBA")
+        self.nhl_btn.setChecked(league == "NHL")
+        
+        self.update_ui_for_league(league)
+
     def on_league_changed(self, league: str, button: QPushButton, checked: bool):
         """Handle league change"""
         if not checked:

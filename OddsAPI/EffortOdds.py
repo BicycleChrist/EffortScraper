@@ -22,6 +22,7 @@ from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
 from effortcalculator import CalculatorApp
 from tickertape import TickerTape
+from radio_widget import ShortWaveRadioWidget
 from polymarketquery import fetch_and_process_markets
 from prediction_markets_worker import PredictionMarketsWorker
 from LiquidityWidget import ProphetXBrowser
@@ -34,7 +35,7 @@ import asyncio
 #TODO: MMA (Mixed Marital Arts) Markets ouput is nuked, gotta investigate that one
 #TODO: Auto update cuts off last few market lines??
 #TODO: change layout of stream-links controls from horizontal to vertical - giving more space to the listbox
-
+#TODO: Explore/investigate threads(Zuck) API for team/player news from beat reporters
 DEBUG_OUTLINES = False
 
 MAJOR_PROP_LEAGUES = {
@@ -414,6 +415,30 @@ class ModernOddsWindow(QMainWindow):
             }
         """)
         buttons_layout.addWidget(self.calc_button)
+
+        # ---- Radio button ----
+        self.radio_button = QPushButton("Radio  📻")
+        self.radio_button.setFixedWidth(90)
+        self.radio_button.clicked.connect(self.handle_radio_button)
+        self.radio_button.setStyleSheet("""
+            QPushButton {
+                background-color: #0a1520;
+                color: #00d4d4;
+                border: 1px solid #00d4d4;
+                border-left: 2px solid #ff0080;
+                padding: 4px;
+                border-radius: 0px;
+                font-size: 9pt;
+                font-family: 'Consolas', 'Courier New', monospace;
+            }
+            QPushButton:hover {
+                background-color: #102030;
+                color: #ffffff;
+                border: 1px solid #00ffff;
+            }
+        """)
+        buttons_layout.addWidget(self.radio_button)
+        self.radio_window = None
 
 
 
@@ -1966,7 +1991,7 @@ class ModernOddsWindow(QMainWindow):
 
     def handle_calc_button(self):
         """Show the odds-converter/calculator."""
-        # If it’s already open, close & re-open to reset state
+        # If it's already open, close & re-open to reset state
         if hasattr(self, "calc_window") and self.calc_window:
             try:
                 self.calc_window.close()
@@ -1975,6 +2000,17 @@ class ModernOddsWindow(QMainWindow):
         self.calc_window = CalculatorApp()
         self.calc_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.calc_window.show()
+
+    def handle_radio_button(self):
+        """Show the radio scanner widget."""
+        if self.radio_window and self.radio_window.isVisible():
+            self.radio_window.raise_()
+            self.radio_window.activateWindow()
+            return
+        self.radio_window = ShortWaveRadioWidget()
+        self.radio_window.setWindowTitle("// RADIO SCANNER")
+        self.radio_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.radio_window.show()
 
     def filter_table(self):
         """Filter the current table based on search term"""
