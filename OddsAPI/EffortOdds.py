@@ -2003,10 +2003,14 @@ class ModernOddsWindow(QMainWindow):
 
     def handle_radio_button(self):
         """Show the radio scanner widget."""
-        if self.radio_window and self.radio_window.isVisible():
-            self.radio_window.raise_()
-            self.radio_window.activateWindow()
-            return
+        try:
+            if self.radio_window and self.radio_window.isVisible():
+                self.radio_window.raise_()
+                self.radio_window.activateWindow()
+                return
+        except RuntimeError:
+            # C++ object was deleted, clear the reference
+            self.radio_window = None
         self.radio_window = ShortWaveRadioWidget()
         self.radio_window.setWindowTitle("// RADIO SCANNER")
         self.radio_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
