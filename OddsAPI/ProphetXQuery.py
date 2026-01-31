@@ -2,15 +2,91 @@
 """
 ProphetX Exchange Scraper
 Fetches orderbook data from ProphetX betting exchange API
+
+TODO: Automated Token Refresh Integration
+----------------------------------------
+1. Modify GetTournaments/GetEventMarkets to return 401/403 status distinctly
+2. Add PyQt6 QDialog in LiquidityWidget for credential entry + 2FA
+3. Split refresh_prophetx_token into:
+   - start_login(email, pw) -> opens browser, logs in, returns page object
+   - submit_2fa(page, code) -> enters code, captures token, closes browser
+4. Run Playwright in QThread to avoid blocking UI
+5. On auth error signal, show dialog -> collect creds -> start_login -> prompt 2FA -> submit_2fa -> update token
 """
 
 
 import pathlib
 import requests
 import json
+import re
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
-from Creds import PROPHETX_AUTH_TOKEN
+from playwright.sync_api import sync_playwright
+from Creds import PROPHETX_AUTH_TOKEN, PROPHETX_EMAIL, PROPHETX_PASSWORD
+
+
+def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX_PASSWORD, headless: bool = True) -> Optional[str]:
+    """
+    Refresh ProphetX JWT token via Playwright. Updates Creds.py automatically.
+    Requires: pip install playwright && playwright install chromium
+    """
+    if not email or not password:
+        print("[!] Set PROPHETX_EMAIL and PROPHETX_PASSWORD in Creds.py")
+        return None
+
+    token = None
+
+    def capture_token(response):
+        nonlocal token
+        auth = response.request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and auth.count(".") == 2 and len(auth) > 100:
+            token = auth[7:]
+            print(f"[*] Captured token from {response.url[:50]}...")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        page.on("response", capture_token)
+
+        try:
+            page.goto("https://www.prophetx.co/?currency=cash", wait_until="load")
+            page.wait_for_timeout(3000)
+            # Dismiss promo popup - try close button, X, or Escape
+            for selector in ["button[aria-label='Close']", "button.close", "[class*='close']", "svg[class*='close']"]:
+                if page.locator(selector).first.is_visible():
+                    page.locator(selector).first.click()
+                    break
+            else:
+                page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
+            # Click the Sign In button (btn--plain class)
+            page.click("button.btn--plain:has-text('Sign In')")
+            page.wait_for_selector("input#email", timeout=5000)
+            page.fill("input#email", email)
+            page.fill("input#password", password)
+            page.click("button:has-text('Login')")
+            page.wait_for_timeout(3000)
+
+            # Handle 2FA if prompted
+            otp_input = page.locator("input[placeholder='Enter Code']")
+            if otp_input.is_visible():
+                code = input("[?] Enter 2FA code from SMS: ").strip()
+                otp_input.fill(code)
+                page.click("button:has-text('Proceed')")
+                page.wait_for_timeout(5000)
+
+            if token:
+                creds_path = pathlib.Path(__file__).parent / "Creds.py"
+                content = creds_path.read_text()
+                new_content = re.sub(r'PROPHETX_AUTH_TOKEN\s*=\s*"[^"]*"', f'PROPHETX_AUTH_TOKEN = "{token}"', content)
+                creds_path.write_text(new_content)
+                print(f"[+] ProphetX token refreshed")
+        except Exception as e:
+            print(f"[!] Token refresh failed: {e}")
+        finally:
+            browser.close()
+
+    return token
 
 # Be careful to avoid Auth Token containing Elipsys; could be dependent on text editor one is using
 
