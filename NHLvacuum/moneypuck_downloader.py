@@ -22,6 +22,14 @@ MP_TEAM_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/reg
 MP_SKATER_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/skaters/{player_id}.csv"
 MP_GOALIE_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/goalies/{player_id}.csv"
 
+# Headers to mimic a browser request (required to avoid 403 Forbidden)
+REQUEST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Connection': 'keep-alive',
+}
+
 # Output directory
 OUTPUT_DIR = Path("moneypuck_data")
 
@@ -84,7 +92,7 @@ def download_file(url: str, output_path: Path, description: str = "", max_retrie
             # Apply global rate limiting before making request
             _rate_limiter.wait()
 
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
 
             # Handle rate limiting (429) or server errors (5xx)
             if response.status_code == 429:
