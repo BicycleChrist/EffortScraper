@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QStackedWidget
 )
 from fractions import Fraction
-from PyQt6.QtGui import QIcon, QFont
+from PyQt6.QtGui import QIcon, QFont, QPalette, QColor
 from PyQt6.QtCore import Qt
 import pathlib
 
@@ -721,6 +721,330 @@ class OddsConverterWidget(QWidget):
             self.line1.info_label.clear()
             self.line2.info_label.clear()
 
+class MultiwayOutcome(QWidget):
+    """Single outcome row in a multiway market (e.g., one team to win championship)."""
+    def __init__(self, outcome_number: int, on_remove_callback=None, on_changed_callback=None):
+        super().__init__()
+        self.outcome_number = outcome_number
+        self.on_remove_callback = on_remove_callback
+        self.on_changed_callback = on_changed_callback
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 3, 5, 3)
+
+        # Outcome name input
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText(f"Outcome {outcome_number}")
+        self.name_input.setFixedWidth(140)
+        self.name_input.setStyleSheet("""
+            QLineEdit {
+                padding: 4px 6px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background-color: rgba(255, 255, 255, 0.08);
+                color: white;
+            }
+        """)
+        layout.addWidget(self.name_input)
+
+        # American odds input
+        odds_label = QLabel("Odds:")
+        odds_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(odds_label)
+
+        self.american_input = QLineEdit()
+        self.american_input.setPlaceholderText("+odds")
+        self.american_input.setFixedWidth(80)
+        self.american_input.setStyleSheet("""
+            QLineEdit {
+                padding: 4px 6px;
+                border: 1px solid #555;
+                border-radius: 4px;
+                background-color: rgba(255, 255, 255, 0.08);
+                color: white;
+            }
+            QLineEdit:focus {
+                border-color: #4CAF50;
+            }
+        """)
+        layout.addWidget(self.american_input)
+
+        # Implied prob (with vig)
+        self.implied_label = QLabel("Imp: -")
+        self.implied_label.setFixedWidth(75)
+        self.implied_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(self.implied_label)
+
+        # Fair prob (no vig)
+        self.fair_prob_label = QLabel("Fair: -")
+        self.fair_prob_label.setFixedWidth(75)
+        self.fair_prob_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 11px;")
+        layout.addWidget(self.fair_prob_label)
+
+        # Fair American odds (no vig)
+        self.fair_odds_label = QLabel("NV: -")
+        self.fair_odds_label.setFixedWidth(80)
+        self.fair_odds_label.setStyleSheet("color: #FFC107; font-weight: bold; font-size: 11px;")
+        layout.addWidget(self.fair_odds_label)
+
+        layout.addStretch()
+
+        # Remove button
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedSize(22, 22)
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #F44336;
+                color: white;
+                border-radius: 11px;
+                font-weight: bold;
+                font-size: 10px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #D32F2F;
+            }
+        """)
+        remove_btn.clicked.connect(lambda: self.on_remove_callback(self) if self.on_remove_callback else None)
+        layout.addWidget(remove_btn)
+
+        # Connect signal
+        self.american_input.textChanged.connect(self._on_odds_changed)
+
+    def _on_odds_changed(self):
+        try:
+            ao = float(self.american_input.text())
+            prob = implied_prob_american(ao)
+            self.implied_label.setText(f"Imp: {prob*100:.1f}%")
+            self.implied_label.setStyleSheet("color: #ccc; font-size: 11px;")
+        except ValueError:
+            self.implied_label.setText("Imp: -")
+            self.implied_label.setStyleSheet("color: #aaa; font-size: 11px;")
+            self.fair_prob_label.setText("Fair: -")
+            self.fair_odds_label.setText("NV: -")
+        if self.on_changed_callback:
+            self.on_changed_callback()
+
+    def get_implied_prob(self):
+        """Return implied probability from American odds, or None."""
+        try:
+            ao = float(self.american_input.text())
+            return implied_prob_american(ao)
+        except ValueError:
+            return None
+
+    def set_fair_values(self, fair_prob):
+        """Update the fair (no-vig) displays."""
+        fair_odds = prob_to_american_odds(fair_prob)
+        self.fair_prob_label.setText(f"Fair: {fair_prob*100:.1f}%")
+        fair_text = f"+{int(fair_odds)}" if fair_odds > 0 else f"{int(fair_odds)}"
+        self.fair_odds_label.setText(f"NV: {fair_text}")
+
+    def clear_fair_values(self):
+        self.fair_prob_label.setText("Fair: -")
+        self.fair_odds_label.setText("NV: -")
+
+
+class MultiwayDevigger(QWidget):
+    """No-vig calculator for multiway markets (championship, MVP, etc.)."""
+    def __init__(self):
+        super().__init__()
+
+        main_layout = QVBoxLayout(self)
+
+        # Header
+        header_label = QLabel("Multiway Market Devigger")
+        header_label.setStyleSheet("""
+            QLabel {
+                font-size: 15px;
+                font-weight: bold;
+                color: #fff;
+                padding: 5px;
+            }
+        """)
+        header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(header_label)
+
+        desc_label = QLabel("Enter American odds for each outcome to remove the vig.")
+        desc_label.setStyleSheet("color: #aaa; font-size: 11px; padding-bottom: 5px;")
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(desc_label)
+
+        # Outcomes container with scroll area
+        outcomes_group = QGroupBox("Outcomes")
+        outcomes_group.setStyleSheet("""
+            QGroupBox {
+                border: 2px solid #444;
+                border-radius: 8px;
+                margin: 5px;
+                padding-top: 20px;
+                background-color: rgba(255, 255, 255, 0.05);
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                color: white;
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+
+        outcomes_layout = QVBoxLayout()
+
+        # Scroll area for outcomes
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        """)
+
+        scroll_content = QWidget()
+        self.outcomes_layout = QVBoxLayout(scroll_content)
+        self.outcomes_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.outcomes_layout.setSpacing(2)
+        scroll.setWidget(scroll_content)
+
+        outcomes_layout.addWidget(scroll)
+
+        # Add outcome button
+        add_btn = QPushButton("+ Add Outcome")
+        add_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 6px;
+                padding: 8px;
+                font-weight: bold;
+                font-size: 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        add_btn.clicked.connect(self.add_outcome)
+        outcomes_layout.addWidget(add_btn)
+
+        outcomes_group.setLayout(outcomes_layout)
+        main_layout.addWidget(outcomes_group)
+
+        # Summary / vig display
+        summary_group = QGroupBox()
+        summary_group.setStyleSheet("""
+            QGroupBox {
+                border: 2px solid #555;
+                border-radius: 8px;
+                margin-top: 5px;
+                background-color: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        summary_layout = QHBoxLayout()
+        summary_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Total implied prob
+        total_prob_title = QLabel("Total Implied:")
+        total_prob_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #fff;")
+        self.total_prob_display = QLabel("-")
+        self.total_prob_display.setStyleSheet("font-size: 14pt; font-weight: bold; color: #2196F3;")
+        summary_layout.addWidget(total_prob_title)
+        summary_layout.addWidget(self.total_prob_display)
+        summary_layout.addStretch()
+
+        # Vig
+        vig_title = QLabel("Vigorish:")
+        vig_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #fff;")
+        self.vig_display = QLabel("-")
+        self.vig_display.setStyleSheet("font-size: 14pt; font-weight: bold; color: #FFC107;")
+        summary_layout.addWidget(vig_title)
+        summary_layout.addWidget(self.vig_display)
+        summary_layout.addStretch()
+
+        # Outcome count
+        count_title = QLabel("Outcomes:")
+        count_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #fff;")
+        self.count_display = QLabel("0")
+        self.count_display.setStyleSheet("font-size: 14pt; font-weight: bold; color: #aaa;")
+        summary_layout.addWidget(count_title)
+        summary_layout.addWidget(self.count_display)
+
+        summary_group.setLayout(summary_layout)
+        main_layout.addWidget(summary_group)
+
+        # Track outcomes
+        self.outcomes = []
+        self.outcome_counter = 0
+
+        # Add initial 3 outcomes
+        for _ in range(3):
+            self.add_outcome()
+
+    def add_outcome(self):
+        self.outcome_counter += 1
+        outcome = MultiwayOutcome(self.outcome_counter, self.remove_outcome, self.recalculate)
+        self.outcomes.append(outcome)
+        self.outcomes_layout.addWidget(outcome)
+        self.recalculate()
+
+    def remove_outcome(self, outcome):
+        if len(self.outcomes) > 2:  # Keep at least 2 outcomes
+            self.outcomes.remove(outcome)
+            self.outcomes_layout.removeWidget(outcome)
+            outcome.deleteLater()
+            self.recalculate()
+
+    def recalculate(self):
+        """Recalculate fair probabilities using proportional devigging."""
+        probs = []
+        valid_outcomes = []
+
+        for outcome in self.outcomes:
+            p = outcome.get_implied_prob()
+            if p is not None:
+                probs.append(p)
+                valid_outcomes.append(outcome)
+            else:
+                outcome.clear_fair_values()
+
+        valid_count = len(probs)
+        self.count_display.setText(f"{len(self.outcomes)} ({valid_count} valid)")
+
+        if valid_count < 2:
+            self.total_prob_display.setText("-")
+            self.vig_display.setText("-")
+            self.vig_display.setStyleSheet("font-size: 14pt; font-weight: bold; color: #FFC107;")
+            for o in valid_outcomes:
+                o.clear_fair_values()
+            return
+
+        total_prob = sum(probs)
+        vig = (total_prob - 1) * 100
+
+        self.total_prob_display.setText(f"{total_prob*100:.1f}%")
+
+        # Vig color
+        if vig < 2:
+            vig_color = "#4CAF50"
+        elif vig < 5:
+            vig_color = "#8BC34A"
+        elif vig < 10:
+            vig_color = "#FFC107"
+        elif vig < 20:
+            vig_color = "#FF9800"
+        else:
+            vig_color = "#F44336"
+
+        self.vig_display.setText(f"{vig:.1f}%")
+        self.vig_display.setStyleSheet(f"font-size: 14pt; font-weight: bold; color: {vig_color};")
+
+        # Proportional devigging: divide each probability by the total
+        for outcome, prob in zip(valid_outcomes, probs):
+            fair_prob = prob / total_prob
+            outcome.set_fair_values(fair_prob)
+
+
 class CalculatorApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -774,62 +1098,76 @@ class CalculatorApp(QWidget):
         # Stacked widget for switching between calculators
         self.stacked_widget = QStackedWidget()
 
-        # Add both calculators
+        # Add all three calculators
         self.odds_calculator = OddsConverterWidget()
         self.parlay_calculator = ParlayCalculator()
+        self.multiway_calculator = MultiwayDevigger()
 
-        self.stacked_widget.addWidget(self.odds_calculator)
-        self.stacked_widget.addWidget(self.parlay_calculator)
+        self.stacked_widget.addWidget(self.odds_calculator)      # index 0
+        self.stacked_widget.addWidget(self.parlay_calculator)     # index 1
+        self.stacked_widget.addWidget(self.multiway_calculator)   # index 2
 
         main_layout.addWidget(self.stacked_widget)
 
-        # Current mode (0 = odds, 1 = parlay)
+        # Mode definitions: (index, button_text_for_next, button_color, hover_color)
+        self.modes = [
+            (0, "Switch to Parlay Calculator", "#2196F3", "#1976D2"),
+            (1, "Switch to Multiway Devigger", "#4CAF50", "#45a049"),
+            (2, "Switch to Odds Calculator", "#9C27B0", "#7B1FA2"),
+        ]
         self.current_mode = 0
 
     def toggle_mode(self):
-        if self.current_mode == 0:
-            # Switch to parlay
-            self.current_mode = 1
-            self.stacked_widget.setCurrentIndex(1)
-            self.toggle_btn.setText("Switch to Odds Calculator")
-            self.toggle_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #4CAF50;
-                    color: white;
-                    border-radius: 6px;
-                    padding: 8px 15px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    border: none;
-                    min-width: 200px;
-                }
-                QPushButton:hover {
-                    background-color: #45a049;
-                }
-            """)
-        else:
-            # Switch to odds
-            self.current_mode = 0
-            self.stacked_widget.setCurrentIndex(0)
-            self.toggle_btn.setText("Switch to Parlay Calculator")
-            self.toggle_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #2196F3;
-                    color: white;
-                    border-radius: 6px;
-                    padding: 8px 15px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    border: none;
-                    min-width: 200px;
-                }
-                QPushButton:hover {
-                    background-color: #1976D2;
-                }
-            """)
+        self.current_mode = (self.current_mode + 1) % len(self.modes)
+        idx, btn_text, bg_color, hover_color = self.modes[self.current_mode]
+        self.stacked_widget.setCurrentIndex(idx)
+        self.toggle_btn.setText(btn_text)
+        self.toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg_color};
+                color: white;
+                border-radius: 6px;
+                padding: 8px 15px;
+                font-weight: bold;
+                font-size: 13px;
+                border: none;
+                min-width: 200px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+        """)
+
+def apply_dark_palette(app):
+    """Force a dark color palette so the UI looks consistent on any system."""
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Base, QColor(42, 42, 42))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(50, 50, 50))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Button, QColor(50, 50, 50))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(127, 127, 127))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(127, 127, 127))
+    app.setPalette(palette)
+    app.setStyleSheet("""
+        QToolTip {
+            color: #ffffff;
+            background-color: #2a2a2a;
+            border: 1px solid #555;
+        }
+    """)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    apply_dark_palette(app)
     w = CalculatorApp()
     w.show()
     sys.exit(app.exec())
