@@ -1629,6 +1629,10 @@ class ModernOddsWindow(QMainWindow):
                     # Reuse the same session for prop client calls
                     available_markets = current_markets.copy()  # Use the current_markets variable
                     selected_region = self.selected_region
+                    # Throttle to stay under 30 req/s API limit
+                    if index > 0:
+                        await asyncio.sleep(0.034)
+
                     odds = await self.data_manager.prop_client.get_event_odds(
                         session,
                         game_id,
@@ -1637,8 +1641,8 @@ class ModernOddsWindow(QMainWindow):
                     )
 
                     if odds is None:
-                        print("you're out of credits - no odds returned (probably)")
-                        return
+                        print(f"No odds returned for game {game_id}, skipping...")
+                        continue
 
                     game_odds_data[game_id] = odds
 
