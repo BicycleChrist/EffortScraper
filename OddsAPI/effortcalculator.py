@@ -1050,10 +1050,19 @@ class CalculatorApp(QWidget):
         super().__init__()
         self.setWindowTitle("Odds Calculator")
 
-        icon_path = pathlib.Path(__file__).parent / "AppIcon.png"
-        self.setWindowIcon(QIcon(str(icon_path)))
+        self.icon_frame = 0
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(16)
 
         self.resize(550, 450)
+
+    def UpdateIcon(self):
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)

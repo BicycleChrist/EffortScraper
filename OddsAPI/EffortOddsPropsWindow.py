@@ -1,5 +1,6 @@
 import qasync
 import aiohttp
+import pathlib
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
@@ -7,7 +8,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QPushButton,
     QHBoxLayout, QGridLayout, QCheckBox, QScrollArea, QGroupBox, QTabWidget
 )
-from PropQuery import PropClient
+from propQuery import PropClient
 from marketKeys import MAJOR_PROP_MARKETS
 import LineCalculator
 from TrackingStatsWidget import integrate_stats_with_props_window
@@ -281,9 +282,9 @@ class PropsWindow(BaseTableWindow):
         self.best_text_color = QColor(255, 255, 255) # White Text
             
     def UpdateIcon(self):
-        framesdir = "/home/retupmoc/Desktop/EffortScraper/OddsAPI/appicon_frames"
-        next_icon = f"{framesdir}/frame{str(self.icon_frame).zfill(3)}.png"
-        self.setWindowIcon(QIcon(next_icon))
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
         self.icon_frame = ((self.icon_frame + 1) % 200)
         #print(next_icon)
     
@@ -298,7 +299,6 @@ class PropsWindow(BaseTableWindow):
         controls_layout = QHBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins for a compact layout
         controls_layout.setSpacing(5)  # Reduce spacing between widgets
-        self.setWindowIcon(QIcon("/home/retupmoc/Desktop/EffortScraper/OddsAPI/AppIcon.png"))
         
         # Prop type label
         controls_layout.addWidget(QLabel("Select Prop Type:"))

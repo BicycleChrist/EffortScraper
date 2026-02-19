@@ -835,6 +835,12 @@ class TableTennisGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("Table Tennis Tracker")
         self.setMinimumSize(1200, 800)
+
+        self.icon_frame = 0
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(16)
         
         # Store data
         self.data = {}
@@ -865,6 +871,12 @@ class TableTennisGUI(QMainWindow):
         self.refresh_timer.timeout.connect(self.refresh_data)
         self.refresh_timer.start(1800000)  # 30 minutes
 
+    def UpdateIcon(self):
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
+
     def setup_ui(self):
         # Create central widget and main layout
         self.central_widget = QWidget()
@@ -882,9 +894,6 @@ class TableTennisGUI(QMainWindow):
         
         # Set splitter sizes
         self.splitter.setSizes([250, 500, 450])
-        
-        icon_path = pathlib.Path(__file__).parent / "AppIcon.png"
-        self.setWindowIcon(QIcon(str(icon_path)))
         
         # Apply dark theme
         self.apply_dark_theme()

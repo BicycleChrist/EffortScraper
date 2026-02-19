@@ -10,6 +10,7 @@ import json
 import urllib.request
 import urllib.parse
 import threading
+import pathlib
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QPushButton, QListWidget, QLabel, QApplication, QFrame,
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QUrl, QRect, QPoint
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QLinearGradient, QBrush,
-    QPainterPath, QPolygon, QFont
+    QPainterPath, QPolygon, QFont, QIcon
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 import numpy as np
@@ -155,8 +156,20 @@ class ShortWaveRadioWidget(QWidget):
         self.player.setAudioOutput(self.audio_output)
         self.audio_output.setVolume(0.7)
 
+        self.icon_frame = 0
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(16)
+
         self.init_ui()
         self.setup_visualizer_timer()
+
+    def UpdateIcon(self):
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
 
     def init_ui(self):
         """Initialize the compact UI with cyberpunk styling"""
