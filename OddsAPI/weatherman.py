@@ -1,6 +1,9 @@
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QLinearGradient, QPolygonF
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import (QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath,
+                         QLinearGradient, QRadialGradient, QPolygonF)
+from PyQt6.QtCore import Qt, QTimer, QPointF
+from PyQt6.QtWidgets import QWidget
 import math
+import random
 import numpy as np
 import requests
 from Creds import open_weather_key
@@ -17,7 +20,7 @@ def polar_equation(angle_deg, coefficients):
         - A dictionary with 'type' key for special equations
     """
     theta = math.radians(angle_deg)
-    
+
     # Handle string descriptions of complex equations
     if isinstance(coefficients, str):
         if "Complex" in coefficients:
@@ -25,39 +28,39 @@ def polar_equation(angle_deg, coefficients):
             # These would need individual implementations
             return 400  # Default distance
         return None
-    
+
     # Handle dictionary format for special equations
     if isinstance(coefficients, dict):
         eq_type = coefficients.get('type')
-        
+
         if eq_type == 'cos_only':
             # r = numerator / cos(θ)
             cos_val = math.cos(theta)
             if abs(cos_val) < 1e-10:
                 return float('inf')
             return coefficients['numerator'] / cos_val
-            
+
         elif eq_type == 'sin_only':
             # r = numerator / sin(θ)
             sin_val = math.sin(theta)
             if abs(sin_val) < 1e-10:
                 return float('inf')
             return coefficients['numerator'] / sin_val
-            
+
         elif eq_type == 'special_cos':
             # r = numerator * cos(θ) / denominator
             return coefficients['numerator'] * math.cos(theta) / coefficients['denominator']
-        
-        
+
+
         # Complex equation for Great American Ball Park (0-44.7 degrees)
         elif eq_type == 'complex_great_american':
             num1 = 11951552.5 * math.cos(theta - math.radians(25.2)) - (8986447.5 * math.cos(theta - math.radians(164.8)))
             num2 = 19212.09 * math.sqrt(41212.25 - (30987.75 * math.cos(2*theta - math.radians(190))) - 168200 * (math.sin(theta - math.radians(25.2))**2))
             numerator = num1 + num2
-            
+
             denominator = 41212.25 - (30987.75 * math.cos(2*theta - math.radians(190)))
             return numerator / denominator
-        
+
         # Complex equation for Minute Maid Park (34-49.6 degrees)
         # Current function for Minute Maid was made when Tals Hill was still a part of the field
         elif eq_type == 'complex_minute_maid':
@@ -65,16 +68,16 @@ def polar_equation(angle_deg, coefficients):
             numerator2 = 7424.6 * math.sqrt(10525 - (725 * math.cos(2 * theta)) - 263538* math.sin(theta - math.radians(42.5)) ** 2)
             denominator = 10525 - 725*math.cos(2*theta)
             return (numerator1+numerator2) / denominator
-        
+
         # Complex equation for Kauffman Stadium (0-10.9 degrees) - from Image 3
         elif eq_type == 'complex_kauffman1':
             num1 = 1738857 * math.cos(theta - math.radians(10.1)) - 495945 * math.cos(theta - math.radians(169.9))
             num2 = 3671.3 * math.sqrt(5417 - 1545 * math.cos(2*theta - math.radians(180)) - (206082 * (math.sin(theta - math.radians(10.1)) ** 2)))
             numerator = num1 + num2
-            
+
             denominator = 5417 - 1545 * math.cos(2*theta - math.radians(180))
             return numerator / denominator
-        
+
         # (22.1-59) degrees
         elif eq_type == 'complex_kauffman2':
             num1 = 19759218 * math.cos(theta - math.radians(50.9)) - 1837968 * math.cos(theta + math.radians(76.9))
@@ -82,7 +85,7 @@ def polar_equation(angle_deg, coefficients):
             numerator = num1 + num2
             denominator = 111634 - (10384 * math.cos(2*theta + math.radians(26)))
             return numerator / denominator
-        
+
         # (59-76.9) degrees
         elif eq_type == 'complex_kauffman3':
             num1 = 5642864 * math.cos(theta - math.radians(68.7)) - 4885920 * math.cos(theta + math.radians(80.7))
@@ -90,7 +93,7 @@ def polar_equation(angle_deg, coefficients):
             numerator = num1 + num2
             denominator = 16218 - (14040 * math.cos(2*theta + math.radians(12)))
             return numerator / denominator
-        
+
         # (82.7-90) degrees
         elif eq_type == 'complex_kauffman4':
             num1 = 958907 * math.cos(theta - math.radians(82.6)) - 322725 * math.cos(theta + math.radians(44.6))
@@ -98,11 +101,11 @@ def polar_equation(angle_deg, coefficients):
             numerator = num1 + num2
             denominator = 2897 - (975 * math.cos(2*theta - math.radians(38)))
             return numerator / denominator
-        
+
         elif eq_type == 'complex_wrigley':
             # Common denominator
             common_denom = 33526.25 - 9105.75 * math.cos(2 * theta - math.radians(180))
-            
+
             # First fraction numerator
             num1 = 9353823.75 * math.cos(theta - math.radians(33.2)) - 2540504.25 * math.cos(theta - math.radians(146.8))
             num2 = 22815.51 * math.sqrt(33526.25 - (9105.75 * math.cos(2 * theta - math.radians(180))) - (155682 * (math.sin(theta - math.radians(33.2)))** 2))
@@ -123,28 +126,28 @@ def polar_equation(angle_deg, coefficients):
                     return r1 + frac * (r2 - r1)
             return None
 
-    
+
     # Handle tuple format
     if len(coefficients) == 3:
         # Simple format: r = numerator / (sin(θ) + cos_coeff * cos(θ))
         numerator, sin_coeff, cos_coeff = coefficients
         denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta)
-        
+
         if abs(denominator) < 1e-10:  # Avoid division by zero
             return float('inf')
-        
+
         return numerator / denominator
-        
+
     elif len(coefficients) == 4:
         # Format with constant: r = numerator / (sin(θ) + cos_coeff * cos(θ) + constant)
         numerator, sin_coeff, cos_coeff, constant = coefficients
         denominator = sin_coeff * math.sin(theta) + cos_coeff * math.cos(theta) + constant
-        
+
         if abs(denominator) < 1e-10:
             return float('inf')
-            
+
         return numerator / denominator
-    
+
     return None
 
 
@@ -152,29 +155,29 @@ def polar_equation(angle_deg, coefficients):
 def get_stadium_wall_distance(stadium_name, angle_deg):
     if stadium_name not in STADIUM_DATA:
         return None
-    
+
     stadium = STADIUM_DATA[stadium_name]
     if "polar_coords" not in stadium:
         return None
-    
+
     for angle_start, angle_end, coefficients in stadium["polar_coords"]:
         if angle_start <= angle_deg <= angle_end:
             result = polar_equation(angle_deg, coefficients)
             if result is None or result <= 0 or result == float('inf') or result > 600:
                 return None
             return result
-    
+
     # Gap in coverage — interpolate from boundary of nearest segments
     polar_coords = stadium["polar_coords"]
     best_below = None
     best_above = None
-    
+
     for angle_start, angle_end, coefficients in polar_coords:
         if angle_end <= angle_deg:
             best_below = (angle_end, coefficients)
         if angle_start >= angle_deg and best_above is None:
             best_above = (angle_start, coefficients)
-    
+
     if best_below and best_above:
         below_angle, below_coeff = best_below
         above_angle, above_coeff = best_above
@@ -189,7 +192,7 @@ def get_stadium_wall_distance(stadium_name, angle_deg):
     if best_above:
         d = polar_equation(best_above[0], best_above[1])
         return d if d and 0 < d < 600 else None
-    
+
     return None
 
 
@@ -844,7 +847,7 @@ STADIUM_DATA = {
         ]
     },
     "George M. Steinbrenner Field": {  # Tampa Bay Rays - 2025 temporary venue
-        "image_path": "MLBstadiumgraphics/SteinbrennerField.gif", 
+        "image_path": "MLBstadiumgraphics/SteinbrennerField.gif",
         "lat": 28.0647,
         "lon": -82.5069,
         "altitude": 15,
@@ -957,7 +960,7 @@ STADIUM_DATA = {
 class WeatherService:
     def __init__(self, api_key=open_weather_key):
         self.api_key = api_key or open_weather_key
-        
+
         self.base_url = "https://api.openweathermap.org/data/2.5/weather"
 
     def get_weather_by_location(self, lat, lon):
@@ -973,11 +976,15 @@ class WeatherService:
 
     def extract_weather_data(self, weather_json):
         """Extract relevant weather data from API response"""
+        # OpenWeather returns pressure in hPa; convert to Pa for physics use
+        pressure_hpa = weather_json["main"].get("pressure", 1013.25)
         weather_data = {
             "wind_speed": weather_json["wind"]["speed"],
             "wind_direction": weather_json["wind"]["deg"],
             "temperature": weather_json["main"]["temp"],
             "humidity": weather_json["main"]["humidity"],
+            "pressure_hpa": pressure_hpa,           # hPa  – for display
+            "pressure_pa": pressure_hpa * 100.0,    # Pa   – for physics
             "condition": weather_json["weather"][0]["main"],
             "description": weather_json["weather"][0]["description"],
             "precipitation": 0  # Default to 0
@@ -1001,20 +1008,20 @@ class WeatherService:
         # Convert wind direction from meteorological to mathematical angle
         math_angle = (270 - direction) % 360
         rad_angle = math.radians(math_angle)
-    
+
         # Scale length based on wind speed
         max_length = 90
         min_length = 40
         scaled_length = min(max_length, max(min_length, speed * 4.5))
-    
+
         # Calculate shaft end point (where arrowhead begins)
         shaft_end_x = x + (scaled_length * 0.7) * math.cos(rad_angle)
         shaft_end_y = y + (scaled_length * 0.7) * math.sin(rad_angle)
-        
+
         # Calculate the true end point (tip of arrow)
         tip_x = x + scaled_length * math.cos(rad_angle)
         tip_y = y + scaled_length * math.sin(rad_angle)
-    
+
         # Set color based on wind speed
         if speed < 5:
             color = QColor(0, 120, 255)  # Blue for light wind
@@ -1022,40 +1029,40 @@ class WeatherService:
             color = QColor(0, 200, 100)  # Green for moderate wind
         else:
             color = QColor(255, 40, 40)  # Red for strong wind
-    
+
         # Save painter state
         painter.save()
-        
+
         # Draw the shaft as a thick line
         pen = QPen(color, 6)  # Thicker line for visibility
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)  # Rounded ends
         painter.setPen(pen)
         painter.drawLine(QPointF(x, y), QPointF(shaft_end_x, shaft_end_y))
-        
+
         # Create arrowhead as a polygon
         arrowhead_width = min(25, scaled_length * 0.4)  # Width proportional to length
-        
+
         # Calculate the perpendicular direction for arrowhead width
         perp_angle = rad_angle + math.pi/2  # 90 degrees
-        
+
         # Calculate the two base points of the arrowhead
         left_x = shaft_end_x + arrowhead_width * math.cos(perp_angle)
         left_y = shaft_end_y + arrowhead_width * math.sin(perp_angle)
-        
+
         right_x = shaft_end_x - arrowhead_width * math.cos(perp_angle)
         right_y = shaft_end_y - arrowhead_width * math.sin(perp_angle)
-        
+
         # Create the polygon
         arrowhead = QPolygonF()
         arrowhead.append(QPointF(tip_x, tip_y))  # Tip
         arrowhead.append(QPointF(left_x, left_y))  # Left corner
         arrowhead.append(QPointF(right_x, right_y))  # Right corner
-        
+
         # Fill the arrowhead polygon
         painter.setPen(Qt.PenStyle.NoPen)  # No outline
         painter.setBrush(QBrush(color))  # Solid fill
         painter.drawPolygon(arrowhead)
-        
+
         # Restore painter state
         painter.restore()
 
@@ -1081,3 +1088,864 @@ def draw_precipitation(painter, precipitation, width, height, is_in_stadium_area
             start_point = QPointF(float(x), float(y))
             end_point = QPointF(float(x), float(y + length))
             painter.drawLine(start_point, end_point)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEATHER ANIMATION WIDGET
+# WindVectorWidget + particle classes (_Cloud, _RainDrop, _FogBank, _MistDrop,
+# _LightningBolt, _Snowflake) — imported by homerunwidget.py
+# ═══════════════════════════════════════════════════════════════════════════════
+class WindVectorWidget(QWidget):
+    """
+    Animated wind-vector banner that shows:
+      • A weather-condition-appropriate animated background (sky, clouds, rain, snow, etc.)
+      • Flowing tapered arrows that travel in the actual wind direction at a speed
+        proportional to wind speed — replacing the old pulsing static arrows.
+    """
+
+    # ── map OpenWeatherMap 'main' condition strings to our scene keys ──────────
+    _CONDITION_MAP = {
+        "Clear":         "clear",
+        "Clouds":        "clouds",   # overcast or broken — refined by description
+        "Rain":          "rain",
+        "Drizzle":       "rain",
+        "Thunderstorm":  "thunder",
+        "Snow":          "snow",
+        "Mist":          "mist",
+        "Fog":           "fog",
+        "Haze":          "haze",
+        "Smoke":         "haze",
+        "Dust":          "haze",
+        "Sand":          "haze",
+        "Ash":           "haze",
+        "Squall":        "rain",
+        "Tornado":       "thunder",
+        "Custom":        "clear",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(180)
+        self.setMaximumHeight(180)
+
+        # Wind / weather state
+        self.wind_speed     = 0.0
+        self.wind_direction = 0.0
+        self.condition      = "clear"   # resolved scene key
+
+        # Arrow particles  [{'x','y','spd','alpha','growing'}]
+        self._arrows        = []
+        self._arrow_vx      = 1.0
+        self._arrow_vy      = 0.0
+
+        # Arrow appearance (recomputed on set_wind_data)
+        self._arrow_len     = 54
+        self._arrow_w       = 11
+        self._tail_len      = 28
+        self._px_per_frame  = 1.2
+        self._arrow_count   = 5
+        self._ar, self._ag, self._ab = 80, 210, 255
+
+        # Scene particles for weather effects
+        self._clouds   = []   # Cloud instances  (broken/overcast)
+        self._drops    = []   # RainParticle / MistDrop instances
+        self._flakes   = []   # SnowParticle instances
+        self._bolt     = None # LightningState instance
+        self._fog_banks= []   # FogBank instances
+
+        # Scene time (milliseconds, driven by timer)
+        self._t = 0.0
+
+        # High-res animation timer  (~60 fps)
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def set_wind_data(self, speed, direction, condition="Clear", description=""):
+        self.wind_speed     = speed
+        self.wind_direction = direction
+
+        # Resolve scene key
+        scene = self._CONDITION_MAP.get(condition, "clear")
+        # Distinguish "few/scattered clouds" (broken) from "overcast"
+        if condition == "Clouds":
+            desc_lower = description.lower()
+            if "overcast" in desc_lower:
+                scene = "overcast"
+            else:
+                scene = "clouds"
+        self.condition = scene
+
+        # Wind vector  (met convention: FROM direction → going = dir+180)
+        going = (direction + 180) % 360
+        rad   = math.radians(90 - going)
+        self._arrow_vx = math.cos(rad)
+        self._arrow_vy = -math.sin(rad)
+
+        # Arrow visual params scaled by speed
+        spd = max(1.0, speed)
+        self._arrow_count  = max(3, min(10, int(spd * 0.35 + 3)))
+        self._arrow_len    = max(28, min(78, int(spd * 2.2 + 32)))
+        self._arrow_w      = max(6,  min(18, int(spd * 0.45 + 7)))
+        self._tail_len     = max(14, min(52, int(spd * 1.4 + 16)))
+        self._px_per_frame = max(0.4, min(3.8, spd * 0.13 + 0.3))
+
+        # Arrow colour by speed
+        if   spd <  5: self._ar, self._ag, self._ab = 80, 210, 255
+        elif spd < 12: self._ar, self._ag, self._ab = 80, 255, 160
+        elif spd < 20: self._ar, self._ag, self._ab = 255, 205, 55
+        else:          self._ar, self._ag, self._ab = 255, 75,  75
+
+        # Rebuild particles for the new wind direction / count
+        self._init_arrows()
+        self._init_scene_particles()
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _init_arrows(self):
+        self._arrows = []
+        W, H = self.width() or 600, self.height() or 180
+        for _ in range(self._arrow_count):
+            self._arrows.append(self._spawn_arrow(W, H, scatter=True))
+
+    def _spawn_arrow(self, W, H, scatter=False):
+        vx, vy = self._arrow_vx, self._arrow_vy
+        L = self._arrow_len
+        if scatter:
+            x, y = random.random() * W, random.random() * H
+        else:
+            if abs(vx) >= abs(vy):
+                x = -L if vx > 0 else W + L
+                y = H * 0.12 + random.random() * H * 0.76
+            else:
+                x = W * 0.08 + random.random() * W * 0.84
+                y = -L if vy > 0 else H + L
+        spd_scale = max(0.5, self.wind_speed / 8.0)
+        return {
+            'x': x, 'y': y,
+            'spd': (self._px_per_frame + random.random() * 0.5) * spd_scale,
+            'alpha': random.uniform(0.15, 0.80) if scatter else 0.05,
+            'growing': not scatter,
+        }
+
+    def _recycle_arrow(self, a, W, H):
+        a['growing'] = True
+        a['alpha']   = 0.05
+        vx, vy = self._arrow_vx, self._arrow_vy
+        L = self._arrow_len
+        spd_scale = max(0.5, self.wind_speed / 8.0)
+        a['spd'] = (self._px_per_frame + random.random() * 0.5) * spd_scale
+        if abs(vx) >= abs(vy):
+            a['x'] = -L if vx > 0 else W + L
+            a['y'] = H * 0.12 + random.random() * H * 0.76
+        else:
+            a['x'] = W * 0.08 + random.random() * W * 0.84
+            a['y'] = -L if vy > 0 else H + L
+
+    def _init_scene_particles(self):
+        W, H = self.width() or 600, self.height() or 180
+        vx, vy = self._arrow_vx, self._arrow_vy
+        scene = self.condition
+
+        self._clouds    = []
+        self._drops     = []
+        self._flakes    = []
+        self._bolt      = None
+        self._fog_banks = []
+
+        if scene in ("clouds",):
+            for spd in (0.28, 0.18, 0.38, 0.24):
+                self._clouds.append(_Cloud(W, H, spd, scatter=True))
+        elif scene == "overcast":
+            for spd in (0.20, 0.13, 0.30, 0.17, 0.25):
+                self._clouds.append(_Cloud(W, H, spd, scatter=True, dark=True))
+        elif scene == "mist":
+            self._drops = [_MistDrop(W, H, vx, vy) for _ in range(220)]
+        elif scene == "fog":
+            self._fog_banks = [_FogBank(W, H) for _ in range(6)]
+        elif scene == "rain":
+            self._drops = [_RainDrop(W, H, vx, vy, heavy=False) for _ in range(100)]
+        elif scene == "thunder":
+            self._drops = [_RainDrop(W, H, vx, vy, heavy=True)  for _ in range(160)]
+            self._bolt  = _LightningBolt(W, H)
+        elif scene == "snow":
+            self._flakes = [_Snowflake(W, H, vx) for _ in range(75)]
+
+    # ── animation tick (called by QTimer) ────────────────────────────────────
+
+    def _tick(self):
+        self._t += 16.0   # ~16 ms per frame
+        self.update()     # schedule a repaint
+
+    # ── Qt paint ──────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        W, H = self.width(), self.height()
+        if W <= 0 or H <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # If particles haven't been sized for this widget size, reinit
+        if not self._arrows:
+            self._init_arrows()
+            self._init_scene_particles()
+
+        t = self._t
+        scene = self.condition
+
+        # ── 1. Draw background ────────────────────────────────────────────
+        self._draw_background(painter, W, H, t, scene)
+
+        # ── 2. Tick + draw scene particles ────────────────────────────────
+        self._tick_and_draw_particles(painter, W, H, scene)
+
+        # ── 3. Draw flowing wind arrows ───────────────────────────────────
+        self._draw_arrows(painter, W, H)
+
+        painter.end()
+
+    # ── background scenes ─────────────────────────────────────────────────────
+
+    def _draw_background(self, painter, W, H, t, scene):
+        if scene == "clear":
+            self._bg_clear(painter, W, H, t)
+        elif scene == "clouds":
+            self._bg_blue_sky(painter, W, H)        # sky behind clouds drawn separately
+        elif scene == "overcast":
+            self._bg_overcast(painter, W, H, t)
+        elif scene == "rain":
+            self._bg_rain(painter, W, H)
+        elif scene == "mist":
+            self._bg_mist(painter, W, H, t)
+        elif scene == "fog":
+            self._bg_fog(painter, W, H, t)
+        elif scene == "thunder":
+            self._bg_thunder(painter, W, H)
+        elif scene == "snow":
+            self._bg_snow(painter, W, H)
+        elif scene == "haze":
+            self._bg_haze(painter, W, H, t)
+        else:
+            self._bg_clear(painter, W, H, t)
+
+    # ── individual background painters ───────────────────────────────────────
+
+    def _bg_clear(self, painter, W, H, t):
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, QColor(9,   30,  74))
+        grad.setColorAt(0.5, QColor(18,  82, 160))
+        grad.setColorAt(1.0, QColor(40, 120, 200))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+        # animated sun
+        sx = int(W * 0.80 + math.sin(t * 0.00025) * 6)
+        sy = int(H * 0.30 + math.cos(t * 0.00018) * 3)
+        for radius, alpha in ((64, 28), (40, 55), (22, 110), (20, 220)):
+            c = QColor(255, 225, 80, alpha)
+            painter.setBrush(QBrush(c)); painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(sx, sy), radius, radius)
+
+    def _bg_blue_sky(self, painter, W, H):
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, QColor(18,  34,  64))
+        grad.setColorAt(0.6, QColor(30,  72, 117))
+        grad.setColorAt(1.0, QColor(46, 106, 170))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+    def _bg_overcast(self, painter, W, H, t):
+        # Deep slate base
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, QColor(28, 32, 38))
+        grad.setColorAt(0.5, QColor(44, 50, 60))
+        grad.setColorAt(1.0, QColor(58, 66, 76))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+        # Rows of cloud blobs, each row scrolling at its own speed — no wobble
+        cloud_layers = [
+            # (speed, y_frac, blob_spacing, blob_rw, blob_rh, color, alpha)
+            (0.018, 0.12, 115, 82, 46, QColor(88,  98, 112), 200),
+            (0.010, 0.30,  95, 72, 40, QColor(68,  78,  92), 225),
+            (0.024, 0.50, 105, 70, 38, QColor(100,112, 126), 175),
+            (0.007, 0.68, 125, 92, 50, QColor(76,  88, 102), 155),
+        ]
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        for spd, yf, spacing, rw, rh, color, max_alpha in cloud_layers:
+            offset = (t * spd) % spacing
+            cy = H * yf
+            x = -offset - rw
+            while x < W + rw:
+                cg = QRadialGradient(x - rw * 0.15, cy - rh * 0.25, 0)
+                cg.setCenter(x, cy)
+                cg.setRadius(max(rw, rh))
+                cg.setFocalPoint(x - rw * 0.15, cy - rh * 0.25)
+                c_inner = QColor(color); c_inner.setAlpha(max_alpha)
+                c_mid   = QColor(color); c_mid.setAlpha(int(max_alpha * 0.55))
+                c_outer = QColor(color); c_outer.setAlpha(0)
+                cg.setColorAt(0.0, c_inner)
+                cg.setColorAt(0.5, c_mid)
+                cg.setColorAt(1.0, c_outer)
+                painter.save()
+                painter.setBrush(QBrush(cg))
+                painter.drawEllipse(QPointF(x, cy), float(rw), float(rh))
+                painter.restore()
+                x += spacing
+
+        # Dark ceiling from top
+        ceiling = QLinearGradient(0, 0, 0, H * 0.40)
+        ceiling.setColorAt(0.0, QColor(18, 20, 26, 200))
+        ceiling.setColorAt(1.0, QColor(18, 20, 26, 0))
+        painter.fillRect(0, 0, W, int(H * 0.40), QBrush(ceiling))
+
+    def _bg_rain(self, painter, W, H):
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, QColor(12, 19, 24))
+        grad.setColorAt(0.5, QColor(20, 30, 40))
+        grad.setColorAt(1.0, QColor(28, 44, 58))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+        cloud_grad = QLinearGradient(0, 0, 0, int(H * 0.42))
+        cloud_grad.setColorAt(0.0, QColor(14, 18, 26, 230))
+        cloud_grad.setColorAt(1.0, QColor(22, 32, 44, 0))
+        painter.fillRect(0, 0, W, int(H * 0.42), QBrush(cloud_grad))
+
+    def _bg_mist(self, painter, W, H, t):
+        # Cool blue-grey sky — muted and low visibility
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0,  QColor(62,  74,  84))
+        grad.setColorAt(0.55, QColor(86, 100, 112))
+        grad.setColorAt(1.0,  QColor(104, 118, 130))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+        # Thin gauzy veil across the whole frame — low visibility feeling
+        veil = QLinearGradient(0, 0, 0, H)
+        veil.setColorAt(0.0, QColor(160, 178, 190, 55))
+        veil.setColorAt(1.0, QColor(172, 188, 198, 88))
+        painter.fillRect(0, 0, W, H, QBrush(veil))
+
+    def _bg_fog(self, painter, W, H, t):
+        # Pale, washed-out sky — visibility near zero
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0,  QColor(148, 158, 165))
+        grad.setColorAt(0.50, QColor(168, 178, 184))
+        grad.setColorAt(1.0,  QColor(182, 192, 198))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+        # ── City skyline silhouette in lower ~40% of frame ───────────────────
+        # Deterministic buildings derived from W so they don't jitter each frame
+        painter.setPen(Qt.PenStyle.NoPen)
+        building_color = QColor(88, 94, 102, 210)
+        painter.setBrush(QBrush(building_color))
+
+        # Use a fixed seed-like sequence based on W to get stable widths/heights
+        bx = 0
+        idx = 0
+        while bx < W:
+            # pseudo-random but stable: vary by position
+            w  = 28 + (((bx * 7 + idx * 31) % 40))
+            h  = int(H * (0.22 + ((bx * 13 + idx * 17) % 100) / 100.0 * 0.28))
+            by = H - h
+            painter.drawRect(bx, by, w - 2, h)
+
+            # Some buildings get a small antenna/spire
+            if (bx * 3 + idx) % 5 == 0:
+                spire_w = 3
+                spire_h = int(h * 0.18 + 6)
+                painter.drawRect(bx + w // 2 - 1, by - spire_h, spire_w, spire_h)
+
+            # Dim lit windows — small rectangles, fixed positions per building
+            win_color = QColor(210, 200, 160, 55)
+            painter.setBrush(QBrush(win_color))
+            rows = max(1, h // 18)
+            cols = max(1, (w - 4) // 10)
+            for row in range(rows):
+                for col in range(cols):
+                    if (bx + row * 7 + col * 13) % 3 != 0:  # skip some — not all lit
+                        wx2 = bx + 4 + col * 10
+                        wy  = by + 6 + row * 16
+                        if wy + 6 < H:
+                            painter.drawRect(wx2, wy, 5, 6)
+            painter.setBrush(QBrush(building_color))
+
+            bx  += w
+            idx += 1
+
+        # Slightly darker ground strip below skyline
+        ground = QLinearGradient(0, int(H * 0.78), 0, H)
+        ground.setColorAt(0.0, QColor(70, 76, 84, 180))
+        ground.setColorAt(1.0, QColor(55, 60, 68, 255))
+        painter.fillRect(0, int(H * 0.78), W, int(H * 0.22), QBrush(ground))
+        fl = 0
+        if self._bolt and self._bolt.visible and self._bolt.alpha > 0:
+            fl = self._bolt.alpha * 0.10
+        r0 = int(10 + fl * 90); g0 = int(6  + fl * 40); b0 = int(18 + fl * 70)
+        r1 = int(15 + fl * 60); g1 = int(10 + fl * 35); b1 = int(28 + fl * 55)
+        r2 = int(20 + fl * 40); g2 = int(16 + fl * 30); b2 = int(36 + fl * 40)
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0, QColor(r0, g0, b0))
+        grad.setColorAt(0.6, QColor(r1, g1, b1))
+        grad.setColorAt(1.0, QColor(r2, g2, b2))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+
+    def _bg_snow(self, painter, W, H):
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0,  QColor(24, 32, 48))
+        grad.setColorAt(0.55, QColor(38, 56, 72))
+        grad.setColorAt(1.0,  QColor(52, 72, 88))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+        ceil_grad = QLinearGradient(0, 0, 0, int(H * 0.38))
+        ceil_grad.setColorAt(0.0, QColor(72, 88, 108, 140))
+        ceil_grad.setColorAt(1.0, QColor(72, 88, 108, 0))
+        painter.fillRect(0, 0, W, int(H * 0.38), QBrush(ceil_grad))
+
+    def _bg_haze(self, painter, W, H, t):
+        grad = QLinearGradient(0, 0, 0, H)
+        grad.setColorAt(0.0,  QColor(48, 40, 24))
+        grad.setColorAt(0.55, QColor(80, 64, 48))
+        grad.setColorAt(1.0,  QColor(112, 88, 72))
+        painter.fillRect(0, 0, W, H, QBrush(grad))
+        haze_layers = [(0.008, 0.55, 28), (0.005, 0.72, 20), (0.013, 0.38, 18)]
+        for spd, yf, alpha in haze_layers:
+            offset = (t * spd) % W
+            cy = H * yf
+            for rep in range(-1, 3):
+                cx = -offset + rep * W + W * 0.5
+                hg = QRadialGradient(cx, cy, W * 0.55)
+                hg.setColorAt(0.0, QColor(215, 178, 88, alpha))
+                hg.setColorAt(0.5, QColor(205, 168, 72, int(alpha * 0.4)))
+                hg.setColorAt(1.0, QColor(205, 168, 72, 0))
+                painter.save()
+                painter.setBrush(QBrush(hg)); painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(cx, cy), W * 0.55, H * 0.13)
+                painter.restore()
+        # diffuse sun
+        sx, sy = W * 0.76, H * 0.24
+        for radius, alpha in ((66, 20), (42, 50), (15, 165)):
+            c = QColor(255, 210, 80, alpha)
+            painter.setBrush(QBrush(c)); painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(sx, sy), radius, radius)
+
+    # ── particle tick + draw ──────────────────────────────────────────────────
+
+    def _tick_and_draw_particles(self, painter, W, H, scene):
+        if scene in ("clouds", "overcast"):
+            for c in self._clouds:
+                c.tick(1.0)
+                c.draw(painter)
+        if scene in ("rain", "thunder", "mist"):
+            for d in self._drops:
+                d.tick(1.0)
+                d.draw(painter)
+        if scene == "fog":
+            for fb in self._fog_banks:
+                fb.tick(1.0)
+                fb.draw(painter)
+        if scene == "thunder" and self._bolt:
+            self._bolt.tick()
+            self._bolt.draw(painter, W, H)
+        if scene == "snow":
+            for f in self._flakes:
+                f.tick(1.0)
+                f.draw(painter)
+
+    # ── flowing arrow renderer ────────────────────────────────────────────────
+
+    def _draw_arrows(self, painter, W, H):
+        vx, vy = self._arrow_vx, self._arrow_vy
+        L   = self._arrow_len
+        AW  = self._arrow_w
+        TL  = self._tail_len
+        r, g, b = self._ar, self._ag, self._ab
+        angle = math.atan2(vy, vx)
+        margin = L + 24
+
+        for a in self._arrows:
+            a['x'] += vx * a['spd']
+            a['y'] += vy * a['spd']
+            if a['growing']:
+                a['alpha'] = min(0.88, a['alpha'] + 0.022)
+                if a['alpha'] >= 0.88:
+                    a['growing'] = False
+            if (a['x'] < -margin or a['x'] > W + margin or
+                    a['y'] < -margin or a['y'] > H + margin):
+                self._recycle_arrow(a, W, H)
+                continue
+
+            alpha_i = int(a['alpha'] * 255)
+            painter.save()
+            painter.translate(a['x'], a['y'])
+            painter.rotate(math.degrees(angle))
+
+            # Tapered body via bezier path
+            path = QPainterPath()
+            path.moveTo(-TL, 0)
+            path.cubicTo(-TL * 0.3, -AW * 0.38,
+                          L  * 0.30, -AW * 0.44,
+                          L  * 0.55,  0)
+            path.cubicTo( L  * 0.30,  AW * 0.44,
+                          -TL * 0.3,  AW * 0.38,
+                          -TL,  0)
+
+            body_grad = QLinearGradient(-TL, 0, L * 0.55, 0)
+            body_grad.setColorAt(0.00, QColor(r, g, b, 0))
+            body_grad.setColorAt(0.35, QColor(r, g, b, int(alpha_i * 0.18)))
+            body_grad.setColorAt(0.72, QColor(r, g, b, int(alpha_i * 0.65)))
+            body_grad.setColorAt(1.00, QColor(r, g, b, 0))
+            painter.setBrush(QBrush(body_grad))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+
+            # Arrowhead triangle
+            hx0, hx1 = L * 0.44, L * 0.75
+            head = QPainterPath()
+            head.moveTo(hx1,  0)
+            head.lineTo(hx0, -AW * 0.90)
+            head.lineTo(hx0 + L * 0.065, 0)
+            head.lineTo(hx0,  AW * 0.90)
+            head.closeSubpath()
+            head_grad = QLinearGradient(hx0, 0, hx1, 0)
+            head_grad.setColorAt(0.0, QColor(r, g, b, int(alpha_i * 0.92)))
+            head_grad.setColorAt(1.0, QColor(r, g, b, int(alpha_i * 0.22)))
+            painter.setBrush(QBrush(head_grad))
+            painter.drawPath(head)
+
+            # Soft glow halo around head
+            glow_grad = QRadialGradient(L * 0.60, 0, AW * 1.7)
+            glow_grad.setColorAt(0.0, QColor(r, g, b, int(alpha_i * 0.16)))
+            glow_grad.setColorAt(1.0, QColor(r, g, b, 0))
+            painter.setBrush(QBrush(glow_grad))
+            painter.drawEllipse(QPointF(L * 0.60, 0), AW * 1.6, AW * 1.25)
+
+            painter.restore()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        super().closeEvent(event)
+
+
+# ── Scene particle helpers (module-level, used only by WindVectorWidget) ──────
+
+
+class _Cloud:
+    """Drifting cloud puff cluster with lit top / shadowed base."""
+    def __init__(self, W, H, spd, scatter=True, dark=False):
+        self.W = W; self.H = H; self.base_spd = spd; self.dark = dark
+        self._randomize(scatter)
+
+    def _randomize(self, scatter=False):
+        self.x     = random.random() * self.W if scatter else -340
+        self.y     = self.H * (0.06 + random.random() * 0.54)
+        self.spd   = self.base_spd * (0.7 + random.random() * 0.6)
+        # dark clouds are more opaque — they're heavy and thick
+        self.alpha = (0.55 + random.random() * 0.30) if self.dark else (0.40 + random.random() * 0.35)
+        self.scale = 0.60 + random.random() * 0.85
+        n = 4 + int(random.random() * 4)
+        self.puffs = [{
+            'ox': (i - n / 2) * 36 * self.scale + (random.random() - 0.5) * 10,
+            'oy': (random.random() - 0.5) * 18 * self.scale,
+            'r':  (28 + random.random() * 30) * self.scale
+        } for i in range(n)]
+
+    def tick(self, dt):
+        self.x += self.spd * dt
+        if self.x > self.W + 380:
+            self._randomize(False)
+
+    def draw(self, painter):
+        painter.setPen(Qt.PenStyle.NoPen)
+        for p in self.puffs:
+            gx = self.x + p['ox']; gy = self.y + p['oy']; r = p['r']
+
+            if self.dark:
+                # Dark overcast puff: heavy charcoal base, almost no bright top
+                # Shadow underneath — gives the cloud its belly
+                shadow_cg = QRadialGradient(gx, gy + r * 0.30, r * 0.20)
+                shadow_cg.setCenter(gx, gy + r * 0.30)
+                shadow_cg.setRadius(r * 1.05)
+                shadow_cg.setFocalPoint(gx, gy + r * 0.30)
+                shadow_cg.setColorAt(0.0, QColor(30,  34,  42, int(self.alpha * 255)))
+                shadow_cg.setColorAt(0.5, QColor(48,  54,  66, int(self.alpha * 200)))
+                shadow_cg.setColorAt(1.0, QColor(48,  54,  66, 0))
+                painter.save()
+                painter.setBrush(QBrush(shadow_cg))
+                painter.drawEllipse(QPointF(gx, gy), r, r)
+                painter.restore()
+
+                # Main body — dark slate
+                body_cg = QRadialGradient(gx - r * 0.18, gy - r * 0.20, r * 0.10)
+                body_cg.setCenter(gx, gy)
+                body_cg.setRadius(r)
+                body_cg.setFocalPoint(gx - r * 0.18, gy - r * 0.20)
+                body_cg.setColorAt(0.0, QColor(72,  80,  96, int(self.alpha * 255)))
+                body_cg.setColorAt(0.5, QColor(58,  66,  80, int(self.alpha * 220)))
+                body_cg.setColorAt(1.0, QColor(44,  50,  62, 0))
+                painter.save()
+                painter.setBrush(QBrush(body_cg))
+                painter.drawEllipse(QPointF(gx, gy), r, r)
+                painter.restore()
+
+                # Faint silver highlight on the very top rim
+                hi_cg = QRadialGradient(gx - r * 0.12, gy - r * 0.42, 0)
+                hi_cg.setCenter(gx - r * 0.12, gy - r * 0.38)
+                hi_cg.setRadius(r * 0.55)
+                hi_cg.setFocalPoint(gx - r * 0.12, gy - r * 0.42)
+                hi_cg.setColorAt(0.0, QColor(120, 130, 148, int(self.alpha * 160)))
+                hi_cg.setColorAt(1.0, QColor(120, 130, 148, 0))
+                painter.save()
+                painter.setBrush(QBrush(hi_cg))
+                painter.drawEllipse(QPointF(gx - r * 0.12, gy - r * 0.38), r * 0.55, r * 0.42)
+                painter.restore()
+
+            else:
+                # Bright broken-cloud puff: white top, blue-grey base
+                # Shadow belly first so it sits behind the body
+                belly_cg = QRadialGradient(gx, gy + r * 0.25, r * 0.15)
+                belly_cg.setCenter(gx, gy + r * 0.22)
+                belly_cg.setRadius(r * 0.90)
+                belly_cg.setFocalPoint(gx, gy + r * 0.25)
+                belly_cg.setColorAt(0.0, QColor(148, 170, 192, int(self.alpha * 180)))
+                belly_cg.setColorAt(1.0, QColor(148, 170, 192, 0))
+                painter.save()
+                painter.setBrush(QBrush(belly_cg))
+                painter.drawEllipse(QPointF(gx, gy + r * 0.10), r, r * 0.70)
+                painter.restore()
+
+                # Main body — bright white-blue
+                body_cg = QRadialGradient(gx - r * 0.20, gy - r * 0.22, r * 0.08)
+                body_cg.setCenter(gx, gy)
+                body_cg.setRadius(r)
+                body_cg.setFocalPoint(gx - r * 0.20, gy - r * 0.22)
+                body_cg.setColorAt(0.0, QColor(240, 248, 255, int(self.alpha * 255)))
+                body_cg.setColorAt(0.45,QColor(210, 228, 244, int(self.alpha * 220)))
+                body_cg.setColorAt(0.80,QColor(178, 200, 222, int(self.alpha * 140)))
+                body_cg.setColorAt(1.0, QColor(160, 185, 210, 0))
+                painter.save()
+                painter.setBrush(QBrush(body_cg))
+                painter.drawEllipse(QPointF(gx, gy), r, r)
+                painter.restore()
+
+                # Bright specular highlight on upper-left
+                hi_cg = QRadialGradient(gx - r * 0.15, gy - r * 0.40, 0)
+                hi_cg.setCenter(gx - r * 0.15, gy - r * 0.35)
+                hi_cg.setRadius(r * 0.50)
+                hi_cg.setFocalPoint(gx - r * 0.15, gy - r * 0.40)
+                hi_cg.setColorAt(0.0, QColor(255, 255, 255, int(self.alpha * 200)))
+                hi_cg.setColorAt(1.0, QColor(255, 255, 255, 0))
+                painter.save()
+                painter.setBrush(QBrush(hi_cg))
+                painter.drawEllipse(QPointF(gx - r * 0.15, gy - r * 0.35), r * 0.50, r * 0.38)
+                painter.restore()
+
+
+class _RainDrop:
+    """A single animated raindrop."""
+    def __init__(self, W, H, vx, vy, heavy=False):
+        self.W = W; self.H = H; self.vx = vx; self.vy = vy; self.heavy = heavy
+        self._reset(scatter=True)
+
+    def _reset(self, scatter=False):
+        self.x     = random.random() * (self.W + 80) - 20
+        self.y     = random.random() * self.H if scatter else -16
+        self.length= (12 + random.random() * 16) if self.heavy else (7 + random.random() * 12)
+        self.spd   = (9  + random.random() *  7) if self.heavy else (6 + random.random() *  5)
+        self.alpha = (0.20 + random.random() * 0.40) if self.heavy else (0.25 + random.random() * 0.45)
+        self.lw    = 1.1 if self.heavy else 0.7
+
+    def tick(self, dt):
+        self.x += self.vx * self.spd * 0.45 * dt
+        self.y += (self.vy * self.spd * 0.18 + self.spd) * dt
+        if self.y > self.H + 20 or self.x < -60 or self.x > self.W + 60:
+            self._reset(False)
+
+    def draw(self, painter):
+        ang = math.atan2(self.vy * 0.18 + 1, self.vx * 0.45)
+        ex  = self.x + math.cos(ang) * self.length
+        ey  = self.y + math.sin(ang) * self.length
+        color = QColor(122, 176, 204, int(self.alpha * 255)) if self.heavy else QColor(144, 192, 216, int(self.alpha * 255))
+        pen = QPen(color, self.lw)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.save(); painter.setPen(pen)
+        painter.drawLine(QPointF(self.x, self.y), QPointF(ex, ey))
+        painter.restore()
+
+
+class _FogBank:
+    """A wide, slowly drifting fog bank that rolls across the skyline,
+    partially obscuring the city silhouette below it."""
+    def __init__(self, W, H):
+        self.W = W; self.H = H
+        self._reset(scatter=True)
+
+    def _reset(self, scatter=False):
+        self.w     = self.W * (0.45 + random.random() * 0.60)
+        self.h     = self.H * (0.18 + random.random() * 0.22)
+        self.x     = random.random() * self.W if scatter else -self.w
+        # Sits in the lower-mid area — hugging the skyline tops
+        self.y     = self.H * (0.38 + random.random() * 0.28)
+        self.spd   = 0.12 + random.random() * 0.20
+        self.alpha = 0.55 + random.random() * 0.30
+
+    def tick(self, dt):
+        self.x += self.spd * dt
+        if self.x > self.W + self.w:
+            self._reset(False)
+
+    def draw(self, painter):
+        cx = self.x + self.w * 0.5
+        cy = self.y + self.h * 0.5
+        # Soft wide ellipse — feathered edges
+        for layer, frac, a_scale in (
+            (0, 1.00, 1.00),
+            (1, 0.80, 0.60),
+            (2, 0.55, 0.30),
+        ):
+            ew = self.w * frac
+            eh = self.h * frac
+            g = QRadialGradient(cx, cy, max(ew, eh))
+            g.setCenter(cx, cy)
+            g.setRadius(max(ew, eh))
+            g.setFocalPoint(cx, cy)
+            alpha = int(self.alpha * a_scale * 255)
+            g.setColorAt(0.0, QColor(195, 205, 212, alpha))
+            g.setColorAt(0.5, QColor(188, 198, 206, alpha // 2))
+            g.setColorAt(1.0, QColor(185, 196, 204, 0))
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(g))
+            painter.drawEllipse(QPointF(cx, cy), ew, eh)
+            painter.restore()
+
+
+class _MistDrop:
+    """Tiny suspended drizzle droplet — much shorter and slower than rain,
+    falls nearly straight down with minimal horizontal drift, giving the
+    impression of fine mist / drizzle hanging in the air."""
+    def __init__(self, W, H, vx, vy):
+        self.W = W; self.H = H; self.vx = vx; self.vy = vy
+        self._reset(scatter=True)
+
+    def _reset(self, scatter=False):
+        self.x      = random.random() * (self.W + 40) - 20
+        self.y      = random.random() * self.H if scatter else -6
+        # Very short — just a pixel or two, barely a streak
+        self.length = 2.0 + random.random() * 4.0
+        # Slow fall
+        self.spd    = 1.2 + random.random() * 1.8
+        # Semi-transparent — looks suspended, not driving
+        self.alpha  = 0.25 + random.random() * 0.45
+        self.lw     = 0.8 + random.random() * 0.6
+
+    def tick(self, dt):
+        # Very slight horizontal drift from wind, predominantly vertical
+        self.x += self.vx * self.spd * 0.18 * dt
+        self.y += self.spd * dt
+        if self.y > self.H + 8 or self.x < -30 or self.x > self.W + 30:
+            self._reset(False)
+
+    def draw(self, painter):
+        # Near-vertical angle with just a whisper of wind lean
+        ang = math.atan2(1.0, self.vx * 0.12)
+        ex = self.x + math.cos(ang) * self.length
+        ey = self.y + math.sin(ang) * self.length
+        color = QColor(172, 196, 212, int(self.alpha * 255))
+        pen = QPen(color, self.lw)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.save()
+        painter.setPen(pen)
+        painter.drawLine(QPointF(self.x, self.y), QPointF(ex, ey))
+        painter.restore()
+
+
+class _LightningBolt:
+    """Randomly fires branched lightning bolts."""
+    def __init__(self, W, H):
+        self.W = W; self.H = H
+        self.visible  = False
+        self.alpha    = 0.0
+        self.cooldown = 80 + random.random() * 140
+        self.timer    = random.random() * 60
+        self.segs     = []
+        self._build()
+
+    def _build(self):
+        self.segs = []
+        cx = self.W * (0.2 + random.random() * 0.6); cy = 0.0
+        while cy < self.H * 0.88:
+            nx = cx + (random.random() - 0.5) * 42
+            ny = cy + 16 + random.random() * 24
+            self.segs.append((cx, cy, nx, ny))
+            if random.random() < 0.2 and ny < self.H * 0.6:
+                self.segs.append((nx, ny, nx + (random.random()-0.5)*60, ny+20+random.random()*40))
+            cx = nx; cy = ny
+
+    def tick(self):
+        self.timer += 1
+        if not self.visible and self.timer >= self.cooldown:
+            self.visible = True; self.alpha = 1.0
+            self.timer = 0; self.cooldown = 80 + random.random() * 160
+            self._build()
+        if self.visible:
+            self.alpha -= 0.055
+            if self.alpha <= 0:
+                self.alpha = 0.0; self.visible = False
+
+    def draw(self, painter, W, H):
+        if not self.visible or self.alpha <= 0:
+            return
+        # Sky flash
+        painter.save()
+        painter.fillRect(0, 0, W, H, QColor(128, 144, 216, int(self.alpha * 36)))
+        painter.restore()
+        # Glow pass
+        glow_pen = QPen(QColor(176, 200, 255, int(self.alpha * 128)), 7)
+        painter.save(); painter.setPen(glow_pen)
+        for x1,y1,x2,y2 in self.segs:
+            painter.drawLine(QPointF(x1,y1), QPointF(x2,y2))
+        painter.restore()
+        # Sharp core
+        core_pen = QPen(QColor(255, 255, 255, int(self.alpha * 242)), 1.5)
+        painter.save(); painter.setPen(core_pen)
+        for x1,y1,x2,y2 in self.segs:
+            painter.drawLine(QPointF(x1,y1), QPointF(x2,y2))
+        painter.restore()
+
+
+class _Snowflake:
+    """Gently drifting snowflake."""
+    def __init__(self, W, H, vx):
+        self.W = W; self.H = H; self.vx = vx
+        self._reset(scatter=True)
+
+    def _reset(self, scatter=False):
+        self.x       = random.random() * self.W
+        self.y       = random.random() * self.H if scatter else -10
+        self.r       = 1.2 + random.random() * 3.2
+        self.spd     = 0.6 + random.random() * 1.8
+        self.wobble  = random.random() * math.pi * 2
+        self.wobble_spd = 0.025 + random.random() * 0.02
+        self.alpha   = 0.45 + random.random() * 0.55
+
+    def tick(self, dt):
+        self.wobble += self.wobble_spd * dt
+        self.x += (self.vx * self.spd * 0.65 + math.sin(self.wobble) * 0.55) * dt
+        self.y += self.spd * dt
+        if self.y > self.H + 12 or self.x < -20 or self.x > self.W + 20:
+            self._reset(False)
+
+    def draw(self, painter):
+        r = self.r * 2.2
+        grad = QRadialGradient(self.x, self.y, r)
+        grad.setColorAt(0.00, QColor(255, 255, 255, int(self.alpha * 242)))
+        grad.setColorAt(0.55, QColor(210, 228, 240, int(self.alpha * 128)))
+        grad.setColorAt(1.00, QColor(200, 218, 235, 0))
+        painter.save()
+        painter.setBrush(QBrush(grad)); painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPointF(self.x, self.y), r, r)
+        painter.restore()

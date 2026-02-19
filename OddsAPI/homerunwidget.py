@@ -15,13 +15,14 @@ from OpenGL.GLUT.fonts import *
 from xml.dom import minidom
 from PyQt6.QtSvg import QtSvg, QSvgRenderer
 from PyQt6.QtSvgWidgets import QGraphicsSvgItem
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat, QIcon
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat, QIcon, QLinearGradient, QRadialGradient, QPolygonF
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal
 import sys
+import random
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
-from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance
+from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, WindVectorWidget
 from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
@@ -59,7 +60,8 @@ class BallFlightSimulator:
         self.omega = 1800  # rpm, typical spin rate
 
     def calculate_trajectory(self, exit_velocity, vlaunch_angle, hlaunch_angle, wind_speed, wind_direction,
-                             temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0):
+                             temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0,
+                             pressure_pa=None):
         """Calculate ball trajectory based on initial conditions and environment
 
         Standard coordinate system:
@@ -73,8 +75,8 @@ class BallFlightSimulator:
         horizontal_angle = np.radians(hlaunch_angle)
         wind = wind_speed * 0.44704  # mph to m/s
         wind_rad = np.radians(wind_direction)
-        # Calculate air density based on temperature, humidity, altitude
-        rho = self.calculate_air_density(temp, humidity, altitude)
+        # Calculate air density — use measured pressure when available
+        rho = self.calculate_air_density(temp, humidity, altitude, pressure_pa=pressure_pa)
 
         # Initial conditions [x, y, z, vx, vy, vz]
         # Using the provided starting position parameters
@@ -205,35 +207,41 @@ class BallFlightSimulator:
         # Return derivatives
         return [vx, vy, vz, ax, ay, az]
 
-    def calculate_air_density(self, temp_f, humidity, altitude_ft):
-        """Calculate air density based on temperature, humidity, and altitude"""
+    def calculate_air_density(self, temp_f, humidity, altitude_ft, pressure_pa=None):
+        """Calculate air density based on temperature, humidity, altitude, and optionally
+        a measured barometric pressure.
+
+        When pressure_pa is supplied (from the live weather API in Pascals) it is used
+        directly, giving more accurate results than the altitude-only barometric formula.
+        When it is None we fall back to the standard atmosphere estimate from altitude.
+        """
         # Convert temperature from Fahrenheit to Celsius
         temp_c = (temp_f - 32) * 5/9
+        T = temp_c + 273.15  # Kelvin
 
-        # Convert altitude from feet to meters
-        altitude_m = altitude_ft * 0.3048
+        if pressure_pa is not None and pressure_pa > 0:
+            # Use the measured station pressure directly — most accurate path
+            p = float(pressure_pa)
+        else:
+            # Fall back: estimate pressure from altitude using standard atmosphere
+            altitude_m = altitude_ft * 0.3048
+            p0 = 101325  # sea level pressure in Pa
+            T0 = 288.15  # sea level standard temperature in K
+            g  = 9.81    # gravity m/s²
+            L  = 0.0065  # temperature lapse rate K/m
+            R  = 8.31447 # gas constant J/(mol·K)
+            M  = 0.0289644  # molar mass dry air kg/mol
+            p  = p0 * (1 - L * altitude_m / T0) ** (g * M / (R * L))
 
-        # Calculate air pressure at altitude (simplified model)
-        p0 = 101325  # sea level pressure in Pa
-        T0 = 288.15  # sea level temperature in K
-        g = 9.81  # gravity in m/s^2
-        L = 0.0065  # temperature lapse rate in K/m
-        R = 8.31447  # gas constant in J/(mol·K)
-        M = 0.0289644  # molar mass of dry air in kg/mol
+        # Saturation vapor pressure (Tetens formula, hPa → Pa)
+        e_s = 6.1078 * 10 ** ((7.5 * temp_c) / (237.3 + temp_c)) * 100.0  # Pa
 
-        T = temp_c + 273.15  # Convert to Kelvin
-        p = p0 * (1 - L * altitude_m / T0) ** (g * M / (R * L))
+        # Actual vapor partial pressure
+        e = (humidity / 100.0) * e_s
 
-        # Calculate saturation vapor pressure
-        e_s = 6.1078 * 10 ** ((7.5 * temp_c) / (237.3 + temp_c))
-
-        # Calculate actual vapor pressure
-        e = humidity / 100 * e_s
-
-        # Calculate air density
-        Rd = 287.05  # specific gas constant for dry air in J/(kg·K)
-        Rv = 461.495  # specific gas constant for water vapor in J/(kg·K)
-
+        # Density of moist air  ρ = (p_dry)/(Rd·T) + (e)/(Rv·T)
+        Rd = 287.05    # specific gas constant dry air  J/(kg·K)
+        Rv = 461.495   # specific gas constant water vapor J/(kg·K)
         rho = (p - e) / (Rd * T) + e / (Rv * T)
 
         return rho
@@ -447,10 +455,12 @@ class StadiumView(QGraphicsView):
         # Layers for organization
         self.stadium_layer = QGraphicsItemGroup()
         self.weather_layer = QGraphicsItemGroup()
+        self.trail_layer = QGraphicsItemGroup()   # Persistent shot trails
         self.ball_layer = QGraphicsItemGroup()
 
         self.scene.addItem(self.stadium_layer)
         self.scene.addItem(self.weather_layer)
+        self.scene.addItem(self.trail_layer)
         self.scene.addItem(self.ball_layer)
 
         # SVG renderer and items
@@ -492,6 +502,11 @@ class StadiumView(QGraphicsView):
         self.scene.addItem(self.stadium_layer)
 
         print(f"Drawing stadium using polar coordinates: {stadium_name}")
+
+        # Clear persistent trails when stadium changes
+        self.scene.removeItem(self.trail_layer)
+        self.trail_layer = QGraphicsItemGroup()
+        self.scene.addItem(self.trail_layer)
 
         # Scale factor - increased for better space usage and visibility
         scale_factor = self.field_scale
@@ -592,7 +607,7 @@ class StadiumView(QGraphicsView):
         # Compute tight scene rect from actual wall point bounds
         valid_points = [p for p in wall_points if p is not None]
         margin = 40
-        home_plate_padding = 375  # Must clear infield diamond bottom + pen widths
+        home_plate_padding = 375  # Clearance for infield diamond below home plate
         if valid_points:
             min_x = min(p.x() for p in valid_points)
             max_x = max(p.x() for p in valid_points)
@@ -923,9 +938,9 @@ class StadiumView(QGraphicsView):
         for item in self.weather_layer.childItems():
             item.setOpacity(opacity)
 
-    def start_ball_trajectory(self, trajectory_data):
+    def start_ball_trajectory(self, trajectory_data, hit_result=None):
         """Initialize the ball trajectory visualization in the 2D view with custom starting position"""
-        # Clear previous ball items, but keep start indicator
+        # Clear previous live ball items only (not persistent trails)
         for item in self.ball_layer.childItems():
             if not (hasattr(item, 'is_start_indicator') and item.is_start_indicator):
                 self.scene.removeItem(item)
@@ -950,57 +965,95 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setPen(QPen(Qt.PenStyle.NoPen))
 
         # Get the starting position and convert using same polar transform as stadium drawing
-        start_x = trajectory_data.get('start_x', 0)  # feet toward center field
-        start_z = trajectory_data.get('start_z', 0)  # feet toward right field (+) or left (-)
+        start_x = trajectory_data.get('start_x', 0)
+        start_z = trajectory_data.get('start_z', 0)
 
         start_horiz = math.sqrt(start_x**2 + start_z**2)
-        start_angle = math.atan2(start_x, start_z) + math.pi / 4  # same 45° rotation as draw_stadium_polar
+        start_angle = math.atan2(start_x, start_z) + math.pi / 4
         scene_start_x = fixed_home_x + start_horiz * math.cos(start_angle) * scale_factor
         scene_start_y = fixed_home_y - start_horiz * math.sin(start_angle) * scale_factor
 
-        # Handle degenerate case where ball starts exactly at home plate
         if start_horiz == 0:
             scene_start_x = fixed_home_x
             scene_start_y = fixed_home_y
 
-        # Create trajectory path using the same polar coordinate transform as the stadium outline
-        # Physics: x = center field distance, z = right(+)/left(-) field distance
-        # Stadium draw_stadium_polar uses: adjusted_angle = baseball_angle + pi/4
-        #   where baseball_angle 0° = right field (+Z axis), 90° = left field (-Z axis)
-        # atan2(x, z) gives 0 when z>0 (right field), pi/2 when x>0 (center field) — matches perfectly
-        path = QPainterPath()
-        path.moveTo(scene_start_x, scene_start_y)
-
+        # Build scene path points
+        path_points = [(scene_start_x, scene_start_y)]
         for i in range(0, len(trajectory_data["x"]), 5):
-            ball_x = trajectory_data["x"][i]  # center field component (feet)
-            ball_z = trajectory_data["z"][i]  # right/left field component (feet)
+            ball_x = trajectory_data["x"][i]
+            ball_z = trajectory_data["z"][i]
             horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
             adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
             scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
             scene_y = fixed_home_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
-            path.lineTo(scene_x, scene_y)
+            path_points.append((scene_x, scene_y))
 
-        self.trajectory_path = QGraphicsPathItem(path)
-        self.trajectory_path.setPen(QPen(QColor(255, 140, 0), 3, Qt.PenStyle.DashLine))
+        # --- Persistent trail in trail_layer ---
+        # Color by hit result
+        result_colors = {
+            "HOME RUN":    QColor(255, 215, 0),    # Gold
+            "OFF THE WALL":QColor(255, 140, 0),    # Orange
+            "WARNING TRACK":QColor(255, 200, 60),  # Yellow
+            "IN PLAY":     QColor(160, 220, 100),  # Green
+            "FOUL BALL":   QColor(180, 180, 180),  # Grey
+        }
+        trail_color = result_colors.get(hit_result, QColor(255, 140, 0))
 
-        # Add everything to the scene
+        trail_path = QPainterPath()
+        trail_path.moveTo(path_points[0][0], path_points[0][1])
+        for px, py in path_points[1:]:
+            trail_path.lineTo(px, py)
+
+        trail_item = QGraphicsPathItem(trail_path)
+        trail_pen = QPen(trail_color, 2, Qt.PenStyle.SolidLine)
+        trail_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        trail_item.setPen(trail_pen)
+        trail_item.setOpacity(0.75)
+
+        # Tag with hit result for potential future filtering
+        trail_item.hit_result = hit_result
+        self.trail_layer.addToGroup(trail_item)
+
+        # Landing dot at end of trail
+        land_x, land_y = path_points[-1]
+        dot_size = 7
+        land_dot = QGraphicsEllipseItem(-dot_size/2, -dot_size/2, dot_size, dot_size)
+        land_dot.setBrush(QBrush(trail_color))
+        land_dot.setPen(QPen(Qt.PenStyle.NoPen))
+        land_dot.setPos(land_x, land_y)
+        self.trail_layer.addToGroup(land_dot)
+
+        # --- Live dashed path for animation (ball_layer, gets cleared next sim) ---
+        live_path = QPainterPath()
+        live_path.moveTo(path_points[0][0], path_points[0][1])
+        for px, py in path_points[1:]:
+            live_path.lineTo(px, py)
+
+        self.trajectory_path = QGraphicsPathItem(live_path)
+        self.trajectory_path.setPen(QPen(QColor(255, 255, 255, 80), 1, Qt.PenStyle.DashLine))
+
+        # Add live items to ball_layer
         self.ball_layer.addToGroup(self.shadow_item)
         self.ball_layer.addToGroup(self.trajectory_path)
         self.ball_layer.addToGroup(self.ball_item)
 
-        # Set the ball position to the starting point
         self.ball_item.setPos(scene_start_x, scene_start_y)
         self.shadow_item.setPos(scene_start_x, scene_start_y)
 
-        # Store the starting position for animation
         self.start_x = scene_start_x
         self.start_y = scene_start_y
 
-        # Make visible
         self.ball_layer.setVisible(True)
         self.ball_layer.setZValue(100)
+        self.trail_layer.setZValue(50)
 
         return True
+
+    def clear_trails(self):
+        """Clear all persistent shot trails"""
+        self.scene.removeItem(self.trail_layer)
+        self.trail_layer = QGraphicsItemGroup()
+        self.scene.addItem(self.trail_layer)
 
     def update_ball_position(self, trajectory_data, frame):
         """Update the ball position for animation with velocity-based visual effects"""
@@ -1833,154 +1886,7 @@ class UmpireView3D(QOpenGLWidget):
 
 
 
-class WindVectorWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(180)  # Ensure enough space for wind vectors
-        self.setMaximumHeight(180)  # Fixed height
-
-        # Set background color
-        self.setAutoFillBackground(True)
-        palette = self.palette()
-        palette.setColor(self.backgroundRole(), QColor(20, 20, 20))  # Dark background
-        self.setPalette(palette)
-
-        # Wind data
-        self.wind_speed = 0
-        self.wind_direction = 0
-        self.animation_state = 0
-
-        # Animation timer
-        self.animation_timer = QTimer(self)
-        self.animation_timer.timeout.connect(self.pulse_animation)
-
-    def set_wind_data(self, speed, direction):
-        """Set wind data and update display"""
-        self.wind_speed = speed
-        self.wind_direction = direction
-        self.update()
-
-        # Start animation if not already running
-        if not self.animation_timer.isActive():
-            self.animation_timer.start(500)  # 500ms pulse interval
-
-    def pulse_animation(self):
-        """Create pulsing effect for wind vectors"""
-        self.animation_state = (self.animation_state + 1) % 3
-        self.update()
-
-    def paintEvent(self, event):
-        """Draw wind vector indicators"""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Draw wind vectors across the full width
-        width = self.width()
-        height = self.height()
-
-        # Create arrow positions spread across the full width
-        num_arrows = 4
-        arrow_positions = []
-        for i in range(num_arrows):
-            x_pos = width * (i + 0.5) / num_arrows  # Evenly space across width
-            arrow_positions.append(QPointF(x_pos, height * 0.55))
-
-        # Convert meteorological to mathematical angle
-        math_angle = (270 - self.wind_direction) % 360
-        rad_angle = math.radians(math_angle)
-
-        # Scale based on wind speed
-        scale_factor = 20
-        length = scale_factor * max(2, self.wind_speed)
-
-        # Get color based on wind speed and animation state
-        if self.wind_speed < 5:
-            base_color = QColor(80, 200, 255)  # Bright blue for light wind
-        elif self.wind_speed < 10:
-            base_color = QColor(50, 255, 120)  # Bright green for moderate wind
-        else:
-            base_color = QColor(255, 60, 60)  # Bright red for strong wind
-
-        # Adjust brightness based on animation state
-        brightness_factor = 1.0 + (self.animation_state * 0.1)
-        color = QColor(
-            min(255, int(base_color.red() * brightness_factor)),
-            min(255, int(base_color.green() * brightness_factor)),
-            min(255, int(base_color.blue() * brightness_factor))
-        )
-
-        # Draw arrows
-        for center_point in arrow_positions:
-            # Calculate endpoint
-            end_x = center_point.x() + length * math.cos(rad_angle)
-            end_y = center_point.y() + length * math.sin(rad_angle)
-
-            # Check if endpoint is within bounds
-            end_x = max(20, min(end_x, width - 20))
-            end_y = max(20, min(end_y, height - 20))
-
-            end_point = QPointF(end_x, end_y)
-
-            # Draw the arrow shaft
-            shaft_pen = QPen(color, 11)
-            painter.setPen(shaft_pen)
-            painter.drawLine(center_point, end_point)
-
-            # Draw arrowhead with slightly adjusted properties to reduce bloom
-            arrowhead_size = 25
-            angle1 = rad_angle + math.radians(150)
-            angle2 = rad_angle + math.radians(210)
-
-            # Calculate arrowhead points
-            # Create a small gap between the tip and where arrowhead lines start
-            gap = 0.5
-            tip_x = end_x - gap * math.cos(rad_angle)
-            tip_y = end_y - gap * math.sin(rad_angle)
-
-            arrow1_x = tip_x + arrowhead_size * math.cos(angle1)
-            arrow1_y = tip_y + arrowhead_size * math.sin(angle1)
-            arrow2_x = tip_x + arrowhead_size * math.cos(angle2)
-            arrow2_y = tip_y + arrowhead_size * math.sin(angle2)
-
-            arrow1_point = QPointF(arrow1_x, arrow1_y)
-            arrow2_point = QPointF(arrow2_x, arrow2_y)
-
-            # Draw arrowhead with slightly thinner lines
-            arrowhead_pen = QPen(color, 12)
-            painter.setPen(arrowhead_pen)
-            painter.drawLine(QPointF(tip_x, tip_y), arrow1_point)
-            painter.drawLine(QPointF(tip_x, tip_y), arrow2_point)
-
-        # Add wind speed text label
-        text_pen = QPen(color, 1)
-        painter.setPen(text_pen)
-        font = painter.font()
-        font.setPointSize(18)
-        painter.setFont(font)
-
-        # Draw MPH text
-        text = f"{self.wind_speed} mph"
-        font_metrics = painter.fontMetrics()
-        text_width = font_metrics.horizontalAdvance(text)
-        fixed_text_x = self.width() / 2 - text_width / 2
-        fixed_text_y = self.height() - 10
-
-        painter.drawText(QPointF(fixed_text_x, fixed_text_y), text)
-
-
-    def hideEvent(self, event):
-        """Handle widget hide event"""
-        if self.animation_timer.isActive():
-            self.animation_timer.stop()
-        super().hideEvent(event)
-
-    def closeEvent(self, event):
-        """Handle widget close event"""
-        if self.animation_timer.isActive():
-            self.animation_timer.stop()
-        super().closeEvent(event)
-
-
+# Weather animation widget and particle classes live in weatherman.py
 
 
 class StadiumSVGManager:
@@ -2230,6 +2136,8 @@ class SplitView(QWidget):
             "wind_direction": wind_direction,
             "temperature": 75,  # Default temperature
             "humidity": 50,     # Default humidity
+            "pressure_hpa": 1013.25,          # Standard atmosphere
+            "pressure_pa":  101325.0,
             "condition": "Custom",
             "description": "custom weather settings",
             "precipitation": 0,
@@ -2240,19 +2148,24 @@ class SplitView(QWidget):
     def update_weather_label(self):
         """Update the weather information display"""
         if self.weather_data:
-            wind_info = f"Wind: {self.weather_data['wind_speed']} mph at {self.weather_data['wind_direction']}°"
-            temp_info = f"Temp: {self.weather_data['temperature']}°F"
-            cond_info = f"Conditions: {self.weather_data['description']}"
-
-            self.weather_label.setText(f"{wind_info} | {temp_info} | {cond_info}")
+            wind_info  = f"Wind: {self.weather_data['wind_speed']} mph at {self.weather_data['wind_direction']}°"
+            temp_info  = f"Temp: {self.weather_data['temperature']}°F"
+            cond_info  = f"Conditions: {self.weather_data['description']}"
+            press_hpa  = self.weather_data.get("pressure_hpa", None)
+            press_info = f"Pressure: {press_hpa:.1f} hPa" if press_hpa is not None else ""
+            parts = [wind_info, temp_info, cond_info]
+            if press_info:
+                parts.append(press_info)
+            self.weather_label.setText(" | ".join(parts))
 
     def update_weather_visualization(self):
         """Update the visual representation of weather conditions"""
         if self.weather_data:
-            # Update wind vectors in the dedicated widget instead of StadiumView
             self.wind_vector_widget.set_wind_data(
                 self.weather_data["wind_speed"],
-                self.weather_data["wind_direction"]
+                self.weather_data["wind_direction"],
+                self.weather_data.get("condition", "Clear"),
+                self.weather_data.get("description", "clear sky")
             )
 
     def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
@@ -2281,7 +2194,8 @@ class SplitView(QWidget):
             self.altitude,
             start_x,
             start_y,
-            start_z
+            start_z,
+            pressure_pa=self.weather_data.get("pressure_pa", None)
         )
 
         if LOG_BALL_PHYSICS:
@@ -2299,7 +2213,10 @@ class SplitView(QWidget):
         if LOG_BALL_PHYSICS: print_physics_summary(self.trajectory_data);
 
         # Initialize ball visualization in top-down view
-        success = self.stadium_view.start_ball_trajectory(self.trajectory_data)
+        # Classify result first so trail gets correct color immediately
+        hit_result = self.classify_hit_result(self.trajectory_data)
+
+        success = self.stadium_view.start_ball_trajectory(self.trajectory_data, hit_result=hit_result)
         if not success:
             print("Warning: Failed to visualize trajectory in 2D view")
 
@@ -2309,16 +2226,12 @@ class SplitView(QWidget):
         # Start animation
         self.current_frame = 0
 
-        # Check if it's a home run
-        is_home_run = self.check_if_home_run(self.trajectory_data)
-
         # Calculate stats
         distance = self.trajectory_data["distance"]
         max_height = max(self.trajectory_data["y"])
-        hr_text = "HOME RUN!" if is_home_run else ""
 
         # Create stats text
-        stats_text = f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm | Dist: {distance:.1f} ft | Height: {max_height:.1f} ft {hr_text}"
+        stats_text = f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm | Dist: {distance:.1f} ft | Height: {max_height:.1f} ft | {hit_result}"
 
         # Add to flight stats list
         self.flight_stats_list.addItem(stats_text)
@@ -2328,7 +2241,7 @@ class SplitView(QWidget):
         self.flight_info_label.setText(
             f"Distance: {distance:.1f} ft | Max Height: {max_height:.1f} ft | "
             f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm"
-            f"{' - ' + hr_text if hr_text else ''}"
+            f" | {hit_result}"
         )
 
         # Start animation timer
@@ -2371,51 +2284,64 @@ class SplitView(QWidget):
         self.umpire_view.update()
         self.update()
 
-    def check_if_home_run(self, trajectory_data):
-        """Check if the trajectory results in a home run using precise polar coordinate data"""
+    def classify_hit_result(self, trajectory_data):
+        """Classify the hit as HOME RUN, OFF THE WALL, WARNING TRACK, IN PLAY, or FOUL BALL"""
         if not self.stadium_name or not trajectory_data:
-            return False
+            return "IN PLAY"
 
-        # Get the final point in the trajectory
-        final_x = trajectory_data["x"][-1]  # Distance toward center field (feet)
-        final_z = trajectory_data["z"][-1]  # Distance toward right field (+) or left field (-) (feet)
-        final_height = trajectory_data["y"][-1]  # Height above ground (feet)
+        final_x = trajectory_data["x"][-1]
+        final_z = trajectory_data["z"][-1]
 
-        # Calculate distance from home plate in the horizontal plane
         distance = np.sqrt(final_x**2 + final_z**2)
 
-        # Calculate the baseball polar angle from the trajectory coordinates
-        # Convert from trajectory coordinates to baseball polar coordinates
-        # Trajectory: +X = toward center field, +Z = toward right field
-        # Baseball polar: 0° = right field foul line, 90° = left field foul line
-
-        # Calculate angle from right field foul line
-        angle_rad = math.atan2(final_x, final_z)  # atan2(center_field_distance, right_field_distance)
+        angle_rad = math.atan2(final_x, final_z)
         angle_deg = math.degrees(angle_rad)
-
-        # Convert to baseball polar coordinate system (0-90 degrees)
         if angle_deg < 0:
-            angle_deg += 180  # Handle negative angles
+            angle_deg += 180
 
-        # Clamp to fair territory (0-90 degrees)
+        # Outside fair territory
         if angle_deg < 0 or angle_deg > 90:
-            return False  # Foul ball
+            return "FOUL BALL"
 
-        # Get the precise wall distance at this angle using polar coordinate data
         wall_distance = get_stadium_wall_distance(self.stadium_name, angle_deg)
-
         if wall_distance is None:
-            # Fallback to basic dimensions if polar data unavailable
-            return self.check_if_home_run_fallback(final_x, final_z, final_height)
+            return "IN PLAY"
 
-        # Check if the ball cleared the wall and was high enough
-        # Ball must be above ~8 feet at the wall to be a home run
-        cleared_wall = distance >= wall_distance
-        high_enough = final_height > 8
+        warning_track_start = wall_distance - 20
 
-        print(f"HR Check: angle={angle_deg:.1f}°, distance={distance:.1f}ft, wall={wall_distance:.1f}ft, height={final_height:.1f}ft, cleared={cleared_wall}, high={high_enough}")
+        # Find the height of the ball when it reaches wall_distance
+        # Walk trajectory to find the frame where horizontal distance crosses wall_distance
+        height_at_wall = None
+        xs = trajectory_data["x"]
+        zs = trajectory_data["z"]
+        ys = trajectory_data["y"]
+        for i in range(1, len(xs)):
+            d_prev = math.sqrt(xs[i-1]**2 + zs[i-1]**2)
+            d_curr = math.sqrt(xs[i]**2 + zs[i]**2)
+            if d_prev <= wall_distance <= d_curr and d_curr > d_prev:
+                # Linearly interpolate height at exact wall crossing
+                frac = (wall_distance - d_prev) / (d_curr - d_prev)
+                height_at_wall = ys[i-1] + frac * (ys[i] - ys[i-1])
+                break
 
-        return cleared_wall and high_enough
+
+        # Typical MLB wall height is ~8 ft; use that if we found a crossing
+        wall_height = 8
+        cleared_wall_height = (height_at_wall is not None and height_at_wall >= wall_height)
+
+        if distance >= wall_distance:
+            if cleared_wall_height:
+                return "HOME RUN"
+            else:
+                return "OFF THE WALL"
+        elif distance >= warning_track_start:
+            return "WARNING TRACK"
+        else:
+            return "IN PLAY"
+
+    def check_if_home_run(self, trajectory_data):
+        """Check if the trajectory results in a home run using precise polar coordinate data"""
+        return self.classify_hit_result(trajectory_data) == "HOME RUN"
 
     def check_if_home_run_fallback(self, final_x, final_z, final_height):
         """Fallback homerun detection using basic dimensions"""
