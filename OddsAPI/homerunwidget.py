@@ -493,81 +493,94 @@ class StadiumView(QGraphicsView):
         
         # Home plate position - centered horizontally, positioned to show full field
         home_plate_x = 0
-        home_plate_y = 200  # Reduced to show more of the field in view
+        home_plate_y = 200
+
+        # Check if stadium has Cartesian wall data (more accurate for complex shapes)
+        stadium_data = STADIUM_DATA.get(stadium_name, {})
         
-        # Generate points for the outfield wall using polar coordinates
-        wall_points = []
-        angle_step = 1.0  # 1-degree increments for smooth curve
+        if "cartesian_wall" in stadium_data:
+            # Use Cartesian wall points directly
+            # Convert (x, z) in feet to scene coordinates using same transform as ball path
+            wall_points = []
+            for (wx, wz) in stadium_data["cartesian_wall"]:
+                horiz_dist = math.sqrt(wx**2 + wz**2)
+                adjusted_angle = math.atan2(wx, wz) + math.pi / 4
+                field_x = horiz_dist * math.cos(adjusted_angle) * scale_factor
+                field_y = -horiz_dist * math.sin(adjusted_angle) * scale_factor
+                wall_points.append(QPointF(home_plate_x + field_x, home_plate_y + field_y))
+            
+            if wall_points:
+                field_boundary = QPainterPath()
+                home_plate_point = QPointF(home_plate_x, home_plate_y)
+                field_boundary.moveTo(home_plate_point)
+                field_boundary.lineTo(wall_points[0])
+                for point in wall_points[1:]:
+                    field_boundary.lineTo(point)
+                field_boundary.lineTo(home_plate_point)
+                
+                boundary_item = QGraphicsPathItem(field_boundary)
+                boundary_item.setPen(QPen(QColor(139, 69, 19), 4))
+                boundary_item.setBrush(QBrush())
+                self.stadium_layer.addToGroup(boundary_item)
         
-        # Generate points from right field (0°) to left field (90°)
-        for angle in np.arange(0, 91, angle_step):
-            # Get distance to wall at this angle
-            distance = get_stadium_wall_distance(stadium_name, angle)
+        else:
+            # Fall back to polar coordinate system
+            wall_points = []
+            angle_step = 1.0
+
+            for angle in np.arange(0, 91, angle_step):
+                distance = get_stadium_wall_distance(stadium_name, angle)
+                
+                if distance is None or distance <= 0 or distance == float('inf'):
+                    wall_points.append(None)
+                    continue
+                
+                angle_rad = math.radians(angle)
+                adjusted_angle = angle_rad + math.pi / 4
+                field_x = distance * math.cos(adjusted_angle) * scale_factor
+                field_y = -distance * math.sin(adjusted_angle) * scale_factor
+                wall_points.append(QPointF(home_plate_x + field_x, home_plate_y + field_y))
             
-            if distance is None:
-                print(f"No polar data for {stadium_name} at angle {angle}°")
-                # Fall back to basic dimensions
-                self.draw_stadium_fallback(dimensions)
-                return
-            
-            # Convert polar to Cartesian coordinates
-            # Baseball polar coordinate system: 0° = right field foul line, 90° = left field foul line
-            # Standard baseball field layout: home plate at bottom, center field at top
-            angle_rad = math.radians(angle)
-            
-            # Baseball field coordinate transformation:
-            # 0° (right field) → +X direction from home plate
-            # 45° (center field) → -Y direction from home plate (toward top of screen)
-            # 90° (left field) → -X direction from home plate
-            
-            # For baseball polar coordinates, we need to convert angles properly:
-            # Baseball angle 0° = right field = standard polar 0°
-            # Baseball angle 45° = center field = standard polar 90°
-            # Baseball angle 90° = left field = standard polar 180°
-            
-            # Convert baseball polar to field coordinates
-            # The infield foul lines are at 45° angles:
-            # Right field foul line: direction (0.707, -0.707) = 45° from home to first base
-            # Left field foul line: direction (-0.707, -0.707) = 135° from home to third base
-            # Center field is straight up: direction (0, -1) = 90°
-            
-            # Convert polar coordinates to match these exact infield directions
-            # Rotate the polar coordinates by 45° to align with the diamond
-            adjusted_angle = angle_rad + math.pi/4  # Add 45° to align with infield
-            field_x = distance * math.cos(adjusted_angle) * scale_factor
-            field_y = -distance * math.sin(adjusted_angle) * scale_factor
-            
-            # Adjust for home plate position in scene
-            final_x = home_plate_x + field_x
-            final_y = home_plate_y + field_y
-            
-            wall_points.append(QPointF(final_x, final_y))
-        
-        # Create the outfield wall path and foul lines
-        if wall_points:
-            # Draw the complete field boundary (outfield wall + foul lines)
-            field_boundary = QPainterPath()
-            home_plate_point = QPointF(home_plate_x, home_plate_y)
-            
-            # Start from home plate, go to right field foul line
-            field_boundary.moveTo(home_plate_point)
-            field_boundary.lineTo(wall_points[0])  # Right field (0°)
-            
-            # Follow the outfield wall from right field to left field
-            for point in wall_points[1:]:
-                field_boundary.lineTo(point)
-            
-            # Close the boundary by connecting left field back to home plate
-            field_boundary.lineTo(home_plate_point)
-            
-            # Create graphics item for the complete field boundary
-            boundary_item = QGraphicsPathItem(field_boundary)
-            boundary_item.setPen(QPen(QColor(139, 69, 19), 4))  # Brown wall color
-            boundary_item.setBrush(QBrush())  # No fill
-            
-            # Add to stadium layer
-            self.stadium_layer.addToGroup(boundary_item)
-        
+            JUMP_THRESHOLD = 130
+            for i in range(1, len(wall_points)):
+                if wall_points[i] is None or wall_points[i-1] is None:
+                    continue
+                dx = wall_points[i].x() - wall_points[i-1].x()
+                dy = wall_points[i].y() - wall_points[i-1].y()
+                if math.sqrt(dx**2 + dy**2) > JUMP_THRESHOLD:
+                    wall_points[i] = None
+
+            if any(p is not None for p in wall_points):
+                field_boundary = QPainterPath()
+                home_plate_point = QPointF(home_plate_x, home_plate_y)
+                
+                in_segment = False
+                first_valid = next((p for p in wall_points if p is not None), None)
+                
+                field_boundary.moveTo(home_plate_point)
+                if first_valid:
+                    field_boundary.lineTo(first_valid)
+                
+                for point in wall_points:
+                    if point is None:
+                        in_segment = False
+                    else:
+                        if not in_segment:
+                            field_boundary.moveTo(point)
+                            in_segment = True
+                        else:
+                            field_boundary.lineTo(point)
+                
+                last_valid = next((p for p in reversed(wall_points) if p is not None), None)
+                if last_valid:
+                    field_boundary.moveTo(last_valid)
+                    field_boundary.lineTo(home_plate_point)
+
+                boundary_item = QGraphicsPathItem(field_boundary)
+                boundary_item.setPen(QPen(QColor(139, 69, 19), 4))
+                boundary_item.setBrush(QBrush())
+                self.stadium_layer.addToGroup(boundary_item)
+
         # Draw the infield (basic diamond shape)
         self.draw_infield(home_plate_x, home_plate_y, scale_factor)
         
@@ -762,11 +775,16 @@ class StadiumView(QGraphicsView):
         # Mark this as a start indicator for easier identification
         self.start_position_group.is_start_indicator = True
         
-        # In 2D top-down view:
-        # - Scene X increases toward right field (positive Z in our coordinate system)
-        # - Scene Y decreases toward center field (positive X in our coordinate system)
-        scene_x = fixed_home_x + start_z * scale_factor
-        scene_y = fixed_home_y - start_x * scale_factor
+        # Convert using the same polar transform as draw_stadium_polar
+        # start_x = feet toward center field, start_z = feet toward right(+)/left(-) field
+        horiz_dist = math.sqrt(start_x**2 + start_z**2)
+        if horiz_dist == 0:
+            scene_x = fixed_home_x
+            scene_y = fixed_home_y
+        else:
+            adjusted_angle = math.atan2(start_x, start_z) + math.pi / 4
+            scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
+            scene_y = fixed_home_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
         
         # Position the indicator
         self.start_position_group.setPos(scene_x, scene_y)
@@ -924,24 +942,35 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setBrush(QBrush(QColor(0, 0, 0, 150)))
         self.shadow_item.setPen(QPen(Qt.PenStyle.NoPen))
         
-        # Get the starting position
-        start_x = trajectory_data.get('start_x', 0)
-        start_z = trajectory_data.get('start_z', 0)
+        # Get the starting position and convert using same polar transform as stadium drawing
+        start_x = trajectory_data.get('start_x', 0)  # feet toward center field
+        start_z = trajectory_data.get('start_z', 0)  # feet toward right field (+) or left (-)
         
-        # Calculate scene coordinates for starting position
-        scene_start_x = fixed_home_x + start_z * scale_factor
-        scene_start_y = fixed_home_y - start_x * scale_factor
+        start_horiz = math.sqrt(start_x**2 + start_z**2)
+        start_angle = math.atan2(start_x, start_z) + math.pi / 4  # same 45° rotation as draw_stadium_polar
+        scene_start_x = fixed_home_x + start_horiz * math.cos(start_angle) * scale_factor
+        scene_start_y = fixed_home_y - start_horiz * math.sin(start_angle) * scale_factor
         
-        # Create trajectory path with fixed starting point
+        # Handle degenerate case where ball starts exactly at home plate
+        if start_horiz == 0:
+            scene_start_x = fixed_home_x
+            scene_start_y = fixed_home_y
+        
+        # Create trajectory path using the same polar coordinate transform as the stadium outline
+        # Physics: x = center field distance, z = right(+)/left(-) field distance
+        # Stadium draw_stadium_polar uses: adjusted_angle = baseball_angle + pi/4
+        #   where baseball_angle 0° = right field (+Z axis), 90° = left field (-Z axis)
+        # atan2(x, z) gives 0 when z>0 (right field), pi/2 when x>0 (center field) — matches perfectly
         path = QPainterPath()
         path.moveTo(scene_start_x, scene_start_y)
         
-        # In 2D top-down view:
-        # - Scene X increases toward right field (positive Z in our coordinate system)
-        # - Scene Y decreases toward center field (positive X in our coordinate system)
         for i in range(0, len(trajectory_data["x"]), 5):
-            scene_x = fixed_home_x + trajectory_data["z"][i] * scale_factor
-            scene_y = fixed_home_y - trajectory_data["x"][i] * scale_factor
+            ball_x = trajectory_data["x"][i]  # center field component (feet)
+            ball_z = trajectory_data["z"][i]  # right/left field component (feet)
+            horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
+            adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
+            scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
+            scene_y = fixed_home_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
             path.lineTo(scene_x, scene_y)
         
         self.trajectory_path = QGraphicsPathItem(path)
@@ -978,9 +1007,13 @@ class StadiumView(QGraphicsView):
         # Scale factor - must match the one used in draw_stadium_polar
         scale_factor = 4.5
         
-        # Get coordinates with proper scaling from the home plate position
-        x = self.home_plate_x + trajectory_data["z"][frame] * scale_factor
-        y = self.home_plate_y - trajectory_data["x"][frame] * scale_factor
+        # Convert ball position using same polar transform as stadium drawing
+        ball_x = trajectory_data["x"][frame]  # center field component (feet)
+        ball_z = trajectory_data["z"][frame]  # right/left field component (feet)
+        horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
+        adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
+        x = self.home_plate_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
+        y = self.home_plate_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
         height = trajectory_data["y"][frame]
         
         # Get velocity data for visual effects
@@ -1003,11 +1036,9 @@ class StadiumView(QGraphicsView):
         # Add speed-based color effect to the ball
         speed_threshold = 25
         if speed_magnitude > speed_threshold:
-            # Add reddish tint for high speed
             speed_color = QColor(255, 255 - min(100, int(speed_magnitude - speed_threshold)), 255 - min(150, int(speed_magnitude - speed_threshold)))
             self.ball_item.setBrush(QBrush(speed_color))
         else:
-            # Normal white ball at lower speeds
             self.ball_item.setBrush(QBrush(QColor(255, 255, 255)))
         
         # Make shadow more transparent based on height
