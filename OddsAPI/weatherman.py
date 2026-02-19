@@ -5,9 +5,6 @@ import numpy as np
 import requests
 from Creds import open_weather_key
 
-# Big props to Robbie Dudzinski and his medium article complete warrior 
-# https://medium.com/@robbiedudz34/drawing-precise-mlb-field-outlines-in-python-with-polar-coordinates-8abd1542a34a
-
 # Helper function for polar coordinate equations
 def polar_equation(angle_deg, coefficients):
     """
@@ -802,6 +799,29 @@ STADIUM_DATA = {
             (88.5, 90, (331, 1, -0.6671))
         ]
 
+    },
+    "Tropicana Field": {  # Tampa Bay Rays - primary venue
+        "image_path": "MLBstadiumgraphics/TropicanaField.gif",
+        "lat": 27.7683,
+        "lon": -82.6534,
+        "altitude": 15,
+        "dimensions": {
+            "left_field": 315,
+            "left_center": 370,
+            "center_field": 404,
+            "right_center": 370,
+            "right_field": 322
+        },
+        "polar_coords": [
+            (0, 1.7, (-357.101, 1, -1.109)),
+            (1.7, 33.75, {'type': 'cos_only', 'numerator': 331}),
+            (33.75, 36.2, (1678.156, 1, 4.403)),
+            (36.2, 55, (596.756, 1, 1.09406)),
+            (55, 56.4, (275.106, 1, -0.2654)),
+            (56.4, 58, (477.013, 1, 0.6444)),
+            (58, 86, (342.4305, 1, 0.011121)),
+            (86, 90, (315, 1, -1.13533))
+        ]
     },
     "Target Field": {  # Minnesota Twins
         "image_path": "MLBstadiumgraphics/TargetField.gif",
