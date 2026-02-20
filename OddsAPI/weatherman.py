@@ -972,6 +972,7 @@ class WeatherService:
         }
 
         response = requests.get(self.base_url, params=params)
+        response.raise_for_status()   # surface HTTP errors (401, 429, 5xx, etc.)
         return response.json()
 
     def extract_weather_data(self, weather_json):

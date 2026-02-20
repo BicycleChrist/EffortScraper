@@ -2174,8 +2174,18 @@ class StadiumSVGManager:
 
 class SplitView(QWidget):
     """Widget that contains both top-down and umpire views"""
+
+    # Signal used to safely deliver weather data from the background thread
+    # to the main thread. Qt signals are inherently thread-safe.
+    _weather_ready  = pyqtSignal(dict)
+    _weather_failed = pyqtSignal(str)
+
     def __init__(self, stadium_image_path, lat, lon, altitude, parent=None, api_key=open_weather_key):
         super().__init__(parent)
+
+        # Connect thread-safe weather signals to their handlers on the main thread
+        self._weather_ready.connect(self._apply_weather)
+        self._weather_failed.connect(self._on_weather_error)
 
         self.weather_service = WeatherService(api_key)
 
@@ -2412,7 +2422,8 @@ class SplitView(QWidget):
             self.update_weather_label()
             self.update_weather_visualization()
 
-        self.weather_label.setText(self.weather_label.text().rstrip(" (updating…)") + " (updating…)")
+        current_text = self.weather_label.text().removesuffix(" (updating…)")
+        self.weather_label.setText(current_text + " (updating…)")
 
         import threading
         lat, lon = self.lat, self.lon
@@ -2423,10 +2434,11 @@ class SplitView(QWidget):
                 print(f"[weather] fetching for lat={lat}, lon={lon}")
                 weather_json = svc.get_weather_by_location(lat, lon)
                 data = svc.extract_weather_data(weather_json)
-                # Deliver result back on the main thread via QTimer
-                QTimer.singleShot(0, lambda d=data: self._apply_weather(d))
+                # Emit signal — crosses thread boundary safely via Qt's queued connection
+                self._weather_ready.emit(data)
             except Exception as e:
                 print(f"[weather] error: {e}")
+                self._weather_failed.emit(str(e))
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -2436,6 +2448,11 @@ class SplitView(QWidget):
         print(f"[weather] ready: {data.get('description', '')}  {data.get('temperature', '')}°F")
         self.update_weather_label()
         self.update_weather_visualization()
+
+    def _on_weather_error(self, error_msg):
+        """Called on main thread when the background weather fetch fails."""
+        current_text = self.weather_label.text().removesuffix(" (updating…)")
+        self.weather_label.setText(current_text + f" (update failed: {error_msg})")
 
     def set_custom_weather(self, wind_speed, wind_direction):
         """Set custom weather data for simulation"""
