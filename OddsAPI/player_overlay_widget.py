@@ -9,15 +9,15 @@ QPropertyAnimation so the 3D view renders uninterrupted behind it.
 
 Architecture:
   PlayerBBEOverlay          — outer shell, toggle button, animation
-    └── _OverlayContent     — scroll area containing all inner widgets
-          ├── search + team filter bar
-          ├── PlayerSummaryWidget   — headshot, name, team, percentile bars
-          └── BBETableWidget        — scrollable event list
+    └── _OverlayContent     — stacked widget with two pages:
+          Page 0 – Search page: search bar + team filter + player list
+          Page 1 – Detail page: back button + headshot + name +
+                                percentile bars + full BBE event table
 
 Data flow:
   BBEDataStore (loaded in QThread on startup)
     → PlayerBBEOverlay.set_data_store()
-    → player selected → PlayerSummaryWidget populated
+    → player selected → navigate to detail page
     → BBE row clicked  → simulate_bbe signal emitted
                         → MLBWeatherApp.on_simulate_bbe() fires sim
 
@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QScrollArea, QFrame, QSizePolicy, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar,
+    QProgressBar, QStackedWidget,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QPropertyAnimation,
@@ -61,7 +61,7 @@ HEADSHOT_URL   = (
 )
 LEADERBOARD_URL = (
     "https://baseballsavant.mlb.com/leaderboard/statcast"
-    "?type=batter&year=2024&position=&team=&min=1&csv=true"
+    "?type=batter&year={year}&position=&team=&min=1&csv=true"
 )
 
 OVERLAY_WIDTH_EXPANDED  = 460
@@ -111,10 +111,11 @@ class DataLoaderWorker(QObject):
     progress  = pyqtSignal(str)
     error     = pyqtSignal(str)
 
-    def __init__(self, bbe_csv_path: str, leaderboard_csv_path: str | None = None):
+    def __init__(self, bbe_csv_path: str, leaderboard_csv_path: str | None = None, year: int = 2024):
         super().__init__()
         self.bbe_csv_path        = bbe_csv_path
         self.leaderboard_csv_path = leaderboard_csv_path
+        self.year                = year
 
     def run(self):
         import requests
@@ -126,7 +127,7 @@ class DataLoaderWorker(QObject):
                 lb = pd.read_csv(self.leaderboard_csv_path)
             else:
                 self.progress.emit("Fetching leaderboard from Baseball Savant…")
-                r = requests.get(LEADERBOARD_URL, timeout=30)
+                r = requests.get(LEADERBOARD_URL.format(year=self.year), timeout=30)
                 r.raise_for_status()
                 lb = pd.read_csv(io.StringIO(r.text))
 
@@ -139,24 +140,48 @@ class DataLoaderWorker(QObject):
             lb["player_id"] = lb["player_id"].astype(int)
             store.leaderboard = lb
 
-            # ---- percentiles ----
-            self.progress.emit("Computing percentiles…")
-            pcts = {}
-            for _, col, higher_is_better in PERCENTILE_STATS:
-                if col not in lb.columns:
-                    continue
-                vals = lb[col].dropna().values
-                for _, row in lb.iterrows():
-                    pid = int(row["player_id"])
-                    v   = row.get(col)
-                    if pd.isna(v):
-                        pct = 50.0
-                    else:
-                        rank = np.sum(vals <= v)
-                        pct  = rank / len(vals) * 100
-                        if not higher_is_better:
-                            pct = 100 - pct
-                    pcts.setdefault(pid, {})[col] = round(pct, 1)
+            # ---- percentiles (vectorized + disk cache) ----
+            import json, hashlib
+            cache_dir = Path("headshots")          # reuse existing cache dir
+            cache_dir.mkdir(exist_ok=True)
+
+            # Cache key: hash of player_ids + stat columns present
+            _key_src = str(sorted(lb["player_id"].tolist())) + str([c for _, c, _ in PERCENTILE_STATS if c in lb.columns])
+            _cache_name = f"pct_cache_{hashlib.md5(_key_src.encode()).hexdigest()[:12]}.json"
+            _cache_path = cache_dir / _cache_name
+
+            if _cache_path.exists():
+                self.progress.emit("Loading cached percentiles…")
+                with open(_cache_path) as f:
+                    # JSON keys are strings; convert back to int
+                    pcts = {int(k): v for k, v in json.load(f).items()}
+            else:
+                self.progress.emit("Computing percentiles…")
+                pcts = {}
+                pids = lb["player_id"].astype(int).values
+                for _, col, higher_is_better in PERCENTILE_STATS:
+                    if col not in lb.columns:
+                        continue
+                    series = lb[col]
+                    n_valid = series.notna().sum()
+                    if n_valid == 0:
+                        continue
+                    # rank() is O(n log n) vs the old O(n²) loop
+                    ranked = series.rank(method="max", na_option="keep")
+                    pct_series = ranked / n_valid * 100
+                    if not higher_is_better:
+                        pct_series = 100 - pct_series
+                    pct_series = pct_series.fillna(50.0).round(1)
+                    for pid, pct in zip(pids, pct_series):
+                        pcts.setdefault(int(pid), {})[col] = float(pct)
+
+                # Persist for next launch
+                try:
+                    with open(_cache_path, "w") as f:
+                        json.dump(pcts, f)
+                except OSError:
+                    pass
+
             store.percentiles = pcts
 
             # ---- BBE events ----
@@ -177,16 +202,22 @@ class DataLoaderWorker(QObject):
                 (c for c in ("last_name_first_name", "player_name", "last_name") if c in lb.columns),
                 None
             )
-            team_col = next(
-                (c for c in ("team_name_abbrev", "team", "team_abbrev") if c in lb.columns),
-                None
-            )
+
+            # Derive each player's team from BBE home_team/away_team
+            # (leaderboard CSV has no team column).
+            # The player's own team dominates the combined frequency.
+            player_team_map: dict[int, str] = {}
+            if "home_team" in bbe.columns and "away_team" in bbe.columns:
+                for pid, grp in bbe.groupby("player_id"):
+                    teams = pd.concat([grp["home_team"], grp["away_team"]])
+                    mode = teams.value_counts()
+                    player_team_map[int(pid)] = mode.index[0] if len(mode) > 0 else "—"
 
             player_list = []
             for _, row in lb.iterrows():
                 pid  = int(row["player_id"])
                 name = str(row[name_col]) if name_col else f"ID {pid}"
-                team = str(row[team_col]) if team_col else "—"
+                team = player_team_map.get(pid, "—")
                 player_list.append((name, pid, team))
 
             player_list.sort(key=lambda x: x[0])
@@ -257,7 +288,7 @@ class PercentileBar(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Player summary widget (headshot + name + percentile bars)
+# Player summary widget (headshot + name + percentile bars) — detail page
 # ---------------------------------------------------------------------------
 class PlayerSummaryWidget(QWidget):
     def __init__(self, parent=None):
@@ -270,12 +301,13 @@ class PlayerSummaryWidget(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 4)
-        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 6)
+        root.setSpacing(4)
 
-        # ---- top row: headshot + identity ----
+        # ---- top row: headshot left, identity + BBE count right ----
         top = QHBoxLayout()
         top.setSpacing(10)
+        top.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.headshot_lbl = QLabel()
         self.headshot_lbl.setFixedSize(67, 67)
@@ -283,10 +315,11 @@ class PlayerSummaryWidget(QWidget):
             "border-radius: 6px; background: #2a2a35; border: 1px solid #444;"
         )
         self.headshot_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        top.addWidget(self.headshot_lbl)
+        top.addWidget(self.headshot_lbl, 0, Qt.AlignmentFlag.AlignTop)
 
         identity = QVBoxLayout()
         identity.setSpacing(2)
+        identity.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.name_lbl = QLabel("—")
         self.name_lbl.setStyleSheet("color: #f0f0f0; font-size: 13px; font-weight: bold;")
         self.name_lbl.setWordWrap(True)
@@ -297,8 +330,7 @@ class PlayerSummaryWidget(QWidget):
         identity.addWidget(self.name_lbl)
         identity.addWidget(self.team_lbl)
         identity.addWidget(self.attempts_lbl)
-        identity.addStretch()
-        top.addLayout(identity)
+        top.addLayout(identity, 1)
         root.addLayout(top)
 
         # Divider
@@ -313,8 +345,6 @@ class PlayerSummaryWidget(QWidget):
             bar = PercentileBar(label, 50.0)
             self.pct_bars[col] = bar
             root.addWidget(bar)
-
-        root.addStretch()
 
     def load_player(self, name: str, team: str, player_id: int,
                     lb_row: pd.Series | None, percentiles: dict):
@@ -340,14 +370,10 @@ class PlayerSummaryWidget(QWidget):
         if cache_path.exists():
             self._set_headshot_pixmap(QPixmap(str(cache_path)))
         else:
-            # Show placeholder while fetching
             self.headshot_lbl.setText("…")
             url = HEADSHOT_URL.format(player_id=player_id)
             req = QNetworkRequest(QUrl(url))
-            req.setAttribute(
-                QNetworkRequest.Attribute.User,
-                player_id
-            )
+            req.setAttribute(QNetworkRequest.Attribute.User, player_id)
             self._pending_player_id = player_id
             self._nam.get(req)
 
@@ -396,6 +422,8 @@ class BBETableWidget(QTableWidget):
         ("LA°",      "launch_angle"),
         ("Dist",     "hit_distance_sc"),
         ("BB Type",  "bb_type"),
+        ("Pitch",    "pitch_name"),
+        ("Velo",     "release_speed"),
     ]
 
     def __init__(self, parent=None):
@@ -486,17 +514,17 @@ class BBETableWidget(QTableWidget):
 
 
 # ---------------------------------------------------------------------------
-# Inner content widget (everything inside the sliding panel)
+# Page 0 – Search / player list
 # ---------------------------------------------------------------------------
-class _OverlayContent(QWidget):
-    player_changed  = pyqtSignal(int)          # player_id
-    bbe_selected    = pyqtSignal(float, float, int)  # ev, la, player_id
+class _SearchPage(QWidget):
+    """Full-panel player search and list.  Emits player_selected when a row is clicked."""
+    player_selected = pyqtSignal(int, str, str)   # player_id, name, team
+    season_changed  = pyqtSignal(int)             # year
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background: #14141e; border-left: 1px solid #333345;")
+        self.setStyleSheet("background: #14141e;")
         self._store: BBEDataStore | None = None
-        self._filtered_players: list     = []
         self._build_ui()
 
     def _build_ui(self):
@@ -530,23 +558,27 @@ class _OverlayContent(QWidget):
         self.team_cb.addItem("All Teams")
         self.team_cb.currentTextChanged.connect(self._apply_filter)
         hl.addWidget(self.team_cb, 1)
+
+        self.season_cb = QComboBox()
+        self.season_cb.setStyleSheet(
+            "background: #2a2a3a; color: #eee; border: 1px solid #444; "
+            "border-radius: 4px; font-size: 11px;"
+        )
+        self.season_cb.setFixedWidth(58)
+        # Populated later by set_available_seasons()
+        self.season_cb.currentTextChanged.connect(self._on_season_changed)
+        hl.addWidget(self.season_cb, 0)
         root.addWidget(header)
 
-        # ---- loading label (shown until data ready) ----
+        # ---- loading label ----
         self.loading_lbl = QLabel("Loading player data…")
         self.loading_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.loading_lbl.setStyleSheet("color: #888; font-size: 12px; padding: 20px;")
         root.addWidget(self.loading_lbl)
 
-        # ---- main content (hidden until ready) ----
-        self.content_frame = QWidget()
-        self.content_frame.hide()
-        cf_layout = QVBoxLayout(self.content_frame)
-        cf_layout.setContentsMargins(0, 0, 0, 0)
-        cf_layout.setSpacing(0)
-
-        # Player list
+        # ---- player list (fills remaining height) ----
         self.player_list_widget = QTableWidget(0, 3)
+        self.player_list_widget.hide()
         self.player_list_widget.setHorizontalHeaderLabels(["Player", "Team", "Avg EV"])
         self.player_list_widget.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
@@ -557,7 +589,7 @@ class _OverlayContent(QWidget):
         self.player_list_widget.verticalHeader().setVisible(False)
         self.player_list_widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.player_list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.player_list_widget.setFixedHeight(180)
+        self.player_list_widget.setAlternatingRowColors(True)
         self.player_list_widget.setStyleSheet("""
             QTableWidget {
                 background: #0e0e18;
@@ -565,6 +597,7 @@ class _OverlayContent(QWidget):
                 color: #cccccc;
                 gridline-color: #252530;
                 font-size: 11px;
+                border: none;
             }
             QHeaderView::section {
                 background: #1c1c28;
@@ -575,39 +608,14 @@ class _OverlayContent(QWidget):
             }
             QTableWidget::item:selected { background: #2a4060; }
         """)
-        self.player_list_widget.setAlternatingRowColors(True)
         self.player_list_widget.cellClicked.connect(self._on_player_clicked)
-        cf_layout.addWidget(self.player_list_widget)
+        root.addWidget(self.player_list_widget, 1)
 
-        # Summary
-        self.summary = PlayerSummaryWidget()
-        cf_layout.addWidget(self.summary)
-
-        # BBE label
-        bbe_hdr = QLabel("  BBE Events")
-        bbe_hdr.setFixedHeight(22)
-        bbe_hdr.setStyleSheet(
-            "background: #1e1e2e; color: #aaa; font-size: 10px; "
-            "border-top: 1px solid #333345; border-bottom: 1px solid #333345;"
-        )
-        cf_layout.addWidget(bbe_hdr)
-
-        # BBE table
-        self.bbe_table = BBETableWidget()
-        self.bbe_table.bbe_selected.connect(self.bbe_selected)
-        cf_layout.addWidget(self.bbe_table, 1)
-
-        root.addWidget(self.content_frame, 1)
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
     def set_data_store(self, store: BBEDataStore):
         self._store = store
         self.loading_lbl.hide()
-        self.content_frame.show()
+        self.player_list_widget.show()
 
-        # Populate team filter
         self.team_cb.blockSignals(True)
         self.team_cb.clear()
         self.team_cb.addItem("All Teams")
@@ -619,24 +627,35 @@ class _OverlayContent(QWidget):
 
     def set_loading_message(self, msg: str):
         self.loading_lbl.setText(msg)
+        self.loading_lbl.show()
+        self.player_list_widget.hide()
 
-    # ------------------------------------------------------------------ #
-    # Filtering
-    # ------------------------------------------------------------------ #
+    def set_available_seasons(self, years: list[int], current: int):
+        """Populate the season combo and select the active year."""
+        self.season_cb.blockSignals(True)
+        self.season_cb.clear()
+        for y in sorted(years, reverse=True):
+            self.season_cb.addItem(str(y))
+        idx = self.season_cb.findText(str(current))
+        if idx >= 0:
+            self.season_cb.setCurrentIndex(idx)
+        self.season_cb.blockSignals(False)
+
+    def _on_season_changed(self, text: str):
+        if text:
+            self.season_changed.emit(int(text))
+
     def _apply_filter(self):
         if self._store is None:
             return
-
         query = self.search.text().strip().lower()
         team  = self.team_cb.currentText()
-
         filtered = [
             (name, pid, t)
             for name, pid, t in self._store.player_list
             if (not query or query in name.lower())
             and (team == "All Teams" or t == team)
         ]
-        self._filtered_players = filtered
         self._populate_player_table(filtered)
 
     def _populate_player_table(self, players: list):
@@ -668,9 +687,137 @@ class _OverlayContent(QWidget):
             return
         pid  = item.data(Qt.ItemDataRole.UserRole)
         name = item.text()
-
         team_item = self.player_list_widget.item(row, 1)
         team = team_item.text() if team_item else "—"
+        self.player_selected.emit(pid, name, team)
+
+
+# ---------------------------------------------------------------------------
+# Page 1 – Player detail (back button + summary + full BBE table)
+# ---------------------------------------------------------------------------
+class _DetailPage(QWidget):
+    """Full-panel player detail view with back button."""
+    back_clicked = pyqtSignal()
+    bbe_selected = pyqtSignal(float, float, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #14141e;")
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ---- back bar ----
+        back_bar = QWidget()
+        back_bar.setFixedHeight(36)
+        back_bar.setStyleSheet("background: #1e1e2e; border-bottom: 1px solid #333345;")
+        bl = QHBoxLayout(back_bar)
+        bl.setContentsMargins(6, 0, 8, 0)
+        bl.setSpacing(6)
+
+        back_btn = QPushButton("◀  Player List")
+        back_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #7ab0e0;
+                border: none;
+                font-size: 12px;
+                padding: 2px 6px;
+                text-align: left;
+            }
+            QPushButton:hover { color: #ffffff; }
+        """)
+        back_btn.clicked.connect(self.back_clicked)
+        bl.addWidget(back_btn)
+        bl.addStretch()
+        root.addWidget(back_bar)
+
+        # ---- player summary (fixed height — headshot + bars) ----
+        self.summary = PlayerSummaryWidget()
+        # Calculate fixed height: top margin(8) + headshot(67) + divider(~8) +
+        # 7 bars × 22px + spacing(6×8) + bottom margin(6) ≈ 285
+        self.summary.setFixedHeight(285)
+        root.addWidget(self.summary)
+
+        # ---- BBE section label ----
+        bbe_hdr = QLabel("  BBE Events")
+        bbe_hdr.setFixedHeight(22)
+        bbe_hdr.setStyleSheet(
+            "background: #1e1e2e; color: #aaa; font-size: 10px; "
+            "border-top: 1px solid #333345; border-bottom: 1px solid #333345;"
+        )
+        root.addWidget(bbe_hdr)
+
+        # ---- BBE table fills all remaining height ----
+        self.bbe_table = BBETableWidget()
+        self.bbe_table.bbe_selected.connect(self.bbe_selected)
+        root.addWidget(self.bbe_table, 1)
+
+    def load_player(self, name: str, team: str, player_id: int,
+                    lb_row, percentiles: dict, events: list):
+        self.summary.load_player(name, team, player_id, lb_row, percentiles)
+        self.bbe_table.load_events(events, player_id)
+
+
+# ---------------------------------------------------------------------------
+# Inner content widget — stacked search + detail pages
+# ---------------------------------------------------------------------------
+class _OverlayContent(QWidget):
+    player_changed  = pyqtSignal(int)
+    player_selected_with_data = pyqtSignal(int, list)  # player_id, list of BBE dicts
+    bbe_selected    = pyqtSignal(float, float, int)
+    season_changed  = pyqtSignal(int)                  # year
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #14141e; border-left: 1px solid #333345;")
+        self._store: BBEDataStore | None = None
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._stack = QStackedWidget()
+
+        # Page 0 — search
+        self._search_page = _SearchPage()
+        self._search_page.player_selected.connect(self._on_player_selected)
+        self._search_page.season_changed.connect(self.season_changed)
+        self._stack.addWidget(self._search_page)
+
+        # Page 1 — detail
+        self._detail_page = _DetailPage()
+        self._detail_page.back_clicked.connect(self._go_back)
+        self._detail_page.bbe_selected.connect(self.bbe_selected)
+        self._stack.addWidget(self._detail_page)
+
+        root.addWidget(self._stack, 1)
+
+    # ------------------------------------------------------------------ #
+    # Public API (kept compatible with existing callers)
+    # ------------------------------------------------------------------ #
+    def set_data_store(self, store: BBEDataStore):
+        self._store = store
+        self._search_page.set_data_store(store)
+        self._stack.setCurrentIndex(0)
+
+    def set_loading_message(self, msg: str):
+        self._search_page.set_loading_message(msg)
+
+    def set_available_seasons(self, years: list[int], current: int):
+        self._search_page.set_available_seasons(years, current)
+
+    # ------------------------------------------------------------------ #
+    # Navigation
+    # ------------------------------------------------------------------ #
+    def _on_player_selected(self, pid: int, name: str, team: str):
+        if self._store is None:
+            return
 
         lb_row = None
         if "player_id" in self._store.leaderboard.columns:
@@ -678,55 +825,56 @@ class _OverlayContent(QWidget):
             if not match.empty:
                 lb_row = match.iloc[0]
 
-        self.summary.load_player(name, team, pid, lb_row, self._store.percentiles)
-
         events = self._store.by_player.get(pid, [])
-        self.bbe_table.load_events(events, pid)
+        self._detail_page.load_player(name, team, pid, lb_row, self._store.percentiles, events)
+        self._stack.setCurrentIndex(1)
         self.player_changed.emit(pid)
+        self.player_selected_with_data.emit(pid, events)
+
+    def _go_back(self):
+        self._stack.setCurrentIndex(0)
+        self.player_selected_with_data.emit(0, [])  # clear signal
 
 
 # ---------------------------------------------------------------------------
-# Outer overlay shell with slide animation and toggle button
+# Inline sidebar panel — lives in the layout next to the 3D viewport
 # ---------------------------------------------------------------------------
 class PlayerBBEOverlay(QWidget):
     """
-    Overlay panel parented directly to the UmpireView3D widget.
-    Call attach(umpire_view) after construction, then position_overlay()
-    whenever the parent resizes.
+    Collapsible sidebar that sits in the same QHBoxLayout as the UmpireView3D.
+    When collapsed only a narrow toggle button is visible.  When expanded the
+    content panel slides open and the 3D viewport shrinks to make room — no
+    native-window overlay hacks needed.
     """
     simulate_bbe = pyqtSignal(float, float, int)   # ev, launch_angle, player_id
+    player_selected_with_data = pyqtSignal(int, list)  # player_id, list of BBE dicts
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("PlayerBBEOverlay")
         self._expanded  = False
         self._loader_thread: QThread | None = None
+        self._current_year: int = 0
+        self._available_years: list[int] = []
 
         self._build_ui()
         self._build_animation()
 
-        # WA_NativeWindow gives the overlay its own OS compositor layer,
-        # which renders above the QOpenGLWidget framebuffer regardless of
-        # Qt Z-order. Without this the GL surface paints over us at the OS level.
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        # Start collapsed — panel hidden so no content bleeds through
+        # Start collapsed
         self.panel.hide()
-        self.panel.setFixedWidth(0)
+        self.panel.setMaximumWidth(0)
+        self.panel.setMinimumWidth(0)
 
     def _build_ui(self):
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ---- sliding content panel ----
-        self.panel = _OverlayContent()
-        self.panel.setFixedWidth(OVERLAY_WIDTH_COLLAPSED)
-        self.panel.bbe_selected.connect(self.simulate_bbe)
-        outer.addWidget(self.panel)
-
-        # ---- toggle tab (always visible, sits on right edge of panel) ----
+        # ---- toggle tab (always visible) ----
         self.toggle_btn = QPushButton("◀")
-        self.toggle_btn.setFixedSize(24, 80)
+        self.toggle_btn.setFixedWidth(24)
+        self.toggle_btn.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.toggle_btn.setStyleSheet("""
             QPushButton {
                 background: #22223a;
@@ -741,62 +889,35 @@ class PlayerBBEOverlay(QWidget):
         self.toggle_btn.clicked.connect(self.toggle)
         outer.addWidget(self.toggle_btn)
 
+        # ---- sliding content panel ----
+        self.panel = _OverlayContent()
+        self.panel.setMinimumWidth(0)
+        self.panel.setMaximumWidth(0)
+        self.panel.bbe_selected.connect(self.simulate_bbe)
+        self.panel.player_selected_with_data.connect(self.player_selected_with_data)
+        self.panel.season_changed.connect(self._on_season_changed)
+        outer.addWidget(self.panel)
+
     def _build_animation(self):
-        self._anim = QPropertyAnimation(self.panel, b"minimumWidth")
-        self._anim.setDuration(ANIM_DURATION_MS)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.finished.connect(self._on_anim_finished)
+        self._anim_min = QPropertyAnimation(self.panel, b"minimumWidth")
+        self._anim_min.setDuration(ANIM_DURATION_MS)
+        self._anim_min.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self._anim_max = QPropertyAnimation(self.panel, b"maximumWidth")
+        self._anim_max.setDuration(ANIM_DURATION_MS)
+        self._anim_max.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_max.finished.connect(self._on_anim_finished)
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
     def attach(self, umpire_view: QWidget):
-        """Store reference to the umpire view for geometry tracking.
-        The overlay is already parented to SplitView via __init__ — we just
-        need the umpire_view reference so position_overlay() can align to it.
-        """
-        self._umpire_view = umpire_view
-        # Reposition whenever the umpire view resizes
-        _orig = umpire_view.resizeEvent
-        def _on_resize(event):
-            _orig(event)
-            self.position_overlay()
-        umpire_view.resizeEvent = _on_resize
-        self.position_overlay()
+        """Kept for API compatibility — no-op since we're in the layout now."""
+        pass
 
     def position_overlay(self):
-        """Position overlay over the umpire view rect within SplitView.
-        Called on umpire_view resize and on toggle so geometry stays correct.
-        """
-        if not hasattr(self, '_umpire_view') or self.parent() is None:
-            return
-        # Map umpire_view top-left into SplitView coordinates
-        par = self.parent()
-        uv  = self._umpire_view
-        if par is None or uv is None:
-            return
-
-        # X: anchor to right edge of SplitView (par.width() is reliable)
-        # Y: map umpire_view top-left into SplitView coords to skip the
-        #    wind widget and stats bar that sit above the views area
-        # H: map umpire_view bottom into SplitView coords for exact height
-        pw   = par.width()
-        uv_top    = uv.mapTo(par, uv.rect().topLeft())
-        uv_bottom = uv.mapTo(par, uv.rect().bottomLeft())
-        y  = uv_top.y()
-        uh = uv_bottom.y() - y
-        # Clamp to sensible values in case mapTo fires before layout is done
-        if uh <= 0:
-            uh = par.height() - y
-
-        tab_w   = 24
-        panel_w = OVERLAY_WIDTH_EXPANDED if self._expanded else OVERLAY_WIDTH_COLLAPSED
-        total_w = panel_w + tab_w
-        x = pw - total_w
-        print(f"[overlay] y={y} uh={uh} -> overlay=({x},{y},{total_w},{uh})")
-        self.setGeometry(x, y, total_w, uh)
-        self.panel.setFixedWidth(panel_w)
-        self.raise_()
+        """Kept for API compatibility — no-op since layout handles sizing."""
+        pass
 
     def toggle(self):
         if self._expanded:
@@ -804,10 +925,30 @@ class PlayerBBEOverlay(QWidget):
         else:
             self._expand()
 
-    def load_data(self, bbe_csv: str, leaderboard_csv: str | None = None):
-        """Start background data load.  Call once after attach()."""
-        self.panel.set_loading_message("Loading player data…")
-        worker = DataLoaderWorker(bbe_csv, leaderboard_csv)
+    def load_data(self, bbe_csv: str, leaderboard_csv: str | None = None, year: int = 2024):
+        """Start background data load for a given season."""
+        # Detect available season CSVs on disk
+        import glob, re
+        self._available_years = sorted({
+            int(m.group(1))
+            for f in glob.glob("savant_bbe_*.csv")
+            if (m := re.search(r"savant_bbe_(\d{4})\.csv$", f))
+        }, reverse=True) or [year]
+
+        self._current_year = year
+        self.panel.set_available_seasons(self._available_years, year)
+
+        self._load_year(bbe_csv, leaderboard_csv, year)
+
+    def _load_year(self, bbe_csv: str, leaderboard_csv: str | None, year: int):
+        """Kick off the background loader thread."""
+        # Kill previous loader if still running
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.quit()
+            self._loader_thread.wait(2000)
+
+        self.panel.set_loading_message(f"Loading {year} player data…")
+        worker = DataLoaderWorker(bbe_csv, leaderboard_csv, year=year)
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.finished.connect(self._on_data_ready)
@@ -816,7 +957,7 @@ class PlayerBBEOverlay(QWidget):
         thread.started.connect(worker.run)
         thread.start()
         self._loader_thread = thread
-        self._loader_worker = worker   # keep reference
+        self._loader_worker = worker
 
     # ------------------------------------------------------------------ #
     # Internal
@@ -825,23 +966,42 @@ class PlayerBBEOverlay(QWidget):
         self._expanded = True
         self.toggle_btn.setText("▶")
         self.panel.show()
-        self._anim.setStartValue(0)
-        self._anim.setEndValue(OVERLAY_WIDTH_EXPANDED)
-        self._anim.start()
-        self.position_overlay()
+        self._anim_min.setStartValue(0)
+        self._anim_min.setEndValue(OVERLAY_WIDTH_EXPANDED)
+        self._anim_max.setStartValue(0)
+        self._anim_max.setEndValue(OVERLAY_WIDTH_EXPANDED)
+        self._anim_min.start()
+        self._anim_max.start()
 
     def _collapse(self):
         self._expanded = False
         self.toggle_btn.setText("◀")
-        self._anim.setStartValue(self.panel.width())
-        self._anim.setEndValue(0)
-        self._anim.start()
+        cur = self.panel.width()
+        self._anim_min.setStartValue(cur)
+        self._anim_min.setEndValue(0)
+        self._anim_max.setStartValue(cur)
+        self._anim_max.setEndValue(0)
+        self._anim_min.start()
+        self._anim_max.start()
 
     def _on_anim_finished(self):
         if not self._expanded:
             self.panel.hide()
-            self.panel.setFixedWidth(0)
-        self.position_overlay()
+            self.panel.setMinimumWidth(0)
+            self.panel.setMaximumWidth(0)
+
+    def _on_season_changed(self, year: int):
+        """User picked a different season in the dropdown."""
+        if year == self._current_year:
+            return
+        self._current_year = year
+        import os
+        bbe_csv = f"savant_bbe_{year}.csv"
+        lb_csv  = f"savant_lb_{year}.csv"
+        lb_csv  = lb_csv if os.path.exists(lb_csv) else None
+        self._load_year(bbe_csv, lb_csv, year)
+        # Clear spray chart via empty signal
+        self.player_selected_with_data.emit(0, [])
 
     def _on_data_ready(self, store: BBEDataStore):
         self.panel.set_data_store(store)

@@ -557,13 +557,18 @@ class StadiumView(QGraphicsView):
         # Layers for organization
         self.stadium_layer = QGraphicsItemGroup()
         self.weather_layer = QGraphicsItemGroup()
-        self.trail_layer = QGraphicsItemGroup()   # Persistent shot trails
+        self.spray_layer = QGraphicsItemGroup()    # Spray chart dots
+        self.trail_layer = QGraphicsItemGroup()    # Persistent shot trails
         self.ball_layer = QGraphicsItemGroup()
 
         self.scene.addItem(self.stadium_layer)
         self.scene.addItem(self.weather_layer)
+        self.scene.addItem(self.spray_layer)
         self.scene.addItem(self.trail_layer)
         self.scene.addItem(self.ball_layer)
+
+        # z-ordering: spray between stadium and trails
+        self.spray_layer.setZValue(25)
 
         # SVG renderer and items
         self.svg_renderer = None
@@ -596,6 +601,65 @@ class StadiumView(QGraphicsView):
         super().resizeEvent(event)
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    # ---- Spray chart --------------------------------------------------- #
+    # Savant hc_x/hc_y pixel grid constants
+    SAVANT_HP_X, SAVANT_HP_Y = 125.42, 198.27
+    SAVANT_SCALE = 2.51  # feet per Savant pixel
+
+    _SPRAY_COLOUR_MAP = {
+        "home_run":   QColor(255, 200, 50),     # gold
+        "single":     QColor(100, 210, 100),     # green
+        "double":     QColor(100, 180, 255),     # blue
+        "triple":     QColor(100, 220, 255),     # cyan
+        "foul":       QColor(140, 140, 140),     # grey
+    }
+    _SPRAY_OUT_COLOUR = QColor(200, 70, 70)      # red for outs
+
+    def set_spray_chart(self, events: list):
+        """Draw spray chart dots from BBE events with hc_x/hc_y."""
+        self.clear_spray_chart()
+        scale = self.field_scale
+        hp_x = self.home_plate_x
+        hp_y = self.home_plate_y
+        dot_r = 2.5  # radius in scene px
+
+        for ev in events:
+            hc_x = ev.get("hc_x")
+            hc_y = ev.get("hc_y")
+            if hc_x is None or hc_y is None:
+                continue
+            try:
+                hc_x = float(hc_x)
+                hc_y = float(hc_y)
+            except (ValueError, TypeError):
+                continue
+            if math.isnan(hc_x) or math.isnan(hc_y):
+                continue
+
+            # Savant pixel → feet relative to home plate
+            dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
+            dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
+
+            # Feet → scene coords (x right, y up in scene is -y in Qt)
+            sx = hp_x + dx_ft * scale
+            sy = hp_y - dy_ft * scale
+
+            event_type = str(ev.get("events", ""))
+            colour = self._SPRAY_COLOUR_MAP.get(event_type, self._SPRAY_OUT_COLOUR)
+
+            dot = QGraphicsEllipseItem(sx - dot_r, sy - dot_r, dot_r * 2, dot_r * 2)
+            dot.setPen(QPen(Qt.PenStyle.NoPen))
+            dot.setBrush(QBrush(colour))
+            dot.setOpacity(0.6)
+            self.spray_layer.addToGroup(dot)
+
+    def clear_spray_chart(self):
+        """Remove all spray chart dots."""
+        self.scene.removeItem(self.spray_layer)
+        self.spray_layer = QGraphicsItemGroup()
+        self.spray_layer.setZValue(25)
+        self.scene.addItem(self.spray_layer)
+
     def draw_stadium_polar(self, stadium_name, dimensions):
         """Draw stadium outline using polar coordinate data from weatherman.py"""
         # Delete all stadium items and create a new layer
@@ -605,10 +669,11 @@ class StadiumView(QGraphicsView):
 
         print(f"Drawing stadium using polar coordinates: {stadium_name}")
 
-        # Clear persistent trails when stadium changes
+        # Clear persistent trails and spray chart when stadium changes
         self.scene.removeItem(self.trail_layer)
         self.trail_layer = QGraphicsItemGroup()
         self.scene.addItem(self.trail_layer)
+        self.clear_spray_chart()
 
         # Scale factor - increased for better space usage and visibility
         scale_factor = self.field_scale
@@ -709,7 +774,7 @@ class StadiumView(QGraphicsView):
         # Compute tight scene rect from actual wall point bounds
         valid_points = [p for p in wall_points if p is not None]
         margin = 40
-        home_plate_padding = 375  # Clearance for infield diamond below home plate
+        home_plate_padding = 125  # Clearance for infield diamond below home plate
         if valid_points:
             min_x = min(p.x() for p in valid_points)
             max_x = max(p.x() for p in valid_points)
@@ -1257,25 +1322,18 @@ class UmpireView3D(QOpenGLWidget):
         self.ball_trail = []  # Store recent ball positions for trail effect
         self.ballpark_model = None
         self.textures = {}
+        self.spray_dots = []  # list of (x_m, z_m, r, g, b) for spray chart
 
         # Set format for better rendering
         fmt = QSurfaceFormat()
         fmt.setSamples(4)  # 4x MSAA
         self.setFormat(fmt)
 
-        # Load model with error handling
-        try:
-            self.ballpark_model = Wavefront(
-                'baseballfield.obj',
-                create_materials=True,
-                collect_faces=True,
-                strict=False,  # Tolerate format issues
-                parse=True
-            )
-            print(f"Loaded 3D model with {len(self.ballpark_model.materials)} materials")
-        except Exception as e:
-            print(f"Error loading 3D model: {str(e)}")
-            self.ballpark_model = None
+        # Model loaded in background thread — display list compiled when it arrives
+        self.ballpark_model = None
+        self._model_load_pending = True
+        import threading
+        threading.Thread(target=self._load_model_bg, daemon=True).start()
 
         # Camera setup
         self.camera = {
@@ -1353,6 +1411,27 @@ class UmpireView3D(QOpenGLWidget):
         # Flag to track when to update camera
         self.is_tracking_ball = False
 
+
+    def _load_model_bg(self):
+        """Load Wavefront OBJ on a background thread (no GL calls here)."""
+        try:
+            model = Wavefront(
+                'baseballfield.obj',
+                create_materials=True,
+                collect_faces=True,
+                strict=False,
+                parse=True,
+            )
+            print(f"[model] loaded {len(model.materials)} materials (bg thread)")
+            # Hand the model to the main thread.  The GIL makes the reference
+            # assignment atomic.  paintGL will lazy-compile the display list
+            # on its next frame since it's already in a valid GL context.
+            self.ballpark_model = model
+            self._model_load_pending = False
+            self.update()   # schedule a repaint
+        except Exception as e:
+            print(f"[model] error loading OBJ: {e}")
+            self._model_load_pending = False
 
     def update_ball_tracking(self):
         """Update the tracking camera to follow the ball"""
@@ -1435,10 +1514,8 @@ class UmpireView3D(QOpenGLWidget):
         # Set up lights based on parameters
         self.set_lighting(self.light_params)
 
-        # Initialize stadium display list
+        # Initialize stadium display list (compiled when model finishes loading)
         self.stadium_display_list = None
-
-        # Compile the proper display list with materials
         if self.ballpark_model:
             self.compile_stadium_display_list()
 
@@ -1588,9 +1665,32 @@ class UmpireView3D(QOpenGLWidget):
         glDisable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT, GL_AMBIENT_AND_DIFFUSE)
 
+        # Lazy-compile: if the bg thread delivered the model but the display
+        # list hasn't been built yet (QTimer from a non-Qt thread can misfire),
+        # compile it now — we're already in a valid GL context here.
+        if self.ballpark_model and not self.stadium_display_list:
+            self.compile_stadium_display_list()
+
         # Render stadium model using display list if available
         if self.stadium_display_list:
             glCallList(self.stadium_display_list)
+
+        # Draw spray chart dots at ground level
+        if self.spray_dots:
+            glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            for x_m, z_m, r, g, b in self.spray_dots:
+                glPushMatrix()
+                glTranslatef(x_m, 0.02, z_m)
+                glRotatef(-90, 1, 0, 0)  # orient disk flat on ground
+                glColor4f(r, g, b, 0.65)
+                disk = gluNewQuadric()
+                gluDisk(disk, 0, 0.15, 12, 1)
+                gluDeleteQuadric(disk)
+                glPopMatrix()
+            glPopAttrib()
 
         # Draw ball starting position indicator
         if hasattr(self, 'start_pos') and self.start_pos is not None:
@@ -1871,6 +1971,51 @@ class UmpireView3D(QOpenGLWidget):
         self.start_pos = (x, y, z)
         self.update()  # Request a redraw of the scene
 
+    # ---- Spray chart --------------------------------------------------- #
+    SAVANT_HP_X, SAVANT_HP_Y = 125.42, 198.27
+    SAVANT_SCALE = 2.51  # feet per Savant pixel
+    FT_TO_M = 1.0 / 3.28084
+
+    _SPRAY_RGB = {
+        "home_run": (1.0, 0.78, 0.2),
+        "single":   (0.4, 0.82, 0.4),
+        "double":   (0.4, 0.7, 1.0),
+        "triple":   (0.4, 0.86, 1.0),
+        "foul":     (0.55, 0.55, 0.55),
+    }
+    _SPRAY_OUT_RGB = (0.8, 0.27, 0.27)
+
+    def set_spray_chart(self, events: list):
+        """Populate spray dots from BBE events with hc_x/hc_y."""
+        self.spray_dots = []
+        for ev in events:
+            hc_x = ev.get("hc_x")
+            hc_y = ev.get("hc_y")
+            if hc_x is None or hc_y is None:
+                continue
+            try:
+                hc_x, hc_y = float(hc_x), float(hc_y)
+            except (ValueError, TypeError):
+                continue
+            if math.isnan(hc_x) or math.isnan(hc_y):
+                continue
+
+            dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
+            dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
+
+            # Feet → meters; 3D view: x toward CF, z toward RF
+            x_m = dy_ft * self.FT_TO_M
+            z_m = dx_ft * self.FT_TO_M
+
+            event_type = str(ev.get("events", ""))
+            r, g, b = self._SPRAY_RGB.get(event_type, self._SPRAY_OUT_RGB)
+            self.spray_dots.append((x_m, z_m, r, g, b))
+        self.update()
+
+    def clear_spray_chart(self):
+        self.spray_dots = []
+        self.update()
+
     def clear_ball(self):
         """Clear any displayed ball from the 3D view but keep the starting position"""
         self.ball_pos = None
@@ -2115,6 +2260,19 @@ class SplitView(QWidget):
         # Create a horizontal layout for organized stats display
         stats_layout = QHBoxLayout()
 
+        # Stadium selector (compact, inside stats bar)
+        stadium_combo_label = QLabel("Stadium:")
+        stadium_combo_label.setStyleSheet("color: #ccc; font-size: 11px; padding: 0 2px;")
+        stats_layout.addWidget(stadium_combo_label, 0)
+        self.stadium_combo = QComboBox()
+        self.stadium_combo.addItems(STADIUM_DATA.keys())
+        self.stadium_combo.setMinimumWidth(180)
+        self.stadium_combo.setStyleSheet(
+            "background: rgba(0,0,0,120); color: white; border: 1px solid #444; "
+            "padding: 2px 6px; font-size: 11px;"
+        )
+        stats_layout.addWidget(self.stadium_combo, 0)
+
         # Weather info panel
         self.weather_label = QLabel("Weather data: Not loaded")
         self.weather_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 120); padding: 8px; margin: 2px;")
@@ -2139,7 +2297,7 @@ class SplitView(QWidget):
 
         # Top-down stadium view
         self.stadium_view = StadiumView()
-        self.stadium_view.setMinimumSize(600, 600)
+        self.stadium_view.setMinimumSize(300, 300)
         stadium_view_layout.addWidget(self.stadium_view)
 
         # Stadium info label positioned at top-right of stadium view
@@ -2183,35 +2341,33 @@ class SplitView(QWidget):
             )
         self.stadium_view.resizeEvent = new_resize_event
 
-        views_layout.addWidget(stadium_view_container, 20)
+        views_layout.addWidget(stadium_view_container, 30)
 
         # 3D umpire view on the right
         self.umpire_view = UmpireView3D()
-        self.umpire_view.setMinimumSize(1400, 800)
-        views_layout.addWidget(self.umpire_view, 80)
+        self.umpire_view.setMinimumSize(600, 300)
+        views_layout.addWidget(self.umpire_view, 70)
+
+        # ---- Player BBE sidebar (inline, next to 3D view) ----
+        import os
+        self.player_overlay = PlayerBBEOverlay()
+        self.player_overlay.simulate_bbe.connect(self._on_simulate_bbe)
+        self.player_overlay.player_selected_with_data.connect(self._on_player_spray)
+        views_layout.addWidget(self.player_overlay, 0)
+        # Auto-detect the most recent season with BBE data on disk
+        import glob as _glob, re as _re
+        _years = sorted({
+            int(m.group(1))
+            for f in _glob.glob("savant_bbe_*.csv")
+            if (m := _re.search(r"savant_bbe_(\d{4})\.csv$", f))
+        }) or [2024]
+        _latest = _years[-1]
+        bbe_path = os.environ.get('BBE_CSV', f'savant_bbe_{_latest}.csv')
+        lb_path  = os.environ.get('LB_CSV',  f'savant_lb_{_latest}.csv')
+        lb_path  = lb_path if os.path.exists(lb_path) else None
+        self.player_overlay.load_data(bbe_path, lb_path, year=_latest)
 
         self.layout.addLayout(views_layout)
-
-        # ---- Player BBE overlay ----
-        # IMPORTANT: Must be parented to SplitView (self), NOT to UmpireView3D.
-        # QOpenGLWidget renders into its own OS-level framebuffer — child widgets
-        # painted over a QOpenGLWidget are silently ignored by Qt's compositor.
-        # As a sibling widget we position it manually over the umpire view rect
-        # and call raise_() so it sits above everything else in the Z-order.
-        import os
-        self.player_overlay = PlayerBBEOverlay(self)   # parent = SplitView
-        self.player_overlay.attach(self.umpire_view)   # tracks umpire_view geometry
-        self.player_overlay.simulate_bbe.connect(self._on_simulate_bbe)
-        bbe_path = os.environ.get('BBE_CSV', 'savant_bbe_2024.csv')
-        lb_path  = os.environ.get('LB_CSV',  'savant_lb_2024.csv')
-        lb_path  = lb_path if os.path.exists(lb_path) else None
-        self.player_overlay.load_data(bbe_path, lb_path)
-        self.player_overlay.raise_()
-        self.player_overlay.show()
-        # Defer initial positioning until Qt has finished laying out the window.
-        # At setup_ui() time all widgets report size 0 — the timer fires after
-        # the first event loop iteration when real geometry is available.
-        QTimer.singleShot(0, self.player_overlay.position_overlay)
 
 
     def update_starting_position(self):
@@ -2235,22 +2391,51 @@ class SplitView(QWidget):
                 self.umpire_view.set_start_position(x_3d, y_3d, z_3d)
 
 
+    # ---- Default weather so the sim is usable before the API responds ---- #
+    _DEFAULT_WEATHER = {
+        "wind_speed": 8,
+        "wind_direction": 180,
+        "temperature": 72,
+        "humidity": 50,
+        "pressure_hpa": 1013.25,
+        "pressure_pa": 101325.0,
+        "condition": "Clear",
+        "description": "loading…",
+        "precipitation": 0,
+    }
+
     def fetch_weather_data(self):
-        """Fetch real weather data for the stadium location"""
-        try:
-            print(f"Fetching weather data for lat: {self.lat}, lon: {self.lon}")
-            weather_json = self.weather_service.get_weather_by_location(self.lat, self.lon)
-            print("Weather JSON received:", weather_json)
-
-            self.weather_data = self.weather_service.extract_weather_data(weather_json)
-            print("Extracted weather data:", self.weather_data)
-
+        """Fetch weather in a background thread so the UI is never blocked."""
+        # If first call, seed with defaults so the sim works immediately
+        if self.weather_data is None:
+            self.weather_data = dict(self._DEFAULT_WEATHER)
             self.update_weather_label()
             self.update_weather_visualization()
-        except Exception as e:
-            print(f"Error fetching weather data: {e}")
-            import traceback
-            traceback.print_exc()
+
+        self.weather_label.setText(self.weather_label.text().rstrip(" (updating…)") + " (updating…)")
+
+        import threading
+        lat, lon = self.lat, self.lon
+        svc = self.weather_service
+
+        def _fetch():
+            try:
+                print(f"[weather] fetching for lat={lat}, lon={lon}")
+                weather_json = svc.get_weather_by_location(lat, lon)
+                data = svc.extract_weather_data(weather_json)
+                # Deliver result back on the main thread via QTimer
+                QTimer.singleShot(0, lambda d=data: self._apply_weather(d))
+            except Exception as e:
+                print(f"[weather] error: {e}")
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _apply_weather(self, data):
+        """Called on main thread when background weather fetch completes."""
+        self.weather_data = data
+        print(f"[weather] ready: {data.get('description', '')}  {data.get('temperature', '')}°F")
+        self.update_weather_label()
+        self.update_weather_visualization()
 
     def set_custom_weather(self, wind_speed, wind_direction):
         """Set custom weather data for simulation"""
@@ -2290,6 +2475,15 @@ class SplitView(QWidget):
                 self.weather_data.get("condition", "Clear"),
                 self.weather_data.get("description", "clear sky")
             )
+
+    def _on_player_spray(self, player_id: int, events: list):
+        """Show or clear spray chart dots when a player is selected/deselected."""
+        if not events or player_id == 0:
+            self.stadium_view.clear_spray_chart()
+            self.umpire_view.clear_spray_chart()
+        else:
+            self.stadium_view.set_spray_chart(events)
+            self.umpire_view.set_spray_chart(events)
 
     def _on_simulate_bbe(self, ev: float, launch_angle: float, player_id: int):
         """Called when user clicks a BBE row in the overlay.  Fires the sim
@@ -2504,24 +2698,15 @@ class MLBWeatherApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MLB Weather & Ball Flight Simulator")
-        self.setMinimumSize(1200, 950)  # Increased size for better display with wind widget
+        self.setMinimumSize(1200, 700)
+        _screen = QApplication.primaryScreen()
+        if _screen:
+            self.setMaximumHeight(_screen.availableGeometry().height())
 
         # Create central widget and layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-
-        # Stadium selection
-        stadium_layout = QHBoxLayout()  # Changed to horizontal layout for better space usage
-        stadium_label = QLabel("Select Stadium:")
-        self.stadium_combo = QComboBox()
-        self.stadium_combo.addItems(STADIUM_DATA.keys())
-        self.stadium_combo.currentTextChanged.connect(self.change_stadium)
-        self.stadium_combo.setMinimumWidth(200)  # Ensure enough width for stadium names
-        stadium_layout.addWidget(stadium_label)
-        stadium_layout.addWidget(self.stadium_combo)
-        stadium_layout.addStretch()  # Add stretch to push controls to the left
-        main_layout.addLayout(stadium_layout)
 
         # Create split view widget with default stadium
         default_stadium = list(STADIUM_DATA.keys())[0]
@@ -2534,6 +2719,10 @@ class MLBWeatherApp(QMainWindow):
         # Set dimensions for the default stadium
         self.stadium_widget.dimensions = STADIUM_DATA[default_stadium]["dimensions"]
         self.stadium_widget.stadium_name = default_stadium
+
+        # Connect the stadium combo (now owned by SplitView)
+        self.stadium_combo = self.stadium_widget.stadium_combo
+        self.stadium_combo.currentTextChanged.connect(self.change_stadium)
 
         # Add the split view with stretching to take most of the space
         main_layout.addWidget(self.stadium_widget, 1)  # Use stretch factor
@@ -2803,6 +2992,20 @@ class MLBWeatherApp(QMainWindow):
 
         self.stadium_widget.umpire_view.update()
         super().keyPressEvent(event)
+
+    def moveEvent(self, event):
+        """Re-fit and re-cap when dragged to a different monitor."""
+        super().moveEvent(event)
+        screen = self.screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        self.setMaximumHeight(available.height())
+        cur_w, cur_h = self.width(), self.height()
+        new_w = max(1200, available.width() - 40)
+        new_h = max(700, available.height() - 40)
+        if abs(new_w - cur_w) > 50 or abs(new_h - cur_h) > 50:
+            self.resize(new_w, new_h)
 
     def change_stadium(self, stadium_name):
         """Update the stadium when selection changes"""
@@ -3117,6 +3320,16 @@ class LightingControlWidget(QWidget):
 def main():
     app = QApplication(sys.argv)
     window = MLBWeatherApp()
+    screen = app.primaryScreen()
+    if screen:
+        available = screen.availableGeometry()
+        w = max(1200, available.width() - 40)
+        h = max(700, available.height() - 40)
+        window.resize(w, h)
+        window.move(
+            available.x() + (available.width()  - w) // 2,
+            available.y() + (available.height() - h) // 2,
+        )
     window.show()
     sys.exit(app.exec())
 

@@ -976,8 +976,12 @@ class WeatherService:
 
     def extract_weather_data(self, weather_json):
         """Extract relevant weather data from API response"""
-        # OpenWeather returns pressure in hPa; convert to Pa for physics use
-        pressure_hpa = weather_json["main"].get("pressure", 1013.25)
+        # OpenWeather's main.pressure is sea-level-normalised (SLP) — useful for display
+        # but inaccurate for physics at altitude.  main.grnd_level is the actual station
+        # pressure at ground level and is preferred when available.
+        slp_hpa     = weather_json["main"].get("pressure", 1013.25)
+        station_hpa = weather_json["main"].get("grnd_level")  # None if not in response
+        pressure_hpa = station_hpa if station_hpa is not None else slp_hpa
         weather_data = {
             "wind_speed": weather_json["wind"]["speed"],
             "wind_direction": weather_json["wind"]["deg"],
@@ -1156,11 +1160,21 @@ class WindVectorWidget(QWidget):
         # Scene time (milliseconds, driven by timer)
         self._t = 0.0
 
-        # High-res animation timer  (~60 fps)
+        # High-res animation timer  (~60 fps) — only runs while visible
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
-        self._timer.start()
+        # Don't start yet; showEvent will start it when the widget is mapped.
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if self._timer.isActive():
+            self._timer.stop()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -1478,6 +1492,9 @@ class WindVectorWidget(QWidget):
         ground.setColorAt(0.0, QColor(70, 76, 84, 180))
         ground.setColorAt(1.0, QColor(55, 60, 68, 255))
         painter.fillRect(0, int(H * 0.78), W, int(H * 0.22), QBrush(ground))
+
+    def _bg_thunder(self, painter, W, H):
+        # Dark stormy sky — flashes brighter when a lightning bolt is active
         fl = 0
         if self._bolt and self._bolt.visible and self._bolt.alpha > 0:
             fl = self._bolt.alpha * 0.10
