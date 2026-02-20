@@ -23,6 +23,7 @@ import numpy as np
 import math
 from scipy.integrate import solve_ivp
 from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, WindVectorWidget
+from player_overlay_widget import PlayerBBEOverlay
 from weatherman import open_weather_key
 from pathlib import Path
 from svgpathtools import svg2paths
@@ -50,6 +51,30 @@ QSurfaceFormat.setDefaultFormat(fmt)
 # Ball Flight Physics Component
 # ==============================================
 class BallFlightSimulator:
+    # ------------------------------------------------------------------
+    # Barometric pressure & altitude handling
+    #
+    # Air density (rho) is the key atmospheric input to both the drag and
+    # Magnus force terms in the ODE.  It is computed via calculate_air_density
+    # and fed into baseball_ode as a callable (rho_fn) rather than a fixed
+    # scalar, so density correctly decreases as the ball gains height during
+    # each solver step.
+    #
+    # Pressure source priority:
+    #   1. OpenWeather grnd_level field (actual station pressure) — preferred
+    #   2. OpenWeather pressure field (sea-level normalised / SLP) — fallback
+    #   3. ISA standard atmosphere derived from stadium altitude — last resort
+    #
+    # At low-altitude parks the difference between SLP and station pressure is
+    # small (~1-2 %) and has negligible effect on simulated carry.  Above
+    # HIGH_ALTITUDE_THRESHOLD_FT the divergence becomes material — at Coors
+    # Field (~5280 ft) SLP overstates station pressure by ~20 %, which would
+    # meaningfully underestimate how far the ball carries.  Above the threshold
+    # we therefore derive station pressure from the ISA formula and blend in
+    # the day's weather anomaly (SLP deviation from ISA standard) so the
+    # actual atmospheric conditions are still reflected in the simulation.
+    # ------------------------------------------------------------------
+
     def __init__(self):
         # Constants
         self.g = 9.81  # m/s^2, gravity
@@ -58,6 +83,11 @@ class BallFlightSimulator:
         self.C_d = 0.3  # drag coefficient
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
+
+    # Stadiums at or above this elevation trigger the high-altitude pressure
+    # correction described above.  1500 ft is the point where the SLP error
+    # (~4 % density impact) starts producing a noticeable difference in carry.
+    HIGH_ALTITUDE_THRESHOLD_FT = 1500
 
     def calculate_trajectory(self, exit_velocity, vlaunch_angle, hlaunch_angle, wind_speed, wind_direction,
                              temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0,
@@ -75,29 +105,72 @@ class BallFlightSimulator:
         horizontal_angle = np.radians(hlaunch_angle)
         wind = wind_speed * 0.44704  # mph to m/s
         wind_rad = np.radians(wind_direction)
-        # Calculate air density — use measured pressure when available
-        rho = self.calculate_air_density(temp, humidity, altitude, pressure_pa=pressure_pa)
+
+        # ----------------------------------------------------------------
+        # High-altitude correction
+        # OpenWeather's main.pressure field is sea-level-normalised (SLP).
+        # At stadiums above the threshold this diverges significantly from
+        # actual station pressure, so we derive station pressure from the
+        # ISA formula instead — it is more accurate than SLP for physics.
+        # ----------------------------------------------------------------
+        corrected_pressure_pa = pressure_pa
+        if altitude >= self.HIGH_ALTITUDE_THRESHOLD_FT:
+            # Derive station pressure from ISA standard atmosphere
+            altitude_m = altitude * 0.3048
+            p0_isa = 101325.0
+            T0_isa = 288.15
+            g_isa  = 9.81
+            L_isa  = 0.0065
+            R_isa  = 8.31447
+            M_isa  = 0.0289644
+            station_pressure_pa = p0_isa * (1 - L_isa * altitude_m / T0_isa) ** ((g_isa * M_isa) / (R_isa * L_isa))
+            if pressure_pa is not None and pressure_pa > 0:
+                # Blend: trust the SLP-derived *anomaly* (today's weather deviation
+                # from ISA standard) but anchor it to the correct station level.
+                # anomaly = SLP - standard SLP; apply to station pressure.
+                slp_standard_pa = p0_isa  # ISA sea-level standard
+                anomaly_pa = pressure_pa - slp_standard_pa  # e.g. +800 Pa if high pressure day
+                corrected_pressure_pa = station_pressure_pa + anomaly_pa
+                print(f"[High-altitude correction] Stadium altitude {altitude} ft "
+                      f"| SLP={pressure_pa/100:.1f} hPa "
+                      f"| Station ISA={station_pressure_pa/100:.1f} hPa "
+                      f"| Corrected={corrected_pressure_pa/100:.1f} hPa")
+            else:
+                corrected_pressure_pa = station_pressure_pa
+                print(f"[High-altitude correction] Stadium altitude {altitude} ft "
+                      f"| No API pressure — using ISA station pressure "
+                      f"{station_pressure_pa/100:.1f} hPa")
+
+        # ----------------------------------------------------------------
+        # Build a height-aware rho function.
+        # The ODE calls rho_fn(y_metres_above_field) at every solver step
+        # so air density correctly decreases as the ball climbs.
+        # ----------------------------------------------------------------
+        def rho_fn(y_m):
+            return self.calculate_air_density(
+                temp, humidity, altitude,
+                pressure_pa=corrected_pressure_pa,
+                extra_altitude_m=y_m
+            )
 
         # Initial conditions [x, y, z, vx, vy, vz]
-        # Using the provided starting position parameters
         initial_state = [
-            start_x, start_y, start_z,  # Starting position parameters
-            v0 * np.cos(vertical_angle) * np.cos(horizontal_angle),  # x component
-            v0 * np.sin(vertical_angle),  # y component (upward)
-            v0 * np.cos(vertical_angle) * np.sin(horizontal_angle)  # z component (sideways)
+            start_x, start_y, start_z,
+            v0 * np.cos(vertical_angle) * np.cos(horizontal_angle),
+            v0 * np.sin(vertical_angle),
+            v0 * np.cos(vertical_angle) * np.sin(horizontal_angle)
         ]
-        # Time span for simulation
-        t_span = (0, 10)  # 10 seconds should be enough for any baseball flight
 
-        # Solve differential equations
+        t_span = (0, 10)  # 10 seconds covers any realistic ball flight
+
         solution = solve_ivp(
-            lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho),
+            lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho_fn),
             t_span,
             initial_state,
             method='RK45',
             max_step=0.05,
-            rtol=1e-6,      # Tighter tolerance
-            atol=1e-6,      # Tighter tolerance
+            rtol=1e-6,
+            atol=1e-6,
             first_step=0.01
         )
 
@@ -134,52 +207,55 @@ class BallFlightSimulator:
             "start_z": start_z * 3.28084
         }
 
-    def baseball_ode(self, t, state, wind_speed, wind_direction, air_density):
-        """ODE system for baseball flight with proper time-dependent physics
+    def baseball_ode(self, t, state, wind_speed, wind_direction, rho_fn):
+        """ODE system for baseball flight with height-varying air density.
 
         Parameters:
         t (float): Time variable for time-dependent forces
         state (array): Current state [x, y, z, vx, vy, vz]
         wind_speed (float): Wind speed in m/s
         wind_direction (float): Wind direction in radians
-        air_density (float): Air density in kg/m³
+        rho_fn (callable): Function rho_fn(y_m) -> air density kg/m³ at height y_m
+                           above field level.  Evaluated at every solver step so that
+                           density correctly decreases as the ball climbs.
 
         Returns:
-        array: Derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt,F dvz/dt]
+        array: Derivatives [dx/dt, dy/dt, dz/dt, dvx/dt, dvy/dt, dvz/dt]
         """
         x, y, z, vx, vy, vz = state
 
+        # Air density at the ball's current height above field level
+        air_density = rho_fn(max(y, 0.0))  # clamp to 0 — no negative heights in density calc
+
         # Wind components with time-dependent variation (like gusts)
-        # Add a small sinusoidal variation to wind speed basFed on time
-        wind_variation = 0.1 * np.sin(2 * np.pi * t)  # 10% variation with 1Hz frequency
+        wind_variation = 0.1 * np.sin(2 * np.pi * t)  # 10% variation with 1 Hz frequency
         current_wind_speed = wind_speed * (1 + wind_variation)
 
         # Wind direction can also vary with time
         dir_variation = np.radians(5) * np.sin(np.pi * t)  # ±5 degrees variation
         current_wind_direction = wind_direction + dir_variation
 
-        # Calculate wind components with time-dependent variations
+        # Calculate wind components
         wind_x = current_wind_speed * np.cos(current_wind_direction)
         wind_z = current_wind_speed * np.sin(current_wind_direction)
 
-        # Relative velocity (ball velocity - wind velocity)
+        # Relative velocity (ball velocity minus wind velocity)
         v_rel_x = vx + wind_x
-        v_rel_y = vy  # No wind in vertical direction
+        v_rel_y = vy  # no vertical wind component
         v_rel_z = vz + wind_z
 
         v_rel = np.sqrt(v_rel_x**2 + v_rel_y**2 + v_rel_z**2)
 
-        # Drag force - may increase over time as the ball gets wet or changes
-        # This simulates increasing drag as flight time increases
-        drag_time_factor = 1.0 + 0.05 * min(t, 5.0)  # Max 25% increase over 5 seconds
+        # Drag force — slight time-based increase simulates ball absorbing moisture/wear
+        drag_time_factor = 1.0 + 0.05 * min(t, 5.0)  # max 25 % increase over 5 s
 
-        A = np.pi * (self.d/2)**2  # cross-sectional area
+        A = np.pi * (self.d / 2) ** 2  # cross-sectional area m²
         F_drag = 0.5 * air_density * v_rel**2 * self.C_d * A * drag_time_factor
 
-        # Magnus force - spin rate might decrease over time
-        spin_decay = np.exp(-0.1 * t)  # Exponential decay of spin
+        # Magnus force — spin decays exponentially
+        spin_decay = np.exp(-0.1 * t)
         current_omega = self.omega * spin_decay
-        omega_rad = current_omega * 2 * np.pi / 60  # rpm to rad/s
+        omega_rad = current_omega * 2 * np.pi / 60  # rpm → rad/s
 
         F_magnus = 0.5 * air_density * v_rel * self.d**3 * self.C_l * omega_rad
 
@@ -196,52 +272,78 @@ class BallFlightSimulator:
         ay_drag = -F_drag * v_rel_unit_y / self.m
         az_drag = -F_drag * v_rel_unit_z / self.m
 
-        # Magnus acceleration
+        # Magnus acceleration (vertical lift)
         ay_magnus = F_magnus / self.m
 
-        # Total acceleration including time-dependent components
         ax = ax_drag
         ay = ay_drag + ay_magnus - self.g
         az = az_drag
 
-        # Return derivatives
         return [vx, vy, vz, ax, ay, az]
 
-    def calculate_air_density(self, temp_f, humidity, altitude_ft, pressure_pa=None):
+    def calculate_air_density(self, temp_f, humidity, altitude_ft, pressure_pa=None,
+                              extra_altitude_m=0.0):
         """Calculate air density based on temperature, humidity, altitude, and optionally
         a measured barometric pressure.
 
-        When pressure_pa is supplied (from the live weather API in Pascals) it is used
-        directly, giving more accurate results than the altitude-only barometric formula.
-        When it is None we fall back to the standard atmosphere estimate from altitude.
+        Parameters
+        ----------
+        temp_f          : float  – surface temperature in °F
+        humidity        : float  – relative humidity 0-100
+        altitude_ft     : float  – stadium field elevation above sea level in feet
+        pressure_pa     : float  – station-level barometric pressure in Pa (preferred);
+                                   if None, the ISA formula is used instead
+        extra_altitude_m: float  – additional height above field level in metres
+                                   (used during simulation to vary rho with ball height)
+
+        When pressure_pa is supplied it is treated as the station pressure at field level.
+        The ISA lapse rate is then used to adjust that pressure upward as the ball climbs,
+        giving a physically correct height-varying air density throughout the trajectory.
+        When pressure_pa is None we fall back entirely to the standard atmosphere formula.
         """
-        # Convert temperature from Fahrenheit to Celsius
-        temp_c = (temp_f - 32) * 5/9
-        T = temp_c + 273.15  # Kelvin
+        # ISA constants
+        p0 = 101325   # sea level pressure Pa
+        T0 = 288.15   # sea level standard temperature K
+        g  = 9.81     # gravity m/s²
+        L  = 0.0065   # temperature lapse rate K/m
+        R  = 8.31447  # universal gas constant J/(mol·K)
+        M  = 0.0289644  # molar mass of dry air kg/mol
+        Rd = 287.05   # specific gas constant dry air J/(kg·K)
+        Rv = 461.495  # specific gas constant water vapor J/(kg·K)
+
+        # Convert temperature from Fahrenheit to Celsius; assume lapse with height
+        temp_c = (temp_f - 32) * 5 / 9
+        # Adjust temperature for ball height above field (ISA lapse rate)
+        temp_c_at_height = temp_c - L * extra_altitude_m
+        T = temp_c_at_height + 273.15  # Kelvin
+
+        # Total altitude above sea level at the ball's current position
+        field_altitude_m = altitude_ft * 0.3048
+        total_altitude_m = field_altitude_m + extra_altitude_m
 
         if pressure_pa is not None and pressure_pa > 0:
-            # Use the measured station pressure directly — most accurate path
-            p = float(pressure_pa)
+            # pressure_pa is station pressure at field level.
+            # Scale it upward using the ISA ratio between total altitude and field altitude
+            # so that pressure decreases correctly as the ball climbs.
+            p_field = float(pressure_pa)
+            T_field = temp_c + 273.15
+            # ISA pressure ratio: p(h) / p(field) = (T(h)/T(field))^(gM/RL)
+            exponent = (g * M) / (R * L)
+            T_at_height = T0 - L * total_altitude_m
+            T_at_field  = T0 - L * field_altitude_m
+            if T_at_field > 0 and T_at_height > 0:
+                p = p_field * (T_at_height / T_at_field) ** exponent
+            else:
+                p = p_field  # safety fallback
         else:
-            # Fall back: estimate pressure from altitude using standard atmosphere
-            altitude_m = altitude_ft * 0.3048
-            p0 = 101325  # sea level pressure in Pa
-            T0 = 288.15  # sea level standard temperature in K
-            g  = 9.81    # gravity m/s²
-            L  = 0.0065  # temperature lapse rate K/m
-            R  = 8.31447 # gas constant J/(mol·K)
-            M  = 0.0289644  # molar mass dry air kg/mol
-            p  = p0 * (1 - L * altitude_m / T0) ** (g * M / (R * L))
+            # Full ISA formula from sea level to current ball altitude
+            p = p0 * (1 - L * total_altitude_m / T0) ** ((g * M) / (R * L))
 
-        # Saturation vapor pressure (Tetens formula, hPa → Pa)
-        e_s = 6.1078 * 10 ** ((7.5 * temp_c) / (237.3 + temp_c)) * 100.0  # Pa
-
-        # Actual vapor partial pressure
+        # Saturation vapor pressure (Tetens formula) at surface temp — Pa
+        e_s = 6.1078 * 10 ** ((7.5 * temp_c) / (237.3 + temp_c)) * 100.0
         e = (humidity / 100.0) * e_s
 
-        # Density of moist air  ρ = (p_dry)/(Rd·T) + (e)/(Rv·T)
-        Rd = 287.05    # specific gas constant dry air  J/(kg·K)
-        Rv = 461.495   # specific gas constant water vapor J/(kg·K)
+        # Density of moist air: ρ = (p_dry)/(Rd·T) + e/(Rv·T)
         rho = (p - e) / (Rd * T) + e / (Rv * T)
 
         return rho
@@ -2090,6 +2192,27 @@ class SplitView(QWidget):
 
         self.layout.addLayout(views_layout)
 
+        # ---- Player BBE overlay ----
+        # IMPORTANT: Must be parented to SplitView (self), NOT to UmpireView3D.
+        # QOpenGLWidget renders into its own OS-level framebuffer — child widgets
+        # painted over a QOpenGLWidget are silently ignored by Qt's compositor.
+        # As a sibling widget we position it manually over the umpire view rect
+        # and call raise_() so it sits above everything else in the Z-order.
+        import os
+        self.player_overlay = PlayerBBEOverlay(self)   # parent = SplitView
+        self.player_overlay.attach(self.umpire_view)   # tracks umpire_view geometry
+        self.player_overlay.simulate_bbe.connect(self._on_simulate_bbe)
+        bbe_path = os.environ.get('BBE_CSV', 'savant_bbe_2024.csv')
+        lb_path  = os.environ.get('LB_CSV',  'savant_lb_2024.csv')
+        lb_path  = lb_path if os.path.exists(lb_path) else None
+        self.player_overlay.load_data(bbe_path, lb_path)
+        self.player_overlay.raise_()
+        self.player_overlay.show()
+        # Defer initial positioning until Qt has finished laying out the window.
+        # At setup_ui() time all widgets report size 0 — the timer fires after
+        # the first event loop iteration when real geometry is available.
+        QTimer.singleShot(0, self.player_overlay.position_overlay)
+
 
     def update_starting_position(self):
         """Update the visual indicator when position controls change"""
@@ -2167,6 +2290,17 @@ class SplitView(QWidget):
                 self.weather_data.get("condition", "Clear"),
                 self.weather_data.get("description", "clear sky")
             )
+
+    def _on_simulate_bbe(self, ev: float, launch_angle: float, player_id: int):
+        """Called when user clicks a BBE row in the overlay.  Fires the sim
+        with real EV and LA; horizontal angle defaults to straight-away center (45 deg)."""
+        spin_rate = 2200  # reasonable average for a batted ball
+        self.simulate_ball_flight(
+            exit_velocity=int(round(ev)),
+            vlaunch_angle=int(round(launch_angle)),
+            hlaunch_angle=45,
+            spin_rate=spin_rate,
+        )
 
     def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions and custom starting position"""
