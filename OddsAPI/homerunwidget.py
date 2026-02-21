@@ -34,9 +34,8 @@ LOG_BALL_PHYSICS = False
 
 
 # Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
-#TODO: PROPERLY LOAD AND DISPLAY .OBJ PARK MODEL IN QopenGLWidget
 # Load the materials as well if possible from baseballfield.mtl
-
+#TODO: Implement animated spray chart with controls in player_overlay widget
 fmt = QSurfaceFormat()
 fmt.setSamples(4)
 fmt.setDepthBufferSize(24)
@@ -615,42 +614,46 @@ class StadiumView(QGraphicsView):
     }
     _SPRAY_OUT_COLOUR = QColor(200, 70, 70)      # red for outs
 
+    def _make_spray_dot(self, hc_x: float, hc_y: float, event_type: str):
+        """Create a spray dot QGraphicsEllipseItem at the correct scene position."""
+        scale = self.field_scale
+        dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
+        dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
+        sx = self.home_plate_x + dx_ft * scale
+        sy = self.home_plate_y - dy_ft * scale
+
+        colour = self._SPRAY_COLOUR_MAP.get(event_type, self._SPRAY_OUT_COLOUR)
+        dot_r = 6  # scene-unit radius — visible at typical zoom
+        dot = QGraphicsEllipseItem(sx - dot_r, sy - dot_r, dot_r * 2, dot_r * 2)
+        outline = QPen(colour.darker(140))
+        outline.setWidthF(1.0)
+        dot.setPen(outline)
+        dot.setBrush(QBrush(colour))
+        dot.setOpacity(0.75)
+        return dot
+
+    def _parse_hc(self, ev: dict):
+        """Return (hc_x, hc_y) as floats or None if invalid."""
+        hc_x = ev.get("hc_x")
+        hc_y = ev.get("hc_y")
+        if hc_x is None or hc_y is None:
+            return None
+        try:
+            hc_x, hc_y = float(hc_x), float(hc_y)
+        except (ValueError, TypeError):
+            return None
+        if math.isnan(hc_x) or math.isnan(hc_y):
+            return None
+        return hc_x, hc_y
+
     def set_spray_chart(self, events: list):
         """Draw spray chart dots from BBE events with hc_x/hc_y."""
         self.clear_spray_chart()
-        scale = self.field_scale
-        hp_x = self.home_plate_x
-        hp_y = self.home_plate_y
-        dot_r = 2.5  # radius in scene px
-
         for ev in events:
-            hc_x = ev.get("hc_x")
-            hc_y = ev.get("hc_y")
-            if hc_x is None or hc_y is None:
+            parsed = self._parse_hc(ev)
+            if parsed is None:
                 continue
-            try:
-                hc_x = float(hc_x)
-                hc_y = float(hc_y)
-            except (ValueError, TypeError):
-                continue
-            if math.isnan(hc_x) or math.isnan(hc_y):
-                continue
-
-            # Savant pixel → feet relative to home plate
-            dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
-            dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
-
-            # Feet → scene coords (x right, y up in scene is -y in Qt)
-            sx = hp_x + dx_ft * scale
-            sy = hp_y - dy_ft * scale
-
-            event_type = str(ev.get("events", ""))
-            colour = self._SPRAY_COLOUR_MAP.get(event_type, self._SPRAY_OUT_COLOUR)
-
-            dot = QGraphicsEllipseItem(sx - dot_r, sy - dot_r, dot_r * 2, dot_r * 2)
-            dot.setPen(QPen(Qt.PenStyle.NoPen))
-            dot.setBrush(QBrush(colour))
-            dot.setOpacity(0.6)
+            dot = self._make_spray_dot(parsed[0], parsed[1], str(ev.get("events", "")))
             self.spray_layer.addToGroup(dot)
 
     def clear_spray_chart(self):
@@ -659,6 +662,14 @@ class StadiumView(QGraphicsView):
         self.spray_layer = QGraphicsItemGroup()
         self.spray_layer.setZValue(25)
         self.scene.addItem(self.spray_layer)
+
+    def add_spray_dot(self, ev: dict):
+        """Add a single spray chart dot (used for animated playback)."""
+        parsed = self._parse_hc(ev)
+        if parsed is None:
+            return
+        dot = self._make_spray_dot(parsed[0], parsed[1], str(ev.get("events", "")))
+        self.spray_layer.addToGroup(dot)
 
     def draw_stadium_polar(self, stadium_name, dimensions):
         """Draw stadium outline using polar coordinate data from weatherman.py"""
@@ -1322,7 +1333,8 @@ class UmpireView3D(QOpenGLWidget):
         self.ball_trail = []  # Store recent ball positions for trail effect
         self.ballpark_model = None
         self.textures = {}
-        self.spray_dots = []  # list of (x_m, z_m, r, g, b) for spray chart
+        self.spray_dots = []   # list of (x_m, z_m, r, g, b) for spray chart
+        self.spray_trails = [] # list of (points_list, r, g, b) for 3D trajectory trails
 
         # Set format for better rendering
         fmt = QSurfaceFormat()
@@ -1675,6 +1687,32 @@ class UmpireView3D(QOpenGLWidget):
         if self.stadium_display_list:
             glCallList(self.stadium_display_list)
 
+        # Draw spray chart 3D trajectory trails
+        if self.spray_trails:
+            glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT | GL_LINE_BIT)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glLineWidth(2.0)
+            for points, r, g, b in self.spray_trails:
+                glColor4f(r, g, b, 0.7)
+                glBegin(GL_LINE_STRIP)
+                for px, py, pz in points:
+                    glVertex3f(px, py, pz)
+                glEnd()
+                # Landing dot at final point
+                if points:
+                    lx, ly, lz = points[-1]
+                    glPushMatrix()
+                    glTranslatef(lx, max(ly, 0.02), lz)
+                    glRotatef(-90, 1, 0, 0)
+                    glColor4f(r, g, b, 0.85)
+                    disk = gluNewQuadric()
+                    gluDisk(disk, 0, 0.5, 12, 1)
+                    gluDeleteQuadric(disk)
+                    glPopMatrix()
+            glPopAttrib()
+
         # Draw spray chart dots at ground level
         if self.spray_dots:
             glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT)
@@ -1685,9 +1723,9 @@ class UmpireView3D(QOpenGLWidget):
                 glPushMatrix()
                 glTranslatef(x_m, 0.02, z_m)
                 glRotatef(-90, 1, 0, 0)  # orient disk flat on ground
-                glColor4f(r, g, b, 0.65)
+                glColor4f(r, g, b, 0.75)
                 disk = gluNewQuadric()
-                gluDisk(disk, 0, 0.15, 12, 1)
+                gluDisk(disk, 0, 0.6, 16, 1)  # ~2ft diameter disk
                 gluDeleteQuadric(disk)
                 glPopMatrix()
             glPopAttrib()
@@ -2014,6 +2052,43 @@ class UmpireView3D(QOpenGLWidget):
 
     def clear_spray_chart(self):
         self.spray_dots = []
+        self.spray_trails = []
+        self.update()
+
+    def add_spray_trail(self, traj: dict, r: float, g: float, b: float):
+        """Add a full trajectory as a persistent 3D trail line."""
+        FT = self.FT_TO_M
+        points = []
+        step = max(1, len(traj["x"]) // 60)  # ~60 points per trail
+        for i in range(0, len(traj["x"]), step):
+            points.append((
+                traj["x"][i] * FT,
+                traj["y"][i] * FT,
+                traj["z"][i] * FT,
+            ))
+        if points:
+            self.spray_trails.append((points, r, g, b))
+            self.update()
+
+    def add_spray_dot(self, ev: dict):
+        """Add a single spray dot (used for animated playback)."""
+        hc_x = ev.get("hc_x")
+        hc_y = ev.get("hc_y")
+        if hc_x is None or hc_y is None:
+            return
+        try:
+            hc_x, hc_y = float(hc_x), float(hc_y)
+        except (ValueError, TypeError):
+            return
+        if math.isnan(hc_x) or math.isnan(hc_y):
+            return
+        dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
+        dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
+        x_m = dy_ft * self.FT_TO_M
+        z_m = dx_ft * self.FT_TO_M
+        event_type = str(ev.get("events", ""))
+        r, g, b = self._SPRAY_RGB.get(event_type, self._SPRAY_OUT_RGB)
+        self.spray_dots.append((x_m, z_m, r, g, b))
         self.update()
 
     def clear_ball(self):
@@ -2363,7 +2438,15 @@ class SplitView(QWidget):
         self.player_overlay = PlayerBBEOverlay()
         self.player_overlay.simulate_bbe.connect(self._on_simulate_bbe)
         self.player_overlay.player_selected_with_data.connect(self._on_player_spray)
+        self.player_overlay.play_spray.connect(self._on_play_spray)
+        self.player_overlay.clear_spray.connect(self._clear_spray)
         views_layout.addWidget(self.player_overlay, 0)
+
+        # Spray chart animation timer
+        from PyQt6.QtCore import QTimer
+        self._spray_timer = QTimer()
+        self._spray_timer.timeout.connect(self._spray_tick)
+        self._spray_queue: list = []
         # Auto-detect the most recent season with BBE data on disk
         import glob as _glob, re as _re
         _years = sorted({
@@ -2493,14 +2576,127 @@ class SplitView(QWidget):
                 self.weather_data.get("description", "clear sky")
             )
 
-    def _on_player_spray(self, player_id: int, events: list):
+    def _on_player_spray(self, player_id: int, events):
         """Show or clear spray chart dots when a player is selected/deselected."""
+        self._spray_timer.stop()
+        self._spray_queue.clear()
         if not events or player_id == 0:
             self.stadium_view.clear_spray_chart()
             self.umpire_view.clear_spray_chart()
         else:
             self.stadium_view.set_spray_chart(events)
             self.umpire_view.set_spray_chart(events)
+
+    def _on_play_spray(self, events, include_fouls: bool):
+        """Animate spray chart: compute each BBE's trajectory and draw trails."""
+        self._spray_timer.stop()
+        self.animation_timer.stop()
+        self.stadium_view.clear_spray_chart()
+        self.stadium_view.clear_trails()
+        self.umpire_view.clear_spray_chart()
+
+        # Filter to events with valid launch data and spray coords
+        queue = []
+        for ev in events:
+            hc_x = ev.get("hc_x")
+            hc_y = ev.get("hc_y")
+            ev_speed = ev.get("launch_speed")
+            la = ev.get("launch_angle")
+            if hc_x is None or hc_y is None or ev_speed is None or la is None:
+                continue
+            try:
+                hc_x, hc_y = float(hc_x), float(hc_y)
+                ev_speed, la = float(ev_speed), float(la)
+            except (ValueError, TypeError):
+                continue
+            if any(math.isnan(v) for v in (hc_x, hc_y, ev_speed, la)):
+                continue
+            if not include_fouls and ev.get("events", "") == "foul":
+                continue
+            queue.append(ev)
+
+        queue.sort(key=lambda e: e.get("game_date", ""))
+
+        if not queue:
+            return
+
+        self._spray_queue = queue
+        interval_ms = max(10, min(80, int(8000 / max(len(queue), 1))))
+        self._spray_timer.start(interval_ms)
+
+    def _spray_tick(self):
+        """Pop one BBE, compute its trajectory, and draw trail on 2D + dot on 3D."""
+        if not self._spray_queue:
+            self._spray_timer.stop()
+            return
+
+        ev = self._spray_queue.pop(0)
+        hc_x = float(ev["hc_x"])
+        hc_y = float(ev["hc_y"])
+        ev_speed = float(ev["launch_speed"])
+        la = float(ev["launch_angle"])
+
+        # Derive horizontal launch angle from Savant spray coords
+        # Savant: hc_x increases toward right field, hc_y decreases toward CF
+        SAVANT_HP_X, SAVANT_HP_Y = 125.42, 198.27
+        dx = hc_x - SAVANT_HP_X   # + toward right field
+        dy = SAVANT_HP_Y - hc_y    # + toward center field
+        # atan2(dx, dy) gives angle from CF toward RF (positive = RF side)
+        hla_deg = math.degrees(math.atan2(dx, dy))
+
+        spin = 2200
+        sr = ev.get("release_spin_rate")
+        if sr is not None:
+            try:
+                spin = int(float(sr))
+            except (ValueError, TypeError):
+                pass
+
+        if not self.weather_data:
+            return
+
+        # Compute trajectory without animating
+        self.ball_simulator.omega = spin
+        start_x = self.x_pos_spin.value() / 3.28084
+        start_y = self.y_pos_spin.value() / 3.28084
+        start_z = self.z_pos_spin.value() / 3.28084
+
+        traj = self.ball_simulator.calculate_trajectory(
+            ev_speed, la, hla_deg,
+            self.weather_data["wind_speed"],
+            self.weather_data["wind_direction"],
+            self.weather_data["temperature"],
+            self.weather_data["humidity"],
+            self.altitude,
+            start_x, start_y, start_z,
+            pressure_pa=self.weather_data.get("pressure_pa", None),
+        )
+
+        # Classify and pick trail color
+        hit_result = self.classify_hit_result(traj)
+        _TRAIL_RGB = {
+            "HOME RUN":     (1.0, 0.84, 0.0),
+            "OFF THE WALL": (1.0, 0.55, 0.0),
+            "WARNING TRACK":(1.0, 0.78, 0.24),
+            "IN PLAY":      (0.63, 0.86, 0.39),
+            "FOUL BALL":    (0.7, 0.7, 0.7),
+        }
+        tr, tg, tb = _TRAIL_RGB.get(hit_result, (1.0, 0.55, 0.0))
+
+        # Draw persistent trail on 2D view (no ball animation)
+        self.stadium_view.start_ball_trajectory(traj, hit_result=hit_result)
+        self.stadium_view.ball_layer.setVisible(False)
+
+        # Draw persistent trail on 3D view
+        self.umpire_view.add_spray_trail(traj, tr, tg, tb)
+
+    def _clear_spray(self):
+        """Clear all spray chart dots and trails from both views."""
+        self._spray_timer.stop()
+        self._spray_queue.clear()
+        self.stadium_view.clear_spray_chart()
+        self.stadium_view.clear_trails()
+        self.umpire_view.clear_spray_chart()
 
     def _on_simulate_bbe(self, ev: float, launch_angle: float, player_id: int):
         """Called when user clicks a BBE row in the overlay.  Fires the sim
