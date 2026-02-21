@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QScrollArea, QFrame, QSizePolicy, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar, QStackedWidget,
+    QProgressBar, QStackedWidget, QCheckBox,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QObject, QPropertyAnimation,
@@ -699,6 +699,8 @@ class _DetailPage(QWidget):
     """Full-panel player detail view with back button."""
     back_clicked = pyqtSignal()
     bbe_selected = pyqtSignal(float, float, int)
+    play_spray   = pyqtSignal(object, bool)  # events, include_fouls
+    clear_spray  = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -742,24 +744,66 @@ class _DetailPage(QWidget):
         self.summary.setFixedHeight(285)
         root.addWidget(self.summary)
 
-        # ---- BBE section label ----
-        bbe_hdr = QLabel("  BBE Events")
-        bbe_hdr.setFixedHeight(22)
-        bbe_hdr.setStyleSheet(
-            "background: #1e1e2e; color: #aaa; font-size: 10px; "
-            "border-top: 1px solid #333345; border-bottom: 1px solid #333345;"
+        # ---- BBE header + spray controls ----
+        bbe_bar = QWidget()
+        bbe_bar.setFixedHeight(26)
+        bbe_bar.setStyleSheet(
+            "background: #1e1e2e; border-top: 1px solid #333345; "
+            "border-bottom: 1px solid #333345;"
         )
-        root.addWidget(bbe_hdr)
+        bb_lay = QHBoxLayout(bbe_bar)
+        bb_lay.setContentsMargins(6, 0, 6, 0)
+        bb_lay.setSpacing(6)
+
+        bbe_lbl = QLabel("BBE Events")
+        bbe_lbl.setStyleSheet("color: #aaa; font-size: 10px; border: none;")
+        bb_lay.addWidget(bbe_lbl)
+        bb_lay.addStretch()
+
+        self._fouls_cb = QCheckBox("Fouls")
+        self._fouls_cb.setChecked(False)
+        self._fouls_cb.setStyleSheet(
+            "QCheckBox { color: #888; font-size: 10px; border: none; }"
+            "QCheckBox::indicator { width: 12px; height: 12px; }"
+        )
+        bb_lay.addWidget(self._fouls_cb)
+
+        _btn_style = """
+            QPushButton {
+                background: #2a4a6a; color: #ccc; border: 1px solid #3a5a7a;
+                border-radius: 3px; font-size: 10px;
+            }
+            QPushButton:hover { background: #3a5a8a; color: #fff; }
+        """
+        self._play_btn = QPushButton("▶ Play")
+        self._play_btn.setFixedSize(58, 20)
+        self._play_btn.setStyleSheet(_btn_style)
+        self._play_btn.clicked.connect(self._on_play_clicked)
+        bb_lay.addWidget(self._play_btn)
+
+        self._clear_btn = QPushButton("✕ Clear")
+        self._clear_btn.setFixedSize(58, 20)
+        self._clear_btn.setStyleSheet(_btn_style)
+        self._clear_btn.clicked.connect(self.clear_spray)
+        bb_lay.addWidget(self._clear_btn)
+        root.addWidget(bbe_bar)
 
         # ---- BBE table fills all remaining height ----
         self.bbe_table = BBETableWidget()
         self.bbe_table.bbe_selected.connect(self.bbe_selected)
         root.addWidget(self.bbe_table, 1)
 
+        self._current_events: list = []
+
     def load_player(self, name: str, team: str, player_id: int,
                     lb_row, percentiles: dict, events: list):
         self.summary.load_player(name, team, player_id, lb_row, percentiles)
         self.bbe_table.load_events(events, player_id)
+        self._current_events = events
+
+    def _on_play_clicked(self):
+        if self._current_events:
+            self.play_spray.emit(self._current_events, self._fouls_cb.isChecked())
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +811,9 @@ class _DetailPage(QWidget):
 # ---------------------------------------------------------------------------
 class _OverlayContent(QWidget):
     player_changed  = pyqtSignal(int)
-    player_selected_with_data = pyqtSignal(int, list)  # player_id, list of BBE dicts
+    player_selected_with_data = pyqtSignal(int, object)  # player_id, list of BBE dicts
+    play_spray      = pyqtSignal(object, bool)           # events, include_fouls
+    clear_spray     = pyqtSignal()
     bbe_selected    = pyqtSignal(float, float, int)
     season_changed  = pyqtSignal(int)                  # year
 
@@ -794,6 +840,8 @@ class _OverlayContent(QWidget):
         self._detail_page = _DetailPage()
         self._detail_page.back_clicked.connect(self._go_back)
         self._detail_page.bbe_selected.connect(self.bbe_selected)
+        self._detail_page.play_spray.connect(self.play_spray)
+        self._detail_page.clear_spray.connect(self.clear_spray)
         self._stack.addWidget(self._detail_page)
 
         root.addWidget(self._stack, 1)
@@ -847,7 +895,9 @@ class PlayerBBEOverlay(QWidget):
     native-window overlay hacks needed.
     """
     simulate_bbe = pyqtSignal(float, float, int)   # ev, launch_angle, player_id
-    player_selected_with_data = pyqtSignal(int, list)  # player_id, list of BBE dicts
+    player_selected_with_data = pyqtSignal(int, object)  # player_id, list of BBE dicts
+    play_spray = pyqtSignal(object, bool)               # events, include_fouls
+    clear_spray = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -895,6 +945,8 @@ class PlayerBBEOverlay(QWidget):
         self.panel.setMaximumWidth(0)
         self.panel.bbe_selected.connect(self.simulate_bbe)
         self.panel.player_selected_with_data.connect(self.player_selected_with_data)
+        self.panel.play_spray.connect(self.play_spray)
+        self.panel.clear_spray.connect(self.clear_spray)
         self.panel.season_changed.connect(self._on_season_changed)
         outer.addWidget(self.panel)
 
