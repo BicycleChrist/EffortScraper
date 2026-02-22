@@ -63,6 +63,10 @@ LEADERBOARD_URL = (
     "https://baseballsavant.mlb.com/leaderboard/statcast"
     "?type=batter&year={year}&position=&team=&min=1&csv=true"
 )
+PITCHER_LEADERBOARD_URL = (
+    "https://baseballsavant.mlb.com/leaderboard/statcast"
+    "?type=pitcher&year={year}&position=&team=&min=1&csv=true"
+)
 
 OVERLAY_WIDTH_EXPANDED  = 460
 OVERLAY_WIDTH_COLLAPSED = 0
@@ -77,6 +81,16 @@ PERCENTILE_STATS = [
     ("Hard Hit %",   "ev95percent",             True),
     ("Sweet Spot %", "anglesweetspotpercent",   True),
     ("Avg Distance", "avg_distance",            True),
+]
+
+PITCHER_PERCENTILE_STATS = [
+    ("Avg EV",       "avg_hit_speed",          False),
+    ("Max EV",       "max_hit_speed",           False),
+    ("EV50",         "ev50",                    False),
+    ("Barrel %",     "brl_percent",             False),
+    ("Hard Hit %",   "ev95percent",             False),
+    ("Sweet Spot %", "anglesweetspotpercent",   False),
+    ("Avg Distance", "avg_distance",            False),
 ]
 
 # Colour stops for percentile bar: 0 → red, 50 → yellow, 100 → green
@@ -111,11 +125,13 @@ class DataLoaderWorker(QObject):
     progress  = pyqtSignal(str)
     error     = pyqtSignal(str)
 
-    def __init__(self, bbe_csv_path: str, leaderboard_csv_path: str | None = None, year: int = 2024):
+    def __init__(self, bbe_csv_path: str, leaderboard_csv_path: str | None = None,
+                 year: int = 2024, player_type: str = "batter"):
         super().__init__()
         self.bbe_csv_path        = bbe_csv_path
         self.leaderboard_csv_path = leaderboard_csv_path
         self.year                = year
+        self.player_type         = player_type
 
     def run(self):
         import requests
@@ -127,13 +143,18 @@ class DataLoaderWorker(QObject):
                 lb = pd.read_csv(self.leaderboard_csv_path)
             else:
                 self.progress.emit("Fetching leaderboard from Baseball Savant…")
-                r = requests.get(LEADERBOARD_URL.format(year=self.year), timeout=30)
+                lb_url = (PITCHER_LEADERBOARD_URL if self.player_type == "pitcher"
+                          else LEADERBOARD_URL)
+                r = requests.get(lb_url.format(year=self.year), timeout=30)
                 r.raise_for_status()
                 lb = pd.read_csv(io.StringIO(r.text))
 
             lb.columns = [c.strip().lower().replace(" ", "_").replace(",", "") for c in lb.columns]
             # canonical id column
-            for cand in ("player_id", "batter", "mlbam_id"):
+            _id_candidates = (["player_id", "pitcher", "mlbam_id"]
+                              if self.player_type == "pitcher"
+                              else ["player_id", "batter", "mlbam_id"])
+            for cand in _id_candidates:
                 if cand in lb.columns:
                     lb = lb.rename(columns={cand: "player_id"})
                     break
@@ -145,8 +166,13 @@ class DataLoaderWorker(QObject):
             cache_dir = Path("headshots")          # reuse existing cache dir
             cache_dir.mkdir(exist_ok=True)
 
-            # Cache key: hash of player_ids + stat columns present
-            _key_src = str(sorted(lb["player_id"].tolist())) + str([c for _, c, _ in PERCENTILE_STATS if c in lb.columns])
+            # Select percentile stat definitions based on player type
+            _pct_stats = (PITCHER_PERCENTILE_STATS if self.player_type == "pitcher"
+                          else PERCENTILE_STATS)
+
+            # Cache key: hash of player_ids + stat columns present + player_type
+            _key_src = (self.player_type + str(sorted(lb["player_id"].tolist()))
+                        + str([c for _, c, _ in _pct_stats if c in lb.columns]))
             _cache_name = f"pct_cache_{hashlib.md5(_key_src.encode()).hexdigest()[:12]}.json"
             _cache_path = cache_dir / _cache_name
 
@@ -159,7 +185,7 @@ class DataLoaderWorker(QObject):
                 self.progress.emit("Computing percentiles…")
                 pcts = {}
                 pids = lb["player_id"].astype(int).values
-                for _, col, higher_is_better in PERCENTILE_STATS:
+                for _, col, higher_is_better in _pct_stats:
                     if col not in lb.columns:
                         continue
                     series = lb[col]
@@ -518,8 +544,9 @@ class BBETableWidget(QTableWidget):
 # ---------------------------------------------------------------------------
 class _SearchPage(QWidget):
     """Full-panel player search and list.  Emits player_selected when a row is clicked."""
-    player_selected = pyqtSignal(int, str, str)   # player_id, name, team
-    season_changed  = pyqtSignal(int)             # year
+    player_selected      = pyqtSignal(int, str, str)   # player_id, name, team
+    season_changed       = pyqtSignal(int)             # year
+    player_type_changed  = pyqtSignal(str)             # "batter" or "pitcher"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -548,6 +575,31 @@ class _SearchPage(QWidget):
         )
         self.search.textChanged.connect(self._apply_filter)
         hl.addWidget(self.search, 2)
+
+        # ---- hitters / pitchers toggle ----
+        _toggle_style_active = (
+            "background: #3a5a8a; color: #fff; border: 1px solid #4a6a9a; "
+            "border-radius: 3px; font-size: 10px; padding: 1px 6px;"
+        )
+        _toggle_style_inactive = (
+            "background: #2a2a3a; color: #888; border: 1px solid #444; "
+            "border-radius: 3px; font-size: 10px; padding: 1px 6px;"
+        )
+        self._hitter_btn = QPushButton("Hit")
+        self._hitter_btn.setFixedSize(34, 22)
+        self._hitter_btn.setStyleSheet(_toggle_style_active)
+        self._hitter_btn.clicked.connect(lambda: self._set_player_type("batter"))
+        hl.addWidget(self._hitter_btn)
+
+        self._pitcher_btn = QPushButton("Pit")
+        self._pitcher_btn.setFixedSize(34, 22)
+        self._pitcher_btn.setStyleSheet(_toggle_style_inactive)
+        self._pitcher_btn.clicked.connect(lambda: self._set_player_type("pitcher"))
+        hl.addWidget(self._pitcher_btn)
+
+        self._player_type = "batter"
+        self._toggle_style_active = _toggle_style_active
+        self._toggle_style_inactive = _toggle_style_inactive
 
         self.team_cb = QComboBox()
         self.team_cb.setStyleSheet(
@@ -644,6 +696,18 @@ class _SearchPage(QWidget):
     def _on_season_changed(self, text: str):
         if text:
             self.season_changed.emit(int(text))
+
+    def _set_player_type(self, ptype: str):
+        if ptype == self._player_type:
+            return
+        self._player_type = ptype
+        if ptype == "pitcher":
+            self._pitcher_btn.setStyleSheet(self._toggle_style_active)
+            self._hitter_btn.setStyleSheet(self._toggle_style_inactive)
+        else:
+            self._hitter_btn.setStyleSheet(self._toggle_style_active)
+            self._pitcher_btn.setStyleSheet(self._toggle_style_inactive)
+        self.player_type_changed.emit(ptype)
 
     def _apply_filter(self):
         if self._store is None:
@@ -816,6 +880,7 @@ class _OverlayContent(QWidget):
     clear_spray     = pyqtSignal()
     bbe_selected    = pyqtSignal(float, float, int)
     season_changed  = pyqtSignal(int)                  # year
+    player_type_changed = pyqtSignal(str)              # "batter" or "pitcher"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -834,6 +899,7 @@ class _OverlayContent(QWidget):
         self._search_page = _SearchPage()
         self._search_page.player_selected.connect(self._on_player_selected)
         self._search_page.season_changed.connect(self.season_changed)
+        self._search_page.player_type_changed.connect(self.player_type_changed)
         self._stack.addWidget(self._search_page)
 
         # Page 1 — detail
@@ -906,6 +972,7 @@ class PlayerBBEOverlay(QWidget):
         self._loader_thread: QThread | None = None
         self._current_year: int = 0
         self._available_years: list[int] = []
+        self._player_type: str = "batter"
 
         self._build_ui()
         self._build_animation()
@@ -948,6 +1015,7 @@ class PlayerBBEOverlay(QWidget):
         self.panel.play_spray.connect(self.play_spray)
         self.panel.clear_spray.connect(self.clear_spray)
         self.panel.season_changed.connect(self._on_season_changed)
+        self.panel.player_type_changed.connect(self._on_player_type_changed)
         outer.addWidget(self.panel)
 
     def _build_animation(self):
@@ -977,20 +1045,33 @@ class PlayerBBEOverlay(QWidget):
         else:
             self._expand()
 
-    def load_data(self, bbe_csv: str, leaderboard_csv: str | None = None, year: int = 2024):
+    def load_data(self, bbe_csv: str, leaderboard_csv: str | None = None,
+                  year: int = 2024, player_type: str = "batter"):
         """Start background data load for a given season."""
-        # Detect available season CSVs on disk
-        import glob, re
-        self._available_years = sorted({
-            int(m.group(1))
-            for f in glob.glob("savant_bbe_*.csv")
-            if (m := re.search(r"savant_bbe_(\d{4})\.csv$", f))
-        }, reverse=True) or [year]
+        self._player_type = player_type
+
+        # Detect available season CSVs on disk for the current player type
+        self._available_years = self._detect_years(player_type) or [year]
 
         self._current_year = year
         self.panel.set_available_seasons(self._available_years, year)
 
         self._load_year(bbe_csv, leaderboard_csv, year)
+
+    def _detect_years(self, player_type: str) -> list[int]:
+        """Find available season years on disk for the given player type."""
+        import glob, re
+        if player_type == "pitcher":
+            pattern = "savant_pitcher-bbe_*.csv"
+            regex = r"savant_pitcher-bbe_(\d{4})\.csv$"
+        else:
+            pattern = "savant_bbe_*.csv"
+            regex = r"savant_bbe_(\d{4})\.csv$"
+        return sorted({
+            int(m.group(1))
+            for f in glob.glob(pattern)
+            if (m := re.search(regex, f))
+        }, reverse=True)
 
     def _load_year(self, bbe_csv: str, leaderboard_csv: str | None, year: int):
         """Kick off the background loader thread."""
@@ -999,8 +1080,9 @@ class PlayerBBEOverlay(QWidget):
             self._loader_thread.quit()
             self._loader_thread.wait(2000)
 
-        self.panel.set_loading_message(f"Loading {year} player data…")
-        worker = DataLoaderWorker(bbe_csv, leaderboard_csv, year=year)
+        self.panel.set_loading_message(f"Loading {year} {'pitcher' if self._player_type == 'pitcher' else 'hitter'} data…")
+        worker = DataLoaderWorker(bbe_csv, leaderboard_csv, year=year,
+                                  player_type=self._player_type)
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.finished.connect(self._on_data_ready)
@@ -1047,10 +1129,31 @@ class PlayerBBEOverlay(QWidget):
         if year == self._current_year:
             return
         self._current_year = year
+        self._reload_for_current_type(year)
+
+    def _on_player_type_changed(self, ptype: str):
+        """User toggled between Hitters and Pitchers."""
+        if ptype == self._player_type:
+            return
+        self._player_type = ptype
+
+        # Re-detect available years for this player type
+        self._available_years = self._detect_years(ptype) or [self._current_year]
+        year = self._available_years[0]  # most recent
+        self._current_year = year
+        self.panel.set_available_seasons(self._available_years, year)
+
+        self._reload_for_current_type(year)
+
+    def _reload_for_current_type(self, year: int):
+        """Reload data for the current player_type and year."""
         import os
-        bbe_csv = f"savant_bbe_{year}.csv"
-        lb_csv  = f"savant_lb_{year}.csv"
-        lb_csv  = lb_csv if os.path.exists(lb_csv) else None
+        if self._player_type == "pitcher":
+            bbe_csv = f"savant_pitcher-bbe_{year}.csv"
+        else:
+            bbe_csv = f"savant_bbe_{year}.csv"
+        lb_csv = f"savant_lb_{year}.csv"
+        lb_csv = lb_csv if os.path.exists(lb_csv) else None
         self._load_year(bbe_csv, lb_csv, year)
         # Clear spray chart via empty signal
         self.player_selected_with_data.emit(0, [])
