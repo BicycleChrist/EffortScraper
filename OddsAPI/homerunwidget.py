@@ -1142,24 +1142,19 @@ class StadiumView(QGraphicsView):
         self.shadow_item.setBrush(QBrush(QColor(0, 0, 0, 150)))
         self.shadow_item.setPen(QPen(Qt.PenStyle.NoPen))
 
-        # Get the starting position and convert using same polar transform as stadium drawing
+        # Subtract the 3D starting offset so 2D coords are relative to home plate
         start_x = trajectory_data.get('start_x', 0)
         start_z = trajectory_data.get('start_z', 0)
 
-        start_horiz = math.sqrt(start_x**2 + start_z**2)
-        start_angle = math.atan2(start_x, start_z) + math.pi / 4
-        scene_start_x = fixed_home_x + start_horiz * math.cos(start_angle) * scale_factor
-        scene_start_y = fixed_home_y - start_horiz * math.sin(start_angle) * scale_factor
+        # 2D always starts at home plate
+        scene_start_x = fixed_home_x
+        scene_start_y = fixed_home_y
 
-        if start_horiz == 0:
-            scene_start_x = fixed_home_x
-            scene_start_y = fixed_home_y
-
-        # Build scene path points
+        # Build scene path points (subtract start offset to keep relative to home plate)
         path_points = [(scene_start_x, scene_start_y)]
         for i in range(0, len(trajectory_data["x"]), 5):
-            ball_x = trajectory_data["x"][i]
-            ball_z = trajectory_data["z"][i]
+            ball_x = trajectory_data["x"][i] - start_x
+            ball_z = trajectory_data["z"][i] - start_z
             horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
             adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
             scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
@@ -1242,8 +1237,11 @@ class StadiumView(QGraphicsView):
         scale_factor = self.field_scale
 
         # Convert ball position using same polar transform as stadium drawing
-        ball_x = trajectory_data["x"][frame]  # center field component (feet)
-        ball_z = trajectory_data["z"][frame]  # right/left field component (feet)
+        # Subtract start offset so 2D coords are relative to home plate
+        start_x = trajectory_data.get('start_x', 0)
+        start_z = trajectory_data.get('start_z', 0)
+        ball_x = trajectory_data["x"][frame] - start_x
+        ball_z = trajectory_data["z"][frame] - start_z
         horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
         adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
         x = self.home_plate_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
@@ -2470,8 +2468,8 @@ class SplitView(QWidget):
             y = self.y_pos_spin.value()
             z = self.z_pos_spin.value()
 
-            # Update the visual indicator in the stadium view
-            self.stadium_view.draw_starting_position(x, y, z)
+            # 2D view always anchors the start indicator at home plate
+            self.stadium_view.draw_starting_position(0, 0, 0)
 
             # Update the 3D view starting position
             # Convert feet to the 3D view's units (approximately meters)
@@ -3040,8 +3038,8 @@ class MLBWeatherApp(QMainWindow):
         # X position (toward center field)
         position_layout.addWidget(QLabel("X (center field):"), 0, 0)
         self.x_pos_spin = QDoubleSpinBox()
-        self.x_pos_spin.setRange(-10, 50)  # Reasonable range for starting position
-        self.x_pos_spin.setValue(0)
+        self.x_pos_spin.setRange(-50, 100)
+        self.x_pos_spin.setValue(-24.5)
         self.x_pos_spin.setSingleStep(0.5)
         self.x_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.x_pos_spin, 0, 1)
@@ -3049,8 +3047,8 @@ class MLBWeatherApp(QMainWindow):
         # Y position (height)
         position_layout.addWidget(QLabel("Y (height):"), 1, 0)
         self.y_pos_spin = QDoubleSpinBox()
-        self.y_pos_spin.setRange(0, 10)  # Height range
-        self.y_pos_spin.setValue(3)  # 3 feet is approximately 0.91 meters
+        self.y_pos_spin.setRange(-5, 20)
+        self.y_pos_spin.setValue(8)
         self.y_pos_spin.setSingleStep(0.5)
         self.y_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.y_pos_spin, 1, 1)
@@ -3058,8 +3056,8 @@ class MLBWeatherApp(QMainWindow):
         # Z position (left/right field)
         position_layout.addWidget(QLabel("Z (left/right):"), 2, 0)
         self.z_pos_spin = QDoubleSpinBox()
-        self.z_pos_spin.setRange(-10, 10)  # Reasonable range for side-to-side
-        self.z_pos_spin.setValue(0)
+        self.z_pos_spin.setRange(-50, 50)
+        self.z_pos_spin.setValue(2.0)
         self.z_pos_spin.setSingleStep(0.5)
         self.z_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.z_pos_spin, 2, 1)
