@@ -2642,13 +2642,8 @@ class SplitView(QWidget):
         # atan2(dx, dy) gives angle from CF toward RF (positive = RF side)
         hla_deg = math.degrees(math.atan2(dx, dy))
 
-        spin = 2200
-        sr = ev.get("release_spin_rate")
-        if sr is not None:
-            try:
-                spin = int(float(sr))
-            except (ValueError, TypeError):
-                pass
+        # Estimate batted ball spin from launch angle (not pitch spin)
+        spin = self._estimate_batted_ball_spin(la)
 
         if not self.weather_data:
             return
@@ -2696,16 +2691,57 @@ class SplitView(QWidget):
         self.stadium_view.clear_trails()
         self.umpire_view.clear_spray_chart()
 
-    def _on_simulate_bbe(self, ev: float, launch_angle: float, player_id: int):
+    def _on_simulate_bbe(self, record: dict):
         """Called when user clicks a BBE row in the overlay.  Fires the sim
-        with real EV and LA; horizontal angle defaults to straight-away center (45 deg)."""
-        spin_rate = 2200  # reasonable average for a batted ball
+        with real EV, LA, and horizontal angle derived from spray coordinates."""
+        try:
+            ev = float(record.get("launch_speed", 0))
+            la = float(record.get("launch_angle", 0))
+        except (ValueError, TypeError):
+            return
+
+        # Derive horizontal launch angle from Savant spray coords if available
+        hc_x = record.get("hc_x")
+        hc_y = record.get("hc_y")
+        hla = 0.0  # default: straight-away center
+        if hc_x is not None and hc_y is not None:
+            try:
+                hc_x, hc_y = float(hc_x), float(hc_y)
+                if not (math.isnan(hc_x) or math.isnan(hc_y)):
+                    dx = hc_x - 125.42   # + toward right field
+                    dy = 198.27 - hc_y   # + toward center field
+                    hla = math.degrees(math.atan2(dx, dy))
+            except (ValueError, TypeError):
+                pass
+
+        # Estimate batted ball spin from launch angle
+        # (pitch spin ≠ batted ball spin; Savant doesn't publish batted ball spin)
+        spin_rate = self._estimate_batted_ball_spin(la)
+
         self.simulate_ball_flight(
             exit_velocity=int(round(ev)),
-            vlaunch_angle=int(round(launch_angle)),
-            hlaunch_angle=45,
+            vlaunch_angle=int(round(la)),
+            hlaunch_angle=round(hla, 1),
             spin_rate=spin_rate,
         )
+
+    @staticmethod
+    def _estimate_batted_ball_spin(launch_angle: float) -> int:
+        """Estimate batted ball backspin (rpm) from vertical launch angle.
+
+        Fly balls carry more backspin; grounders have topspin/less backspin.
+        This is a rough heuristic — Savant doesn't publish per-event batted ball spin.
+        """
+        if launch_angle >= 30:
+            return 2500     # high fly balls — strong backspin
+        elif launch_angle >= 20:
+            return 2100     # medium fly balls
+        elif launch_angle >= 10:
+            return 1800     # line drives
+        elif launch_angle >= 0:
+            return 1200     # low liners / soft grounders
+        else:
+            return 700      # topped grounders — topspin dominant
 
     def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions and custom starting position"""

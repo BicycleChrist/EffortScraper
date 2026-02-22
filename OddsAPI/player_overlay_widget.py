@@ -439,7 +439,7 @@ class PlayerSummaryWidget(QWidget):
 # BBE event table
 # ---------------------------------------------------------------------------
 class BBETableWidget(QTableWidget):
-    bbe_selected = pyqtSignal(float, float, int)   # ev, launch_angle, player_id
+    bbe_selected = pyqtSignal(object)   # dict: full BBE event record + player_id
 
     COLS = [
         ("Date",     "game_date"),
@@ -450,6 +450,8 @@ class BBETableWidget(QTableWidget):
         ("BB Type",  "bb_type"),
         ("Pitch",    "pitch_name"),
         ("Velo",     "release_speed"),
+        ("Spin",     "release_spin_rate"),
+        ("Inn",      "inning"),
     ]
 
     def __init__(self, parent=None):
@@ -482,9 +484,11 @@ class BBETableWidget(QTableWidget):
         """)
         self.cellClicked.connect(self._on_cell_clicked)
         self._player_id = None
+        self._events: list = []
 
     def load_events(self, events: list, player_id: int):
         self._player_id = player_id
+        self._events = list(events)
         self.setRowCount(0)
         for record in events:
             row = self.rowCount()
@@ -492,7 +496,14 @@ class BBETableWidget(QTableWidget):
             for col_idx, (_, key) in enumerate(self.COLS):
                 val = record.get(key, "")
                 if isinstance(val, float):
-                    text = "—" if math.isnan(val) else f"{val:.1f}"
+                    if math.isnan(val):
+                        text = "—"
+                    elif key in ("release_spin_rate", "inning"):
+                        text = f"{val:.0f}"
+                    else:
+                        text = f"{val:.1f}"
+                elif isinstance(val, int):
+                    text = str(val)
                 else:
                     text = str(val) if val else "—"
                 item = QTableWidgetItem(text)
@@ -525,17 +536,15 @@ class BBETableWidget(QTableWidget):
                 self.setItem(row, col_idx, item)
 
     def _on_cell_clicked(self, row: int, _col: int):
-        if self._player_id is None:
+        if self._player_id is None or row >= len(self._events):
             return
-        try:
-            ev  = float(self.item(row, 2).text())
-            la  = float(self.item(row, 3).text())
-            self.bbe_selected.emit(ev, la, self._player_id)
-        except (ValueError, AttributeError):
-            pass
+        record = self._events[row]
+        record["player_id"] = self._player_id
+        self.bbe_selected.emit(record)
 
     def clear_events(self):
         self._player_id = None
+        self._events = []
         self.setRowCount(0)
 
 
@@ -762,7 +771,7 @@ class _SearchPage(QWidget):
 class _DetailPage(QWidget):
     """Full-panel player detail view with back button."""
     back_clicked = pyqtSignal()
-    bbe_selected = pyqtSignal(float, float, int)
+    bbe_selected = pyqtSignal(object)   # dict: full BBE event record
     play_spray   = pyqtSignal(object, bool)  # events, include_fouls
     clear_spray  = pyqtSignal()
 
@@ -822,6 +831,18 @@ class _DetailPage(QWidget):
         bbe_lbl = QLabel("BBE Events")
         bbe_lbl.setStyleSheet("color: #aaa; font-size: 10px; border: none;")
         bb_lay.addWidget(bbe_lbl)
+
+        self._pitch_filter = QComboBox()
+        self._pitch_filter.setStyleSheet(
+            "QComboBox { background: #2a2a3a; color: #ccc; border: 1px solid #444; "
+            "border-radius: 3px; font-size: 10px; padding: 1px 4px; }"
+            "QComboBox::drop-down { border: none; }"
+        )
+        self._pitch_filter.setFixedWidth(82)
+        self._pitch_filter.addItem("All Pitches")
+        self._pitch_filter.currentTextChanged.connect(self._on_pitch_filter_changed)
+        bb_lay.addWidget(self._pitch_filter)
+
         bb_lay.addStretch()
 
         self._fouls_cb = QCheckBox("Fouls")
@@ -858,12 +879,44 @@ class _DetailPage(QWidget):
         root.addWidget(self.bbe_table, 1)
 
         self._current_events: list = []
+        self._all_events: list = []
+        self._current_player_id: int = 0
 
     def load_player(self, name: str, team: str, player_id: int,
                     lb_row, percentiles: dict, events: list):
         self.summary.load_player(name, team, player_id, lb_row, percentiles)
-        self.bbe_table.load_events(events, player_id)
-        self._current_events = events
+        self._all_events = events
+        self._current_player_id = player_id
+
+        # Populate pitch-type filter from this player's events
+        pitch_types = sorted({
+            str(e.get("pitch_name", ""))
+            for e in events if e.get("pitch_name")
+        })
+        self._pitch_filter.blockSignals(True)
+        self._pitch_filter.clear()
+        self._pitch_filter.addItem("All Pitches")
+        for pt in pitch_types:
+            self._pitch_filter.addItem(pt)
+        self._pitch_filter.blockSignals(False)
+
+        self._apply_pitch_filter()
+
+    def _on_pitch_filter_changed(self, _text: str):
+        self._apply_pitch_filter()
+
+    def _apply_pitch_filter(self):
+        """Filter events by selected pitch type and reload table."""
+        selected = self._pitch_filter.currentText()
+        if selected == "All Pitches":
+            self._current_events = self._all_events
+        else:
+            self._current_events = [
+                e for e in self._all_events
+                if str(e.get("pitch_name", "")) == selected
+            ]
+        self.bbe_table.load_events(self._current_events,
+                                   getattr(self, "_current_player_id", 0))
 
     def _on_play_clicked(self):
         if self._current_events:
@@ -878,7 +931,7 @@ class _OverlayContent(QWidget):
     player_selected_with_data = pyqtSignal(int, object)  # player_id, list of BBE dicts
     play_spray      = pyqtSignal(object, bool)           # events, include_fouls
     clear_spray     = pyqtSignal()
-    bbe_selected    = pyqtSignal(float, float, int)
+    bbe_selected    = pyqtSignal(object)               # dict: full BBE event record
     season_changed  = pyqtSignal(int)                  # year
     player_type_changed = pyqtSignal(str)              # "batter" or "pitcher"
 
@@ -960,7 +1013,7 @@ class PlayerBBEOverlay(QWidget):
     content panel slides open and the 3D viewport shrinks to make room — no
     native-window overlay hacks needed.
     """
-    simulate_bbe = pyqtSignal(float, float, int)   # ev, launch_angle, player_id
+    simulate_bbe = pyqtSignal(object)   # dict: full BBE event record
     player_selected_with_data = pyqtSignal(int, object)  # player_id, list of BBE dicts
     play_spray = pyqtSignal(object, bool)               # events, include_fouls
     clear_spray = pyqtSignal()
