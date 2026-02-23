@@ -4,7 +4,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem,
-    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget, QDoubleSpinBox, QTabWidget
+    QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget, QDoubleSpinBox, QTabWidget,
+    QSizePolicy
 )
 # Import QOpenGLWidget from the correct module
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -12,11 +13,8 @@ from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *
 from OpenGL.GLUT.fonts import *
-from xml.dom import minidom
-from PyQt6.QtSvg import QtSvg, QSvgRenderer
-from PyQt6.QtSvgWidgets import QGraphicsSvgItem
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat, QIcon, QLinearGradient, QRadialGradient, QPolygonF
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal, QPropertyAnimation, QEasingCurve
 import sys
 import random
 import numpy as np
@@ -26,7 +24,6 @@ from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, 
 from player_overlay_widget import PlayerBBEOverlay
 from weatherman import open_weather_key
 from pathlib import Path
-from svgpathtools import svg2paths
 from pywavefront import Wavefront
 import csv
 from test_pitch_simulation import savant_row_to_pitch_trajectory
@@ -583,10 +580,6 @@ class StadiumView(QGraphicsView):
         # z-ordering: spray between stadium and trails
         self.spray_layer.setZValue(25)
 
-        # SVG renderer and items
-        self.svg_renderer = None
-        self.stadium_svg_item = None
-
         # Ball and trajectory items
         self.ball_item = None
         self.shadow_item = None
@@ -716,7 +709,7 @@ class StadiumView(QGraphicsView):
             wall_points = []
             for (wx, wz) in stadium_data["cartesian_wall"]:
                 horiz_dist = math.sqrt(wx**2 + wz**2)
-                adjusted_angle = math.atan2(wx, wz) + math.pi / 4
+                adjusted_angle = math.atan2(wx, wz)
                 field_x = horiz_dist * math.cos(adjusted_angle) * scale_factor
                 field_y = -horiz_dist * math.sin(adjusted_angle) * scale_factor
                 wall_points.append(QPointF(home_plate_x + field_x, home_plate_y + field_y))
@@ -870,88 +863,6 @@ class StadiumView(QGraphicsView):
 
         self.stadium_layer.addToGroup(mound_item)
 
-    def draw_stadium_fallback(self, dimensions):
-        """Fallback method using basic dimensions when polar data unavailable"""
-        print("Using fallback stadium drawing with basic dimensions")
-
-        # Delete all stadium items and create a new layer
-        self.scene.removeItem(self.stadium_layer)
-        self.stadium_layer = QGraphicsItemGroup()
-        self.scene.addItem(self.stadium_layer)
-
-        scale_factor = 3.0
-        home_x, home_y = 0, 400
-
-        # Draw basic outfield arc using dimension data
-        wall_points = []
-
-        # Create points for basic outfield shape
-        angles = [0, 22.5, 45, 67.5, 90]  # Right field to left field
-        distances = [
-            dimensions["right_field"],
-            dimensions["right_center"],
-            dimensions["center_field"],
-            dimensions["left_center"],
-            dimensions["left_field"]
-        ]
-
-        for angle, distance in zip(angles, distances):
-            angle_rad = math.radians(angle)
-            scene_x = distance * math.sin(angle_rad) * scale_factor  # sin for right field → left field
-            scene_y = -distance * math.cos(angle_rad) * scale_factor  # -cos for toward center field
-            final_x = home_x + scene_x
-            final_y = home_y + scene_y
-            wall_points.append(QPointF(final_x, final_y))
-
-        # Create smooth curve through points
-        if wall_points:
-            wall_path = QPainterPath()
-            wall_path.moveTo(wall_points[0])
-            for point in wall_points[1:]:
-                wall_path.lineTo(point)
-
-            wall_item = QGraphicsPathItem(wall_path)
-            wall_item.setPen(QPen(QColor(139, 69, 19), 4))
-            self.stadium_layer.addToGroup(wall_item)
-
-        # Draw infield
-        self.draw_infield(home_x, home_y, scale_factor)
-
-        # Set scene bounds
-        max_distance = max(distances) * scale_factor
-        margin = 100
-        scene_width = max_distance * 2 + margin * 2
-        scene_height = max_distance + home_y + margin * 2
-
-        self.scene.setSceneRect(
-            -max_distance - margin,
-            home_y - max_distance - margin,
-            scene_width,
-            scene_height
-        )
-
-        self.resetCachedContent()
-        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        self.update()
-
-    def load_stadium_svg(self, svg_path, dimensions):
-        """Legacy SVG loading method - now redirects to polar coordinate drawing"""
-        # Extract stadium name from the SVG path or use a lookup
-        stadium_name = None
-
-        # Try to find stadium name from STADIUM_DATA that matches this svg_path
-        for name, data in STADIUM_DATA.items():
-            if "image_path" in data and svg_path.endswith(data["image_path"]):
-                stadium_name = name
-                break
-
-        if stadium_name:
-            print(f"Redirecting SVG load to polar coordinate drawing for: {stadium_name}")
-            self.draw_stadium_polar(stadium_name, dimensions)
-        else:
-            print(f"Could not find stadium name for SVG path: {svg_path}")
-            print("Using fallback drawing method")
-            self.draw_stadium_fallback(dimensions)
 
 
     def draw_starting_position(self, start_x, start_y, start_z):
@@ -996,7 +907,7 @@ class StadiumView(QGraphicsView):
             scene_x = fixed_home_x
             scene_y = fixed_home_y
         else:
-            adjusted_angle = math.atan2(start_x, start_z) + math.pi / 4
+            adjusted_angle = math.atan2(start_x, start_z)
             scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
             scene_y = fixed_home_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
 
@@ -1170,7 +1081,9 @@ class StadiumView(QGraphicsView):
             ball_x = trajectory_data["x"][i] - start_x
             ball_z = trajectory_data["z"][i] - start_z
             horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
-            adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
+            # atan2(X,Z) already gives angles π/4 higher than stadium polar convention
+            # (RF foul line = atan2 π/4 vs polar 0°), so no extra offset needed
+            adjusted_angle = math.atan2(ball_x, ball_z)
             scene_x = fixed_home_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
             scene_y = fixed_home_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
             path_points.append((scene_x, scene_y))
@@ -1257,7 +1170,7 @@ class StadiumView(QGraphicsView):
         ball_x = trajectory_data["x"][frame] - start_x
         ball_z = trajectory_data["z"][frame] - start_z
         horiz_dist = math.sqrt(ball_x**2 + ball_z**2)
-        adjusted_angle = math.atan2(ball_x, ball_z) + math.pi / 4
+        adjusted_angle = math.atan2(ball_x, ball_z)
         x = self.home_plate_x + horiz_dist * math.cos(adjusted_angle) * scale_factor
         y = self.home_plate_y - horiz_dist * math.sin(adjusted_angle) * scale_factor
         height = trajectory_data["y"][frame]
@@ -1349,6 +1262,15 @@ class UmpireView3D(QOpenGLWidget):
         self.spray_trails = [] # list of (points_list, r, g, b) for 3D trajectory trails
         self.pitch_trail_color = None  # when set (r,g,b), trail dots use this color
         self.trail_min_dist = 0.1      # minimum distance between trail points (meters)
+
+        # Physics-to-model coordinate transform constants
+        # Model home plate at (-7.38, 1.14, 0.90), CF direction at 45.2° in XZ plane
+        # Model scale: ~2.32 model units per meter (HP-to-rubber = 42.8 units / 18.44m)
+        self._model_hp = (-7.38, 1.14, 0.90)
+        self._model_scale = 2.320
+        _angle_rad = math.radians(45.2)
+        self._model_cos = math.cos(_angle_rad)
+        self._model_sin = math.sin(_angle_rad)
 
         # Set format for better rendering
         fmt = QSurfaceFormat()
@@ -1497,6 +1419,20 @@ class UmpireView3D(QOpenGLWidget):
         self.camera['pos'] = [x - offset_distance, y + height_offset, z]
         self.camera['target'] = [x, y, z]
 
+
+    def set_spray_camera(self, enabled: bool):
+        """Switch to a wide, centered camera for spray chart viewing."""
+        if enabled:
+            self._pre_spray_camera = self.camera.copy()
+            self.camera = {
+                'pos': [-20.0, 14.0, -12.0],
+                'target': [42.0, 0.0, 50.0],
+                'up': [0, 1, 0],
+                'fov': 65
+            }
+        elif hasattr(self, '_pre_spray_camera'):
+            self.camera = self._pre_spray_camera.copy()
+        self.update()
 
     def toggle_ball_tracking(self):
         """Toggle between normal camera and ball tracking camera"""
@@ -1718,11 +1654,11 @@ class UmpireView3D(QOpenGLWidget):
                 if points:
                     lx, ly, lz = points[-1]
                     glPushMatrix()
-                    glTranslatef(lx, max(ly, 0.02), lz)
+                    glTranslatef(lx, max(ly, self._model_hp[1] + 0.05), lz)
                     glRotatef(-90, 1, 0, 0)
                     glColor4f(r, g, b, 0.85)
                     disk = gluNewQuadric()
-                    gluDisk(disk, 0, 0.5, 12, 1)
+                    gluDisk(disk, 0, 1.0, 12, 1)
                     gluDeleteQuadric(disk)
                     glPopMatrix()
             glPopAttrib()
@@ -1735,11 +1671,11 @@ class UmpireView3D(QOpenGLWidget):
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             for x_m, z_m, r, g, b in self.spray_dots:
                 glPushMatrix()
-                glTranslatef(x_m, 0.02, z_m)
+                glTranslatef(x_m, self._model_hp[1] + 0.05, z_m)
                 glRotatef(-90, 1, 0, 0)  # orient disk flat on ground
                 glColor4f(r, g, b, 0.75)
                 disk = gluNewQuadric()
-                gluDisk(disk, 0, 0.6, 16, 1)  # ~2ft diameter disk
+                gluDisk(disk, 0, 1.2, 16, 1)  # ~2ft diameter disk (model scale)
                 gluDeleteQuadric(disk)
                 glPopMatrix()
             glPopAttrib()
@@ -1878,16 +1814,17 @@ class UmpireView3D(QOpenGLWidget):
 
             # Draw shadow with proper physics
             glPushMatrix()
-            glTranslatef(x, 0.01, z)  # Shadow is at ground level
+            glTranslatef(x, self._model_hp[1] + 0.02, z)  # Shadow at model ground level
 
-            # Shadow darkness based on height
-            shadow_alpha = max(0.1, min(0.6, 0.6 - y/20))
+            # Shadow darkness based on height above ground (in model units)
+            height_above_ground = y - self._model_hp[1]
+            shadow_alpha = max(0.1, min(0.6, 0.6 - height_above_ground/50))
             glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [0.0, 0.0, 0.0, shadow_alpha])
             glMaterialfv(GL_FRONT, GL_SPECULAR, [0.0, 0.0, 0.0, 0.0])
             glMaterialf(GL_FRONT, GL_SHININESS, 0.0)
 
-            # Shadow size scales with height
-            shadow_scale = max(0.5, min(1.0, 0.8 + 0.2*(10-y)/10))
+            # Shadow size scales with height above ground
+            shadow_scale = max(0.5, min(1.0, 0.8 + 0.2*(25-height_above_ground)/25))
             glScalef(shadow_scale, 0.1, shadow_scale)
 
             # Draw shadow
@@ -2023,9 +1960,22 @@ class UmpireView3D(QOpenGLWidget):
         glEndList()
         print("✅ Stadium model compiled into display list with materials based on mesh names")
 
+    def physics_to_model(self, x_m, y_m, z_m):
+        """Convert physics coordinates (meters) to 3D model coordinates.
+
+        Physics: X = toward CF, Y = up, Z = toward RF (+) / LF (-)
+        Model:   CF direction is at 45° in XZ plane, scale ~2.32 units/m,
+                 home plate at (-7.38, 1.14, 0.90).
+        """
+        # Rotate 45° around Y axis and scale
+        mx = (x_m * self._model_cos - z_m * self._model_sin) * self._model_scale + self._model_hp[0]
+        my = y_m * self._model_scale + self._model_hp[1]
+        mz = (x_m * self._model_sin + z_m * self._model_cos) * self._model_scale + self._model_hp[2]
+        return mx, my, mz
+
     def set_start_position(self, x, y, z):
         """Set the starting position indicator for the 3D view"""
-        self.start_pos = (x, y, z)
+        self.start_pos = self.physics_to_model(x, y, z)
         self.update()  # Request a redraw of the scene
 
     # ---- Spray chart --------------------------------------------------- #
@@ -2060,13 +2010,15 @@ class UmpireView3D(QOpenGLWidget):
             dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
             dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
 
-            # Feet → meters; 3D view: x toward CF, z toward RF
-            x_m = dy_ft * self.FT_TO_M
-            z_m = dx_ft * self.FT_TO_M
+            # Physics coords: x toward CF, z toward RF (meters)
+            x_phys = dy_ft * self.FT_TO_M
+            z_phys = dx_ft * self.FT_TO_M
+            # Transform to model coordinates
+            mx, _, mz = self.physics_to_model(x_phys, 0, z_phys)
 
             event_type = str(ev.get("events", ""))
             r, g, b = self._SPRAY_RGB.get(event_type, self._SPRAY_OUT_RGB)
-            self.spray_dots.append((x_m, z_m, r, g, b))
+            self.spray_dots.append((mx, mz, r, g, b))
         self.update()
 
     def clear_spray_chart(self):
@@ -2080,7 +2032,7 @@ class UmpireView3D(QOpenGLWidget):
         points = []
         step = max(1, len(traj["x"]) // 60)  # ~60 points per trail
         for i in range(0, len(traj["x"]), step):
-            points.append((
+            points.append(self.physics_to_model(
                 traj["x"][i] * FT,
                 traj["y"][i] * FT,
                 traj["z"][i] * FT,
@@ -2103,11 +2055,12 @@ class UmpireView3D(QOpenGLWidget):
             return
         dx_ft = (hc_x - self.SAVANT_HP_X) * self.SAVANT_SCALE
         dy_ft = (self.SAVANT_HP_Y - hc_y) * self.SAVANT_SCALE
-        x_m = dy_ft * self.FT_TO_M
-        z_m = dx_ft * self.FT_TO_M
+        x_phys = dy_ft * self.FT_TO_M
+        z_phys = dx_ft * self.FT_TO_M
+        mx, _, mz = self.physics_to_model(x_phys, 0, z_phys)
         event_type = str(ev.get("events", ""))
         r, g, b = self._SPRAY_RGB.get(event_type, self._SPRAY_OUT_RGB)
-        self.spray_dots.append((x_m, z_m, r, g, b))
+        self.spray_dots.append((mx, mz, r, g, b))
         self.update()
 
     def clear_ball(self):
@@ -2230,40 +2183,6 @@ class UmpireView3D(QOpenGLWidget):
 # Weather animation widget and particle classes live in weatherman.py
 
 
-class StadiumSVGManager:
-    def get_clean_outline(self, svg_path):
-        """Extract simplified path from SVG"""
-        try:
-            paths, _ = svg2paths(svg_path)
-            return max(paths, key=lambda p: p.length())
-        except:
-            return None
-
-    def get_svg_path(self, stadium_name):
-        """Get the SVG path for a given stadium name"""
-        # Check if the stadium exists in the stadium data
-        if stadium_name not in STADIUM_DATA:
-            print(f"Stadium {stadium_name} not found in STADIUM_DATA")
-            return None
-
-        # Get the image path from the stadium data
-        image_path = STADIUM_DATA[stadium_name]["image_path"]
-
-        # Extract the filename without path or extension
-        filename = Path(image_path).stem
-
-        # Create the SVG path in the SVGMLBstadiumgraphics directory
-        svg_path = f"MLBstadiumgraphics/SVGMLBstadiumgraphics/{filename}.svg"
-
-        # Check if the SVG file exists
-        if not Path(svg_path).exists():
-            print(f"SVG file not found: {svg_path}")
-            return None
-
-        return svg_path
-
-
-
 
 
 class SplitView(QWidget):
@@ -2293,9 +2212,6 @@ class SplitView(QWidget):
         self.altitude = altitude
         self.dimensions = None
         self.stadium_name = ""
-
-        # Add SVG manager
-        self.svg_manager = StadiumSVGManager()
 
         # Weather and simulation data
         self.weather_data = None
@@ -2359,10 +2275,13 @@ class SplitView(QWidget):
     def setup_ui(self):
         """Set up the split view UI layout"""
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
 
         # Create top section with only the wind vector widget taking full width
-        top_layout = QVBoxLayout()  # Changed to vertical layout
+        top_layout = QVBoxLayout()
+        top_layout.setSpacing(0)
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
         # Add the wind vector widget taking full width
         self.wind_vector_widget = WindVectorWidget()
@@ -2370,6 +2289,8 @@ class SplitView(QWidget):
 
         # Create a horizontal layout for organized stats display
         stats_layout = QHBoxLayout()
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(0)
 
         # Stadium selector (compact, inside stats bar)
         stadium_combo_label = QLabel("Stadium:")
@@ -2400,6 +2321,8 @@ class SplitView(QWidget):
 
         # Main views container - side by side
         views_layout = QHBoxLayout()
+        views_layout.setSpacing(0)
+        views_layout.setContentsMargins(0, 0, 0, 0)
 
         # Container for top-down stadium view with overlay elements
         stadium_view_container = QWidget()
@@ -2609,9 +2532,11 @@ class SplitView(QWidget):
         if not events or player_id == 0:
             self.stadium_view.clear_spray_chart()
             self.umpire_view.clear_spray_chart()
+            self.umpire_view.set_spray_camera(False)
         else:
             self.stadium_view.set_spray_chart(events)
             self.umpire_view.set_spray_chart(events)
+            self.umpire_view.set_spray_camera(True)
 
     def _on_play_spray(self, events, include_fouls: bool):
         """Animate spray chart: compute each BBE's trajectory and draw trails."""
@@ -2620,6 +2545,7 @@ class SplitView(QWidget):
         self.stadium_view.clear_spray_chart()
         self.stadium_view.clear_trails()
         self.umpire_view.clear_spray_chart()
+        self.umpire_view.set_spray_camera(True)
 
         # Filter to events with valid launch data and spray coords
         queue = []
@@ -2718,6 +2644,7 @@ class SplitView(QWidget):
         self.stadium_view.clear_spray_chart()
         self.stadium_view.clear_trails()
         self.umpire_view.clear_spray_chart()
+        self.umpire_view.set_spray_camera(False)
 
     def _on_simulate_bbe(self, record: dict):
         """Called when user clicks a BBE row in the overlay.  Fires the sim
@@ -2791,90 +2718,21 @@ class SplitView(QWidget):
         self.umpire_view.clear_ball()
         self.umpire_view.ball_trail = []
 
-        # Remap pitch trajectory so it ends at the batted ball starting position
-        # and starts near the model's pitcher's rubber.
-        #
-        # The OBJ model's field is rotated ~45° in XZ and scaled ~2.3x vs reality:
-        #   Model home plate center: (-7.33, 1.13, 0.96) meters
-        #   Model pitcher's rubber:  (22.77, 3.21, 31.24) meters
-        # The physics trajectory assumes mound is along +X from plate, but the
-        # model has it at +X AND +Z equally.  We offset to anchor the plate-
-        # crossing at the bat position, then rotate+scale in XZ so the release
-        # point aligns with the model's rubber direction.
+        # Anchor pitch trajectory so the plate-crossing ends at the bat position.
+        # physics_to_model() in _update_pitch_animation handles the 45° rotation,
+        # scale, and translation to model coordinates.
         traj = self.pitch_trajectory_data
         bat_x = self.x_pos_spin.value()  # feet — batted ball start X (toward CF)
         bat_y = self.y_pos_spin.value()  # feet — batted ball start Y (height)
         bat_z = self.z_pos_spin.value()  # feet — batted ball start Z (1B/3B)
 
-        # Save raw physics Y (heights above field level, feet) before transforms
-        raw_y = traj["y"].copy()
-
-        # Step 1: Offset XZ so the last trajectory point lands at the bat position
+        # Offset so the last trajectory point lands at the bat position (physics space)
         offset_x = bat_x - traj["x"][-1]
+        offset_y = bat_y - traj["y"][-1]
         offset_z = bat_z - traj["z"][-1]
         traj["x"] = traj["x"] + offset_x
+        traj["y"] = traj["y"] + offset_y
         traj["z"] = traj["z"] + offset_z
-
-        # Step 2: Rotate + scale XZ around bat position to match model geometry
-        # Model rubber/plate positions (meters → feet)
-        FT = 3.28084
-        MODEL_RUBBER_X_FT = 22.77 * FT   # ~74.7 ft
-        MODEL_RUBBER_Z_FT = 31.24 * FT   # ~102.5 ft
-
-        # Desired direction: bat → rubber (in the model)
-        desired_dx = MODEL_RUBBER_X_FT - bat_x
-        desired_dz = MODEL_RUBBER_Z_FT - bat_z
-        desired_angle = math.atan2(desired_dz, desired_dx)
-        desired_dist = math.sqrt(desired_dx**2 + desired_dz**2)
-
-        # Current trajectory direction: bat → release (physics coords after offset)
-        cur_dx = traj["x"][0] - bat_x
-        cur_dz = traj["z"][0] - bat_z
-        cur_angle = math.atan2(cur_dz, cur_dx)
-        cur_dist = math.sqrt(cur_dx**2 + cur_dz**2)
-
-        if cur_dist > 0.1:  # guard against degenerate trajectories
-            rot = desired_angle - cur_angle
-            scl = desired_dist / cur_dist
-            cos_r = math.cos(rot)
-            sin_r = math.sin(rot)
-
-            # Rotate + scale XZ positions around bat position
-            dx = traj["x"] - bat_x
-            dz = traj["z"] - bat_z
-            traj["x"] = bat_x + scl * (dx * cos_r - dz * sin_r)
-            traj["z"] = bat_z + scl * (dx * sin_r + dz * cos_r)
-
-            # Rotate + scale XZ velocities
-            old_vx = traj["vx"].copy()
-            traj["vx"] = scl * (old_vx * cos_r - traj["vz"] * sin_r)
-            traj["vz"] = scl * (old_vx * sin_r + traj["vz"] * cos_r)
-
-            # Step 3: Map Y to model coords (elevated mound → plate)
-            # The model's mound surface is at Y=2.0m while plate is at Y=1.13m.
-            # In reality the mound is only ~10 inches above field level.
-            # We anchor release height relative to model mound ground and
-            # plate crossing at bat_y, preserving trajectory curvature.
-            MODEL_MOUND_GROUND_M = 2.0    # mound surface Y (meters)
-            REAL_MOUND_ELEV_FT = 0.83     # real mound elevation (10 inches)
-
-            n = len(raw_y)
-            frac = np.linspace(0, 1, n)   # 0 = release, 1 = plate
-
-            # Curvature: deviation from straight-line path (gravity + Magnus)
-            raw_line = raw_y[0] + frac * (raw_y[-1] - raw_y[0])
-            raw_deviation = raw_y - raw_line
-
-            # Target release Y: model mound ground + hand-above-mound * scale
-            h_above_mound = raw_y[0] - REAL_MOUND_ELEV_FT
-            release_y_ft = (MODEL_MOUND_GROUND_M + (h_above_mound / FT) * scl) * FT
-
-            # Straight line in model space: release → bat_y
-            model_line = release_y_ft + frac * (bat_y - release_y_ft)
-
-            # Add curvature scaled by XZ scale (keeps break proportional)
-            traj["y"] = model_line + raw_deviation * scl
-            traj["vy"] = traj["vy"] * scl
 
         # Set pitch trail color and tighter trail spacing
         pitch_name = record.get("pitch_name", "")
@@ -2934,16 +2792,16 @@ class SplitView(QWidget):
 
         frame = min(self.current_frame, n - 1)
 
-        # Convert feet → meters and set 3D ball position
-        x = traj["x"][frame] / 3.28084
-        y = traj["y"][frame] / 3.28084
-        z = traj["z"][frame] / 3.28084
+        # Convert feet → meters then to model coordinates
+        x_m = traj["x"][frame] / 3.28084
+        y_m = traj["y"][frame] / 3.28084
+        z_m = traj["z"][frame] / 3.28084
         vx = traj["vx"][frame] / 3.28084
         vy = traj["vy"][frame] / 3.28084
         vz = traj["vz"][frame] / 3.28084
 
         self.umpire_view.ball_vel = (vx, vy, vz)
-        self.umpire_view.ball_pos = (x, y, z)
+        self.umpire_view.ball_pos = self.umpire_view.physics_to_model(x_m, y_m, z_m)
         self.umpire_view.update()
 
     def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
@@ -3051,10 +2909,10 @@ class SplitView(QWidget):
         )
 
         # Update ball position in 3D umpire view
-        # Convert from feet to meters for the 3D view
-        x = self.trajectory_data["x"][self.current_frame] / 3.28084
-        y = self.trajectory_data["y"][self.current_frame] / 3.28084
-        z = self.trajectory_data["z"][self.current_frame] / 3.28084
+        # Convert from feet to meters then to model coordinates
+        x_m = self.trajectory_data["x"][self.current_frame] / 3.28084
+        y_m = self.trajectory_data["y"][self.current_frame] / 3.28084
+        z_m = self.trajectory_data["z"][self.current_frame] / 3.28084
 
         # Get velocities for the current frame
         vx = self.trajectory_data["vx"][self.current_frame] / 3.28084  # Convert ft/s to m/s
@@ -3064,8 +2922,8 @@ class SplitView(QWidget):
         # Store velocity in the umpire view for visual effects
         self.umpire_view.ball_vel = (vx, vy, vz)
 
-        # Apply proper coordinate mapping for 3D view
-        self.umpire_view.ball_pos = (x, y, z)
+        # Apply physics-to-model coordinate transform for 3D view
+        self.umpire_view.ball_pos = self.umpire_view.physics_to_model(x_m, y_m, z_m)
         self.umpire_view.update()
         self.update()
 
@@ -3079,16 +2937,21 @@ class SplitView(QWidget):
 
         distance = np.sqrt(final_x**2 + final_z**2)
 
+        # atan2(X, Z) gives angle from +Z (RF direction) counterclockwise:
+        #   RF foul line ≈ 45°, dead CF = 90°, LF foul line ≈ 135°
+        # Stadium polar coords use 0° = RF foul line, 90° = LF foul line,
+        # so subtract 45° to convert.
         angle_rad = math.atan2(final_x, final_z)
-        angle_deg = math.degrees(angle_rad)
-        if angle_deg < 0:
-            angle_deg += 180
+        atan2_deg = math.degrees(angle_rad)
+        if atan2_deg < 0:
+            atan2_deg += 360
+        stadium_angle = atan2_deg - 45.0
 
-        # Outside fair territory
-        if angle_deg < 0 or angle_deg > 90:
+        # Outside fair territory (stadium polar 0°–90° = RF line to LF line)
+        if stadium_angle < 0 or stadium_angle > 90:
             return "FOUL BALL"
 
-        wall_distance = get_stadium_wall_distance(self.stadium_name, angle_deg)
+        wall_distance = get_stadium_wall_distance(self.stadium_name, stadium_angle)
         if wall_distance is None:
             return "IN PLAY"
 
@@ -3164,6 +3027,8 @@ class MLBWeatherApp(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # Create split view widget with default stadium
         default_stadium = list(STADIUM_DATA.keys())[0]
@@ -3184,12 +3049,122 @@ class MLBWeatherApp(QMainWindow):
         # Add the split view with stretching to take most of the space
         main_layout.addWidget(self.stadium_widget, 1)  # Use stretch factor
 
-        # Ball flight controls in a horizontal layout for better space usage
+        # ============================================================
+        # Compact always-visible toolbar
+        # ============================================================
+        toolbar_css = """
+            QWidget#CompactToolbar {
+                background: #1a1a2e;
+                border-top: 1px solid #333345;
+                border-bottom: 1px solid #333345;
+            }
+            QWidget#CompactToolbar QLabel {
+                color: #aaa; font-size: 10px; padding: 0 2px;
+            }
+            QWidget#CompactToolbar QSpinBox, QWidget#CompactToolbar QDoubleSpinBox {
+                background: #22223a; color: white; border: 1px solid #444;
+                padding: 2px 4px; font-size: 11px; min-width: 50px; max-width: 65px;
+            }
+            QWidget#CompactToolbar QPushButton {
+                background: #22223a; color: white; border: 1px solid #444;
+                padding: 4px 10px; font-size: 11px;
+            }
+            QWidget#CompactToolbar QPushButton:hover { background: #2a2a4a; }
+            QWidget#CompactToolbar QPushButton#SimBtn {
+                background: #1a5276; font-weight: bold;
+            }
+            QWidget#CompactToolbar QPushButton#SimBtn:hover { background: #21618c; }
+        """
+        compact_toolbar = QWidget()
+        compact_toolbar.setObjectName("CompactToolbar")
+        compact_toolbar.setStyleSheet(toolbar_css)
+        compact_toolbar.setFixedHeight(32)
+        tb_layout = QHBoxLayout(compact_toolbar)
+        tb_layout.setContentsMargins(4, 2, 4, 2)
+        tb_layout.setSpacing(6)
+
+        # -- Simulate button --
+        self.simulate_btn = QPushButton("Simulate")
+        self.simulate_btn.setObjectName("SimBtn")
+        self.simulate_btn.clicked.connect(self.simulate_flight)
+        tb_layout.addWidget(self.simulate_btn)
+
+        # -- Track Ball button --
+        self.track_ball_btn = QPushButton("Track")
+        def ToggleBallTracking():
+            enabled_css = "QPushButton { background-color: #00FF00; color: white; border: 1px solid #444; padding: 4px 10px; font-size: 11px; }"
+            disabled_css = "QPushButton { background-color: #FF0000; color: white; border: 1px solid #444; padding: 4px 10px; font-size: 11px; }"
+            isEnabled = self.stadium_widget.umpire_view.toggle_ball_tracking()
+            self.track_ball_btn.setStyleSheet(enabled_css if isEnabled else disabled_css)
+        self.track_ball_btn.clicked.connect(ToggleBallTracking)
+        tb_layout.addWidget(self.track_ball_btn)
+        ToggleBallTracking(); ToggleBallTracking()  # toggle twice to set initial css
+
+        tb_layout.addWidget(self._tb_separator())
+
+        # -- EV spinbox --
+        tb_layout.addWidget(QLabel("EV"))
+        self._tb_ev_spin = QSpinBox()
+        self._tb_ev_spin.setRange(0, 160)
+        self._tb_ev_spin.setValue(100)
+        self._tb_ev_spin.setSuffix(" mph")
+        tb_layout.addWidget(self._tb_ev_spin)
+
+        # -- VLA spinbox --
+        tb_layout.addWidget(QLabel("VLA"))
+        self._tb_vla_spin = QSpinBox()
+        self._tb_vla_spin.setRange(0, 90)
+        self._tb_vla_spin.setValue(25)
+        self._tb_vla_spin.setSuffix("°")
+        tb_layout.addWidget(self._tb_vla_spin)
+
+        # -- HLA spinbox --
+        tb_layout.addWidget(QLabel("HLA"))
+        self._tb_hla_spin = QSpinBox()
+        self._tb_hla_spin.setRange(0, 90)
+        self._tb_hla_spin.setValue(45)
+        self._tb_hla_spin.setSuffix("°")
+        tb_layout.addWidget(self._tb_hla_spin)
+
+        # -- Spin spinbox --
+        tb_layout.addWidget(QLabel("Spin"))
+        self._tb_spin_spin = QSpinBox()
+        self._tb_spin_spin.setRange(1000, 3000)
+        self._tb_spin_spin.setValue(1800)
+        self._tb_spin_spin.setSingleStep(50)
+        self._tb_spin_spin.setSuffix(" rpm")
+        tb_layout.addWidget(self._tb_spin_spin)
+
+        # -- Pitch speed spinbox --
+        tb_layout.addWidget(QLabel("Speed"))
+        self._tb_pitch_speed_spin = QDoubleSpinBox()
+        self._tb_pitch_speed_spin.setRange(0.1, 2.0)
+        self._tb_pitch_speed_spin.setValue(1.0)
+        self._tb_pitch_speed_spin.setSingleStep(0.1)
+        self._tb_pitch_speed_spin.setDecimals(1)
+        self._tb_pitch_speed_spin.setSuffix("x")
+        tb_layout.addWidget(self._tb_pitch_speed_spin)
+
+        tb_layout.addStretch()
+
+        # -- Drawer toggle --
+        self._drawer_toggle = QPushButton("▼ More")
+        self._drawer_toggle.setFixedWidth(70)
+        self._drawer_toggle.clicked.connect(self._toggle_drawer)
+        tb_layout.addWidget(self._drawer_toggle)
+
+        main_layout.addWidget(compact_toolbar)
+
+        # ============================================================
+        # Full controls drawer (collapsible, hidden by default)
+        # ============================================================
+        self._drawer_expanded = False
         controls_container = QWidget()
+        controls_container.setObjectName("ControlsDrawer")
         controls_main_layout = QVBoxLayout(controls_container)
         controls_main_layout.setContentsMargins(5, 5, 5, 5)
 
-        # Top row of controls
+        # Top row of controls (sliders)
         top_controls = QHBoxLayout()
 
         # Exit Velocity control
@@ -3269,7 +3244,6 @@ class MLBWeatherApp(QMainWindow):
         spin_pitch_container.addWidget(pitch_speed_group)
 
         top_controls.addLayout(spin_pitch_container)
-
         controls_main_layout.addLayout(top_controls)
 
         # Bottom row of controls
@@ -3277,54 +3251,47 @@ class MLBWeatherApp(QMainWindow):
 
         # Wind override controls
         wind_group = QGroupBox("Override Weather")
-        wind_layout = QGridLayout()  # Use grid layout for better organization
+        wind_layout = QGridLayout()
 
-        # Wind speed
         wind_layout.addWidget(QLabel("Wind Speed (mph):"), 0, 0)
         self.wind_speed_spin = QSpinBox()
         self.wind_speed_spin.setRange(0, 100)
         self.wind_speed_spin.setValue(10)
         wind_layout.addWidget(self.wind_speed_spin, 0, 1)
 
-        # Wind direction
         wind_layout.addWidget(QLabel("Wind Direction (°):"), 1, 0)
         self.wind_dir_spin = QSpinBox()
         self.wind_dir_spin.setRange(0, 360)
         self.wind_dir_spin.setValue(0)
         wind_layout.addWidget(self.wind_dir_spin, 1, 1)
 
-        # Override checkbox
         self.override_weather = QCheckBox("Override Weather Data")
-        wind_layout.addWidget(self.override_weather, 2, 0, 1, 2)  # Span two columns
-
+        wind_layout.addWidget(self.override_weather, 2, 0, 1, 2)
 
         # Ball position controls
         position_group = QGroupBox("Ball Starting Position (feet)")
         position_layout = QGridLayout()
 
-        # X position (toward center field)
         position_layout.addWidget(QLabel("X (center field):"), 0, 0)
         self.x_pos_spin = QDoubleSpinBox()
         self.x_pos_spin.setRange(-50, 100)
-        self.x_pos_spin.setValue(-24.5)
+        self.x_pos_spin.setValue(-3.0)
         self.x_pos_spin.setSingleStep(0.5)
         self.x_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.x_pos_spin, 0, 1)
 
-        # Y position (height)
         position_layout.addWidget(QLabel("Y (height):"), 1, 0)
         self.y_pos_spin = QDoubleSpinBox()
         self.y_pos_spin.setRange(-5, 20)
-        self.y_pos_spin.setValue(8)
+        self.y_pos_spin.setValue(4.5)
         self.y_pos_spin.setSingleStep(0.5)
         self.y_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.y_pos_spin, 1, 1)
 
-        # Z position (left/right field)
         position_layout.addWidget(QLabel("Z (left/right):"), 2, 0)
         self.z_pos_spin = QDoubleSpinBox()
         self.z_pos_spin.setRange(-50, 50)
-        self.z_pos_spin.setValue(2.0)
+        self.z_pos_spin.setValue(0.0)
         self.z_pos_spin.setSingleStep(0.5)
         self.z_pos_spin.valueChanged.connect(lambda: self.stadium_widget.update_starting_position())
         position_layout.addWidget(self.z_pos_spin, 2, 1)
@@ -3332,7 +3299,6 @@ class MLBWeatherApp(QMainWindow):
         position_group.setLayout(position_layout)
         bottom_controls.addWidget(position_group)
 
-        # Store references in the stadium widget for easy access
         self.stadium_widget.x_pos_spin = self.x_pos_spin
         self.stadium_widget.y_pos_spin = self.y_pos_spin
         self.stadium_widget.z_pos_spin = self.z_pos_spin
@@ -3340,36 +3306,16 @@ class MLBWeatherApp(QMainWindow):
         wind_group.setLayout(wind_layout)
         bottom_controls.addWidget(wind_group)
 
-        # Action buttons
+        # Action buttons (in drawer: lighting + weather update)
         button_layout = QVBoxLayout()
 
-        # Simulate button
-        self.simulate_btn = QPushButton("Simulate Ball Flight")
-        self.simulate_btn.setMinimumHeight(40)  # Make button taller for emphasis
-        self.simulate_btn.clicked.connect(self.simulate_flight)
-        button_layout.addWidget(self.simulate_btn)
-
-        self.track_ball_btn = QPushButton("Track Ball")
-        def ToggleBallTracking():
-            enabled_css = """QPushButton { background-color: #00FF00; color: white; }"""
-            disabled_css = """QPushButton { background-color: #FF0000; color: white; }"""
-            isEnabled = self.stadium_widget.umpire_view.toggle_ball_tracking()
-            self.track_ball_btn.setStyleSheet(enabled_css if isEnabled else disabled_css)
-        self.track_ball_btn.clicked.connect(ToggleBallTracking)
-        button_layout.addWidget(self.track_ball_btn)
-        ToggleBallTracking(); ToggleBallTracking() # toggle twice to set initial css
-
-        # Lighting control button
         self.lighting_btn = QPushButton("Lighting Controls")
         self.lighting_btn.clicked.connect(self.show_lighting_controls)
         button_layout.addWidget(self.lighting_btn)
 
-        # Create lighting control widget (but don't show it yet)
         self.lighting_control = LightingControlWidget(self.stadium_widget.umpire_view.light_params)
         self.lighting_control.lightChanged.connect(self.update_lighting)
 
-
-        # Update weather button
         self.update_weather_btn = QPushButton("Update Weather Data")
         self.update_weather_btn.clicked.connect(self.update_weather)
         button_layout.addWidget(self.update_weather_btn)
@@ -3378,7 +3324,105 @@ class MLBWeatherApp(QMainWindow):
         bottom_controls.addLayout(button_layout)
 
         controls_main_layout.addLayout(bottom_controls)
+
+        # --- Drawer starts collapsed ---
+        self._controls_container = controls_container
+        self._controls_container.setMaximumHeight(0)
+        self._controls_container.setMinimumHeight(0)
         main_layout.addWidget(controls_container)
+
+        # Measure natural height after layout settles
+        controls_container.adjustSize()
+        self._drawer_full_height = controls_container.sizeHint().height()
+
+        # Drawer animation
+        self._drawer_anim = QPropertyAnimation(controls_container, b"maximumHeight")
+        self._drawer_anim.setDuration(250)
+        self._drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._drawer_anim_min = QPropertyAnimation(controls_container, b"minimumHeight")
+        self._drawer_anim_min.setDuration(250)
+        self._drawer_anim_min.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # ============================================================
+        # Bidirectional sync: toolbar spinboxes <-> drawer sliders
+        # ============================================================
+        self._syncing = False  # guard against feedback loops
+
+        def _sync_ev_to_slider(v):
+            if not self._syncing:
+                self._syncing = True
+                self.ev_slider.setValue(v)
+                self._syncing = False
+
+        def _sync_ev_to_spin(v):
+            if not self._syncing:
+                self._syncing = True
+                self._tb_ev_spin.setValue(v)
+                self._syncing = False
+
+        self._tb_ev_spin.valueChanged.connect(_sync_ev_to_slider)
+        self.ev_slider.valueChanged.connect(_sync_ev_to_spin)
+
+        def _sync_vla_to_slider(v):
+            if not self._syncing:
+                self._syncing = True
+                self.vla_slider.setValue(v)
+                self._syncing = False
+
+        def _sync_vla_to_spin(v):
+            if not self._syncing:
+                self._syncing = True
+                self._tb_vla_spin.setValue(v)
+                self._syncing = False
+
+        self._tb_vla_spin.valueChanged.connect(_sync_vla_to_slider)
+        self.vla_slider.valueChanged.connect(_sync_vla_to_spin)
+
+        def _sync_hla_to_slider(v):
+            if not self._syncing:
+                self._syncing = True
+                self.hla_slider.setValue(v)
+                self._syncing = False
+
+        def _sync_hla_to_spin(v):
+            if not self._syncing:
+                self._syncing = True
+                self._tb_hla_spin.setValue(v)
+                self._syncing = False
+
+        self._tb_hla_spin.valueChanged.connect(_sync_hla_to_slider)
+        self.hla_slider.valueChanged.connect(_sync_hla_to_spin)
+
+        def _sync_spin_to_slider(v):
+            if not self._syncing:
+                self._syncing = True
+                self.spin_slider.setValue(v)
+                self._syncing = False
+
+        def _sync_spin_to_spin(v):
+            if not self._syncing:
+                self._syncing = True
+                self._tb_spin_spin.setValue(v)
+                self._syncing = False
+
+        self._tb_spin_spin.valueChanged.connect(_sync_spin_to_slider)
+        self.spin_slider.valueChanged.connect(_sync_spin_to_spin)
+
+        def _sync_pitch_speed_to_slider(v):
+            if not self._syncing:
+                self._syncing = True
+                slider_val = int(round(v * 10))
+                self.pitch_speed_slider.setValue(slider_val)
+                self._syncing = False
+
+        def _sync_pitch_speed_to_spin(v):
+            if not self._syncing:
+                self._syncing = True
+                self._tb_pitch_speed_spin.setValue(v / 10.0)
+                self._syncing = False
+
+        self._tb_pitch_speed_spin.valueChanged.connect(_sync_pitch_speed_to_slider)
+        self.pitch_speed_slider.valueChanged.connect(_sync_pitch_speed_to_spin)
         self.control_target = 'pos'
         self.control_index = 2
         self.control_value = self.stadium_widget.umpire_view.camera[self.control_target][self.control_index]
@@ -3405,6 +3449,42 @@ class MLBWeatherApp(QMainWindow):
     #
     #     super().keyPressEvent(a0) # delegate back to base keybind handling
     #     return
+
+    # ------------------------------------------------------------------ #
+    # Compact toolbar / drawer helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _tb_separator():
+        sep = QWidget()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(20)
+        sep.setStyleSheet("background: #444;")
+        return sep
+
+    def _toggle_drawer(self):
+        if self._drawer_expanded:
+            # collapse
+            self._drawer_expanded = False
+            self._drawer_toggle.setText("▼ More")
+            cur = self._controls_container.height()
+            self._drawer_anim.setStartValue(cur)
+            self._drawer_anim.setEndValue(0)
+            self._drawer_anim_min.setStartValue(cur)
+            self._drawer_anim_min.setEndValue(0)
+        else:
+            # expand
+            self._drawer_expanded = True
+            self._drawer_toggle.setText("▲ Less")
+            # Recalculate in case font/dpi changed
+            self._drawer_full_height = self._controls_container.sizeHint().height()
+            if self._drawer_full_height < 50:
+                self._drawer_full_height = 220  # sane fallback
+            self._drawer_anim.setStartValue(0)
+            self._drawer_anim.setEndValue(self._drawer_full_height)
+            self._drawer_anim_min.setStartValue(0)
+            self._drawer_anim_min.setEndValue(self._drawer_full_height)
+        self._drawer_anim.start()
+        self._drawer_anim_min.start()
 
     def keyPressEvent(self, event):
         """Handle key press events for camera movement"""
