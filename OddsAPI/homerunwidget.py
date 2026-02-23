@@ -29,8 +29,22 @@ from pathlib import Path
 from svgpathtools import svg2paths
 from pywavefront import Wavefront
 import csv
+from test_pitch_simulation import savant_row_to_pitch_trajectory
 
 LOG_BALL_PHYSICS = False
+
+# Pitch trail colors by pitch type (matches test_pitch_viewer.py)
+PITCH_TRAIL_COLORS = {
+    "4-Seam Fastball": (1.0, 0.3, 0.3),
+    "Sinker":          (1.0, 0.5, 0.2),
+    "Cutter":          (0.9, 0.2, 0.5),
+    "Slider":          (0.3, 0.7, 1.0),
+    "Sweeper":         (0.2, 0.5, 1.0),
+    "Curveball":       (0.4, 1.0, 0.4),
+    "Knuckle Curve":   (0.3, 0.9, 0.5),
+    "Changeup":        (1.0, 0.8, 0.2),
+    "Splitter":        (0.8, 0.6, 1.0),
+}
 
 
 # Ballpark model in baseballfield.obj file is at 'pos': [-515.808441, 41.099228, -760.366211]
@@ -1333,6 +1347,8 @@ class UmpireView3D(QOpenGLWidget):
         self.textures = {}
         self.spray_dots = []   # list of (x_m, z_m, r, g, b) for spray chart
         self.spray_trails = [] # list of (points_list, r, g, b) for 3D trajectory trails
+        self.pitch_trail_color = None  # when set (r,g,b), trail dots use this color
+        self.trail_min_dist = 0.1      # minimum distance between trail points (meters)
 
         # Set format for better rendering
         fmt = QSurfaceFormat()
@@ -1759,8 +1775,13 @@ class UmpireView3D(QOpenGLWidget):
                 alpha = alpha * 0.9  # Further reduce alpha
 
                 # Set material for trail segment
-                glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, alpha])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, alpha])
+                if self.pitch_trail_color is not None:
+                    r, g, b = self.pitch_trail_color
+                    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [r, g, b, alpha])
+                    glMaterialfv(GL_FRONT, GL_SPECULAR, [r*0.5, g*0.5, b*0.5, alpha])
+                else:
+                    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, alpha])
+                    glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, alpha])
                 glMaterialf(GL_FRONT, GL_SHININESS, 80.0)
 
                 # Draw smaller spheres for trail
@@ -1795,7 +1816,7 @@ class UmpireView3D(QOpenGLWidget):
                     # Only add to trail if ball has moved sufficiently
                     px, py, pz = self.prev_ball_pos
                     dist = ((x-px)**2 + (y-py)**2 + (z-pz)**2)**0.5
-                    if dist > 0.1:  # Minimum distance to add a trail point
+                    if dist > self.trail_min_dist:  # Minimum distance to add a trail point
                         # Add current position to trail with full opacity
                         self.ball_trail.insert(0, ((x, y, z), 0.7))
 
@@ -2281,6 +2302,13 @@ class SplitView(QWidget):
         self.trajectory_data = None
         self.current_frame = 0
 
+        # Pitch animation state
+        self.pitch_trajectory_data = None
+        self.animation_phase = "idle"  # "idle" | "pitch" | "flight"
+        self.pitch_slowdown = 1.0      # slowdown multiplier for pitch phase (1.0 = real speed)
+        self.pitch_frame_accumulator = 0.0
+        self.pending_bbe_record = None  # stashed BBE record to fire after pitch
+
 
 
 
@@ -2700,6 +2728,15 @@ class SplitView(QWidget):
         except (ValueError, TypeError):
             return
 
+        # If not already in flight phase, try to play pitch animation first
+        if self.animation_phase != "flight":
+            pitch_traj = savant_row_to_pitch_trajectory(record)
+            if pitch_traj is not None:
+                self.pitch_trajectory_data = pitch_traj
+                self.pending_bbe_record = record
+                self._start_pitch_animation(record)
+                return  # don't fire batted ball yet — pitch plays first
+
         # Derive horizontal launch angle from Savant spray coords if available
         hc_x = record.get("hc_x")
         hc_y = record.get("hc_y")
@@ -2742,6 +2779,145 @@ class SplitView(QWidget):
             return 1200     # low liners / soft grounders
         else:
             return 700      # topped grounders — topspin dominant
+
+    def _start_pitch_animation(self, record: dict):
+        """Begin pitch phase animation — ball flies from mound to plate in 3D only."""
+        self.animation_timer.stop()
+        self.animation_phase = "pitch"
+        self.current_frame = 0
+        self.pitch_frame_accumulator = 0.0
+
+        # Clear 3D ball state
+        self.umpire_view.clear_ball()
+        self.umpire_view.ball_trail = []
+
+        # Remap pitch trajectory so it ends at the batted ball starting position
+        # and starts near the model's pitcher's rubber.
+        #
+        # The OBJ model's field is rotated ~45° in XZ and scaled ~2.3x vs reality:
+        #   Model home plate center: (-7.33, 1.13, 0.96) meters
+        #   Model pitcher's rubber:  (22.77, 3.21, 31.24) meters
+        # The physics trajectory assumes mound is along +X from plate, but the
+        # model has it at +X AND +Z equally.  We offset to anchor the plate-
+        # crossing at the bat position, then rotate+scale in XZ so the release
+        # point aligns with the model's rubber direction.
+        traj = self.pitch_trajectory_data
+        bat_x = self.x_pos_spin.value()  # feet — batted ball start X (toward CF)
+        bat_y = self.y_pos_spin.value()  # feet — batted ball start Y (height)
+        bat_z = self.z_pos_spin.value()  # feet — batted ball start Z (1B/3B)
+
+        # Step 1: Offset so the last trajectory point lands at the bat position
+        offset_x = bat_x - traj["x"][-1]
+        offset_y = bat_y - traj["y"][-1]
+        offset_z = bat_z - traj["z"][-1]
+        traj["x"] = traj["x"] + offset_x
+        traj["y"] = traj["y"] + offset_y
+        traj["z"] = traj["z"] + offset_z
+
+        # Step 2: Rotate + scale XZ around bat position to match model geometry
+        # Model rubber/plate positions (meters → feet)
+        FT = 3.28084
+        MODEL_RUBBER_X_FT = 22.77 * FT   # ~74.7 ft
+        MODEL_RUBBER_Z_FT = 31.24 * FT   # ~102.5 ft
+
+        # Desired direction: bat → rubber (in the model)
+        desired_dx = MODEL_RUBBER_X_FT - bat_x
+        desired_dz = MODEL_RUBBER_Z_FT - bat_z
+        desired_angle = math.atan2(desired_dz, desired_dx)
+        desired_dist = math.sqrt(desired_dx**2 + desired_dz**2)
+
+        # Current trajectory direction: bat → release (physics coords after offset)
+        cur_dx = traj["x"][0] - bat_x
+        cur_dz = traj["z"][0] - bat_z
+        cur_angle = math.atan2(cur_dz, cur_dx)
+        cur_dist = math.sqrt(cur_dx**2 + cur_dz**2)
+
+        if cur_dist > 0.1:  # guard against degenerate trajectories
+            rot = desired_angle - cur_angle
+            scl = desired_dist / cur_dist
+            cos_r = math.cos(rot)
+            sin_r = math.sin(rot)
+
+            # Rotate + scale positions around bat position
+            dx = traj["x"] - bat_x
+            dz = traj["z"] - bat_z
+            traj["x"] = bat_x + scl * (dx * cos_r - dz * sin_r)
+            traj["z"] = bat_z + scl * (dx * sin_r + dz * cos_r)
+
+            # Rotate + scale velocities (same transform, no translation)
+            old_vx = traj["vx"].copy()
+            traj["vx"] = scl * (old_vx * cos_r - traj["vz"] * sin_r)
+            traj["vz"] = scl * (old_vx * sin_r + traj["vz"] * cos_r)
+
+        # Set pitch trail color and tighter trail spacing
+        pitch_name = record.get("pitch_name", "")
+        self.umpire_view.pitch_trail_color = PITCH_TRAIL_COLORS.get(pitch_name, (0.7, 0.7, 1.0))
+        self.umpire_view.trail_min_dist = 0.03
+
+        # Update info label with pitch info
+        velo = record.get("release_speed", 0)
+        spin = record.get("release_spin_rate", 0)
+        pfx_x = record.get("pfx_x", 0) or 0
+        pfx_z = record.get("pfx_z", 0) or 0
+        self.flight_info_label.setText(
+            f"Pitch: {pitch_name} | {velo:.1f} mph | Spin: {spin} rpm | "
+            f"HB: {pfx_x:.1f}\" | IVB: {pfx_z:.1f}\""
+        )
+
+        # Start at 60fps for smooth pitch rendering
+        self.animation_timer.start(16)
+
+    def _update_pitch_animation(self):
+        """Advance pitch animation by one tick (called at ~60fps)."""
+        traj = self.pitch_trajectory_data
+        if traj is None:
+            self.animation_timer.stop()
+            self.animation_phase = "idle"
+            return
+
+        n = len(traj["time"])
+        plate_time = traj.get("plate_time", traj["time"][-1])
+
+        # Fractional frame stepping: how many trajectory frames per timer tick
+        # At 60fps with slowdown, we want the pitch to take plate_time * slowdown seconds
+        frames_per_tick = n / (plate_time * 60.0 * self.pitch_slowdown)
+        self.pitch_frame_accumulator += frames_per_tick
+
+        while self.pitch_frame_accumulator >= 1.0 and self.current_frame < n:
+            self.pitch_frame_accumulator -= 1.0
+            self.current_frame += 1
+
+        if self.current_frame >= n:
+            # Pitch phase complete — fire the batted ball
+            self.animation_timer.stop()
+            self.umpire_view.pitch_trail_color = None
+            self.umpire_view.trail_min_dist = 0.1
+            self.umpire_view.ball_trail = []  # clear pitch trail before batted ball
+
+            # Fire batted ball from stashed record
+            record = self.pending_bbe_record
+            self.pending_bbe_record = None
+            self.pitch_trajectory_data = None
+            if record is not None:
+                self.animation_phase = "flight"  # skip pitch phase on re-entry
+                self._on_simulate_bbe(record)
+            else:
+                self.animation_phase = "idle"
+            return
+
+        frame = min(self.current_frame, n - 1)
+
+        # Convert feet → meters and set 3D ball position
+        x = traj["x"][frame] / 3.28084
+        y = traj["y"][frame] / 3.28084
+        z = traj["z"][frame] / 3.28084
+        vx = traj["vx"][frame] / 3.28084
+        vy = traj["vy"][frame] / 3.28084
+        vz = traj["vz"][frame] / 3.28084
+
+        self.umpire_view.ball_vel = (vx, vy, vz)
+        self.umpire_view.ball_pos = (x, y, z)
+        self.umpire_view.update()
 
     def simulate_ball_flight(self, exit_velocity, vlaunch_angle, hlaunch_angle, spin_rate=1800):
         """Simulate ball flight with current weather conditions and custom starting position"""
@@ -2820,10 +2996,16 @@ class SplitView(QWidget):
         )
 
         # Start animation timer
+        self.animation_phase = "flight"
         self.animation_timer.start(30)  # 30ms per frame (~33fps)
 
     def update_animation(self):
-        """Update animation frame for both views with proper physics"""
+        """Update animation frame — dispatches to pitch or flight phase."""
+        if self.animation_phase == "pitch":
+            self._update_pitch_animation()
+            return
+
+        # Flight phase (existing batted ball animation)
         if not self.trajectory_data:
             return
 
@@ -2832,6 +3014,7 @@ class SplitView(QWidget):
         if self.current_frame >= len(self.trajectory_data["x"]):
             self.animation_timer.stop()
             self.current_frame = 0
+            self.animation_phase = "idle"
             return
 
         # Update ball position in top-down view
