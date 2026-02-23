@@ -2806,12 +2806,13 @@ class SplitView(QWidget):
         bat_y = self.y_pos_spin.value()  # feet — batted ball start Y (height)
         bat_z = self.z_pos_spin.value()  # feet — batted ball start Z (1B/3B)
 
-        # Step 1: Offset so the last trajectory point lands at the bat position
+        # Save raw physics Y (heights above field level, feet) before transforms
+        raw_y = traj["y"].copy()
+
+        # Step 1: Offset XZ so the last trajectory point lands at the bat position
         offset_x = bat_x - traj["x"][-1]
-        offset_y = bat_y - traj["y"][-1]
         offset_z = bat_z - traj["z"][-1]
         traj["x"] = traj["x"] + offset_x
-        traj["y"] = traj["y"] + offset_y
         traj["z"] = traj["z"] + offset_z
 
         # Step 2: Rotate + scale XZ around bat position to match model geometry
@@ -2838,16 +2839,42 @@ class SplitView(QWidget):
             cos_r = math.cos(rot)
             sin_r = math.sin(rot)
 
-            # Rotate + scale positions around bat position
+            # Rotate + scale XZ positions around bat position
             dx = traj["x"] - bat_x
             dz = traj["z"] - bat_z
             traj["x"] = bat_x + scl * (dx * cos_r - dz * sin_r)
             traj["z"] = bat_z + scl * (dx * sin_r + dz * cos_r)
 
-            # Rotate + scale velocities (same transform, no translation)
+            # Rotate + scale XZ velocities
             old_vx = traj["vx"].copy()
             traj["vx"] = scl * (old_vx * cos_r - traj["vz"] * sin_r)
             traj["vz"] = scl * (old_vx * sin_r + traj["vz"] * cos_r)
+
+            # Step 3: Map Y to model coords (elevated mound → plate)
+            # The model's mound surface is at Y=2.0m while plate is at Y=1.13m.
+            # In reality the mound is only ~10 inches above field level.
+            # We anchor release height relative to model mound ground and
+            # plate crossing at bat_y, preserving trajectory curvature.
+            MODEL_MOUND_GROUND_M = 2.0    # mound surface Y (meters)
+            REAL_MOUND_ELEV_FT = 0.83     # real mound elevation (10 inches)
+
+            n = len(raw_y)
+            frac = np.linspace(0, 1, n)   # 0 = release, 1 = plate
+
+            # Curvature: deviation from straight-line path (gravity + Magnus)
+            raw_line = raw_y[0] + frac * (raw_y[-1] - raw_y[0])
+            raw_deviation = raw_y - raw_line
+
+            # Target release Y: model mound ground + hand-above-mound * scale
+            h_above_mound = raw_y[0] - REAL_MOUND_ELEV_FT
+            release_y_ft = (MODEL_MOUND_GROUND_M + (h_above_mound / FT) * scl) * FT
+
+            # Straight line in model space: release → bat_y
+            model_line = release_y_ft + frac * (bat_y - release_y_ft)
+
+            # Add curvature scaled by XZ scale (keeps break proportional)
+            traj["y"] = model_line + raw_deviation * scl
+            traj["vy"] = traj["vy"] * scl
 
         # Set pitch trail color and tighter trail spacing
         pitch_name = record.get("pitch_name", "")
@@ -3208,7 +3235,9 @@ class MLBWeatherApp(QMainWindow):
         la_group.setLayout(la_layout)
         top_controls.addWidget(la_group)
 
-        # Spin rate control
+        # Spin rate + Pitch speed controls (side by side)
+        spin_pitch_container = QHBoxLayout()
+
         spin_group = QGroupBox("Spin Rate (rpm)")
         spin_layout = QVBoxLayout()
         self.spin_slider = QSlider(Qt.Orientation.Horizontal)
@@ -3220,7 +3249,26 @@ class MLBWeatherApp(QMainWindow):
         spin_layout.addWidget(self.spin_slider)
         spin_layout.addWidget(self.spin_value)
         spin_group.setLayout(spin_layout)
-        top_controls.addWidget(spin_group)
+        spin_pitch_container.addWidget(spin_group)
+
+        pitch_speed_group = QGroupBox("Pitch Speed")
+        pitch_speed_layout = QVBoxLayout()
+        self.pitch_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pitch_speed_slider.setRange(1, 20)  # 0.1x to 2.0x in tenths
+        self.pitch_speed_slider.setValue(10)      # 1.0x = real speed
+        self.pitch_speed_value = QLabel("1.0x")
+        self.pitch_speed_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        def _update_pitch_speed(v):
+            speed = v / 10.0
+            self.pitch_speed_value.setText(f"{speed:.1f}x")
+            self.stadium_widget.pitch_slowdown = 1.0 / speed if speed > 0 else 10.0
+        self.pitch_speed_slider.valueChanged.connect(_update_pitch_speed)
+        pitch_speed_layout.addWidget(self.pitch_speed_slider)
+        pitch_speed_layout.addWidget(self.pitch_speed_value)
+        pitch_speed_group.setLayout(pitch_speed_layout)
+        spin_pitch_container.addWidget(pitch_speed_group)
+
+        top_controls.addLayout(spin_pitch_container)
 
         controls_main_layout.addLayout(top_controls)
 
