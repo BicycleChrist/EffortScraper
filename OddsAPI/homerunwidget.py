@@ -1487,6 +1487,113 @@ class UmpireView3D(QOpenGLWidget):
         # Set up procedural sky shader
         self._setup_sky_shader()
 
+        # Set up per-pixel stadium lighting shader (used in night mode)
+        self._setup_stadium_lighting_shader()
+
+    def _setup_stadium_lighting_shader(self):
+        """Compile GLSL shader for per-pixel stadium lighting.
+
+        Uses built-in gl_LightSource[i] and gl_FrontMaterial so the existing
+        display list (glMaterialfv + glVertex calls) works unchanged — we just
+        bind this program before glCallList and get real per-fragment spotlight
+        evaluation instead of per-vertex interpolation.
+        """
+        self._stadium_shader = None
+
+        vert_src = """
+#version 130
+out vec3 vPos;     // eye-space position
+out vec3 vNormal;  // eye-space normal
+
+void main() {
+    vPos    = (gl_ModelViewMatrix * gl_Vertex).xyz;
+    vNormal = normalize(gl_NormalMatrix * gl_Normal);
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+"""
+        frag_src = """
+#version 130
+in vec3 vPos;
+in vec3 vNormal;
+out vec4 fragColor;
+
+void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(-vPos);  // eye at origin in eye space
+
+    // Global ambient
+    vec3 color = gl_LightModel.ambient.rgb * gl_FrontMaterial.ambient.rgb;
+
+    // Evaluate all 6 lights per-pixel
+    for (int i = 0; i < 6; i++) {
+        vec3 lightDir;
+        float attenuation = 1.0;
+
+        if (gl_LightSource[i].position.w == 0.0) {
+            // Directional light
+            lightDir = normalize(gl_LightSource[i].position.xyz);
+        } else {
+            // Positional light
+            vec3 toLight = gl_LightSource[i].position.xyz - vPos;
+            float dist = length(toLight);
+            lightDir = toLight / dist;
+            attenuation = 1.0 / (gl_LightSource[i].constantAttenuation
+                                + gl_LightSource[i].linearAttenuation * dist
+                                + gl_LightSource[i].quadraticAttenuation * dist * dist);
+        }
+
+        // Spotlight factor
+        float spotFactor = 1.0;
+        if (gl_LightSource[i].spotCutoff < 180.0) {
+            float spotCos = dot(-lightDir, normalize(gl_LightSource[i].spotDirection));
+            if (spotCos < gl_LightSource[i].spotCosCutoff) {
+                spotFactor = 0.0;
+            } else {
+                spotFactor = pow(max(spotCos, 0.0), gl_LightSource[i].spotExponent);
+            }
+        }
+
+        float atten = attenuation * spotFactor;
+
+        // Ambient
+        color += gl_LightSource[i].ambient.rgb * gl_FrontMaterial.ambient.rgb * atten;
+
+        // Diffuse
+        float NdotL = max(dot(N, lightDir), 0.0);
+        color += gl_LightSource[i].diffuse.rgb * gl_FrontMaterial.diffuse.rgb * NdotL * atten;
+
+        // Specular (Blinn-Phong)
+        if (NdotL > 0.0) {
+            vec3 H = normalize(lightDir + V);
+            float NdotH = max(dot(N, H), 0.0);
+            float spec = pow(NdotH, gl_FrontMaterial.shininess);
+            color += gl_LightSource[i].specular.rgb * gl_FrontMaterial.specular.rgb * spec * atten;
+        }
+    }
+
+    fragColor = vec4(color, gl_FrontMaterial.diffuse.a);
+}
+"""
+        try:
+            prog = QOpenGLShaderProgram(self)
+            ok_v = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, vert_src)
+            if not ok_v:
+                print(f"[stadium-light] vertex shader compile failed: {prog.log()}")
+                return
+            ok_f = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, frag_src)
+            if not ok_f:
+                print(f"[stadium-light] fragment shader compile failed: {prog.log()}")
+                return
+            if not prog.link():
+                print(f"[stadium-light] shader link failed: {prog.log()}")
+                return
+
+            self._stadium_shader = prog
+            print("[stadium-light] per-pixel lighting shader compiled OK")
+        except Exception as e:
+            print(f"[stadium-light] shader setup exception: {e}")
+            self._stadium_shader = None
+
     def _setup_sky_shader(self):
         """Compile GLSL sky shader (fullscreen triangle, no VBO needed)."""
         self._sky_shader = None
@@ -1832,8 +1939,19 @@ void main() {
             self.compile_stadium_display_list()
 
         # Render stadium model using display list if available
+        # In night mode, bind per-pixel lighting shader so spotlights are
+        # evaluated per-fragment instead of per-vertex (which can't show
+        # light pools on large triangles).
+        _use_ppx = (self._night_mode
+                     and self._stadium_shader is not None)
+        if _use_ppx:
+            self._stadium_shader.bind()
+
         if self.stadium_display_list:
             glCallList(self.stadium_display_list)
+
+        if _use_ppx:
+            self._stadium_shader.release()
 
         # Draw spray chart 3D trajectory trails
         if self.spray_trails:
@@ -2344,6 +2462,8 @@ void main() {
             field_center = [10.0, 0.0, 10.0]
 
             # Configure lights 0-3 as stadium flood spotlights
+            # Real stadium floods are huge banks covering the whole field — use very
+            # wide cones with minimal exponent so the coverage is even, not a hotspot.
             for i in range(4):
                 lp = self.light_params[i]
                 lp['enabled'] = True
@@ -2356,27 +2476,31 @@ void main() {
                     lp['spot_direction'] = [dx/mag, dy/mag, dz/mag]
                 else:
                     lp['spot_direction'] = [0.0, -1.0, 0.0]
-                lp['spot_cutoff'] = 55.0
-                lp['spot_exponent'] = 8.0
-                lp['diffuse'] = [1.4, 1.35, 1.2, 1.0]
-                lp['ambient'] = [0.0, 0.0, 0.0, 1.0]
-                lp['specular'] = [1.0, 0.95, 0.85, 1.0]
-                lp['quadratic_attenuation'] = 0.0003
+                lp['spot_cutoff'] = 80.0           # very wide flood cone
+                lp['spot_exponent'] = 1.5           # nearly flat — no visible hotspot
+                lp['diffuse'] = [1.1, 1.1, 1.05, 1.0]  # neutral white, slight warm tint
+                lp['ambient'] = [0.03, 0.03, 0.03, 1.0]  # tiny per-light ambient fill
+                lp['specular'] = [0.9, 0.9, 0.85, 1.0]
+                lp['quadratic_attenuation'] = 0.00008  # very low — lights are far away
 
-            # Light 4 (fill): disable at night
-            self.light_params[4]['enabled'] = False
+            # Light 4 (fill): keep enabled but dim — simulates scatter/bounce light
+            # that fills the whole field evenly (what the banks of floods create in sum)
+            self.light_params[4]['enabled'] = True
+            self.light_params[4]['diffuse'] = [0.18, 0.18, 0.20, 1.0]
+            self.light_params[4]['ambient'] = [0.05, 0.05, 0.07, 1.0]
+            self.light_params[4]['specular'] = [0.0, 0.0, 0.0, 1.0]
 
-            # Light 5 (ambient/directional): dim blue moonlight
+            # Light 5 (directional ambient): dim blue-ish moonlight/skylight
             self.light_params[5]['enabled'] = True
-            self.light_params[5]['diffuse'] = [0.04, 0.04, 0.08, 1.0]
-            self.light_params[5]['ambient'] = [0.02, 0.02, 0.04, 1.0]
+            self.light_params[5]['diffuse'] = [0.06, 0.06, 0.10, 1.0]
+            self.light_params[5]['ambient'] = [0.03, 0.03, 0.05, 1.0]
             self.light_params[5]['specular'] = [0.0, 0.0, 0.0, 1.0]
 
             # Apply the modified params
             self.set_lighting(self.light_params)
 
-            # Global ambient: near-dark
-            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.03, 0.03, 0.05, 1.0])
+            # Global ambient: low but not pitch-black — simulates ambient sky scatter
+            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.06, 0.06, 0.08, 1.0])
 
             # Dark navy clear color
             glClearColor(0.01, 0.01, 0.03, 1.0)
@@ -3872,8 +3996,11 @@ class MLBWeatherApp(QMainWindow):
     def simulate_flight(self):
         exit_velocity = self.ev_slider.value()
         vlaunch_angle = self.vla_slider.value()
-        hlaunch_angle = self.hla_slider.value()
         spin_rate = self.spin_slider.value()
+
+        # Slider uses stadium polar convention (0=RF foul line, 45=CF, 90=LF
+        # foul line).  Physics expects 0=CF, +45=RF foul line, -45=LF foul line.
+        hlaunch_angle = 45 - self.hla_slider.value()
 
         # Check if we should override weather
         if self.override_weather.isChecked():
