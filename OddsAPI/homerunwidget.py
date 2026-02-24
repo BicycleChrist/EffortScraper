@@ -9,6 +9,8 @@ from PyQt6.QtWidgets import (
 )
 # Import QOpenGLWidget from the correct module
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from PyQt6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader
+from PyQt6.QtGui import QMatrix4x4
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *
@@ -30,6 +32,7 @@ from test_pitch_simulation import savant_row_to_pitch_trajectory
 
 LOG_BALL_PHYSICS = False
 
+# Foul balls without spray cords are sim'd as 0 deg HLA and therefore end up in CF within BBE events
 # Pitch trail colors by pitch type (matches test_pitch_viewer.py)
 PITCH_TRAIL_COLORS = {
     "4-Seam Fastball": (1.0, 0.3, 0.3),
@@ -1481,6 +1484,154 @@ class UmpireView3D(QOpenGLWidget):
         if self.ballpark_model:
             self.compile_stadium_display_list()
 
+        # Set up procedural sky shader
+        self._setup_sky_shader()
+
+    def _setup_sky_shader(self):
+        """Compile GLSL sky shader (fullscreen triangle, no VBO needed)."""
+        self._sky_shader = None
+        self._sky_vao = None
+
+        vert_src = """
+#version 130
+out vec2 vUV;
+void main() {
+    // Fullscreen triangle from gl_VertexID (covers [-1,1] clip space)
+    float x = float((gl_VertexID & 1) << 2) - 1.0;
+    float y = float((gl_VertexID & 2) << 1) - 1.0;
+    vUV = vec2(x, y);
+    gl_Position = vec4(x, y, 0.999, 1.0);  // far depth
+}
+"""
+        frag_src = """
+#version 130
+in vec2 vUV;
+out vec4 fragColor;
+uniform mat4 u_invViewProj;
+uniform vec3 u_sunDir;
+uniform float u_nightMix;  // 0.0 = day, 1.0 = night
+
+// Pseudo-random hash for stars
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+    // Reconstruct view ray from clip-space UV
+    vec4 clipNear = vec4(vUV, -1.0, 1.0);
+    vec4 clipFar  = vec4(vUV,  1.0, 1.0);
+    vec4 worldNear = u_invViewProj * clipNear;
+    vec4 worldFar  = u_invViewProj * clipFar;
+    worldNear /= worldNear.w;
+    worldFar  /= worldFar.w;
+    vec3 ray = normalize(worldFar.xyz - worldNear.xyz);
+
+    float y = ray.y;
+
+    // === DAY SKY ===
+    // --- Zenith-to-horizon blue gradient ---
+    vec3 zenith  = vec3(0.18, 0.30, 0.70);
+    vec3 horizon = vec3(0.55, 0.70, 0.90);
+    float t = pow(clamp(y, 0.0, 1.0), 0.6);
+    vec3 daySky = mix(horizon, zenith, t);
+
+    // --- Horizon haze (warm glow) ---
+    float haze = exp(-abs(y) * 6.0);
+    daySky += vec3(0.20, 0.15, 0.08) * haze;
+
+    // --- Sun disk + corona ---
+    float sunDot = max(dot(ray, u_sunDir), 0.0);
+    float disk   = smoothstep(0.9994, 0.9998, sunDot);
+    float corona = pow(sunDot, 256.0) * 0.6 + pow(sunDot, 32.0) * 0.15;
+    daySky += vec3(1.0, 0.95, 0.85) * disk;
+    daySky += vec3(1.0, 0.85, 0.55) * corona;
+
+    // --- Below-horizon darkening (day) ---
+    if (y < 0.0) {
+        float dark = clamp(-y * 3.0, 0.0, 1.0);
+        daySky = mix(daySky, vec3(0.25, 0.30, 0.35), dark);
+    }
+
+    // === NIGHT SKY ===
+    vec3 nightZenith  = vec3(0.02, 0.02, 0.06);
+    vec3 nightHorizon = vec3(0.05, 0.06, 0.12);
+    float tn = pow(clamp(y, 0.0, 1.0), 0.5);
+    vec3 nightSky = mix(nightHorizon, nightZenith, tn);
+
+    // --- City-glow horizon tint ---
+    float nightHaze = exp(-abs(y) * 4.0);
+    nightSky += vec3(0.06, 0.06, 0.10) * nightHaze;
+
+    // --- Stars (above horizon only) ---
+    if (y > 0.3) {
+        // Quantize ray direction for stable star positions
+        vec2 starUV = ray.xz / (y + 0.001) * 80.0;
+        vec2 starCell = floor(starUV);
+        float starVal = hash(starCell);
+        // Only ~3% of cells get a star
+        if (starVal > 0.97) {
+            // Brightness variation
+            float brightness = 0.5 + 0.5 * hash(starCell + vec2(7.0, 13.0));
+            // Twinkle based on slight offset
+            float twinkle = 0.7 + 0.3 * sin(starVal * 100.0);
+            // Size: tiny dot - check distance to cell center
+            vec2 starPos = starCell + vec2(hash(starCell + vec2(1.0, 0.0)),
+                                           hash(starCell + vec2(0.0, 1.0)));
+            float dist = length(starUV - starPos);
+            float starDot = smoothstep(0.15, 0.0, dist);
+            nightSky += vec3(0.8, 0.85, 1.0) * starDot * brightness * twinkle;
+        }
+    }
+
+    // --- Subtle moon (opposite sun direction) ---
+    vec3 moonDir = normalize(vec3(-u_sunDir.x, abs(u_sunDir.y) + 0.3, -u_sunDir.z));
+    float moonDot = max(dot(ray, moonDir), 0.0);
+    float moonDisk = smoothstep(0.9990, 0.9997, moonDot);
+    float moonGlow = pow(moonDot, 64.0) * 0.08;
+    nightSky += vec3(0.7, 0.75, 0.9) * moonDisk * 0.6;
+    nightSky += vec3(0.15, 0.15, 0.25) * moonGlow;
+
+    // --- Below-horizon darkening (night) ---
+    if (y < 0.0) {
+        float dark = clamp(-y * 3.0, 0.0, 1.0);
+        nightSky = mix(nightSky, vec3(0.01, 0.01, 0.02), dark);
+    }
+
+    // === BLEND ===
+    vec3 sky = mix(daySky, nightSky, u_nightMix);
+
+    fragColor = vec4(sky, 1.0);
+}
+"""
+        try:
+            prog = QOpenGLShaderProgram(self)
+            ok_v = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, vert_src)
+            if not ok_v:
+                print(f"[sky] vertex shader compile failed: {prog.log()}")
+                return
+            ok_f = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, frag_src)
+            if not ok_f:
+                print(f"[sky] fragment shader compile failed: {prog.log()}")
+                return
+            if not prog.link():
+                print(f"[sky] shader link failed: {prog.log()}")
+                return
+
+            self._sky_shader = prog
+            self._sky_loc_invVP = prog.uniformLocation("u_invViewProj")
+            self._sky_loc_sunDir = prog.uniformLocation("u_sunDir")
+            self._sky_loc_nightMix = prog.uniformLocation("u_nightMix")
+            self._night_mode = False
+
+            # Create a dummy VAO in case we're in a core context
+            from OpenGL.GL import glGenVertexArrays
+            vao = glGenVertexArrays(1)
+            self._sky_vao = vao
+
+            print("[sky] procedural sky shader compiled OK")
+        except Exception as e:
+            print(f"[sky] shader setup exception: {e}")
+            self._sky_shader = None
 
     def clear_ball(self):
         """Clear any displayed ball from the 3D view"""
@@ -1490,8 +1641,55 @@ class UmpireView3D(QOpenGLWidget):
         # self.ball_trail = []
         self.update()  # Request a redraw of the scene
 
+    def _drawSkyShader(self):
+        """Draw procedural sky via GLSL shader; falls back to dome if unavailable."""
+        if self._sky_shader is None:
+            self.drawSkyGradient()
+            return
+
+        # Read the matrices already set by gluPerspective / gluLookAt
+        proj_raw = glGetFloatv(GL_PROJECTION_MATRIX)  # 4x4 column-major
+        mv_raw   = glGetFloatv(GL_MODELVIEW_MATRIX)
+
+        # QMatrix4x4 constructor takes row-major, GL returns column-major → transpose
+        proj = QMatrix4x4([float(proj_raw[j][i]) for i in range(4) for j in range(4)])
+        mv   = QMatrix4x4([float(mv_raw[j][i])   for i in range(4) for j in range(4)])
+
+        vp = proj * mv
+        inv_vp, invertible = vp.inverted()
+        if not invertible:
+            self.drawSkyGradient()
+            return
+
+        # Save GL state affected by the shader pass
+        glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT)
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
+
+        self._sky_shader.bind()
+        self._sky_shader.setUniformValue(self._sky_loc_invVP, inv_vp)
+        # Pleasant afternoon sun direction (normalized)
+        self._sky_shader.setUniformValue(self._sky_loc_sunDir, 0.4, 0.6, 0.3)
+        self._sky_shader.setUniformValue(self._sky_loc_nightMix, 1.0 if self._night_mode else 0.0)
+
+        if self._sky_vao is not None:
+            from OpenGL.GL import glBindVertexArray
+            glBindVertexArray(self._sky_vao)
+
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+
+        if self._sky_vao is not None:
+            from OpenGL.GL import glBindVertexArray
+            glBindVertexArray(0)
+
+        self._sky_shader.release()
+
+        glDepthMask(GL_TRUE)
+        glPopAttrib()
+
     def drawSkyGradient(self):
-        """Draw a distant sky dome that respects the depth buffer"""
+        """Draw a distant sky dome that respects the depth buffer (fallback)"""
         # Save current states
         glPushAttrib(GL_ALL_ATTRIB_BITS)
 
@@ -1620,8 +1818,8 @@ class UmpireView3D(QOpenGLWidget):
         gluPerspective(self.camera['fov'], self.width()/self.height(), 0.1, 500)
         gluLookAt(*self.camera['pos'], *self.camera['target'], *self.camera['up'])
 
-        # Trying to draw the sky
-        self.drawSkyGradient()
+        # Draw procedural sky (falls back to dome gradient if shader unavailable)
+        self._drawSkyShader()
 
         # Enable material properties
         glDisable(GL_COLOR_MATERIAL)
@@ -1949,11 +2147,19 @@ class UmpireView3D(QOpenGLWidget):
                 glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
                 print(f"Applied default material to {mesh_name}")
 
-            # Draw the triangles for this mesh
+            # Draw the triangles for this mesh with per-face normals
             glBegin(GL_TRIANGLES)
             for face in mesh.faces:
-                for vertex_i in face:
-                    glVertex3f(*vertices[vertex_i])
+                if len(face) >= 3:
+                    v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+                    e1 = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
+                    e2 = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
+                    nx = e1[1]*e2[2] - e1[2]*e2[1]
+                    ny = e1[2]*e2[0] - e1[0]*e2[2]
+                    nz = e1[0]*e2[1] - e1[1]*e2[0]
+                    if nx or ny or nz:
+                        glNormal3f(nx, ny, nz)
+                    glVertex3f(*v0); glVertex3f(*v1); glVertex3f(*v2)
             glEnd()
 
         glPopMatrix()
@@ -2101,13 +2307,101 @@ class UmpireView3D(QOpenGLWidget):
                     if light['position'][3] == 1.0:
                         glLightf(light_id, GL_CONSTANT_ATTENUATION, 1.0)
                         glLightf(light_id, GL_LINEAR_ATTENUATION, 0.0)
-                        glLightf(light_id, GL_QUADRATIC_ATTENUATION, 0.0005)
+                        quad_atten = light.get('quadratic_attenuation', 0.0005)
+                        glLightf(light_id, GL_QUADRATIC_ATTENUATION, quad_atten)
+
+                    # Spotlight parameters (optional)
+                    spot_cutoff = light.get('spot_cutoff', 180.0)
+                    glLightf(light_id, GL_SPOT_CUTOFF, spot_cutoff)
+                    if spot_cutoff < 180.0:
+                        glLightfv(light_id, GL_SPOT_DIRECTION, light.get('spot_direction', [0.0, -1.0, 0.0]))
+                        glLightf(light_id, GL_SPOT_EXPONENT, light.get('spot_exponent', 0.0))
                 else:
                     glDisable(light_id)
             except Exception as e:
                 print(f"Error setting light {i}: {e}")
 
         # Request a redraw
+        self.update()
+
+    def set_night_mode(self, enabled):
+        """Toggle between day and night lighting modes.
+
+        Night mode converts lights 0-3 into spotlights aimed at the field,
+        disables the fill light, dims the ambient light to moonlight levels,
+        and switches the sky shader to a dark starry sky.
+        """
+        import math as _math
+        self.makeCurrent()
+
+        if enabled:
+            # Save day params for restoration (deep copy)
+            self._day_light_params = []
+            for lp in self.light_params:
+                self._day_light_params.append({k: (v.copy() if isinstance(v, list) else v) for k, v in lp.items()})
+
+            # Field center in model coords (approximate center of the diamond)
+            field_center = [10.0, 0.0, 10.0]
+
+            # Configure lights 0-3 as stadium flood spotlights
+            for i in range(4):
+                lp = self.light_params[i]
+                lp['enabled'] = True
+                # Compute spot direction: from light position toward field center
+                dx = field_center[0] - lp['position'][0]
+                dy = field_center[1] - lp['position'][1]
+                dz = field_center[2] - lp['position'][2]
+                mag = _math.sqrt(dx*dx + dy*dy + dz*dz)
+                if mag > 0.001:
+                    lp['spot_direction'] = [dx/mag, dy/mag, dz/mag]
+                else:
+                    lp['spot_direction'] = [0.0, -1.0, 0.0]
+                lp['spot_cutoff'] = 55.0
+                lp['spot_exponent'] = 8.0
+                lp['diffuse'] = [1.4, 1.35, 1.2, 1.0]
+                lp['ambient'] = [0.0, 0.0, 0.0, 1.0]
+                lp['specular'] = [1.0, 0.95, 0.85, 1.0]
+                lp['quadratic_attenuation'] = 0.0003
+
+            # Light 4 (fill): disable at night
+            self.light_params[4]['enabled'] = False
+
+            # Light 5 (ambient/directional): dim blue moonlight
+            self.light_params[5]['enabled'] = True
+            self.light_params[5]['diffuse'] = [0.04, 0.04, 0.08, 1.0]
+            self.light_params[5]['ambient'] = [0.02, 0.02, 0.04, 1.0]
+            self.light_params[5]['specular'] = [0.0, 0.0, 0.0, 1.0]
+
+            # Apply the modified params
+            self.set_lighting(self.light_params)
+
+            # Global ambient: near-dark
+            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.03, 0.03, 0.05, 1.0])
+
+            # Dark navy clear color
+            glClearColor(0.01, 0.01, 0.03, 1.0)
+
+            self._night_mode = True
+
+        else:
+            # Restore day params
+            if hasattr(self, '_day_light_params') and self._day_light_params:
+                self.light_params = self._day_light_params
+                self.set_lighting(self.light_params)
+
+                # Reset spotlight cutoff to 180 (point light) on lights 0-3
+                light_constants = [GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3]
+                for light_id in light_constants:
+                    glLightf(light_id, GL_SPOT_CUTOFF, 180.0)
+
+            # Restore day global ambient
+            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.2, 0.2, 0.25, 1.0])
+
+            # Restore sky blue clear color
+            glClearColor(0.529, 0.808, 0.922, 1.0)
+
+            self._night_mode = False
+
         self.update()
 
     def draw_light_sources(self, show_lights):
@@ -3315,6 +3609,7 @@ class MLBWeatherApp(QMainWindow):
 
         self.lighting_control = LightingControlWidget(self.stadium_widget.umpire_view.light_params)
         self.lighting_control.lightChanged.connect(self.update_lighting)
+        self.lighting_control.nightModeChanged.connect(self._on_night_mode_changed)
 
         self.update_weather_btn = QPushButton("Update Weather Data")
         self.update_weather_btn.clicked.connect(self.update_weather)
@@ -3604,12 +3899,19 @@ class MLBWeatherApp(QMainWindow):
         self.stadium_widget.umpire_view.show_lights = self.lighting_control.show_lights()
         self.stadium_widget.umpire_view.update()
 
+    def _on_night_mode_changed(self, enabled):
+        """Toggle night game lighting on the 3D view."""
+        self.stadium_widget.umpire_view.set_night_mode(enabled)
+        if not enabled:
+            # Sync the lighting control widget's params back from the restored day params
+            self.lighting_control.lights = self.stadium_widget.umpire_view.light_params
 
 
 class LightingControlWidget(QWidget):
     """Widget to control 3D scene lighting parameters"""
 
     lightChanged = pyqtSignal()  # Signal emitted when light parameters change
+    nightModeChanged = pyqtSignal(bool)  # Signal emitted when night mode is toggled
 
     def __init__(self, lights, parent=None):
         super().__init__(parent)
@@ -3655,6 +3957,12 @@ class LightingControlWidget(QWidget):
         self.show_lights_check.setChecked(True)
         self.show_lights_check.stateChanged.connect(self.emit_light_changed)
         main_layout.addWidget(self.show_lights_check)
+
+        # Night game mode checkbox
+        self.night_game_check = QCheckBox("Night Game")
+        self.night_game_check.setChecked(False)
+        self.night_game_check.stateChanged.connect(self._on_night_game_toggled)
+        main_layout.addWidget(self.night_game_check)
 
         # Create tabs for lights
         for i, light in enumerate(self.lights):
@@ -3868,6 +4176,17 @@ class LightingControlWidget(QWidget):
     def get_light_params(self):
         """Return current light parameters"""
         return self.lights
+
+    def _on_night_game_toggled(self, state):
+        """Handle night game checkbox toggle."""
+        enabled = bool(state)
+        # Disable individual light tabs when night mode overrides them
+        self.tab_widget.setEnabled(not enabled)
+        self.nightModeChanged.emit(enabled)
+
+    def is_night_mode(self):
+        """Return whether night game mode is active."""
+        return self.night_game_check.isChecked()
 
 
 
