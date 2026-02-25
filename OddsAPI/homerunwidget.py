@@ -3463,6 +3463,8 @@ class MLBWeatherApp(QMainWindow):
         # Connect the stadium combo (now owned by SplitView)
         self.stadium_combo = self.stadium_widget.stadium_combo
         self.stadium_combo.currentTextChanged.connect(self.change_stadium)
+        # Draw the default stadium once the event loop (and OpenGL context) is ready
+        QTimer.singleShot(0, lambda: self.change_stadium(default_stadium))
 
         # Add the split view with stretching to take most of the space
         main_layout.addWidget(self.stadium_widget, 1)  # Use stretch factor
