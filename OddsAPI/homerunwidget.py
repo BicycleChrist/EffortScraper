@@ -1263,6 +1263,7 @@ class UmpireView3D(QOpenGLWidget):
         self.textures = {}
         self.spray_dots = []   # list of (x_m, z_m, r, g, b) for spray chart
         self.spray_trails = [] # list of (points_list, r, g, b) for 3D trajectory trails
+        self._stadium_name: str = ""   # set by SplitView when stadium changes
         self.pitch_trail_color = None  # when set (r,g,b), trail dots use this color
         self.trail_min_dist = 0.1      # minimum distance between trail points (meters)
 
@@ -1278,6 +1279,8 @@ class UmpireView3D(QOpenGLWidget):
         # Set format for better rendering
         fmt = QSurfaceFormat()
         fmt.setSamples(4)  # 4x MSAA
+        fmt.setDepthBufferSize(24)
+        fmt.setStencilBufferSize(8)
         self.setFormat(fmt)
 
         # Model loaded in background thread — display list compiled when it arrives
@@ -1953,6 +1956,8 @@ void main() {
         if _use_ppx:
             self._stadium_shader.release()
 
+        self._draw_outfield_geometry()
+
         # Draw spray chart 3D trajectory trails
         if self.spray_trails:
             glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT | GL_LINE_BIT)
@@ -2283,6 +2288,297 @@ void main() {
         glPopMatrix()
         glEndList()
         print("✅ Stadium model compiled into display list with materials based on mesh names")
+
+    def _draw_outfield_geometry(self):
+        """Draw procedural outfield geometry: ground plane, wall, warning track, foul lines, foul poles.
+        All coordinates derived from STADIUM_DATA wall distances via physics_to_model().
+        """
+        if not self._stadium_name:
+            return
+
+        # --- shared constants ---
+        WALL_HEIGHT_FT = 8.0          # default outfield wall height (feet)
+        POLE_HEIGHT_FT = 30.0         # foul pole height (feet)
+        POLE_RADIUS_M  = 0.07         # foul pole radius in meters (~3 inches)
+        WARN_TRACK_FT  = 20.0         # warning track depth (feet in front of wall)
+        GROUND_Y_M     = 0.0          # physics Y of ground level
+        WALL_H_M       = WALL_HEIGHT_FT / 3.28084
+        POLE_H_M       = POLE_HEIGHT_FT / 3.28084
+        FT_TO_M        = 1.0 / 3.28084
+
+        # ------------------------------------------------------------------ #
+        # Build wall point list: one entry per integer polar angle 0..90      #
+        # Each entry: (bx,by,bz, tx,ty,tz, dist_ft, phys_x_m, phys_z_m)    #
+        #             or None if no data                                      #
+        # ------------------------------------------------------------------ #
+        polar_angles = list(range(0, 91))   # 0..90 inclusive, 1° steps
+        wall_pts = []
+
+        for theta in polar_angles:
+            dist_ft = get_stadium_wall_distance(self._stadium_name, theta)
+            if dist_ft is None or dist_ft <= 0:
+                wall_pts.append(None)
+                continue
+            phys_angle = math.radians(theta + 45)
+            x_m = dist_ft * math.sin(phys_angle) * FT_TO_M
+            z_m = dist_ft * math.cos(phys_angle) * FT_TO_M
+            bx, by, bz = self.physics_to_model(x_m, GROUND_Y_M, z_m)
+            tx, ty, tz = self.physics_to_model(x_m, WALL_H_M,   z_m)
+            wall_pts.append((bx, by, bz, tx, ty, tz, dist_ft, x_m, z_m))
+
+        # Pre-build list of valid adjacent pairs for segment drawing
+        valid_pairs = [
+            (i, wall_pts[i], wall_pts[i+1])
+            for i in range(len(wall_pts) - 1)
+            if wall_pts[i] is not None and wall_pts[i+1] is not None
+        ]
+
+        # Home plate model position (used as fan center and normal reference)
+        origin_mx, origin_my, origin_mz = self.physics_to_model(0.0, 0.0, 0.0)
+        hp_mx, _hp_my, hp_mz = self._model_hp
+
+        # ------------------------------------------------------------------ #
+        # Push shared OpenGL state                                            #
+        # ------------------------------------------------------------------ #
+        glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT |
+                     GL_POLYGON_BIT | GL_DEPTH_BUFFER_BIT | GL_LINE_BIT)
+        glEnable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # ================================================================== #
+        # Component 1 — Outfield ground plane (full fan from HP)              #
+        # Triangle fan from home plate to all wall base points.               #
+        # GROUND_DROP = -0.08m puts the grass at model Y ≈ 0.95, safely     #
+        # below the infield dirt (model Y ≈ 0.985) and infield grass         #
+        # (model Y ≈ 1.14). The depth buffer naturally hides the procedural  #
+        # grass wherever the OBJ model exists above it.                       #
+        # ================================================================== #
+        GROUND_DROP = -0.08  # ~8cm below HP → model Y ≈ 0.95 (below dirt at 0.985)
+        RADIAL_STEPS = 6    # subdivide radially to avoid per-vertex lighting streaks
+
+        glEnable(GL_POLYGON_OFFSET_FILL)
+        glPolygonOffset(1.0, 1.0)
+
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.05, 0.20, 0.05, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [0.08, 0.30, 0.08, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.02, 0.05, 0.02, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 4.0)
+        glNormal3f(0.0, 1.0, 0.0)   # flat ground, normal straight up
+
+        # Subdivided quad grid: RADIAL_STEPS rings × 90 angular slices
+        # Eliminates per-vertex lighting streaks from giant triangles
+        for i, pt0, pt1 in valid_pairs:
+            dist0 = pt0[6]  # wall distance in ft for this angle
+            dist1 = pt1[6]
+            pa0 = math.radians(polar_angles[i] + 45)
+            pa1 = math.radians(polar_angles[i + 1] + 45)
+            for r in range(RADIAL_STEPS):
+                frac0 = r / RADIAL_STEPS
+                frac1 = (r + 1) / RADIAL_STEPS
+                # Inner and outer radius for this ring segment
+                r0_ft = frac0 * dist0
+                r1_ft = frac1 * dist0
+                r0b_ft = frac0 * dist1
+                r1b_ft = frac1 * dist1
+                # Four corners of the quad
+                x00 = r0_ft * math.sin(pa0) * FT_TO_M
+                z00 = r0_ft * math.cos(pa0) * FT_TO_M
+                x10 = r1_ft * math.sin(pa0) * FT_TO_M
+                z10 = r1_ft * math.cos(pa0) * FT_TO_M
+                x01 = r0b_ft * math.sin(pa1) * FT_TO_M
+                z01 = r0b_ft * math.cos(pa1) * FT_TO_M
+                x11 = r1b_ft * math.sin(pa1) * FT_TO_M
+                z11 = r1b_ft * math.cos(pa1) * FT_TO_M
+                mx00, my00, mz00 = self.physics_to_model(x00, GROUND_DROP, z00)
+                mx10, my10, mz10 = self.physics_to_model(x10, GROUND_DROP, z10)
+                mx01, my01, mz01 = self.physics_to_model(x01, GROUND_DROP, z01)
+                mx11, my11, mz11 = self.physics_to_model(x11, GROUND_DROP, z11)
+                glBegin(GL_QUADS)
+                glVertex3f(mx00, my00, mz00)
+                glVertex3f(mx10, my10, mz10)
+                glVertex3f(mx11, my11, mz11)
+                glVertex3f(mx01, my01, mz01)
+                glEnd()
+
+        glDisable(GL_POLYGON_OFFSET_FILL)
+
+        # ================================================================== #
+        # Component 3 — Warning track                                         #
+        # Brown/clay arc on the ground, 20 ft wide, immediately inside wall. #
+        # ================================================================== #
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.25, 0.15, 0.05, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [0.60, 0.38, 0.18, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.05, 0.03, 0.01, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 4.0)
+        glNormal3f(0.0, 1.0, 0.0)
+
+        for i, pt0, pt1 in valid_pairs:
+            theta0  = polar_angles[i]
+            theta1  = polar_angles[i + 1]
+            dist0   = pt0[6]
+            dist1   = pt1[6]
+            inner0_ft = max(0.0, dist0 - WARN_TRACK_FT)
+            inner1_ft = max(0.0, dist1 - WARN_TRACK_FT)
+            pa0 = math.radians(theta0 + 45)
+            pa1 = math.radians(theta1 + 45)
+            ix0_m = inner0_ft * math.sin(pa0) * FT_TO_M
+            iz0_m = inner0_ft * math.cos(pa0) * FT_TO_M
+            ix1_m = inner1_ft * math.sin(pa1) * FT_TO_M
+            iz1_m = inner1_ft * math.cos(pa1) * FT_TO_M
+            imx0, imy0, imz0 = self.physics_to_model(ix0_m, GROUND_Y_M, iz0_m)
+            imx1, imy1, imz1 = self.physics_to_model(ix1_m, GROUND_Y_M, iz1_m)
+
+            glBegin(GL_QUADS)
+            glVertex3f(imx0,    imy0,    imz0)
+            glVertex3f(pt0[0],  pt0[1],  pt0[2])   # outer = bottom of wall pt0
+            glVertex3f(pt1[0],  pt1[1],  pt1[2])   # outer = bottom of wall pt1
+            glVertex3f(imx1,    imy1,    imz1)
+            glEnd()
+
+        # ================================================================== #
+        # Component 2 — Outfield wall face + top cap                          #
+        # Vertical green face; inward-facing normal per quad segment.         #
+        # Grey horizontal cap strip on top.                                   #
+        # ================================================================== #
+        # Wall face (dark green)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.05, 0.20, 0.05, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [0.10, 0.40, 0.10, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.05, 0.15, 0.05, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 16.0)
+
+        for i, pt0, pt1 in valid_pairs:
+            bx0, by0, bz0 = pt0[0], pt0[1], pt0[2]
+            tx0, ty0, tz0 = pt0[3], pt0[4], pt0[5]
+            bx1, by1, bz1 = pt1[0], pt1[1], pt1[2]
+            tx1, ty1, tz1 = pt1[3], pt1[4], pt1[5]
+
+            # Normal: from wall midpoint toward home plate in XZ, Y=0
+            mid_x = (bx0 + bx1) * 0.5
+            mid_z = (bz0 + bz1) * 0.5
+            nx = hp_mx - mid_x
+            nz = hp_mz - mid_z
+            n_len = math.sqrt(nx * nx + nz * nz)
+            if n_len > 0:
+                nx /= n_len;  nz /= n_len
+            glNormal3f(nx, 0.0, nz)
+
+            glBegin(GL_QUADS)
+            glVertex3f(bx0, by0, bz0)
+            glVertex3f(tx0, ty0, tz0)
+            glVertex3f(tx1, ty1, tz1)
+            glVertex3f(bx1, by1, bz1)
+            glEnd()
+
+        # Top cap (grey)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.10, 0.10, 0.10, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [0.25, 0.25, 0.25, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.10, 0.10, 0.10, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 8.0)
+        glNormal3f(0.0, 1.0, 0.0)
+
+        CAP_DEPTH_FT = 1.0   # 1 ft deep outward from wall top
+        for i, pt0, pt1 in valid_pairs:
+            tx0, ty0, tz0 = pt0[3], pt0[4], pt0[5]
+            tx1, ty1, tz1 = pt1[3], pt1[4], pt1[5]
+            theta0 = polar_angles[i];       theta1 = polar_angles[i + 1]
+            dist0  = pt0[6];                dist1  = pt1[6]
+            pa0 = math.radians(theta0 + 45);  pa1 = math.radians(theta1 + 45)
+            ox0_m = (dist0 + CAP_DEPTH_FT) * math.sin(pa0) * FT_TO_M
+            oz0_m = (dist0 + CAP_DEPTH_FT) * math.cos(pa0) * FT_TO_M
+            ox1_m = (dist1 + CAP_DEPTH_FT) * math.sin(pa1) * FT_TO_M
+            oz1_m = (dist1 + CAP_DEPTH_FT) * math.cos(pa1) * FT_TO_M
+            otx0, oty0, otz0 = self.physics_to_model(ox0_m, WALL_H_M, oz0_m)
+            otx1, oty1, otz1 = self.physics_to_model(ox1_m, WALL_H_M, oz1_m)
+
+            glBegin(GL_QUADS)
+            glVertex3f(tx0,  ty0,  tz0)
+            glVertex3f(otx0, oty0, otz0)
+            glVertex3f(otx1, oty1, otz1)
+            glVertex3f(tx1,  ty1,  tz1)
+            glEnd()
+
+        # ================================================================== #
+        # Component 5 — Foul lines                                            #
+        # White GL_LINES from home plate along each foul line to foul poles.  #
+        # ================================================================== #
+        glDisable(GL_LIGHTING)
+        glLineWidth(2.5)
+        glColor3f(1.0, 1.0, 1.0)
+
+        rf_dist = get_stadium_wall_distance(self._stadium_name, 0.0)
+        lf_dist = get_stadium_wall_distance(self._stadium_name, 90.0)
+
+        if rf_dist and rf_dist > 0:
+            pa = math.radians(45)
+            rx_m = rf_dist * math.sin(pa) * FT_TO_M
+            rz_m = rf_dist * math.cos(pa) * FT_TO_M
+            rmx, rmy, rmz = self.physics_to_model(rx_m, GROUND_Y_M, rz_m)
+            glBegin(GL_LINES)
+            glVertex3f(origin_mx, origin_my + 0.02, origin_mz)
+            glVertex3f(rmx,       rmy       + 0.02, rmz)
+            glEnd()
+
+        if lf_dist and lf_dist > 0:
+            pa = math.radians(135)
+            lx_m = lf_dist * math.sin(pa) * FT_TO_M
+            lz_m = lf_dist * math.cos(pa) * FT_TO_M
+            lmx, lmy, lmz = self.physics_to_model(lx_m, GROUND_Y_M, lz_m)
+            glBegin(GL_LINES)
+            glVertex3f(origin_mx, origin_my + 0.02, origin_mz)
+            glVertex3f(lmx,       lmy       + 0.02, lmz)
+            glEnd()
+
+        # ================================================================== #
+        # Component 4 — Foul poles                                            #
+        # Yellow gluCylinder at RF (polar 0°) and LF (polar 90°) corners.    #
+        # ================================================================== #
+        glEnable(GL_LIGHTING)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.30, 0.28, 0.00, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [1.00, 0.90, 0.00, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.60, 0.55, 0.10, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 40.0)
+
+        pole_r_model = POLE_RADIUS_M * self._model_scale
+
+        for polar_base, dist_ft in [(0.0, rf_dist), (90.0, lf_dist)]:
+            if dist_ft is None or dist_ft <= 0:
+                continue
+            pa  = math.radians(polar_base + 45)
+            x_m = dist_ft * math.sin(pa) * FT_TO_M
+            z_m = dist_ft * math.cos(pa) * FT_TO_M
+            base_mx, base_my, base_mz = self.physics_to_model(x_m, GROUND_Y_M, z_m)
+            top_mx,  top_my,  top_mz  = self.physics_to_model(x_m, POLE_H_M,   z_m)
+
+            pole_h_model = top_my - base_my
+
+            glPushMatrix()
+            glTranslatef(base_mx, base_my, base_mz)
+
+            # Rotate gluCylinder (default draws along +Z) to point toward top in model space
+            dx = top_mx - base_mx
+            dy = top_my - base_my
+            dz = top_mz - base_mz
+            length = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if length > 1e-6:
+                dx /= length;  dy /= length;  dz /= length
+                # Rotation axis = cross(Z_hat, target) = (-dy, dx, 0)
+                ax = -dy;  ay = dx
+                a_len = math.sqrt(ax*ax + ay*ay)
+                if a_len > 1e-4:
+                    angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, dz))))
+                    glRotatef(angle_deg, ax / a_len, ay / a_len, 0.0)
+
+            cyl = gluNewQuadric()
+            gluQuadricDrawStyle(cyl, GLU_FILL)
+            gluQuadricNormals(cyl, GLU_SMOOTH)
+            gluCylinder(cyl, pole_r_model, pole_r_model, pole_h_model, 8, 1)
+            gluDeleteQuadric(cyl)
+            glPopMatrix()
+
+        # ------------------------------------------------------------------ #
+        glPopAttrib()
 
     def physics_to_model(self, x_m, y_m, z_m):
         """Convert physics coordinates (meters) to 3D model coordinates.
@@ -2685,7 +2981,8 @@ class SplitView(QWidget):
             # 2D View - now using polar coordinates directly
             self.stadium_view.draw_stadium_polar(stadium_name, self.dimensions)
 
-            # 3D View
+            # 3D View — pass stadium name then repaint
+            self.umpire_view._stadium_name = stadium_name
             self.umpire_view.update()
         else:
             print(f"Stadium {stadium_name} not found in STADIUM_DATA")
