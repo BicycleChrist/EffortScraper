@@ -196,6 +196,36 @@ def get_stadium_wall_distance(stadium_name, angle_deg):
     return None
 
 
+def get_stadium_wall_height(stadium_name, angle_deg):
+    """Return wall height in feet at the given stadium polar angle (0°=RF, 90°=LF).
+
+    Walks the wall_heights segments for the stadium and returns the constant
+    height for the segment containing angle_deg.  Falls back to 8.0 ft if the
+    stadium has no wall_heights data or the angle falls in a gap.
+    """
+    if stadium_name not in STADIUM_DATA:
+        return 8.0
+
+    stadium = STADIUM_DATA[stadium_name]
+    wall_heights = stadium.get("wall_heights")
+    if not wall_heights:
+        return 8.0
+
+    # Find the segment containing this angle
+    best_dist = None
+    best_height = 8.0
+    for angle_start, angle_end, height_ft in wall_heights:
+        if angle_start <= angle_deg <= angle_end:
+            return height_ft
+        # Track nearest segment in case of gap
+        dist = min(abs(angle_deg - angle_start), abs(angle_deg - angle_end))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_height = height_ft
+
+    return best_height
+
+
 # ==============================================
 # Stadium Data
 # ==============================================
@@ -212,6 +242,7 @@ STADIUM_DATA = {
             "right_center": 374,
             "right_field": 345
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 16.5, (4068.1011, 1, 11.7916)),
             (16.5, 16.8, (-60.8626, 1, -0.47706)),
@@ -237,6 +268,7 @@ STADIUM_DATA = {
             "right_center": 368,
             "right_field": 330
         },
+        "wall_heights": [(0, 25, 8), (25, 65, 8), (65, 90, 5)],
         "polar_coords": [
             (0, 1.6, (-352.2388, 1, -1.06739)),
             (1.6, 3.2, (-496.7696, 1, -1.493901)),
@@ -264,6 +296,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 335
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 3.3, (-436.689, 1, -1.3173)),
             (3.3, 25.6, {'type': 'cos_only', 'numerator': 346.303}),  # r = 346.303/cos θ
@@ -286,6 +319,7 @@ STADIUM_DATA = {
             "right_center": 373,
             "right_field": 318
         },
+        "wall_heights": [(0, 15, 21), (15, 25, 21), (25, 65, 7), (65, 90, 8)],
         "polar_coords": [
             (0, 25.5, (-1786.977, 1, -5.61942)),
             (25.5, 49, (801.702, 1, 1.830)),
@@ -311,6 +345,7 @@ STADIUM_DATA = {
             "right_center": 376,
             "right_field": 334
         },
+        "wall_heights": [(0, 25, 8), (25, 65, 25), (65, 90, 8)],
         "polar_coords": [
             (0, 4.9, (-389.4197, 1, -1.1624468)),
             (4.9, 6.6, (423.5471, 1, 1.085346)),
@@ -341,6 +376,7 @@ STADIUM_DATA = {
             "right_center": 378,
             "right_field": 330
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 18.8, (-1967.79, 1, -5.963)),
             (18.8, 23, (667.7078, 1, 1.566132)),
@@ -362,6 +398,7 @@ STADIUM_DATA = {
             "right_center": 369,
             "right_field": 330
         },
+        "wall_heights": [(0, 25, 13), (25, 65, 6), (65, 90, 11)],
         "polar_coords": [
             (0, 34.3, {'type': 'cos_only', 'numerator': 330}),
             (34.3, 50.7, (644.15, 1, 1.277017)),
@@ -383,6 +420,7 @@ STADIUM_DATA = {
             "right_center": 388,
             "right_field": 345
         },
+        "wall_heights": [(0, 25, 9), (25, 65, 9), (65, 90, 7)],
         "polar_coords": [
             (0, 1.25, (-405.584, 1, -1.23813)),
             (1.25, 22.5, {'type': 'cos_only', 'numerator': 337.21}),  # r = 337.21/cos θ
@@ -404,6 +442,7 @@ STADIUM_DATA = {
             "right_center": 387,
             "right_field": 350
         },
+        "wall_heights": [(0, 15, 17), (15, 25, 17), (25, 65, 8), (65, 90, 8)],
         "polar_coords": [
             (0, 1.25, (-551.417, 1, -1.57548)),
             (1.25, 37.5, (4061.537, 1, 11.422)),
@@ -423,6 +462,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 330
         },
+        "wall_heights": [(0, 25, 4), (25, 65, 8), (65, 90, 4)],
         "polar_coords": [
             (0, 4.2, (-443.8081, 1, -1.344873)),
             (4.2, 7.8, (-829.5118, 1, -2.44985)),
@@ -459,6 +499,12 @@ STADIUM_DATA = {
             "right_center": 380,
             "right_field": 302
         },
+        "wall_heights": [
+            (0, 5, 3),        # Pesky Pole area — very short RF fence
+            (5, 25, 5),       # RF bullpen area
+            (25, 55, 17),     # CF triangle / batter's eye
+            (55, 90, 37),     # Green Monster (LC through LF foul line)
+        ],
         "polar_coords": [
             # Format: (angle_start, angle_end, (numerator, sin_coeff, cos_coeff)) where r = numerator/(sin_coeff*sin(θ) + cos_coeff*cos(θ))
             (0, 3.8, (-119.0423, 1, -0.3941798)),
@@ -485,6 +531,7 @@ STADIUM_DATA = {
             "right_center": 374,
             "right_field": 326
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 4, (-432.031, 1, -1.3252)),
             (4, 24, {'type': 'cos_only', 'numerator': 343.5}),  # r = 343.5/cos θ
@@ -508,6 +555,7 @@ STADIUM_DATA = {
             "right_center": 365,
             "right_field": 325
         },
+        "wall_heights": [(0, 25, 8), (25, 65, 8), (65, 90, 12)],
         "polar_coords": [
             (0, 44.7, {'type': 'complex_great_american'}),  # Complex equation
             (44.7, 60.3, (436.311, 1, 0.52231577)),
@@ -527,6 +575,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 335
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 24.1, (-7014.6043, 1, -20.939117)),
             (24.1, 30.6, (1495.6997, 1, 3.92207)),
@@ -552,6 +601,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 330
         },
+        "wall_heights": [(0, 90, 9)],
         "polar_coords": [
             (0, 5.9, {'type': 'complex_kauffman1'}),
             (5.9, 22.1, (25784.376, 1, 71.503534)),
@@ -573,6 +623,7 @@ STADIUM_DATA = {
             "right_center": 392,
             "right_field": 335
         },
+        "wall_heights": [(0, 25, 12), (25, 65, 9), (65, 90, 12)],
         "polar_coords": [
             (0, 23.7, (-3285.092, 1, -9.80624)),
             (23.7, 59, {'type': 'interpolated', 'data': [
@@ -600,6 +651,7 @@ STADIUM_DATA = {
             "right_center": 373,
             "right_field": 326
         },
+        "wall_heights": [(0, 25, 7), (25, 65, 9), (65, 90, 21)],
         "polar_coords": [
             (0, 23, (-2738.7177, 1, -8.400974)),
             (23, 24.1, (315.172, 1, 0.493462)),
@@ -622,6 +674,7 @@ STADIUM_DATA = {
             "right_center": 370,
             "right_field": 335
         },
+        "wall_heights": [(0, 25, 16), (25, 65, 10), (65, 90, 10)],
         "polar_coords": [
             (0, 13.1, (-1192.9, 1, -3.56091)),
             (13.1, 46.5, (1018.837, 1, 2.609847)),
@@ -645,6 +698,7 @@ STADIUM_DATA = {
             "right_center": 365,
             "right_field": 320
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 90, {'type': 'interpolated', 'data': [
                 (0.0, 325.0), (1.0, 327.3), (2.0, 329.7), (3.0, 332.2),
@@ -685,6 +739,7 @@ STADIUM_DATA = {
             "right_center": 415,
             "right_field": 309
         },
+        "wall_heights": [(0, 15, 25), (15, 25, 25), (25, 65, 8), (65, 90, 8)],
         "polar_coords": [
             (0, 15, (-697.339, 1, -2.25676)),
             (15, 18, (946.0859, 1, 2.4155)),
@@ -706,6 +761,7 @@ STADIUM_DATA = {
             "right_center": 391,
             "right_field": 322
         },
+        "wall_heights": [(0, 25, 10), (25, 65, 7), (65, 90, 4)],
         "polar_coords": [
             (0, 3.4, {'type': 'cos_only', 'numerator': 321.433}),  # r = 321.433/cos θ
             (3.4, 7.2, (-311.7359, 1, -1.029242)),
@@ -732,6 +788,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 320
         },
+        "wall_heights": [(0, 15, 21), (15, 25, 21), (25, 65, 10), (65, 90, 6)],
         "polar_coords": [
             (0, 22.3, (-1759.947, 1, -5.4827)),
             (22.3, 34.1, (1120.149, 1, 2.8184)),
@@ -754,6 +811,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 325
         },
+        "wall_heights": [(0, 25, 9), (25, 65, 9), (65, 90, 19)],
         "polar_coords": [
             (0, 20.3, (-1609.844, 1, -4.98404)),
             (20.3, 48.25, (906.183, 1, 2.2274)),
@@ -773,6 +831,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 328
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 20, (-1725.1974, 1, -5.2597)),
             (20, 32.5, (2160.354, 1, 5.7667)),
@@ -793,6 +852,7 @@ STADIUM_DATA = {
             "right_center": 381,
             "right_field": 326
         },
+        "wall_heights": [(0, 25, 7), (25, 65, 7), (65, 90, 15)],
         "polar_coords": [
             (0, 26.5, (-3502.437, 1, -10.74367)),
             (26.5, 47, (825.224, 1, 1.9153)),
@@ -815,6 +875,7 @@ STADIUM_DATA = {
             "right_center": 370,
             "right_field": 322
         },
+        "wall_heights": [(0, 25, 11), (25, 65, 9), (65, 90, 11)],
         "polar_coords": [
             (0, 1.7, (-357.101, 1, -1.109)),
             (1.7, 33.75, {'type': 'cos_only', 'numerator': 331}),
@@ -838,6 +899,7 @@ STADIUM_DATA = {
             "right_center": 367,
             "right_field": 328
         },
+        "wall_heights": [(0, 15, 23), (15, 25, 23), (25, 65, 8), (65, 90, 8)],
         "polar_coords": [
             (0, 20, (-2731.998, 1, -8.3292)),
             (20, 38.5, (1691.285, 1, 4.5671)),
@@ -858,6 +920,7 @@ STADIUM_DATA = {
             "right_center": 370,
             "right_field": 325
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 90, {'type': 'interpolated', 'data': [
                 (0.0, 314), (1.8, 322), (3.6, 329), (5.4, 336),
@@ -892,6 +955,7 @@ STADIUM_DATA = {
             "right_center": 375,
             "right_field": 325
         },
+        "wall_heights": [(0, 25, 16), (25, 65, 9), (65, 90, 9)],
         "polar_coords": [
             (0, 23, (-2358.6904452, 1, -7.257509)),
             (23, 38, (1373.4019163, 1, 3.554217)),
@@ -913,6 +977,7 @@ STADIUM_DATA = {
             "right_center": 368,
             "right_field": 353
         },
+        "wall_heights": [(0, 90, 11)],
         "polar_coords": [
             (0, 10.9, (-4499.412, 1, -12.7462)),
             (10.9, 13.1, (297.1748, 1, 0.636566)),
@@ -935,6 +1000,7 @@ STADIUM_DATA = {
             "right_center": 385,
             "right_field": 314
         },
+        "wall_heights": [(0, 90, 8)],
         "polar_coords": [
             (0, 3.2, (-752.7415, 1, -2.397266)),
             (3.2, 4.9, (-1341.4764, 1, -4.22849)),

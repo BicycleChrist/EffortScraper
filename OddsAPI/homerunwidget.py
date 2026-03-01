@@ -22,7 +22,7 @@ import random
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
-from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, WindVectorWidget
+from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, get_stadium_wall_height, WindVectorWidget
 from player_overlay_widget import PlayerBBEOverlay
 from weatherman import open_weather_key
 from pathlib import Path
@@ -2297,19 +2297,17 @@ void main() {
             return
 
         # --- shared constants ---
-        WALL_HEIGHT_FT = 8.0          # default outfield wall height (feet)
         POLE_HEIGHT_FT = 30.0         # foul pole height (feet)
         POLE_RADIUS_M  = 0.07         # foul pole radius in meters (~3 inches)
         WARN_TRACK_FT  = 20.0         # warning track depth (feet in front of wall)
         GROUND_Y_M     = 0.0          # physics Y of ground level
-        WALL_H_M       = WALL_HEIGHT_FT / 3.28084
         POLE_H_M       = POLE_HEIGHT_FT / 3.28084
         FT_TO_M        = 1.0 / 3.28084
 
         # ------------------------------------------------------------------ #
         # Build wall point list: one entry per integer polar angle 0..90      #
-        # Each entry: (bx,by,bz, tx,ty,tz, dist_ft, phys_x_m, phys_z_m)    #
-        #             or None if no data                                      #
+        # Each entry: (bx,by,bz, tx,ty,tz, dist_ft, phys_x_m, phys_z_m,    #
+        #              wall_h_m)  or None if no data                          #
         # ------------------------------------------------------------------ #
         polar_angles = list(range(0, 91))   # 0..90 inclusive, 1° steps
         wall_pts = []
@@ -2319,12 +2317,14 @@ void main() {
             if dist_ft is None or dist_ft <= 0:
                 wall_pts.append(None)
                 continue
+            wall_h_ft = get_stadium_wall_height(self._stadium_name, theta)
+            wall_h_m  = wall_h_ft * FT_TO_M
             phys_angle = math.radians(theta + 45)
             x_m = dist_ft * math.sin(phys_angle) * FT_TO_M
             z_m = dist_ft * math.cos(phys_angle) * FT_TO_M
             bx, by, bz = self.physics_to_model(x_m, GROUND_Y_M, z_m)
-            tx, ty, tz = self.physics_to_model(x_m, WALL_H_M,   z_m)
-            wall_pts.append((bx, by, bz, tx, ty, tz, dist_ft, x_m, z_m))
+            tx, ty, tz = self.physics_to_model(x_m, wall_h_m,   z_m)
+            wall_pts.append((bx, by, bz, tx, ty, tz, dist_ft, x_m, z_m, wall_h_m))
 
         # Pre-build list of valid adjacent pairs for segment drawing
         valid_pairs = [
@@ -2484,13 +2484,14 @@ void main() {
             tx1, ty1, tz1 = pt1[3], pt1[4], pt1[5]
             theta0 = polar_angles[i];       theta1 = polar_angles[i + 1]
             dist0  = pt0[6];                dist1  = pt1[6]
+            wh0_m  = pt0[9];                wh1_m  = pt1[9]
             pa0 = math.radians(theta0 + 45);  pa1 = math.radians(theta1 + 45)
             ox0_m = (dist0 + CAP_DEPTH_FT) * math.sin(pa0) * FT_TO_M
             oz0_m = (dist0 + CAP_DEPTH_FT) * math.cos(pa0) * FT_TO_M
             ox1_m = (dist1 + CAP_DEPTH_FT) * math.sin(pa1) * FT_TO_M
             oz1_m = (dist1 + CAP_DEPTH_FT) * math.cos(pa1) * FT_TO_M
-            otx0, oty0, otz0 = self.physics_to_model(ox0_m, WALL_H_M, oz0_m)
-            otx1, oty1, otz1 = self.physics_to_model(ox1_m, WALL_H_M, oz1_m)
+            otx0, oty0, otz0 = self.physics_to_model(ox0_m, wh0_m, oz0_m)
+            otx1, oty1, otz1 = self.physics_to_model(ox1_m, wh1_m, oz1_m)
 
             glBegin(GL_QUADS)
             glVertex3f(tx0,  ty0,  tz0)
@@ -3688,8 +3689,7 @@ class SplitView(QWidget):
                 break
 
 
-        # Typical MLB wall height is ~8 ft; use that if we found a crossing
-        wall_height = 8
+        wall_height = get_stadium_wall_height(self.stadium_name, stadium_angle)
         cleared_wall_height = (height_at_wall is not None and height_at_wall >= wall_height)
 
         if distance >= wall_distance:
@@ -3726,7 +3726,11 @@ class SplitView(QWidget):
         else:
             wall_distance = self.dimensions["right_field"]
 
-        return distance >= wall_distance and final_height > 8
+        # Convert horizontal angle to approximate stadium polar angle for wall height lookup
+        # horizontal_angle here is from arctan2(z, x) in physics coords — rough mapping
+        polar_approx = max(0, min(90, 45 - horizontal_angle))
+        wall_ht = get_stadium_wall_height(self.stadium_name, polar_approx) if self.stadium_name else 8
+        return distance >= wall_distance and final_height > wall_ht
 
 
 class MLBWeatherApp(QMainWindow):
