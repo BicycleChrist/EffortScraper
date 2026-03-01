@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 )
 from fractions import Fraction
 from PyQt6.QtGui import QIcon, QFont, QPalette, QColor
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 import pathlib
 
 def american_to_decimal(odds):
@@ -1058,12 +1058,6 @@ class CalculatorApp(QWidget):
 
         self.resize(550, 450)
 
-    def UpdateIcon(self):
-        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
-        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
-        self.setWindowIcon(QIcon(str(next_icon)))
-        self.icon_frame = ((self.icon_frame + 1) % 200)
-
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
@@ -1125,6 +1119,12 @@ class CalculatorApp(QWidget):
             (2, "Switch to Odds Calculator", "#9C27B0", "#7B1FA2"),
         ]
         self.current_mode = 0
+
+    def UpdateIcon(self):
+        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+        self.setWindowIcon(QIcon(str(next_icon)))
+        self.icon_frame = ((self.icon_frame + 1) % 200)
 
     def toggle_mode(self):
         self.current_mode = (self.current_mode + 1) % len(self.modes)
