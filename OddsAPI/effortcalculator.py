@@ -732,20 +732,11 @@ class MultiwayOutcome(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 3, 5, 3)
 
-        # Outcome name input
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText(f"Outcome {outcome_number}")
-        self.name_input.setFixedWidth(140)
-        self.name_input.setStyleSheet("""
-            QLineEdit {
-                padding: 4px 6px;
-                border: 1px solid #555;
-                border-radius: 4px;
-                background-color: rgba(255, 255, 255, 0.08);
-                color: white;
-            }
-        """)
-        layout.addWidget(self.name_input)
+        # Outcome number label
+        num_label = QLabel(f"#{outcome_number}")
+        num_label.setFixedWidth(30)
+        num_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(num_label)
 
         # American odds input
         odds_label = QLabel("Odds:")
