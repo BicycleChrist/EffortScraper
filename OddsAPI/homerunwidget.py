@@ -1,3 +1,9 @@
+# TODO: Train lightweight XGBoost/LightGBM model on BBE data (~15-18 features: launch_speed,
+#       launch_angle, hla, bb_type, release_speed, spin_rate, spin_axis, pfx_x/z, altitude,
+#       temp, humidity, wind_speed/dir, baro_pressure, park_id) to predict hit distance.
+#       Compare ML prediction vs physics engine vs actual hit_distance_sc per BBE event.
+#       Inference is microseconds so no perf hit. Filter training to FB/LD with distance > 150ft.
+
 import pathlib
 
 from PyQt6.QtWidgets import (
@@ -1253,6 +1259,20 @@ class StadiumView(QGraphicsView):
 # 3D Umpire View
 # ==============================================
 class UmpireView3D(QOpenGLWidget):
+    # ------------------------------------------------------------------ #
+    # Static geometry (OBJ model + procedural outfield) is compiled into
+    # GL display lists so paintGL just replays them with zero Python
+    # overhead per frame.
+    #
+    # OBJ model:  loaded on a background thread → normals and materials
+    #             pre-computed there → display list compiled lazily in
+    #             paintGL on first frame after data arrives.
+    #
+    # Outfield:   ground plane, wall, warning track, foul lines/poles
+    #             compiled into a separate display list on first paint
+    #             after a stadium change.  Invalidated when the stadium
+    #             name changes or the GL context is re-created.
+    # ------------------------------------------------------------------ #
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ball_pos = None
@@ -1264,6 +1284,7 @@ class UmpireView3D(QOpenGLWidget):
         self.spray_dots = []   # list of (x_m, z_m, r, g, b) for spray chart
         self.spray_trails = [] # list of (points_list, r, g, b) for 3D trajectory trails
         self._stadium_name: str = ""   # set by SplitView when stadium changes
+        self._outfield_display_list = None  # compiled in paintGL, invalidated on stadium change
         self.pitch_trail_color = None  # when set (r,g,b), trail dots use this color
         self.trail_min_dist = 0.1      # minimum distance between trail points (meters)
 
@@ -1285,6 +1306,7 @@ class UmpireView3D(QOpenGLWidget):
 
         # Model loaded in background thread — display list compiled when it arrives
         self.ballpark_model = None
+        self._precomputed_meshes = None
         self._model_load_pending = True
         import threading
         threading.Thread(target=self._load_model_bg, daemon=True).start()
@@ -1366,6 +1388,22 @@ class UmpireView3D(QOpenGLWidget):
         self.is_tracking_ball = False
 
 
+    # Material definitions keyed by mesh name substring match.
+    # Looked up once on the background thread during _precompute_mesh_data().
+    _MESH_MATERIALS = {
+        "Infield":        ([0.2,0.15,0.1,1.0], [0.76,0.46,0.25,1.0], [0.4,0.3,0.2,1.0], 64.0, None),
+        "outfield":       ([0.05,0.2,0.05,1.0],[0.1,0.6,0.1,1.0],   [0.1,0.4,0.1,1.0], 12.0, None),
+        "EffortText":     ([1.0,1.0,1.0,0.1], [1.0,1.0,1.0,0.1],   [1.0,1.0,1.0,0.1], 128.0,[0.15,0.05,0.05,0.05]),
+        "homeplate":      ([0.3,0.3,0.3,1.0], [0.95,0.95,0.95,1.0],[0.8,0.8,0.8,1.0],  96.0, None),
+        "pitchersmound":  ([0.22,0.17,0.12,1.0],[0.7,0.4,0.2,1.0], [0.4,0.3,0.2,1.0],  32.0, None),
+        "Dugout":         ([0.2,0.2,0.2,1.0], [0.6,0.6,0.6,1.0],   [0.3,0.3,0.3,1.0],  48.0, None),
+        "dugout":         ([0.2,0.2,0.2,1.0], [0.6,0.6,0.6,1.0],   [0.3,0.3,0.3,1.0],  48.0, None),
+        "Graffiti":       ([0.2,0.2,0.2,1.0], [0.8,0.8,0.8,1.0],   [0.3,0.3,0.3,1.0],  8.0,  None),
+        "Cylinder":       ([0.2,0.2,0.25,1.0],[0.5,0.5,0.6,1.0],   [0.3,0.3,0.4,1.0],  32.0, None),
+        "Box":            ([0.2,0.2,0.25,1.0],[0.5,0.5,0.6,1.0],   [0.3,0.3,0.4,1.0],  32.0, None),
+    }
+    _DEFAULT_MATERIAL = ([0.2,0.2,0.2,1.0], [0.8,0.8,0.8,1.0], [0.5,0.5,0.5,1.0], 32.0, None)
+
     def _load_model_bg(self):
         """Load Wavefront OBJ on a background thread (no GL calls here)."""
         try:
@@ -1377,15 +1415,61 @@ class UmpireView3D(QOpenGLWidget):
                 parse=True,
             )
             print(f"[model] loaded {len(model.materials)} materials (bg thread)")
-            # Hand the model to the main thread.  The GIL makes the reference
-            # assignment atomic.  paintGL will lazy-compile the display list
-            # on its next frame since it's already in a valid GL context.
+
+            # Pre-compute normals and flatten vertex data on this thread
+            # so the GL compile on the main thread is a fast memcpy-style loop.
+            precomputed = self._precompute_mesh_data(model)
+
+            # Hand results to the main thread.  GIL makes reference assignment atomic.
+            self._precomputed_meshes = precomputed
             self.ballpark_model = model
             self._model_load_pending = False
             self.update()   # schedule a repaint
         except Exception as e:
             print(f"[model] error loading OBJ: {e}")
             self._model_load_pending = False
+
+    def _precompute_mesh_data(self, model):
+        """Pre-compute per-face normals and material assignments (pure Python, no GL).
+
+        Returns a list of (material_tuple, gl_data) where gl_data is a flat list
+        of (nx,ny,nz, v0,v1,v2, v3,v4,v5, v6,v7,v8) per triangle — ready to be
+        blasted into glNormal3f/glVertex3f with minimal per-face Python overhead.
+        """
+        import array
+        vertices = model.vertices
+        result = []
+
+        for mesh in model.mesh_list:
+            mesh_name = getattr(mesh, 'name', '') or ''
+
+            # Find matching material
+            mat = self._DEFAULT_MATERIAL
+            for key, mat_def in self._MESH_MATERIALS.items():
+                if key in mesh_name:
+                    mat = mat_def
+                    break
+
+            # Pre-compute flattened vertex+normal data for all faces
+            gl_data = array.array('f')
+            for face in mesh.faces:
+                if len(face) < 3:
+                    continue
+                v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+                e1x = v1[0]-v0[0]; e1y = v1[1]-v0[1]; e1z = v1[2]-v0[2]
+                e2x = v2[0]-v0[0]; e2y = v2[1]-v0[1]; e2z = v2[2]-v0[2]
+                nx = e1y*e2z - e1z*e2y
+                ny = e1z*e2x - e1x*e2z
+                nz = e1x*e2y - e1y*e2x
+                gl_data.extend((nx, ny, nz,
+                                v0[0], v0[1], v0[2],
+                                v1[0], v1[1], v1[2],
+                                v2[0], v2[1], v2[2]))
+
+            result.append((mat, gl_data))
+
+        print(f"[model] pre-computed {sum(len(d)//12 for _,d in result)} triangles on bg thread")
+        return result
 
     def update_ball_tracking(self):
         """Update the tracking camera to follow the ball"""
@@ -1482,15 +1566,14 @@ class UmpireView3D(QOpenGLWidget):
         # Set up lights based on parameters
         self.set_lighting(self.light_params)
 
-        # Initialize stadium display list (compiled when model finishes loading)
+        # GL context was (re-)created — previous display lists are invalid.
         self.stadium_display_list = None
-        if self.ballpark_model:
+        self._outfield_display_list = None
+        if self.ballpark_model and self._precomputed_meshes:
             self.compile_stadium_display_list()
 
-        # Set up procedural sky shader
+        # Shaders must be recompiled after a context (re-)init.
         self._setup_sky_shader()
-
-        # Set up per-pixel stadium lighting shader (used in night mode)
         self._setup_stadium_lighting_shader()
 
     def _setup_stadium_lighting_shader(self):
@@ -1956,7 +2039,14 @@ void main() {
         if _use_ppx:
             self._stadium_shader.release()
 
-        self._draw_outfield_geometry()
+        # Outfield geometry (ground, wall, warning track, foul lines/poles)
+        # is compiled into a display list that is rebuilt only when the stadium changes.
+        if getattr(self, '_outfield_display_list', None):
+            glCallList(self._outfield_display_list)
+        elif self._stadium_name:
+            self._compile_outfield_display_list()
+            if self._outfield_display_list:
+                glCallList(self._outfield_display_list)
 
         # Draw spray chart 3D trajectory trails
         if self.spray_trails:
@@ -2166,135 +2256,64 @@ void main() {
  # this function actually tries to load the mats from .mtl file
 
     def compile_stadium_display_list(self):
+        """Compile the OBJ model into a GL display list.
+
+        All heavy work (normal computation, material lookup, vertex flattening)
+        was already done on the background thread in _precompute_mesh_data().
+        This method just streams the pre-built arrays into GL calls — typically
+        completes in <50ms for the ~9k triangle model.
+        """
         if not self.ballpark_model:
             return
+        precomputed = getattr(self, '_precomputed_meshes', None)
+        if not precomputed:
+            return
 
-        # Generate a new display list
         self.stadium_display_list = glGenLists(1)
         glNewList(self.stadium_display_list, GL_COMPILE)
-
-        # Basic model transformations
         glPushMatrix()
-        glScalef(1.0, 1.0, 1.0)
-        vertices = self.ballpark_model.vertices
 
-        # Process each mesh with its own material based on new names
-        for mesh_index, mesh in enumerate(self.ballpark_model.mesh_list):
-            # Get material name for this mesh
-            material_name = None
-            if hasattr(mesh, 'materials') and mesh.materials and len(mesh.materials) > 0:
-                material = mesh.materials[0]
-                if isinstance(material, str):
-                    material_name = material
-                elif hasattr(material, 'name'):
-                    material_name = material.name
+        for mat, gl_data in precomputed:
+            ambient, diffuse, specular, shininess, emission = mat
+            glMaterialfv(GL_FRONT, GL_AMBIENT, ambient)
+            glMaterialfv(GL_FRONT, GL_DIFFUSE, diffuse)
+            glMaterialfv(GL_FRONT, GL_SPECULAR, specular)
+            glMaterialf(GL_FRONT, GL_SHININESS, shininess)
+            if emission is not None:
+                glMaterialfv(GL_FRONT, GL_EMISSION, emission)
 
-            # Get mesh name if available (should be available with new Blender export)
-            mesh_name = ""
-            if hasattr(mesh, 'name'):
-                mesh_name = mesh.name
-
-            print(f"Processing mesh {mesh_index}: {mesh_name} with material: {material_name}")
-
-            # Apply materials based on mesh name
-            if "Infield" in mesh_name or mesh_name == "Infield":
-                # Dirt infield
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.15, 0.1, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.76, 0.46, 0.25, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 64.0)
-                print(f"Applied dirt material to infield")
-
-            elif "outfield" in mesh_name or mesh_name == "outfield":
-                # Green grass outfield
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.05, 0.2, 0.05, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.1, 0.6, 0.1, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.1, 0.4, 0.1, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 12.0)
-                print(f"Applied grass material to outfield")
-
-            elif "EffortText" in mesh_name or mesh_name == "EffortText":
-                # Nearly transparent material for EffortText
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 0.1])
-                glMaterialfv(GL_FRONT, GL_EMISSION, [0.15, 0.05, 0.05, 0.05])  # No emission
-                glMaterialf(GL_FRONT, GL_SHININESS, 128.0)
-                # glDisable(GL_BLEND)
-
-            elif "homeplate" in mesh_name:
-                # White for home plate
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.95, 0.95, 0.95, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.8, 0.8, 0.8, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 96.0)
-                print(f"Applied white material to homeplate")
-
-            elif "pitchersmound" in mesh_name:
-                # Slightly different dirt color for pitcher's mound
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.22, 0.17, 0.12, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.7, 0.4, 0.2, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.4, 0.3, 0.2, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
-                print(f"Applied mound material to pitchersmound")
-
-            elif "Dugout" in mesh_name or "dugout" in mesh_name:
-                # Gray concrete for dugouts
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.6, 0.6, 0.6, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 48.0)
-                print(f"Applied concrete material to dugout")
-
-            elif "Graffiti" in mesh_name:
-                # Graffiti wall - you could use a texture here in the future
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 8.0)
-                print(f"Applied wall material to Graffiti Wall")
-
-            elif "Cylinder" in mesh_name or "Box" in mesh_name:
-                # Stadium structures - light blue/gray
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.25, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.5, 0.5, 0.6, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.3, 0.3, 0.4, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
-                print(f"Applied structure material to {mesh_name}")
-
-            else:
-                # Default white material for unrecognized meshes
-                glMaterialfv(GL_FRONT, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-                glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
-                glMaterialfv(GL_FRONT, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
-                glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
-                print(f"Applied default material to {mesh_name}")
-
-            # Draw the triangles for this mesh with per-face normals
+            # Each triangle is 12 floats: nx,ny,nz, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z
+            n = len(gl_data)
             glBegin(GL_TRIANGLES)
-            for face in mesh.faces:
-                if len(face) >= 3:
-                    v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
-                    e1 = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
-                    e2 = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
-                    nx = e1[1]*e2[2] - e1[2]*e2[1]
-                    ny = e1[2]*e2[0] - e1[0]*e2[2]
-                    nz = e1[0]*e2[1] - e1[1]*e2[0]
-                    if nx or ny or nz:
-                        glNormal3f(nx, ny, nz)
-                    glVertex3f(*v0); glVertex3f(*v1); glVertex3f(*v2)
+            for i in range(0, n, 12):
+                nx, ny, nz = gl_data[i], gl_data[i+1], gl_data[i+2]
+                if nx or ny or nz:
+                    glNormal3f(nx, ny, nz)
+                glVertex3f(gl_data[i+3], gl_data[i+4], gl_data[i+5])
+                glVertex3f(gl_data[i+6], gl_data[i+7], gl_data[i+8])
+                glVertex3f(gl_data[i+9], gl_data[i+10], gl_data[i+11])
             glEnd()
+
+            # Reset emission if it was set
+            if emission is not None:
+                glMaterialfv(GL_FRONT, GL_EMISSION, [0.0, 0.0, 0.0, 1.0])
 
         glPopMatrix()
         glEndList()
-        print("✅ Stadium model compiled into display list with materials based on mesh names")
+        print(f"[model] display list compiled ({sum(len(d)//12 for _,d in precomputed)} triangles)")
 
-    def _draw_outfield_geometry(self):
-        """Draw procedural outfield geometry: ground plane, wall, warning track, foul lines, foul poles.
-        All coordinates derived from STADIUM_DATA wall distances via physics_to_model().
+    def _compile_outfield_display_list(self):
+        """Compile procedural outfield geometry into a GL display list.
+
+        Ground plane, wall, warning track, foul lines, foul poles — all derived
+        from STADIUM_DATA wall distances via physics_to_model().  This is called
+        once per stadium change; subsequent frames just glCallList.
         """
         if not self._stadium_name:
             return
+
+        self._outfield_display_list = glGenLists(1)
+        glNewList(self._outfield_display_list, GL_COMPILE)
 
         # --- shared constants ---
         POLE_HEIGHT_FT = 30.0         # foul pole height (feet)
@@ -2580,6 +2599,8 @@ void main() {
 
         # ------------------------------------------------------------------ #
         glPopAttrib()
+        glEndList()
+        print(f"[outfield] display list compiled for {self._stadium_name}")
 
     def physics_to_model(self, x_m, y_m, z_m):
         """Convert physics coordinates (meters) to 3D model coordinates.
@@ -2921,7 +2942,7 @@ class SplitView(QWidget):
         self.ball_simulator = BallFlightSimulator()
 
         # Stadium and location information
-        self.stadium_pixmap = QPixmap(stadium_image_path)
+        self.stadium_image_path = stadium_image_path  # deferred — loaded only if needed
         self.lat = lat
         self.lon = lon
         self.altitude = altitude
@@ -2950,8 +2971,13 @@ class SplitView(QWidget):
         self.animation_timer = QTimer(self)
         self.animation_timer.timeout.connect(self.update_animation)
 
-        # Fetch initial weather data
-        self.fetch_weather_data()
+        # Seed default weather so the sim is usable immediately.
+        # The actual API fetch is triggered by change_stadium() after the
+        # event loop starts (via QTimer.singleShot in MLBWeatherApp.__init__),
+        # so we don't fire a duplicate request here.
+        self.weather_data = dict(self._DEFAULT_WEATHER)
+        self.update_weather_label()
+        self.update_weather_visualization()
 
 
 
@@ -2982,8 +3008,9 @@ class SplitView(QWidget):
             # 2D View - now using polar coordinates directly
             self.stadium_view.draw_stadium_polar(stadium_name, self.dimensions)
 
-            # 3D View — pass stadium name then repaint
+            # 3D View — pass stadium name, invalidate outfield cache, repaint
             self.umpire_view._stadium_name = stadium_name
+            self.umpire_view._outfield_display_list = None
             self.umpire_view.update()
         else:
             print(f"Stadium {stadium_name} not found in STADIUM_DATA")

@@ -1026,6 +1026,7 @@ class PlayerBBEOverlay(QWidget):
         self._current_year: int = 0
         self._available_years: list[int] = []
         self._player_type: str = "batter"
+        self._store_cache: dict[tuple[int, str], BBEDataStore] = {}  # (year, player_type) → store
 
         self._build_ui()
         self._build_animation()
@@ -1127,7 +1128,13 @@ class PlayerBBEOverlay(QWidget):
         }, reverse=True)
 
     def _load_year(self, bbe_csv: str, leaderboard_csv: str | None, year: int):
-        """Kick off the background loader thread."""
+        """Kick off the background loader thread (cache hit skips the thread)."""
+        cache_key = (year, self._player_type)
+        if cache_key in self._store_cache:
+            self.panel.set_loading_message(f"Restoring {year} {'pitcher' if self._player_type == 'pitcher' else 'hitter'} data…")
+            self._on_data_ready(self._store_cache[cache_key])
+            return
+
         # Kill previous loader if still running
         if self._loader_thread and self._loader_thread.isRunning():
             self._loader_thread.quit()
@@ -1212,6 +1219,7 @@ class PlayerBBEOverlay(QWidget):
         self.player_selected_with_data.emit(0, [])
 
     def _on_data_ready(self, store: BBEDataStore):
+        self._store_cache[(self._current_year, self._player_type)] = store
         self.panel.set_data_store(store)
         if self._loader_thread:
             self._loader_thread.quit()

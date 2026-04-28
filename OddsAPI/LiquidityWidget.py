@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurv
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QLinearGradient, QRadialGradient, QPainterPath
 import json
 import math
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -456,9 +457,39 @@ class OrderBookWidget(QWidget):
         # Render all lines from this market
         self.renderOrderBook(market_data)
 
+    def _extract_market_side(self, display_name: str) -> str:
+        """
+        Extract the market side (team or over/under) from display name.
+        Returns just the side identifier, ignoring the line value.
+
+        Examples:
+            "over 15.5" -> "over"
+            "under 12.5" -> "under"
+            "BUF +1" -> "BUF"
+            "Buffalo Bills +1.5" -> "Buffalo Bills"
+            "DEN -3.5" -> "DEN"
+        """
+        name_lower = display_name.lower().strip()
+
+        # Handle over/under totals and props
+        if name_lower.startswith('over'):
+            return 'over'
+        elif name_lower.startswith('under'):
+            return 'under'
+
+        # Handle spread/moneyline markets - extract team name (everything before the number)
+        # Remove the spread number to get just the team identifier
+        match = re.match(r'^(.+?)\s*[+-]?\d', display_name)
+        if match:
+            return match.group(1).strip()
+
+        # Fallback: return the full name
+        return display_name
+
     def renderOrderBook(self, market_data: Dict):
         """
-        Render the order book showing ALL available lines with enhanced depth visualization
+        Render the order book showing ALL available lines with enhanced depth visualization.
+        Groups orders by the two market sides (over/under, or team1/team2) with one separator.
 
         Args:
             market_data: Full market dict from ProphetX API
@@ -500,76 +531,101 @@ class OrderBookWidget(QWidget):
             self.orderbook_table.setSpan(0, 0, 1, 5)
             return
 
-        # Separate into bids (negative odds/favorites) and asks (positive odds/underdogs)
-        bids = [o for o in all_orders if o.get('odds', 0) < 0]
-        asks = [o for o in all_orders if o.get('odds', 0) >= 0]
+        # Group orders by market side (over/under, or team1/team2)
+        side_groups = {}
+        for order in all_orders:
+            display_name = order.get('displayName', order.get('abbreviatedName', ''))
+            side = self._extract_market_side(display_name)
 
-        # Sort bids by odds descending (best price first: -110 before -120)
-        bids.sort(key=lambda x: x.get('odds', 0), reverse=True)
+            if side not in side_groups:
+                side_groups[side] = []
+            side_groups[side].append(order)
 
-        # Sort asks by odds ascending (best price first: +110 before +120)
-        asks.sort(key=lambda x: x.get('odds', 0))
+        # Sort each group by odds (best price first - highest value, closest to even money)
+        for side, orders in side_groups.items():
+            orders.sort(key=lambda x: x.get('odds', 0), reverse=True)
 
-        # Limit display per side
-        max_per_side = 25
-        asks = asks[:max_per_side]
-        bids = bids[:max_per_side]
+        # Determine display order for the two sides
+        if 'over' in side_groups and 'under' in side_groups:
+            # Over/under market - show overs first, then unders
+            side_order = ['over', 'under']
+        else:
+            # Other market types - sort by total liquidity (highest first)
+            side_liquidity = [(side, sum(o.get('value', 0) for o in orders))
+                             for side, orders in side_groups.items()]
+            side_liquidity.sort(key=lambda x: x[1], reverse=True)
+            side_order = [s[0] for s in side_liquidity]
 
-        # Combine: asks first (best to worst), separator, then bids (best to worst)
-        all_orders = asks + bids
-        insert_separator = len(asks) if (asks and bids) else -1
+        # Build ordered list: side1 orders, separator, side2 orders
+        max_per_side = 50
+        ordered_sections = [(side, side_groups[side][:max_per_side])
+                           for side in side_order if side in side_groups]
 
-        # Set row count (add 1 for separator if needed)
-        total_rows = len(all_orders) + (1 if insert_separator >= 0 else 0)
+        # Calculate total rows (orders + 1 separator if we have 2 sides)
+        total_orders = sum(len(orders) for _, orders in ordered_sections)
+        has_separator = len(ordered_sections) == 2
+        total_rows = total_orders + (1 if has_separator else 0)
         self.orderbook_table.setRowCount(total_rows)
 
-        # Calculate total book liquidity
-        total_liquidity = sum(order.get('value', 0) for order in all_orders)
+        # Calculate totals for display
+        total_liquidity = sum(order.get('value', 0) for _, orders in ordered_sections for order in orders)
+        max_stake = max((order.get('value', 1) for _, orders in ordered_sections for order in orders), default=1)
 
-        # Find max stake for liquidity bar scaling
-        max_stake = max(order.get('value', 1) for order in all_orders)
-
-        # Calculate cumulative liquidity and render all orders
+        # Render: first side, separator, second side
+        current_row = 0
         cumulative = 0
-        row_offset = 0
-        for i, order in enumerate(all_orders):
-            # Insert separator between asks and bids
-            if i == insert_separator and insert_separator >= 0:
-                self.renderSeparatorRow(i)
-                row_offset = 1
+        all_rendered_orders = []
 
-            cumulative += order.get('value', 0)
-            self.renderOrderRow(i + row_offset, order, max_stake, cumulative, total_liquidity)
+        for section_idx, (side, orders) in enumerate(ordered_sections):
+            # Add separator between the two sides (after first section)
+            if section_idx == 1 and has_separator:
+                separator_label = side.upper() if side in ('over', 'under') else side
+                self.renderSideSeparatorRow(current_row, f"─ {separator_label} ─")
+                current_row += 1
 
-        # Update footer with spread info
-        if bids and asks:
-            best_bid = bids[0]
-            best_ask = asks[0]
-            best_bid_odds = best_bid.get('odds', 0)
-            best_ask_odds = best_ask.get('odds', 0)
+            # Render orders in this section
+            for order in orders:
+                cumulative += order.get('value', 0)
+                self.renderOrderRow(current_row, order, max_stake, cumulative, total_liquidity)
+                all_rendered_orders.append(order)
+                current_row += 1
 
-            # Calculate implied probabilities and spread
-            bid_prob = abs(best_bid_odds) / (abs(best_bid_odds) + 100) * 100 if best_bid_odds < 0 else 100 / (best_ask_odds + 100) * 100
-            ask_prob = 100 / (best_ask_odds + 100) * 100 if best_ask_odds > 0 else abs(best_ask_odds) / (abs(best_ask_odds) + 100) * 100
-
-            spread = abs(best_bid_odds - best_ask_odds)
-
+        # Update footer with summary info
+        if all_rendered_orders:
+            best_order = all_rendered_orders[0]
             self.footer_label.setText(
-                f"Showing {len(all_orders)} price levels • "
-                f"Best Bid: {best_bid.get('displayOdds', 'N/A')} • "
-                f"Best Ask: {best_ask.get('displayOdds', 'N/A')} • "
-                f"Spread: {spread} points • "
-                f"Total Liquidity: ${total_liquidity:,.2f}"
-            )
-        elif all_orders:
-            best_order = all_orders[0]
-            self.footer_label.setText(
-                f"Showing {len(all_orders)} price levels • "
-                f"Best: {best_order.get('displayName', 'N/A')} @ {best_order.get('displayOdds', 'N/A')} • "
+                f"Showing {len(all_rendered_orders)} price levels • "
+                f"Best Bid: {best_order.get('displayOdds', 'N/A')} • "
+                f"Best Ask: {all_rendered_orders[-1].get('displayOdds', 'N/A') if len(all_rendered_orders) > 1 else 'N/A'} • "
+                f"Spread: {len(side_groups)} sides • "
                 f"Total Liquidity: ${total_liquidity:,.2f}"
             )
         else:
             self.footer_label.setText("No orders available")
+
+    def renderSideSeparatorRow(self, row: int, label: str):
+        """Render a separator row between the two market sides"""
+        if self.compact_mode:
+            separator = QTableWidgetItem(label)
+            font_size = 9
+            row_height = 24
+            colspan = 3
+        else:
+            separator = QTableWidgetItem(f"───── {label} ─────")
+            font_size = 12
+            row_height = 40
+            colspan = 5
+
+        separator.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        sep_font = QFont("SF Mono", font_size, QFont.Weight.Bold)
+        sep_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        separator.setFont(sep_font)
+        separator.setForeground(QColor(96, 165, 250))  # Professional blue
+        separator.setBackground(QColor(31, 41, 55))  # Darker gray-blue
+
+        self.orderbook_table.setItem(row, 0, separator)
+        self.orderbook_table.setSpan(row, 0, 1, colspan)
+        self.orderbook_table.setRowHeight(row, row_height)
 
     def renderSeparatorRow(self, row: int):
         """Render a separator row between asks and bids showing the spread"""
@@ -1218,6 +1274,8 @@ class ProphetXBrowser(QWidget):
 
     def refreshCompactEventCombo(self):
         """Refresh the compact event combo box"""
+        # Block signals to prevent auto-selection when populating with stale data
+        self.event_combo.blockSignals(True)
         self.event_combo.clear()
 
         for event in self.filtered_events:
@@ -1229,6 +1287,9 @@ class ProphetXBrowser(QWidget):
             # Compact display
             display = f"{event_name} (${stake:,.0f})"
             self.event_combo.addItem(display, event)
+
+        # Re-enable signals - don't auto-select, wait for fresh data
+        self.event_combo.blockSignals(False)
 
     def onCompactEventSelected(self, index: int):
         """Handle event selection in compact mode"""

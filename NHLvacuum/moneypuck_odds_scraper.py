@@ -835,6 +835,35 @@ def get_scraped_game_ids(moneypuck_csv: str) -> Set[str]:
     return scraped_ids
 
 
+def identify_timeout_games(moneypuck_odds_csv: str) -> List[Tuple[str, str, str]]:
+    """
+    Identify games with timeout or error status in the moneypuck_odds CSV.
+
+    Args:
+        moneypuck_odds_csv: Path to moneypuck_odds CSV file
+
+    Returns:
+        List of tuples: (traditional_game_id, game_id, season) for timed-out/errored games
+    """
+    if not Path(moneypuck_odds_csv).exists():
+        logger.error(f"File {moneypuck_odds_csv} does not exist")
+        return []
+
+    timeout_games = []
+    with open(moneypuck_odds_csv, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('scrape_status') in ('timeout', 'error'):
+                timeout_games.append((
+                    row['traditional_game_id'],
+                    row['game_id'],
+                    row['season']
+                ))
+
+    logger.info(f"Found {len(timeout_games)} timed-out/errored games in {moneypuck_odds_csv}")
+    return timeout_games
+
+
 def identify_missing_games_from_lists(unique_game_ids_csv: str, moneypuck_odds_csv: str) -> List[Tuple[str, str, str]]:
     """
     Identify games that are in unique_game_ids but not yet in moneypuck_odds.
@@ -952,6 +981,8 @@ if __name__ == '__main__':
                         help='Specific season to scrape (e.g., 2023-24). If not specified, scrapes all available seasons.')
     parser.add_argument('--update-season', action='store_true',
                         help='Update unique_game_ids for the season, then scrape only games not yet in moneypuck_odds CSV')
+    parser.add_argument('--retry-timeouts', action='store_true',
+                        help='Re-scrape games with timeout or error status in the existing moneypuck_odds CSV')
     parser.add_argument('--playoffs', action='store_true',
                         help='Scrape playoff games from database instead of regular season games from CSV')
     parser.add_argument('--db-path', type=str, default='nhl_analytics.db',
@@ -1091,9 +1122,23 @@ if __name__ == '__main__':
 
                 existing_data[game_key] = row
 
+            # Rebuild fieldnames from all rows to include any new sportsbooks
+            # (e.g., fanduel/betano may not exist in older CSV but appear in new scrapes)
+            base_fields = [
+                'game_id', 'traditional_game_id', 'season',
+                'away_team', 'home_team',
+                'mp_away_win_prob', 'mp_home_win_prob',
+                'scrape_status', 'error_message'
+            ]
+            all_keys = set()
+            for row in existing_data.values():
+                all_keys.update(row.keys())
+            sportsbook_fields = sorted(k for k in all_keys if k not in base_fields)
+            fieldnames = base_fields + sportsbook_fields
+
             # Write merged data back
             with open(moneypuck_odds_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 for game_key in sorted(existing_data.keys()):
                     writer.writerow(existing_data[game_key])
@@ -1105,6 +1150,151 @@ if __name__ == '__main__':
 
         logger.info("=" * 60)
         logger.info("UPDATE SEASON MODE COMPLETE")
+        logger.info("=" * 60)
+        exit(0)
+
+    # Handle retry-timeouts mode
+    if args.retry_timeouts:
+        season = args.season  # defaults to '2025-26'
+        moneypuck_odds_file = f"moneypuck_odds_{season}.csv"
+
+        logger.info("=" * 60)
+        logger.info(f"RETRY TIMEOUTS MODE - Season {season}")
+        logger.info("=" * 60)
+
+        # Step 1: Identify timed-out/errored games
+        timeout_games = identify_timeout_games(moneypuck_odds_file)
+
+        if not timeout_games:
+            logger.info("No timed-out or errored games to retry.")
+            exit(0)
+
+        logger.info(f"Found {len(timeout_games)} games to retry")
+
+        # Step 2: Re-scrape those games
+        scraper = MoneyPuckScraper(headless=not args.no_headless, max_retries=args.retries, timeout=args.timeout)
+        results = []
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_game = {
+                executor.submit(scraper.scrape_game, trad_id, game_id, season_str): (trad_id, game_id, season_str)
+                for trad_id, game_id, season_str in timeout_games
+            }
+
+            for i, future in enumerate(as_completed(future_to_game), 1):
+                trad_id, game_id, season_str = future_to_game[future]
+                try:
+                    game_lines = future.result()
+                    results.extend(game_lines)
+
+                    success_count = sum(1 for gl in game_lines if gl.scrape_status == 'success')
+                    logger.info(f"Progress: {i}/{len(timeout_games)} - Game {trad_id}: {success_count}/{len(game_lines)} sportsbooks successful")
+                except Exception as e:
+                    logger.error(f"Unexpected error for game {trad_id}: {e}")
+                    results.append(GameLine(
+                        game_id=game_id,
+                        traditional_game_id=trad_id,
+                        season=season_str,
+                        sportsbook='unknown',
+                        scrape_status='error',
+                        error_message=str(e)
+                    ))
+
+                if i < len(timeout_games):
+                    time.sleep(args.delay)
+
+        # Step 3: Merge back into existing CSV, replacing old timed-out rows
+        existing_data = {}
+        with open(moneypuck_odds_file, 'r') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            for row in reader:
+                game_key = (row['game_id'], row['traditional_game_id'], row['season'])
+                existing_data[game_key] = row
+
+        # Group new results by game
+        new_games_dict = {}
+        all_sportsbooks = set()
+
+        for result in results:
+            game_key = (result.game_id, result.traditional_game_id, result.season)
+
+            if game_key not in new_games_dict:
+                new_games_dict[game_key] = {
+                    'game_id': result.game_id,
+                    'traditional_game_id': result.traditional_game_id,
+                    'season': result.season,
+                    'away_team': result.away_team,
+                    'home_team': result.home_team,
+                    'mp_away_win_prob': result.mp_away_win_prob,
+                    'mp_home_win_prob': result.mp_home_win_prob,
+                    'scrape_status': result.scrape_status,
+                    'error_message': result.error_message,
+                    'sportsbooks': {}
+                }
+
+            if result.sportsbook and result.sportsbook != 'unknown':
+                all_sportsbooks.add(result.sportsbook)
+                new_games_dict[game_key]['sportsbooks'][result.sportsbook] = {
+                    'opening_timestamp': result.opening_timestamp,
+                    'opening_away_odds': result.opening_away_odds,
+                    'opening_home_odds': result.opening_home_odds,
+                    'closing_timestamp': result.closing_timestamp,
+                    'closing_away_odds': result.closing_away_odds,
+                    'closing_home_odds': result.closing_home_odds
+                }
+
+        # Replace old timed-out rows with new results
+        for game_key, game_data in new_games_dict.items():
+            row = {field: '' for field in fieldnames}
+            row['game_id'] = game_data['game_id']
+            row['traditional_game_id'] = game_data['traditional_game_id']
+            row['season'] = game_data['season']
+            row['away_team'] = game_data['away_team'] or ''
+            row['home_team'] = game_data['home_team'] or ''
+            row['mp_away_win_prob'] = game_data['mp_away_win_prob'] or ''
+            row['mp_home_win_prob'] = game_data['mp_home_win_prob'] or ''
+            row['scrape_status'] = game_data['scrape_status']
+            row['error_message'] = game_data['error_message'] or ''
+
+            for sportsbook, sb_data in game_data['sportsbooks'].items():
+                row[f'{sportsbook}_opening_timestamp'] = sb_data['opening_timestamp'] or ''
+                row[f'{sportsbook}_opening_away_odds'] = sb_data['opening_away_odds'] or ''
+                row[f'{sportsbook}_opening_home_odds'] = sb_data['opening_home_odds'] or ''
+                row[f'{sportsbook}_closing_timestamp'] = sb_data['closing_timestamp'] or ''
+                row[f'{sportsbook}_closing_away_odds'] = sb_data['closing_away_odds'] or ''
+                row[f'{sportsbook}_closing_home_odds'] = sb_data['closing_home_odds'] or ''
+
+            existing_data[game_key] = row
+
+        # Rebuild fieldnames to include any new sportsbooks
+        base_fields = [
+            'game_id', 'traditional_game_id', 'season',
+            'away_team', 'home_team',
+            'mp_away_win_prob', 'mp_home_win_prob',
+            'scrape_status', 'error_message'
+        ]
+        all_keys = set()
+        for row in existing_data.values():
+            all_keys.update(row.keys())
+        sportsbook_fields = sorted(k for k in all_keys if k not in base_fields)
+        fieldnames = base_fields + sportsbook_fields
+
+        # Write merged data back
+        with open(moneypuck_odds_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            for game_key in sorted(existing_data.keys()):
+                writer.writerow(existing_data[game_key])
+
+        # Summary
+        retry_success = sum(1 for gd in new_games_dict.values() if gd['scrape_status'] == 'success')
+        retry_still_failed = len(new_games_dict) - retry_success
+        logger.info(f"Retried {len(new_games_dict)} games: {retry_success} now successful, {retry_still_failed} still failed")
+        logger.info(f"Results merged back into {moneypuck_odds_file}")
+
+        logger.info("=" * 60)
+        logger.info("RETRY TIMEOUTS MODE COMPLETE")
         logger.info("=" * 60)
         exit(0)
 
