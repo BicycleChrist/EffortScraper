@@ -250,13 +250,14 @@ async def FetchSingleEventAsync(event_id: int, event_metadata: Optional[Dict] = 
         return markets_data
 
 
-async def FetchAllEventsAsync(save_combined: bool = False) -> Dict:
+async def FetchAllEventsAsync(save_combined: bool = False, max_concurrent: int = 10) -> Dict:
     """
     Fetch all events and their markets asynchronously.
-    Much faster than sync version due to concurrent requests.
+    Uses true concurrency with semaphore to limit simultaneous requests.
 
     Args:
         save_combined: Save results to combined JSON file
+        max_concurrent: Maximum number of concurrent requests (default 10)
 
     Returns:
         Dictionary mapping event_id -> market_data
@@ -264,6 +265,21 @@ async def FetchAllEventsAsync(save_combined: bool = False) -> Dict:
     print("=" * 60)
     print("ProphetX Exchange Async Full Scrape")
     print("=" * 60)
+
+    # Semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def fetch_with_semaphore(session, event):
+        """Fetch single event with semaphore limiting"""
+        async with semaphore:
+            try:
+                markets_data = await GetEventMarketsAsync(session, event['id'])
+                if markets_data:
+                    markets_data['event_metadata'] = event
+                return (event, markets_data)
+            except Exception as e:
+                print(f"  Error fetching {event['name']}: {e}")
+                return (event, None)
 
     async with aiohttp.ClientSession() as session:
         # Step 1: Get all tournaments and events
@@ -277,43 +293,49 @@ async def FetchAllEventsAsync(save_combined: bool = False) -> Dict:
         events = ExtractEventList(tournaments_data)
         print(f"Found {len(events)} events across all tournaments\n")
 
-        # Step 2: Fetch markets for all events concurrently
-        print(f"[2/2] Fetching markets for {len(events)} events concurrently...")
+        # Step 2: Fetch markets for all events TRULY concurrently
+        print(f"[2/2] Fetching markets for {len(events)} events (max {max_concurrent} concurrent)...")
+
+        # Create actual concurrent tasks
+        tasks = [fetch_with_semaphore(session, event) for event in events]
+
+        # Gather all results concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
         all_markets = {}
+        success_count = 0
+        for i, result in enumerate(results, 1):
+            if isinstance(result, Exception):
+                print(f"  [{i}/{len(events)}] Task exception: {result}")
+                continue
 
-        # Create tasks for all events
-        tasks = []
-        for event in events:
-            task = GetEventMarketsAsync(session, event['id'])
-            tasks.append((event, task))
+            event, markets_data = result
+            if markets_data:
+                num_markets = len(markets_data.get('data', {}).get('markets', []))
+                total_stake = sum(m.get('totalStake', 0) for m in markets_data.get('data', {}).get('markets', []))
+                print(f"  [{i}/{len(events)}] {event['name']}: OK ({num_markets} markets, ${total_stake:,.0f})")
+                all_markets[event['id']] = markets_data
+                success_count += 1
+            else:
+                print(f"  [{i}/{len(events)}] {event['name']}: SKIPPED (no markets)")
 
-        # Gather all results
-        for i, (event, task) in enumerate(tasks, 1):
-            try:
-                markets_data = await task
+    print(f"\nSuccessfully scraped {success_count}/{len(events)} events")
 
-                if markets_data:
-                    num_markets = len(markets_data.get('data', {}).get('markets', []))
-                    total_stake = sum(m.get('totalStake', 0) for m in markets_data.get('data', {}).get('markets', []))
-                    print(f"  [{i}/{len(events)}] {event['name']}: OK ({num_markets} markets, ${total_stake:,.0f})")
-
-                    markets_data['event_metadata'] = event
-                    all_markets[event['id']] = markets_data
-                else:
-                    print(f"  [{i}/{len(events)}] {event['name']}: SKIPPED (no markets)")
-            except Exception as e:
-                print(f"  [{i}/{len(events)}] {event['name']}: FAILED ({e})")
-
-    print(f"\nSuccessfully scraped {len(all_markets)}/{len(events)} events")
-
-    # Save combined results if requested
+    # Save combined results if requested (run in executor to not block)
     if save_combined and all_markets:
-        from ProphetXQuery import SaveResponse
-        combined_file = SaveResponse("all_markets_combined", all_markets)
-        print(f"\nCombined data saved to: {combined_file}")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _save_combined_sync, all_markets)
 
     print("=" * 60)
     return all_markets
+
+
+def _save_combined_sync(all_markets: Dict):
+    """Synchronous save helper to run in executor"""
+    from ProphetXQuery import SaveResponse
+    combined_file = SaveResponse("all_markets_combined", all_markets)
+    print(f"\nCombined data saved to: {combined_file}")
 
 
 if __name__ == "__main__":
