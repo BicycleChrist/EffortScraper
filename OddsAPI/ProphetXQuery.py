@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-ProphetX Exchange Scraper
-Fetches orderbook data from ProphetX betting exchange API
+ProphetX Exchange Scraper + SGP Scanner
+
+Two responsibilities live here:
+  1. Sync orderbook scraping via cash.api.prophetx.co (Bearer auth) —
+     GetTournaments, GetEventMarkets, ScrapeAllMarkets, GetBestLines.
+  2. Async SGP-quote scanner via www.prophetx.co/parlay (cookie auth) —
+     GetSGPQuote/GetSGPQuoteAsync, BuildSGPLegs, SGPScanner. See the comment
+     block above class SGPScanner for the implication-chain logic and the
+     auto-bet / LiquidityWidget TODOs.
+
+Auth state:
+  - Bearer JWT lives in Creds.PROPHETX_AUTH_TOKEN (refreshed by Playwright).
+  - Cookie jar is dumped to prophetx_session.json by refresh_prophetx_token
+    and read back by load_prophetx_cookies() for the parlay endpoint.
+
+CLI: see argparse block at bottom (--scan toggles scanner mode).
 
 TODO: Automated Token Refresh Integration
 ----------------------------------------
@@ -576,6 +590,12 @@ def BuildSGPLegs(markets_data: Dict, picks: List[Tuple[int, int]]) -> List[Dict]
 
 
 class SGPScanner:
+    """Async SGP implication-chain scanner. See module-level comment block above
+    for the chain logic and auto-bet / widget integration TODOs. Entry point:
+    `await SGPScanner(concurrency=N).scan(event_ids=None)` returns a list of
+    row dicts; pair with `annotate_and_save_scan()` for EV ranking + CSV.
+    """
+
     CHAIN_SUFFIXES = {
         "hr":  " Total Home Runs",
         "rbi": " Total RBIs",
