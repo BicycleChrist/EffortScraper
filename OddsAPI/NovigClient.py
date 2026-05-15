@@ -111,6 +111,99 @@ class NovigClient:
             )
         return r.json()
 
+    def price_parlay(self, outcome_ids: list[str],
+                     boost_id: Optional[str] = None) -> dict:
+        """Quote a parlay (SGP or cross-game) via the NBX parlay pricer.
+
+        Posts to /nbx/v1/parlay/request with body shape:
+            {"outcomes": [{"id": <outcomeId>}, ...], "boostId": <id|null>}
+
+        Response is a parlay quote object: top-level `price` is the combined
+        implied probability (multiplied across legs with SWISH correlation
+        adjustments for true SGPs), plus per-leg prices under `legs[]`.
+        Quote fields traderId/walletId/wager are null — this does NOT place
+        a wager; it returns the price the site would offer.
+
+        Currency (CASH vs COIN) is inferred from the bearer token's active
+        wallet, not from the request body.
+        """
+        url = f"{NOVIG_NBX_BASE}/parlay/request"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": self.session.headers["Authorization"],
+            "Origin": "https://novig.com",
+            "Referer": "https://novig.com/",
+        }
+        payload = {
+            "outcomes": [{"id": oid} for oid in outcome_ids],
+            "boostId": boost_id,
+        }
+        r = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+        # Server returns 201 Created with the quote object wrapped in a list.
+        if r.status_code not in (200, 201):
+            raise NovigError(
+                f"NBX HTTP {r.status_code} for {r.url}\n  body: {r.text[:500]}"
+            )
+        body = r.json()
+        if isinstance(body, list):
+            if not body:
+                raise NovigError("Empty parlay quote response")
+            return body[0]
+        return body
+
+
+def summarize_parlay_quote(quote: dict) -> dict:
+    """Flatten a parlay/request response into a compact display dict.
+
+    Returns:
+      {
+        "parlay_id": str,
+        "status": str,                 # e.g. "Unfilled"
+        "combined_price": float,       # implied prob of full parlay
+        "combined_american": str,      # American odds string
+        "unboosted_price": float|None,
+        "naive_price": float,          # product of leg prices (no correlation)
+        "correlation_edge": float,     # combined - naive (positive = SWISH gives you better than independent)
+        "legs": [
+            {"outcome_id": ..., "price": ..., "american": ...,
+             "description": ..., "market_description": ...},
+            ...
+        ],
+      }
+    """
+    def _f(x):
+        try: return float(x)
+        except (TypeError, ValueError): return None
+
+    combined = _f(quote.get("price"))
+    legs_out = []
+    naive = 1.0
+    for leg in quote.get("legs") or []:
+        lp = _f(leg.get("price"))
+        if lp is not None:
+            naive *= lp
+        out = leg.get("outcome") or {}
+        mkt = out.get("market") or {}
+        legs_out.append({
+            "outcome_id": leg.get("outcomeId"),
+            "price": lp,
+            "american": fmt_american(lp),
+            "description": out.get("description"),
+            "market_description": mkt.get("description"),
+            "vendor": leg.get("vendor"),
+        })
+    return {
+        "parlay_id": quote.get("id"),
+        "status": quote.get("status"),
+        "combined_price": combined,
+        "combined_american": fmt_american(combined),
+        "unboosted_price": _f(quote.get("unboostedPrice")),
+        "naive_price": naive if legs_out else None,
+        "correlation_edge": (combined - naive) if (combined is not None and legs_out) else None,
+        "legs": legs_out,
+    }
+
 
 def prob_to_american(p: Optional[float]) -> Optional[int]:
     """Convert an implied probability (0..1) to American moneyline odds.
@@ -426,6 +519,159 @@ class NovigQueries:
         return self.list_events(league="MLB", status_in=("OPEN_INGAME",), limit=limit)
 
 
+# ---------------------------------------------------------------------------
+# SGP correlation-floor scanner
+# ---------------------------------------------------------------------------
+# The SWISH parlay pricer occasionally violates the deterministic implication
+# floor: for two events A and B where A => B (B always happens whenever A does),
+# the parlay price P(A ∧ B) must equal P(A). If SWISH returns a parlay price
+# *below* P(A_leg), the parlay strictly dominates the single A wager — same
+# winning condition, larger payout.
+#
+# MLB deterministic implications among the common props (all on Over/Under 0.5):
+#
+#   OVER side:  HR ≥ 1  =>  RBI ≥ 1, R ≥ 1, H ≥ 1
+#               (a HR drives the batter in, scores them, and counts as a hit)
+#
+#   UNDER side (contrapositive):
+#               Under_RBI  =>  Under_HR
+#               Under_Runs =>  Under_HR
+#               Under_Hits =>  Under_HR
+#               (if no RBI/run/hit, then no HR either)
+#
+# Each tuple: (dominant_type, dominant_side, implied_type, implied_side).
+# "Dominant" = the leg that *implies* the other. The parlay's correlation
+# floor is P(dominant). SWISH violates the floor when combined < P(dominant).
+
+SGP_IMPLICATION_PAIRS = [
+    # Over side: HR is dominant (HR => X)
+    ("HOME_RUNS", "Over",  "RBIS",  "Over"),
+    ("HOME_RUNS", "Over",  "RUNS",  "Over"),
+    ("HOME_RUNS", "Over",  "HITS",  "Over"),
+    # Under side: the non-HR leg is dominant (Under_X => Under_HR)
+    ("RBIS",      "Under", "HOME_RUNS", "Under"),
+    ("RUNS",      "Under", "HOME_RUNS", "Under"),
+    ("HITS",      "Under", "HOME_RUNS", "Under"),
+]
+
+
+def _find_outcome(market: dict, side: str, strike: float = 0.5) -> Optional[dict]:
+    """Find the Over/Under outcome on a market at the given strike."""
+    if market.get("strike") != strike:
+        return None
+    prefix = side.lower()
+    for o in market.get("outcomes") or []:
+        d = (o.get("description") or "").lower()
+        if d.startswith(prefix):
+            return o
+    return None
+
+
+def scan_sgp_implications(client: "NovigClient", event_id: str,
+                          pairs: list[tuple[str, str, str, str]] = SGP_IMPLICATION_PAIRS,
+                          strike: float = 0.5,
+                          max_workers: int = 4,
+                          throttle_s: float = 0.25,
+                          jitter_s: float = 0.20) -> list[dict]:
+    """Quote every (dominant, implied) SGP pair per player for one event.
+
+    Concurrency: `max_workers` threads run quote requests in parallel. Each
+    worker sleeps `throttle_s + uniform(0, jitter_s)` after its request so the
+    aggregate rate stays in human-browsing territory rather than firehose. With
+    the defaults (4 workers, ~0.35s mean per worker) the effective request rate
+    is ~11 req/s — comparable to a user opening one parlay-builder leg per
+    ~90ms. Tune down for stealthier scans, up only if you've cleared it.
+
+    Each pair is (dominant_type, dominant_side, implied_type, implied_side)
+    where dominant => implied, so the parlay floor is P(dominant_leg).
+    A row is `mispriced` when combined < dominant_price.
+    """
+    import random as _random
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    queries = NovigQueries(client)
+    ev = queries.get_event_markets(event_id, only_available=False)
+    if not ev:
+        return []
+    mkts = NovigQueries.flatten_markets(ev)
+
+    by_player_type: dict = {}
+    for m in mkts:
+        pid = m.get("playerId")
+        if not pid or m.get("strike") != strike:
+            continue
+        by_player_type.setdefault(pid, {})[m.get("type")] = m
+
+    # Build the task list up front so the request fan-out is cheap.
+    tasks: list[dict] = []
+    for pid, type_map in by_player_type.items():
+        for dom_t, dom_side, imp_t, imp_side in pairs:
+            dom_mkt = type_map.get(dom_t)
+            imp_mkt = type_map.get(imp_t)
+            if not dom_mkt or not imp_mkt:
+                continue
+            dom_out = _find_outcome(dom_mkt, dom_side, strike)
+            imp_out = _find_outcome(imp_mkt, imp_side, strike)
+            if not dom_out or not imp_out:
+                continue
+            dom_p = dom_out.get("last") or dom_out.get("available")
+            imp_p = imp_out.get("last") or imp_out.get("available")
+            if dom_p is None or imp_p is None:
+                continue
+            try:
+                dom_p = float(dom_p); imp_p = float(imp_p)
+            except (TypeError, ValueError):
+                continue
+            tasks.append({
+                "dom_t": dom_t, "dom_side": dom_side,
+                "imp_t": imp_t, "imp_side": imp_side,
+                "dom_mkt": dom_mkt, "dom_out": dom_out, "dom_p": dom_p,
+                "imp_out": imp_out, "imp_p": imp_p,
+            })
+
+    def _run(t: dict) -> Optional[dict]:
+        try:
+            quote = client.price_parlay([t["dom_out"]["id"], t["imp_out"]["id"]])
+        except NovigError:
+            return None
+        finally:
+            # Per-worker throttle with jitter — keeps the aggregate rate
+            # sane regardless of how many workers complete back-to-back.
+            _time.sleep(throttle_s + _random.uniform(0.0, jitter_s))
+        s = summarize_parlay_quote(quote)
+        combined = s["combined_price"]
+        if combined is None:
+            return None
+        dom_p, imp_p = t["dom_p"], t["imp_p"]
+        naive = dom_p * imp_p
+        name = (t["dom_mkt"].get("description") or "").rsplit(f" {strike} ", 1)[0]
+        return {
+            "player": name,
+            "dominant_type": t["dom_t"], "dominant_side": t["dom_side"],
+            "implied_type": t["imp_t"], "implied_side": t["imp_side"],
+            "dominant_price": dom_p, "implied_price": imp_p,
+            "naive_price": naive, "combined_price": combined,
+            "delta_vs_dominant": combined - dom_p,
+            "delta_vs_naive": combined - naive,
+            "american_dominant": fmt_american(dom_p),
+            "american_implied": fmt_american(imp_p),
+            "american_combined": fmt_american(combined),
+            "mispriced": combined + 1e-6 < dom_p,
+            "dominant_outcome_id": t["dom_out"]["id"],
+            "implied_outcome_id": t["imp_out"]["id"],
+        }
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for fut in as_completed(ex.submit(_run, t) for t in tasks):
+            r = fut.result()
+            if r is not None:
+                results.append(r)
+    results.sort(key=lambda r: r["delta_vs_dominant"])
+    return results
+
+
 if __name__ == "__main__":
     import argparse, sys
 
@@ -443,6 +689,25 @@ if __name__ == "__main__":
     ap.add_argument("--currency", default="CASH", choices=["CASH", "COIN"],
                     help="CASH = real-money orderbook, COIN = sweepstakes play-money. "
                          "Separate ladders, separate liquidity.")
+    ap.add_argument("--parlay", metavar="OUTCOME_ID", action="append",
+                    help="Quote a parlay. Pass --parlay once per leg (outcome UUID). "
+                         "Single-game legs are priced by SWISH with correlation.")
+    ap.add_argument("--boost-id", default=None,
+                    help="Optional boost token id to apply to the parlay quote.")
+    ap.add_argument("--scan-sgp", metavar="EVENT_ID",
+                    help="Scan all deterministic-implication SGP pairs for an event "
+                         "(HR=>RBI, HR=>Runs, HR=>Hits). Flags parlays where SWISH "
+                         "prices below the implication floor (P(parlay) < P(dominant leg)).")
+    ap.add_argument("--mispriced-only", action="store_true",
+                    help="With --scan-sgp, only print mispriced rows.")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="Parallel quote workers for --scan-sgp (default 4). "
+                         "Keep low to stay in human-traffic territory.")
+    ap.add_argument("--throttle", type=float, default=0.25,
+                    help="Per-worker post-request sleep in seconds (default 0.25). "
+                         "Each worker also adds up to --jitter random extra delay.")
+    ap.add_argument("--jitter", type=float, default=0.20,
+                    help="Max additional random per-worker delay (default 0.20).")
     args = ap.parse_args()
 
     client = NovigClient()
@@ -455,6 +720,58 @@ if __name__ == "__main__":
         if away and home:
             return f"{away} @ {home}"
         return ev.get("description") or f"<{ev.get('type','?')}>"
+
+    if args.scan_sgp:
+        import time as _t
+        t0 = _t.time()
+        rows = scan_sgp_implications(
+            client, args.scan_sgp,
+            max_workers=args.workers,
+            throttle_s=args.throttle,
+            jitter_s=args.jitter,
+        )
+        elapsed = _t.time() - t0
+        print(f"\n(scan finished in {elapsed:.1f}s with {args.workers} workers, "
+              f"throttle={args.throttle}+jitter≤{args.jitter}s)")
+        if args.mispriced_only:
+            rows = [r for r in rows if r["mispriced"]]
+        print(f"\nScanned {len(rows)} SGP pairs (sorted by delta_vs_dominant, most negative first)")
+        print(f"{'Player':22s} {'Pair':18s} {'Dom':>8s} {'Imp':>8s} "
+              f"{'Synth':>8s} {'Naive':>9s} {'SWISH':>9s} "
+              f"{'vsDom':>9s} {'vsNaive':>10s}  flag")
+        print("-" * 125)
+        for r in rows:
+            side = "O" if r["dominant_side"].lower().startswith("o") else "U"
+            pair = f"{side}:{r['dominant_type'][:3]}=>{r['implied_type'][:4]}"
+            # Synth = the American odds the bettor effectively gets via the parlay.
+            # Same winning condition as the dominant leg (since dominant => implied),
+            # but priced at the parlay's better implied prob when mispriced.
+            flag = "<<< MISPRICED" if r["mispriced"] else ""
+            print(f"{r['player'][:22]:22s} {pair:18s} "
+                  f"{r['american_dominant']:>8s} {r['american_implied']:>8s} "
+                  f"{r['american_combined']:>8s} "
+                  f"{r['naive_price']:>9.4f} {r['combined_price']:>9.4f} "
+                  f"{r['delta_vs_dominant']:>+9.4f} {r['delta_vs_naive']:>+10.4f}  {flag}")
+        sys.exit(0)
+
+    if args.parlay:
+        quote = client.price_parlay(args.parlay, boost_id=args.boost_id)
+        s = summarize_parlay_quote(quote)
+        print(f"\nParlay {s['parlay_id']}  status={s['status']}")
+        print(f"  Combined: {s['combined_american']} ({s['combined_price']:.5f})")
+        if s["naive_price"]:
+            edge = s["correlation_edge"]
+            sign = "+" if edge >= 0 else ""
+            print(f"  Naive product (independent legs): {s['naive_price']:.5f}  "
+                  f"correlation edge: {sign}{edge:.5f}")
+        if s["unboosted_price"] is not None:
+            print(f"  Unboosted: {s['unboosted_price']:.5f}")
+        print(f"  Legs ({len(s['legs'])}):")
+        for leg in s["legs"]:
+            mkt = leg["market_description"] or ""
+            print(f"    {leg['american']:>6s} ({leg['price']:.4f})  "
+                  f"{leg['description']:30s}  [{mkt}]  vendor={leg['vendor']}")
+        sys.exit(0)
 
     if args.book:
         books = client.get_market_books(args.book, currency=args.currency)
