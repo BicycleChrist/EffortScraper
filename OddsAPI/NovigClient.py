@@ -17,6 +17,11 @@ markets) will be added on top.
 """
 
 import json
+import pathlib
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any, Optional
 
 import requests
@@ -29,6 +34,11 @@ except ImportError:
 
 NOVIG_GRAPHQL_URL = "https://api.novig.us/v1/graphql"
 NOVIG_NBX_BASE = "https://api.novig.us/nbx/v1"
+
+# Where scrape_all_mlb() writes dumps. Mirrors the layout of
+# prophetx_dumps/ so the widget's stale-fallback machinery can consume
+# Novig data uniformly.
+NOVIG_DUMP_DIR = pathlib.Path(__file__).parent / "novig_dumps"
 
 # qty values on NBX orderbook entries are in cents/centi-units. Display = qty/100.
 # Verified against site UI:
@@ -126,6 +136,16 @@ class NovigClient:
 
         Currency (CASH vs COIN) is inferred from the bearer token's active
         wallet, not from the request body.
+
+        TODO (future session): automated placement. The /parlay/request POST
+        only quotes — actual wager submission is a separate endpoint (likely
+        PATCH /nbx/v1/parlay/request/{id} with {wager, walletId} or a sibling
+        /parlay/place route). Capture that request from the site's Network
+        tab once, then add a `place_parlay(quote_id, stake)` method that
+        reuses the quote returned here. Tie it to the scanner so mispriced
+        rows above a delta threshold can auto-fire, but keep a hard stake
+        cap and a per-day spend ceiling — auto-placement is exactly the
+        behavior that gets accounts flagged fastest.
         """
         url = f"{NOVIG_NBX_BASE}/parlay/request"
         headers = {
@@ -518,6 +538,232 @@ class NovigQueries:
     def get_mlb_live(self, limit: int = 50) -> list[dict]:
         return self.list_events(league="MLB", status_in=("OPEN_INGAME",), limit=limit)
 
+    # ---------------------------------------------------------------------
+    # Dump scraper
+    # ---------------------------------------------------------------------
+    # Produces a JSON dump in a shape parallel to ProphetX's
+    # all_markets_combined_*.json, so the LiquidityWidget's existing load
+    # / stale-fallback / async-refresh machinery can consume Novig data
+    # with the same code path. See _event_to_dump_entry below for the
+    # per-event layout.
+
+    def scrape_all_mlb(self, *,
+                       with_books: bool = False,
+                       currency: str = "CASH",
+                       max_workers: int = 4,
+                       throttle_s: float = 0.25,
+                       jitter_s: float = 0.20,
+                       only_available: bool = False,
+                       save: bool = True,
+                       dump_dir: Optional[pathlib.Path] = None,
+                       progress: bool = True) -> dict:
+        """Scrape all current MLB pregame + live events into a single
+        combined dump.
+
+        Args:
+            with_books: also fetch full NBX /book/batch ladders per
+                event. Adds one batch RTT per ~20 markets, so a full
+                slate with books can take a few minutes. Default off
+                because callers can lazy-fetch.
+            currency: "CASH" or "COIN" — only relevant when with_books.
+            only_available: passed to get_event_markets. False = all
+                markets even empty ones; True = website's
+                consensus-OR-has-liquidity filter.
+            save: if True, writes <dump_dir>/all_events_combined_<ts>.json.
+            dump_dir: override write location (default NOVIG_DUMP_DIR).
+        """
+        return self.scrape_all_leagues(
+            leagues=("MLB",),
+            with_books=with_books, currency=currency,
+            max_workers=max_workers, throttle_s=throttle_s, jitter_s=jitter_s,
+            only_available=only_available, save=save, dump_dir=dump_dir,
+            progress=progress,
+        )
+
+    def scrape_all_leagues(self, *,
+                           leagues: tuple[str, ...] = (
+                               "MLB", "NBA", "NHL", "NFL",
+                               "NCAAF", "NCAAB", "WNBA", "EPL"),
+                           with_books: bool = False,
+                           currency: str = "CASH",
+                           max_workers: int = 4,
+                           throttle_s: float = 0.25,
+                           jitter_s: float = 0.20,
+                           only_available: bool = False,
+                           save: bool = True,
+                           dump_dir: Optional[pathlib.Path] = None,
+                           progress: bool = True) -> dict:
+        """Same as scrape_all_mlb but iterates a list of leagues. Output
+        dump shape is identical (event_metadata.tournament carries the
+        league code), so LiquidityWidget consumes it unchanged."""
+        dump_dir = dump_dir or NOVIG_DUMP_DIR
+
+        events: list[dict] = []
+        for lg in leagues:
+            if progress:
+                print(f"[novig.scrape] listing {lg} events...")
+            try:
+                events += self.list_events(
+                    league=lg, status_in=("OPEN_PREGAME",), limit=200)
+                events += self.list_events(
+                    league=lg, status_in=("OPEN_INGAME",), limit=100)
+            except NovigError as e:
+                if progress:
+                    print(f"  {lg} listing failed: {e}")
+        seen_ids: set[str] = set()
+        unique_events: list[dict] = []
+        for ev in events:
+            eid = ev.get("id")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                unique_events.append(ev)
+
+        if progress:
+            print(f"[novig.scrape] {len(unique_events)} events "
+                  f"(workers={max_workers}, "
+                  f"throttle={throttle_s}+jitter≤{jitter_s}s)")
+
+        dump: dict[str, dict] = {}
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(self._fetch_one_event_for_dump, ev["id"],
+                              only_available, throttle_s, jitter_s): ev["id"]
+                    for ev in unique_events}
+            for i, fut in enumerate(as_completed(futs), 1):
+                eid, entry = fut.result()
+                if entry is None:
+                    if progress:
+                        print(f"  [{i}/{len(unique_events)}] {eid} (empty)")
+                    continue
+                dump[eid] = entry
+                if progress:
+                    n_mkts = len((entry.get("data") or {}).get("markets") or [])
+                    print(f"  [{i}/{len(unique_events)}] "
+                          f"{entry['event_metadata']['name']:30s} "
+                          f"({n_mkts} markets)")
+
+        if with_books:
+            if progress:
+                print(f"[novig.scrape] fetching books (currency={currency})...")
+            for j, (eid, entry) in enumerate(dump.items(), 1):
+                entry["books"] = self._fetch_books_for_event(
+                    entry, currency=currency,
+                    throttle_s=throttle_s, jitter_s=jitter_s)
+                if progress:
+                    print(f"  [{j}/{len(dump)}] "
+                          f"{entry['event_metadata']['name']:30s} "
+                          f"({len(entry['books'])} markets booked)")
+
+        elapsed = time.time() - t0
+        if progress:
+            print(f"[novig.scrape] done in {elapsed:.1f}s — "
+                  f"{len(dump)} events captured")
+
+        if save and dump:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out = dump_dir / f"all_events_combined_{ts}.json"
+            out.write_text(json.dumps(dump, indent=2, default=str))
+            if progress:
+                size_mb = out.stat().st_size / (1024 * 1024)
+                print(f"[novig.scrape] wrote {out}  ({size_mb:.2f} MB)")
+        return dump
+
+    def _fetch_one_event_for_dump(self, event_id: str,
+                                  only_available: bool,
+                                  throttle_s: float, jitter_s: float
+                                  ) -> tuple[str, Optional[dict]]:
+        """Worker for scrape_all_mlb. Returns (event_id, dump_entry|None).
+        Always sleeps post-request to throttle the aggregate rate."""
+        try:
+            ev = self.get_event_markets(event_id, only_available=only_available)
+        except NovigError:
+            ev = None
+        finally:
+            time.sleep(throttle_s + random.uniform(0.0, jitter_s))
+        if not ev:
+            return event_id, None
+        return event_id, _event_to_dump_entry(ev)
+
+    def _fetch_books_for_event(self, entry: dict, *,
+                               currency: str,
+                               batch_size: int = 20,
+                               throttle_s: float = 0.25,
+                               jitter_s: float = 0.20) -> dict:
+        """Optional second pass — fetch /book/batch for an event's
+        markets and return {market_id: book_entry}. Skips markets that
+        are clearly empty (non-consensus, no `available` price)."""
+        markets = (entry.get("data") or {}).get("markets") or []
+        candidate_ids: list[str] = []
+        for m in markets:
+            if m.get("status") != "OPEN":
+                continue
+            if m.get("is_consensus"):
+                candidate_ids.append(m["id"])
+                continue
+            outcomes = m.get("outcomes") or []
+            if any(o.get("available") is not None for o in outcomes):
+                candidate_ids.append(m["id"])
+
+        books_out: dict[str, dict] = {}
+        for i in range(0, len(candidate_ids), batch_size):
+            batch = candidate_ids[i:i + batch_size]
+            try:
+                resp = self.client.get_market_books(batch, currency=currency)
+            except NovigError:
+                resp = []
+            for b in resp:
+                mid = (b.get("market") or {}).get("id")
+                if mid:
+                    books_out[mid] = b
+            time.sleep(throttle_s + random.uniform(0.0, jitter_s))
+        return books_out
+
+    @staticmethod
+    def load_latest_dump(dump_dir: Optional[pathlib.Path] = None
+                         ) -> Optional[dict]:
+        """Load the most recent novig dump file. Returns None if none."""
+        dump_dir = dump_dir or NOVIG_DUMP_DIR
+        if not dump_dir.exists():
+            return None
+        files = sorted(dump_dir.glob("all_events_combined_*.json"),
+                       key=lambda p: p.stat().st_mtime)
+        if not files:
+            return None
+        return json.loads(files[-1].read_text())
+
+
+def _event_to_dump_entry(event_node: dict) -> dict:
+    """Build the per-event dump entry. Mirrors ProphetX's
+    {event_metadata, data:{markets}} shape so the widget's loader can
+    consume both sources via one code path."""
+    game = event_node.get("game") or {}
+    home = game.get("homeTeam") or {}
+    away = game.get("awayTeam") or {}
+    meta = {
+        "id": event_node.get("id") or "",
+        "name": event_node.get("description") or "",
+        "startTime": event_node.get("scheduled_start") or "",
+        "status": event_node.get("status") or "",
+        "tournament": event_node.get("league") or game.get("league") or "",
+        "sport": game.get("sport") or "Baseball",
+        # Novig has no per-event total volume on the GraphQL surface;
+        # 0 keeps stake-sort downstream sane.
+        "stake": 0.0,
+        "home_team_symbol": home.get("symbol"),
+        "home_team_name": home.get("name"),
+        "away_team_symbol": away.get("symbol"),
+        "away_team_name": away.get("name"),
+        "game_status": game.get("status"),
+        "game_period": game.get("period"),
+        "home_score": game.get("home_score"),
+        "away_score": game.get("away_score"),
+    }
+    return {
+        "event_metadata": meta,
+        "data": {"markets": NovigQueries.flatten_markets(event_node)},
+    }
+
 
 # ---------------------------------------------------------------------------
 # SGP correlation-floor scanner
@@ -708,6 +954,14 @@ if __name__ == "__main__":
                          "Each worker also adds up to --jitter random extra delay.")
     ap.add_argument("--jitter", type=float, default=0.20,
                     help="Max additional random per-worker delay (default 0.20).")
+    ap.add_argument("--scrape-dump", action="store_true",
+                    help="Scrape all MLB pregame + live events into "
+                         "novig_dumps/all_events_combined_<ts>.json. Mirrors "
+                         "ProphetX's combined-dump shape so the widget can "
+                         "load both sources via one code path.")
+    ap.add_argument("--with-books", action="store_true",
+                    help="With --scrape-dump, also fetch /book/batch ladders "
+                         "per event (slower; widget can lazy-fetch otherwise).")
     args = ap.parse_args()
 
     client = NovigClient()
@@ -720,6 +974,17 @@ if __name__ == "__main__":
         if away and home:
             return f"{away} @ {home}"
         return ev.get("description") or f"<{ev.get('type','?')}>"
+
+    if args.scrape_dump:
+        q.scrape_all_mlb(
+            with_books=args.with_books,
+            currency=args.currency,
+            max_workers=args.workers,
+            throttle_s=args.throttle,
+            jitter_s=args.jitter,
+            only_available=args.only_available,
+        )
+        sys.exit(0)
 
     if args.scan_sgp:
         import time as _t
