@@ -7,9 +7,9 @@ GraphQL queries needed for the LiquidityWidget dump pipeline. Re-uses the
 GraphQL field fragments and dump-entry shaper from NovigClient.py so the
 two paths stay schema-aligned.
 
-The sync NovigClient remains the source of truth for orderbook (`/book/batch`)
-and parlay quoting. This file only covers the listing + per-event-markets
-queries that dominate the cold-start scrape.
+The sync NovigClient remains the source of truth for the orderbook
+(`/book/batch`). This file covers the async listing + per-event-markets
+queries plus the async parlay pricer and SGP implication scanner.
 """
 
 import asyncio
@@ -17,18 +17,24 @@ import json
 import pathlib
 import random
 from datetime import datetime
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import aiohttp
 
 from NovigClient import (
     NOVIG_GRAPHQL_URL,
+    NOVIG_NBX_BASE,
     NOVIG_DUMP_DIR,
     NovigError,
+    NovigQueries,
+    SGP_IMPLICATION_PAIRS,
     _EVENT_FIELDS,
     _GAME_FIELDS,
     _MARKET_FIELDS,
     _event_to_dump_entry,
+    _find_outcome,
+    fmt_american,
+    summarize_parlay_quote,
 )
 
 try:
@@ -279,10 +285,221 @@ def _save_dump_sync(dump: dict, dump_dir: pathlib.Path,
         print(f"[novig.async] wrote {out}  ({size_mb:.2f} MB)")
 
 
+# ============================================================================
+# ASYNC NBX PARLAY PRICER + SGP IMPLICATION SCANNER
+# ============================================================================
+# Async ports of NovigClient.price_parlay and scan_sgp_implications. The sync
+# versions block on `requests` / a ThreadPoolExecutor; these run as coroutines
+# on the caller's event loop, so the scanner can sit alongside the rest of the
+# widget's qasync work without a dedicated QThread. Every pure helper (task
+# building, _find_outcome, summarize_parlay_quote, the result-row dict) is
+# reused verbatim from NovigClient — only the I/O is swapped for aiohttp, so
+# the two paths stay behaviourally identical.
+
+
+async def price_parlay_async(session: aiohttp.ClientSession,
+                             outcome_ids: list[str],
+                             boost_id: Optional[str] = None) -> dict:
+    """Async port of NovigClient.price_parlay.
+
+    Quote an SGP / parlay via the NBX parlay pricer. Read-only — returns the
+    quote object the site would offer; does NOT place a wager. Raises
+    NovigError on transport failure or a non-2xx response.
+    """
+    url = f"{NOVIG_NBX_BASE}/parlay/request"
+    payload = {
+        "outcomes": [{"id": oid} for oid in outcome_ids],
+        "boostId": boost_id,
+    }
+    try:
+        async with session.post(url, json=payload, headers=_headers(),
+                                timeout=REQUEST_TIMEOUT) as r:
+            # Server returns 201 Created with the quote wrapped in a list.
+            if r.status not in (200, 201):
+                text = await r.text()
+                raise NovigError(f"NBX HTTP {r.status}: {text[:500]}")
+            body = await r.json()
+    except aiohttp.ClientError as e:
+        raise NovigError(f"transport: {e}")
+    if isinstance(body, list):
+        if not body:
+            raise NovigError("Empty parlay quote response")
+        return body[0]
+    return body
+
+
+async def scan_sgp_implications_async(
+        session: aiohttp.ClientSession,
+        event_id: str,
+        *,
+        pairs: Optional[list] = None,
+        strike: float = 0.5,
+        concurrency: int = 4,
+        throttle_s: float = 0.25,
+        jitter_s: float = 0.20,
+        progress_cb: Optional[Callable[[int, int], None]] = None
+        ) -> list[dict]:
+    """Async port of NovigClient.scan_sgp_implications, for ONE event.
+
+    Quotes every (dominant, implied) SGP pair per player and flags rows where
+    the SWISH pricer prices the parlay below the deterministic implication
+    floor — i.e. combined < P(dominant leg), which means the parlay strictly
+    dominates the standalone dominant wager.
+
+    Concurrency is an asyncio.Semaphore: at most `concurrency` quotes are
+    in flight, and each holds its slot through a `throttle_s + uniform(0,
+    jitter_s)` cooldown, so the aggregate request rate stays in
+    human-browsing territory (the same throttle the sync scanner applies).
+
+    progress_cb, when supplied, is called progress_cb(done, total): once with
+    (0, total) before the first quote, then after each quote completes. It
+    runs on the caller's event loop, so a Qt slot/signal is safe to use.
+
+    Returns the result rows sorted by delta_vs_dominant (most negative — most
+    mispriced — first), identical in shape to the sync scanner's output.
+    """
+    if pairs is None:
+        pairs = SGP_IMPLICATION_PAIRS
+
+    ev = await get_event_markets_async(session, event_id,
+                                       only_available=False)
+    if not ev:
+        if progress_cb:
+            progress_cb(0, 0)
+        return []
+    mkts = NovigQueries.flatten_markets(ev)
+
+    # Index player-prop markets by playerId -> {market_type: market}, at the
+    # target strike only (deterministic implications are all on the 0.5 line).
+    by_player_type: dict = {}
+    for m in mkts:
+        pid = m.get("playerId")
+        if not pid or m.get("strike") != strike:
+            continue
+        by_player_type.setdefault(pid, {})[m.get("type")] = m
+
+    # Build the quote task list up front.
+    tasks: list[dict] = []
+    for _pid, type_map in by_player_type.items():
+        for dom_t, dom_side, imp_t, imp_side in pairs:
+            dom_mkt = type_map.get(dom_t)
+            imp_mkt = type_map.get(imp_t)
+            if not dom_mkt or not imp_mkt:
+                continue
+            dom_out = _find_outcome(dom_mkt, dom_side, strike)
+            imp_out = _find_outcome(imp_mkt, imp_side, strike)
+            if not dom_out or not imp_out:
+                continue
+            dom_p = dom_out.get("last") or dom_out.get("available")
+            imp_p = imp_out.get("last") or imp_out.get("available")
+            if dom_p is None or imp_p is None:
+                continue
+            try:
+                dom_p = float(dom_p)
+                imp_p = float(imp_p)
+            except (TypeError, ValueError):
+                continue
+            tasks.append({
+                "dom_t": dom_t, "dom_side": dom_side,
+                "imp_t": imp_t, "imp_side": imp_side,
+                "dom_mkt": dom_mkt, "dom_out": dom_out, "dom_p": dom_p,
+                "imp_out": imp_out, "imp_p": imp_p,
+            })
+
+    if progress_cb:
+        progress_cb(0, len(tasks))
+    if not tasks:
+        return []
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _run(t: dict) -> Optional[dict]:
+        async with sem:
+            try:
+                quote = await price_parlay_async(
+                    session, [t["dom_out"]["id"], t["imp_out"]["id"]])
+            except NovigError:
+                return None
+            finally:
+                # Hold the semaphore slot through the cooldown so the
+                # aggregate request rate stays bounded regardless of how
+                # many quotes complete back-to-back.
+                await asyncio.sleep(
+                    throttle_s + random.uniform(0.0, jitter_s))
+        s = summarize_parlay_quote(quote)
+        combined = s["combined_price"]
+        if combined is None:
+            return None
+        dom_p, imp_p = t["dom_p"], t["imp_p"]
+        naive = dom_p * imp_p
+        name = (t["dom_mkt"].get("description") or "").rsplit(
+            f" {strike} ", 1)[0]
+        return {
+            "player": name,
+            "dominant_type": t["dom_t"], "dominant_side": t["dom_side"],
+            "implied_type": t["imp_t"], "implied_side": t["imp_side"],
+            "dominant_price": dom_p, "implied_price": imp_p,
+            "naive_price": naive, "combined_price": combined,
+            "delta_vs_dominant": combined - dom_p,
+            "delta_vs_naive": combined - naive,
+            "american_dominant": fmt_american(dom_p),
+            "american_implied": fmt_american(imp_p),
+            "american_combined": fmt_american(combined),
+            "mispriced": combined + 1e-6 < dom_p,
+            "dominant_outcome_id": t["dom_out"]["id"],
+            "implied_outcome_id": t["imp_out"]["id"],
+        }
+
+    results: list[dict] = []
+    done = 0
+    total = len(tasks)
+    for fut in asyncio.as_completed([_run(t) for t in tasks]):
+        r = await fut
+        done += 1
+        if progress_cb:
+            progress_cb(done, total)
+        if r is not None:
+            results.append(r)
+    results.sort(key=lambda row: row["delta_vs_dominant"])
+    return results
+
+
 if __name__ == "__main__":
-    # CLI smoke test: scrape one league and print event count.
+    # CLI smoke test. Two modes:
+    #   python novig_async.py                       -> scrape MLB events
+    #   python novig_async.py NBA NHL                -> scrape those leagues
+    #   python novig_async.py scan <event_id>        -> async SGP scan
     import sys
-    leagues = tuple(sys.argv[1:]) if len(sys.argv) > 1 else ("MLB",)
+    args = sys.argv[1:]
+
+    if args and args[0] == "scan":
+        if len(args) < 2:
+            print("usage: python novig_async.py scan <event_id>")
+            sys.exit(1)
+        scan_event_id = args[1]
+
+        async def _scan_smoke() -> list[dict]:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as s:
+                def _prog(done: int, total: int) -> None:
+                    print(f"\r  quoting {done}/{total}", end="", flush=True)
+                rows = await scan_sgp_implications_async(
+                    s, scan_event_id, progress_cb=_prog)
+                print()
+                return rows
+
+        scan_rows = asyncio.run(_scan_smoke())
+        print(f"\n{len(scan_rows)} SGP pairs scanned "
+              f"(sorted by delta_vs_dominant, most negative first)")
+        for row in scan_rows:
+            flag = "  <<< MISPRICED" if row["mispriced"] else ""
+            print(f"  {row['player'][:22]:22s} "
+                  f"{row['dominant_type'][:3]:3s}=>{row['implied_type'][:4]:4s} "
+                  f"dom {row['american_dominant']:>6s} "
+                  f"swish {row['american_combined']:>6s} "
+                  f"vsDom {row['delta_vs_dominant']:>+8.4f}{flag}")
+        sys.exit(0)
+
+    leagues = tuple(args) if args else ("MLB",)
     dump = asyncio.run(FetchAllLeaguesAsync(
         leagues=leagues, save=False, progress=True))
     print(f"DONE: {len(dump)} events scraped")

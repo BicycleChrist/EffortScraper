@@ -781,7 +781,16 @@ class SGPScanner:
         return rows
 
     async def scan_event(self, session, event_id, event_name) -> List[Dict]:
-        markets_data, _ = GetEventMarkets(event_id)
+        # Event-markets fetch goes through the async path so the scan never
+        # blocks the event loop — required when the scanner runs as a task
+        # on the widget's qasync loop instead of in a dedicated thread.
+        # FetchSingleEventAsync manages its own bearer-auth session; the
+        # `session` arg here is the cookie-auth session used only for the
+        # SGP quote requests (different host, different auth scheme).
+        # Imported locally so ProphetXQuery's CLI path doesn't pull in
+        # prophetx_async's PyQt/qasync dependency at module load.
+        from prophetx_async import FetchSingleEventAsync
+        markets_data = await FetchSingleEventAsync(event_id)
         if not markets_data or not markets_data.get("data"):
             print(f"  [skip] {event_name}: no markets")
             return []

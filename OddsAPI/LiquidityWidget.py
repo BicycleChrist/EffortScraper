@@ -8,10 +8,11 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QSplitter, QFrame, QComboBox, QHeaderView, QGraphicsOpacityEffect,
-    QStackedWidget
+    QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QLinearGradient, QRadialGradient, QPainterPath
+import asyncio
 import json
 import math
 import re
@@ -310,11 +311,408 @@ class OrderBookLoadingOverlay(QWidget):
             painter.drawEllipse(QPointF(px, py), 8, 8)
 
 
+class SGPScannerPanel(QWidget):
+    """SGP +EV scanner — shown in place of the order book table when the
+    header's EV-scan toggle is active.
+
+    Per-event scope: the user ticks MLB events, hits Run, and both exchange
+    scanners run per event as asyncio tasks on the host qasync loop —
+    ProphetX (`ProphetXQuery.SGPScanner`) and Novig
+    (`novig_async.scan_sgp_implications_async`), concurrently within each
+    event. Only +EV rows surface: parlays whose SGP price beats the
+    standalone implication-floor leg.
+
+    The panel owns no threads — every scan is a coroutine. ProphetXBrowser
+    repopulates it via set_events() each time the toggle opens it.
+    """
+
+    # Novig prop-type token -> short label for the parlay-legs column.
+    _TYPE_ABBR = {
+        "HOME_RUNS": "HR", "RBIS": "RBI", "RUNS": "Run", "HITS": "Hit",
+    }
+
+    def __init__(self, parent=None, compact_mode=False):
+        super().__init__(parent)
+        self.compact_mode = compact_mode
+        self._novig_map: Dict[str, object] = {}
+        self._scanning = False
+        self._cascading = False   # re-entrancy guard for tree check cascade
+        self.initUI()
+
+    def initUI(self):
+        outer = QVBoxLayout(self)
+        pad = 4 if self.compact_mode else 8
+        outer.setContentsMargins(pad, pad, pad, pad)
+        outer.setSpacing(pad)
+        fs = 9 if self.compact_mode else 12
+
+        # --- Event selection tree (league -> events, checkable) ---
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setMaximumHeight(140 if self.compact_mode else 220)
+        self.tree.itemChanged.connect(self._onItemChanged)
+        self.tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background-color: #0d0f14;
+                border: 1px solid #2a2d34;
+                border-radius: 4px;
+                color: #e8e9ed;
+                font-size: {fs}px;
+                outline: none;
+            }}
+            QTreeWidget::item {{ padding: 3px; }}
+            QTreeWidget::item:hover {{ background-color: #1a1d24; }}
+        """)
+        outer.addWidget(self.tree)
+
+        # --- Controls row: Run button + status text ---
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self.run_btn = QPushButton("Run EV Scan")
+        self.run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.run_btn.clicked.connect(self._onRunClicked)
+        self.run_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1f6f5e; color: #e8fff8;
+                border: 1px solid #5eead4; border-radius: 4px;
+                padding: {3 if self.compact_mode else 6}px
+                         {10 if self.compact_mode else 16}px;
+                font-size: {fs}px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: #2a8c76; }}
+            QPushButton:disabled {{
+                background-color: #1a1d24; color: #555b66;
+                border: 1px solid #2a2d34;
+            }}
+        """)
+        controls.addWidget(self.run_btn)
+        controls.addStretch()
+        self.status_label = QLabel("Select events to scan")
+        self.status_label.setStyleSheet(f"color: #8a92a3; font-size: {fs}px;")
+        controls.addWidget(self.status_label)
+        outer.addLayout(controls)
+
+        # --- Progress bar (per-event) ---
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6 if self.compact_mode else 10)
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                background-color: #1a1d24; border: none; border-radius: 3px;
+            }
+            QProgressBar::chunk {
+                background-color: #5eead4; border-radius: 3px;
+            }
+        """)
+        outer.addWidget(self.progress)
+
+        # --- Results table ---
+        self.results = QTableWidget()
+        self.results.setColumnCount(6)
+        self.results.setHorizontalHeaderLabels(
+            ["SRC", "PLAYER", "PARLAY LEGS", "SINGLE", "SGP", "EDGE"])
+        self.results.verticalHeader().setVisible(False)
+        self.results.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.results.setShowGrid(False)
+        self.results.setAlternatingRowColors(False)
+        hdr = self.results.horizontalHeader()
+        for col, mode in (
+            (0, QHeaderView.ResizeMode.ResizeToContents),
+            (1, QHeaderView.ResizeMode.ResizeToContents),
+            (2, QHeaderView.ResizeMode.Stretch),
+            (3, QHeaderView.ResizeMode.ResizeToContents),
+            (4, QHeaderView.ResizeMode.ResizeToContents),
+            (5, QHeaderView.ResizeMode.ResizeToContents),
+        ):
+            hdr.setSectionResizeMode(col, mode)
+        self.results.verticalHeader().setDefaultSectionSize(
+            22 if self.compact_mode else 30)
+        tfs = 9 if self.compact_mode else 12
+        self.results.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: #0d0f14; border: 1px solid #2a2d34;
+                border-radius: 4px; color: #e8e9ed;
+                gridline-color: transparent; font-size: {tfs}px;
+            }}
+            QTableWidget::item {{ padding: 2px 6px; }}
+            QHeaderView::section {{
+                background-color: #1a1d24; color: #9ca3af;
+                padding: 4px; border: none; font-size: {max(tfs - 1, 8)}px;
+                font-weight: 600; letter-spacing: 0.5px;
+            }}
+        """)
+        outer.addWidget(self.results, 1)
+
+    # ------------------------------------------------------------------
+    # Population — called by ProphetXBrowser when the toggle opens.
+    # ------------------------------------------------------------------
+    def set_events(self, mlb_events: list, novig_map: dict) -> None:
+        """Rebuild the event tree.
+
+        `mlb_events` is a list of (event_id, event_dump_dict).
+        `novig_map` is ProphetXBrowser._novig_event_map
+        ({str(px_event_id): EventPair}), used to resolve each event's Novig
+        UUID so the Novig scan can run for it.
+        """
+        self._novig_map = novig_map or {}
+        self._cascading = True
+        self.tree.clear()
+
+        league_item = QTreeWidgetItem(self.tree, ["MLB"])
+        league_item.setFlags(league_item.flags()
+                             | Qt.ItemFlag.ItemIsUserCheckable)
+        league_item.setCheckState(0, Qt.CheckState.Unchecked)
+
+        def _start(pair):
+            return ((pair[1].get("event_metadata") or {}).get("startTime")
+                    or "")
+
+        for eid, ev in sorted(mlb_events, key=_start):
+            meta = ev.get("event_metadata") or {}
+            name = meta.get("name") or str(eid)
+            child = QTreeWidgetItem(league_item, [name])
+            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            child.setCheckState(0, Qt.CheckState.Unchecked)
+            pair = self._novig_map.get(str(eid))
+            nv_uuid = pair.event_b.source_event_id if pair else None
+            child.setData(0, Qt.ItemDataRole.UserRole, {
+                "px_id": eid, "name": name, "nv_uuid": nv_uuid,
+            })
+            if not nv_uuid:
+                child.setForeground(0, QColor(138, 146, 163))
+                child.setToolTip(0, "No Novig match — ProphetX scan only")
+
+        league_item.setExpanded(True)
+        self._cascading = False
+        n = league_item.childCount()
+        self.status_label.setText(
+            f"{n} MLB event(s) available" if n else "No MLB events loaded")
+
+    # ------------------------------------------------------------------
+    # Tree check cascade
+    # ------------------------------------------------------------------
+    def _onItemChanged(self, item: QTreeWidgetItem, col: int) -> None:
+        if self._cascading:
+            return
+        self._cascading = True
+        try:
+            if item.parent() is None:
+                # League row toggled -> apply to every event under it.
+                st = item.checkState(0)
+                if st != Qt.CheckState.PartiallyChecked:
+                    for i in range(item.childCount()):
+                        item.child(i).setCheckState(0, st)
+            else:
+                # Event toggled -> reflect the aggregate on the league row.
+                league = item.parent()
+                states = [league.child(i).checkState(0)
+                          for i in range(league.childCount())]
+                if states and all(s == Qt.CheckState.Checked
+                                  for s in states):
+                    league.setCheckState(0, Qt.CheckState.Checked)
+                elif all(s == Qt.CheckState.Unchecked for s in states):
+                    league.setCheckState(0, Qt.CheckState.Unchecked)
+                else:
+                    league.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        finally:
+            self._cascading = False
+
+    def _selectedEvents(self) -> list:
+        out = []
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            league = root.child(i)
+            for j in range(league.childCount()):
+                child = league.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    data = child.data(0, Qt.ItemDataRole.UserRole)
+                    if data:
+                        out.append(data)
+        return out
+
+    # ------------------------------------------------------------------
+    # Scan orchestration (async, on the host qasync loop — no threads)
+    # ------------------------------------------------------------------
+    def _onRunClicked(self) -> None:
+        if self._scanning:
+            return
+        try:
+            asyncio.ensure_future(self._runScan())
+        except RuntimeError as e:
+            self.status_label.setText(f"Cannot start scan: {e}")
+
+    async def _runScan(self) -> None:
+        selected = self._selectedEvents()
+        if not selected:
+            self.status_label.setText("No events selected")
+            return
+        self._scanning = True
+        self.run_btn.setEnabled(False)
+        self.tree.setEnabled(False)
+        self.results.setRowCount(0)
+        self.progress.setVisible(True)
+        # Scale by 1000 so the bar advances smoothly *within* an event —
+        # driven by the per-quote Novig progress callback — rather than
+        # jumping once per finished event.
+        self._progress_scale = 1000
+        self.progress.setMaximum(len(selected) * self._progress_scale)
+        self.progress.setValue(0)
+        found = 0
+        try:
+            for i, ev in enumerate(selected):
+                self.status_label.setText(
+                    f"Scanning {ev['name']}  ({i + 1}/{len(selected)})")
+                rows = await self._scanEvent(ev, i + 1, len(selected))
+                for src, row in rows:
+                    self._addRow(src, row)
+                found += len(rows)
+                self.progress.setValue((i + 1) * self._progress_scale)
+            self.status_label.setText(
+                f"Done — {found} +EV play(s) across "
+                f"{len(selected)} event(s)")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.status_label.setText(f"Scan error: {e}")
+        finally:
+            self._scanning = False
+            self.run_btn.setEnabled(True)
+            self.tree.setEnabled(True)
+
+    async def _scanEvent(self, ev: dict, idx: int, total: int) -> list:
+        """Run the PX and NV scanners for one event concurrently. Returns
+        a list of (source, row) tuples. A failure on one exchange is
+        logged and does not abort the other."""
+        px_rows, nv_rows = await asyncio.gather(
+            self._scanPX(ev),
+            self._scanNV(ev, idx, total),
+            return_exceptions=True,
+        )
+        out = []
+        if isinstance(px_rows, Exception):
+            print(f"[sgp-panel] PX scan failed for {ev['name']}: "
+                  f"{px_rows!r}")
+        else:
+            out += [("PX", r) for r in px_rows]
+        if isinstance(nv_rows, Exception):
+            print(f"[sgp-panel] NV scan failed for {ev['name']}: "
+                  f"{nv_rows!r}")
+        else:
+            out += [("NV", r) for r in nv_rows]
+        return out
+
+    async def _scanPX(self, ev: dict) -> list:
+        from ProphetXQuery import SGPScanner
+        try:
+            scanner = SGPScanner(concurrency=4)
+        except FileNotFoundError:
+            raise RuntimeError("ProphetX session file missing")
+        rows = await scanner.scan(event_ids=[ev["px_id"]])
+        return [r for r in rows if (r.get("edge_decimal") or 0) > 0]
+
+    async def _scanNV(self, ev: dict, idx: int, total: int) -> list:
+        nv_uuid = ev.get("nv_uuid")
+        if not nv_uuid:
+            return []   # no Novig match for this event — PX-only
+        import aiohttp
+        from novig_async import (scan_sgp_implications_async,
+                                 REQUEST_TIMEOUT)
+
+        def _prog(done: int, tot: int) -> None:
+            if tot:
+                self.status_label.setText(
+                    f"Scanning {ev['name']}  ({idx}/{total}) "
+                    f"— NV {done}/{tot}")
+                # Advance the bar fractionally through this event so it
+                # tracks quote combinations checked, not whole events.
+                # idx is 1-based, so (idx-1) events are already complete.
+                scale = getattr(self, "_progress_scale", 1000)
+                self.progress.setValue(
+                    int((idx - 1 + done / tot) * scale))
+
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+            rows = await scan_sgp_implications_async(
+                session, nv_uuid, concurrency=4, progress_cb=_prog)
+        return [r for r in rows if r.get("mispriced")]
+
+    # ------------------------------------------------------------------
+    # Result rows
+    # ------------------------------------------------------------------
+    def _addRow(self, src: str, row: dict) -> None:
+        r = self.results.rowCount()
+        self.results.insertRow(r)
+        if src == "PX":
+            player = row.get("player", "")
+            legs = row.get("chain", "")
+            single = self._fmtOdds(row.get("hr_odds"))
+            sgp = self._fmtOdds(row.get("sgp_odds"))
+            edge = float(row.get("edge_pct") or 0.0)
+            src_color = QColor(94, 234, 212)     # ProphetX mint
+        else:
+            player = row.get("player", "")
+            legs = self._nvLegs(row)
+            single = row.get("american_dominant", "") or "--"
+            sgp = row.get("american_combined", "") or "--"
+            edge = self._nvEdgePct(row)
+            src_color = QColor(59, 130, 246)     # Novig blue
+
+        values = [src, player, legs, single, sgp, f"{edge:+.1f}%"]
+        for c, val in enumerate(values):
+            item = QTableWidgetItem(str(val))
+            if c in (3, 4, 5):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                      | Qt.AlignmentFlag.AlignVCenter)
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft
+                                      | Qt.AlignmentFlag.AlignVCenter)
+            if c == 0:
+                item.setForeground(src_color)
+            elif c == 5:
+                item.setForeground(QColor(251, 191, 36) if edge > 0
+                                   else QColor(156, 163, 175))
+            self.results.setItem(r, c, item)
+
+    def _nvLegs(self, row: dict) -> str:
+        dom_t = self._TYPE_ABBR.get(row.get("dominant_type", ""),
+                                    row.get("dominant_type", ""))
+        imp_t = self._TYPE_ABBR.get(row.get("implied_type", ""),
+                                    row.get("implied_type", ""))
+        return (f"{dom_t} {row.get('dominant_side', '')} 0.5"
+                f" + {imp_t} {row.get('implied_side', '')} 0.5")
+
+    @staticmethod
+    def _nvEdgePct(row: dict) -> float:
+        """Edge % for a Novig row, mirroring the PX scanner's edge_pct:
+        the parlay wins exactly when the dominant leg wins (dominant =>
+        implied), so edge = how much more decimal the SGP pays. With
+        implied probabilities dp/cp, decimal ratio = dp/cp."""
+        dp = row.get("dominant_price")
+        cp = row.get("combined_price")
+        try:
+            return (float(dp) / float(cp) - 1.0) * 100.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+
+    @staticmethod
+    def _fmtOdds(american) -> str:
+        if american is None:
+            return "--"
+        try:
+            a = int(american)
+        except (TypeError, ValueError):
+            return str(american)
+        return f"+{a}" if a > 0 else str(a)
+
+
 class OrderBookWidget(QWidget):
     """
     Professional order book display widget for ProphetX markets.
     Shows bid/ask ladder with liquidity depth similar to Polymarket.
     """
+
+    # Emitted when the header's EV-scan toggle flips (True = scanner shown).
+    scannerToggled = pyqtSignal(bool)
 
     def __init__(self, parent=None, compact_mode=False):
         super().__init__(parent)
@@ -339,6 +737,10 @@ class OrderBookWidget(QWidget):
 
     def showLoading(self, status_text: str = "Fetching live orderbook..."):
         """Show the loading overlay with animation"""
+        # Don't drop the order book loading overlay over the scanner panel.
+        if (getattr(self, "sgp_panel", None) is not None
+                and self.sgp_panel.isVisible()):
+            return
         self.is_loading = True
         self.loading_overlay.setGeometry(self.rect())
         self.loading_overlay.start(status_text)
@@ -347,6 +749,38 @@ class OrderBookWidget(QWidget):
         """Hide the loading overlay"""
         self.is_loading = False
         self.loading_overlay.stop()
+
+    @staticmethod
+    def _scannerToggleStyle(compact: bool) -> str:
+        """Stylesheet for the header EV-scan toggle button."""
+        fs = 9 if compact else 12
+        pad = "2px 6px" if compact else "5px 12px"
+        return f"""
+            QPushButton {{
+                background-color: #1a1d24; color: #8a92a3;
+                border: 1px solid #2a2d34; border-radius: 4px;
+                padding: {pad}; font-size: {fs}px; font-weight: 600;
+            }}
+            QPushButton:hover {{
+                border: 1px solid #5eead4; color: #c8d0dc;
+            }}
+            QPushButton:checked {{
+                background-color: #1f6f5e; color: #e8fff8;
+                border: 1px solid #5eead4;
+            }}
+        """
+
+    def _on_scanner_toggle(self, checked: bool):
+        """Header EV-scan toggle handler: swap the order book table region
+        for the SGP scanner panel. The header bar itself stays put — only
+        the content below it changes."""
+        if hasattr(self, "orderbook_table"):
+            self.orderbook_table.setVisible(not checked)
+        if hasattr(self, "footer_label"):
+            self.footer_label.setVisible(not checked)
+        if hasattr(self, "sgp_panel"):
+            self.sgp_panel.setVisible(checked)
+        self.scannerToggled.emit(checked)
 
     def initUI(self):
         layout = QVBoxLayout(self)
@@ -474,6 +908,16 @@ class OrderBookWidget(QWidget):
             }}
         """)
 
+        # SGP +EV scanner panel — a sibling of the order book table,
+        # created hidden. The header's EV-scan toggle swaps which one is
+        # visible; the persistent header bar above is untouched in either
+        # mode. Hidden widgets are skipped by the layout, so when the
+        # scanner is off the panel takes no space and the book renders
+        # exactly as before.
+        self.sgp_panel = SGPScannerPanel(compact_mode=self.compact_mode)
+        self.sgp_panel.setVisible(False)
+        layout.addWidget(self.sgp_panel, 1)
+
     def createHeader(self):
         """Create header widget showing current market name"""
         header = QFrame()
@@ -497,6 +941,15 @@ class OrderBookWidget(QWidget):
         self.stake_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.stake_label.setStyleSheet("color: #8a92a3; font-size: 13px;")
         layout.addWidget(self.stake_label)
+
+        # EV-scan toggle — sits at the far right, with the liquidity label
+        # now between it and the market title / source legend.
+        self.scanner_toggle = QPushButton("EV Scan")
+        self.scanner_toggle.setCheckable(True)
+        self.scanner_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scanner_toggle.setStyleSheet(self._scannerToggleStyle(False))
+        self.scanner_toggle.toggled.connect(self._on_scanner_toggle)
+        layout.addWidget(self.scanner_toggle)
 
         return header
 
@@ -529,6 +982,14 @@ class OrderBookWidget(QWidget):
         self.stake_label.setStyleSheet("color: #8a92a3; font-size: 9px; font-weight: bold;")
         self.stake_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.stake_label)
+
+        # EV-scan toggle — far right; liquidity label now sits to its left.
+        self.scanner_toggle = QPushButton("EV Scan")
+        self.scanner_toggle.setCheckable(True)
+        self.scanner_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scanner_toggle.setStyleSheet(self._scannerToggleStyle(True))
+        self.scanner_toggle.toggled.connect(self._on_scanner_toggle)
+        layout.addWidget(self.scanner_toggle)
 
         return header
 
@@ -1549,6 +2010,19 @@ class ProphetXBrowser(QWidget):
         if idx >= 0:
             self.onMarketSelected(idx)
 
+    def _onScannerToggled(self, opened: bool) -> None:
+        """When the order book's EV-scan panel opens, hand it the current
+        MLB events plus the Novig match map so it can run per-event SGP
+        scans on both exchanges. Closing the panel needs no action."""
+        if not opened:
+            return
+        mlb_events = [
+            (eid, ev) for eid, ev in self.all_events.items()
+            if (ev.get("event_metadata") or {}).get("tournament") == "MLB"
+        ]
+        self.orderbook.sgp_panel.set_events(
+            mlb_events, self._novig_event_map)
+
     def _onNovigDumpFailed(self, err: str) -> None:
         # Quiet failure — widget stays PX-only, user can retry by
         # restarting EffortOdds or running the scraper manually.
@@ -1695,6 +2169,7 @@ class ProphetXBrowser(QWidget):
 
         # Order book widget (shows all lines automatically)
         self.orderbook = OrderBookWidget()
+        self.orderbook.scannerToggled.connect(self._onScannerToggled)
         layout.addWidget(self.orderbook, 1)
 
         panel.setStyleSheet("background-color: #0d0f14;")
@@ -1775,6 +2250,7 @@ class ProphetXBrowser(QWidget):
 
         # Order book widget in compact mode
         self.orderbook = OrderBookWidget(compact_mode=True)
+        self.orderbook.scannerToggled.connect(self._onScannerToggled)
         layout.addWidget(self.orderbook, 1)
 
         panel.setStyleSheet("background-color: #0d0f14;")
