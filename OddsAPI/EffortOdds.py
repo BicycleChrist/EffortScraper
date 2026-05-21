@@ -1695,8 +1695,11 @@ class ModernOddsWindow(QMainWindow):
                             market_key = market['key']
 
                             # Add game_id to each outcome for reference (needed for best lines)
+                            # Also attach the game name so the best lines widget can label
+                            # totals rows (whose outcome 'name' is Over/Under, not a team).
                             for outcome in market.get('outcomes', []):
                                 outcome['game_id'] = game_id
+                                outcome['game_name'] = f"{home_team} vs {away_team}"
 
                             # Add to consolidated data
                             bookmakers_map[bm_title]['markets'].append(market)
@@ -2086,13 +2089,16 @@ class ModernOddsWindow(QMainWindow):
             # Import the async scraping function
             from prophetx_async import FetchAllEventsAsync
 
-            # Fetch all events fresh
-            all_markets = await FetchAllEventsAsync(save_combined=True)
+            # Fetch all events fresh (30s hard cap so a stuck request can't pin the spinner)
+            all_markets = await asyncio.wait_for(
+                FetchAllEventsAsync(save_combined=True), timeout=30
+            )
 
             if all_markets:
                 # Update the widget with fresh data
                 self.liquidity_widget.all_events = all_markets
                 self.liquidity_widget._populateEventListOnly()
+                self.liquidity_widget.onProphetxDataRefreshed()
 
                 # Auto-select the first event if available
                 if self.liquidity_widget.filtered_events:
@@ -2111,6 +2117,10 @@ class ModernOddsWindow(QMainWindow):
                 print("ProphetX fresh scrape returned no data")
                 self.liquidity_widget.hideLoading()
 
+        except asyncio.TimeoutError:
+            print("ProphetX refresh timed out after 30s")
+            self.liquidity_widget.hideLoading()
+
         except ImportError as e:
             # FetchAllEventsAsync might not exist, fall back to selecting first event from stale data
             print(f"FetchAllEventsAsync not available ({e}), using stale data...")
@@ -2124,22 +2134,32 @@ class ModernOddsWindow(QMainWindow):
             traceback.print_exc()
             self.liquidity_widget.hideLoading()
 
+    async def _get_prophetx_session(self):
+        """Lazily build a long-lived aiohttp session for the periodic
+        ProphetX refresh path. Reusing one session avoids paying
+        TCP+TLS handshake every 20s. Must be called from the qasync loop."""
+        sess = getattr(self, "_prophetx_session", None)
+        if sess is None or sess.closed:
+            from prophetx_async import REQUEST_TIMEOUT
+            self._prophetx_session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
+        return self._prophetx_session
+
     @qasync.asyncSlot(int)
     async def fetch_prophetx_event(self, event_id: int):
         """Fetch ProphetX event data asynchronously in main thread"""
         try:
             self.prophetx_worker.status_update.emit(f"Fetching ProphetX event {event_id}...")
 
-            async with aiohttp.ClientSession() as session:
-                from prophetx_async import GetEventMarketsAsync
-                markets_data = await GetEventMarketsAsync(session, event_id)
+            session = await self._get_prophetx_session()
+            from prophetx_async import GetEventMarketsAsync
+            markets_data = await GetEventMarketsAsync(session, event_id)
 
-                if markets_data:
-                    self.prophetx_worker.data_ready.emit(markets_data)
-                    num_markets = len(markets_data.get('data', {}).get('markets', []))
-                    self.prophetx_worker.status_update.emit(f"Updated {num_markets} markets")
-                else:
-                    self.prophetx_worker.error_occurred.emit(f"No data for event {event_id}")
+            if markets_data:
+                self.prophetx_worker.data_ready.emit(markets_data)
+                num_markets = len(markets_data.get('data', {}).get('markets', []))
+                self.prophetx_worker.status_update.emit(f"Updated {num_markets} markets")
+            else:
+                self.prophetx_worker.error_occurred.emit(f"No data for event {event_id}")
 
         except Exception as e:
             self.prophetx_worker.error_occurred.emit(f"Error fetching event: {e}")
@@ -2188,6 +2208,16 @@ class ModernOddsWindow(QMainWindow):
         if hasattr(self, 'update_timer') and self.update_timer.isActive():
             self.update_timer.stop()
 
+        # Close the persistent ProphetX aiohttp session (fire-and-forget;
+        # the loop is closing anyway, but this avoids a "Unclosed client
+        # session" warning on shutdown).
+        sess = getattr(self, "_prophetx_session", None)
+        if sess is not None and not sess.closed:
+            try:
+                asyncio.get_event_loop().create_task(sess.close())
+            except Exception:
+                pass
+
         print("Cleanup complete")
         event.accept()
 
@@ -2202,10 +2232,12 @@ def main():
 
     window = ModernOddsWindow()
 
-    # Run initialization within the qasync event loop
-    loop.run_until_complete(window.initialize())
-
+    # Render the UI immediately. Async initialization (populate_leagues
+    # over the network, etc.) runs as a task once the loop starts — the
+    # league selector will fill in after the first frame instead of
+    # blocking window.show() behind a network round-trip.
     window.show()
+    loop.create_task(window.initialize())
 
     app.dumpObjectTree()
     app.dumpObjectInfo()

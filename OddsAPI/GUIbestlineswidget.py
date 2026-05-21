@@ -435,6 +435,7 @@ class BestLinesWidget(QTableWidget):
                 for outcome in market.get('outcomes', []):
                     game_id = outcome.get('game_id', '')
                     team_name = outcome.get('name', '')
+                    game_name = outcome.get('game_name', '')
                     point = outcome.get('point', '')
                     price = outcome.get('price', '')
     
@@ -447,6 +448,7 @@ class BestLinesWidget(QTableWidget):
                             'game_id': game_id,
                             'market_type': market_key,
                             'team': team_name,
+                            'game_name': game_name,
                             'point': point,
                             'bookmakers': [],
                             'best_odds': float(-999999),
@@ -523,8 +525,15 @@ class BestLinesWidget(QTableWidget):
                 # Add a new row
                 self.insertRow(row)
     
-                # For the game name, we use the team name as a placeholder since we don't have the game header
-                game_or_team = market_data['team']
+                # Column 0 label: for totals markets the outcome 'name' is Over/Under
+                # (not a team), so show the game name with the bet side appended.
+                # For spreads/h2h the outcome 'name' is the team name, so use it as-is.
+                team_name = market_data['team']
+                game_name = market_data.get('game_name', '')
+                if team_name.strip().lower() in ('over', 'under') and game_name:
+                    game_or_team = f"{game_name} {team_name}"
+                else:
+                    game_or_team = team_name
                 self.setItem(row, 0, QTableWidgetItem(game_or_team))
     
                 # Set the market type and point
