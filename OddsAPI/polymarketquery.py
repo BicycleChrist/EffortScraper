@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 import orjson
 from py_clob_client.client import ClobClient
 from mmKEY import pmkey
@@ -60,7 +61,7 @@ def get_market_volume_single(token_id):
     
     # Adaptive rate limiting for burst + throttle pattern
     max_retries = 3  # More retries for heavy throttling
-    base_delay = 0.5  # Longer delay for throttled requests
+    base_delay = 0.25  # Longer delay for throttled requests
     
     for attempt in range(max_retries):
         try:
@@ -339,7 +340,7 @@ def get_client():
     return _client
 
 
-def FetchMarkets(next_cursor=None, recent_only=True):
+def FetchMarkets(next_cursor=None, recent_only=True, cancellation_flag=None):
     """Fetch markets from Polymarket CLOB API"""
     markets_list = []
 
@@ -351,29 +352,36 @@ def FetchMarkets(next_cursor=None, recent_only=True):
     client = get_client()
 
     while True:
+        if cancellation_flag and cancellation_flag.get('should_stop', False):
+            print("🚫 FetchMarkets cancelled during pagination")
+            break
         try:
             print(f"Fetching markets with next_cursor: {next_cursor}")
             response = client.get_markets(next_cursor=next_cursor) if next_cursor else client.get_markets()
-            
+
             if 'data' not in response:
                 print("No data found in response.")
                 break
-            
+
             markets_list.extend(response['data'])
             next_cursor = response.get("next_cursor")
-            
+
             if not next_cursor or next_cursor.startswith('LTE='):
                 if next_cursor and next_cursor.startswith('LTE='):
                     print(f"Reached endmarker cursor {next_cursor}, stopping pagination")
                 break
-                
+
+            # Yield to the GIL so the Qt event loop can repaint between
+            # back-to-back JSON-decode bursts from py-clob-client.
+            time.sleep(0.02)
+
         except Exception as e:
             print(f"Exception occurred: {e}")
             break
-    
+
     return markets_list
 
-def get_cached_or_fresh_markets(recent_only=True):
+def get_cached_or_fresh_markets(recent_only=True, cancellation_flag=None):
     """Get markets from cache if fresh, otherwise fetch and process from API
 
     Returns FILTERED active markets (not raw API response) to reduce memory usage
@@ -384,7 +392,7 @@ def get_cached_or_fresh_markets(recent_only=True):
     else:
         print("🔄 Cache stale, fetching fresh markets from CLOB API")
         # Fetch raw markets from API
-        raw_markets_list = FetchMarkets(recent_only=recent_only)
+        raw_markets_list = FetchMarkets(recent_only=recent_only, cancellation_flag=cancellation_flag)
 
         # Filter to active markets BEFORE caching (saves memory and time)
         print(f"Filtering {len(raw_markets_list)} raw markets to active only...")
@@ -599,7 +607,7 @@ def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_ful
                      If False, uses old behavior (fallback)
     """
     # Get FILTERED markets from cache (metadata only, no volume yet)
-    processed_markets = get_cached_or_fresh_markets(recent_only=recent_only)
+    processed_markets = get_cached_or_fresh_markets(recent_only=recent_only, cancellation_flag=cancellation_flag)
 
     # Check for cancellation
     if cancellation_flag and cancellation_flag.get('should_stop', False):
