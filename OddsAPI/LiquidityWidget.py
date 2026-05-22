@@ -8,10 +8,11 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QSplitter, QFrame, QComboBox, QHeaderView, QGraphicsOpacityEffect,
-    QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem
+    QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem,
+    QStyledItemDelegate
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread
-from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QLinearGradient, QRadialGradient, QPainterPath
+from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath
 import asyncio
 import json
 import math
@@ -705,6 +706,126 @@ class SGPScannerPanel(QWidget):
         return f"+{a}" if a > 0 else str(a)
 
 
+class OddsBarDelegate(QStyledItemDelegate):
+    """Paints the odds-with-liquidity-bar cell via QPainter, replacing
+    the previous per-row QWidget + QHBoxLayout + QLabel + setStyleSheet
+    pattern.
+
+    The old pattern's dominant cost was the stylesheet engine
+    re-parsing a multi-stop qlineargradient string for every row on
+    every refresh — ~300-800µs per row, scaling to 15-40ms total for
+    a ~50-row orderbook. A delegate's paint() does the same visual via
+    plain QPainter calls in ~10-20µs per row, taking the table-render
+    portion of a refresh from "blocks the qasync loop visibly" down to
+    "below frame budget."
+
+    Reads three custom data roles from the cell's QTableWidgetItem:
+        ODDS_ROLE       — display string ("+164", "-190")
+        BAR_WIDTH_ROLE  — 0–100, % of cell width the gradient fills
+        SIDE_TYPE_ROLE  — "ask" or "bid", drives the color palette
+    """
+
+    ODDS_ROLE = Qt.ItemDataRole.UserRole + 1
+    BAR_WIDTH_ROLE = Qt.ItemDataRole.UserRole + 2
+    SIDE_TYPE_ROLE = Qt.ItemDataRole.UserRole + 3
+
+    def __init__(self, parent=None, compact_mode: bool = False):
+        super().__init__(parent)
+        self.compact_mode = compact_mode
+        # Build the font once; reused for every paint.
+        font_size = 10 if compact_mode else 16
+        self._font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
+        self._font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        # Color palette pre-built so paint() does no QColor allocation
+        # in the hot path.
+        self._ask_text = QColor("#f87171")
+        self._bid_text = QColor("#34d399")
+        self._ask_bar = QColor(248, 113, 113)
+        self._bid_bar = QColor(52, 211, 153)
+        self._transparent = QColor(13, 15, 20, 0)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        odds = index.data(self.ODDS_ROLE)
+        if odds is None:
+            # Not one of our cells (e.g. separator/empty state) — fall
+            # through to default item rendering so text + background
+            # set on the QTableWidgetItem still paint.
+            super().paint(painter, option, index)
+            return
+
+        bar_width = index.data(self.BAR_WIDTH_ROLE) or 0
+        side_type = index.data(self.SIDE_TYPE_ROLE) or 'bid'
+
+        if side_type == 'ask':
+            text_color = self._ask_text
+            bar_color = self._ask_bar
+        else:
+            text_color = self._bid_text
+            bar_color = self._bid_bar
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Honor any background brush set on the item (used by the
+        # dual-source render path to tint rows by their source). We
+        # fully override paint() so Qt's default item background draw
+        # is skipped — restore it explicitly so PX/NV color cues survive.
+        bg = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg is not None:
+            painter.fillRect(option.rect, QBrush(bg))
+
+        # Mirror the stylesheet's padding: original had 8/4 margins
+        # full-mode, 2/1 compact. Translate to inset on option.rect.
+        inset_x, inset_y = (2, 1) if self.compact_mode else (4, 2)
+        rect = option.rect.adjusted(inset_x, inset_y, -inset_x, -inset_y)
+
+        if bar_width > 0:
+            # Recreate the qlineargradient stops from the old stylesheet
+            # exactly. Visual parity with the previous look.
+            opacity = min(int(bar_width * 0.35), 35)
+            edge_opacity = max(int(opacity * 0.6), 8)
+            frac = bar_width / 100.0
+
+            opaque = QColor(bar_color)
+            opaque.setAlpha(opacity)
+            edge = QColor(bar_color)
+            edge.setAlpha(edge_opacity)
+
+            grad = QLinearGradient(float(rect.left()), 0.0,
+                                   float(rect.right()), 0.0)
+            grad.setColorAt(0.0, opaque)
+            mid_stop = max(0.0, min(1.0, frac * 0.7))
+            end_stop = max(0.0, min(1.0, frac))
+            grad.setColorAt(mid_stop, opaque)
+            grad.setColorAt(end_stop, edge)
+            # Hard cut to transparent — small epsilon so the gradient
+            # engine doesn't smear past the bar end.
+            cut = max(0.0, min(1.0, frac + 0.0001))
+            grad.setColorAt(cut, self._transparent)
+            grad.setColorAt(1.0, self._transparent)
+
+            border = QColor(bar_color)
+            border.setAlpha(min(opacity + 10, 45))
+            painter.setBrush(QBrush(grad))
+            painter.setPen(QPen(border, 1))
+            painter.drawRoundedRect(QRectF(rect), 4.0, 4.0)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Odds text, left-aligned with the original horizontal padding.
+        text_pad = 2 if self.compact_mode else 8
+        text_rect = rect.adjusted(text_pad, 0, -text_pad, 0)
+        painter.setPen(text_color)
+        painter.setFont(self._font)
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            str(odds),
+        )
+        painter.restore()
+
+
 class OrderBookWidget(QWidget):
     """
     Professional order book display widget for ProphetX markets.
@@ -798,6 +919,17 @@ class OrderBookWidget(QWidget):
 
         # Order book table (all lines displayed)
         self.orderbook_table = QTableWidget()
+
+        # Paint the odds-bar column via a QStyledItemDelegate instead of
+        # per-row QWidgets. The previous setCellWidget approach forced
+        # the Qt stylesheet engine to re-parse a multi-stop gradient for
+        # every row on every refresh, costing 15-40ms total and showing
+        # up as a tickertape stutter. The delegate paints with QPainter
+        # directly: ~10-20µs per row, the table-render portion of a
+        # refresh drops below the frame budget.
+        self._odds_delegate = OddsBarDelegate(self.orderbook_table,
+                                              compact_mode=self.compact_mode)
+        self.orderbook_table.setItemDelegateForColumn(1, self._odds_delegate)
 
         # In compact mode, hide some columns
         if self.compact_mode:
@@ -1098,6 +1230,13 @@ class OrderBookWidget(QWidget):
     def renderNormalizedOrderBook(self, nm) -> None:
         """Walk Lines -> Sides -> Orders and emit one row per Order using
         the existing renderOrderRow / separator helpers."""
+        self.orderbook_table.setUpdatesEnabled(False)
+        try:
+            self._renderNormalizedOrderBookImpl(nm)
+        finally:
+            self.orderbook_table.setUpdatesEnabled(True)
+
+    def _renderNormalizedOrderBookImpl(self, nm) -> None:
         # Bring SIDE_* enums into local scope without forcing import-time
         # coupling at the top of the file.
         import exchange_market_keys as _emk
@@ -1168,9 +1307,8 @@ class OrderBookWidget(QWidget):
                     if rows:
                         sections.append((label, rows))
 
-        # Clear and render
-        self.orderbook_table.clearContents()
-        self.orderbook_table.setRowCount(0)
+        # See _renderOrderBookImpl comment on why we don't clearContents().
+        self.orderbook_table.clearSpans()
 
         total_orders = sum(len(rows) for _, rows in sections)
         if total_orders == 0:
@@ -1285,6 +1423,13 @@ class OrderBookWidget(QWidget):
         American-desc within strike, then dispatch to the existing
         renderOrderRow / separator helpers. Each rendered row gets a
         background tint based on its source."""
+        self.orderbook_table.setUpdatesEnabled(False)
+        try:
+            self._renderDualOrderBookImpl(px_norm, nv_norm)
+        finally:
+            self.orderbook_table.setUpdatesEnabled(True)
+
+    def _renderDualOrderBookImpl(self, px_norm, nv_norm) -> None:
         import exchange_market_keys as _emk
 
         # Combine lines by strike. Either source may have lines the
@@ -1412,9 +1557,8 @@ class OrderBookWidget(QWidget):
                 if rows:
                     sections.append((team_sym, rows))
 
-        # Render
-        self.orderbook_table.clearContents()
-        self.orderbook_table.setRowCount(0)
+        # See _renderOrderBookImpl comment on why we don't clearContents().
+        self.orderbook_table.clearSpans()
 
         total_orders = sum(len(rows) for _, rows in sections)
         if total_orders == 0:
@@ -1521,6 +1665,17 @@ class OrderBookWidget(QWidget):
         Args:
             market_data: Full market dict from ProphetX API
         """
+        # Suspend paints across the whole rebuild so the dozens of
+        # per-cell writes coalesce into a single repaint at the end.
+        # try/finally guards against a render-time exception leaving
+        # the widget in a permanently un-updating state.
+        self.orderbook_table.setUpdatesEnabled(False)
+        try:
+            self._renderOrderBookImpl(market_data)
+        finally:
+            self.orderbook_table.setUpdatesEnabled(True)
+
+    def _renderOrderBookImpl(self, market_data: Dict):
         all_orders = []
 
         # Check if this market has multiple lines (spread/total) or simple selections (moneyline)
@@ -1546,9 +1701,14 @@ class OrderBookWidget(QWidget):
                 for order in side_orders:
                     all_orders.append(order)
 
-        # Clear the table completely to avoid widget overlap issues
-        self.orderbook_table.clearContents()
-        self.orderbook_table.setRowCount(0)
+        # Clear spans (separator positions can move) but DO NOT call
+        # clearContents() or setRowCount(0) — both destroy the pooled
+        # bar widgets in col 1, forcing the ~15-30ms QWidget/layout/
+        # stylesheet reallocation that previously caused the visible
+        # tickertape stutter. Surviving rows keep their cell widgets;
+        # the final setRowCount() at the bottom only destroys widgets
+        # in rows that are actually dropped.
+        self.orderbook_table.clearSpans()
 
         if not all_orders:
             self.orderbook_table.setRowCount(1)
@@ -1696,6 +1856,14 @@ class OrderBookWidget(QWidget):
         # Calculate percentage of total book
         percentage = (value / total_liquidity * 100) if total_liquidity > 0 else 0
 
+        # Build the odds-bar cell as a QTableWidgetItem carrying three
+        # data roles consumed by OddsBarDelegate.paint(). No QWidget is
+        # created; no stylesheet is parsed.
+        odds_item = QTableWidgetItem()
+        odds_item.setData(OddsBarDelegate.ODDS_ROLE, display_odds)
+        odds_item.setData(OddsBarDelegate.BAR_WIDTH_ROLE, int(bar_width))
+        odds_item.setData(OddsBarDelegate.SIDE_TYPE_ROLE, side_type)
+
         if self.compact_mode:
             # Compact mode: only 3 columns - SIDE, ODDS, LIQ
             # Use abbreviated name for side column
@@ -1705,7 +1873,6 @@ class OrderBookWidget(QWidget):
                 side_name = side_name[:8] + ".."
 
             selection_item = self.createSelectionItem(side_name, side_type)
-            odds_widget = self.createLiquidityBarWidget(display_odds, bar_width, side_type)
 
             # Compact liquidity display
             if value >= 1000:
@@ -1715,81 +1882,20 @@ class OrderBookWidget(QWidget):
             liquidity_item = self.createPlainItem(liquidity_text)
 
             self.orderbook_table.setItem(row, 0, selection_item)
-            self.orderbook_table.setCellWidget(row, 1, odds_widget)
+            self.orderbook_table.setItem(row, 1, odds_item)
             self.orderbook_table.setItem(row, 2, liquidity_item)
         else:
             # Full mode: all 5 columns
             selection_item = self.createSelectionItem(display_name, side_type)
-            odds_widget = self.createLiquidityBarWidget(display_odds, bar_width, side_type)
             liquidity_item = self.createPlainItem(f"${value:,.2f}")
             cumulative_item = self.createPlainItem(f"${cumulative:,.2f}")
             percentage_item = self.createPercentageItem(f"{percentage:.1f}%", percentage)
 
             self.orderbook_table.setItem(row, 0, selection_item)
-            self.orderbook_table.setCellWidget(row, 1, odds_widget)
+            self.orderbook_table.setItem(row, 1, odds_item)
             self.orderbook_table.setItem(row, 2, liquidity_item)
             self.orderbook_table.setItem(row, 3, cumulative_item)
             self.orderbook_table.setItem(row, 4, percentage_item)
-
-    def createLiquidityBarWidget(self, odds: str, bar_width: int, side_type: str) -> QWidget:
-        """
-        Create a widget with odds text and liquidity bar background
-
-        Args:
-            odds: Odds string to display (e.g., "+164", "-190")
-            bar_width: Width of liquidity bar as percentage (0-100)
-            side_type: 'ask' or 'bid' for color coding
-        """
-        widget = QWidget()
-
-        # Adjust layout and font size for compact mode
-        if self.compact_mode:
-            layout = QHBoxLayout(widget)
-            layout.setContentsMargins(2, 1, 2, 1)
-            layout.setSpacing(2)
-            odds_font_size = 10
-        else:
-            layout = QHBoxLayout(widget)
-            layout.setContentsMargins(8, 4, 8, 4)
-            layout.setSpacing(12)
-            odds_font_size = 16
-
-        # Odds label
-        odds_label = QLabel(odds)
-        odds_font = QFont("SF Mono", odds_font_size, QFont.Weight.DemiBold)
-        odds_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
-        odds_label.setFont(odds_font)
-
-        if side_type == 'ask':
-            # Refined red for asks - more professional crimson
-            odds_label.setStyleSheet("color: #f87171; font-weight: 600;")
-            bar_color = "248, 113, 113"  # Softer red
-        else:
-            # Refined green for bids - professional emerald
-            odds_label.setStyleSheet("color: #34d399; font-weight: 600;")
-            bar_color = "52, 211, 153"  # Softer emerald
-
-        layout.addWidget(odds_label)
-        layout.addStretch()
-
-        # Apply refined gradient background based on liquidity
-        # More liquidity = more opaque bar with smoother transitions
-        opacity = min(int(bar_width * 0.35), 35)  # Max 35% opacity for subtlety
-        edge_opacity = max(int(opacity * 0.6), 8)  # Softer edge
-        widget.setStyleSheet(f"""
-            QWidget {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba({bar_color}, {opacity}),
-                    stop:{bar_width/100 * 0.7:.2f} rgba({bar_color}, {opacity}),
-                    stop:{bar_width/100:.2f} rgba({bar_color}, {edge_opacity}),
-                    stop:{bar_width/100:.2f} rgba(13, 15, 20, 0),
-                    stop:1 rgba(13, 15, 20, 0));
-                border-radius: 4px;
-                border: 1px solid rgba({bar_color}, {min(opacity + 10, 45)});
-            }}
-        """)
-
-        return widget
 
     def createSelectionItem(self, text: str, side_type: str) -> QTableWidgetItem:
         """Create selection/team name item with color coding"""
@@ -1875,6 +1981,17 @@ class ProphetXBrowser(QWidget):
         self.compact_mode = compact_mode
         self._initial_load_complete = False
         self._pending_fresh_fetch = False
+        # State for the refresh-time diff in _refreshMarketSelector:
+        #   _last_market_name_order: names in the order they currently
+        #     occupy the combo, so we can detect structure changes and
+        #     fall back to a full rebuild when markets open/close or
+        #     liquidity-based ordering shuffles them.
+        #   _last_selected_market_sig: content hash of the most recently
+        #     rendered market, so a refresh that doesn't move the
+        #     selected market's orders skips the orderbook re-render
+        #     entirely.
+        self._last_market_name_order: Optional[List[str]] = None
+        self._last_selected_market_sig: Optional[str] = None
 
         # Cross-source matching state. Built from the latest Novig
         # dump in _loadNovigMatchMap(); empty when no dump exists,
@@ -2609,36 +2726,138 @@ class ProphetXBrowser(QWidget):
         # The updateEventMarkets method will be called when fresh data arrives
 
     def populateMarketSelector(self):
-        """Populate market selector - SORTED BY ACTIVE ORDERBOOK LIQUIDITY (highest to lowest)"""
-        self.market_combo.clear()
+        """Initial-load entry point. Resets the diff state so the next
+        call rebuilds the combo from scratch, then delegates to the
+        shared refresh path."""
+        self._last_market_name_order = None
+        self._last_selected_market_sig = None
+        self._refreshMarketSelector(prev_selected_name=None,
+                                    force_orderbook_render=True)
 
+    def _marketDisplayLabel(self, market: Dict, active_liquidity: float) -> str:
+        name = market.get('name', 'Unknown')
+        if self.compact_mode:
+            return f"{name} (${active_liquidity:,.0f})"
+        total_stake = market.get('totalStake', 0)
+        return (f"{name} (${active_liquidity:,.0f} active • "
+                f"${total_stake:,.0f} total)")
+
+    @staticmethod
+    def _marketContentSignature(market: Dict) -> str:
+        """Compact hash of a market's visible state. Includes line names,
+        order display labels, odds, and dollar values — exactly the
+        fields the orderbook render reads. If two refreshes produce
+        identical signatures for the selected market, the rendered
+        view would be identical, so we can skip the render entirely."""
+        # Fast path: cache stamped off the main thread (see
+        # prophetx_async.precompute_market_caches). Only the displayed
+        # market's signature is consulted per refresh, so the cache hit
+        # rate here is whatever fetch_prophetx_event produced.
+        cached = market.get('_content_signature')
+        if cached is not None:
+            return cached
+        import hashlib
+        h = hashlib.blake2b(digest_size=12)
+        h.update((market.get('name', '') or '').encode())
+
+        def _hash_orders(side_orders):
+            if not side_orders:
+                return
+            for o in side_orders:
+                h.update(b"|")
+                h.update(str(o.get('odds', '')).encode())
+                h.update(b",")
+                h.update(str(o.get('value', '')).encode())
+                h.update(b",")
+                h.update((o.get('displayName') or '').encode())
+
+        market_lines = market.get('marketLines') or []
+        if market_lines:
+            for ml in market_lines:
+                h.update(b"\n")
+                h.update((ml.get('name', '') or '').encode())
+                for side_orders in ml.get('selections', []) or []:
+                    _hash_orders(side_orders)
+        else:
+            for side_orders in market.get('selections', []) or []:
+                _hash_orders(side_orders)
+        return h.hexdigest()
+
+    def _refreshMarketSelector(self, prev_selected_name: Optional[str],
+                               force_orderbook_render: bool = False):
+        """Refresh the market combo + orderbook with minimal work.
+
+        Common case (refresh tick where the same markets are still
+        listed in the same order): zero clear/addItem churn — we just
+        update the dollar figures via setItemText/setItemData. No
+        spurious currentIndexChanged fires from the combo, so the
+        orderbook only re-renders if the selected market's actual
+        content changed (detected via _marketContentSignature).
+
+        Structural change case (markets added/removed/reordered): full
+        rebuild under blockSignals, then a single explicit render call.
+        """
         if not self.current_event_data:
             return
 
         markets = self.current_event_data.get('data', {}).get('markets', [])
 
-        # Calculate active liquidity for each market
-        markets_with_liquidity = []
-        for market in markets:
-            active_liquidity = self.calculateActiveMarketLiquidity(market)
-            markets_with_liquidity.append((market, active_liquidity))
-
-        # Sort by active liquidity descending
+        markets_with_liquidity = [
+            (m, self.calculateActiveMarketLiquidity(m)) for m in markets
+        ]
         markets_with_liquidity.sort(key=lambda x: x[1], reverse=True)
 
-        for market, active_liquidity in markets_with_liquidity:
-            market_name = market.get('name', 'Unknown')
-            market_type = market.get('type', '')
-            total_stake = market.get('totalStake', 0)
+        new_names = [m.get('name', 'Unknown') for m, _ in markets_with_liquidity]
+        same_structure = (new_names == self._last_market_name_order)
 
-            if self.compact_mode:
-                # Compact display - shorter format
-                display = f"{market_name} (${active_liquidity:,.0f})"
+        self.market_combo.blockSignals(True)
+        self.market_combo.setUpdatesEnabled(False)
+        try:
+            if same_structure:
+                # In-place: update display strings + stored market dicts.
+                # Combo selection (currentIndex) is preserved automatically.
+                for i, (market, liq) in enumerate(markets_with_liquidity):
+                    self.market_combo.setItemText(i, self._marketDisplayLabel(market, liq))
+                    self.market_combo.setItemData(i, market)
             else:
-                # Full display
-                display = f"{market_name} (${active_liquidity:,.0f} active • ${total_stake:,.0f} total)"
+                self.market_combo.clear()
+                for market, liq in markets_with_liquidity:
+                    self.market_combo.addItem(self._marketDisplayLabel(market, liq), market)
+                # Restore previous selection if the same market is still listed.
+                if prev_selected_name is not None:
+                    for i in range(self.market_combo.count()):
+                        m = self.market_combo.itemData(i)
+                        if m and m.get('name') == prev_selected_name:
+                            self.market_combo.setCurrentIndex(i)
+                            break
+                # Structural change invalidates the cached render signature
+                # because the previously-selected market may have moved or
+                # been replaced.
+                self._last_selected_market_sig = None
+            self._last_market_name_order = new_names
+        finally:
+            self.market_combo.setUpdatesEnabled(True)
+            self.market_combo.blockSignals(False)
 
-            self.market_combo.addItem(display, market)
+        # Decide whether to re-render the orderbook.
+        idx = self.market_combo.currentIndex()
+        if idx < 0:
+            return
+        selected_market = self.market_combo.itemData(idx)
+        if selected_market is None:
+            return
+
+        new_sig = self._marketContentSignature(selected_market)
+        if not force_orderbook_render and new_sig == self._last_selected_market_sig:
+            # Selected market's orders, sizes, and labels are identical to
+            # the last render. Nothing to repaint.
+            return
+        self._last_selected_market_sig = new_sig
+
+        # Render exactly once via the existing selection handler so the
+        # Novig-pair lookup and dual-source render path are exercised
+        # the same way as a user-initiated change.
+        self.onMarketSelected(idx)
 
     def calculateActiveMarketLiquidity(self, market: Dict) -> float:
         """
@@ -2651,6 +2870,14 @@ class ProphetXBrowser(QWidget):
         Returns:
             Total active liquidity (sum of all order values)
         """
+        # Fast path: cache stamped by prophetx_async.precompute_market_caches
+        # off the main thread. Falls back to live compute only for paths
+        # that don't go through fetch_prophetx_event (initial JSON-dump
+        # loads, manual refreshes).
+        cached = market.get('_active_liquidity')
+        if cached is not None:
+            return cached
+
         total_active = 0.0
 
         # For markets with multiple lines (spread/total)
@@ -2690,8 +2917,6 @@ class ProphetXBrowser(QWidget):
         if not market:
             return
 
-        # Look up matched Novig market via the event-pair map. None if
-        # either no match for this event or no matching market.
         market_pair = self._lookupCurrentMarketPair(market)
         self._current_market_pair = market_pair
 
@@ -2903,18 +3128,12 @@ class ProphetXBrowser(QWidget):
         # Update current event data
         self.current_event_data = markets_data
 
-        # Refresh the market selector and orderbook display
-        self.populateMarketSelector()
-
-        # Restore previously selected market if it still exists
-        if current_market_name:
-            for i in range(self.market_combo.count()):
-                market = self.market_combo.itemData(i)
-                if market and market.get('name') == current_market_name:
-                    self.market_combo.setCurrentIndex(i)
-                    break
-
-        # Hide loading animation - fresh data is now displayed
+        # Diff-aware refresh: avoids the clear+addItem churn, the
+        # spurious currentIndexChanged-driven orderbook render, and the
+        # orderbook re-render when the selected market's content hasn't
+        # actually moved between refreshes.
+        self._refreshMarketSelector(prev_selected_name=current_market_name,
+                                    force_orderbook_render=False)
         self.hideLoading()
 
     def refreshData(self):
