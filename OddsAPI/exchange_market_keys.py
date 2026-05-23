@@ -224,6 +224,60 @@ _PROPHETX_PROP_CATEGORY_MAP = {
     "anytime td":        PROP_ANYTIME_TD,
 }
 
+# Fallback map keyed by the noun phrase that follows " Total " in a
+# ProphetX market name. The v1 /markets endpoint omits `categoryName`
+# and `subType`, so the v2 classifier path (which relies on those
+# fields) collapses every player prop into MTYPE_TOTAL and they
+# collide with the real game total. With this map we recover the
+# subtype from the market name itself.
+#
+# Differences from _PROPHETX_PROP_CATEGORY_MAP (which keys off
+# categoryName):
+#   - "Total Bases"      → name trailing is "Bases"
+#   - "Strikeouts"       → name trailing is "Pitching Strikeouts" or
+#                          "Batting Strikeouts" (PX names disambiguate
+#                          batter vs pitcher in the noun phrase even
+#                          though categoryName collapsed both to
+#                          "Strikeouts")
+#   - "Earned Runs"      → name trailing is "Earned Runs Allowed"
+#   - "Pitcher Outs"     → name trailing is "Outs Recorded"
+_PROPHETX_PROP_NAME_SUFFIX_MAP = {
+    # MLB batter
+    "home runs":             PROP_HOME_RUNS,
+    "hits":                  PROP_HITS,
+    "rbis":                  PROP_RBIS,
+    "runs":                  PROP_RUNS,
+    "bases":                 PROP_TOTAL_BASES,
+    "hits, runs & rbis":     PROP_HRR,
+    "batting strikeouts":    PROP_STRIKEOUTS,
+    "walks":                 PROP_WALKS,
+    "stolen bases":          PROP_STOLEN_BASES,
+    # MLB pitcher
+    "pitching strikeouts":   PROP_PITCHER_STRIKEOUTS,
+    "outs recorded":         PROP_PITCHER_OUTS,
+    "earned runs allowed":   PROP_PITCHER_EARNED_RUNS,
+    "hits allowed":          PROP_PITCHER_HITS_ALLOWED,
+    # NBA — same trailing tokens as the categoryName variant
+    "points":                PROP_POINTS,
+    "rebounds":              PROP_REBOUNDS,
+    "assists":               PROP_ASSISTS,
+    "threes":                PROP_THREES,
+    "steals":                PROP_STEALS,
+    "blocks":                PROP_BLOCKS,
+    "turnovers":             PROP_TURNOVERS,
+    # NHL
+    "goals":                 PROP_GOALS,
+    "shots on goal":         PROP_SHOTS_ON_GOAL,
+    "saves":                 PROP_SAVES,
+    # NFL — most NFL props don't use " Total " phrasing, so a small
+    # set; passing/rushing/receiving yards do follow the pattern.
+    "passing yards":         PROP_PASS_YDS,
+    "passing touchdowns":    PROP_PASS_TDS,
+    "rushing yards":         PROP_RUSH_YDS,
+    "receiving yards":       PROP_REC_YDS,
+    "receptions":            PROP_RECEPTIONS,
+}
+
 # Novig `type` enum -> canonical prop subtype. Novig already uses
 # upper-snake-case tokens, mostly aligned with our canonical set.
 _NOVIG_PROP_TYPE_MAP = {
@@ -434,15 +488,41 @@ def _prophetx_market_type(market: dict) -> tuple[str, Optional[str]]:
     raw_type = (market.get("type") or "").lower()
     category = (market.get("categoryName") or "").strip()
     cat_lower = category.lower()
+    name = (market.get("name") or "").strip()
 
-    # If categoryName matches a known prop bucket, that wins regardless
-    # of the `type` token. ProphetX ships player props as type=total but
-    # they're not game totals.
+    # 1) categoryName match (v2 path). categoryName is the most reliable
+    # signal when present.
     prop_subtype = _PROPHETX_PROP_CATEGORY_MAP.get(cat_lower)
     if prop_subtype is not None:
         return MTYPE_PLAYER_PROP, prop_subtype
 
-    # Game-line types — only when categoryName isn't a prop bucket.
+    # 2) Name-suffix match (v1 fallback). v1 omits categoryName so we
+    # derive the subtype from the noun phrase after " Total " in the
+    # market name. Without this, every player prop collapses into
+    # MTYPE_TOTAL and collides with the game total when matching
+    # against Novig.
+    #
+    # Guard against period-restricted game totals like
+    # "1st-5th Inning Total Runs" or "1st Inning Total Runs" — those
+    # also contain " Total " but the prefix is a period specifier, not
+    # a player name. Treat the market as a player prop only when the
+    # prefix doesn't look like one of those.
+    sep = " Total "
+    sep_idx = name.find(sep)
+    if sep_idx > 0:
+        prefix_lower = name[:sep_idx].lower()
+        is_period_prefix = any(tok in prefix_lower for tok in (
+            "inning", "period", "quarter", "half", " set ",
+        ))
+        is_team_prefix = ":" in prefix_lower  # "CLE: Team Total Runs"
+        if not is_period_prefix and not is_team_prefix:
+            trailing = name[sep_idx + len(sep):].strip().lower()
+            suffix_subtype = _PROPHETX_PROP_NAME_SUFFIX_MAP.get(trailing)
+            if suffix_subtype is not None:
+                return MTYPE_PLAYER_PROP, suffix_subtype
+
+    # 3) Game-line types — only when neither categoryName nor name
+    # suffix indicated a prop.
     mtype = _PROPHETX_TYPE_MAP.get(raw_type)
     if mtype is not None:
         # Use subType, not the bare `type` token, as the game-line
@@ -450,11 +530,11 @@ def _prophetx_market_type(market: dict) -> tuple[str, Optional[str]]:
         # "first_half_moneyline" — whereas `type` is "moneyline" for
         # both, which would collapse full-game and 1H markets onto a
         # single match key (pairing a 1H market against a full-game
-        # one). Fall back to raw_type when subType is absent.
+        # one). Fall back to raw_type when subType is absent (v1).
         sub = (market.get("subType") or "").strip().lower() or raw_type
         return mtype, sub
 
-    # Heuristic fallback for unknown prop-looking categories
+    # 4) Heuristic fallback for unknown prop-looking categories
     if any(k in cat_lower for k in ("player", "prop", "batter", "pitcher", "hitter")):
         return MTYPE_PLAYER_PROP, category or raw_type or None
     return MTYPE_OTHER, raw_type or cat_lower or None
@@ -679,8 +759,17 @@ def _novig_player_name(market: dict) -> Optional[str]:
     return desc or None
 
 
-def _novig_order_from_book(o: dict) -> Optional[NormalizedOrder]:
-    """One entry from ladders[outcome_id].bids or .asks."""
+def _novig_order_from_book(o: dict, *, market_id: Optional[str] = None,
+                           outcome_id: Optional[str] = None,
+                           is_bid: Optional[bool] = None
+                           ) -> Optional[NormalizedOrder]:
+    """One entry from ladders[outcome_id].bids or .asks.
+
+    market_id / outcome_id / is_bid are stamped into the raw dict so the
+    bet slip can pass them straight to /nbx/v1/orders without re-walking
+    the parent containers. None when called from a context that doesn't
+    know them (legacy callers); single-bet placement skips those rows.
+    """
     try:
         prob = float(o.get("price"))
         qty = float(o.get("qty") or 0.0)
@@ -691,8 +780,15 @@ def _novig_order_from_book(o: dict) -> Optional[NormalizedOrder]:
     american = prob_to_american(prob)
     if american is None:
         return None
+    raw = dict(o)
+    if market_id is not None:
+        raw["_market_id"] = market_id
+    if outcome_id is not None:
+        raw["_outcome_id"] = outcome_id
+    if is_bid is not None:
+        raw["_is_bid"] = is_bid
     return NormalizedOrder(prob=prob, american=american,
-                           size_usd=qty / _NBX_QTY_SCALE, raw=o)
+                           size_usd=qty / _NBX_QTY_SCALE, raw=raw)
 
 
 def _novig_outcome_to_top_level_side(outcome: dict) -> NormalizedSide:
@@ -721,11 +817,22 @@ def _novig_outcome_to_top_level_side(outcome: dict) -> NormalizedSide:
                           orders=orders, total_size_usd=0.0)
 
 
-def _novig_outcome_to_side_from_book(outcome: dict, ladder: dict) -> NormalizedSide:
+def _novig_outcome_to_side_from_book(outcome: dict, ladder: dict,
+                                     market_id: Optional[str] = None
+                                     ) -> NormalizedSide:
     label = outcome.get("description") or outcome.get("type") or "?"
+    outcome_id = outcome.get("id")
     orders: list[NormalizedOrder] = []
-    for o in (ladder.get("bids") or []) + (ladder.get("asks") or []):
-        no = _novig_order_from_book(o)
+    # `bids` are takers buying this outcome; `asks` are takers selling.
+    # Tag orders so the bet slip knows which side to PLACE on.
+    for o in (ladder.get("bids") or []):
+        no = _novig_order_from_book(o, market_id=market_id,
+                                    outcome_id=outcome_id, is_bid=True)
+        if no is not None:
+            orders.append(no)
+    for o in (ladder.get("asks") or []):
+        no = _novig_order_from_book(o, market_id=market_id,
+                                    outcome_id=outcome_id, is_bid=False)
         if no is not None:
             orders.append(no)
     orders = _sort_side_orders(orders)
@@ -769,7 +876,8 @@ def _novig_line_from_market(market: dict,
     for o in outcomes:
         ladder = ladders.get(o.get("id"))
         if ladder is not None:
-            sides.append(_novig_outcome_to_side_from_book(o, ladder))
+            sides.append(_novig_outcome_to_side_from_book(
+                o, ladder, market_id=market.get("id")))
         else:
             sides.append(_novig_outcome_to_top_level_side(o))
     total = sum(s.total_size_usd for s in sides)
