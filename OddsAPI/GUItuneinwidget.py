@@ -87,17 +87,17 @@ class StreamLoadWorker(QThread):
 
 class TuneInWidget(QWidget):
     """PyQt6 implementation of TuneIn widget for displaying streaming links"""
-    
+
     # Signal emitted when links are loaded
     linksLoaded = pyqtSignal(list)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
         # URLs to be parsed (streaming aggregator main pages)
         self.urls = [
-            "https://www.nflbite.is/",          # NFL games with 10-15 streams each
-            "https://today.totalsportek.army/", # Multi-sport aggregator
+            #"https://www.nflbite.is/",          # NFL games with 10-15 streams each
+            "https://istreameast.app/v52"  # Multi-sport aggregator
         ]
 
         # League names for filtering
@@ -137,7 +137,7 @@ class TuneInWidget(QWidget):
         self.worker_thread = None
 
         self.init_ui()
-        
+
     def init_ui(self):
         """Initialize the user interface for the widget"""
 
@@ -301,19 +301,19 @@ class TuneInWidget(QWidget):
     def load_links(self):
         """Trigger a refresh of stream links"""
         self.start_background_load()
-        
+
     def extract_game_name(self, game_url):
-        """Extract readable game name from URL"""
+        """Extract readable game name from URL.
+
+        istreameast structure:
+          https://istreameast.app/nhl-playoffs/vegas-golden-knights-colorado-avalanche/42249792
+          parts[-1] = "42249792"  (numeric ID)
+          parts[-2] = "vegas-golden-knights-colorado-avalanche"  (team slug)
+          parts[-3] = "nhl-playoffs"  (sport/league slug)
+        """
         try:
             parts = game_url.rstrip('/').split('/')
 
-            # Totalsportek format: https://totalsportek.army/game/team1-vs-team2/ID/
-            if len(parts) >= 5 and parts[-3] == 'game':
-                game_name = parts[-2].replace('-', ' ').title()
-                return game_name
-
-            # NFLbite/NBABite/etc format: https://www.nflbite.is/Team1-vs-Team2/ID
-            # The team names are in the second-to-last segment
             if len(parts) >= 2 and parts[-1].isnumeric():
                 game_name = parts[-2].replace('-', ' ').title()
                 return game_name
@@ -369,4 +369,3 @@ class TuneInWidget(QWidget):
                 self.worker.terminate()
                 self.worker.wait(1000)
         event.accept()
-
