@@ -328,6 +328,197 @@ async def price_parlay_async(session: aiohttp.ClientSession,
     return body
 
 
+# App version + screen string mirror what the Novig web app sends. They look
+# like analytics fields, but the backend rejects executions missing them. Pin
+# to the version captured at implementation time; bump if Novig changes their
+# wire contract.
+_NOVIG_APP_VERSION = "1.1.194"
+_NOVIG_DEFAULT_SCREEN = "Home - Baseball"
+
+
+async def place_parlay_async(session: aiohttp.ClientSession,
+                             saved_parlay_id: str,
+                             wager: float,
+                             *,
+                             currency: str = "CASH",
+                             current_screen: str = _NOVIG_DEFAULT_SCREEN,
+                             ) -> dict:
+    """Execute a previously-quoted Novig parlay.
+
+    Two-step flow (mirrors the web app):
+      1. price_parlay_async returns a quote with `id`
+      2. place_parlay_async takes that id as `saved_parlay_id`, plus the
+         actual stake, and POSTs to /nbx/v1/parlay/execute
+
+    On a Filled order the response includes the real `wager`, `price`,
+    settled wallet balance, and per-leg outcomes. Raises NovigError on
+    transport failure or any non-2xx response.
+    """
+    url = f"{NOVIG_NBX_BASE}/parlay/execute"
+    payload = {
+        "savedParlayId": saved_parlay_id,
+        "wager": f"{wager:.5f}",
+        "currency": currency,
+        "partnerId": None,
+        "appVersion": _NOVIG_APP_VERSION,
+        "featuredParlayId": None,
+        "currentScreen": current_screen,
+    }
+    try:
+        async with session.post(url, json=payload, headers=_headers(),
+                                timeout=REQUEST_TIMEOUT) as r:
+            if r.status not in (200, 201):
+                text = await r.text()
+                raise NovigError(f"NBX execute HTTP {r.status}: {text[:500]}")
+            body = await r.json()
+    except aiohttp.ClientError as e:
+        raise NovigError(f"transport: {e}")
+    _harvest_wallet_id(body)
+    if isinstance(body, dict):
+        # Parlay execute also nests {trader: {wallets: [...]}} and
+        # {wallet: {id: ...}} — let the harvester walk the obvious slot.
+        _harvest_wallet_id(body.get("trader") or {})
+    return body
+
+
+# Cached walletId, populated opportunistically from any response that
+# includes it (parlay execute, /orders, /wallets fetch). Lets single-bet
+# placement work without forcing the user to copy a UUID into Creds.py.
+_NOVIG_WALLET_ID_CACHE: Optional[str] = None
+
+
+def _harvest_wallet_id(payload) -> None:
+    """Walk a Novig response and stash any walletId we see. Cheap; runs
+    on every success path."""
+    global _NOVIG_WALLET_ID_CACHE
+    if _NOVIG_WALLET_ID_CACHE:
+        return
+    if not isinstance(payload, dict):
+        return
+    wid = payload.get("walletId")
+    if isinstance(wid, str) and wid:
+        _NOVIG_WALLET_ID_CACHE = wid
+        return
+    wallet = payload.get("wallet")
+    if isinstance(wallet, dict):
+        inner = wallet.get("id")
+        if isinstance(inner, str) and inner:
+            _NOVIG_WALLET_ID_CACHE = inner
+
+
+def get_cached_wallet_id() -> Optional[str]:
+    """Return the harvested walletId, or None if we haven't seen one yet.
+    Callers needing it for single-bet placement either fetch via a parlay
+    quote first or pull NOVIG_WALLET_ID out of Creds.py."""
+    if _NOVIG_WALLET_ID_CACHE:
+        return _NOVIG_WALLET_ID_CACHE
+    try:
+        from Creds import NOVIG_WALLET_ID as _wid
+        return _wid or None
+    except ImportError:
+        return None
+
+
+def _novig_geo_token() -> Optional[str]:
+    """Pull the latest geolocation transaction id from Creds.py. Novig
+    rotates these via a third-party SDK on the site; there's no clean way
+    to refresh them headlessly, so the user grabs one from DevTools and
+    pastes it into Creds.NOVIG_GEO_TX_ID periodically."""
+    try:
+        from Creds import NOVIG_GEO_TX_ID as _g
+        return _g or None
+    except ImportError:
+        return None
+
+
+async def place_order_async(session: aiohttp.ClientSession,
+                            market_id: str,
+                            outcome_id: str,
+                            price: float,
+                            qty_centi: int,
+                            *,
+                            is_bid: bool = True,
+                            wallet_id: Optional[str] = None,
+                            geo_tx_id: Optional[str] = None,
+                            tif: str = "IOC",
+                            currency: str = "CASH") -> dict:
+    """Place a single order against the Novig NBX orderbook.
+
+    Args:
+        market_id: target market UUID
+        outcome_id: side being taken (Yes/No, Team-A/Team-B, Over/Under, ...)
+        price: decimal probability (0 < p < 1) — matches the row's price
+        qty_centi: qty in centi-contracts. For a $stake-dollar bet at price p,
+            use round((stake / p) * 100). At fill the trader pays
+            qty_centi/100 * price dollars.
+        is_bid: True buys the outcome; False sells (only matters for binary
+            markets where you take the opposite side).
+        wallet_id: explicit walletId; falls back to harvested cache / Creds.
+        geo_tx_id: explicit geolocation transaction id; falls back to Creds.
+        tif: time-in-force. IOC = immediate-or-cancel (market take, default);
+            GTC keeps the order resting on the book.
+
+    Returns the parsed order object. Raises NovigError on transport failure,
+    missing wallet/geo credentials, or any non-2xx response.
+    """
+    import uuid
+    wid = wallet_id or get_cached_wallet_id()
+    if not wid:
+        raise NovigError(
+            "No Novig walletId available. Place a parlay first (harvests the "
+            "id) or set NOVIG_WALLET_ID in Creds.py.")
+    gtx = geo_tx_id or _novig_geo_token()
+    if not gtx:
+        raise NovigError(
+            "No Novig geolocationTransactionId. Grab the latest from a live "
+            "/orders request in DevTools and set NOVIG_GEO_TX_ID in Creds.py.")
+
+    url = f"{NOVIG_NBX_BASE}/orders"
+    # uuid4 instead of uuid7 — server doesn't appear to enforce v7, and the
+    # stdlib lacks uuid7 prior to 3.13. Order id is idempotency token only.
+    payload = {
+        "id": str(uuid.uuid4()),
+        "appVersion": _NOVIG_APP_VERSION,
+        "currency": currency,
+        "entryPromotionClaimId": None,
+        "geolocationTransactionId": gtx,
+        "isBid": bool(is_bid),
+        "marketId": market_id,
+        "outcomeId": outcome_id,
+        "partnerId": None,
+        "price": float(price),
+        "qty": int(qty_centi),
+        "tif": tif,
+        "timeToLiveMs": None,
+        "type": "PLACE",
+        "walletId": wid,
+    }
+    try:
+        async with session.post(url, json=payload, headers=_headers(),
+                                timeout=REQUEST_TIMEOUT) as r:
+            text = await r.text()
+            if r.status not in (200, 201):
+                raise NovigError(f"NBX orders HTTP {r.status}: {text[:500]}")
+            body = json.loads(text) if text else {}
+    except aiohttp.ClientError as e:
+        raise NovigError(f"transport: {e}")
+    _harvest_wallet_id(body)
+    return body
+
+
+def stake_to_qty_centi(stake_usd: float, price: float) -> int:
+    """Translate a dollar stake at a given decimal-probability price into
+    the centi-contract qty Novig's orders endpoint expects.
+
+    At fill, the trader pays (qty/100)*price dollars and wins (qty/100)
+    dollars on a winning outcome. So for a target stake s at price p:
+        qty_centi = round((s / p) * 100)
+    """
+    if price <= 0:
+        raise ValueError("price must be > 0")
+    return max(1, round((stake_usd / price) * 100))
+
+
 async def scan_sgp_implications_async(
         session: aiohttp.ClientSession,
         event_id: str,

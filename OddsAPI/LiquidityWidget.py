@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QSplitter, QFrame, QComboBox, QHeaderView, QGraphicsOpacityEffect,
     QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem,
-    QStyledItemDelegate
+    QStyledItemDelegate, QDoubleSpinBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath
@@ -312,6 +312,336 @@ class OrderBookLoadingOverlay(QWidget):
             painter.drawEllipse(QPointF(px, py), 8, 8)
 
 
+class BetSlipDrawer(QWidget):
+    """Collapsible bet slip pinned to the bottom of SGPScannerPanel.
+
+    Collapsed state: a thin always-visible header bar showing the leg
+    count plus the running stake → payout summary. Click expands upward
+    (eating into the EV results table above) to reveal each leg, a
+    shared per-leg wager input, the Place button, and a status strip.
+
+    Owns the slip state but not the placement coroutine: clicking Place
+    emits `place_requested(legs, wager)` so the parent panel can drive
+    the async re-quote + execute flow with whatever session/clients it
+    already has wired up.
+
+    Each leg is a dict with at least: src ("PX"|"NV"), key (unique
+    identifier for dedup + removal), label (display string),
+    odds (american), edge_pct (float), and raw (the original EV row
+    dict, used by the parent panel at place time).
+    """
+
+    leg_added = pyqtSignal(str)         # leg key
+    leg_removed = pyqtSignal(str)       # leg key
+    place_requested = pyqtSignal(list, float)  # (legs, per_leg_wager)
+
+    # Hard session cap. Matches the $5 deposit per exchange — placement
+    # is blocked once cumulative wagers across this session reach this
+    # threshold. Tracked per-drawer instance; resets on app restart.
+    SESSION_CAP_USD = 5.0
+    DEFAULT_PER_LEG_WAGER = 0.50
+    MAX_PER_LEG_WAGER = 2.0
+
+    def __init__(self, parent=None, compact_mode: bool = False):
+        super().__init__(parent)
+        self.compact_mode = compact_mode
+        self._legs: list[dict] = []
+        self._expanded = False
+        self._session_placed_usd = 0.0
+        self._initUI()
+        self._refreshHeader()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _initUI(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        fs = 9 if self.compact_mode else 11
+
+        # --- Header strip (always visible) ---
+        self.header = QPushButton()
+        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.header.clicked.connect(self._toggleExpanded)
+        self.header.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #14181f;
+                color: #e8e9ed;
+                border: none;
+                border-top: 1px solid #2a2d34;
+                border-bottom: 1px solid #2a2d34;
+                padding: {4 if self.compact_mode else 7}px 10px;
+                font-size: {fs}px;
+                text-align: left;
+            }}
+            QPushButton:hover {{ background-color: #1a1f28; }}
+        """)
+        outer.addWidget(self.header)
+
+        # --- Expanded body (hidden when collapsed) ---
+        self.body = QWidget()
+        self.body.setVisible(False)
+        body_layout = QVBoxLayout(self.body)
+        pad = 4 if self.compact_mode else 8
+        body_layout.setContentsMargins(pad, pad, pad, pad)
+        body_layout.setSpacing(pad)
+
+        # Leg list — scrollable so 10+ legs don't blow up the height.
+        self.legs_container = QWidget()
+        self.legs_layout = QVBoxLayout(self.legs_container)
+        self.legs_layout.setContentsMargins(0, 0, 0, 0)
+        self.legs_layout.setSpacing(2)
+        self.legs_layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.legs_container)
+        scroll.setMaximumHeight(120 if self.compact_mode else 180)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                background-color: #0d0f14;
+                border: 1px solid #2a2d34;
+                border-radius: 3px;
+            }
+        """)
+        body_layout.addWidget(scroll)
+
+        # Controls row: stake input + place button.
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        stake_label = QLabel("Wager / leg:")
+        stake_label.setStyleSheet(f"color: #8a92a3; font-size: {fs}px;")
+        controls.addWidget(stake_label)
+
+        self.wager_spin = QDoubleSpinBox()
+        self.wager_spin.setRange(0.10, self.MAX_PER_LEG_WAGER)
+        self.wager_spin.setSingleStep(0.10)
+        self.wager_spin.setDecimals(2)
+        self.wager_spin.setValue(self.DEFAULT_PER_LEG_WAGER)
+        self.wager_spin.setPrefix("$")
+        self.wager_spin.setFixedWidth(80)
+        self.wager_spin.valueChanged.connect(self._refreshHeader)
+        self.wager_spin.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: #0d0f14;
+                border: 1px solid #2a2d34;
+                border-radius: 3px;
+                color: #e8e9ed;
+                padding: 2px 4px;
+                font-size: {fs}px;
+            }}
+        """)
+        controls.addWidget(self.wager_spin)
+        controls.addStretch()
+
+        self.place_btn = QPushButton("Place All")
+        self.place_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.place_btn.clicked.connect(self._onPlaceClicked)
+        self.place_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1f6f5e; color: #e8fff8;
+                border: 1px solid #5eead4; border-radius: 4px;
+                padding: {3 if self.compact_mode else 6}px
+                         {10 if self.compact_mode else 16}px;
+                font-size: {fs}px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: #2a8c76; }}
+            QPushButton:disabled {{
+                background-color: #1a1d24; color: #555b66;
+                border: 1px solid #2a2d34;
+            }}
+        """)
+        controls.addWidget(self.place_btn)
+        body_layout.addLayout(controls)
+
+        # Status / session-cap strip.
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            f"color: #8a92a3; font-size: {fs - 1}px;")
+        self.status_label.setWordWrap(True)
+        body_layout.addWidget(self.status_label)
+
+        outer.addWidget(self.body)
+        self._refreshStatus()
+
+    # ------------------------------------------------------------------
+    # Leg management — called by SGPScannerPanel on row click.
+    # ------------------------------------------------------------------
+    def has_leg(self, key: str) -> bool:
+        return any(leg["key"] == key for leg in self._legs)
+
+    def add_leg(self, leg: dict) -> None:
+        if self.has_leg(leg["key"]):
+            return
+        self._legs.append(leg)
+        self._rebuildLegRows()
+        self._refreshHeader()
+        self.leg_added.emit(leg["key"])
+
+    def remove_leg(self, key: str) -> None:
+        before = len(self._legs)
+        self._legs = [leg for leg in self._legs if leg["key"] != key]
+        if len(self._legs) != before:
+            self._rebuildLegRows()
+            self._refreshHeader()
+            self.leg_removed.emit(key)
+
+    def clear(self) -> None:
+        removed_keys = [leg["key"] for leg in self._legs]
+        self._legs = []
+        self._rebuildLegRows()
+        self._refreshHeader()
+        for k in removed_keys:
+            self.leg_removed.emit(k)
+
+    def legs(self) -> list:
+        return list(self._legs)
+
+    def mark_leg_status(self, key: str, status: str,
+                        success: bool = True) -> None:
+        """Update the status label of a specific leg row in the slip."""
+        for leg in self._legs:
+            if leg["key"] == key:
+                leg["status"] = status
+                leg["status_ok"] = success
+                self._rebuildLegRows()
+                return
+
+    def record_placement(self, dollars: float) -> None:
+        """Bump the session-cap counter after a leg places successfully."""
+        self._session_placed_usd += dollars
+        self._refreshStatus()
+
+    # ------------------------------------------------------------------
+    # Visual rebuild — cheap, slip rarely exceeds ~10 entries.
+    # ------------------------------------------------------------------
+    def _rebuildLegRows(self) -> None:
+        # Strip everything before the trailing stretch.
+        while self.legs_layout.count() > 1:
+            item = self.legs_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        fs = 9 if self.compact_mode else 11
+        for leg in self._legs:
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(4, 2, 4, 2)
+            rl.setSpacing(6)
+
+            src = leg.get("src", "?")
+            src_color = "#5eead4" if src == "PX" else "#3b82f6"
+            src_lbl = QLabel(src)
+            src_lbl.setStyleSheet(
+                f"color: {src_color}; font-weight: 700; font-size: {fs}px;")
+            src_lbl.setFixedWidth(22)
+            rl.addWidget(src_lbl)
+
+            desc = QLabel(leg.get("label", ""))
+            desc.setStyleSheet(f"color: #e8e9ed; font-size: {fs}px;")
+            rl.addWidget(desc, 1)
+
+            odds = leg.get("odds")
+            odds_text = (f"+{odds}" if isinstance(odds, (int, float))
+                         and odds > 0 else str(odds) if odds is not None
+                         else "--")
+            odds_lbl = QLabel(odds_text)
+            odds_lbl.setStyleSheet(
+                f"color: #fbbf24; font-size: {fs}px; font-weight: 600;")
+            rl.addWidget(odds_lbl)
+
+            status_text = leg.get("status", "")
+            if status_text:
+                status_ok = leg.get("status_ok", True)
+                status_color = "#34d399" if status_ok else "#f87171"
+                stat = QLabel(status_text)
+                stat.setStyleSheet(
+                    f"color: {status_color}; font-size: {fs - 1}px;")
+                rl.addWidget(stat)
+
+            remove = QPushButton("✕")
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.setFixedWidth(20)
+            remove.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: transparent; color: #8a92a3;
+                    border: none; font-size: {fs}px;
+                }}
+                QPushButton:hover {{ color: #f87171; }}
+            """)
+            key = leg["key"]
+            remove.clicked.connect(lambda _checked, k=key: self.remove_leg(k))
+            rl.addWidget(remove)
+
+            row.setStyleSheet(
+                "QWidget { background-color: #14181f; border-radius: 2px; }")
+            self.legs_layout.insertWidget(self.legs_layout.count() - 1, row)
+
+    def _refreshHeader(self) -> None:
+        n = len(self._legs)
+        wager = self.wager_spin.value() if hasattr(self, "wager_spin") else 0
+        total_stake = wager * n
+        # Naive payout estimate — sum of (decimal_odds * wager) per leg.
+        payout = 0.0
+        for leg in self._legs:
+            odds = leg.get("odds")
+            try:
+                a = int(odds)
+                dec = 1 + a / 100 if a > 0 else 1 + 100 / abs(a)
+                payout += dec * wager
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        chev = "▼" if self._expanded else "▲"
+        self.header.setText(
+            f"  {chev}  Bet Slip ({n})   "
+            f"${total_stake:,.2f} stake → ${payout:,.2f} payout")
+        # Enable Place only when we have legs AND room under the cap.
+        if hasattr(self, "place_btn"):
+            remaining = self.SESSION_CAP_USD - self._session_placed_usd
+            self.place_btn.setEnabled(n > 0 and total_stake <= remaining
+                                      and total_stake > 0)
+        self._refreshStatus()
+
+    def _refreshStatus(self) -> None:
+        if not hasattr(self, "status_label"):
+            return
+        remaining = self.SESSION_CAP_USD - self._session_placed_usd
+        msg = (f"Session: ${self._session_placed_usd:.2f} placed • "
+               f"${remaining:.2f} left under ${self.SESSION_CAP_USD:.2f} cap.")
+        wager = self.wager_spin.value() if hasattr(self, "wager_spin") else 0
+        total_stake = wager * len(self._legs)
+        if total_stake > remaining and self._legs:
+            msg += (f"  ⚠ Stake ${total_stake:.2f} exceeds remaining "
+                    f"cap — lower wager or remove legs.")
+        self.status_label.setText(msg)
+
+    # ------------------------------------------------------------------
+    # Interaction
+    # ------------------------------------------------------------------
+    def _toggleExpanded(self) -> None:
+        self._expanded = not self._expanded
+        self.body.setVisible(self._expanded)
+        self._refreshHeader()
+
+    def expand(self) -> None:
+        if not self._expanded:
+            self._toggleExpanded()
+
+    def _onPlaceClicked(self) -> None:
+        if not self._legs:
+            return
+        wager = self.wager_spin.value()
+        # Final cap check (UI also guards but be paranoid).
+        if wager * len(self._legs) > (self.SESSION_CAP_USD
+                                      - self._session_placed_usd):
+            return
+        self.place_btn.setEnabled(False)
+        self.place_requested.emit(list(self._legs), float(wager))
+
+
 class SGPScannerPanel(QWidget):
     """SGP +EV scanner — shown in place of the order book table when the
     header's EV-scan toggle is active.
@@ -331,6 +661,16 @@ class SGPScannerPanel(QWidget):
     _TYPE_ABBR = {
         "HOME_RUNS": "HR", "RBIS": "RBI", "RUNS": "Run", "HITS": "Hit",
     }
+
+    # Emitted when a result row is clicked. Payload is a leg dict ready
+    # for the bet slip (src, key, label, odds, edge_pct, raw, bet_kind,
+    # status). OrderBookWidget hooks this to manage the shared slip.
+    leg_picked = pyqtSignal(dict)
+
+    # Fires when the user clicks Run — slip owner uses this to drop any
+    # legs that came from previous scan results (since savedParlayId
+    # quote IDs expire and the table row indexes are about to reset).
+    scan_started = pyqtSignal()
 
     def __init__(self, parent=None, compact_mode=False):
         super().__init__(parent)
@@ -445,6 +785,14 @@ class SGPScannerPanel(QWidget):
         """)
         outer.addWidget(self.results, 1)
 
+        # Row registry — keyed by stable row key. Used by OrderBookWidget
+        # (the slip owner one level up) to look up payloads at place time
+        # and to repaint row highlights when the slip state changes.
+        self._row_payloads: Dict[str, tuple] = {}
+
+        # Wire row clicks → emit leg-ready dict for the slip owner
+        self.results.cellClicked.connect(self._onResultRowClicked)
+
     # ------------------------------------------------------------------
     # Population — called by ProphetXBrowser when the toggle opens.
     # ------------------------------------------------------------------
@@ -552,6 +900,12 @@ class SGPScannerPanel(QWidget):
         self.run_btn.setEnabled(False)
         self.tree.setEnabled(False)
         self.results.setRowCount(0)
+        # Drop the row registry — a fresh scan invalidates both the row
+        # indexes and the underlying quote (savedParlayId TTL expires
+        # server-side too). OrderBookWidget will clear its slip in
+        # response to the scan_started signal.
+        self._row_payloads.clear()
+        self.scan_started.emit()
         self.progress.setVisible(True)
         # Scale by 1000 so the bar advances smoothly *within* an event —
         # driven by the per-quote Novig progress callback — rather than
@@ -640,8 +994,23 @@ class SGPScannerPanel(QWidget):
     # ------------------------------------------------------------------
     # Result rows
     # ------------------------------------------------------------------
+    @staticmethod
+    def _rowKey(src: str, row: dict) -> str:
+        """Stable identifier for a result row across click toggles."""
+        if src == "PX":
+            return (f"PX|{row.get('event_id')}|{row.get('player')}|"
+                    f"{row.get('chain')}")
+        return (f"NV|{row.get('player')}|{row.get('dominant_type')}|"
+                f"{row.get('dominant_side')}|{row.get('implied_type')}|"
+                f"{row.get('implied_side')}|"
+                f"{row.get('dominant_outcome_id')}|"
+                f"{row.get('implied_outcome_id')}")
+
     def _addRow(self, src: str, row: dict) -> None:
         r = self.results.rowCount()
+        # Register the row payload for slip lookup at click time.
+        key = self._rowKey(src, row)
+        self._row_payloads[key] = (src, row, r)
         self.results.insertRow(r)
         if src == "PX":
             player = row.get("player", "")
@@ -704,6 +1073,62 @@ class SGPScannerPanel(QWidget):
         except (TypeError, ValueError):
             return str(american)
         return f"+{a}" if a > 0 else str(a)
+
+    # ------------------------------------------------------------------
+    # Slip wiring: row click emits a ready-to-slip leg dict for the
+    # OrderBookWidget owner to consume. Highlight maintenance is driven
+    # by the owner via set_row_slipped().
+    # ------------------------------------------------------------------
+    def _slipLabelForRow(self, src: str, row: dict) -> tuple:
+        if src == "PX":
+            return (f"{row.get('player', '')} — {row.get('chain', '')}",
+                    row.get("sgp_odds"))
+        return (f"{row.get('player', '')} — {self._nvLegs(row)}",
+                row.get("american_combined"))
+
+    def _onResultRowClicked(self, table_row: int, _col: int) -> None:
+        target = None
+        for key, (src, row_dict, idx) in self._row_payloads.items():
+            if idx == table_row:
+                target = (key, src, row_dict)
+                break
+        if target is None:
+            return
+        key, src, row_dict = target
+        label, odds = self._slipLabelForRow(src, row_dict)
+        try:
+            odds_int = int(odds) if odds is not None else None
+        except (TypeError, ValueError):
+            odds_int = None
+        edge_pct = (float(row_dict.get("edge_pct") or 0.0)
+                    if src == "PX"
+                    else self._nvEdgePct(row_dict))
+        leg = {
+            "src": src,
+            "key": key,
+            "label": label,
+            "odds": odds_int,
+            "edge_pct": edge_pct,
+            "raw": row_dict,
+            "bet_kind": "sgp",
+            "status": "",
+        }
+        self.leg_picked.emit(leg)
+
+    def set_row_slipped(self, key: str, slipped: bool) -> None:
+        """Called by the slip owner when a leg sourced from this panel
+        enters or leaves the slip. Repaints the SRC-cell tint."""
+        payload = self._row_payloads.get(key)
+        if payload is None:
+            return
+        _src, _row, table_row = payload
+        item = self.results.item(table_row, 0)
+        if item is None:
+            return
+        if slipped:
+            item.setBackground(QColor(94, 234, 212, 60))   # mint wash
+        else:
+            item.setBackground(QColor(0, 0, 0, 0))
 
 
 class OddsBarDelegate(QStyledItemDelegate):
@@ -1050,6 +1475,29 @@ class OrderBookWidget(QWidget):
         self.sgp_panel.setVisible(False)
         layout.addWidget(self.sgp_panel, 1)
 
+        # --- Shared bet slip (pinned to bottom) ---
+        # Slip lives at the OrderBookWidget level so it persists across the
+        # orderbook ↔ EV-scan toggle and accepts legs from both surfaces.
+        self.bet_slip = BetSlipDrawer(compact_mode=self.compact_mode)
+        self.bet_slip.leg_removed.connect(self._onSlipLegRemoved)
+        self.bet_slip.place_requested.connect(self._onSlipPlaceRequested)
+        layout.addWidget(self.bet_slip)
+
+        # Master leg registry across all sources. key -> leg dict. Keeps
+        # row-highlight bookkeeping aware of which source originated a leg
+        # so removals route to the right repaint method.
+        self._slip_legs: Dict[str, dict] = {}
+
+        # SGP scanner pushes ready-to-slip legs via leg_picked. Scan starts
+        # drop scan-sourced legs (their quote IDs expire server-side).
+        self.sgp_panel.leg_picked.connect(self._onLegPicked)
+        self.sgp_panel.scan_started.connect(self._onScanStarted)
+
+        # Orderbook taps: clicking a row stages a "take this resting offer"
+        # leg. Registry mirrors the SGP panel's row-payload dict.
+        self._orderbook_row_payloads: Dict[str, dict] = {}
+        self.orderbook_table.cellClicked.connect(self._onOrderbookRowClicked)
+
     def createHeader(self):
         """Create header widget showing current market name"""
         header = QFrame()
@@ -1205,18 +1653,38 @@ class OrderBookWidget(QWidget):
         self.renderNormalizedOrderBook(nm)
 
     def _normalized_order_to_dict(self, side_label: str, abbreviated: str,
-                                  order) -> Dict:
+                                  order, source_line_id: str = "",
+                                  source: str = "") -> Dict:
         """Adapt one NormalizedOrder into the dict shape that
-        renderOrderRow / _extract_market_side already consume. This lets
-        the new path reuse every styling helper unchanged."""
+        renderOrderRow / _extract_market_side already consume. Also
+        stamps placement metadata (`_place_*` keys) so the row-click
+        handler can route a click into the bet slip without re-walking
+        the NormalizedMarket tree."""
         american = order.american
         display_odds = f"+{american}" if american > 0 else str(american)
+        raw = order.raw if hasattr(order, "raw") else None
+        place_info: Dict = {
+            "source": source,                  # "prophetx" / "novig:CASH"
+            "american": int(american),
+            "prob": float(order.prob or 0.0),
+            "size_usd": float(order.size_usd or 0.0),
+            "line_id": source_line_id,
+        }
+        if isinstance(raw, dict):
+            # PX raw is the original PX order dict (carries lineID, odds,
+            # value, displayName). NV raw is the ladder entry stamped
+            # with _market_id / _outcome_id / _is_bid by the adapter.
+            place_info["px_line_id"] = raw.get("lineID") or source_line_id
+            place_info["nv_market_id"] = raw.get("_market_id")
+            place_info["nv_outcome_id"] = raw.get("_outcome_id")
+            place_info["nv_is_bid"] = raw.get("_is_bid")
         return {
             "displayName": side_label,
             "abbreviatedName": abbreviated,
             "displayOdds": display_odds,
             "value": float(order.size_usd or 0.0),
             "odds": int(american),
+            "_place": place_info,
         }
 
     @staticmethod
@@ -1240,6 +1708,8 @@ class OrderBookWidget(QWidget):
         # Bring SIDE_* enums into local scope without forcing import-time
         # coupling at the top of the file.
         import exchange_market_keys as _emk
+        if hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads.clear()
 
         # Collect rows grouped by display section. For Over/Under markets,
         # produce two sections (OVER, UNDER); for team markets, produce
@@ -1273,7 +1743,9 @@ class OrderBookWidget(QWidget):
                         continue
                     for o in s.orders:
                         bucket.append(self._normalized_order_to_dict(
-                            full_label, short_label, o))
+                            full_label, short_label, o,
+                            source_line_id=ln.source_line_id,
+                            source=nm.source))
             # Under half: existing widget shows Under with strikes ASCENDING
             # so the closest-to-center strike sits next to the separator.
             # Reverse the line order by reversing the rows-per-line groups.
@@ -1289,7 +1761,9 @@ class OrderBookWidget(QWidget):
                                   if strike_str else side_word)
                     for o in s.orders:
                         under_rows.append(self._normalized_order_to_dict(
-                            full_label, full_label, o))
+                            full_label, full_label, o,
+                            source_line_id=ln.source_line_id,
+                            source=nm.source))
             if over_rows:
                 sections.append(("OVER", over_rows))
             if under_rows:
@@ -1302,7 +1776,10 @@ class OrderBookWidget(QWidget):
                 for s in ln.sides:
                     label = s.label or "?"
                     short = label[:10] + ".." if len(label) > 12 else label
-                    rows = [self._normalized_order_to_dict(label, short, o)
+                    rows = [self._normalized_order_to_dict(
+                                label, short, o,
+                                source_line_id=ln.source_line_id,
+                                source=nm.source)
                             for o in s.orders]
                     if rows:
                         sections.append((label, rows))
@@ -1431,6 +1908,8 @@ class OrderBookWidget(QWidget):
 
     def _renderDualOrderBookImpl(self, px_norm, nv_norm) -> None:
         import exchange_market_keys as _emk
+        if hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads.clear()
 
         # Combine lines by strike. Either source may have lines the
         # other lacks; we keep all of them. Strike None (moneyline)
@@ -1464,7 +1943,9 @@ class OrderBookWidget(QWidget):
 
         def _orders_for_side(strike, side_type):
             """Return merged source-tagged orders for one (strike,
-            side_type), sorted American-desc."""
+            side_type), sorted American-desc. Each tuple carries the
+            source key, the side label, the NormalizedOrder, AND the
+            parent Line's source_line_id (needed by the bet slip)."""
             out = []
             for src_key in ("px", "nv"):
                 ln = lines_by_strike[strike][src_key]
@@ -1474,7 +1955,8 @@ class OrderBookWidget(QWidget):
                     if s.side_type != side_type:
                         continue
                     for o in s.orders:
-                        out.append((src_key, s.label, o))
+                        out.append((src_key, s.label, o,
+                                    ln.source_line_id))
             out.sort(key=lambda t: t[2].american, reverse=True)
             return out
 
@@ -1486,10 +1968,14 @@ class OrderBookWidget(QWidget):
             for strike in line_order:
                 strike_str = self._format_strike_short(strike)
                 tagged = _orders_for_side(strike, _emk.SIDE_OVER)
-                for src_key, _side_label, o in tagged:
+                for src_key, _side_label, o, line_id in tagged:
                     label = (f"over {strike_str}".strip()
                              if strike_str else "over")
-                    od = self._normalized_order_to_dict(label, label, o)
+                    nm_source = (px_norm.source if src_key == "px"
+                                 else nv_norm.source)
+                    od = self._normalized_order_to_dict(
+                        label, label, o,
+                        source_line_id=line_id, source=nm_source)
                     od["_source"] = src_key
                     over_rows.append(od)
             # Under half: ascending strike order
@@ -1497,10 +1983,14 @@ class OrderBookWidget(QWidget):
             for strike in list(reversed(line_order)):
                 strike_str = self._format_strike_short(strike)
                 tagged = _orders_for_side(strike, _emk.SIDE_UNDER)
-                for src_key, _side_label, o in tagged:
+                for src_key, _side_label, o, line_id in tagged:
                     label = (f"under {strike_str}".strip()
                              if strike_str else "under")
-                    od = self._normalized_order_to_dict(label, label, o)
+                    nm_source = (px_norm.source if src_key == "px"
+                                 else nv_norm.source)
+                    od = self._normalized_order_to_dict(
+                        label, label, o,
+                        source_line_id=line_id, source=nm_source)
                     od["_source"] = src_key
                     under_rows.append(od)
             if over_rows:
@@ -1534,7 +2024,8 @@ class OrderBookWidget(QWidget):
                             team_order.append(team_sym)
                         team_strike_groups[team_sym].setdefault(strike, [])
                         for o in s.orders:
-                            team_strike_groups[team_sym][strike].append((src_key, o))
+                            team_strike_groups[team_sym][strike].append(
+                                (src_key, o, ln.source_line_id))
 
             for team_sym in team_order:
                 strikes_in_team = sorted(
@@ -1549,9 +2040,12 @@ class OrderBookWidget(QWidget):
                                   if strike is not None else "")
                     row_label = (f"{team_sym} {strike_str}".strip()
                                  if strike_str else team_sym)
-                    for src_key, o in tagged:
+                    for src_key, o, line_id in tagged:
+                        nm_source = (px_norm.source if src_key == "px"
+                                     else nv_norm.source)
                         od = self._normalized_order_to_dict(
-                            row_label, row_label, o)
+                            row_label, row_label, o,
+                            source_line_id=line_id, source=nm_source)
                         od["_source"] = src_key
                         rows.append(od)
                 if rows:
@@ -1676,11 +2170,104 @@ class OrderBookWidget(QWidget):
             self.orderbook_table.setUpdatesEnabled(True)
 
     def _renderOrderBookImpl(self, market_data: Dict):
+        if hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads.clear()
         all_orders = []
 
         # Check if this market has multiple lines (spread/total) or simple selections (moneyline)
+        # Stamp `_place` metadata on each PX order so the bet slip's
+        # cellClicked handler can route the click into a wager leg, the
+        # same way the normalized + dual render paths do.
+        def _pick_line_id_from_outcomes(market: Dict, order: Dict) -> str:
+            """ProphetX moneyline / simple markets carry per-side line ids
+            on `market.outcomes` (one entry per competitor). Match by
+            competitorId, falling back to side index via the order's
+            integer `id` if competitorId is absent."""
+            outcomes = market.get("outcomes") if isinstance(market, dict) else None
+            if not isinstance(outcomes, list):
+                return ""
+            comp = order.get("competitorId")
+            if comp is not None:
+                for oc in outcomes:
+                    if not isinstance(oc, dict):
+                        continue
+                    if oc.get("competitorId") == comp:
+                        for k in ("lineID", "lineId", "line_id"):
+                            v = oc.get(k)
+                            if v:
+                                return str(v)
+                        break
+            # Fallback: order.id appears to index into outcomes for some
+            # market types. Try positional match before giving up.
+            try:
+                idx = int(order.get("id"))
+                if 0 <= idx < len(outcomes) and isinstance(outcomes[idx], dict):
+                    for k in ("lineID", "lineId", "line_id"):
+                        v = outcomes[idx].get(k)
+                        if v:
+                            return str(v)
+            except (TypeError, ValueError):
+                pass
+            return ""
+
+        def _pick_line_id(order: Dict, parent_line: Dict, market: Dict) -> str:
+            # 1) order itself (rare)
+            for k in ("lineID", "lineId", "line_id"):
+                v = order.get(k)
+                if v:
+                    return str(v)
+            # 2) parent marketLine (spread/total path)
+            if isinstance(parent_line, dict):
+                for k in ("lineID", "lineId", "line_id"):
+                    v = parent_line.get(k)
+                    if v:
+                        return str(v)
+                obj = parent_line.get("line")
+                if isinstance(obj, dict):
+                    for kk in ("id", "lineID", "lineId"):
+                        v = obj.get(kk)
+                        if v:
+                            return str(v)
+            # 3) market.outcomes matched by competitorId (moneyline path)
+            v = _pick_line_id_from_outcomes(market, order)
+            if v:
+                return v
+            return ""
+
+        # One-time diagnostic if we still can't find a lineId after
+        # walking both order + parent containers.
+        _logged_missing = [False]
+
+        def _stamp_px(order: Dict, parent_line: Dict, market: Dict) -> Dict:
+            try:
+                american = int(order.get("odds"))
+            except (TypeError, ValueError):
+                return order
+            prob = (1 / (1 + american / 100) if american > 0
+                    else abs(american) / (abs(american) + 100))
+            line_id = _pick_line_id(order, parent_line, market)
+            if not line_id and not _logged_missing[0]:
+                _logged_missing[0] = True
+                outcomes = market.get("outcomes") if isinstance(market, dict) else None
+                print(f"[bet-slip] PX order has no lineId. "
+                      f"order={order}, "
+                      f"outcomes sample={outcomes[:2] if isinstance(outcomes, list) else outcomes}",
+                      flush=True)
+            order["_place"] = {
+                "source": "prophetx",
+                "american": american,
+                "prob": prob,
+                "size_usd": float(order.get("value") or 0.0),
+                "line_id": line_id,
+                "px_line_id": line_id,
+                "nv_market_id": None,
+                "nv_outcome_id": None,
+                "nv_is_bid": None,
+            }
+            return order
+
         if 'marketLines' in market_data and market_data['marketLines']:
-            # Spread/Total markets - collect all orders from all lines
+            # Spread/Total markets - lineId lives on each marketLine
             for market_line in market_data['marketLines']:
                 line_name = market_line.get('name', '')
                 selections = market_line.get('selections', [])
@@ -1690,16 +2277,18 @@ class OrderBookWidget(QWidget):
                     if not side_orders:
                         continue
                     for order in side_orders:
-                        all_orders.append(order)
+                        all_orders.append(
+                            _stamp_px(order, market_line, market_data))
 
         elif 'selections' in market_data:
-            # Moneyline/simple markets
+            # Moneyline/simple markets — lineId on the market itself
             selections = market_data.get('selections', [])
             for side_orders in selections:
                 if not side_orders:
                     continue
                 for order in side_orders:
-                    all_orders.append(order)
+                    all_orders.append(
+                        _stamp_px(order, {}, market_data))
 
         # Clear spans (separator positions can move) but DO NOT call
         # clearContents() or setRowCount(0) — both destroy the pooled
@@ -1847,6 +2436,17 @@ class OrderBookWidget(QWidget):
         value = order.get('value', 0)
         odds_value = order.get('odds', 0)
 
+        # Register the row for bet-slip lookup. _place is stamped by the
+        # normalized adapter; legacy PX-only path leaves it absent, which
+        # the click handler treats as "not placeable from here".
+        place = order.get("_place")
+        if place is not None and hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads[row] = {
+                **place,
+                "display_name": display_name,
+                "display_odds": display_odds,
+            }
+
         # Determine if this is a favorite (negative odds) or underdog (positive odds)
         side_type = 'bid' if odds_value < 0 else 'ask'
 
@@ -1954,6 +2554,282 @@ class OrderBookWidget(QWidget):
         if odds > 0:
             return f"+{odds}"
         return str(odds)
+
+    # ==================================================================
+    # Bet slip orchestration (cross-source: SGP scanner + orderbook)
+    # ==================================================================
+
+    @staticmethod
+    def _orderbookRowKey(place: dict) -> str:
+        """Stable key for an orderbook row click. Encodes source + the
+        specific resting offer being targeted, so two distinct levels at
+        the same price (e.g. two NV bids at $0.45 from different
+        traders) don't collide."""
+        return (f"OB|{place.get('source')}|{place.get('line_id')}|"
+                f"{place.get('nv_outcome_id') or ''}|"
+                f"{place.get('american')}|{place.get('size_usd'):.2f}")
+
+    def _onLegPicked(self, leg: dict) -> None:
+        """Leg arrived from the SGP scanner (or any other source)."""
+        key = leg.get("key")
+        if not key:
+            return
+        if key in self._slip_legs:
+            self.bet_slip.remove_leg(key)
+            return
+        leg.setdefault("source_widget", "sgp")
+        self._slip_legs[key] = leg
+        self.bet_slip.add_leg(leg)
+        self.bet_slip.expand()
+        self._setLegHighlight(leg, slipped=True)
+
+    def _onSlipLegRemoved(self, key: str) -> None:
+        leg = self._slip_legs.pop(key, None)
+        if leg is not None:
+            self._setLegHighlight(leg, slipped=False)
+
+    def _setLegHighlight(self, leg: dict, *, slipped: bool) -> None:
+        """Tell the leg's source to repaint its row's selection state."""
+        src_origin = leg.get("source_widget")
+        if src_origin == "sgp":
+            if hasattr(self, "sgp_panel"):
+                self.sgp_panel.set_row_slipped(leg["key"], slipped)
+        elif src_origin == "ob":
+            # Orderbook rows live on `self.orderbook_table`. Iterate to
+            # find the row with this place key — cheap, the table has at
+            # most ~50 rows.
+            target_row = leg.get("table_row")
+            if target_row is not None:
+                item = self.orderbook_table.item(target_row, 0)
+                if item is not None:
+                    if slipped:
+                        item.setBackground(QColor(94, 234, 212, 60))
+                    else:
+                        item.setBackground(QColor(0, 0, 0, 0))
+
+    def _onScanStarted(self) -> None:
+        """Drop any SGP-sourced legs when a new scan begins; the cached
+        savedParlayId quote IDs are about to be invalid server-side."""
+        sgp_keys = [k for k, v in self._slip_legs.items()
+                    if v.get("source_widget") == "sgp"]
+        for k in sgp_keys:
+            self.bet_slip.remove_leg(k)
+
+    def _onOrderbookRowClicked(self, table_row: int, _col: int) -> None:
+        place = self._orderbook_row_payloads.get(table_row)
+        if not place:
+            return
+        key = self._orderbookRowKey(place)
+        if key in self._slip_legs:
+            self.bet_slip.remove_leg(key)
+            return
+        odds = place.get("american")
+        leg = {
+            "src": ("PX" if (place.get("source") or "").startswith("prophetx")
+                    else "NV"),
+            "key": key,
+            "label": (f"{place.get('display_name', '?')} "
+                      f"@ {place.get('display_odds', '?')} "
+                      f"(${place.get('size_usd', 0):,.2f} avail)"),
+            "odds": odds,
+            "edge_pct": 0.0,
+            "raw": place,
+            "bet_kind": "wager",
+            "status": "",
+            "source_widget": "ob",
+            "table_row": table_row,
+        }
+        self._slip_legs[key] = leg
+        self.bet_slip.add_leg(leg)
+        self.bet_slip.expand()
+        self._setLegHighlight(leg, slipped=True)
+
+    # ------------------------------------------------------------------
+    # Place flow — dispatch by (src, bet_kind).
+    # ------------------------------------------------------------------
+    def _onSlipPlaceRequested(self, legs: list, wager: float) -> None:
+        try:
+            asyncio.ensure_future(self._runPlacements(legs, wager))
+        except RuntimeError as e:
+            print(f"[bet-slip] Cannot start placement task: {e}")
+            self.bet_slip.place_btn.setEnabled(True)
+
+    async def _runPlacements(self, legs: list, wager: float) -> None:
+        try:
+            for leg in legs:
+                src = leg.get("src")
+                kind = leg.get("bet_kind", "sgp")
+                key = leg.get("key")
+                self.bet_slip.mark_leg_status(key, "placing…", success=True)
+                try:
+                    if kind == "sgp" and src == "PX":
+                        ok, msg, dollars = await self._placePXSGP(
+                            leg.get("raw") or {}, wager)
+                    elif kind == "sgp" and src == "NV":
+                        ok, msg, dollars = await self._placeNVSGP(
+                            leg.get("raw") or {}, wager)
+                    elif kind == "wager" and src == "PX":
+                        ok, msg, dollars = await self._placePXWager(
+                            leg.get("raw") or {}, wager)
+                    elif kind == "wager" and src == "NV":
+                        ok, msg, dollars = await self._placeNVWager(
+                            leg.get("raw") or {}, wager)
+                    else:
+                        ok, msg, dollars = False, f"unknown {src}/{kind}", 0.0
+                except Exception as e:
+                    ok, msg, dollars = False, f"error: {e}", 0.0
+                self.bet_slip.mark_leg_status(key, msg, success=ok)
+                if ok and dollars > 0:
+                    self.bet_slip.record_placement(dollars)
+        finally:
+            self.bet_slip.place_btn.setEnabled(True)
+
+    # --- SGP placements (unchanged from previous SGP-only slip) -------
+
+    async def _placePXSGP(self, row: dict, wager: float) -> tuple:
+        from ProphetXQuery import (GetSGPQuoteAsync, PlaceSGPAsync,
+                                   load_prophetx_cookies)
+        legs = row.get("legs")
+        if not legs:
+            return False, "no legs cached", 0.0
+        import aiohttp
+        try:
+            cookies = load_prophetx_cookies()
+        except FileNotFoundError:
+            return False, "no PX session", 0.0
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(cookies=cookies,
+                                         timeout=timeout) as session:
+            quote = await GetSGPQuoteAsync(session, legs, stake=wager)
+            if not quote or not quote.get("success"):
+                return False, "re-quote failed", 0.0
+            data = quote.get("data") or {}
+            parlay_id = data.get("parlayId")
+            offers = data.get("offers") or []
+            if not parlay_id or not offers:
+                return False, "no parlayId/offers", 0.0
+            tier = None
+            for o in offers:
+                try:
+                    s = float(o.get("stake") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if s <= wager + 1e-6 and (tier is None
+                                          or s > float(tier["stake"])):
+                    tier = o
+            tier = tier or offers[0]
+            live_odds = tier.get("odds")
+            hr_odds = row.get("hr_odds")
+            if (isinstance(live_odds, (int, float))
+                    and isinstance(hr_odds, (int, float))):
+                live_dec = (1 + live_odds / 100 if live_odds > 0
+                            else 1 + 100 / abs(live_odds))
+                hr_dec = (1 + hr_odds / 100 if hr_odds > 0
+                          else 1 + 100 / abs(hr_odds))
+                if live_dec <= hr_dec:
+                    return False, "edge gone (drift)", 0.0
+            actual_stake = float(tier.get("stake") or wager)
+            resp = await PlaceSGPAsync(session, parlay_id,
+                                       int(live_odds), actual_stake)
+        if not resp or not resp.get("success"):
+            return False, "place rejected", 0.0
+        return True, f"placed ${actual_stake:.2f}", actual_stake
+
+    async def _placeNVSGP(self, row: dict, wager: float) -> tuple:
+        import aiohttp
+        from novig_async import (price_parlay_async, place_parlay_async,
+                                 REQUEST_TIMEOUT)
+        dom_id = row.get("dominant_outcome_id")
+        imp_id = row.get("implied_outcome_id")
+        if not dom_id or not imp_id:
+            return False, "missing outcome ids", 0.0
+        try:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+                quote = await price_parlay_async(session, [dom_id, imp_id])
+                saved_id = quote.get("id")
+                if not saved_id:
+                    return False, "no savedParlayId", 0.0
+                try:
+                    from NovigClient import summarize_parlay_quote
+                    s = summarize_parlay_quote(quote)
+                    live_combined = s.get("combined_price")
+                except Exception:
+                    live_combined = None
+                cached_dom = row.get("dominant_price")
+                if (live_combined is not None and cached_dom is not None
+                        and float(live_combined) + 1e-6 >= float(cached_dom)):
+                    return False, "edge gone (drift)", 0.0
+                resp = await place_parlay_async(session, saved_id, wager)
+        except Exception as e:
+            return False, f"error: {e}", 0.0
+        status = resp.get("status") if isinstance(resp, dict) else None
+        if status in ("Filled", "Pending", "Open"):
+            return True, f"{status} ${wager:.2f}", wager
+        return False, f"status={status!r}", 0.0
+
+    # --- Single-bet placements (new) ---------------------------------
+
+    async def _placePXWager(self, place: dict, wager: float) -> tuple:
+        """Take a resting offer on ProphetX. `place` is the orderbook
+        row payload stamped by _normalized_order_to_dict."""
+        from ProphetXQuery import (PlaceMarketOrderAsync,
+                                   load_prophetx_cookies)
+        line_id = place.get("px_line_id") or place.get("line_id")
+        odds = place.get("american")
+        avail = float(place.get("size_usd") or 0.0)
+        if not line_id or odds is None:
+            return False, "missing lineId/odds", 0.0
+        actual_stake = min(wager, avail) if avail > 0 else wager
+        if actual_stake <= 0:
+            return False, "no liquidity", 0.0
+        import aiohttp
+        try:
+            cookies = load_prophetx_cookies()
+        except FileNotFoundError:
+            return False, "no PX session", 0.0
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(cookies=cookies,
+                                         timeout=timeout) as session:
+            resp = await PlaceMarketOrderAsync(session, line_id,
+                                               int(odds), actual_stake)
+        if not resp:
+            return False, "place rejected", 0.0
+        # Server returns {orderId, status, ...} — accept anything 2xx-shaped
+        # since the read-back GET handles fill detail.
+        return True, f"placed ${actual_stake:.2f}", actual_stake
+
+    async def _placeNVWager(self, place: dict, wager: float) -> tuple:
+        """Take a resting offer on Novig. `place` is the orderbook row
+        payload stamped by _normalized_order_to_dict."""
+        from novig_async import (place_order_async, stake_to_qty_centi,
+                                 REQUEST_TIMEOUT, NovigError)
+        market_id = place.get("nv_market_id")
+        outcome_id = place.get("nv_outcome_id")
+        is_bid = place.get("nv_is_bid")
+        prob = float(place.get("prob") or 0.0)
+        avail = float(place.get("size_usd") or 0.0)
+        if not market_id or not outcome_id or prob <= 0:
+            return False, "missing market/outcome", 0.0
+        if is_bid is None:
+            is_bid = True
+        actual_stake = min(wager, avail) if avail > 0 else wager
+        if actual_stake <= 0:
+            return False, "no liquidity", 0.0
+        qty_centi = stake_to_qty_centi(actual_stake, prob)
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
+                resp = await place_order_async(
+                    session, market_id, outcome_id, prob, qty_centi,
+                    is_bid=bool(is_bid))
+        except NovigError as e:
+            return False, f"NV: {e}", 0.0
+        except Exception as e:
+            return False, f"error: {e}", 0.0
+        status = resp.get("status") if isinstance(resp, dict) else None
+        if status in ("FILLED", "PENDING", "OPEN"):
+            return True, f"{status.title()} ${actual_stake:.2f}", actual_stake
+        return False, f"status={status!r}", 0.0
 
 
 class ProphetXBrowser(QWidget):
@@ -2770,6 +3646,13 @@ class ProphetXBrowser(QWidget):
                 h.update(str(o.get('value', '')).encode())
                 h.update(b",")
                 h.update((o.get('displayName') or '').encode())
+                # Include lineID so the v1->v2 transition (v1 lacks the
+                # per-order lineID; v2 carries it) bumps the signature
+                # and forces a re-render. Without this, fresh v2 data is
+                # ingested but the table keeps showing stale v1 order
+                # dicts, breaking single-bet placement.
+                h.update(b",")
+                h.update(str(o.get('lineID') or '').encode())
 
         market_lines = market.get('marketLines') or []
         if market_lines:

@@ -7,6 +7,7 @@ Async API queries + Background worker for non-blocking orderbook updates
 import aiohttp
 import json
 import asyncio
+import orjson
 from datetime import datetime
 from typing import Optional, Dict, List
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
@@ -22,6 +23,8 @@ HEADERS = {
     "X-Currency": "cash",
     "Authorization": f"Bearer {PROPHETX_AUTH_TOKEN}",
 }
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
 
 
 # ============================================================================
@@ -48,7 +51,7 @@ async def GetTournamentsAsync(session: aiohttp.ClientSession, type_filter: str =
     }
 
     try:
-        async with session.get(url, headers=HEADERS, params=params) as response:
+        async with session.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT) as response:
             if response.status != 200:
                 print(f"ERROR: Failed to fetch tournaments (status: {response.status})")
                 return None
@@ -61,9 +64,23 @@ async def GetTournamentsAsync(session: aiohttp.ClientSession, type_filter: str =
         return None
 
 
+# Cooldown for v2 fallback: once v2 returns 403 (CloudFront WAF) we
+# avoid the wasted round-trip for this many seconds, then probe again.
+# v1 lacks lineID on moneyline/simple markets (only marketLines-shaped
+# player props carry them), which breaks single-bet placement — so we
+# must recover to v2 as soon as the WAF rule clears.
+import time as _time
+_PX_V2_BLOCK_UNTIL = 0.0
+_PX_V2_BLOCK_SECONDS = 300  # 5 min
+
+
 async def GetEventMarketsAsync(session: aiohttp.ClientSession, event_id: int) -> Optional[Dict]:
     """
     Async fetch all markets (orderbook) for a specific event.
+
+    Tries v2 first; transparently falls back to v1 if CloudFront blocks
+    v2 with a 403. Once any v2 call has been blocked we stop trying it
+    for the rest of the session so we don't keep hammering a WAF rule.
 
     Args:
         session: aiohttp ClientSession
@@ -72,25 +89,112 @@ async def GetEventMarketsAsync(session: aiohttp.ClientSession, event_id: int) ->
     Returns:
         Response data dictionary or None on error
     """
-    url = f"{BASE_URL}/v2/events/{event_id}/markets"
+    global _PX_V2_BLOCK_UNTIL
+    v2_blocked_now = _time.time() < _PX_V2_BLOCK_UNTIL
+    versions = ("v1",) if v2_blocked_now else ("v2", "v1")
 
-    try:
-        async with session.get(url, headers=HEADERS) as response:
-            if response.status != 200:
+    for version in versions:
+        url = f"{BASE_URL}/{version}/events/{event_id}/markets"
+        try:
+            async with session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as response:
+                if response.status == 200:
+                    data_bytes = await response.read()
+                    if not data_bytes:
+                        return None
+                    return orjson.loads(data_bytes)
+
+                if response.status == 403 and version == "v2":
+                    # CloudFront edge block — arm the TTL and try v1 for
+                    # this event. Subsequent calls will probe v2 again
+                    # once the cooldown expires.
+                    _PX_V2_BLOCK_UNTIL = _time.time() + _PX_V2_BLOCK_SECONDS
+                    print(f"ProphetX /v2 blocked by CloudFront — falling back to /v1 for {_PX_V2_BLOCK_SECONDS}s",
+                          flush=True)
+                    continue
+
+                # Any other non-200: surface it and stop.
+                body_preview = ""
+                try:
+                    body_preview = (await response.text())[:200]
+                except Exception:
+                    pass
+                print(f"ERROR: ProphetX markets HTTP {response.status} ({version}) for event {event_id}: {body_preview}",
+                      flush=True)
                 return None
+        except orjson.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON for event {event_id} ({version}): {e}")
+            return None
+        except Exception as e:
+            print(f"ERROR: Failed to fetch markets for event {event_id} ({version}): {e}")
+            return None
 
-            text = await response.text()
-            if not text.strip():
-                return None
+    return None
 
-            data = json.loads(text)
-            return data
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON for event {event_id}: {e}")
-        return None
-    except Exception as e:
-        print(f"ERROR: Failed to fetch markets for event {event_id}: {e}")
-        return None
+
+def precompute_market_caches(markets_data: Dict) -> Dict:
+    """Walk every market once and stamp two derived caches on each:
+
+      - ``_active_liquidity``: sum of every order's ``value``. Read by
+        LiquidityWidget.calculateActiveMarketLiquidity to populate the
+        combo box's dollar figures without re-walking the orders.
+      - ``_content_signature``: blake2b digest of the market's name +
+        line names + every (odds, value, displayName). Read by
+        ProphetXBrowser._marketContentSignature to short-circuit the
+        orderbook re-render when nothing visible has changed.
+
+    Designed to run in a ThreadPoolExecutor via run_in_executor() so the
+    ~20-40ms of order-walking work for a 199-market payload lands in a
+    worker thread instead of the qasync (main) loop. CPython releases
+    the GIL every ~5ms during pure-Python work, which gives the Qt
+    event loop frequent breathing room and prevents the visible
+    tickertape stutter on each refresh tick.
+
+    Mutates ``markets_data`` in place and returns it so the caller can
+    write ``markets_data = await loop.run_in_executor(...)``.
+    """
+    import hashlib
+    markets = (markets_data or {}).get('data', {}).get('markets', []) or []
+
+    for market in markets:
+        total = 0.0
+        h = hashlib.blake2b(digest_size=12)
+        h.update((market.get('name', '') or '').encode())
+
+        def _walk_orders(side_orders):
+            nonlocal total
+            if not side_orders:
+                return
+            for o in side_orders:
+                v = o.get('value', 0)
+                if v:
+                    try:
+                        total += float(v)
+                    except (TypeError, ValueError):
+                        pass
+                h.update(b"|")
+                h.update(str(o.get('odds', '')).encode())
+                h.update(b",")
+                h.update(str(v).encode())
+                h.update(b",")
+                h.update((o.get('displayName') or '').encode())
+                h.update(b",")
+                h.update(str(o.get('lineID') or '').encode())
+
+        market_lines = market.get('marketLines') or []
+        if market_lines:
+            for ml in market_lines:
+                h.update(b"\n")
+                h.update((ml.get('name', '') or '').encode())
+                for side_orders in ml.get('selections', []) or []:
+                    _walk_orders(side_orders)
+        else:
+            for side_orders in market.get('selections', []) or []:
+                _walk_orders(side_orders)
+
+        market['_active_liquidity'] = total
+        market['_content_signature'] = h.hexdigest()
+
+    return markets_data
 
 
 def ExtractEventList(tournaments_data: Dict) -> List[Dict]:
@@ -179,7 +283,7 @@ class ProphetXWorker(QObject):
         try:
             self.status_update.emit("Fetching ProphetX tournaments...")
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
                 tournaments_data = await GetTournamentsAsync(session)
 
                 if not tournaments_data:
@@ -203,7 +307,7 @@ class ProphetXWorker(QObject):
         try:
             self.status_update.emit(f"Updating ProphetX event {self.current_event_id}...")
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
                 markets_data = await GetEventMarketsAsync(session, self.current_event_id)
 
                 if not markets_data:
@@ -237,7 +341,7 @@ async def FetchSingleEventAsync(event_id: int, event_metadata: Optional[Dict] = 
     Returns:
         Complete event data with markets, or None on error
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
         markets_data = await GetEventMarketsAsync(session, event_id)
 
         if not markets_data:
@@ -281,7 +385,7 @@ async def FetchAllEventsAsync(save_combined: bool = False, max_concurrent: int =
                 print(f"  Error fetching {event['name']}: {e}")
                 return (event, None)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
         # Step 1: Get all tournaments and events
         print("\n[1/2] Fetching tournaments and events...")
         tournaments_data = await GetTournamentsAsync(session)

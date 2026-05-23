@@ -432,6 +432,106 @@ async def GetSGPQuoteAsync(session: aiohttp.ClientSession,
         return None
 
 
+# Single-leg market-order endpoint. Distinct from the parlay /confirm path:
+# this places a direct take against a specific orderbook line. Cookie auth
+# is enough (mirrors the rest of the prophetx.co paths).
+MARKET_ORDERS_URL = "https://www.prophetx.co/trade/private/api/v1/market-orders"
+
+
+async def PlaceMarketOrderAsync(session: aiohttp.ClientSession,
+                                line_id: str,
+                                american_odds: int,
+                                stake: float,
+                                expected_avg_odds: Optional[int] = None,
+                                ) -> Optional[Dict]:
+    """Take a resting offer on ProphetX.
+
+    Args:
+        session: aiohttp session with the prophetx.co cookie jar
+        line_id: target orderbook line (`lineID` on the selection dict)
+        american_odds: the price the trader is willing to accept; the
+            server may fill across multiple price levels if size at the
+            named odds is exhausted.
+        stake: dollar stake (server-side dollars, not centi-units)
+        expected_avg_odds: drift guard. If the avg fill odds drift worse
+            than this, the server rejects. Defaults to american_odds.
+
+    Returns the order response (status, fill info) or None on transport
+    / non-200 failure.
+    """
+    body = {
+        "lineId": line_id,
+        "oddsList": [int(american_odds)],
+        "expectedAverageOdds": int(expected_avg_odds
+                                   if expected_avg_odds is not None
+                                   else american_odds),
+        "stake": float(stake),
+    }
+    # /market-orders needs Bearer auth in addition to the cookie jar —
+    # /confirm accepts cookie-only, but the private trade endpoints
+    # require both (401 otherwise).
+    headers = dict(PARLAY_HEADERS)
+    try:
+        from Creds import PROPHETX_AUTH_TOKEN as _tok
+        if _tok:
+            headers["Authorization"] = f"Bearer {_tok}"
+    except ImportError:
+        pass
+    try:
+        async with session.post(MARKET_ORDERS_URL, headers=headers,
+                                json=body) as resp:
+            text = await resp.text()
+            if resp.status not in (200, 201) or not text.strip():
+                print(f"ERROR: ProphetX market-orders HTTP {resp.status}: "
+                      f"{text[:300]}")
+                return None
+            return json.loads(text)
+    except Exception as e:
+        print(f"ERROR: ProphetX market-order failed: {e}")
+        return None
+
+
+# Placement endpoint — different host/path than the quote. Captured live: the
+# web app POSTs {odds, parlayId, stake} here after the user confirms an
+# offer tier from the quote response. Auth piggybacks on the prophetx.co
+# cookie jar; PARLAY_HEADERS already carries the rest.
+CONFIRM_URL = "https://www.prophetx.co/confirm"
+
+
+async def PlaceSGPAsync(session: aiohttp.ClientSession,
+                        parlay_id: str,
+                        odds: int,
+                        stake: float) -> Optional[Dict]:
+    """Confirm and place a previously-quoted ProphetX SGP.
+
+    Args:
+        session: aiohttp session carrying the prophetx.co cookie jar
+            (same one used for GetSGPQuoteAsync)
+        parlay_id: `data.parlayId` from the quote response
+        odds: American odds of the chosen `data.offers[i]` tier
+        stake: dollar stake matching that offer tier
+
+    Returns the parsed JSON response on success
+    ({"data": {"parlayId", "createdAt"}, "success": True}), or None on
+    transport / non-200 failure. Caller is responsible for sanity-checking
+    the stake against the offer tier before invoking this — server will
+    reject mismatches.
+    """
+    body = {"odds": int(odds), "parlayId": parlay_id, "stake": stake}
+    try:
+        async with session.post(CONFIRM_URL, headers=PARLAY_HEADERS,
+                                json=body) as resp:
+            text = await resp.text()
+            if resp.status != 200 or not text.strip():
+                print(f"ERROR: ProphetX /confirm HTTP {resp.status}: "
+                      f"{text[:300]}")
+                return None
+            return json.loads(text)
+    except Exception as e:
+        print(f"ERROR: ProphetX SGP placement failed: {e}")
+        return None
+
+
 def GetSGPQuote(market_lines: List[Dict], stake: float = 1.0) -> Tuple[Optional[Dict], Optional[requests.Response]]:
     """
     Request a same-game parlay quote from ProphetX.
@@ -676,12 +776,14 @@ class SGPScanner:
         return idx
 
     def build_row(self, event_name, player, chain_key, line, hr_odds, hr_dec,
-                  implied_over, sgp_odds, sgp_stake) -> Dict:
+                  implied_over, sgp_odds, sgp_stake,
+                  event_id=None, legs=None) -> Dict:
         sgp_dec = self.amer_to_dec(sgp_odds)
         edge_dec = sgp_dec - hr_dec
         edge_pct = (sgp_dec / hr_dec - 1) * 100 if hr_dec else 0
         return {
             "event": event_name,
+            "event_id": event_id,
             "player": player,
             "chain": f"HR + {chain_key.upper()} O{line}",
             "hr_odds": hr_odds,
@@ -691,6 +793,10 @@ class SGPScanner:
             "sgp_stake": sgp_stake,
             "edge_decimal": round(edge_dec, 2),
             "edge_pct": round(edge_pct, 1),
+            # Placement metadata: the leg list the bet slip re-quotes and
+            # confirms with. None when the scanner runs without keeping
+            # legs around (legacy CLI path).
+            "legs": legs,
         }
 
     @staticmethod
@@ -721,9 +827,10 @@ class SGPScanner:
         o = offers[0]
         if o.get("odds") is None:
             return None
-        return o.get("odds"), o.get("stake")
+        return o.get("odds"), o.get("stake"), legs
 
-    async def scan_player(self, session, markets_data, event_name, player, chains) -> List[Dict]:
+    async def scan_player(self, session, markets_data, event_name, player, chains,
+                          event_id=None) -> List[Dict]:
         hr_market = chains.get("hr")
         if not hr_market:
             return []
@@ -747,10 +854,11 @@ class SGPScanner:
                                          probe_market, probe_over)
         if probe_res is None:
             return []
-        probe_odds, probe_stake = probe_res
+        probe_odds, probe_stake, probe_legs = probe_res
         probe_row = self.build_row(event_name, player, probe_key,
                                    probe_over.get("line"), hr_odds, hr_dec,
-                                   probe_over, probe_odds, probe_stake)
+                                   probe_over, probe_odds, probe_stake,
+                                   event_id=event_id, legs=probe_legs)
         rows.append(probe_row)
         self.print_row(probe_row)
         if probe_row["edge_decimal"] <= self.PROBE_THRESHOLD:
@@ -772,10 +880,11 @@ class SGPScanner:
         for (chain_key, implied_over), res in zip(leg_meta, results):
             if isinstance(res, Exception) or res is None:
                 continue
-            sgp_odds, sgp_stake = res
+            sgp_odds, sgp_stake, fan_legs = res
             row = self.build_row(event_name, player, chain_key,
                                  implied_over.get("line"), hr_odds, hr_dec,
-                                 implied_over, sgp_odds, sgp_stake)
+                                 implied_over, sgp_odds, sgp_stake,
+                                 event_id=event_id, legs=fan_legs)
             rows.append(row)
             self.print_row(row)
         return rows
@@ -795,7 +904,8 @@ class SGPScanner:
             print(f"  [skip] {event_name}: no markets")
             return []
         by_player = self.index_player_markets(markets_data["data"]["markets"])
-        tasks = [self.scan_player(session, markets_data, event_name, p, c)
+        tasks = [self.scan_player(session, markets_data, event_name, p, c,
+                                  event_id=event_id)
                  for p, c in by_player.items()]
         nested = await asyncio.gather(*tasks)
         return [r for sub in nested for r in sub]
