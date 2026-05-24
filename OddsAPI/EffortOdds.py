@@ -2151,10 +2151,18 @@ class ModernOddsWindow(QMainWindow):
             self.prophetx_worker.status_update.emit(f"Fetching ProphetX event {event_id}...")
 
             session = await self._get_prophetx_session()
-            from prophetx_async import GetEventMarketsAsync
+            from prophetx_async import GetEventMarketsAsync, precompute_market_caches
             markets_data = await GetEventMarketsAsync(session, event_id)
 
             if markets_data:
+                # Offload per-market liquidity sum + content-signature
+                # walk to a worker thread so the qasync loop stays
+                # responsive while the ~20-40ms of pure-Python order
+                # iteration runs.
+                loop = asyncio.get_running_loop()
+                markets_data = await loop.run_in_executor(
+                    None, precompute_market_caches, markets_data)
+
                 self.prophetx_worker.data_ready.emit(markets_data)
                 num_markets = len(markets_data.get('data', {}).get('markets', []))
                 self.prophetx_worker.status_update.emit(f"Updated {num_markets} markets")
@@ -2203,6 +2211,19 @@ class ModernOddsWindow(QMainWindow):
                 print("Team news worker didn't stop gracefully, terminating...")
                 self.team_news_widget.worker_thread.terminate()
                 self.team_news_widget.worker_thread.wait(1000)
+
+        # Stop wallet/positions workers inside the LiquidityWidget's
+        # bet slip — they spawn QThreads owned by BetSlipDrawer; killing
+        # the parent without quit()+wait() triggers Qt's "Timers cannot
+        # be stopped from another thread" warning on shutdown.
+        slip = getattr(getattr(self.liquidity_widget, "orderbook", None),
+                       "bet_slip", None)
+        if slip is not None:
+            print("Stopping wallet workers...")
+            try:
+                slip.cleanup()
+            except Exception as e:
+                print(f"  bet_slip cleanup failed: {e}")
 
         # Stop any update timers
         if hasattr(self, 'update_timer') and self.update_timer.isActive():

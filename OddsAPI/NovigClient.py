@@ -424,6 +424,137 @@ _MARKET_FIELDS = f"""
 """
 
 
+# ============================================================================
+# Wallet + open-positions fetchers (async, used by LiquidityWidget)
+# ----------------------------------------------------------------------------
+# NV exposes account state via two Hasura GraphQL operations the web app
+# already calls — we reuse the exact query/variable shapes so server-side
+# validators see traffic indistinguishable from novig.com.
+# ============================================================================
+
+_NV_BALANCE_QUERY = """
+query WalletBalance_Query($userId: uuid) {
+  user(where: {id: {_eq: $userId}}) {
+    id
+    trader {
+      id
+      trader_wallets: wallets(where: {type: {_eq: "Trader"}, currency: {_eq: "CASH"}}) {
+        id balance __typename
+      }
+      coin_wallets: wallets(where: {type: {_eq: "Trader"}, currency: {_eq: "COIN"}}) {
+        id balance __typename
+      }
+      bonus_wallets: wallets(where: {type: {_eq: "Bonus"}}) {
+        id balance __typename
+      }
+      __typename
+    }
+    withdrawal_hold
+    __typename
+  }
+}
+""".strip()
+
+_NV_POSITIONS_QUERY = """
+query ActivePortfolioOrders_Query($trader_id: uuid!, $item_sort: jsonb!,
+                                   $item_where: jsonb!, $offset: Int!, $limit: Int!) {
+  ActivePortfolioOrders_Query(
+    args: {trader_id: $trader_id, item_sort: $item_sort,
+           item_where: $item_where, offset: $offset, limit: $limit}
+  ) {
+    id timeToLiveMs qty originalQty created_at updated_at status price
+    isBid tif currency market outcome fills entry_promotion_name __typename
+  }
+}
+""".strip()
+
+_NV_REQUEST_HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {NOVIG_AUTH_TOKEN}",
+    "Origin": "https://novig.com",
+    "Referer": "https://novig.com/",
+}
+
+
+async def _nv_post_gql_async(session, operation_name: str,
+                             query: str, variables: dict) -> dict:
+    payload = {"operationName": operation_name,
+               "query": query, "variables": variables}
+    async with session.post(NOVIG_GRAPHQL_URL, headers=_NV_REQUEST_HEADERS,
+                            data=json.dumps(payload)) as r:
+        r.raise_for_status()
+        return await r.json()
+
+
+async def fetch_nv_balance(session, user_id: str) -> dict:
+    """Return {'cash': float|None, 'coin': float|None, 'bonus': float|None,
+    'error': str|None}. user_id is the NOVIG_USER_ID uuid."""
+    try:
+        body = await _nv_post_gql_async(
+            session, "WalletBalance_Query", _NV_BALANCE_QUERY,
+            {"userId": user_id})
+    except Exception as e:
+        return {"cash": None, "coin": None, "bonus": None, "error": str(e)}
+    users = ((body or {}).get("data") or {}).get("user") or []
+    if not users:
+        errs = (body or {}).get("errors")
+        msg = (errs[0].get("message") if errs else "empty user response")
+        return {"cash": None, "coin": None, "bonus": None, "error": msg}
+    trader = (users[0] or {}).get("trader") or {}
+    tw = trader.get("trader_wallets") or []
+    cw = trader.get("coin_wallets") or []
+    bw = trader.get("bonus_wallets") or []
+    return {
+        "cash": float(tw[0].get("balance") or 0) if tw else None,
+        "coin": float(cw[0].get("balance") or 0) if cw else None,
+        "bonus": float(bw[0].get("balance") or 0) if bw else None,
+        "error": None,
+    }
+
+
+async def fetch_nv_open_positions(session, trader_id: str,
+                                  auth_id: str) -> list:
+    """Return the raw ActivePortfolioOrders_Query rows; caller normalizes.
+    `trader_id` is NOVIG_TRADER_ID, `auth_id` is the google-oauth2|...
+    subject from NOVIG_AUTH_ID."""
+    pos_vars = {
+        "trader_id": trader_id,
+        "item_sort": {"created_at": "desc"},
+        "item_where": {
+            "_and": [
+                {"status": {"_neq": "REJECTED"}},
+                {"trader": {"user": {"auth_id": {"_eq": auth_id}}}},
+                {"currency": {"_eq": "CASH"}},
+                {"_or": [
+                    {"market": {"status": {"_eq": "OPEN"}}},
+                    {"market": {"status": {"_eq": "OPEN_LIVE"}}},
+                ]},
+                {"status_filters": []},
+            ]
+        },
+        "offset": 0,
+        "limit": 50,
+    }
+    body = await _nv_post_gql_async(
+        session, "ActivePortfolioOrders_Query",
+        _NV_POSITIONS_QUERY, pos_vars)
+    return (((body or {}).get("data") or {})
+            .get("ActivePortfolioOrders_Query") or [])
+
+
+def nv_decimal_to_american(p) -> str:
+    """Convert NV's decimal price (0..1 probability) to american odds."""
+    try:
+        p = float(p)
+    except Exception:
+        return ""
+    if not (0 < p < 1):
+        return ""
+    if p >= 0.5:
+        return f"-{round(100 * p / (1 - p))}"
+    return f"+{round(100 * (1 - p) / p)}"
+
+
 class NovigQueries:
     """High-level read queries layered on top of NovigClient.gql()."""
 

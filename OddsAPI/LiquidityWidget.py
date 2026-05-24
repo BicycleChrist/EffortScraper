@@ -17,10 +17,258 @@ import asyncio
 import json
 import math
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
 import ProphetXQuery
+
+
+# ============================================================================
+# Wallet snapshot data classes + workers
+# ----------------------------------------------------------------------------
+# The bet slip displays current PX/NV balances + open positions. We pull this
+# in two cadences:
+#   - balance: once per session (cheap, rarely changes outside of placements)
+#   - positions: re-fetched after each placement + on user ↻ click
+#
+# The actual API calls live in ProphetXQuery (PX) and NovigClient (NV). These
+# workers run them on a fresh asyncio loop inside a QThread and emit the
+# normalized result back to the BetSlipDrawer.
+# ============================================================================
+
+@dataclass
+class Position:
+    """One open wager, normalized across PX and NV."""
+    src: str               # "PX" or "NV"
+    event: str
+    market: str
+    side: str
+    odds: str              # american-format display string
+    stake: float           # dollars at risk
+    matched: float
+    status: str            # raw status from the API
+
+
+@dataclass
+class WalletSnapshot:
+    """Unified balance + positions snapshot. Either side may be partially
+    populated (one source failing doesn't poison the other)."""
+    px_balance: Optional[float] = None
+    px_withdrawable: Optional[float] = None
+    px_exposure: Optional[float] = None
+    px_positions: List[Position] = field(default_factory=list)
+    px_error: Optional[str] = None
+
+    nv_balance: Optional[float] = None
+    nv_coin_balance: Optional[float] = None
+    nv_bonus_balance: Optional[float] = None
+    nv_positions: List[Position] = field(default_factory=list)
+    nv_error: Optional[str] = None
+
+
+def _normalize_px_wager(w: dict) -> Position:
+    sport_event = (w.get("sportEvent") or {}).get("name") or ""
+    market = (w.get("market") or {}).get("name") or w.get("marketLineName") or ""
+    mtype = (w.get("market") or {}).get("type") or ""
+    label = f"{market} ({mtype})" if mtype else market
+    outcome = (w.get("outcome") or {}).get("name") or ""
+    line = w.get("displayLine") or w.get("line") or ""
+    side = outcome
+    if line and str(line) not in ("0.0", "0", ""):
+        side = f"{outcome} {line}"
+    try:
+        a = int(w.get("odds") or 0)
+        odds_disp = w.get("displayOdds") or (f"+{a}" if a > 0 else str(a))
+    except (TypeError, ValueError):
+        odds_disp = w.get("displayOdds") or ""
+    return Position(
+        src="PX",
+        event=sport_event,
+        market=label,
+        side=side,
+        odds=odds_disp,
+        stake=float(w.get("stake") or 0),
+        matched=float(w.get("matchedStake") or 0),
+        status=w.get("matchingStatus") or w.get("status") or "",
+    )
+
+
+def _normalize_px_parlay(p: dict) -> Position:
+    legs = p.get("legs") or []
+    n_legs = len(legs)
+    titles = [leg.get("sportEventName") for leg in legs
+              if leg.get("sportEventName")]
+    if titles:
+        seen = set()
+        uniq = [t for t in titles if not (t in seen or seen.add(t))]
+        event_desc = " • ".join(uniq[:2]) + (" …" if len(uniq) > 2 else "")
+    else:
+        event_desc = "Parlay"
+    leg_summary = []
+    for leg in legs[:3]:
+        mkt = (leg.get("market") or {}).get("name") or ""
+        sel = (leg.get("selection") or {}).get("name") or ""
+        if mkt or sel:
+            leg_summary.append(f"{mkt}: {sel}".strip(": "))
+    side = " / ".join(leg_summary) + (" …" if n_legs > 3 else "")
+    # Parlay endpoint encodes odds as american * 100 — divide if too large.
+    raw = p.get("confirmedOdds") or p.get("requestedOdds") or 0
+    try:
+        v = int(raw)
+        if abs(v) > 10000:
+            v = round(v / 100)
+        odds_disp = f"+{v}" if v > 0 else str(v)
+    except (TypeError, ValueError):
+        odds_disp = str(raw)
+    stake = float(p.get("confirmedStake") or p.get("requestedStake") or 0)
+    return Position(
+        src="PX",
+        event=event_desc,
+        market=f"{n_legs}-leg parlay",
+        side=side,
+        odds=odds_disp,
+        stake=stake,
+        matched=stake,
+        status=p.get("settlementStatus") or p.get("status") or "",
+    )
+
+
+def _normalize_nv_order(o: dict) -> Position:
+    from NovigClient import nv_decimal_to_american
+    market = o.get("market") or {}
+    outcome = o.get("outcome") or {}
+    event = (market.get("event") or {}) if isinstance(market, dict) else {}
+    event_desc = event.get("description") or ""
+    mtype = market.get("type") or ""
+    market_label = (market.get("name") or
+                    (market.get("market_detail") or {}).get("name") or
+                    mtype or "")
+    side = outcome.get("description") or ""
+    competitor = outcome.get("competitor") or {}
+    if competitor.get("name"):
+        side = competitor["name"]
+    strike = market.get("strike")
+    if strike and float(strike) != 0:
+        side = f"{side} {strike}".strip()
+    qty = float(o.get("qty") or 0)
+    orig = float(o.get("originalQty") or 0)
+    return Position(
+        src="NV",
+        event=event_desc,
+        market=market_label,
+        side=side,
+        odds=nv_decimal_to_american(o.get("price")),
+        stake=orig,
+        matched=orig - qty if qty <= orig else orig,
+        status=o.get("status") or "",
+    )
+
+
+class WalletBalanceWorker(QThread):
+    """One-shot balance fetch (PX + NV). Emits a WalletSnapshot with only
+    the balance fields populated; positions are left empty so the caller
+    can merge in a positions snapshot independently."""
+
+    snapshot_ready = pyqtSignal(object)
+
+    def run(self) -> None:
+        snap = WalletSnapshot()
+
+        async def _go():
+            import aiohttp
+            try:
+                from ProphetXQuery import fetch_px_wallet
+                timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    wallet = await fetch_px_wallet(session)
+                snap.px_balance = float(wallet.get("totalBalance") or
+                                        wallet.get("balance") or 0)
+                snap.px_withdrawable = float(wallet.get("withdrawableCash") or 0)
+                snap.px_exposure = float(wallet.get("exposureCredit") or 0)
+            except Exception as e:
+                snap.px_error = str(e)
+
+            try:
+                from NovigClient import fetch_nv_balance
+                from Creds import NOVIG_USER_ID
+                timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    bal = await fetch_nv_balance(session, NOVIG_USER_ID)
+                snap.nv_balance = bal.get("cash")
+                snap.nv_coin_balance = bal.get("coin")
+                snap.nv_bonus_balance = bal.get("bonus")
+                if bal.get("error"):
+                    snap.nv_error = bal["error"]
+            except Exception as e:
+                snap.nv_error = str(e)
+
+        try:
+            asyncio.run(asyncio.wait_for(_go(), timeout=15))
+        except Exception as e:
+            if not snap.px_error:
+                snap.px_error = str(e)
+            if not snap.nv_error:
+                snap.nv_error = str(e)
+        self.snapshot_ready.emit(snap)
+
+
+class OpenPositionsWorker(QThread):
+    """Refreshable open-positions fetch (PX singles + parlays + NV).
+    Emits a WalletSnapshot with only the positions / error fields set;
+    balance fields stay None so callers know to preserve their cached
+    balance snapshot rather than overwriting it."""
+
+    snapshot_ready = pyqtSignal(object)
+
+    def run(self) -> None:
+        snap = WalletSnapshot()
+
+        async def _go():
+            import aiohttp
+            try:
+                from ProphetXQuery import (fetch_px_open_wagers,
+                                           fetch_px_open_parlays)
+                timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    wagers, parlays = await asyncio.gather(
+                        fetch_px_open_wagers(session),
+                        fetch_px_open_parlays(session),
+                        return_exceptions=True,
+                    )
+                singles = []
+                parlay_rows = []
+                if isinstance(wagers, Exception):
+                    snap.px_error = f"wagers: {wagers}"
+                else:
+                    singles = [_normalize_px_wager(w) for w in wagers]
+                if isinstance(parlays, Exception):
+                    snap.px_error = snap.px_error or f"parlays: {parlays}"
+                else:
+                    parlay_rows = [_normalize_px_parlay(p) for p in parlays]
+                snap.px_positions = singles + parlay_rows
+            except Exception as e:
+                snap.px_error = str(e)
+
+            try:
+                from NovigClient import fetch_nv_open_positions
+                from Creds import NOVIG_TRADER_ID, NOVIG_AUTH_ID
+                timeout = aiohttp.ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    rows = await fetch_nv_open_positions(
+                        session, NOVIG_TRADER_ID, NOVIG_AUTH_ID)
+                snap.nv_positions = [_normalize_nv_order(o) for o in rows]
+            except Exception as e:
+                snap.nv_error = str(e)
+
+        try:
+            asyncio.run(asyncio.wait_for(_go(), timeout=15))
+        except Exception as e:
+            if not snap.px_error:
+                snap.px_error = str(e)
+            if not snap.nv_error:
+                snap.nv_error = str(e)
+        self.snapshot_ready.emit(snap)
 
 
 class NovigDumpWorker(QThread):
@@ -334,11 +582,11 @@ class BetSlipDrawer(QWidget):
     leg_added = pyqtSignal(str)         # leg key
     leg_removed = pyqtSignal(str)       # leg key
     place_requested = pyqtSignal(list, float)  # (legs, per_leg_wager)
+    # Emitted when the wallet snapshot worker finishes — lets callers
+    # (OrderBookWidget) chain a re-render after a placement-triggered
+    # refresh if they want to.
+    wallet_refreshed = pyqtSignal(object)
 
-    # Hard session cap. Matches the $5 deposit per exchange — placement
-    # is blocked once cumulative wagers across this session reach this
-    # threshold. Tracked per-drawer instance; resets on app restart.
-    SESSION_CAP_USD = 5.0
     DEFAULT_PER_LEG_WAGER = 0.50
     MAX_PER_LEG_WAGER = 2.0
 
@@ -347,9 +595,20 @@ class BetSlipDrawer(QWidget):
         self.compact_mode = compact_mode
         self._legs: list[dict] = []
         self._expanded = False
-        self._session_placed_usd = 0.0
+        # Live wallet snapshot — merged from a one-shot balance fetch + a
+        # refreshable positions fetch. Placement gating reads PX/NV
+        # balances off this; None means "not loaded yet".
+        self._snapshot = WalletSnapshot()
+        self._balance_loaded = False
+        self._balance_worker = None
+        self._positions_worker = None
+        self._positions_expanded = False
         self._initUI()
         self._refreshHeader()
+        # Stagger initial fetches so the event loop / parent wiring is
+        # settled first. Balance + positions fire in parallel.
+        QTimer.singleShot(100, self.fetch_balance)
+        QTimer.singleShot(120, self.refresh_positions)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -456,7 +715,65 @@ class BetSlipDrawer(QWidget):
         controls.addWidget(self.place_btn)
         body_layout.addLayout(controls)
 
-        # Status / session-cap strip.
+        # --- Wallet balance strip ---
+        wallet_row = QHBoxLayout()
+        wallet_row.setSpacing(6)
+        self.wallet_label = QLabel("PX: …   •   NV: …")
+        self.wallet_label.setTextFormat(Qt.TextFormat.RichText)
+        self.wallet_label.setStyleSheet(
+            f"color: #e8e9ed; font-size: {fs}px;")
+        wallet_row.addWidget(self.wallet_label, 1)
+
+        self.wallet_refresh_btn = QPushButton("↻")
+        self.wallet_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wallet_refresh_btn.setToolTip("Refresh PX & NV balance / positions")
+        self.wallet_refresh_btn.setFixedWidth(24)
+        self.wallet_refresh_btn.clicked.connect(self.refresh_wallet)
+        self.wallet_refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #1a1d24; color: #8a92a3;
+                border: 1px solid #2a2d34; border-radius: 3px;
+                padding: 1px 4px; font-size: {fs}px;
+            }}
+            QPushButton:hover {{ color: #e8e9ed; }}
+        """)
+        wallet_row.addWidget(self.wallet_refresh_btn)
+        body_layout.addLayout(wallet_row)
+
+        # --- Open-positions disclosure ---
+        self.positions_toggle = QPushButton("▸  Open positions (0)")
+        self.positions_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.positions_toggle.clicked.connect(self._togglePositions)
+        self.positions_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent; color: #8a92a3;
+                border: none; padding: 2px 0px;
+                font-size: {fs - 1}px; text-align: left;
+            }}
+            QPushButton:hover {{ color: #e8e9ed; }}
+        """)
+        body_layout.addWidget(self.positions_toggle)
+
+        self.positions_container = QWidget()
+        self.positions_layout = QVBoxLayout(self.positions_container)
+        self.positions_layout.setContentsMargins(0, 0, 0, 0)
+        self.positions_layout.setSpacing(2)
+        self._positions_scroll = QScrollArea()
+        self._positions_scroll.setWidgetResizable(True)
+        self._positions_scroll.setWidget(self.positions_container)
+        self._positions_scroll.setMaximumHeight(
+            120 if self.compact_mode else 180)
+        self._positions_scroll.setStyleSheet("""
+            QScrollArea {
+                background-color: #0d0f14;
+                border: 1px solid #2a2d34;
+                border-radius: 3px;
+            }
+        """)
+        self._positions_scroll.setVisible(False)
+        body_layout.addWidget(self._positions_scroll)
+
+        # --- Status strip (placement warnings) ---
         self.status_label = QLabel()
         self.status_label.setStyleSheet(
             f"color: #8a92a3; font-size: {fs - 1}px;")
@@ -509,10 +826,243 @@ class BetSlipDrawer(QWidget):
                 self._rebuildLegRows()
                 return
 
-    def record_placement(self, dollars: float) -> None:
-        """Bump the session-cap counter after a leg places successfully."""
-        self._session_placed_usd += dollars
+    def record_placement(self, dollars: float, src: str = "") -> None:
+        """Optimistically decrement the cached balance for `src` after a
+        leg places. Authoritative state arrives shortly via the next
+        wallet refresh (which callers should trigger after _runPlacements
+        completes); this just keeps the gating reactive in the gap."""
+        if not self._balance_loaded:
+            return
+        if src == "PX" and self._snapshot.px_balance is not None:
+            self._snapshot.px_balance = max(
+                0.0, self._snapshot.px_balance - dollars)
+        elif src == "NV" and self._snapshot.nv_balance is not None:
+            self._snapshot.nv_balance = max(
+                0.0, self._snapshot.nv_balance - dollars)
+        self._refreshWalletLabel()
+        self._refreshHeader()
+
+    # ------------------------------------------------------------------
+    # Wallet + positions
+    # ------------------------------------------------------------------
+    def fetch_balance(self) -> None:
+        """One-shot balance fetch. Wired to fire once on construction.
+        Manual refresh comes through refresh_wallet() which fires both
+        workers (used by the ↻ button so the user can force-reload if
+        they paste a new token mid-session)."""
+        if (self._balance_worker is not None
+                and self._balance_worker.isRunning()):
+            return
+        if hasattr(self, "wallet_label") and not self._balance_loaded:
+            self.wallet_label.setText("PX: …   •   NV: …")
+        self._balance_worker = WalletBalanceWorker(self)
+        self._balance_worker.snapshot_ready.connect(self._onBalanceReady)
+        self._balance_worker.start()
+
+    def refresh_positions(self) -> None:
+        """Re-fetch open positions on both exchanges. Called on init, on
+        ↻ click, and after every placement so freshly-placed bets appear
+        in the slip's open-positions list."""
+        if (self._positions_worker is not None
+                and self._positions_worker.isRunning()):
+            return
+        self._positions_worker = OpenPositionsWorker(self)
+        self._positions_worker.snapshot_ready.connect(self._onPositionsReady)
+        self._positions_worker.start()
+
+    def refresh_wallet(self) -> None:
+        """Force-refresh both balance and positions. Bound to the ↻
+        button — typically used after the user repastes a fresh
+        localStorage.auth or wants to manually re-sync. Drops the
+        in-memory token cache too so a re-pasted token in
+        prophetx_auth_state.json gets picked up."""
+        try:
+            from ProphetXQuery import reload_state_from_disk
+            reload_state_from_disk()
+        except Exception:
+            pass
+        self.fetch_balance()
+        self.refresh_positions()
+
+    def cleanup(self) -> None:
+        """Stop any in-flight wallet workers. Called by the parent on
+        app close so QThreads finish before their owning widget is
+        destroyed (otherwise Qt emits 'Timers cannot be stopped from
+        another thread' warnings on shutdown)."""
+        for attr in ("_balance_worker", "_positions_worker"):
+            w = getattr(self, attr, None)
+            if w is not None and w.isRunning():
+                w.quit()
+                w.wait(2000)
+
+    def _onBalanceReady(self, snap) -> None:
+        # Merge balance fields onto the cached snapshot — preserve
+        # whatever positions already arrived from the other worker.
+        self._snapshot.px_balance = snap.px_balance
+        self._snapshot.px_withdrawable = snap.px_withdrawable
+        self._snapshot.px_exposure = snap.px_exposure
+        self._snapshot.nv_balance = snap.nv_balance
+        self._snapshot.nv_coin_balance = snap.nv_coin_balance
+        self._snapshot.nv_bonus_balance = snap.nv_bonus_balance
+        if snap.px_error:
+            self._snapshot.px_error = snap.px_error
+        if snap.nv_error:
+            self._snapshot.nv_error = snap.nv_error
+        self._balance_loaded = True
+        self._refreshWalletLabel()
         self._refreshStatus()
+        self._refreshHeader()
+        self.wallet_refreshed.emit(self._snapshot)
+
+    def _onPositionsReady(self, snap) -> None:
+        # Merge positions onto the cached snapshot.
+        self._snapshot.px_positions = snap.px_positions
+        self._snapshot.nv_positions = snap.nv_positions
+        # Positions-side errors shouldn't clobber a clean balance error
+        # — only fill if currently empty.
+        if snap.px_error and not self._snapshot.px_error:
+            self._snapshot.px_error = snap.px_error
+        if snap.nv_error and not self._snapshot.nv_error:
+            self._snapshot.nv_error = snap.nv_error
+        self._refreshPositionsToggle()
+        self._rebuildPositionsRows()
+        self._refreshStatus()
+        self.wallet_refreshed.emit(self._snapshot)
+
+    @staticmethod
+    def _fmt_money(x) -> str:
+        if x is None:
+            return "—"
+        try:
+            return f"${float(x):,.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _refreshWalletLabel(self) -> None:
+        if not hasattr(self, "wallet_label"):
+            return
+        snap = self._snapshot
+        if not self._balance_loaded:
+            self.wallet_label.setText("PX: …   •   NV: …")
+            return
+        px_part = (f"<span style='color:#f87171;'>PX err</span>"
+                   if snap.px_error
+                   else f"<b>PX:</b> {self._fmt_money(snap.px_balance)}")
+        nv_part = (f"<span style='color:#f87171;'>NV err</span>"
+                   if snap.nv_error
+                   else f"<b>NV:</b> {self._fmt_money(snap.nv_balance)}")
+        self.wallet_label.setText(
+            f"{px_part} &nbsp;•&nbsp; {nv_part}")
+        tip_parts = []
+        if not snap.px_error and snap.px_balance is not None:
+            tip_parts.append(
+                f"ProphetX — withdrawable {self._fmt_money(snap.px_withdrawable)}"
+                f", exposure {self._fmt_money(snap.px_exposure)}")
+        if snap.px_error:
+            tip_parts.append(f"ProphetX error: {snap.px_error}")
+        if not snap.nv_error and snap.nv_balance is not None:
+            extras = []
+            if snap.nv_coin_balance:
+                extras.append(f"coin {snap.nv_coin_balance:.0f}")
+            if snap.nv_bonus_balance:
+                extras.append(f"bonus {snap.nv_bonus_balance:.2f}")
+            tail = f" ({', '.join(extras)})" if extras else ""
+            tip_parts.append(f"Novig — cash {self._fmt_money(snap.nv_balance)}{tail}")
+        if snap.nv_error:
+            tip_parts.append(f"Novig error: {snap.nv_error}")
+        self.wallet_label.setToolTip("\n".join(tip_parts))
+
+    def _refreshPositionsToggle(self) -> None:
+        if not hasattr(self, "positions_toggle"):
+            return
+        n_px = len(self._snapshot.px_positions) if self._snapshot else 0
+        n_nv = len(self._snapshot.nv_positions) if self._snapshot else 0
+        total = n_px + n_nv
+        chev = "▾" if self._positions_expanded else "▸"
+        self.positions_toggle.setText(
+            f"{chev}  Open positions ({total})  —  PX {n_px} • NV {n_nv}")
+
+    def _togglePositions(self) -> None:
+        self._positions_expanded = not self._positions_expanded
+        if hasattr(self, "_positions_scroll"):
+            self._positions_scroll.setVisible(self._positions_expanded)
+        self._refreshPositionsToggle()
+
+    def _rebuildPositionsRows(self) -> None:
+        if not hasattr(self, "positions_layout"):
+            return
+        # Clear existing rows.
+        while self.positions_layout.count():
+            item = self.positions_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        fs = 8 if self.compact_mode else 10
+        positions = list(self._snapshot.px_positions) + list(
+            self._snapshot.nv_positions)
+        if not positions:
+            empty = QLabel("  No open positions.")
+            empty.setStyleSheet(
+                f"color: #555b66; font-size: {fs}px; padding: 4px;")
+            self.positions_layout.addWidget(empty)
+            return
+        for pos in positions:
+            self.positions_layout.addWidget(self._buildPositionRow(pos, fs))
+        self.positions_layout.addStretch()
+
+    def _buildPositionRow(self, pos, fs: int) -> QWidget:
+        src_color = "#5eead4" if pos.src == "PX" else "#a78bfa"
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(6)
+
+        tag = QLabel(pos.src)
+        tag.setFixedWidth(22)
+        tag.setStyleSheet(
+            f"color: {src_color}; font-weight: 700; font-size: {fs}px;")
+        layout.addWidget(tag)
+
+        # event / market / side block (truncate-tolerant)
+        title_text = pos.event or "—"
+        sub_text = f"{pos.market} • {pos.side}".strip(" •")
+        text = QLabel(f"<b>{title_text}</b><br>"
+                      f"<span style='color:#8a92a3;'>{sub_text}</span>")
+        text.setStyleSheet(f"color: #e8e9ed; font-size: {fs}px;")
+        text.setWordWrap(True)
+        layout.addWidget(text, 1)
+
+        odds_lbl = QLabel(pos.odds or "")
+        odds_lbl.setStyleSheet(
+            f"color: #c8d0dc; font-size: {fs}px; font-weight: 600;")
+        odds_lbl.setFixedWidth(40)
+        odds_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
+                              | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(odds_lbl)
+
+        stake_lbl = QLabel(self._fmt_money(pos.stake))
+        stake_lbl.setStyleSheet(
+            f"color: #8a92a3; font-size: {fs}px;")
+        stake_lbl.setFixedWidth(56)
+        stake_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
+                               | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(stake_lbl)
+
+        row.setStyleSheet(
+            "QWidget { background-color: #14181f; border-radius: 2px; }")
+        return row
+
+    def _stakeTotalsBySource(self) -> dict:
+        """Sum the current slip's projected stake (wager * leg_count) per
+        source. Used by the placement gate so PX legs can't blow PX
+        balance even if NV has plenty."""
+        wager = self.wager_spin.value() if hasattr(self, "wager_spin") else 0
+        out = {"PX": 0.0, "NV": 0.0}
+        for leg in self._legs:
+            src = leg.get("src")
+            if src in out:
+                out[src] += wager
+        return out
 
     # ------------------------------------------------------------------
     # Visual rebuild — cheap, slip rarely exceeds ~10 entries.
@@ -598,25 +1148,52 @@ class BetSlipDrawer(QWidget):
         self.header.setText(
             f"  {chev}  Bet Slip ({n})   "
             f"${total_stake:,.2f} stake → ${payout:,.2f} payout")
-        # Enable Place only when we have legs AND room under the cap.
         if hasattr(self, "place_btn"):
-            remaining = self.SESSION_CAP_USD - self._session_placed_usd
-            self.place_btn.setEnabled(n > 0 and total_stake <= remaining
-                                      and total_stake > 0)
+            self.place_btn.setEnabled(n > 0 and total_stake > 0
+                                      and self._canCoverStake())
         self._refreshStatus()
+
+    def _canCoverStake(self) -> bool:
+        """True iff every per-source stake fits the corresponding cached
+        balance. When the snapshot hasn't loaded yet we allow placement
+        — the worker takes ~1s and we don't want to lock the user out on
+        startup; the server will still reject if truly underfunded."""
+        if not self._balance_loaded:
+            return True
+        totals = self._stakeTotalsBySource()
+        if totals["PX"] > 0:
+            bal = self._snapshot.px_balance
+            if bal is not None and totals["PX"] > bal + 1e-6:
+                return False
+        if totals["NV"] > 0:
+            bal = self._snapshot.nv_balance
+            if bal is not None and totals["NV"] > bal + 1e-6:
+                return False
+        return True
 
     def _refreshStatus(self) -> None:
         if not hasattr(self, "status_label"):
             return
-        remaining = self.SESSION_CAP_USD - self._session_placed_usd
-        msg = (f"Session: ${self._session_placed_usd:.2f} placed • "
-               f"${remaining:.2f} left under ${self.SESSION_CAP_USD:.2f} cap.")
-        wager = self.wager_spin.value() if hasattr(self, "wager_spin") else 0
-        total_stake = wager * len(self._legs)
-        if total_stake > remaining and self._legs:
-            msg += (f"  ⚠ Stake ${total_stake:.2f} exceeds remaining "
-                    f"cap — lower wager or remove legs.")
-        self.status_label.setText(msg)
+        if not self._balance_loaded:
+            self.status_label.setText("Loading balances…")
+            return
+        warnings = []
+        totals = self._stakeTotalsBySource()
+        snap = self._snapshot
+        if (totals["PX"] > 0 and snap.px_balance is not None
+                and totals["PX"] > snap.px_balance + 1e-6):
+            warnings.append(
+                f"⚠ PX stake ${totals['PX']:.2f} exceeds "
+                f"balance ${snap.px_balance:.2f}")
+        if (totals["NV"] > 0 and snap.nv_balance is not None
+                and totals["NV"] > snap.nv_balance + 1e-6):
+            warnings.append(
+                f"⚠ NV stake ${totals['NV']:.2f} exceeds "
+                f"balance ${snap.nv_balance:.2f}")
+        if warnings:
+            self.status_label.setText(" • ".join(warnings))
+        else:
+            self.status_label.setText("")
 
     # ------------------------------------------------------------------
     # Interaction
@@ -634,9 +1211,10 @@ class BetSlipDrawer(QWidget):
         if not self._legs:
             return
         wager = self.wager_spin.value()
-        # Final cap check (UI also guards but be paranoid).
-        if wager * len(self._legs) > (self.SESSION_CAP_USD
-                                      - self._session_placed_usd):
+        # Final balance check — _refreshHeader already disables the
+        # button when this fails, but recheck in case the snapshot
+        # changed in between.
+        if not self._canCoverStake():
             return
         self.place_btn.setEnabled(False)
         self.place_requested.emit(list(self._legs), float(wager))
@@ -2680,9 +3258,15 @@ class OrderBookWidget(QWidget):
                     ok, msg, dollars = False, f"error: {e}", 0.0
                 self.bet_slip.mark_leg_status(key, msg, success=ok)
                 if ok and dollars > 0:
-                    self.bet_slip.record_placement(dollars)
+                    self.bet_slip.record_placement(dollars, src=src or "")
         finally:
             self.bet_slip.place_btn.setEnabled(True)
+            # Authoritative refresh of open positions — pulls the newly-
+            # placed wager(s) into the slip's positions list. Balance is
+            # already optimistically decremented by record_placement and
+            # rarely changes outside of placements, so we skip re-fetching
+            # it here. The ↻ button forces a full refresh if needed.
+            QTimer.singleShot(500, self.bet_slip.refresh_positions)
 
     # --- SGP placements (unchanged from previous SGP-only slip) -------
 

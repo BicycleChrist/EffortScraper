@@ -16,6 +16,11 @@ from Creds import PROPHETX_AUTH_TOKEN
 
 BASE_URL = "https://cash.api.prophetx.co/trade/public/api"
 
+# Static header template. The Authorization field is filled in at module
+# load with whatever Creds currently has, but downstream callers should
+# prefer prophetx_token.get_token() at request time so a refreshed token
+# is picked up without a process restart. `HEADERS` is kept around for
+# backward-compat with the existing sync code paths.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
     "Accept": "application/json, text/plain, */*",
@@ -23,6 +28,19 @@ HEADERS = {
     "X-Currency": "cash",
     "Authorization": f"Bearer {PROPHETX_AUTH_TOKEN}",
 }
+
+
+def _live_headers() -> dict:
+    """Return a HEADERS copy with the current token from ProphetXQuery's
+    token manager. Falls back to the import-time HEADERS if the manager
+    isn't available (e.g. circular-import edge cases during startup)."""
+    try:
+        from ProphetXQuery import get_token
+        h = dict(HEADERS)
+        h["Authorization"] = f"Bearer {get_token()}"
+        return h
+    except Exception:
+        return HEADERS
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
 
@@ -51,7 +69,7 @@ async def GetTournamentsAsync(session: aiohttp.ClientSession, type_filter: str =
     }
 
     try:
-        async with session.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT) as response:
+        async with session.get(url, headers=_live_headers(), params=params, timeout=REQUEST_TIMEOUT) as response:
             if response.status != 200:
                 print(f"ERROR: Failed to fetch tournaments (status: {response.status})")
                 return None
@@ -96,7 +114,7 @@ async def GetEventMarketsAsync(session: aiohttp.ClientSession, event_id: int) ->
     for version in versions:
         url = f"{BASE_URL}/{version}/events/{event_id}/markets"
         try:
-            async with session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as response:
+            async with session.get(url, headers=_live_headers(), timeout=REQUEST_TIMEOUT) as response:
                 if response.status == 200:
                     data_bytes = await response.read()
                     if not data_bytes:

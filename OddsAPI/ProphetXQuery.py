@@ -34,12 +34,347 @@ import requests
 import json
 import re
 import csv
+import base64
+import threading
+import time
 import asyncio
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 from playwright.sync_api import sync_playwright
 from Creds import PROPHETX_AUTH_TOKEN, PROPHETX_EMAIL, PROPHETX_PASSWORD
+
+
+# ============================================================================
+# Bearer-token manager
+# ----------------------------------------------------------------------------
+# PX issues two JWTs:
+#   * accessToken  — short-lived (~hours). Used as Authorization: Bearer.
+#   * refreshToken — long-lived (~30 days). Rotates on each refresh call.
+#
+# Refresh endpoint:
+#   POST https://www.prophetx.co/api/v1/auth/extend-session
+#   body: {"refreshToken": "<jwt>", "device_id": "<uuid or empty>"}
+#   reply: {"accessToken": "...", "refreshToken": "...", "exp": <unix>, ...}
+#
+# State lives in prophetx_auth_state.json next to this file. Bootstrap:
+#   1. If state file exists, use it.
+#   2. Otherwise seed access from Creds.PROPHETX_AUTH_TOKEN + refresh from
+#      the `refreshToken` cookie in prophetx_session.json.
+#   3. If neither is available, downstream calls will fail until the user
+#      pastes a fresh localStorage.auth blob into prophetx_auth_state.json.
+# ============================================================================
+
+_PX_AUTH_BASE_DIR = pathlib.Path(__file__).parent
+_PX_AUTH_STATE_PATH = _PX_AUTH_BASE_DIR / "prophetx_auth_state.json"
+_PX_AUTH_SESSION_PATH = _PX_AUTH_BASE_DIR / "prophetx_session.json"
+_PX_EXTEND_URL = "https://www.prophetx.co/api/v1/auth/extend-session"
+
+# Refresh proactively this many seconds before hard expiry.
+_PX_REFRESH_LEEWAY = 120
+
+# Backoff after a failed refresh. Stops the hot path from re-attempting
+# (and re-logging) every request when the server is returning 401 due to
+# isOtpExpired or any other persistent error.
+_PX_REFRESH_BACKOFF_SECONDS = 120
+
+# In-memory cache of the persisted state. `get_token()` reads from here
+# on the hot path — disk + refresh HTTP only fire when the cache is
+# explicitly invalidated or `ensure_fresh()` is called. Keeps the market
+# scraper from blocking on disk IO every request.
+_px_cached_state: Optional[dict] = None
+_px_last_refresh_failure_ts: float = 0.0
+_px_refresh_in_flight: bool = False
+
+# Concurrent-refresh guard.
+_px_token_lock = threading.Lock()
+
+
+def _px_decode_jwt_exp(jwt: str) -> Optional[int]:
+    try:
+        payload = jwt.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return int(data.get("exp")) if data.get("exp") is not None else None
+    except Exception:
+        return None
+
+
+def _px_load_state_from_disk() -> dict:
+    """Read the state file (or bootstrap from Creds + session cookies).
+    Hot-path callers should use _px_get_state() instead — it caches and
+    avoids the disk hit per call."""
+    if _PX_AUTH_STATE_PATH.exists():
+        try:
+            return json.loads(_PX_AUTH_STATE_PATH.read_text())
+        except Exception:
+            pass
+    state = {"accessToken": None, "refreshToken": None,
+             "exp": None, "device_id": ""}
+    if PROPHETX_AUTH_TOKEN:
+        state["accessToken"] = PROPHETX_AUTH_TOKEN
+        state["exp"] = _px_decode_jwt_exp(PROPHETX_AUTH_TOKEN)
+    if _PX_AUTH_SESSION_PATH.exists():
+        try:
+            session = json.loads(_PX_AUTH_SESSION_PATH.read_text())
+            for c in session.get("cookies", []):
+                if c.get("name") == "refreshToken":
+                    state["refreshToken"] = c.get("value")
+                    break
+        except Exception:
+            pass
+    _px_save_state(state)
+    return state
+
+
+def _px_get_state() -> dict:
+    """Return the in-memory state, loading from disk on first access.
+    Caller must hold _px_token_lock when calling this if they intend to
+    mutate the result."""
+    global _px_cached_state
+    if _px_cached_state is None:
+        _px_cached_state = _px_load_state_from_disk()
+    return _px_cached_state
+
+
+def reload_state_from_disk() -> None:
+    """Drop the in-memory cache so the next get_token() call re-reads
+    prophetx_auth_state.json. Call after the user manually pastes a fresh
+    localStorage.auth blob so the widget picks it up without a restart."""
+    global _px_cached_state
+    with _px_token_lock:
+        _px_cached_state = None
+
+
+def _px_save_state(state: dict) -> None:
+    try:
+        _PX_AUTH_STATE_PATH.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        print(f"[prophetx_token] WARN: failed to persist state: {e}")
+
+
+def _px_persist_access_to_creds(access_token: str) -> None:
+    """Mirror the freshly-issued access token back to Creds.py so other
+    modules that read it at import time stay in sync. Best-effort."""
+    creds_path = _PX_AUTH_BASE_DIR / "Creds.py"
+    try:
+        content = creds_path.read_text()
+        new = re.sub(
+            r'PROPHETX_AUTH_TOKEN\s*=\s*"[^"]*"',
+            f'PROPHETX_AUTH_TOKEN = "{access_token}"',
+            content, count=1,
+        )
+        if new != content:
+            creds_path.write_text(new)
+    except Exception as e:
+        print(f"[prophetx_token] WARN: failed to update Creds.py: {e}")
+
+
+def _px_refresh_headers(state: dict) -> dict:
+    """Headers for extend-session. The endpoint requires the (possibly
+    soon-stale) accessToken as Bearer too — refresh token alone isn't
+    sufficient; that's how the SPA does it."""
+    h = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.prophetx.co",
+        "Referer": "https://www.prophetx.co/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) "
+                      "Gecko/20100101 Firefox/151.0",
+        "Accept": "application/json, text/plain, */*",
+        "__source": "web",
+        "X-Currency": "cash",
+    }
+    if state.get("accessToken"):
+        h["Authorization"] = f"Bearer {state['accessToken']}"
+    return h
+
+
+def _px_needs_refresh(state: dict) -> bool:
+    if not state.get("accessToken"):
+        return True
+    exp = state.get("exp")
+    if not exp:
+        return True
+    return exp - time.time() < _PX_REFRESH_LEEWAY
+
+
+def _px_do_refresh_sync(state: dict) -> dict:
+    refresh = state.get("refreshToken")
+    if not refresh:
+        raise RuntimeError(
+            "no refreshToken available — bootstrap prophetx_auth_state.json "
+            "from a logged-in browser's localStorage.auth")
+    body = {"refreshToken": refresh, "device_id": state.get("device_id") or ""}
+    r = requests.post(_PX_EXTEND_URL, json=body,
+                      headers=_px_refresh_headers(state), timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"extend-session HTTP {r.status_code}: {r.text[:200]}")
+    blob = r.json()
+    data = blob.get("data") if isinstance(blob, dict) and "data" in blob else blob
+    access = data.get("accessToken")
+    if not access:
+        raise RuntimeError(f"extend-session: no accessToken in {blob}")
+    state["accessToken"] = access
+    state["refreshToken"] = data.get("refreshToken") or refresh
+    exp = data.get("exp") or _px_decode_jwt_exp(access)
+    state["exp"] = int(exp) if exp else None
+    _px_save_state(state)
+    _px_persist_access_to_creds(access)
+    return state
+
+
+def _px_kick_background_refresh() -> None:
+    """Fire-and-forget refresh on a daemon thread. Coalesces concurrent
+    requests (only one refresh in flight at a time) and applies a
+    backoff after failures so a persistent server-side rejection (e.g.
+    isOtpExpired=true) doesn't log-spam or stampede the endpoint."""
+    global _px_refresh_in_flight, _px_last_refresh_failure_ts
+    with _px_token_lock:
+        if _px_refresh_in_flight:
+            return
+        if (time.time() - _px_last_refresh_failure_ts
+                < _PX_REFRESH_BACKOFF_SECONDS):
+            return
+        state = _px_get_state()
+        if not _px_needs_refresh(state):
+            return
+        _px_refresh_in_flight = True
+        snap = dict(state)  # work on a copy so the lock can be released
+
+    def _run():
+        global _px_refresh_in_flight, _px_last_refresh_failure_ts, _px_cached_state
+        try:
+            _px_do_refresh_sync(snap)
+            with _px_token_lock:
+                _px_cached_state = snap
+                _px_last_refresh_failure_ts = 0.0
+        except Exception as e:
+            # One log line per backoff window — chatty enough to notice,
+            # not enough to spam.
+            print(f"[prophetx_token] refresh failed, using cached "
+                  f"(retry in {_PX_REFRESH_BACKOFF_SECONDS}s): {e}")
+            with _px_token_lock:
+                _px_last_refresh_failure_ts = time.time()
+        finally:
+            with _px_token_lock:
+                _px_refresh_in_flight = False
+
+    threading.Thread(target=_run, name="px-token-refresh",
+                     daemon=True).start()
+
+
+def get_token() -> str:
+    """Return the cached bearer. Cheap — no disk IO, no HTTP — safe to
+    call on hot paths (every market request). If the cached token is
+    stale, a background refresh is kicked off but we still return the
+    current (about-to-expire or expired) token; downstream calls will
+    surface a 401 if it's truly dead. Use _px_get_with_retry to recover
+    on that."""
+    with _px_token_lock:
+        state = _px_get_state()
+        stale = _px_needs_refresh(state)
+        token = state.get("accessToken") or ""
+    if stale:
+        _px_kick_background_refresh()
+    return token
+
+
+async def get_token_async() -> str:
+    """Awaitable variant — same cheap path as get_token(). The refresh
+    runs on a background thread (not the calling event loop) so QThread-
+    hosted loops never block on HTTP."""
+    return get_token()
+
+
+def invalidate_token() -> None:
+    """Force the next get_token call to refresh. Called by the 401-retry
+    helper when a data endpoint rejects the cached token despite its exp
+    claim looking valid. Also clears the failure-backoff so the refresh
+    actually fires."""
+    global _px_last_refresh_failure_ts, _px_cached_state
+    with _px_token_lock:
+        if _px_cached_state is not None:
+            _px_cached_state["exp"] = 0
+        _px_last_refresh_failure_ts = 0.0
+
+
+# ============================================================================
+# www.prophetx.co/api request helpers
+# ----------------------------------------------------------------------------
+# /api/v1/wallet, /api/v2/transaction/wagers/cursor, /parlay/api/v1/user/list
+# all live on the www. host and require the Bearer token. Wrap calls in a
+# 401-retry that invalidates the token cache and tries once more so a stale
+# bearer recovers without surfacing to the UI (when refresh works at all).
+# ============================================================================
+
+_PX_WWW_BASE = "https://www.prophetx.co"
+
+
+async def _px_www_headers() -> dict:
+    return {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) "
+                      "Gecko/20100101 Firefox/151.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Authorization": f"Bearer {await get_token_async()}",
+        "Origin": "https://www.prophetx.co",
+        "Referer": "https://www.prophetx.co/",
+        "__source": "web",
+        "X-Currency": "cash",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+    }
+
+
+async def _px_get_with_retry(session: aiohttp.ClientSession, url: str,
+                             *, params: Optional[dict] = None) -> dict:
+    """GET helper that retries once on 401, invalidating the token cache
+    in between so the second attempt forces a refresh."""
+    for attempt in (1, 2):
+        async with session.get(url, headers=await _px_www_headers(),
+                               params=params) as r:
+            if r.status == 401 and attempt == 1:
+                invalidate_token()
+                continue
+            r.raise_for_status()
+            return await r.json()
+    raise RuntimeError("unreachable")
+
+
+# --- PX wallet / wagers / parlays --------------------------------------
+
+async def fetch_px_wallet(session: aiohttp.ClientSession) -> dict:
+    """Account balance snapshot. Once-per-session is fine."""
+    body = await _px_get_with_retry(session, f"{_PX_WWW_BASE}/api/v1/wallet")
+    return body.get("data") or {}
+
+
+async def fetch_px_open_wagers(session: aiohttp.ClientSession) -> List[dict]:
+    """Open single-bet wagers (partially or fully matched) over the last
+    year. Returns the raw row list — caller normalizes."""
+    date_from = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
+    params = {
+        "cursor": "",
+        "status": "open",
+        "matchingStatus": "partially_matched,fully_matched",
+        "dateFrom": date_from,
+        "sortField": "placed_date:desc",
+        "limit": 50,
+        "group": 1,
+    }
+    body = await _px_get_with_retry(
+        session, f"{_PX_WWW_BASE}/api/v2/transaction/wagers/cursor",
+        params=params)
+    return body.get("data") or []
+
+
+async def fetch_px_open_parlays(session: aiohttp.ClientSession) -> List[dict]:
+    """Open parlay orders from the My Plays → Parlays tab."""
+    params = {"limit": 20, "type": "confirmed", "settlementType": "pending"}
+    body = await _px_get_with_retry(
+        session, f"{_PX_WWW_BASE}/parlay/api/v1/user/list", params=params)
+    return ((body or {}).get("data") or {}).get("orders") or []
 
 
 def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX_PASSWORD, headless: bool = True) -> Optional[str]:
