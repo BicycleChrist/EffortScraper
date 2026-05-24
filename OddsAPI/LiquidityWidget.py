@@ -904,10 +904,11 @@ class BetSlipDrawer(QWidget):
         self._snapshot.nv_balance = snap.nv_balance
         self._snapshot.nv_coin_balance = snap.nv_coin_balance
         self._snapshot.nv_bonus_balance = snap.nv_bonus_balance
-        if snap.px_error:
-            self._snapshot.px_error = snap.px_error
-        if snap.nv_error:
-            self._snapshot.nv_error = snap.nv_error
+        # Overwrite (don't OR) so a successful refresh after a prior
+        # failure clears the stale "PX err" / "NV err" label. The old
+        # gated assignment kept the error sticky forever.
+        self._snapshot.px_error = snap.px_error
+        self._snapshot.nv_error = snap.nv_error
         self._balance_loaded = True
         self._refreshWalletLabel()
         self._refreshStatus()
@@ -918,12 +919,20 @@ class BetSlipDrawer(QWidget):
         # Merge positions onto the cached snapshot.
         self._snapshot.px_positions = snap.px_positions
         self._snapshot.nv_positions = snap.nv_positions
-        # Positions-side errors shouldn't clobber a clean balance error
-        # — only fill if currently empty.
+        # A successful positions fetch with no error proves the token is
+        # working, so clear any stale balance-side error too — otherwise
+        # the label stays red even after the next balance fetch succeeds.
+        # If positions itself errored, surface that (but don't stomp an
+        # existing balance error with a positions-side error of equal
+        # priority).
         if snap.px_error and not self._snapshot.px_error:
             self._snapshot.px_error = snap.px_error
+        elif not snap.px_error and snap.px_positions is not None:
+            self._snapshot.px_error = None
         if snap.nv_error and not self._snapshot.nv_error:
             self._snapshot.nv_error = snap.nv_error
+        elif not snap.nv_error and snap.nv_positions is not None:
+            self._snapshot.nv_error = None
         self._refreshPositionsToggle()
         self._rebuildPositionsRows()
         self._refreshStatus()
@@ -1011,7 +1020,6 @@ class BetSlipDrawer(QWidget):
         self.positions_layout.addStretch()
 
     def _buildPositionRow(self, pos, fs: int) -> QWidget:
-        src_color = "#5eead4" if pos.src == "PX" else "#a78bfa"
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(6, 3, 6, 3)
@@ -1019,8 +1027,15 @@ class BetSlipDrawer(QWidget):
 
         tag = QLabel(pos.src)
         tag.setFixedWidth(22)
-        tag.setStyleSheet(
-            f"color: {src_color}; font-weight: 700; font-size: {fs}px;")
+        tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if pos.src == "PX":
+            tag.setStyleSheet(
+                f"color: #5eead4; font-weight: 700; font-size: {fs}px;")
+        else:  # NV — Novig blue text on black chip
+            tag.setStyleSheet(
+                f"color: #3b82f6; background-color: #000000; "
+                f"font-weight: 700; font-size: {fs}px; "
+                f"border-radius: 3px; padding: 1px 2px;")
         layout.addWidget(tag)
 
         # event / market / side block (truncate-tolerant)

@@ -89,6 +89,57 @@ _px_refresh_in_flight: bool = False
 # Concurrent-refresh guard.
 _px_token_lock = threading.Lock()
 
+# Set when no refresh is in progress; cleared while a background refresh
+# runs. `force_refresh_token_async()` waits on this so the 401-retry path
+# can synchronously block until a fresh token is in the cache instead of
+# racing past with the same stale bearer.
+_px_refresh_done_event = threading.Event()
+_px_refresh_done_event.set()
+
+# Playwright fallback state. Only the in-flight guard remains — no
+# cooldown: a successful refresh holds for the rest of the session, and
+# if it fails the user will see the browser anyway, so there's no value
+# in suppressing a second attempt.
+_px_playwright_in_flight: bool = False
+
+# OTP provider: optional Callable[[], Optional[str]] the Qt layer can
+# register so the Playwright refresh asks the user for the SMS code via
+# an in-app dialog instead of typing it into the (possibly-hidden)
+# Chromium window. When unset, the refresh waits for the user to enter
+# the code in the browser themselves — only useful when headless=False.
+_px_otp_provider = None
+
+# Token-refresh listeners: callables invoked (from the Playwright thread,
+# NOT the GUI thread) after refresh_prophetx_token writes a fresh auth
+# state to disk + reloads the in-memory cache. The Qt layer hooks one of
+# these to a Qt signal so wallet/positions widgets auto-repopulate when
+# the new token lands, without waiting for the next manual ↻ click.
+_px_token_refresh_callbacks = []
+
+
+def set_otp_provider(fn) -> None:
+    """Register the function used to prompt the user for the ProphetX
+    SMS OTP. fn() is called from the Playwright background thread; it
+    must block until the user provides the code (or returns None to
+    abort)."""
+    global _px_otp_provider
+    _px_otp_provider = fn
+
+
+def on_token_refresh(cb) -> None:
+    """Register a callback fired after a successful Playwright refresh.
+    Called from the Playwright background thread, so the Qt-side handler
+    must marshal back to the main thread (e.g. via a queued signal)."""
+    _px_token_refresh_callbacks.append(cb)
+
+
+def _fire_token_refresh_callbacks() -> None:
+    for cb in list(_px_token_refresh_callbacks):
+        try:
+            cb()
+        except Exception as e:
+            print(f"[prophetx_token] refresh listener failed: {e}")
+
 
 def _px_decode_jwt_exp(jwt: str) -> Optional[int]:
     try:
@@ -240,6 +291,7 @@ def _px_kick_background_refresh() -> None:
         if not _px_needs_refresh(state):
             return
         _px_refresh_in_flight = True
+        _px_refresh_done_event.clear()
         snap = dict(state)  # work on a copy so the lock can be released
 
     def _run():
@@ -256,12 +308,70 @@ def _px_kick_background_refresh() -> None:
                   f"(retry in {_PX_REFRESH_BACKOFF_SECONDS}s): {e}")
             with _px_token_lock:
                 _px_last_refresh_failure_ts = time.time()
+            # extend-session 401 means isOtpExpired or the refresh token
+            # is dead — neither is recoverable without a fresh full login.
+            # Escalate to Playwright in a separate thread so the user can
+            # complete OTP visually. Guarded by its own cooldown so the
+            # browser doesn't pop on every retry.
+            if "401" in str(e) or "unauthorized" in str(e).lower():
+                _px_kick_playwright_refresh()
         finally:
             with _px_token_lock:
                 _px_refresh_in_flight = False
+            _px_refresh_done_event.set()
 
     threading.Thread(target=_run, name="px-token-refresh",
                      daemon=True).start()
+
+
+def _px_kick_playwright_refresh() -> None:
+    """Spawn a Playwright-based full re-login in a background thread when
+    extend-session can't recover. Only the in-flight guard — once a
+    successful refresh lands, the new token holds for the rest of the
+    session; if it fails the user already saw the browser, so re-popping
+    is fine."""
+    global _px_playwright_in_flight
+    with _px_token_lock:
+        if _px_playwright_in_flight:
+            return
+        _px_playwright_in_flight = True
+
+    def _run():
+        global _px_playwright_in_flight
+        try:
+            print("[prophetx_token] extend-session unrecoverable — "
+                  "launching Playwright login (complete OTP in the "
+                  "browser window)")
+            refresh_prophetx_token(headless=False)
+        except Exception as e:
+            print(f"[prophetx_token] Playwright refresh failed: {e}")
+        finally:
+            with _px_token_lock:
+                _px_playwright_in_flight = False
+
+    threading.Thread(target=_run, name="px-playwright-refresh",
+                     daemon=True).start()
+
+
+async def force_refresh_token_async(timeout: float = 15.0) -> bool:
+    """Invalidate the cached bearer and block until a refresh completes.
+
+    Use this from the 401-retry path: a plain `invalidate_token()` only
+    marks the cached token stale, but `get_token()` still returns the
+    stale bearer immediately (the refresh runs on a daemon thread). Two
+    back-to-back requests then send the same dead token and the second
+    surfaces a 401 to the UI.
+
+    Returns True if the cache holds a fresh (non-stale) accessToken when
+    the wait finishes; False if the refresh failed or timed out.
+    """
+    invalidate_token()
+    _px_kick_background_refresh()
+    # Wait off the event loop so we don't block other coroutines.
+    await asyncio.to_thread(_px_refresh_done_event.wait, timeout)
+    with _px_token_lock:
+        state = _px_get_state()
+        return bool(state.get("accessToken")) and not _px_needs_refresh(state)
 
 
 def get_token() -> str:
@@ -329,13 +439,15 @@ async def _px_www_headers() -> dict:
 
 async def _px_get_with_retry(session: aiohttp.ClientSession, url: str,
                              *, params: Optional[dict] = None) -> dict:
-    """GET helper that retries once on 401, invalidating the token cache
-    in between so the second attempt forces a refresh."""
+    """GET helper that retries once on 401, forcing a synchronous token
+    refresh (and awaiting its completion) between attempts so the second
+    attempt actually carries a freshly-issued bearer instead of racing
+    past the daemon-thread refresh with the stale one."""
     for attempt in (1, 2):
         async with session.get(url, headers=await _px_www_headers(),
                                params=params) as r:
             if r.status == 401 and attempt == 1:
-                invalidate_token()
+                await force_refresh_token_async()
                 continue
             r.raise_for_status()
             return await r.json()
@@ -377,9 +489,24 @@ async def fetch_px_open_parlays(session: aiohttp.ClientSession) -> List[dict]:
     return ((body or {}).get("data") or {}).get("orders") or []
 
 
-def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX_PASSWORD, headless: bool = True) -> Optional[str]:
+def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX_PASSWORD, headless: bool = True, otp_provider=None) -> Optional[str]:
     """
-    Refresh ProphetX JWT token via Playwright. Updates Creds.py automatically.
+    Refresh ProphetX auth via Playwright when extend-session can't recover
+    (e.g. isOtpExpired=true on the cached JWT).
+
+    Persists the freshly-issued auth blob to prophetx_auth_state.json — the
+    file the hot path actually reads — and drops the in-memory cache so the
+    next get_token() picks it up without a process restart. Previously the
+    function only updated Creds.py and prophetx_session.json, neither of
+    which the hot path consults after first boot, so the running process
+    kept serving the dead token.
+
+    headless defaults to True now that an in-app OTP dialog is wired
+    via set_otp_provider() — the user never has to see the Chromium
+    window. If no provider is registered and headless=True, the refresh
+    will time out at the OTP step; pass headless=False to fall back to
+    manual entry in a visible browser.
+
     Requires: pip install playwright && playwright install chromium
     """
     if not email or not password:
@@ -393,7 +520,6 @@ def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX
         auth = response.request.headers.get("authorization", "")
         if auth.startswith("Bearer ") and auth.count(".") == 2 and len(auth) > 100:
             token = auth[7:]
-            print(f"[*] Captured token from {response.url[:50]}...")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -404,7 +530,6 @@ def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX
         try:
             page.goto("https://www.prophetx.co/?currency=cash", wait_until="load")
             page.wait_for_timeout(3000)
-            # Dismiss promo popup - try close button, X, or Escape
             for selector in ["button[aria-label='Close']", "button.close", "[class*='close']", "svg[class*='close']"]:
                 if page.locator(selector).first.is_visible():
                     page.locator(selector).first.click()
@@ -412,34 +537,91 @@ def refresh_prophetx_token(email: str = PROPHETX_EMAIL, password: str = PROPHETX
             else:
                 page.keyboard.press("Escape")
             page.wait_for_timeout(1000)
-            # Click the Sign In button (btn--plain class)
             page.click("button.btn--plain:has-text('Sign In')")
             page.wait_for_selector("input#email", timeout=5000)
             page.fill("input#email", email)
             page.fill("input#password", password)
             page.click("button:has-text('Login')")
-            page.wait_for_timeout(3000)
 
-            # Handle 2FA if prompted
-            otp_input = page.locator("input[placeholder='Enter Code']")
-            if otp_input.is_visible():
-                code = input("[?] Enter 2FA code from SMS: ").strip()
-                otp_input.fill(code)
-                page.click("button:has-text('Proceed')")
-                page.wait_for_timeout(5000)
+            # If the OTP screen appears, ask the registered provider for
+            # the code (the Qt layer pops a QInputDialog) and fill it in
+            # programmatically. This is what lets us run headless: the
+            # user types into an in-app modal, not the browser.
+            provider = otp_provider or _px_otp_provider
+            try:
+                otp_field = page.wait_for_selector(
+                    "input[placeholder='Enter Code']", timeout=8000)
+            except Exception:
+                otp_field = None
+            if otp_field is not None:
+                if provider is None:
+                    print("[!] OTP required but no provider registered "
+                          "and headless=True; cannot complete login")
+                    return None
+                code = provider()
+                if not code:
+                    print("[!] OTP entry cancelled / empty")
+                    return None
+                otp_field.fill(code.strip())
+                try:
+                    page.click("button:has-text('Proceed')")
+                except Exception:
+                    page.keyboard.press("Enter")
 
-            if token:
-                creds_path = pathlib.Path(__file__).parent / "Creds.py"
-                content = creds_path.read_text()
-                new_content = re.sub(r'PROPHETX_AUTH_TOKEN\s*=\s*"[^"]*"', f'PROPHETX_AUTH_TOKEN = "{token}"', content)
-                creds_path.write_text(new_content)
-                print(f"[+] ProphetX token refreshed")
+            # Poll localStorage.auth — the SPA writes the freshly-issued
+            # auth blob there as soon as login + OTP completes.
+            auth_json = None
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    auth_json = page.evaluate("() => localStorage.getItem('auth')")
+                except Exception:
+                    auth_json = None
+                if auth_json:
+                    break
+                page.wait_for_timeout(500)
 
-            # Save full browser storage_state (cookies + localStorage) for the
-            # parlay service which authenticates by cookie, not bearer token.
+            if not auth_json:
+                print("[!] Token refresh timed out waiting for login + OTP")
+                return None
+
+            try:
+                auth_blob = json.loads(auth_json)
+            except Exception as e:
+                print(f"[!] Could not parse localStorage.auth: {e}")
+                return None
+
+            access = auth_blob.get("accessToken") or token
+            refresh = auth_blob.get("refreshToken")
+            exp = auth_blob.get("exp") or _px_decode_jwt_exp(access or "")
+            device_id = auth_blob.get("device_id") or auth_blob.get("deviceId") or ""
+
+            if not access:
+                print("[!] localStorage.auth had no accessToken")
+                return None
+
+            new_state = {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "exp": int(exp) if exp else None,
+                "device_id": device_id,
+            }
+            _PX_AUTH_STATE_PATH.write_text(json.dumps(new_state, indent=2))
+            _px_persist_access_to_creds(access)
+            reload_state_from_disk()
+            token = access
+            print(f"[+] ProphetX auth refreshed: state file rewritten, "
+                  f"in-memory cache reloaded (exp in "
+                  f"{int(exp - time.time()) if exp else '?'}s)")
+
+            # Also save Playwright's storage_state for the parlay service
+            # which still authenticates by cookie.
             state_path = pathlib.Path(__file__).parent / "prophetx_session.json"
             context.storage_state(path=str(state_path))
-            print(f"[+] ProphetX session state saved to {state_path.name}")
+
+            # Notify the Qt layer so the wallet/positions widgets
+            # re-fetch with the fresh bearer immediately.
+            _fire_token_refresh_callbacks()
         except Exception as e:
             print(f"[!] Token refresh failed: {e}")
         finally:

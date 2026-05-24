@@ -7,7 +7,8 @@ from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetri
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit
+    QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit,
+    QInputDialog
 )
 from propQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -220,6 +221,15 @@ class DataManager(QObject):
 
 class ModernOddsWindow(QMainWindow):
     """Main window for displaying and managing odds data"""
+
+    # PX auth bridge signals — see _setup_px_auth_bridge. Declared as
+    # pyqtSignals so they can be emitted from the Playwright background
+    # thread and received via QueuedConnection on the main thread (Qt's
+    # rule: signals can only be cross-thread when both sides are QObjects
+    # with a proper event loop on the receiver).
+    px_otp_requested = pyqtSignal()
+    px_token_refreshed = pyqtSignal()
+
     BUTTON_STYLE = """
         QPushButton {
             background-color: #007bff;  /* Blue */
@@ -779,6 +789,14 @@ class ModernOddsWindow(QMainWindow):
         self.liquidity_widget = ProphetXBrowser(compact_mode=True)
         self.liquidity_widget.setMaximumWidth(400)  # Constrain max width to keep it compact
         self.liquidity_widget.setMinimumWidth(250)  # Allow it to be narrower
+
+        # Bridge the Playwright-thread refresh path to the Qt main thread:
+        #   - OTP requests pop a QInputDialog instead of typing into the
+        #     (now-hidden) Chromium window.
+        #   - Token-refresh notifications auto-refire the bet slip's
+        #     wallet/positions workers so the labels repopulate without
+        #     a manual ↻ click.
+        self._setup_px_auth_bridge()
 
         # Initialize ProphetX worker for async data updates
         # Refresh interval: 20 seconds (more frequent than main odds due to live orderbook changes)
@@ -2070,6 +2088,72 @@ class ModernOddsWindow(QMainWindow):
         """Handle status updates from prediction markets worker"""
         print(f"Prediction markets status: {status_message}")
 
+    def _setup_px_auth_bridge(self) -> None:
+        """Wire the cross-thread bridge between the Playwright refresh
+        (runs on a daemon thread) and the Qt main thread:
+
+        - OTP requests from the headless browser pop a QInputDialog so
+          the user types the SMS code into an in-app modal instead of
+          having to spot the hidden Chromium window.
+        - On successful token refresh, the bet slip's wallet/positions
+          workers re-fire automatically so the labels reflect the new
+          token without a manual ↻ click.
+        """
+        import threading
+        import ProphetXQuery
+
+        # Result holder for cross-thread OTP request/response.
+        self._px_otp_event = threading.Event()
+        self._px_otp_result = None
+
+        # Signals are declared as pyqtSignal class members on
+        # ModernOddsWindow; wire them to the main-thread slots via
+        # QueuedConnection so emit() from the PW thread is safe.
+        self.px_token_refreshed.connect(
+            self._on_px_token_refreshed,
+            Qt.ConnectionType.QueuedConnection)
+        self.px_otp_requested.connect(
+            self._on_px_otp_requested,
+            Qt.ConnectionType.QueuedConnection)
+
+        def otp_provider():
+            self._px_otp_result = None
+            self._px_otp_event.clear()
+            self.px_otp_requested.emit()
+            # Block the PW thread for up to 3 min while the user types.
+            self._px_otp_event.wait(timeout=180)
+            return self._px_otp_result
+
+        def on_refresh():
+            try:
+                self.px_token_refreshed.emit()
+            except Exception:
+                pass
+
+        ProphetXQuery.set_otp_provider(otp_provider)
+        ProphetXQuery.on_token_refresh(on_refresh)
+        print("[px-bridge] OTP provider + token-refresh listener registered")
+
+    def _on_px_otp_requested(self) -> None:
+        """Main-thread slot: pop a QInputDialog for the ProphetX SMS
+        code, stash the result, and release the PW thread waiting on
+        _px_otp_event."""
+        code, ok = QInputDialog.getText(
+            self, "ProphetX SMS OTP",
+            "Enter the SMS code from ProphetX to complete re-authentication:",
+            QLineEdit.EchoMode.Normal)
+        self._px_otp_result = code.strip() if (ok and code) else None
+        self._px_otp_event.set()
+
+    def _on_px_token_refreshed(self) -> None:
+        """Main-thread slot: re-fire wallet + positions workers so the
+        bet slip labels repopulate immediately when a fresh token lands."""
+        try:
+            slip = self.liquidity_widget.orderbook.bet_slip
+            slip.refresh_wallet()
+        except Exception as e:
+            print(f"[px-bridge] auto-refresh failed: {e}")
+
     def on_prophetx_event_selected(self, event_id: int):
         """Handle event selection from liquidity widget - trigger async refresh"""
         print(f"ProphetX event selected: {event_id}")
@@ -2100,17 +2184,11 @@ class ModernOddsWindow(QMainWindow):
                 self.liquidity_widget._populateEventListOnly()
                 self.liquidity_widget.onProphetxDataRefreshed()
 
-                # Auto-select the first event if available
-                if self.liquidity_widget.filtered_events:
-                    first_event = self.liquidity_widget.filtered_events[0]
-                    event_id = first_event['metadata'].get('id')
-                    if event_id:
-                        # Set combo to first event and manually trigger selection
-                        # (setCurrentIndex alone may not fire signal if index is already 0)
-                        self.liquidity_widget.event_combo.setCurrentIndex(0)
-                        self.liquidity_widget.onCompactEventSelected(0)
-                else:
-                    self.liquidity_widget.hideLoading()
+                # No auto-select on startup. The previous behavior auto-
+                # selected the highest-stake event, which was often a
+                # finished game whose leftover orders looked like stale
+                # cached data. Wait for the user to pick.
+                self.liquidity_widget.hideLoading()
 
                 print(f"ProphetX fresh scrape complete: {len(all_markets)} events")
             else:
@@ -2122,12 +2200,11 @@ class ModernOddsWindow(QMainWindow):
             self.liquidity_widget.hideLoading()
 
         except ImportError as e:
-            # FetchAllEventsAsync might not exist, fall back to selecting first event from stale data
+            # FetchAllEventsAsync might not exist — leave the event list
+            # populated from stale data but don't auto-open any event's
+            # orderbook (would show post-game leftover orders).
             print(f"FetchAllEventsAsync not available ({e}), using stale data...")
-            if self.liquidity_widget.filtered_events:
-                self.liquidity_widget.event_combo.setCurrentIndex(0)
-            else:
-                self.liquidity_widget.hideLoading()
+            self.liquidity_widget.hideLoading()
 
         except Exception as e:
             print(f"Error during ProphetX refresh: {e}")

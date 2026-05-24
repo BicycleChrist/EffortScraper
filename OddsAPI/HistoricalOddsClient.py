@@ -135,6 +135,16 @@ class UnifiedMarket:
 class EventMatcher:
     """Matches sports events across Kalshi and Polymarket APIs"""
 
+    # Teams that share names across sports - require sport context for disambiguation
+    CROSS_SPORT_CONFLICTS = {
+        'cardinals': ['NFL', 'MLB'],  # Arizona Cardinals (NFL) vs St. Louis Cardinals (MLB)
+        'rangers': ['NHL', 'MLB'],     # New York Rangers (NHL) vs Texas Rangers (MLB)
+        'kings': ['NHL', 'NBA'],       # Los Angeles Kings (NHL) vs Sacramento Kings (NBA)
+        'panthers': ['NFL', 'NHL'],    # Carolina Panthers (NFL) vs Florida Panthers (NHL)
+        'jets': ['NFL', 'NHL'],        # New York Jets (NFL) vs Winnipeg Jets (NHL)
+        'giants': ['NFL', 'MLB'],      # New York Giants (NFL) vs San Francisco Giants (MLB)
+    }
+
     @staticmethod
     def parse_kalshi_event_date(event_ticker: str) -> str:
         """
@@ -209,7 +219,7 @@ class EventMatcher:
         'seattle seahawks': ['seattle', 'seahawks', 'sea'],
         'tampa bay buccaneers': ['tampa bay', 'buccaneers', 'bucs', 'tb'],
         'tennessee titans': ['tennessee', 'titans', 'ten'],
-        'washington commanders': ['washington', 'commanders', 'wash', 'wsh']
+        'washington commanders': ['washington', 'commanders', 'wash', 'wsh', 'was']
     },
 
     'NBA': {
@@ -231,7 +241,7 @@ class EventMatcher:
         'milwaukee bucks': ['milwaukee', 'bucks', 'mil'],
         'minnesota timberwolves': ['minnesota', 'timberwolves', 'wolves', 'min'],
         'new orleans pelicans': ['new orleans', 'pelicans', 'no'],
-        'new york knicks': ['new york', 'knicks', 'nyk', 'new york k'],
+        'new york knicks': ['new york knicks', 'knicks', 'nyk', 'ny knicks', 'nyknicks'],
         'oklahoma city thunder': ['oklahoma city', 'thunder', 'okc'],
         'orlando magic': ['orlando', 'magic', 'orl'],
         'philadelphia 76ers': ['philadelphia', '76ers', 'sixers', 'phi'],
@@ -282,7 +292,7 @@ class EventMatcher:
         'los angeles kings': ['los angeles', 'la', 'kings', 'lak'],
         'san jose sharks': ['san jose', 'sharks', 'sjs', 'sj'],
         'seattle kraken': ['seattle', 'kraken', 'sea'],
-        'utah hockey club': ['utah', 'uta'],
+        'utah hockey club': ['utah hockey club', 'utah hc', 'utah', 'uta', 'uhc'],
         'vancouver canucks': ['vancouver', 'canucks', 'nucks', 'van'],
         'vegas golden knights': ['vegas', 'las vegas', 'golden knights', 'knights', 'vgk']
     },
@@ -305,7 +315,7 @@ class EventMatcher:
         'miami marlins': ['miami', 'marlins', 'mia'],
         'milwaukee brewers': ['milwaukee', 'brewers', 'mil'],
         'minnesota twins': ['minnesota', 'twins', 'min'],
-        'new york yankees': ['new york yankees', 'ny yankees', 'yankees', 'nyy'],
+        'new york yankees': ['new york yankees', 'ny yankees', 'yankees', 'yanks', 'nyy'],
         'new york mets': ['new york mets', 'ny mets', 'mets', 'nym'],
         'oakland athletics': ['oakland', 'athletics', 'a\'s', 'oak'],
         'philadelphia phillies': ['philadelphia', 'phillies', 'phi'],
@@ -323,7 +333,12 @@ class EventMatcher:
 
     @staticmethod
     def normalize_team_name(team_name: str, sport: str = None) -> str:
-        """Normalize team name for matching with sport-specific aliases"""
+        """
+        Normalize team name for matching with sport-specific aliases.
+        
+        Uses deterministic matching: longest alias first to avoid ambiguity.
+        Avoids cross-sport conflicts when sport context is available.
+        """
         if not team_name:
             return ""
 
@@ -337,31 +352,96 @@ class EventMatcher:
         if sport and sport in EventMatcher.TEAM_ALIASES_BY_SPORT:
             sport_aliases = EventMatcher.TEAM_ALIASES_BY_SPORT[sport]
 
-            # Check aliases - try exact match first, then substring
+            # Phase 1: Exact match in aliases (highest priority)
             for canonical, aliases in sport_aliases.items():
-                # Exact match in aliases
-                if normalized in aliases:
+                if normalized in aliases or normalized == canonical:
                     return canonical
 
-            # If no exact match, try substring matching
+            # Phase 2: Substring matching - SORT BY LENGTH (longest first) for deterministic results
+            # This ensures "los angeles chargers" matches before "los angeles"
+            all_alias_pairs = []
             for canonical, aliases in sport_aliases.items():
                 for alias in aliases:
-                    if alias in normalized and len(alias) >= 3:
+                    if len(alias) >= 3:  # Minimum alias length
+                        all_alias_pairs.append((alias, canonical))
+            
+            # Sort by alias length descending for deterministic matching
+            all_alias_pairs.sort(key=lambda x: len(x[0]), reverse=True)
+            
+            for alias, canonical in all_alias_pairs:
+                if alias in normalized:
+                    # Check for cross-sport conflicts - skip ambiguous names without more context
+                    if alias in EventMatcher.CROSS_SPORT_CONFLICTS:
+                        conflict_sports = EventMatcher.CROSS_SPORT_CONFLICTS[alias]
+                        if sport in conflict_sports:
+                            # Only match if it's unambiguous within this sport
+                            # (the canonical name should be sport-specific)
+                            return canonical
+                    else:
                         return canonical
 
         # Fallback: check all sports (less precise but better than nothing)
+        # Only use exact matches in fallback to avoid cross-sport confusion
         for sport_key, sport_aliases in EventMatcher.TEAM_ALIASES_BY_SPORT.items():
             for canonical, aliases in sport_aliases.items():
-                if normalized in aliases:
+                if normalized in aliases or normalized == canonical:
                     return canonical
 
-            # Substring fallback across all sports
-            for canonical, aliases in sport_aliases.items():
-                for alias in aliases:
-                    if alias in normalized and len(alias) >= 3:
-                        return canonical
-
         return normalized
+    
+    @staticmethod
+    def normalize_team_name_fuzzy(team_name: str, sport: str = None) -> tuple[str, float]:
+        """
+        Normalize team name with fuzzy matching fallback.
+        
+        Returns:
+            Tuple of (canonical_name, confidence_score)
+            confidence_score: 1.0 = exact match, 0.8+ = high confidence fuzzy match
+        """
+        from difflib import SequenceMatcher
+        
+        if not team_name:
+            return "", 0.0
+
+        # Try exact normalization first
+        exact_result = EventMatcher.normalize_team_name(team_name, sport)
+        
+        # Check if we got a canonical match
+        if sport and sport in EventMatcher.TEAM_ALIASES_BY_SPORT:
+            if exact_result in EventMatcher.TEAM_ALIASES_BY_SPORT[sport]:
+                return exact_result, 1.0
+        
+        # Fuzzy matching fallback
+        normalized = team_name.lower().strip()
+        best_match = None
+        best_score = 0.0
+        
+        sports_to_check = [sport] if sport else EventMatcher.TEAM_ALIASES_BY_SPORT.keys()
+        
+        for sport_key in sports_to_check:
+            if sport_key not in EventMatcher.TEAM_ALIASES_BY_SPORT:
+                continue
+            sport_aliases = EventMatcher.TEAM_ALIASES_BY_SPORT[sport_key]
+            
+            for canonical, aliases in sport_aliases.items():
+                # Check canonical name
+                score = SequenceMatcher(None, normalized, canonical).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = canonical
+                
+                # Check all aliases
+                for alias in aliases:
+                    score = SequenceMatcher(None, normalized, alias).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_match = canonical
+        
+        # Return fuzzy match if confidence is high enough
+        if best_score >= 0.7 and best_match:
+            return best_match, best_score
+        
+        return exact_result, 0.5  # Low confidence, return normalized form
 
     @staticmethod
     def parse_kalshi_title(title: str) -> tuple[str, str]:
@@ -533,38 +613,58 @@ class MarketMatcher:
         return None
 
     @staticmethod
-    def get_market_period(text):
+    def get_market_period(text, sport: str = None):
         """
         Determine the period/time frame for a market.
 
         Args:
             text: Market title or question text
+            sport: Optional sport for sport-specific period detection
 
         Returns:
-            'full_game', '1h', '2h', '1q', '2q', '3q', '4q', or None
+            'full_game', '1h', '2h', '1q', '2q', '3q', '4q', '1p', '2p', '3p', 'f5', etc.
         """
         if not text:
             return 'full_game'  # Default to full game
 
         text_lower = text.lower()
 
-        # First half
-        if '1h' in text_lower or 'first half' in text_lower or '1st half' in text_lower or 'half 1' in text_lower:
+        # === HALVES (Basketball, Football) ===
+        if any(p in text_lower for p in ['1h', 'h1', 'first half', '1st half', 'half 1']):
             return '1h'
-
-        # Second half
-        if '2h' in text_lower or 'second half' in text_lower or '2nd half' in text_lower or 'half 2' in text_lower:
+        if any(p in text_lower for p in ['2h', 'h2', 'second half', '2nd half', 'half 2']):
             return '2h'
 
-        # Quarters
-        if '1q' in text_lower or 'first quarter' in text_lower or '1st quarter' in text_lower:
+        # === QUARTERS (Basketball, Football) ===
+        if any(p in text_lower for p in ['1q', 'q1', 'first quarter', '1st quarter']):
             return '1q'
-        if '2q' in text_lower or 'second quarter' in text_lower or '2nd quarter' in text_lower:
+        if any(p in text_lower for p in ['2q', 'q2', 'second quarter', '2nd quarter']):
             return '2q'
-        if '3q' in text_lower or 'third quarter' in text_lower or '3rd quarter' in text_lower:
+        if any(p in text_lower for p in ['3q', 'q3', 'third quarter', '3rd quarter']):
             return '3q'
-        if '4q' in text_lower or 'fourth quarter' in text_lower or '4th quarter' in text_lower:
+        if any(p in text_lower for p in ['4q', 'q4', 'fourth quarter', '4th quarter']):
             return '4q'
+
+        # === NHL PERIODS ===
+        if any(p in text_lower for p in ['1p', 'p1', 'first period', '1st period']):
+            return '1p'
+        if any(p in text_lower for p in ['2p', 'p2', 'second period', '2nd period']):
+            return '2p'
+        if any(p in text_lower for p in ['3p', 'p3', 'third period', '3rd period']):
+            return '3p'
+        if 'overtime' in text_lower or ' ot' in text_lower:
+            return 'ot'
+
+        # === MLB INNINGS ===
+        if any(p in text_lower for p in ['f5', 'first 5', 'first five', '1st 5 innings']):
+            return 'f5'
+        if any(p in text_lower for p in ['first inning', '1st inning']):
+            return '1inn'
+        # Check for specific inning numbers (e.g., "5th inning")
+        import re
+        inning_match = re.search(r'(\d+)(?:st|nd|rd|th)\s+inning', text_lower)
+        if inning_match:
+            return f'{inning_match.group(1)}inn'
 
         return 'full_game'
 
@@ -588,7 +688,21 @@ class MarketMatcher:
             return 'total'
 
         # Props (check before moneyline, more specific)
-        if any(keyword in text for keyword in ['touchdown', 'td', 'yards', 'passing', 'rushing', 'receiving']):
+        # NFL props
+        if any(keyword in text for keyword in ['touchdown', 'td', 'yards', 'passing', 'rushing', 'receiving', 
+                                                'sack', 'interception', 'reception', 'completions']):
+            return 'prop'
+        # NBA props
+        if any(keyword in text for keyword in ['points', 'rebounds', 'assists', '3-pointer', 'three pointer',
+                                                'double-double', 'triple-double', 'steals', 'blocks']):
+            return 'prop'
+        # MLB props
+        if any(keyword in text for keyword in ['home run', 'hits', 'strikeout', 'rbi', 'stolen base',
+                                                'pitcher', 'batter', 'innings pitched']):
+            return 'prop'
+        # NHL props
+        if any(keyword in text for keyword in ['goal', 'assist', 'save', 'shutout', 'shots on goal',
+                                                'power play', 'penalty']):
             return 'prop'
 
         # Moneyline indicators
@@ -599,7 +713,8 @@ class MarketMatcher:
 
         # Polymarket moneyline: Simple format with just teams and vs/@ separator
         # Pattern: "Team1 vs. Team2" or "Team1 vs Team2" or "Team1 @ Team2"
-        if re.match(r'^[a-z\s]+\s+(?:vs\.?|@)\s+[a-z\s]+$', text.strip()):
+        # Note: [\w\s] allows numbers in team names (49ers, 76ers)
+        if re.match(r'^[\w\s]+\s+(?:vs\.?|@)\s+[\w\s]+$', text.strip()):
             # Make sure it's not a spread or total (those have extra info)
             if 'spread' not in text and 'o/u' not in text and not re.search(r'\([+-]?\d+', text):
                 return 'moneyline'
@@ -1116,13 +1231,46 @@ class KalshiHistoricalOddsClient:
             skipped_none = 0
             skipped_time = 0
 
-            for candle in candles:
-                price_data = candle.get('price', {})
+            def _dollars_to_cents(v):
+                # Kalshi returns dollar-denominated strings like "0.5100".
+                # Accept int/float too in case the schema flips back.
+                if v is None:
+                    return None
+                try:
+                    return int(round(float(v) * 100))
+                except (TypeError, ValueError):
+                    return None
 
-                # Try to get a price value - prefer close, fall back to previous
-                close_price = price_data.get('close')
+            for candle in candles:
+                price_data = candle.get('price') or {}
+
+                # Kalshi candlestick schema uses `*_dollars` suffix with
+                # string dollar values. Prefer the period's executed-trade
+                # close; fall back to previous trade; finally fall back to
+                # the bid/ask mid (still meaningful for resting-order-only
+                # periods at the start of a market).
+                close_price = _dollars_to_cents(
+                    price_data.get('close_dollars')
+                    or price_data.get('close')
+                )
                 if close_price is None:
-                    close_price = price_data.get('previous')
+                    close_price = _dollars_to_cents(
+                        price_data.get('previous_dollars')
+                        or price_data.get('previous')
+                    )
+                if close_price is None:
+                    yb = (candle.get('yes_bid') or {})
+                    ya = (candle.get('yes_ask') or {})
+                    yb_c = _dollars_to_cents(
+                        yb.get('close_dollars') or yb.get('close'))
+                    ya_c = _dollars_to_cents(
+                        ya.get('close_dollars') or ya.get('close'))
+                    if yb_c is not None and ya_c is not None:
+                        close_price = (yb_c + ya_c) // 2
+                    elif yb_c is not None:
+                        close_price = yb_c
+                    elif ya_c is not None:
+                        close_price = ya_c
 
                 # Skip candlesticks with no price data at all
                 if close_price is None:
@@ -1319,8 +1467,10 @@ class HistoricalOddsWidget(QWidget):
         self.time_range.currentIndexChanged.connect(self.on_time_range_changed)
         header_layout.addWidget(self.time_range)
 
-        # TODO: only display for kalshi datasource
-        self.kalshi_interval = QComboBox()
+        # Interval selector (controls both Kalshi candlestick period and Polymarket fidelity)
+        self.interval_label = QLabel("Interval:")
+        header_layout.addWidget(self.interval_label)
+        self.kalshi_interval = QComboBox()  # Keep variable name for compatibility
         self.kalshi_interval.addItems([f"{M}m" for M in (1, 60, 1440)])
         self.kalshi_interval.setFixedWidth(60)
         self.kalshi_interval.currentIndexChanged.connect(self.on_time_range_changed)
@@ -1330,6 +1480,12 @@ class HistoricalOddsWidget(QWidget):
         self.refresh_button.setFixedWidth(30)
         self.refresh_button.clicked.connect(self.on_refresh_clicked)
         header_layout.addWidget(self.refresh_button)
+
+        # WebSocket status indicator
+        self.ws_status_label = QLabel("⚪")
+        self.ws_status_label.setToolTip("WebSocket: Not connected")
+        self.ws_status_label.setFixedWidth(20)
+        header_layout.addWidget(self.ws_status_label)
 
         layout.addLayout(header_layout)
 
@@ -1412,6 +1568,9 @@ class HistoricalOddsWidget(QWidget):
     def _on_websocket_connected(self):
         """Handle WebSocket connection"""
         print("🔌 Kalshi WebSocket connected")
+        self.ws_status_label.setText("🟢")
+        self.ws_status_label.setToolTip("WebSocket: Connected (Live)")
+        self.ws_status_label.setStyleSheet("color: green")
         # Re-subscribe to current market if any
         if self.kalshi_market_ticker and self.websocket_enabled:
             self._subscribe_to_current_market()
@@ -1419,10 +1578,15 @@ class HistoricalOddsWidget(QWidget):
     def _on_websocket_disconnected(self):
         """Handle WebSocket disconnection"""
         print("🔌 Kalshi WebSocket disconnected")
+        self.ws_status_label.setText("🔴")
+        self.ws_status_label.setToolTip("WebSocket: Disconnected")
+        self.ws_status_label.setStyleSheet("color: red")
 
     def _on_websocket_error(self, error_data):
         """Handle WebSocket error"""
         print(f"⚠️  Kalshi WebSocket error: {error_data}")
+        self.ws_status_label.setText("🟠")
+        self.ws_status_label.setToolTip(f"WebSocket: Error - {error_data.get('action', 'unknown')}")
 
     def _on_websocket_tick(self, tick_data):
         """
@@ -1448,25 +1612,66 @@ class HistoricalOddsWidget(QWidget):
                 return
 
             yes_price = msg.get('yes_price')
-            timestamp = msg.get('timestamp')
+            tick_timestamp = msg.get('timestamp')
 
-            if yes_price is not None and timestamp:
+            if yes_price is not None and tick_timestamp:
                 # Update plot with new data point
                 # Convert cents to dollars and then to American odds
                 price_dollars = yes_price
                 if 0 < price_dollars < 1:
                     # Convert probability to American odds
                     if price_dollars >= 0.5:
-                        american_odds = -100 * (price_dollars / (1 - price_dollars))
+                        american_odds = int(-100 * (price_dollars / (1 - price_dollars)))
                     else:
-                        american_odds = 100 * ((1 - price_dollars) / price_dollars)
+                        american_odds = int(100 * ((1 - price_dollars) / price_dollars))
 
-                    print(f"📊 Live update: {market_ticker} = ${price_dollars:.2f} ({american_odds:+.0f})")
-                    # TODO: Add this point to the plot
-                    # This would require extending the existing plot data
+                    print(f"📊 Live update: {market_ticker} = ${price_dollars:.2f} ({american_odds:+d})")
+
+                    # Create synthetic snapshot in TheOddsAPI-compatible format
+                    # This allows it to integrate with existing plotting logic
+                    from datetime import datetime, timezone
+                    now_iso = datetime.fromtimestamp(tick_timestamp, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+                    
+                    # Extract team/outcome name from ticker (last segment after dash)
+                    outcome_name = market_ticker.split('-')[-1] if '-' in market_ticker else 'Yes'
+                    
+                    synthetic_snapshot = {
+                        'timestamp': now_iso,
+                        'data': {
+                            'bookmakers': [{
+                                'key': 'kalshi',
+                                'title': 'Kalshi',
+                                'markets': [{
+                                    'key': 'h2h',  # Will be adjusted by market type if needed
+                                    'outcomes': [{
+                                        'name': outcome_name,
+                                        'price': american_odds,
+                                        'kalshi_cents': int(price_dollars * 100),
+                                    }]
+                                }]
+                            }]
+                        }
+                    }
+                    
+                    # Append to current snapshots
+                    if hasattr(self, 'current_snapshots') and self.current_snapshots:
+                        self.current_snapshots.append(synthetic_snapshot)
+                        
+                        # Throttle plot updates - only update every 10 seconds max
+                        if not hasattr(self, '_last_tick_plot_time'):
+                            self._last_tick_plot_time = 0
+                        
+                        import time
+                        current_time = time.time()
+                        if current_time - self._last_tick_plot_time >= 10.0:
+                            self._last_tick_plot_time = current_time
+                            # Schedule async plot update
+                            asyncio.create_task(self.update_plot(self.current_snapshots))
 
         except Exception as e:
             print(f"Error processing websocket tick: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _subscribe_to_current_market(self):
         """Subscribe to live updates for the currently selected Kalshi market"""
@@ -3064,7 +3269,7 @@ class HistoricalOddsWidget(QWidget):
                                         outcome_name,
                                         start_time,
                                         end_time,
-                                        fidelity=60,
+                                        fidelity=kalshi_interval_value,  # Use same interval as Kalshi for alignment
                                         market_type=unified_market.market_type  # Pass market type for correct market key
                                     )
                                     all_snapshots.extend(poly_snapshots)
@@ -3107,7 +3312,7 @@ class HistoricalOddsWidget(QWidget):
                                 outcome_name,
                                 start_time,
                                 end_time,
-                                fidelity=60
+                                fidelity=kalshi_interval_value  # Use same interval as Kalshi for alignment
                             )
                             all_snapshots = snapshots
                         else:
