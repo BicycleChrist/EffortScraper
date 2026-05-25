@@ -1,12 +1,12 @@
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import GUItunein
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, pyqtSlot, QThread
+from PyQt6.QtCore import Qt, QObject, QUrl, pyqtSignal, pyqtSlot, QThread
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QScrollBar,
     QComboBox, QLabel, QPushButton, QLineEdit, QFrame, QListWidgetItem, QSizePolicy
 )
-import webbrowser
 
 
 class StreamLoadWorker(QThread):
@@ -327,7 +327,7 @@ class TuneInWidget(QWidget):
         """Open the stream URL stored in the item's data"""
         url = item.data(Qt.ItemDataRole.UserRole)
         if url:
-            webbrowser.open(url)
+            QDesktopServices.openUrl(QUrl(url))
 
     @pyqtSlot()
     def filter_links(self):
