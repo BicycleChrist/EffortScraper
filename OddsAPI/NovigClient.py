@@ -16,13 +16,17 @@ Once introspection is on disk, higher-level helpers (list events, fetch
 markets) will be added on top.
 """
 
+import asyncio
 import json
+import os
 import pathlib
 import random
+import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -504,6 +508,19 @@ async def fetch_nv_balance(session, user_id: str) -> dict:
     tw = trader.get("trader_wallets") or []
     cw = trader.get("coin_wallets") or []
     bw = trader.get("bonus_wallets") or []
+    # Stash the CASH trader walletId in novig_async's cache so single-bet
+    # placement (place_order_async) can find it without forcing the user
+    # to place a parlay first. The balance query is the earliest call
+    # that ships this id back; before this hook, _NOVIG_WALLET_ID_CACHE
+    # was only ever populated by parlay-execute/orders responses, which
+    # don't fire until *after* a placement attempt — hence the "No Novig
+    # walletId available" error on the very first single-bet Place click.
+    if tw and tw[0].get("id"):
+        try:
+            from novig_async import _harvest_wallet_id
+            _harvest_wallet_id({"walletId": tw[0]["id"]})
+        except ImportError:
+            pass
     return {
         "cash": float(tw[0].get("balance") or 0) if tw else None,
         "coin": float(cw[0].get("balance") or 0) if cw else None,
@@ -1049,7 +1066,12 @@ def scan_sgp_implications(client: "NovigClient", event_id: str,
     return results
 
 
-if __name__ == "__main__":
+def _main_cli():
+    # Wrapped in a function (rather than running directly inside the
+    # `if __name__ == "__main__":` block) so it can be called AFTER
+    # the NovigGeoHarvester class + geo_harvester singleton are
+    # defined further down the file. --refresh-geo would otherwise
+    # NameError on geo_harvester.
     import argparse, sys
 
     ap = argparse.ArgumentParser(description="Novig client smoke test / CLI")
@@ -1090,10 +1112,26 @@ if __name__ == "__main__":
                          "novig_dumps/all_events_combined_<ts>.json. Mirrors "
                          "ProphetX's combined-dump shape so the widget can "
                          "load both sources via one code path.")
+    ap.add_argument("--refresh-geo", action="store_true",
+                    help="Drive a fresh Novig geo_tx via Selenium + "
+                         "Tampermonkey userscript and write it to the "
+                         "cache. Pair with --headless for background "
+                         "use. Bypasses all other CLI flags.")
+    ap.add_argument("--headless", action="store_true",
+                    help="Run --refresh-geo without a visible browser "
+                         "window.")
     ap.add_argument("--with-books", action="store_true",
                     help="With --scrape-dump, also fetch /book/batch ladders "
                          "per event (slower; widget can lazy-fetch otherwise).")
     args = ap.parse_args()
+
+    # --refresh-geo short-circuits — no GraphQL client needed, just
+    # drive the Tampermonkey-backed harvester.
+    if args.refresh_geo:
+        ok = asyncio.run(
+            geo_harvester.refresh_geo_tx(headless=args.headless))
+        print(f"refresh: {'OK' if ok else 'FAIL'}")
+        sys.exit(0 if ok else 1)
 
     client = NovigClient()
     q = NovigQueries(client)
@@ -1343,3 +1381,847 @@ if __name__ == "__main__":
 #         hits = [t["name"] for t in user_types if needle.lower() in t["name"].lower()]
 #         if hits:
 #             print(f"\nTypes matching '{needle}': {', '.join(sorted(hits)[:20])}")
+
+
+# ===========================================================================
+# Geo harvester
+# ---------------------------------------------------------------------------
+# Merged from the former novig_auth.py (cache + HTTP listener for the
+# Tampermonkey userscript) and novig_auto_refresh.py (Selenium-driven
+# refresh that places a small COIN bet to force a fresh PREWAGER
+# attestation). Both files used to be standalone; this class is the
+# single integration point now consumed by novig_async and EffortOdds.
+# ===========================================================================
+
+
+class NovigGeoHarvester:
+    """One stop for Novig's PREWAGER geolocationTransactionId.
+
+    Two halves:
+      Cache + listener:
+        - in-memory + on-disk JSON store of the latest tx
+        - HTTP listener on 127.0.0.1:54321 that the Tampermonkey
+          userscript (OddsAPI/novig_userscript.js) POSTs to whenever
+          the GeoComply SDK mints or surfaces a tx
+        - source-confidence ranking + overwrite protection so a noisy
+          json-parse capture can't clobber a fresh proto-setter
+      Refresh driver (on-demand, called when a /orders POST returns
+      400 "Geolocation validation has expired"):
+        - rsync-snapshot the user's live Firefox profile (so we don't
+          fight the running browser's profile lock)
+        - launch Firefox via Selenium against the snapshot
+        - place a small COIN bet — the /orders POST forces the SDK to
+          mint a fresh PREWAGER attestation, which the always-present
+          userscript captures and POSTs back to our listener
+
+    See the long comment above _place_coin_bet for *why* the refresh
+    path bottoms out in a userscript instead of inline JS injection.
+    """
+
+    # --- cache / listener config ------------------------------------------
+    _CACHE_PATH = pathlib.Path(__file__).parent / "novig_geo_cache.json"
+    _LISTEN_HOST = "127.0.0.1"
+    _LISTEN_PORT = 54321
+
+    _SOURCE_CONFIDENCE = {
+        # Highest — SPA literally assigned the tx onto the outbound payload.
+        "proto-setter": 9,
+        # SPA's actual outbound /orders body — gold standard.
+        "fetch-req": 8, "xhr-req": 8,
+        # SDK events / direct return values, ranked by reason code below.
+        "sdk-emit": 7, "sdk-request": 7,
+        # GeoComply engine response bodies.
+        "fetch-resp": 6, "resp-json": 6, "xhr-resp": 5,
+        "ws-msg": 4,
+        "sdk-walk": 2,
+        # Wide net — catches historical / cross-currency tokens too.
+        "json-parse": 1,
+        "plain": 5,  # back-compat with v1 userscript's plain-text body
+    }
+    # How long a high-confidence cache "protects" itself against lower-
+    # confidence overwrites. PREWAGER tokens last hours; this just stops
+    # a noisy json-parse capture (e.g. a cross-currency token landing
+    # seconds later) from clobbering a fresh proto-setter.
+    _OVERWRITE_PROTECTION_S = 120
+
+    # --- refresh-driver config --------------------------------------------
+    # NOTE: hard-coded Firefox profile path. If you ever delete the
+    # profile, switch Firefox installs, or run this on a different box,
+    # update this constant — _snapshot_profile() raises RuntimeError
+    # ("live FF profile not found") if the path is missing. Tampermonkey
+    # + novig_userscript.js MUST be installed and enabled inside this
+    # profile; the snapshot copies it verbatim, so what's in your real
+    # Firefox is what runs in the headless Selenium session.
+    # To find your current path: `ls ~/.mozilla/firefox/ | grep default`.
+    _LIVE_PROFILE = pathlib.Path(os.path.expanduser(
+        "~/.mozilla/firefox/lumoar1n.default-release"))
+    _SNAPSHOT = pathlib.Path(__file__).parent / "novig_ff_snapshot"
+    _NOVIG_URL = "https://novig.com/"
+    _RSYNC_EXCLUDES = (
+        "lock", ".parentlock", "parent.lock",
+        "cache2/", "startupCache/", "safebrowsing/", "gmp-*/",
+        "minidumps/", "crashes/", "datareporting/",
+        "saved-telemetry-pings/", "shader-cache/", "cookies.sqlite-shm",
+    )
+
+    # --- in-page JS used by the refresh driver ----------------------------
+    _DETECT_CURRENCY_JS = r"""
+    const all = document.querySelectorAll(
+        'div[style*="translateX(0px)"], '
+        + 'div[style*="translateX(-18px)"]');
+    for (const el of all) {
+        if (!el.querySelector('[data-expoimage="true"]')) continue;
+        return /translateX\(-/.test(el.getAttribute('style') || '')
+            ? 'coin' : 'cash';
+    }
+    return null;
+    """
+    _TAG_COIN_TOGGLE_JS = r"""
+    const all = document.querySelectorAll('div[style*="translateX(0px)"]');
+    for (const el of all) {
+        if (!el.querySelector('[data-expoimage="true"]')) continue;
+        let cur = el.parentElement;
+        for (let i = 0; i < 6 && cur; i++) {
+            if (cur.getAttribute && cur.getAttribute('tabindex') === '0') {
+                cur.setAttribute('data-novig-coin-toggle', '1');
+                return true;
+            }
+            cur = cur.parentElement;
+        }
+    }
+    return false;
+    """
+
+    def __init__(self):
+        self._geo_cache: Optional[str] = None
+        self._geo_meta: dict = {"source": None, "ts": None}
+        self._lock = threading.Lock()
+        self._refresh_done = threading.Event()
+        self._refresh_done.set()
+        self._callbacks: list = []
+        self._listener_started = False
+
+    # ====================================================================
+    # Cache + listener half
+    # ====================================================================
+
+    def _log(self, msg: str) -> None:
+        print(f"[novig_geo] {msg}", flush=True)
+
+    def on_geo_refresh(self, cb: Callable[[], None]) -> None:
+        """Register a callback fired (from the listener thread) whenever
+        a fresh tx is received. Qt-side handlers must marshal to the
+        main thread via a queued signal."""
+        self._callbacks.append(cb)
+
+    def _fire_callbacks(self) -> None:
+        for cb in list(self._callbacks):
+            try:
+                cb()
+            except Exception as e:
+                self._log(f"callback failed: {e}")
+
+    def _load_from_disk(self) -> None:
+        """Populate in-memory cache + meta from disk on first read."""
+        if not self._CACHE_PATH.exists():
+            return
+        try:
+            blob = json.loads(self._CACHE_PATH.read_text())
+            v = blob.get("geo_tx_id")
+            if isinstance(v, str) and v:
+                self._geo_cache = v
+                self._geo_meta = {
+                    "source": blob.get("source"),
+                    "ts": blob.get("received_at"),
+                }
+        except Exception:
+            pass
+
+    def get_cached_geo_tx(self) -> Optional[str]:
+        """In-memory > disk > None. novig_async falls back to Creds when
+        this returns None."""
+        if self._geo_cache:
+            return self._geo_cache
+        self._load_from_disk()
+        return self._geo_cache
+
+    def get_cached_geo_meta(self) -> dict:
+        """Return {tx, source, ts, age_s} or {} if no token cached.
+        Used by UI to surface freshness."""
+        if not self._geo_cache:
+            self._load_from_disk()
+        if not self._geo_cache:
+            return {}
+        ts = self._geo_meta.get("ts")
+        age = int(time.time() - ts) if isinstance(ts, (int, float)) else None
+        return {
+            "tx": self._geo_cache,
+            "source": self._geo_meta.get("source"),
+            "ts": ts,
+            "age_s": age,
+        }
+
+    def invalidate_geo_tx(self) -> None:
+        """Drop the in-memory cache so the next read consults disk."""
+        with self._lock:
+            self._geo_cache = None
+
+    def _source_confidence(self, src: Optional[str]) -> int:
+        if not src:
+            return 0
+        # Bonus tier: PREWAGER reason code (=2) — what /orders actually
+        # validates. SDK-emit/request tags carry ":rc=2".
+        if "rc=2" in src:
+            return 10
+        head = src.split("|", 1)[0].split(":", 1)[0]
+        return self._SOURCE_CONFIDENCE.get(head, 1)
+
+    def _set_geo_tx(self, geo_tx: str,
+                    source: Optional[str] = None) -> None:
+        """Stash a freshly-received tx in cache + disk + fire callbacks.
+        Refuses to overwrite a fresher, higher-confidence cache so that
+        a noisy json-parse (e.g. cross-currency token or historical
+        /orders hydration) doesn't clobber a recent proto-setter or
+        fetch-req capture."""
+        now = int(time.time())
+        new_conf = self._source_confidence(source)
+        with self._lock:
+            if geo_tx == self._geo_cache:
+                # Refresh the timestamp on a duplicate so we know the
+                # harvester is still alive. Keep the BETTER source label.
+                old_conf = self._source_confidence(
+                    self._geo_meta.get("source"))
+                keep_src = (self._geo_meta.get("source")
+                            if old_conf >= new_conf else source)
+                self._geo_meta = {"source": keep_src, "ts": now}
+                self._refresh_done.set()
+                return
+            old_conf = self._source_confidence(
+                self._geo_meta.get("source"))
+            old_ts = self._geo_meta.get("ts") or 0
+            if (old_conf > new_conf
+                    and (now - old_ts) < self._OVERWRITE_PROTECTION_S):
+                self._log(
+                    f"suppressing overwrite: new source={source!r} "
+                    f"(conf={new_conf}) won't replace current "
+                    f"source={self._geo_meta.get('source')!r} "
+                    f"(conf={old_conf}, age={now - old_ts}s)")
+                self._refresh_done.set()
+                return
+            self._geo_cache = geo_tx
+            self._geo_meta = {"source": source, "ts": now}
+        try:
+            self._CACHE_PATH.write_text(json.dumps({
+                "geo_tx_id": geo_tx,
+                "received_at": now,
+                "source": source,
+            }, indent=2))
+        except Exception as e:
+            self._log(f"persist failed: {e}")
+        self._refresh_done.set()
+        self._fire_callbacks()
+        self._log(f"received fresh geo_tx ({len(geo_tx)} chars, "
+                  f"source={source})")
+
+    def _parse_post_body(self, raw: bytes) -> tuple[Optional[str],
+                                                    Optional[str]]:
+        """Accept either a plain-text token body or a JSON envelope
+        from the harvester. Returns (tx, source) or (None, None)."""
+        if not raw:
+            return None, None
+        body = raw.decode("utf-8", "ignore").strip()
+        if not body:
+            return None, None
+        # JSON envelope path
+        if body[0] == "{":
+            try:
+                j = json.loads(body)
+                tx = j.get("tx")
+                source = j.get("source")
+                if isinstance(tx, str) and tx:
+                    return tx, (source if isinstance(source, str)
+                                else None)
+            except Exception:
+                pass
+        # Plain-text path (back-compat with v1 userscript)
+        if 8 <= len(body) <= 256 and "\n" not in body:
+            return body, "plain"
+        return None, None
+
+    def start_geo_listener(self, host: Optional[str] = None,
+                           port: Optional[int] = None) -> None:
+        """Start the local HTTP listener the harvester POSTs to.
+        Idempotent — safe to call multiple times. Listener runs on a
+        daemon thread so it doesn't block Qt shutdown."""
+        if self._listener_started:
+            return
+        self._listener_started = True
+        host = host or self._LISTEN_HOST
+        port = port or self._LISTEN_PORT
+
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        outer = self
+
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods",
+                             "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type")
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                tx, source = outer._parse_post_body(raw)
+                if tx:
+                    outer._set_geo_tx(tx, source)
+                self.send_response(204)
+                _cors(self)
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path.rstrip("/") in ("/status",
+                                              "/geo/status"):
+                    meta = outer.get_cached_geo_meta()
+                    body = json.dumps({
+                        "have": bool(meta),
+                        "age_s": meta.get("age_s"),
+                        "source": meta.get("source"),
+                        "ts": meta.get("ts"),
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "application/json")
+                    self.send_header("Content-Length",
+                                     str(len(body)))
+                    _cors(self)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                _cors(self)
+                self.end_headers()
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                _cors(self)
+                self.end_headers()
+
+            def log_message(self, *args, **kwargs):
+                pass  # mute access log noise
+
+        def _run():
+            try:
+                srv = HTTPServer((host, port), _Handler)
+                outer._log(f"listening for geo_tx on "
+                           f"http://{host}:{port}/geo "
+                           f"(status: http://{host}:{port}/status)")
+                srv.serve_forever()
+            except Exception as e:
+                outer._log(f"listener failed: {e}")
+
+        threading.Thread(target=_run, name="novig-geo-listener",
+                         daemon=True).start()
+
+    async def force_refresh_geo_async(self,
+                                      timeout: float = 20.0) -> bool:
+        """Wait until a fresh tx lands in the cache (via harvester POST)
+        or until `timeout` elapses. Returns True on fresh tx, False on
+        timeout. Caller surfaces the original 400 to the UI on timeout.
+
+        This is the *listener-only* wait — it does NOT drive a browser.
+        Use refresh_geo_tx() for the full Selenium-driven refresh."""
+        self.invalidate_geo_tx()
+        self._refresh_done.clear()
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(None, self._refresh_done.wait,
+                                         timeout)
+        if not ok:
+            self._log("no fresh geo_tx within timeout — ensure "
+                      "novig.com is open in your real Firefox with the "
+                      "userscript harvester installed")
+        return ok
+
+    # ====================================================================
+    # Refresh-driver half
+    # ====================================================================
+
+    def _snapshot_profile(self, force: bool = False) -> pathlib.Path:
+        """rsync the live profile to a snapshot. Reuses existing
+        snapshot if <5 min old. Safe to run while Firefox is open."""
+        if not self._LIVE_PROFILE.exists():
+            raise RuntimeError(
+                f"live FF profile not found at {self._LIVE_PROFILE}")
+        if self._SNAPSHOT.exists() and not force:
+            if time.time() - self._SNAPSHOT.stat().st_mtime < 300:
+                self._log(f"reusing snapshot (age "
+                          f"{int(time.time() - self._SNAPSHOT.stat().st_mtime)}s)")
+                return self._SNAPSHOT
+        self._log(f"rsync {self._LIVE_PROFILE} -> {self._SNAPSHOT}")
+        self._SNAPSHOT.mkdir(exist_ok=True)
+        cmd = ["rsync", "-a", "--delete"]
+        for ex in self._RSYNC_EXCLUDES:
+            cmd.append(f"--exclude={ex}")
+        cmd += [str(self._LIVE_PROFILE) + "/",
+                str(self._SNAPSHOT) + "/"]
+        t0 = time.time()
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode not in (0, 23, 24):
+            raise RuntimeError(f"rsync failed rc={r.returncode}: "
+                               f"{r.stderr[:400]}")
+        self._log(f"snapshot ready in {time.time() - t0:.1f}s")
+        for fn in ("lock", ".parentlock", "parent.lock"):
+            p = self._SNAPSHOT / fn
+            if p.exists() or p.is_symlink():
+                try: p.unlink()
+                except Exception: pass
+        return self._SNAPSHOT
+
+    def _launch_firefox(self, headless: bool = False):
+        from selenium import webdriver
+        from selenium.webdriver.firefox.options import Options
+        opts = Options()
+        opts.add_argument("-profile")
+        opts.add_argument(str(self._SNAPSHOT))
+        opts.set_preference("dom.webdriver.enabled", False)
+        opts.set_preference("permissions.default.geo", 1)
+        if headless:
+            opts.add_argument("--headless")
+            opts.add_argument("--width=1920")
+            opts.add_argument("--height=1080")
+        self._log(f"launching Firefox (headless={headless}) ...")
+        driver = webdriver.Firefox(options=opts)
+        driver.set_page_load_timeout(60)
+        if not headless:
+            try: driver.set_window_size(1920, 1080)
+            except Exception: pass
+        return driver
+
+    # --- Why we use the userscript+listener pattern instead of an
+    #     inline Selenium-injected hook -----------------------------------
+    #
+    # The capture mechanism that works for /orders is a setter trap on
+    # Object.prototype.geolocationTransactionId — the SPA assigns the
+    # freshly-minted PREWAGER tx onto its outbound payload object, and
+    # the trap fires at the moment of assignment (source label
+    # "proto-setter", highest confidence in _SOURCE_CONFIDENCE).
+    #
+    # That trap MUST be installed at document-start, before any SPA
+    # code touches Object.prototype or caches a reference to
+    # window.fetch. From Selenium-driven Firefox we cannot do that:
+    #   - driver.execute_script only runs once the document is loaded;
+    #     by then the GeoComply SDK and the React bundle have already
+    #     grabbed their fetch references and (in our experiments) the
+    #     SPA's own Object.prototype writes have already happened.
+    #   - Firefox-Marionette has no equivalent of Chrome DevTools'
+    #     Page.addScriptToEvaluateOnNewDocument. Selenium 4's BiDi
+    #     script.add_preload_script has spotty Firefox support and is
+    #     not reliable here.
+    #   - When we tried to inject the same hook post-load, two failure
+    #     modes appeared: (1) wrapping fetch with `orig.apply(this,
+    #     args)` throws "'fetch' called on an object that does not
+    #     implement interface Window" and breaks every subsequent SPA
+    #     network call; (2) even after binding fetch correctly, our
+    #     Object.prototype defineProperty races against Tampermonkey's
+    #     already-installed setter — defineProperty either silently
+    #     no-ops (if TM's setter was non-configurable) or replaces
+    #     TM's, but by then the SPA has captured its own references
+    #     and the setter never fires.
+    #
+    # So the architecture is: novig_userscript.js (installed in the
+    # user's real Firefox profile via Tampermonkey) runs at
+    # document-start every time novig.com loads, regardless of whether
+    # the load is user-driven or Selenium-driven (because we launch
+    # Selenium against a SNAPSHOT of that same profile, so the
+    # extension + its userscript come along). When it sees a tx, it
+    # POSTs to http://localhost:54321/geo. start_geo_listener caches
+    # it. refresh_geo_tx polls that cache until a high-confidence,
+    # post-start_ts capture lands.
+
+    def _place_coin_bet(self, driver, amount: str = "10",
+                        cta_timeout: int = 120) -> dict:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import (
+            TimeoutException, ElementClickInterceptedException,
+            ElementNotInteractableException)
+        log = []
+        t0 = time.time()
+        def push(m): log.append(f"+{int((time.time()-t0)*1000)}ms {m}")
+        def fail(step):
+            return {"ok": False, "step": step, "detail": log}
+
+        def safe_click(el, label):
+            """Selenium click first (trusted-event, required for
+            RN-Web Pressables). If a sticky overlay (ticker tape,
+            toast, etc.) intercepts at the original coords, scroll the
+            element to the viewport center and retry. As a last
+            resort, dispatch a JS MouseEvent — works on Pressables
+            that don't require trust."""
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', "
+                "inline:'center'});", el)
+            time.sleep(0.15)
+            try:
+                el.click()
+                push(f"clicked {label} (selenium)")
+                return True
+            except (ElementClickInterceptedException,
+                    ElementNotInteractableException) as e:
+                push(f"  {label}: intercepted/non-interactable, "
+                     f"retrying ({type(e).__name__})")
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});",
+                    el)
+                time.sleep(0.2)
+                el.click()
+                push(f"clicked {label} (selenium-retry)")
+                return True
+            except (ElementClickInterceptedException,
+                    ElementNotInteractableException):
+                pass
+            try:
+                driver.execute_script(r"""
+                    const el = arguments[0];
+                    const r = el.getBoundingClientRect();
+                    const cx = r.left + r.width/2;
+                    const cy = r.top + r.height/2;
+                    for (const t of ['mousedown','mouseup','click']) {
+                        el.dispatchEvent(new MouseEvent(t, {
+                            bubbles: true, cancelable: true,
+                            view: window,
+                            clientX: cx, clientY: cy, button: 0,
+                        }));
+                    }
+                """, el)
+                push(f"clicked {label} (js-dispatch fallback)")
+                return True
+            except Exception as e:
+                push(f"  {label}: js-dispatch failed: {e}")
+                return False
+
+        # 1. Switch to COIN if needed
+        cur = driver.execute_script("return (function(){"
+                                     + self._DETECT_CURRENCY_JS + "})()")
+        if cur == "cash":
+            if not driver.execute_script(
+                    "return (function(){"
+                    + self._TAG_COIN_TOGGLE_JS + "})()"):
+                return fail("find-coin-toggle")
+            toggle_el = driver.find_element(
+                By.CSS_SELECTOR, '[data-novig-coin-toggle="1"]')
+            if not safe_click(toggle_el, "COIN toggle"):
+                return fail("click-coin-toggle")
+            try:
+                WebDriverWait(driver, 5).until(
+                    lambda d: d.execute_script(
+                        "return (function(){"
+                        + self._DETECT_CURRENCY_JS + "})()") == "coin")
+                push("COIN mode confirmed")
+            except TimeoutException:
+                return fail("switch-to-coin")
+        elif cur == "coin":
+            push("already in COIN mode")
+
+        # 2. Pick first MONEY outcome inside a NON-LIVE event card,
+        # directly on /events. Clicking opens the bet slip drawer
+        # with the CTA already mounted; no detail-page navigation.
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'div[data-testid^="outcome-"]')))
+        except TimeoutException:
+            return fail("find-outcome")
+
+        pick_js = r"""
+        const cards = document.querySelectorAll('[data-testid^="event-card-"]');
+        let chosen = null;
+        let chosenTid = null;
+        let chosenCardTitle = null;
+        for (const card of cards) {
+            const txt = (card.innerText || '').toLowerCase();
+            if (txt.includes('live')) continue;
+            const outcomes = card.querySelectorAll(
+                'div[data-testid^="outcome-"]');
+            if (!outcomes.length) continue;
+            let money = null;
+            for (const o of outcomes) {
+                const tid = o.getAttribute('data-testid') || '';
+                if (tid.includes('MONEY')) { money = o; break; }
+            }
+            chosen = money || outcomes[0];
+            chosenTid = chosen.getAttribute('data-testid');
+            chosenCardTitle = (card.innerText || '').split('\n')[0];
+            chosen.setAttribute('data-novig-pick', '1');
+            break;
+        }
+        return chosen
+            ? {tid: chosenTid, title: chosenCardTitle}
+            : null;
+        """
+        pick = driver.execute_script("return (function(){"
+                                      + pick_js + "})()")
+        if not pick:
+            return fail("no-non-live-outcome")
+        push(f"picked outcome: {pick.get('tid')!r} in card: "
+             f"{(pick.get('title') or '')[:60]!r}")
+        chosen = driver.find_element(
+            By.CSS_SELECTOR, '[data-novig-pick="1"]')
+        if not safe_click(chosen, "outcome on /events"):
+            return fail("click-outcome")
+
+        # 2b. Wait for the slip drawer to mount. Three slip facts the
+        # rest of this function depends on (discovered via a DOM dump
+        # that has since been removed):
+        #   - no `orderslip-cta` testid exists on /events; the CTA is
+        #     a bare <div> identified only by its visible text
+        #   - the geo-verifying signal is a top-level
+        #     <div role="progressbar"> (NOT a child of the CTA),
+        #     paired with the CTA text starting with "Retry"
+        #   - the amount field is NOT an <input> — it's a focusable
+        #     <div tabindex="0" data-testid="order-amount-input-<UUID>">
+        #     React-Native-Web shim, typed via ActionChains.send_keys
+        try:
+            WebDriverWait(driver, 5).until(
+                lambda d: d.execute_script(
+                    "return document.querySelectorAll('[role=\"dialog\"], "
+                    "[data-testid*=\"slip\"], [data-testid*=\"order\"]')"
+                    ".length > 0"))
+            push("slip drawer mounted")
+        except TimeoutException:
+            push("slip drawer not detected in 5s — continuing anyway")
+
+        # 3. Locate slip CTA by text ("Retry Geolocation" while
+        # verifying, "Place Order" once ready). Tag the clickable
+        # ancestor for stable referencing across re-renders.
+        tag_cta_js = r"""
+        const RX = /^(retry\s*geolocation|place\s*order)/i;
+        let hit = null;
+        for (const el of document.querySelectorAll('div,span,button')) {
+            const t = (el.innerText || '').trim();
+            if (!t || t.length > 40) continue;
+            if (!RX.test(t)) continue;
+            if (!hit || el.contains(hit) === false) hit = el;
+        }
+        if (!hit) return null;
+        let target = hit;
+        let cur = hit;
+        for (let i = 0; i < 8 && cur; i++) {
+            const ti = cur.getAttribute && cur.getAttribute('tabindex');
+            const role = cur.getAttribute && cur.getAttribute('role');
+            if (ti === '0' || role === 'button'
+                    || (cur.getAttribute
+                        && cur.getAttribute('data-focusable') === 'true')) {
+                target = cur;
+                break;
+            }
+            cur = cur.parentElement;
+        }
+        target.setAttribute('data-novig-cta', '1');
+        hit.setAttribute('data-novig-cta-text', '1');
+        return {text: hit.innerText.trim()};
+        """
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script(
+                    "return (function(){" + tag_cta_js + "})()")
+                is not None)
+        except TimeoutException:
+            return fail("find-cta-text")
+        push("slip CTA found by text")
+
+        def cta_state():
+            """Returns (state, text). state='verifying' iff any
+            visible role=progressbar is up OR the CTA still reads
+            "Retry"; else 'ready'."""
+            info = driver.execute_script(
+                "return (function(){" + tag_cta_js + "})()")
+            if not info:
+                return None, None
+            txt = (info.get("text") or "").strip()
+            verifying = driver.execute_script(r"""
+                const bars = document.querySelectorAll('[role="progressbar"]');
+                for (const b of bars) {
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return true;
+                }
+                return false;
+            """)
+            if verifying or txt.lower().startswith("retry"):
+                return "verifying", txt
+            return "ready", txt
+
+        def wait_cta_ready(label):
+            deadline = time.time() + cta_timeout
+            last_state = None
+            last_log = 0.0
+            while time.time() < deadline:
+                st, txt = cta_state()
+                if st == "ready":
+                    push(f"{label}: CTA ready ({txt[:50]!r})")
+                    return True
+                now = time.time()
+                if now - last_log >= 1.0 and (st, txt) != last_state:
+                    push(f"  {label}: state={st!r} "
+                         f"text={(txt or '')[:50]!r}")
+                    last_state = (st, txt)
+                    last_log = now
+                time.sleep(0.25)
+            st, txt = cta_state()
+            push(f"{label} timeout: state={st!r} "
+                 f"text={(txt or '')[:60]!r}")
+            return False
+
+        # 4. Type amount into the slip's shim input.
+        amt_sel = '[data-testid^="order-amount-input-"]'
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, amt_sel)))
+        except TimeoutException:
+            push("no amount input within 10s — "
+                 "proceeding with slip default")
+        else:
+            try:
+                from selenium.webdriver.common.action_chains import (
+                    ActionChains)
+                amt_el = driver.find_element(By.CSS_SELECTOR, amt_sel)
+                if safe_click(amt_el, "amount field"):
+                    time.sleep(0.15)
+                    ActionChains(driver).send_keys(
+                        str(amount)).perform()
+                    shown = driver.execute_script(r"""
+                        const el = document.querySelector(arguments[0]);
+                        if (!el) return null;
+                        const t = el.querySelector('[data-testid="Text"]');
+                        return t ? (t.innerText || '').trim() : null;
+                    """, amt_sel)
+                    push(f"typed {amount} (shim shows {shown!r})")
+                else:
+                    push("amount field click failed — slip default")
+            except Exception as e:
+                push(f"amount entry failed: {e}")
+
+        # 5. Conditional wait — up to cta_timeout (default 120s) for
+        # the spinner to clear AND the CTA text to flip past "Retry".
+        if not wait_cta_ready("post-amount"):
+            return fail("cta-never-ready")
+
+        # 6. Click Place Order on the tagged CTA.
+        cta_el = driver.find_element(
+            By.CSS_SELECTOR, '[data-novig-cta="1"]')
+        if not safe_click(cta_el, "Place Order"):
+            return fail("click-place")
+
+        return {"ok": True, "step": "placed", "detail": log,
+                "elapsed_ms": int((time.time() - t0) * 1000)}
+
+    async def refresh_geo_tx(self, timeout_s: float = 30.0,
+                             headless: bool = False,
+                             amount: str = "10") -> bool:
+        """Drive the SPA to fire a /orders POST so the Tampermonkey
+        userscript captures a fresh PREWAGER geo_tx and POSTs it to
+        the local listener. Returns True iff a high-confidence,
+        post-start_ts capture lands in the cache within `timeout_s`
+        of the Place Order click."""
+        self.start_geo_listener()
+        # Snapshot BEFORE invalidating: invalidate_geo_tx() clears
+        # in-mem only, then the next get_cached_geo_meta() reloads off
+        # disk, which would resurrect a stale token from a prior run
+        # with its old source label intact. Comparing ts >= start_ts
+        # is the real freshness gate.
+        start_ts = int(time.time())
+        self.invalidate_geo_tx()
+        loop = asyncio.get_running_loop()
+
+        def is_fresh_high_conf(meta: dict) -> bool:
+            if not meta:
+                return False
+            ts = meta.get("ts") or 0
+            if ts < start_ts:
+                return False
+            src = meta.get("source") or ""
+            return (src.startswith("proto-setter")
+                    or src.startswith("fetch-req")
+                    or "rc=2" in src)
+
+        def wait_for_page_ready(driver, timeout: float = 15.0) -> bool:
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            try:
+                WebDriverWait(driver, timeout).until(
+                    lambda d: d.execute_script(
+                        "return document.readyState")
+                    in ("interactive", "complete"))
+                WebDriverWait(driver, timeout).until(
+                    lambda d: d.find_elements(
+                        By.CSS_SELECTOR,
+                        'div[data-testid^="outcome-"], '
+                        '[data-testid^="event-card-"]'))
+                return True
+            except Exception as e:
+                self._log(f"page-ready wait failed: {e}")
+                return False
+
+        def blocking():
+            self._snapshot_profile()
+            driver = self._launch_firefox(headless=headless)
+            try:
+                self._log(f"navigating to {self._NOVIG_URL}")
+                driver.get(self._NOVIG_URL)
+                if not wait_for_page_ready(driver):
+                    self._log("page never became ready; aborting")
+                    return False
+                self._log(f"placing {amount} COIN bet ...")
+                r = self._place_coin_bet(driver, amount=amount)
+                self._log(f"place: ok={r['ok']} step={r['step']!r} "
+                          f"elapsed_ms={r.get('elapsed_ms')}")
+                for line in r["detail"]:
+                    self._log(f"  {line}")
+                if not r["ok"]:
+                    return False
+                self._log(f"awaiting fresh geo_tx (start_ts={start_ts}, "
+                          f"timeout={timeout_s}s) ...")
+                deadline = time.time() + timeout_s
+                last_log = 0.0
+                while time.time() < deadline:
+                    meta = self.get_cached_geo_meta() or {}
+                    if is_fresh_high_conf(meta):
+                        self._log(f"captured fresh geo_tx via "
+                                  f"{meta.get('source')!r} "
+                                  f"(age={meta.get('age_s')}s, "
+                                  f"ts={meta.get('ts')})")
+                        return True
+                    now = time.time()
+                    if now - last_log >= 2.0:
+                        self._log(f"  waiting... cache source="
+                                  f"{meta.get('source')!r} "
+                                  f"ts={meta.get('ts')} "
+                                  f"(start_ts={start_ts})")
+                        last_log = now
+                    time.sleep(0.5)
+                meta = self.get_cached_geo_meta() or {}
+                self._log(f"timed out: final source="
+                          f"{meta.get('source')!r} "
+                          f"ts={meta.get('ts')} "
+                          f"(start_ts={start_ts})")
+                return False
+            finally:
+                try: driver.quit()
+                except Exception: pass
+
+        return await loop.run_in_executor(None, blocking)
+
+
+# Module-level singleton — keeps the single-cache, single-listener
+# semantics the old module-level novig_auth had. Callers should import
+# this rather than constructing their own NovigGeoHarvester unless
+# they need test isolation.
+geo_harvester = NovigGeoHarvester()
+
+
+if __name__ == "__main__":
+    _main_cli()

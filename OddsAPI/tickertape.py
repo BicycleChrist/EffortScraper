@@ -152,6 +152,15 @@ class TickerTape(QWidget):
     def update_current_text(self):
         """Update the current text to display"""
         sports = list(self.sports_data.keys())
+        if not sports:
+            self.current_text = "Loading..."
+            self.update_text_width()
+            return
+
+        # Ensure index is in bounds
+        if self.current_sport_index >= len(sports):
+            self.current_sport_index = 0
+
         sport = sports[self.current_sport_index]
         games = self.sports_data[sport]["games"]
 
@@ -177,6 +186,10 @@ class TickerTape(QWidget):
         sports = list(self.sports_data.keys())
         if not sports:
             return
+
+        # Ensure index is in bounds
+        if self.current_sport_index >= len(sports):
+            self.current_sport_index = 0
 
         sport = sports[self.current_sport_index]
         games = self.sports_data[sport]["games"]
@@ -228,43 +241,58 @@ class TickerTape(QWidget):
     def get_current_sport_info(self):
         """Get current sport color information"""
         sports = list(self.sports_data.keys())
+        if not sports:
+            # Return default sport info when no data available
+            return {
+                "color": QColor("#2C3E50"),
+                "accent": QColor("#3498DB"),
+                "icon": "🌐",
+                "games": ["Loading..."]
+            }
+        # Ensure index is in bounds
+        if self.current_sport_index >= len(sports):
+            self.current_sport_index = 0
         sport = sports[self.current_sport_index]
         return self.sports_data[sport]
 
     def paintEvent(self, event):
         """Paint the ESPN-style ticker with smooth animations"""
         painter = QPainter(self)
+        try:
+            # Windows-specific performance optimization
+            if platform.system() == "Windows":
+                # Only use essential antialiasing on Windows
+                painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            else:
+                # Full antialiasing on Linux/Mac
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        # Windows-specific performance optimization
-        if platform.system() == "Windows":
-            # Only use essential antialiasing on Windows
-            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        else:
-            # Full antialiasing on Linux/Mac
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            rect = self.rect()
+            sport_info = self.get_current_sport_info()
 
-        rect = self.rect()
-        sport_info = self.get_current_sport_info()
+            # Cache graphics objects when sport or size changes
+            cache_key = (self.current_sport_index, rect.width(), rect.height())
+            if self._cache_key != cache_key or self._cached_gradients is None:
+                self._create_cached_graphics(rect, sport_info)
+                self._cache_key = cache_key
 
-        # Cache graphics objects when sport or size changes
-        cache_key = (self.current_sport_index, rect.width(), rect.height())
-        if self._cache_key != cache_key or self._cached_gradients is None:
-            self._create_cached_graphics(rect, sport_info)
-            self._cache_key = cache_key
+            # Draw sophisticated background with sport-specific colors
+            self.draw_background(painter, rect, sport_info)
 
-        # Draw sophisticated background with sport-specific colors
-        self.draw_background(painter, rect, sport_info)
+            # Draw scrolling game content FIRST (underneath everything)
+            self.draw_scrolling_content(painter, rect, sport_info)
 
-        # Draw scrolling game content FIRST (underneath everything)
-        self.draw_scrolling_content(painter, rect, sport_info)
+            # Draw sport segment OVER the scrolling text (like an overlay)
+            self.draw_sport_segment(painter, rect, sport_info)
 
-        # Draw sport segment OVER the scrolling text (like an overlay)
-        self.draw_sport_segment(painter, rect, sport_info)
-
-        # Draw accent elements and effects on top
-        self.draw_accent_effects(painter, rect, sport_info)
+            # Draw accent elements and effects on top
+            self.draw_accent_effects(painter, rect, sport_info)
+        except Exception as e:
+            print(f"TickerTape paintEvent error: {e}")
+        finally:
+            painter.end()
 
     def _create_cached_graphics(self, rect, sport_info):
         """Create and cache gradients and paths"""
@@ -339,7 +367,10 @@ class TickerTape(QWidget):
         painter.setFont(self.sport_font)
 
         sports = list(self.sports_data.keys())
-        sport_name = sports[self.current_sport_index]
+        if not sports or self.current_sport_index >= len(sports):
+            sport_name = ""
+        else:
+            sport_name = sports[self.current_sport_index]
         icon = sport_info["icon"]
 
         # Center the text in the segment
@@ -363,8 +394,14 @@ class TickerTape(QWidget):
 
         # Get sport info for old and new sports
         sports = list(self.sports_data.keys())
-        old_sport_info = self.sports_data[sports[self.previous_sport_index]]
-        new_sport_info = self.sports_data[sports[self.current_sport_index]]
+        if not sports:
+            painter.restore()
+            return
+        # Ensure indices are in bounds
+        prev_idx = min(self.previous_sport_index, len(sports) - 1)
+        curr_idx = min(self.current_sport_index, len(sports) - 1)
+        old_sport_info = self.sports_data[sports[prev_idx]]
+        new_sport_info = self.sports_data[sports[curr_idx]]
 
         # Transform for 3D flip effect
         center_x = self.segment_width / 2
@@ -392,8 +429,14 @@ class TickerTape(QWidget):
         painter.save()
 
         sports = list(self.sports_data.keys())
-        old_sport_info = self.sports_data[sports[self.previous_sport_index]]
-        new_sport_info = self.sports_data[sports[self.current_sport_index]]
+        if not sports:
+            painter.restore()
+            return
+        # Ensure indices are in bounds
+        prev_idx = min(self.previous_sport_index, len(sports) - 1)
+        curr_idx = min(self.current_sport_index, len(sports) - 1)
+        old_sport_info = self.sports_data[sports[prev_idx]]
+        new_sport_info = self.sports_data[sports[curr_idx]]
 
         progress = self._transition_progress
 
@@ -484,8 +527,15 @@ class TickerTape(QWidget):
         news_items = worker.news_items
 
         # Get more headlines - prioritize by injury score first, then by date (newest first)
-        sorted_news = sorted(news_items,
-                           key=lambda x: (x.get('injury_score', 0), x.get('date', datetime.min)),
+        # Keep only ticker-worthy items. The NewsWorker flags low-value /
+        # fluff headlines (speculation, listicles, fantasy advice) as
+        # ticker_worthy=False; they stay visible in the news widget but are
+        # kept out of the ticker. Older payloads lack the flag -> treat as True.
+        ticker_news = [x for x in news_items if x.get('ticker_worthy', True)]
+        if not ticker_news:
+            ticker_news = news_items
+        sorted_news = sorted(ticker_news,
+                           key=lambda x: (x.get('relevance_score', x.get('injury_score', 0)), x.get('date', datetime.min)),
                            reverse=True)
 
         # Process ALL available headlines for categorization

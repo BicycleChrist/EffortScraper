@@ -587,8 +587,7 @@ class BetSlipDrawer(QWidget):
     # refresh if they want to.
     wallet_refreshed = pyqtSignal(object)
 
-    DEFAULT_PER_LEG_WAGER = 0.50
-    MAX_PER_LEG_WAGER = 2.0
+    DEFAULT_PER_LEG_WAGER = 10.00
 
     def __init__(self, parent=None, compact_mode: bool = False):
         super().__init__(parent)
@@ -675,12 +674,22 @@ class BetSlipDrawer(QWidget):
         controls.addWidget(stake_label)
 
         self.wager_spin = QDoubleSpinBox()
-        self.wager_spin.setRange(0.10, self.MAX_PER_LEG_WAGER)
+        # No hard cap on per-leg wager — the only real ceiling is the
+        # liquidity available at the targeted price, which is enforced
+        # downstream in _placePXWager / _placeNVWager via
+        # `actual_stake = min(wager, avail)`. Qt's QDoubleSpinBox needs a
+        # finite max (it can't represent inf), so we set a value large
+        # enough never to be hit by a realistic edit.
+        self.wager_spin.setRange(0.01, 1e9)
         self.wager_spin.setSingleStep(0.10)
         self.wager_spin.setDecimals(2)
         self.wager_spin.setValue(self.DEFAULT_PER_LEG_WAGER)
         self.wager_spin.setPrefix("$")
-        self.wager_spin.setFixedWidth(80)
+        # Don't fire valueChanged on every keystroke — only on commit
+        # (Enter / focus loss / spin click). Avoids partial values like
+        # 22 firing the header refresh while the user is mid-typing 2.22.
+        self.wager_spin.setKeyboardTracking(False)
+        self.wager_spin.setFixedWidth(100)
         self.wager_spin.valueChanged.connect(self._refreshHeader)
         self.wager_spin.setStyleSheet(f"""
             QDoubleSpinBox {{
@@ -2600,24 +2609,36 @@ class OrderBookWidget(QWidget):
             # existing single-source ladder behavior.
             team_strike_groups: dict = {}   # {team_sym: {strike: [(src, order)]}}
             team_order: list = []
+            # Strip trailing signed decimal from a label so "OKC -1.5"
+            # becomes "OKC" for team_to_symbol lookup. This is distinct
+            # from strip_price_from_label (which targets American-odds
+            # suffixes only) — here we want spread strikes off too.
+            _strip_trailing_num = re.compile(r"\s*[+-]?\d+(?:\.\d+)?\s*$")
             for strike in line_order:
                 for src_key in ("px", "nv"):
                     ln = lines_by_strike[strike][src_key]
                     if ln is None:
                         continue
                     for s in ln.sides:
-                        # Strip a trailing signed number ("-1.5", "+160")
-                        # so "Athletics -1.5" -> "Athletics" before
-                        # the symbol lookup.
-                        bare = _emk.strip_price_from_label(s.label or "")
+                        # Per-side strike: parse from the side label
+                        # ("OKC -1.5" -> -1.5). On a spread the two sides
+                        # of one line have OPPOSITE-signed strikes, so
+                        # we must NOT reuse ln.strike for both — that's
+                        # the line's POV, not the side's. Fall back to
+                        # ln.strike only when the label carries no
+                        # number (moneyline, "Over"/"Under").
+                        side_strike = _emk._parse_strike(s.label or "")
+                        if side_strike is None:
+                            side_strike = ln.strike
+                        bare = _strip_trailing_num.sub("", s.label or "").strip()
                         team_sym = (_emk.team_to_symbol(bare)
                                     or bare or s.side_type or "?")
                         if team_sym not in team_strike_groups:
                             team_strike_groups[team_sym] = {}
                             team_order.append(team_sym)
-                        team_strike_groups[team_sym].setdefault(strike, [])
+                        team_strike_groups[team_sym].setdefault(side_strike, [])
                         for o in s.orders:
-                            team_strike_groups[team_sym][strike].append(
+                            team_strike_groups[team_sym][side_strike].append(
                                 (src_key, o, ln.source_line_id))
 
             for team_sym in team_order:
@@ -2631,6 +2652,13 @@ class OrderBookWidget(QWidget):
                     tagged.sort(key=lambda t: t[1].american, reverse=True)
                     strike_str = (self._format_strike_short(strike)
                                   if strike is not None else "")
+                    # Prepend explicit "+" for positive spreads so the
+                    # display matches sportsbook convention (+1.5, +12.5).
+                    # Negative strikes already carry their sign; zero and
+                    # blank pass through untouched.
+                    if (strike_str and strike is not None and strike > 0
+                            and not strike_str.startswith("+")):
+                        strike_str = f"+{strike_str}"
                     row_label = (f"{team_sym} {strike_str}".strip()
                                  if strike_str else team_sym)
                     for src_key, o, line_id in tagged:
@@ -3399,7 +3427,16 @@ class OrderBookWidget(QWidget):
 
     async def _placeNVWager(self, place: dict, wager: float) -> tuple:
         """Take a resting offer on Novig. `place` is the orderbook row
-        payload stamped by _normalized_order_to_dict."""
+        payload stamped by _normalized_order_to_dict.
+
+        TODO: auto-refresh the Novig geolocationTransactionId. Currently
+        it lives statically in Creds.NOVIG_GEO_TX_ID and the user has to
+        re-paste it from DevTools when Novig's GeoComply SDK rotates it
+        (hours-to-days cadence). Mirror the existing PX playwright auth
+        bridge: headless-launch novig.com, intercept the outgoing
+        /nbx/v1/orders payload to read geolocationTransactionId, stash
+        in novig_async._NOVIG_GEO_TX_CACHE, and kick a refresh on the
+        "No Novig geolocationTransactionId" NovigError raised below."""
         from novig_async import (place_order_async, stake_to_qty_centi,
                                  REQUEST_TIMEOUT, NovigError)
         market_id = place.get("nv_market_id")

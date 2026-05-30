@@ -820,6 +820,41 @@ class ModernOddsWindow(QMainWindow):
         self.prophetx_worker_thread.started.connect(self.prophetx_worker.start)
         self.prophetx_worker_thread.start()
 
+        # Start the Novig geo_tx HTTP listener. The Tampermonkey
+        # userscript in the user's real Firefox POSTs every fresh
+        # geolocationTransactionId it sees here, so single-bet NV
+        # placements always have a current token without manual paste.
+        #
+        # We also kick off a one-shot headless refresh in a background
+        # daemon thread: drives a snapshot Firefox to novig.com, places
+        # a 10-COIN bet, captures the fresh PREWAGER tx. Runs concurrent
+        # with the rest of EffortOdds startup so the UI is interactive
+        # immediately; takes ~25-30s wall-time. Best-effort — if it
+        # fails (no userscript, no Firefox profile, network down) we
+        # fall back to whatever's already on disk and let the
+        # in-flight 400-retry path handle expiry later.
+        try:
+            from NovigClient import geo_harvester
+            geo_harvester.start_geo_listener()
+
+            def _bg_refresh():
+                import asyncio as _asyncio
+                try:
+                    ok = _asyncio.run(
+                        geo_harvester.refresh_geo_tx(
+                            headless=True, timeout_s=30.0))
+                    print(f"[novig] startup geo refresh: "
+                          f"{'OK' if ok else 'FAIL'}")
+                except Exception as ex:
+                    print(f"[novig] startup geo refresh crashed: {ex}")
+
+            import threading as _threading
+            _threading.Thread(target=_bg_refresh,
+                              name="novig-startup-geo-refresh",
+                              daemon=True).start()
+        except Exception as e:
+            print(f"[novig] couldn't start geo listener: {e}")
+
         # Create horizontal splitter for odds table + liquidity widget (side-by-side)
         self.odds_liquidity_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.odds_liquidity_splitter.setOpaqueResize(False)

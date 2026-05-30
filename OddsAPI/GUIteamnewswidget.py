@@ -76,7 +76,7 @@ class NewsWorker(QObject):
             "football_nfl": {
                 "general": [
                     "https://www.nfl.com/rss/rsslanding?searchString=home",
-                    "https://www.rotowire.com/rss/news.php?sport=nfl,",
+                    "https://www.rotowire.com/rss/news.php?sport=nfl",
                     "https://www.espn.com/espn/rss/nfl/news",
                     "https://www.cbssports.com/rss/headlines/nfl",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl",
@@ -90,7 +90,12 @@ class NewsWorker(QObject):
                     "https://www.espn.com/espn/rss/mlb/news",
                     "https://www.cbssports.com/rss/headlines/mlb/",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/mlb",
-                    "https://sports.yahoo.com/mlb/rss/"
+                    "https://sports.yahoo.com/mlb/rss/",
+                    # Bullpen/closer-role changes — Cloudflare-fronted (see
+                    # the browser User-Agent set on the session below).
+                    "https://closermonkey.com/feed/",
+                    # Fast on transactions / IL moves / signings.
+                    "https://www.mlbtraderumors.com/feed"
                 ]
             },
             # NHL
@@ -161,6 +166,53 @@ class NewsWorker(QObject):
         # Compile all patterns once at initialization
         self.compiled_low_value = [re.compile(p, re.IGNORECASE) for p in low_value_patterns]
         self.compiled_legitimate = [re.compile(p, re.IGNORECASE) for p in legitimate_patterns]
+
+        # --- Relevance scoring (ticker-worthiness) -----------------------
+        # Unlike the keep/drop lists above, these drive a numeric score so
+        # nothing is hard-dropped: low-value items stay in the news widget
+        # (ranked to the bottom) but are flagged out of the ticker tape.
+        #
+        # Positive signal: concrete, actionable news — injuries, roster
+        # moves, transactions, availability/lineup.
+        hard_news_terms = [
+            r'\binjur\w+', r'\bplaced on\b', r'\b(15|10|60)[\- ]day\b',
+            r'\b(injured|disabled)\s+list\b', r'\bIL\b', r'\bDL\b', r'\bIR\b',
+            r'\bactivat\w+', r'\breinstat\w+', r'\boption(ed|s)?\b',
+            r'\brecall\w+', r'\bcall(ed)?\s*up\b', r'\bdesignated\b', r'\bDFA\b',
+            r'\bclaim\w+', r'\bsign(s|ed|ing)?\b', r'\bre-?sign\w+',
+            r'\btrade[ds]\b', r'\bacquir\w+', r'\breleas\w+', r'\bwaiv\w+',
+            r'\bsuspend\w+', r'\bsuspension\b', r'\bsurger\w+', r'\bMRI\b',
+            r'\bfractur\w+', r'\bstrain\w+', r'\bsprain\w+', r'\btorn?\b',
+            r'\bconcussion\b', r'\bscratch\w+', r'\bbench(ed|es)?\b',
+            r'\bruled out\b', r'\bday[\- ]to[\- ]day\b', r'\bout for\b',
+            r'\bseason[\- ]ending\b', r'\bexits?\b', r'\bleft (the )?game\b',
+            r'\bback in (the )?lineup\b', r'\bstarting\s+(pitcher|lineup)\b',
+            r'\bpromot\w+', r'\bdemot\w+', r'\bfined?\b', r'\bretir(e|es|ed|ing)\b',
+            r'\bextension\b', r'\bcontract\b', r'\bcall-?up\b',
+        ]
+        # Negative signal: fluff — speculation, opinion, listicles, fantasy
+        # advice, rankings, "X things to know" filler.
+        fluff_terms = [
+            r'^\s*why\b', r'^\s*how\b', r'\bcould\b', r'\bshould\b',
+            r'\bwould\b', r'\bmight\b',
+            r'\bwill\s+\w+\s+(turn|bounce|rebound|figure|fix|save|win|improve)\b',
+            r'\bthese\s+\d+\b',
+            r'\b\d+\s+(players?|hitters?|pitchers?|guys|names|reasons|takeaways|things|sleepers?|targets?)\b',
+            r'\btop\s+\d+\b', r'\brank(ing|ings)?\b', r'\bpower\s+rank',
+            r'\btier', r'\bsleeper', r'\bwaiver', r'\bstart\s*/?\s*sit\b',
+            r'\badd\s*/?\s*drop\b', r'\bstreamer', r'\bfantasy\b',
+            r'\bdown the stretch\b', r'\brest[\- ]of[\- ]season\b', r'\bROS\b',
+            r'\bhelp your\b', r'\bbold predict', r'\bpredict\w+',
+            r'\bway[\- ]too[\- ]early\b', r'\bwhat if\b', r'\bcase for\b',
+            r'\bcase against\b', r'\bthings to know\b', r'\bwhat to watch\b',
+            r'\btakeaway', r'\bgrades?\b', r'\bwinners? and losers?\b',
+            r'\boverreaction', r'\bbreakout candidate', r'\bbuy or sell\b',
+            r'\bbuy[\- ]low\b', r'\bsell[\- ]high\b', r"\bhere'?s why\b",
+            r"\bhere'?s what\b", r'\bwhat we learned\b', r'\byou need to know\b',
+            r'\bbest and worst\b', r'\bmock draft\b',
+        ]
+        self.compiled_hard_news = [re.compile(p, re.IGNORECASE) for p in hard_news_terms]
+        self.compiled_fluff = [re.compile(p, re.IGNORECASE) for p in fluff_terms]
 
     def set_league(self, league_key):
         """Set the current league to fetch news for"""
@@ -242,6 +294,71 @@ class NewsWorker(QObject):
 
         print(f"[NewsWorker] Low-value filtering: {len(news_items)} → {len(filtered_news)} headlines ({filtered_count} filtered)")
         return filtered_news
+
+    def _score_headline(self, title, description=""):
+        """Numeric relevance score for one item. Positive = actionable news
+        (injuries/roster/transactions); negative = fluff (speculation,
+        listicles, fantasy advice). Title hits weigh more than body hits.
+        Runs in the worker thread — keep it cheap (precompiled regex)."""
+        t = title or ""
+        d = description or ""
+        score = 0
+        for rx in self.compiled_hard_news:
+            if rx.search(t):
+                score += 3
+            elif rx.search(d):
+                score += 1
+        for rx in self.compiled_fluff:
+            if rx.search(t):
+                score -= 3
+            elif rx.search(d):
+                score -= 1
+        return score
+
+    def dedupe_news(self, news_items):
+        """Collapse the same story repeated across wire-sharing sources
+        (ESPN/CBS/Yahoo/Fox), keeping the first occurrence. Normalizes the
+        title (lowercase, strip punctuation + common 'Report:/Breaking:'
+        prefixes) and dedupes on the first 60 chars. Worker-thread only."""
+        if not news_items:
+            return news_items
+        seen = set()
+        out = []
+        for item in news_items:
+            norm = re.sub(r'[^a-z0-9 ]', '', (item.get('title', '') or '').lower())
+            norm = re.sub(r'^(report|breaking|update|official|sources?)\s+', '', norm)
+            norm = re.sub(r'\s+', ' ', norm).strip()[:60]
+            if not norm:
+                out.append(item)
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append(item)
+        if self.print_fetches:
+            print(f"[NewsWorker] Dedupe: {len(news_items)} → {len(out)} items")
+        return out
+
+    def score_and_rank(self, news_items):
+        """Score every item, flag ticker-worthiness, and sort so the most
+        actionable items lead and fluff sinks to the bottom. Nothing is
+        dropped — the news widget still shows everything; only the ticker
+        consults `ticker_worthy`. Worker-thread only (off the UI)."""
+        if not news_items:
+            return news_items
+        for item in news_items:
+            s = self._score_headline(item.get('title', ''),
+                                     item.get('description', ''))
+            item['relevance_score'] = s
+            # Exclude net-negative (fluff) from the ticker, but always let
+            # injury items ride even if phrased softly ("Why is X hurt?").
+            item['ticker_worthy'] = (s >= 0) or item.get('is_injury_news', False)
+        news_items.sort(key=lambda x: (x.get('relevance_score', 0), x['date']),
+                        reverse=True)
+        ticker_n = sum(1 for i in news_items if i.get('ticker_worthy'))
+        print(f"[NewsWorker] Scored {len(news_items)} items; "
+              f"{ticker_n} ticker-worthy, {len(news_items) - ticker_n} fluff")
+        return news_items
 
     async def fetch_rss_feed_with_session(self, session, url):
         """Fetch and parse an RSS feed using provided session"""
@@ -382,7 +499,21 @@ class NewsWorker(QObject):
                 enable_cleanup_closed=True
             )
 
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            # Browser User-Agent: some feeds (e.g. CloserMonkey) sit behind
+            # Cloudflare, which can challenge/403 aiohttp's default
+            # "Python/aiohttp" UA depending on the client IP's reputation.
+            # CloserMonkey currently serves 200 to the default UA from here,
+            # but a browser UA is cheap insurance against Cloudflare flipping
+            # to challenge mode. Harmless for the existing major-site feeds,
+            # which already serve fine to browsers.
+            headers = {
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+                               "Gecko/20100101 Firefox/128.0"),
+                "Accept": ("application/rss+xml, application/xml, text/xml, "
+                           "application/atom+xml, */*"),
+            }
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector,
+                                             headers=headers) as session:
                 # Fetch from all RSS sources in parallel
                 tasks = [self.fetch_rss_feed_with_session(session, url) for url in sources]
                 
@@ -421,8 +552,14 @@ class NewsWorker(QObject):
             # Apply injury news prioritization (but keep date sorting)
             all_news = self.prioritize_injury_news(all_news)
             
-            # Apply comprehensive headline filtering for ticker tape
-            all_news = self.filter_low_value_headlines(all_news)
+            # De-duplicate wire copy across sources, then score every item
+            # for ticker-worthiness. Nothing is dropped: low-value/fluff
+            # headlines stay in the list (shown at the bottom of the news
+            # widget) but are flagged ticker_worthy=False so the ticker tape
+            # can exclude them. All of this runs here in the worker thread,
+            # off the UI — the consumers only read the flags.
+            all_news = self.dedupe_news(all_news)
+            all_news = self.score_and_rank(all_news)
             
             self.news_items = all_news
             
@@ -581,11 +718,14 @@ class TeamNewsWidget(QWidget):
         self.setup_ui()
         self.setup_worker()
 
-        # Add auto-refresh timer (5 minutes by default)
+        # Auto-refresh timer (10 minutes). Start is offset by 60s in
+        # refresh_news_offset() below so we don't tick at the exact same
+        # second as ModernOddsWindow.status_timer (also 10min).
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_news)
-        self.refresh_timer.start(10 * 60 * 1000)  # 5 minutes in milliseconds
-        self.current_refresh_interval = 5  # Store current interval in minutes
+        self.current_refresh_interval = 10  # minutes
+        QTimer.singleShot(60 * 1000,
+                          lambda: self.refresh_timer.start(10 * 60 * 1000))
 
         # Delay initial news fetch to avoid blocking during UI initialization
         # This prevents DNS/network blocking from affecting app startup
@@ -615,7 +755,7 @@ class TeamNewsWidget(QWidget):
         refresh_layout.addWidget(QLabel("Refresh Freq"))
         self.refresh_interval = QSpinBox()
         self.refresh_interval.setRange(0, 30)
-        self.refresh_interval.setValue(25)
+        self.refresh_interval.setValue(10)
         self.refresh_interval.setSuffix(" min")
         self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
         self.refresh_interval.setFixedWidth(70)
@@ -840,9 +980,12 @@ class TeamNewsWidget(QWidget):
         if self.show_injuries_only:
             filtered_items = [item for item in news_items if item.get('is_injury_news', False)]
 
-        # Sort by date (newest first) - this is now redundant as we sort in prioritize_injury_news
-        # But keeping it here as a safeguard
-        filtered_items.sort(key=lambda x: x['date'], reverse=True)
+        # Rank by relevance score first (so fluff/speculation sinks to the
+        # bottom), then by date. The worker already sorted this way; re-sort
+        # here as a safeguard since the injuries-only filter may have run.
+        filtered_items.sort(
+            key=lambda x: (x.get('relevance_score', 0), x['date']),
+            reverse=True)
 
         if not filtered_items:
             message = "No injury news found" if self.show_injuries_only else "No news items found"
