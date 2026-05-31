@@ -185,6 +185,85 @@ class EventMatcher:
         # Return as ISO datetime (using midnight UTC as we don't have exact time)
         return f"{year}-{month}-{day}T00:00:00Z"
 
+    @staticmethod
+    def parse_kalshi_event_datetime(event_ticker: str):
+        """
+        Parse the full game start datetime (UTC) from a Kalshi event ticker.
+
+        Kalshi tickers encode the date AND a 4-digit UTC time after the day,
+        e.g. KXMLBGAME-26MAY301915ATLCIN -> 2026-05-30 19:15 UTC. The time is
+        what disambiguates two same-matchup games on different days, which
+        parse_kalshi_event_date() (date-only) cannot do.
+
+        Returns a timezone-aware datetime, or None if the ticker can't be parsed.
+        """
+        import re
+        from datetime import datetime, timezone
+
+        match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})(\d{4})?', event_ticker)
+        if not match:
+            return None
+
+        year_short, month_abbr, day, hhmm = match.groups()
+        months = {
+            'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+            'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
+        }
+        month = months.get(month_abbr)
+        if not month:
+            return None
+
+        hour, minute = 0, 0
+        if hhmm:
+            hour, minute = int(hhmm[:2]), int(hhmm[2:])
+
+        try:
+            return datetime(int(f"20{year_short}"), month, int(day),
+                            hour, minute, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def dates_compatible(event_ticker: str, poly_start_time, tolerance_hours: float = 12.0) -> bool:
+        """
+        Check whether a Kalshi event and a Polymarket game refer to the same
+        calendar game, by comparing start times.
+
+        Two same-matchup games (e.g. a doubleheader or back-to-back days) share
+        team names but differ in start time, so team-only matching can pair the
+        live game's Polymarket market with a different day's (untraded) Kalshi
+        event - which renders as a flat Kalshi line next to a moving PM line.
+
+        Returns True when the start times are within tolerance_hours. If the
+        Kalshi ticker has no time component, or either side's time is
+        missing/unparseable, returns True so matching falls back to team-only
+        behavior rather than dropping a valid match.
+        """
+        import re
+        from datetime import datetime
+
+        # Only enforce the time window when the ticker actually encodes a time
+        # (HHMM after the day). Date-only tickers can't disambiguate by time, so
+        # fall back to team-only matching.
+        m = re.search(r'-(\d{2})([A-Z]{3})(\d{2})(\d{4})', event_ticker)
+        if not m:
+            return True
+
+        k_dt = EventMatcher.parse_kalshi_event_datetime(event_ticker)
+        if k_dt is None or not poly_start_time:
+            return True
+
+        try:
+            p_dt = datetime.fromisoformat(str(poly_start_time).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            return True
+
+        if p_dt.tzinfo is None:
+            from datetime import timezone
+            p_dt = p_dt.replace(tzinfo=timezone.utc)
+
+        return abs((k_dt - p_dt).total_seconds()) <= tolerance_hours * 3600.0
+
     # Team name variations for matching
     TEAM_ALIASES_BY_SPORT = {
     'NFL': {
@@ -1590,18 +1669,24 @@ class HistoricalOddsWidget(QWidget):
 
     def _on_websocket_tick(self, tick_data):
         """
-        Handle incoming tick data from Kalshi WebSocket
+        Handle incoming tick data from Kalshi WebSocket `ticker` channel.
 
-        Tick format:
+        Current Kalshi schema (all prices are DOLLAR strings, 0-1, not cents):
         {
             "type": "ticker",
             "msg": {
                 "market_ticker": "...",
-                "yes_price": 0.52,
-                "no_price": 0.48,
-                "timestamp": 1234567890
+                "price_dollars": "0.520",      # last traded YES price (may be absent)
+                "yes_bid_dollars": "0.510",
+                "yes_ask_dollars": "0.530",
+                "ts_ms": 1234567890123,         # preferred (ms); also "ts" (sec)
+                "time": "2026-05-30T..."        # deprecated RFC3339 fallback
             }
         }
+
+        The previous implementation read `yes_price`/`timestamp`, which no longer
+        exist on the message, so every live tick was silently dropped and the Kalshi
+        line never moved during a game.
         """
         try:
             msg = tick_data.get('msg', {})
@@ -1611,62 +1696,104 @@ class HistoricalOddsWidget(QWidget):
             if market_ticker != self.kalshi_market_ticker:
                 return
 
-            yes_price = msg.get('yes_price')
-            tick_timestamp = msg.get('timestamp')
+            def _to_float(v):
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
 
-            if yes_price is not None and tick_timestamp:
-                # Update plot with new data point
-                # Convert cents to dollars and then to American odds
-                price_dollars = yes_price
-                if 0 < price_dollars < 1:
-                    # Convert probability to American odds
-                    if price_dollars >= 0.5:
-                        american_odds = int(-100 * (price_dollars / (1 - price_dollars)))
-                    else:
-                        american_odds = int(100 * ((1 - price_dollars) / price_dollars))
+            # Prefer last traded price; fall back to the bid/ask mid so the line
+            # still moves between trades during a live game. Keep legacy field
+            # names as a last resort in case the schema flips back.
+            price_dollars = _to_float(msg.get('price_dollars'))
+            if price_dollars is None:
+                price_dollars = _to_float(msg.get('price'))  # legacy
+            if price_dollars is None:
+                bid = _to_float(msg.get('yes_bid_dollars'))
+                ask = _to_float(msg.get('yes_ask_dollars'))
+                if bid is not None and ask is not None:
+                    price_dollars = (bid + ask) / 2.0
+                elif bid is not None:
+                    price_dollars = bid
+                elif ask is not None:
+                    price_dollars = ask
+            if price_dollars is None:
+                # Last-ditch legacy cents field
+                legacy_cents = msg.get('yes_price')
+                if legacy_cents is not None:
+                    price_dollars = _to_float(legacy_cents)
+                    if price_dollars is not None and price_dollars > 1:
+                        price_dollars = price_dollars / 100.0
 
-                    print(f"📊 Live update: {market_ticker} = ${price_dollars:.2f} ({american_odds:+d})")
+            # Timestamp: ts_ms (ms) -> ts (sec) -> RFC3339 time -> now
+            from datetime import datetime, timezone
+            ts_ms = msg.get('ts_ms')
+            ts_sec = msg.get('ts')
+            if ts_ms is not None:
+                tick_dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            elif ts_sec is not None:
+                tick_dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+            elif msg.get('time'):
+                tick_dt = datetime.fromisoformat(msg['time'].replace('Z', '+00:00'))
+            else:
+                tick_dt = datetime.now(timezone.utc)
 
-                    # Create synthetic snapshot in TheOddsAPI-compatible format
-                    # This allows it to integrate with existing plotting logic
-                    from datetime import datetime, timezone
-                    now_iso = datetime.fromtimestamp(tick_timestamp, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
-                    
-                    # Extract team/outcome name from ticker (last segment after dash)
-                    outcome_name = market_ticker.split('-')[-1] if '-' in market_ticker else 'Yes'
-                    
-                    synthetic_snapshot = {
-                        'timestamp': now_iso,
-                        'data': {
-                            'bookmakers': [{
-                                'key': 'kalshi',
-                                'title': 'Kalshi',
-                                'markets': [{
-                                    'key': 'h2h',  # Will be adjusted by market type if needed
-                                    'outcomes': [{
-                                        'name': outcome_name,
-                                        'price': american_odds,
-                                        'kalshi_cents': int(price_dollars * 100),
-                                    }]
-                                }]
+            if price_dollars is None or not (0.0 < price_dollars < 1.0):
+                return
+
+            price_cents = int(round(price_dollars * 100))
+            american_odds = kalshi_cents_to_american_odds(price_cents)
+            if american_odds is None:
+                return
+
+            print(f"📊 Live update: {market_ticker} = ${price_dollars:.3f} ({american_odds:+d})")
+
+            now_iso = tick_dt.isoformat().replace('+00:00', 'Z')
+            outcome_name = market_ticker.split('-')[-1] if '-' in market_ticker else 'Yes'
+
+            # Match the market key the candlestick path uses so the live point lands
+            # on the same series instead of spawning a stray h2h line.
+            market_key = 'h2h'
+            market_type = getattr(getattr(self, 'current_unified_market', None), 'market_type', None)
+            if market_type == 'spread':
+                market_key = 'spreads'
+            elif market_type == 'total':
+                market_key = 'totals'
+
+            synthetic_snapshot = {
+                'timestamp': now_iso,
+                'data': {
+                    'bookmakers': [{
+                        'key': 'kalshi',
+                        'title': 'Kalshi',
+                        'markets': [{
+                            'key': market_key,
+                            'outcomes': [{
+                                'name': outcome_name,
+                                'price': american_odds,
+                                'kalshi_cents': price_cents,
                             }]
-                        }
-                    }
-                    
-                    # Append to current snapshots
-                    if hasattr(self, 'current_snapshots') and self.current_snapshots:
-                        self.current_snapshots.append(synthetic_snapshot)
-                        
-                        # Throttle plot updates - only update every 10 seconds max
-                        if not hasattr(self, '_last_tick_plot_time'):
-                            self._last_tick_plot_time = 0
-                        
-                        import time
-                        current_time = time.time()
-                        if current_time - self._last_tick_plot_time >= 10.0:
-                            self._last_tick_plot_time = current_time
-                            # Schedule async plot update
-                            asyncio.create_task(self.update_plot(self.current_snapshots))
+                        }]
+                    }]
+                }
+            }
+
+            # Append to current snapshots
+            if hasattr(self, 'current_snapshots') and self.current_snapshots:
+                self.current_snapshots.append(synthetic_snapshot)
+
+                # Throttle plot updates - only update every 10 seconds max
+                if not hasattr(self, '_last_tick_plot_time'):
+                    self._last_tick_plot_time = 0
+
+                import time
+                current_time = time.time()
+                if current_time - self._last_tick_plot_time >= 10.0:
+                    self._last_tick_plot_time = current_time
+                    # Schedule async plot update
+                    asyncio.create_task(self.update_plot(self.current_snapshots))
 
         except Exception as e:
             print(f"Error processing websocket tick: {e}")
@@ -1877,6 +2004,7 @@ class HistoricalOddsWidget(QWidget):
         for k_event in kalshi_events:
             k_title = k_event.get('title', '')
             k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
+            event_ticker = k_event.get('event_ticker', '')
 
             # Try to find matching Polymarket game
             matched_poly_game = None
@@ -1887,14 +2015,17 @@ class HistoricalOddsWidget(QWidget):
                 p_title = p_game.title
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_title)
 
-                if EventMatcher.events_match(k_away, k_home, p_away, p_home, sport):
+                # Match on teams AND start time. The date guard prevents pairing
+                # the live game's Polymarket market with a different day's
+                # (untraded) Kalshi event for the same matchup.
+                if (EventMatcher.events_match(k_away, k_home, p_away, p_home, sport)
+                        and EventMatcher.dates_compatible(event_ticker, p_game.start_time)):
                     matched_poly_game = p_game
                     matched_poly_ids.add(p_game.id)
                     break
 
             # Create unified event
             # Parse start_time from event_ticker since strike_date doesn't exist
-            event_ticker = k_event.get('event_ticker', '')
             start_time = EventMatcher.parse_kalshi_event_date(event_ticker)
 
             unified_event = UnifiedEvent(
@@ -2008,6 +2139,7 @@ class HistoricalOddsWidget(QWidget):
         for k_event in kalshi_events:
             k_title = k_event.get('title', '')
             k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
+            event_ticker = k_event.get('event_ticker', '')
 
             # Try to find matching Polymarket game
             matched_poly_game = None
@@ -2018,14 +2150,17 @@ class HistoricalOddsWidget(QWidget):
                 p_title = p_game.title
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_title)
 
-                if EventMatcher.events_match(k_away, k_home, p_away, p_home):
+                # Match on teams AND start time. The date guard prevents pairing
+                # the live game's Polymarket market with a different day's
+                # (untraded) Kalshi event for the same matchup.
+                if (EventMatcher.events_match(k_away, k_home, p_away, p_home)
+                        and EventMatcher.dates_compatible(event_ticker, p_game.start_time)):
                     matched_poly_game = p_game
                     matched_poly_ids.add(p_game.id)
                     break
 
             # Create unified event
             # Parse start_time from event_ticker since strike_date doesn't exist
-            event_ticker = k_event.get('event_ticker', '')
             start_time = EventMatcher.parse_kalshi_event_date(event_ticker)
 
             unified_event = UnifiedEvent(
@@ -3145,7 +3280,9 @@ class HistoricalOddsWidget(QWidget):
     @qasync.asyncSlot()
     async def on_auto_refresh(self):
         """Handle automatic refresh timer"""
-        if not self.auto_refresh_enabled or not self.data_source == 'kalshi':
+        # Refresh for Kalshi-only views and for unified (Kalshi + Polymarket) markets.
+        has_unified = getattr(self, 'current_unified_market', None) is not None
+        if not self.auto_refresh_enabled or (self.data_source != 'kalshi' and not has_unified):
             return
 
         if self._load_task and not self._load_task.done():
@@ -3162,9 +3299,14 @@ class HistoricalOddsWidget(QWidget):
 
     def start_live_updates(self):
         """Start the auto-refresh timer"""
-        if self.data_source == 'kalshi' and self.auto_refresh_enabled:
-            self.refresh_timer.start(self.refresh_interval_ms)
-            print(f"Live updates enabled (refresh every {self.refresh_interval_ms/1000}s)")
+        # WebSocket streaming, when enabled, drives live updates instead of polling.
+        if self.websocket_enabled:
+            return
+        has_unified = getattr(self, 'current_unified_market', None) is not None
+        if (self.data_source == 'kalshi' or has_unified) and self.auto_refresh_enabled:
+            if not self.refresh_timer.isActive():
+                self.refresh_timer.start(self.refresh_interval_ms)
+                print(f"Live updates enabled (refresh every {self.refresh_interval_ms/1000}s)")
 
     def stop_live_updates(self):
         """Stop the auto-refresh timer"""
@@ -3192,6 +3334,12 @@ class HistoricalOddsWidget(QWidget):
         end_time = datetime.now()
         start_time = self.calculate_start_time(end_time)
         kalshi_interval_value = int(self.kalshi_interval.currentText().removesuffix('m'))
+        # At 1-minute granularity the Kalshi candlestick endpoint caps results at
+        # ~5000 candles. A wide range (e.g. 7d) silently truncates/errors the Kalshi
+        # request while Polymarket still returns data, leaving the Kalshi line blank
+        # or stale. Clamp the lookback so the live 1m series always comes back.
+        if kalshi_interval_value == 1:
+            start_time = max(start_time, end_time - timedelta(days=2))
 
         self.progress_bar.setValue(10)
         self.refresh_button.setEnabled(False)
@@ -3330,6 +3478,13 @@ class HistoricalOddsWidget(QWidget):
                     self.update_plot(snapshots)
                 )
                 self.progress_bar.setValue(100)
+
+                # Start live updates - the unified (Kalshi + Polymarket) path is what
+                # the dual-line chart uses, so it MUST start the auto-refresh timer too.
+                # Without this the chart freezes after the initial load and never picks
+                # up in-game odds moves (the legacy load_data path started it, this one
+                # did not).
+                self.start_live_updates()
             else:
                 print("No data returned")
                 self.progress_bar.setValue(0)
