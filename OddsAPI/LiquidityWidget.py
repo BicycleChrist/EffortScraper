@@ -364,6 +364,75 @@ class NovigMarketBookWorker(QThread):
         self.books_ready.emit(self.prophetx_event_id, books)
 
 
+class MatchMapWorker(QThread):
+    """Builds the ProphetX↔Novig event match map off the main thread.
+
+    The load (disk JSON of the ~650-event Novig dump) + normalize + match
+    (28 PX × 650 NV events) is ~135ms of disk I/O plus ~300-400ms of pure-
+    Python cross-matching — a GIL-bound burst that stalled the ticker by
+    ~270-570ms when it ran on the qasync loop inside _loadNovigMatchMap.
+
+    The worker reproduces exactly that compute and emits the resulting
+    pairs list. The caller (ProphetXBrowser._onMatchMapReady) does the only
+    main-thread-bound part: stamping self._novig_event_map and re-rendering
+    the current market. px_data is passed in (a snapshot of self.all_events)
+    so the worker never touches live widget state.
+
+    Emits an empty list on any failure → widget stays PX-only, same as the
+    old inline except-branch.
+    """
+
+    map_ready = pyqtSignal(list)  # list[EventPair]
+
+    def __init__(self, px_data: dict, parent=None):
+        super().__init__(parent)
+        # Shallow copy so a concurrent refresh re-assigning self.all_events
+        # can't mutate what we're iterating. The event dicts themselves are
+        # read-only here.
+        self._px_data = dict(px_data) if px_data else {}
+
+    def run(self) -> None:
+        try:
+            from NovigClient import NovigQueries
+            import exchange_market_keys as emk
+        except Exception:
+            self.map_ready.emit([])
+            return
+
+        try:
+            nv_data = NovigQueries.load_latest_dump()
+            if not nv_data:
+                self.map_ready.emit([])
+                return
+
+            px_data = self._px_data
+            if not px_data:
+                dump_dir = Path.cwd() / "prophetx_dumps"
+                if dump_dir.exists():
+                    files = sorted(dump_dir.glob("all_markets_combined_*.json"),
+                                   key=lambda p: p.stat().st_mtime)
+                    if files:
+                        try:
+                            px_data = json.loads(files[-1].read_text())
+                        except Exception:
+                            px_data = {}
+            if not px_data:
+                self.map_ready.emit([])
+                return
+
+            px_events = emk.load_prophetx_normalized_events(
+                px_data, league_filter=None)
+            nv_events = emk.load_novig_normalized_events(
+                nv_data, league_filter=None, currency="CASH")
+            pairs = emk.match_events(px_events, nv_events)
+            self.map_ready.emit(pairs)
+        except Exception as e:
+            import traceback
+            print(f"[LiquidityWidget] Novig match-map build failed: {e!r}")
+            traceback.print_exc()
+            self.map_ready.emit([])
+
+
 class OrderBookLoadingOverlay(QWidget):
     """
     Animated loading overlay for orderbook widget.
@@ -1392,6 +1461,15 @@ class SGPScannerPanel(QWidget):
         # and to repaint row highlights when the slip state changes.
         self._row_payloads: Dict[str, tuple] = {}
 
+        # Canonical, edge-sorted result store. Each entry is
+        # (key, src, row, edge). The table is rebuilt from this list on
+        # every add so newly-scanned rows slot into the right rank as the
+        # scan progresses. Slipped keys are tracked here so the mint tint
+        # survives a rebuild (the slip owner one level up drives them via
+        # set_row_slipped()).
+        self._results_rows: List[tuple] = []
+        self._slipped_keys: set = set()
+
         # Wire row clicks → emit leg-ready dict for the slip owner
         self.results.cellClicked.connect(self._onResultRowClicked)
 
@@ -1507,6 +1585,8 @@ class SGPScannerPanel(QWidget):
         # server-side too). OrderBookWidget will clear its slip in
         # response to the scan_started signal.
         self._row_payloads.clear()
+        self._results_rows.clear()
+        self._slipped_keys.clear()
         self.scan_started.emit()
         self.progress.setVisible(True)
         # Scale by 1000 so the bar advances smoothly *within* an event —
@@ -1608,25 +1688,53 @@ class SGPScannerPanel(QWidget):
                 f"{row.get('dominant_outcome_id')}|"
                 f"{row.get('implied_outcome_id')}")
 
+    @staticmethod
+    def _rowEdge(src: str, row: dict) -> float:
+        """Numeric edge % used for sorting and the EDGE column."""
+        if src == "PX":
+            return float(row.get("edge_pct") or 0.0)
+        return SGPScannerPanel._nvEdgePct(row)
+
     def _addRow(self, src: str, row: dict) -> None:
-        r = self.results.rowCount()
-        # Register the row payload for slip lookup at click time.
+        # Append to the canonical store, then rebuild the table sorted by
+        # edge so this row lands in rank. De-dupe on key in case the same
+        # play is emitted twice (keeps the latest payload).
         key = self._rowKey(src, row)
-        self._row_payloads[key] = (src, row, r)
-        self.results.insertRow(r)
+        edge = self._rowEdge(src, row)
+        self._results_rows = [e for e in self._results_rows if e[0] != key]
+        self._results_rows.append((key, src, row, edge))
+        self._rebuildResults()
+
+    def _rebuildResults(self) -> None:
+        """Repopulate the results table from `_results_rows`, sorted by
+        edge descending. Rebuilds `_row_payloads` (the click/slip index)
+        and re-applies the slip tint for any rows still in the slip."""
+        # Stable sort: equal-edge rows keep insertion order.
+        self._results_rows.sort(key=lambda e: e[3], reverse=True)
+        self.results.setRowCount(0)
+        self._row_payloads.clear()
+        for r, (key, src, row, edge) in enumerate(self._results_rows):
+            self.results.insertRow(r)
+            self._row_payloads[key] = (src, row, r)
+            self._renderRow(r, src, row, edge)
+            if key in self._slipped_keys:
+                item = self.results.item(r, 0)
+                if item is not None:
+                    item.setBackground(QColor(94, 234, 212, 60))
+
+    def _renderRow(self, r: int, src: str, row: dict, edge: float) -> None:
+        """Fill the six cells of table row `r` for one result."""
         if src == "PX":
             player = row.get("player", "")
             legs = row.get("chain", "")
             single = self._fmtOdds(row.get("hr_odds"))
             sgp = self._fmtOdds(row.get("sgp_odds"))
-            edge = float(row.get("edge_pct") or 0.0)
             src_color = QColor(94, 234, 212)     # ProphetX mint
         else:
             player = row.get("player", "")
             legs = self._nvLegs(row)
             single = row.get("american_dominant", "") or "--"
             sgp = row.get("american_combined", "") or "--"
-            edge = self._nvEdgePct(row)
             src_color = QColor(59, 130, 246)     # Novig blue
 
         values = [src, player, legs, single, sgp, f"{edge:+.1f}%"]
@@ -1720,6 +1828,11 @@ class SGPScannerPanel(QWidget):
     def set_row_slipped(self, key: str, slipped: bool) -> None:
         """Called by the slip owner when a leg sourced from this panel
         enters or leaves the slip. Repaints the SRC-cell tint."""
+        # Track the slip state so a re-sort rebuild can restore the tint.
+        if slipped:
+            self._slipped_keys.add(key)
+        else:
+            self._slipped_keys.discard(key)
         payload = self._row_payloads.get(key)
         if payload is None:
             return
@@ -2100,6 +2213,14 @@ class OrderBookWidget(QWidget):
         self._orderbook_row_payloads: Dict[str, dict] = {}
         self.orderbook_table.cellClicked.connect(self._onOrderbookRowClicked)
 
+        # Multi-strike (spread/total) ALT LINES section: collapsed by
+        # default, toggled by clicking its header row. _alt_header_row is
+        # stamped during render so the click handler can recognise it;
+        # _last_render stashes the inputs so a toggle can re-render.
+        self._alts_collapsed: bool = True
+        self._alt_header_row: Optional[int] = None
+        self._last_render = None  # ("dual", px, nv) | ("single", nm)
+
     def createHeader(self):
         """Create header widget showing current market name"""
         header = QFrame()
@@ -2175,28 +2296,9 @@ class OrderBookWidget(QWidget):
 
         return header
 
-    def setMarket(self, market_data: Dict):
-        """
-        Update order book display with new market data - shows ALL lines
-
-        Args:
-            market_data: Full market dict from ProphetX API
-        """
-        self.current_market = market_data
-
-        # Update header
-        market_name = market_data.get('name', 'Unknown Market')
-        total_stake = market_data.get('totalStake', 0)
-        self.market_title.setText(market_name)
-        self.stake_label.setText(f"Total Liquidity: ${total_stake:,.2f}")
-
-        # Render all lines from this market
-        self.renderOrderBook(market_data)
-
     # ------------------------------------------------------------------
-    # Source-agnostic render path (additive — existing setMarket above
-    # stays untouched so legacy ProphetX-dict callers keep working).
-    # Consumes a NormalizedMarket from exchange_market_keys.
+    # Source-agnostic render path. Consumes a NormalizedMarket from
+    # exchange_market_keys.
     # ------------------------------------------------------------------
 
     # Brand-derived accent colors. Used by setNormalizedMarket to give
@@ -2216,10 +2318,10 @@ class OrderBookWidget(QWidget):
     def setNormalizedMarket(self, nm) -> None:
         """Render the order book from a NormalizedMarket.
 
-        Multi-strike layout matches setMarket(): for Over/Under markets,
-        Overs are rendered with strikes descending, Unders with strikes
-        ascending, separated by a labeled divider. For team markets each
-        line is rendered as its own block.
+        Multi-strike layout: for Over/Under markets, Overs are rendered
+        with strikes descending, Unders with strikes ascending, separated
+        by a labeled divider. For team markets each line is rendered as
+        its own block.
 
         Source identity is communicated via:
           - A 2px colored top border on the market title (accent bar)
@@ -2227,6 +2329,7 @@ class OrderBookWidget(QWidget):
         Neither touches table spacing or row heights.
         """
         self.current_market = nm
+        self._last_render = ("single", nm)
         accent = self.SOURCE_ACCENT_COLOR.get(nm.source, "#8a92a3")
         badge = self.SOURCE_BADGE_TEXT.get(nm.source, nm.source.upper())
 
@@ -2257,11 +2360,10 @@ class OrderBookWidget(QWidget):
     def _normalized_order_to_dict(self, side_label: str, abbreviated: str,
                                   order, source_line_id: str = "",
                                   source: str = "") -> Dict:
-        """Adapt one NormalizedOrder into the dict shape that
-        renderOrderRow / _extract_market_side already consume. Also
-        stamps placement metadata (`_place_*` keys) so the row-click
-        handler can route a click into the bet slip without re-walking
-        the NormalizedMarket tree."""
+        """Adapt one NormalizedOrder into the dict shape renderOrderRow
+        consumes. Also stamps placement metadata (`_place_*` keys) so the
+        row-click handler can route a click into the bet slip without
+        re-walking the NormalizedMarket tree."""
         american = order.american
         display_odds = f"+{american}" if american > 0 else str(american)
         raw = order.raw if hasattr(order, "raw") else None
@@ -2297,6 +2399,170 @@ class OrderBookWidget(QWidget):
             return str(int(strike))
         return f"{strike}"
 
+    # ------------------------------------------------------------------
+    # Multi-strike (spread / total) grouping
+    # ------------------------------------------------------------------
+    # Spread + total markets bundle MANY strikes (8-10 alt totals / run
+    # lines) into ONE market, each strike carrying two sides and a full
+    # ladder. The default per-side flattening dumps 130-170 rows and
+    # scatters the two halves of each line into opposite ends of the book.
+    # These helpers regroup by LINE: the most-liquid strike becomes the
+    # featured "main line" shown with real depth (best prices meeting in
+    # the middle, like the moneyline); every other strike collapses to its
+    # best price per side under a single ALT LINES section.
+    MAIN_LINE_DEPTH = 4   # offers shown per side on the featured main line
+
+    def _gridFromLines(self, sources, is_over_under):
+        """Build the per-strike grid used by the multi-strike renderer.
+
+        Returns (per_strike, strike_liq) where:
+          per_strike = {strike: [(side_label, [order_dict, ...best-first]), ...]}
+          strike_liq = {strike: total_displayed_value}
+
+        sources: list of (src_key, NormalizedMarket). src_key is "px"/"nv"
+        for the dual view (stamped onto each row dict so the dual loop can
+        tint it) or None for a single source. Sides are merged across
+        sources by over/under type or canonical team symbol, so PX + NV
+        depth for the same (line, side) lands together."""
+        import exchange_market_keys as _emk
+        _strip = re.compile(r"\s*[+-]?\d+(?:\.\d+)?\s*$")
+        grid: dict = {}   # {strike: {side_key: {"label":.., "rows":[..]}}}
+        for src_key, nm in sources:
+            if nm is None:
+                continue
+            for ln in nm.lines:
+                sd = grid.setdefault(ln.strike, {})
+                for s in ln.sides:
+                    if is_over_under:
+                        if s.side_type == _emk.SIDE_OVER:
+                            skey = "over"
+                        elif s.side_type == _emk.SIDE_UNDER:
+                            skey = "under"
+                        else:
+                            continue
+                        ss = self._format_strike_short(ln.strike)
+                        label = f"{skey} {ss}".strip() if ss else skey
+                    else:
+                        # Per-side strike from the label ("NYY -1.5" -> -1.5):
+                        # a spread line's two sides carry opposite-signed
+                        # strikes, so we can't reuse ln.strike for both.
+                        side_strike = _emk._parse_strike(s.label or "")
+                        if side_strike is None:
+                            side_strike = ln.strike
+                        bare = _strip.sub("", s.label or "").strip()
+                        team_sym = (_emk.team_to_symbol(bare)
+                                    or bare or s.side_type or "?")
+                        skey = team_sym
+                        ss = (self._format_strike_short(side_strike)
+                              if side_strike is not None else "")
+                        if (ss and side_strike is not None and side_strike > 0
+                                and not ss.startswith("+")):
+                            ss = f"+{ss}"
+                        label = f"{team_sym} {ss}".strip() if ss else team_sym
+                    entry = sd.setdefault(skey, {"label": label, "rows": []})
+                    for o in s.orders:
+                        od = self._normalized_order_to_dict(
+                            label, label, o,
+                            source_line_id=ln.source_line_id,
+                            source=nm.source)
+                        if src_key is not None:
+                            od["_source"] = src_key
+                        entry["rows"].append(od)
+        per_strike: dict = {}
+        strike_liq: dict = {}
+        for strike, sd in grid.items():
+            if is_over_under:
+                keyorder = [k for k in ("over", "under") if k in sd]
+            else:
+                keyorder = list(sd.keys())   # first-seen (favorite-ish) first
+            sides = []
+            liq = 0.0
+            for k in keyorder:
+                rows = sd[k]["rows"]
+                # Best-paying offer first (max american) — same convention
+                # the renderers use to find each side's touch.
+                rows.sort(key=lambda od: od["odds"], reverse=True)
+                liq += sum(o["value"] for o in rows)
+                sides.append((sd[k]["label"], rows))
+            per_strike[strike] = sides
+            strike_liq[strike] = liq
+        return per_strike, strike_liq
+
+    def _composeMultiStrikeSections(self, per_strike, strike_liq,
+                                    is_over_under, alts_collapsed=True):
+        """Turn the per-strike grid into render sections: one MAIN LINE
+        section (top MAIN_LINE_DEPTH offers per side PER SOURCE so both
+        exchanges show, best prices meeting in the middle) followed by an
+        ALT LINES section (every other strike collapsed to its best price
+        per side). When alts_collapsed the alt section is header-only (its
+        rows are hidden until the user clicks the header). Returns
+        (sections, main_strike)."""
+        strikes = [s for s in per_strike if s is not None]
+        if not strikes:
+            return [], None
+
+        def _sources_at(s):
+            return {od.get("_source")
+                    for _lbl, rows in per_strike[s] for od in rows}
+
+        # Main-line selection, in priority order:
+        #   1. strikes BOTH exchanges quote — so the featured book is a true
+        #      side-by-side PX vs NV comparison, not a single-source line;
+        #   2. CLOSEST-TO-EVEN odds — what "the line" means (the book centres
+        #      the primary spread/total near pick'em while alts get lopsided),
+        #      measured by the tightest side's |american| (rows are best-first
+        #      so rows[0] is each side's best price);
+        #   3. total displayed liquidity, as a final tiebreak.
+        def _tightness(s):
+            vals = [abs(rows[0]["odds"]) for _lbl, rows in per_strike[s]
+                    if rows]
+            return min(vals) if vals else float("inf")
+        def _both(s):
+            srcs = _sources_at(s)
+            return 0 if ("px" in srcs and "nv" in srcs) else 1
+        main = min(strikes, key=lambda s: (_both(s), _tightness(s),
+                                           -strike_liq.get(s, 0.0)))
+        sections: list = []
+
+        # --- main line: top-N PER SOURCE so a tighter exchange can't crowd
+        # the other out of the featured book ---
+        main_rows: list = []
+        for idx, (_label, rows) in enumerate(per_strike[main]):
+            by_src: dict = {}
+            for od in rows:                       # rows are best-first
+                by_src.setdefault(od.get("_source"), []).append(od)
+            picked: list = []
+            for _src, lst in by_src.items():
+                picked.extend(lst[:self.MAIN_LINE_DEPTH])
+            picked.sort(key=lambda od: od["odds"], reverse=True)   # best-first
+            # First side's touch drops to the BOTTOM (nearest the spread);
+            # the second side's touch stays at the TOP — the two best prices
+            # meet in the middle, same idea as the moneyline.
+            if idx == 0:
+                picked = list(reversed(picked))
+            main_rows.extend(picked)
+        ss = self._format_strike_short(main if is_over_under else abs(main))
+        main_label = f"MAIN LINE — {ss}" if ss else "MAIN LINE"
+        sections.append((main_label, main_rows))
+
+        # --- alt lines: best price per side, every other strike (desc) ---
+        alt_strikes = sorted((s for s in strikes if s != main), key=lambda v: -v)
+        alt_rows: list = []
+        for s in alt_strikes:
+            for _label, rows in per_strike[s]:
+                if rows:
+                    alt_rows.append(rows[0])   # best price per side
+        if alt_strikes:
+            if alts_collapsed:
+                # Header-only; rows hidden. The chevron + count signal it's
+                # tappable; _onOrderbookRowClicked toggles on the header row.
+                hdr = f"▸ ALT LINES ({len(alt_strikes)})  •  tap to expand"
+                sections.append((hdr, []))
+            else:
+                hdr = "▾ ALT LINES  •  tap to collapse"
+                sections.append((hdr, alt_rows))
+        return sections, main
+
     def renderNormalizedOrderBook(self, nm) -> None:
         """Walk Lines -> Sides -> Orders and emit one row per Order using
         the existing renderOrderRow / separator helpers."""
@@ -2312,6 +2578,7 @@ class OrderBookWidget(QWidget):
         import exchange_market_keys as _emk
         if hasattr(self, "_orderbook_row_payloads"):
             self._orderbook_row_payloads.clear()
+        self._alt_header_row = None
 
         # Collect rows grouped by display section. For Over/Under markets,
         # produce two sections (OVER, UNDER); for team markets, produce
@@ -2324,7 +2591,17 @@ class OrderBookWidget(QWidget):
                          or _emk.SIDE_UNDER in side_types_present)
 
         sections: list[tuple[str, list[Dict]]] = []
-        if is_over_under:
+        distinct_strikes = {ln.strike for ln in nm.lines if ln.strike is not None}
+        lead_header = False
+        if len(distinct_strikes) >= 2:
+            # Multi-strike spread/total (single source): feature the
+            # most-liquid line with depth, collapse the rest to best price.
+            per_strike, strike_liq = self._gridFromLines(
+                [(None, nm)], is_over_under)
+            sections, _main = self._composeMultiStrikeSections(
+                per_strike, strike_liq, is_over_under, self._alts_collapsed)
+            lead_header = True
+        elif is_over_under:
             # Build the Over half: lines in strike-DESC order (already
             # sorted by the normalizer that way).
             over_rows: list[Dict] = []
@@ -2383,10 +2660,15 @@ class OrderBookWidget(QWidget):
                                 source_line_id=ln.source_line_id,
                                 source=nm.source)
                             for o in s.orders]
+                    # Sort by |american| (see dual path): the favorite's
+                    # touch drops to the bottom of its block near the
+                    # spread instead of sitting atop the book.
+                    rows.sort(key=lambda od: abs(od["odds"]), reverse=True)
                     if rows:
                         sections.append((label, rows))
 
-        # See _renderOrderBookImpl comment on why we don't clearContents().
+        # clearSpans only — clearContents()/setRowCount(0) destroy pooled
+        # cell widgets and force costly stylesheet reparses on rebuild.
         self.orderbook_table.clearSpans()
 
         total_orders = sum(len(rows) for _, rows in sections)
@@ -2402,8 +2684,10 @@ class OrderBookWidget(QWidget):
                     f"No orders available — {nm.market_name}")
             return
 
-        has_separator = len(sections) >= 2
-        total_rows = total_orders + (len(sections) - 1 if has_separator else 0)
+        # lead_header (multi-strike) labels every section incl. the first.
+        n_separators = (len(sections) if lead_header
+                        else (len(sections) - 1 if len(sections) >= 2 else 0))
+        total_rows = total_orders + n_separators
         self.orderbook_table.setRowCount(total_rows)
 
         total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
@@ -2416,8 +2700,10 @@ class OrderBookWidget(QWidget):
         first_order: Optional[Dict] = None
         last_order: Optional[Dict] = None
         for section_label, rows in sections:
-            if not first_section:
+            if (not first_section) or lead_header:
                 self.renderSideSeparatorRow(current_row, f"─ {section_label} ─")
+                if "ALT LINES" in section_label:
+                    self._alt_header_row = current_row
                 current_row += 1
             first_section = False
             for od in rows:
@@ -2430,11 +2716,15 @@ class OrderBookWidget(QWidget):
                 current_row += 1
 
         if hasattr(self, "footer_label") and first_order is not None:
-            best_bid = first_order.get("displayOdds", "N/A")
-            best_ask = last_order.get("displayOdds", "N/A") if last_order else "N/A"
+            # Best/worst from odds extremes, not row position (display is
+            # sorted by |american|, so the top row isn't the best price).
+            all_rows = [o for _, rows in sections for o in rows]
+            best_o = max(all_rows, key=lambda o: o["odds"])
+            worst_o = min(all_rows, key=lambda o: o["odds"])
             self.footer_label.setText(
                 f"Showing {total_orders} price levels • "
-                f"Best Bid: {best_bid} • Best Ask: {best_ask} • "
+                f"Best Bid: {best_o.get('displayOdds', 'N/A')} • "
+                f"Best Ask: {worst_o.get('displayOdds', 'N/A')} • "
                 f"Spread: {len(sections)} sides • "
                 f"Total Liquidity: ${total_liquidity:,.2f}")
 
@@ -2465,6 +2755,7 @@ class OrderBookWidget(QWidget):
             self.setNormalizedMarket(px_norm)
             return
 
+        self._last_render = ("dual", px_norm, nv_norm)
         self.current_market = px_norm  # primary source for header
         # Header: small inline legend (PX/NV chips colored to match the
         # row colors in the table) followed by the market name. No
@@ -2512,6 +2803,7 @@ class OrderBookWidget(QWidget):
         import exchange_market_keys as _emk
         if hasattr(self, "_orderbook_row_payloads"):
             self._orderbook_row_payloads.clear()
+        self._alt_header_row = None
 
         # Combine lines by strike. Either source may have lines the
         # other lacks; we keep all of them. Strike None (moneyline)
@@ -2564,7 +2856,19 @@ class OrderBookWidget(QWidget):
 
         # Build sections
         sections: list[tuple[str, list]] = []  # (label, [(src, order_dict)])
-        if is_over_under:
+        distinct_strikes = [s for s in line_order if s is not None]
+        lead_header = False
+        if len(distinct_strikes) >= 2:
+            # Multi-strike spread/total: feature the most-liquid line with
+            # real depth, collapse every other strike to its best price per
+            # side. lead_header makes the render loop label the first
+            # (main-line) section too.
+            per_strike, strike_liq = self._gridFromLines(
+                [("px", px_norm), ("nv", nv_norm)], is_over_under)
+            sections, _main = self._composeMultiStrikeSections(
+                per_strike, strike_liq, is_over_under, self._alts_collapsed)
+            lead_header = True
+        elif is_over_under:
             # Over half: lines in descending strike order
             over_rows = []
             for strike in line_order:
@@ -2649,7 +2953,15 @@ class OrderBookWidget(QWidget):
                 rows = []
                 for strike in strikes_in_team:
                     tagged = team_strike_groups[team_sym][strike]
-                    tagged.sort(key=lambda t: t[1].american, reverse=True)
+                    # Sort by ABSOLUTE american so each side's touch (best
+                    # price) sits nearest the separator. A favorite
+                    # (negative) ascends — its least-juiced top-of-book
+                    # (-144) lands at the BOTTOM of the block, right above
+                    # the spread, instead of hiding at the very top of the
+                    # book; an underdog (positive) keeps its longest price
+                    # up top. Both sides' true market prices then meet at
+                    # the spread in the middle.
+                    tagged.sort(key=lambda t: abs(t[1].american), reverse=True)
                     strike_str = (self._format_strike_short(strike)
                                   if strike is not None else "")
                     # Prepend explicit "+" for positive spreads so the
@@ -2672,7 +2984,8 @@ class OrderBookWidget(QWidget):
                 if rows:
                     sections.append((team_sym, rows))
 
-        # See _renderOrderBookImpl comment on why we don't clearContents().
+        # clearSpans only — clearContents()/setRowCount(0) destroy pooled
+        # cell widgets and force costly stylesheet reparses on rebuild.
         self.orderbook_table.clearSpans()
 
         total_orders = sum(len(rows) for _, rows in sections)
@@ -2685,8 +2998,11 @@ class OrderBookWidget(QWidget):
             self.orderbook_table.setSpan(0, 0, 1, colspan)
             return
 
-        has_separator = len(sections) >= 2
-        total_rows = total_orders + (len(sections) - 1 if has_separator else 0)
+        # lead_header (multi-strike) labels every section incl. the first,
+        # so the MAIN LINE block gets its own header row.
+        n_separators = (len(sections) if lead_header
+                        else (len(sections) - 1 if len(sections) >= 2 else 0))
+        total_rows = total_orders + n_separators
         self.orderbook_table.setRowCount(total_rows)
 
         total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
@@ -2699,8 +3015,10 @@ class OrderBookWidget(QWidget):
         first_order = None
         last_order = None
         for section_label, rows in sections:
-            if not first_section:
+            if (not first_section) or lead_header:
                 self.renderSideSeparatorRow(current_row, f"─ {section_label} ─")
+                if "ALT LINES" in section_label:
+                    self._alt_header_row = current_row
                 current_row += 1
             first_section = False
             for od in rows:
@@ -2735,270 +3053,17 @@ class OrderBookWidget(QWidget):
                 current_row += 1
 
         if hasattr(self, "footer_label") and first_order is not None:
-            best_bid = first_order.get("displayOdds", "N/A")
-            best_ask = (last_order.get("displayOdds", "N/A")
-                        if last_order else "N/A")
+            # Derive best/worst from the actual odds extremes, not row
+            # position — the display is sorted by |american| so the top
+            # row is no longer the best-paying one.
+            all_rows = [o for _, rows in sections for o in rows]
+            best_o = max(all_rows, key=lambda o: o["odds"])
+            worst_o = min(all_rows, key=lambda o: o["odds"])
             self.footer_label.setText(
                 f"Showing {total_orders} price levels • "
-                f"Best: {best_bid} • Worst: {best_ask} • "
+                f"Best: {best_o.get('displayOdds', 'N/A')} • "
+                f"Worst: {worst_o.get('displayOdds', 'N/A')} • "
                 f"PX+NV • Total Liquidity: ${total_liquidity:,.2f}")
-
-    def _extract_market_side(self, display_name: str) -> str:
-        """
-        Extract the market side (team or over/under) from display name.
-        Returns just the side identifier, ignoring the line value.
-
-        Examples:
-            "over 15.5" -> "over"
-            "under 12.5" -> "under"
-            "BUF +1" -> "BUF"
-            "Buffalo Bills +1.5" -> "Buffalo Bills"
-            "DEN -3.5" -> "DEN"
-        """
-        name_lower = display_name.lower().strip()
-
-        # Handle over/under totals and props
-        if name_lower.startswith('over'):
-            return 'over'
-        elif name_lower.startswith('under'):
-            return 'under'
-
-        # Handle spread/moneyline markets - extract team name (everything before the number)
-        # Remove the spread number to get just the team identifier
-        match = re.match(r'^(.+?)\s*[+-]?\d', display_name)
-        if match:
-            return match.group(1).strip()
-
-        # Fallback: return the full name
-        return display_name
-
-    def renderOrderBook(self, market_data: Dict):
-        """
-        Render the order book showing ALL available lines with enhanced depth visualization.
-        Groups orders by the two market sides (over/under, or team1/team2) with one separator.
-
-        Args:
-            market_data: Full market dict from ProphetX API
-        """
-        # Suspend paints across the whole rebuild so the dozens of
-        # per-cell writes coalesce into a single repaint at the end.
-        # try/finally guards against a render-time exception leaving
-        # the widget in a permanently un-updating state.
-        self.orderbook_table.setUpdatesEnabled(False)
-        try:
-            self._renderOrderBookImpl(market_data)
-        finally:
-            self.orderbook_table.setUpdatesEnabled(True)
-
-    def _renderOrderBookImpl(self, market_data: Dict):
-        if hasattr(self, "_orderbook_row_payloads"):
-            self._orderbook_row_payloads.clear()
-        all_orders = []
-
-        # Check if this market has multiple lines (spread/total) or simple selections (moneyline)
-        # Stamp `_place` metadata on each PX order so the bet slip's
-        # cellClicked handler can route the click into a wager leg, the
-        # same way the normalized + dual render paths do.
-        def _pick_line_id_from_outcomes(market: Dict, order: Dict) -> str:
-            """ProphetX moneyline / simple markets carry per-side line ids
-            on `market.outcomes` (one entry per competitor). Match by
-            competitorId, falling back to side index via the order's
-            integer `id` if competitorId is absent."""
-            outcomes = market.get("outcomes") if isinstance(market, dict) else None
-            if not isinstance(outcomes, list):
-                return ""
-            comp = order.get("competitorId")
-            if comp is not None:
-                for oc in outcomes:
-                    if not isinstance(oc, dict):
-                        continue
-                    if oc.get("competitorId") == comp:
-                        for k in ("lineID", "lineId", "line_id"):
-                            v = oc.get(k)
-                            if v:
-                                return str(v)
-                        break
-            # Fallback: order.id appears to index into outcomes for some
-            # market types. Try positional match before giving up.
-            try:
-                idx = int(order.get("id"))
-                if 0 <= idx < len(outcomes) and isinstance(outcomes[idx], dict):
-                    for k in ("lineID", "lineId", "line_id"):
-                        v = outcomes[idx].get(k)
-                        if v:
-                            return str(v)
-            except (TypeError, ValueError):
-                pass
-            return ""
-
-        def _pick_line_id(order: Dict, parent_line: Dict, market: Dict) -> str:
-            # 1) order itself (rare)
-            for k in ("lineID", "lineId", "line_id"):
-                v = order.get(k)
-                if v:
-                    return str(v)
-            # 2) parent marketLine (spread/total path)
-            if isinstance(parent_line, dict):
-                for k in ("lineID", "lineId", "line_id"):
-                    v = parent_line.get(k)
-                    if v:
-                        return str(v)
-                obj = parent_line.get("line")
-                if isinstance(obj, dict):
-                    for kk in ("id", "lineID", "lineId"):
-                        v = obj.get(kk)
-                        if v:
-                            return str(v)
-            # 3) market.outcomes matched by competitorId (moneyline path)
-            v = _pick_line_id_from_outcomes(market, order)
-            if v:
-                return v
-            return ""
-
-        # One-time diagnostic if we still can't find a lineId after
-        # walking both order + parent containers.
-        _logged_missing = [False]
-
-        def _stamp_px(order: Dict, parent_line: Dict, market: Dict) -> Dict:
-            try:
-                american = int(order.get("odds"))
-            except (TypeError, ValueError):
-                return order
-            prob = (1 / (1 + american / 100) if american > 0
-                    else abs(american) / (abs(american) + 100))
-            line_id = _pick_line_id(order, parent_line, market)
-            if not line_id and not _logged_missing[0]:
-                _logged_missing[0] = True
-                outcomes = market.get("outcomes") if isinstance(market, dict) else None
-                print(f"[bet-slip] PX order has no lineId. "
-                      f"order={order}, "
-                      f"outcomes sample={outcomes[:2] if isinstance(outcomes, list) else outcomes}",
-                      flush=True)
-            order["_place"] = {
-                "source": "prophetx",
-                "american": american,
-                "prob": prob,
-                "size_usd": float(order.get("value") or 0.0),
-                "line_id": line_id,
-                "px_line_id": line_id,
-                "nv_market_id": None,
-                "nv_outcome_id": None,
-                "nv_is_bid": None,
-            }
-            return order
-
-        if 'marketLines' in market_data and market_data['marketLines']:
-            # Spread/Total markets - lineId lives on each marketLine
-            for market_line in market_data['marketLines']:
-                line_name = market_line.get('name', '')
-                selections = market_line.get('selections', [])
-
-                # Each selection array is [side1_orders, side2_orders]
-                for side_orders in selections:
-                    if not side_orders:
-                        continue
-                    for order in side_orders:
-                        all_orders.append(
-                            _stamp_px(order, market_line, market_data))
-
-        elif 'selections' in market_data:
-            # Moneyline/simple markets — lineId on the market itself
-            selections = market_data.get('selections', [])
-            for side_orders in selections:
-                if not side_orders:
-                    continue
-                for order in side_orders:
-                    all_orders.append(
-                        _stamp_px(order, {}, market_data))
-
-        # Clear spans (separator positions can move) but DO NOT call
-        # clearContents() or setRowCount(0) — both destroy the pooled
-        # bar widgets in col 1, forcing the ~15-30ms QWidget/layout/
-        # stylesheet reallocation that previously caused the visible
-        # tickertape stutter. Surviving rows keep their cell widgets;
-        # the final setRowCount() at the bottom only destroys widgets
-        # in rows that are actually dropped.
-        self.orderbook_table.clearSpans()
-
-        if not all_orders:
-            self.orderbook_table.setRowCount(1)
-            item = QTableWidgetItem("No orders available")
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.orderbook_table.setItem(0, 0, item)
-            self.orderbook_table.setSpan(0, 0, 1, 5)
-            return
-
-        # Group orders by market side (over/under, or team1/team2)
-        side_groups = {}
-        for order in all_orders:
-            display_name = order.get('displayName', order.get('abbreviatedName', ''))
-            side = self._extract_market_side(display_name)
-
-            if side not in side_groups:
-                side_groups[side] = []
-            side_groups[side].append(order)
-
-        # Sort each group by odds (best price first - highest value, closest to even money)
-        for side, orders in side_groups.items():
-            orders.sort(key=lambda x: x.get('odds', 0), reverse=True)
-
-        # Determine display order for the two sides
-        if 'over' in side_groups and 'under' in side_groups:
-            # Over/under market - show overs first, then unders
-            side_order = ['over', 'under']
-        else:
-            # Other market types - sort by total liquidity (highest first)
-            side_liquidity = [(side, sum(o.get('value', 0) for o in orders))
-                             for side, orders in side_groups.items()]
-            side_liquidity.sort(key=lambda x: x[1], reverse=True)
-            side_order = [s[0] for s in side_liquidity]
-
-        # Build ordered list: side1 orders, separator, side2 orders
-        max_per_side = 50
-        ordered_sections = [(side, side_groups[side][:max_per_side])
-                           for side in side_order if side in side_groups]
-
-        # Calculate total rows (orders + 1 separator if we have 2 sides)
-        total_orders = sum(len(orders) for _, orders in ordered_sections)
-        has_separator = len(ordered_sections) == 2
-        total_rows = total_orders + (1 if has_separator else 0)
-        self.orderbook_table.setRowCount(total_rows)
-
-        # Calculate totals for display
-        total_liquidity = sum(order.get('value', 0) for _, orders in ordered_sections for order in orders)
-        max_stake = max((order.get('value', 1) for _, orders in ordered_sections for order in orders), default=1)
-
-        # Render: first side, separator, second side
-        current_row = 0
-        cumulative = 0
-        all_rendered_orders = []
-
-        for section_idx, (side, orders) in enumerate(ordered_sections):
-            # Add separator between the two sides (after first section)
-            if section_idx == 1 and has_separator:
-                separator_label = side.upper() if side in ('over', 'under') else side
-                self.renderSideSeparatorRow(current_row, f"─ {separator_label} ─")
-                current_row += 1
-
-            # Render orders in this section
-            for order in orders:
-                cumulative += order.get('value', 0)
-                self.renderOrderRow(current_row, order, max_stake, cumulative, total_liquidity)
-                all_rendered_orders.append(order)
-                current_row += 1
-
-        # Update footer with summary info
-        if all_rendered_orders:
-            best_order = all_rendered_orders[0]
-            self.footer_label.setText(
-                f"Showing {len(all_rendered_orders)} price levels • "
-                f"Best Bid: {best_order.get('displayOdds', 'N/A')} • "
-                f"Best Ask: {all_rendered_orders[-1].get('displayOdds', 'N/A') if len(all_rendered_orders) > 1 else 'N/A'} • "
-                f"Spread: {len(side_groups)} sides • "
-                f"Total Liquidity: ${total_liquidity:,.2f}"
-            )
-        else:
-            self.footer_label.setText("No orders available")
 
     def renderSideSeparatorRow(self, row: int, label: str):
         """Render a separator row between the two market sides"""
@@ -3022,32 +3087,6 @@ class OrderBookWidget(QWidget):
 
         self.orderbook_table.setItem(row, 0, separator)
         self.orderbook_table.setSpan(row, 0, 1, colspan)
-        self.orderbook_table.setRowHeight(row, row_height)
-
-    def renderSeparatorRow(self, row: int):
-        """Render a separator row between asks and bids showing the spread"""
-        if self.compact_mode:
-            separator = QTableWidgetItem("─ SPREAD ─")
-            font_size = 9
-            row_height = 24
-            colspan = 3
-        else:
-            separator = QTableWidgetItem("───── SPREAD ─────")
-            font_size = 12
-            row_height = 40
-            colspan = 5
-
-        separator.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        sep_font = QFont("SF Mono", font_size, QFont.Weight.Bold)
-        sep_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
-        separator.setFont(sep_font)
-        separator.setForeground(QColor(96, 165, 250))  # Professional blue
-        separator.setBackground(QColor(31, 41, 55))  # Darker gray-blue
-
-        self.orderbook_table.setItem(row, 0, separator)
-        self.orderbook_table.setSpan(row, 0, 1, colspan)
-
-        # Set row height slightly larger for visual separation
         self.orderbook_table.setRowHeight(row, row_height)
 
     def renderOrderRow(self, row: int, order: Dict, max_stake: float, cumulative: float, total_liquidity: float):
@@ -3170,12 +3209,6 @@ class OrderBookWidget(QWidget):
 
         return item
 
-    def formatOdds(self, odds: int) -> str:
-        """Format odds for display"""
-        if odds > 0:
-            return f"+{odds}"
-        return str(odds)
-
     # ==================================================================
     # Bet slip orchestration (cross-source: SGP scanner + orderbook)
     # ==================================================================
@@ -3236,7 +3269,24 @@ class OrderBookWidget(QWidget):
         for k in sgp_keys:
             self.bet_slip.remove_leg(k)
 
+    def _toggleAltsCollapsed(self) -> None:
+        """Expand/collapse the multi-strike ALT LINES section and re-render
+        the current book from the stashed inputs."""
+        self._alts_collapsed = not self._alts_collapsed
+        r = self._last_render
+        if not r:
+            return
+        if r[0] == "dual":
+            self.setMarketDual(r[1], r[2])
+        else:
+            self.setNormalizedMarket(r[1])
+
     def _onOrderbookRowClicked(self, table_row: int, _col: int) -> None:
+        # Clicking the ALT LINES header toggles the collapsed section
+        # rather than staging a bet.
+        if table_row == self._alt_header_row:
+            self._toggleAltsCollapsed()
+            return
         place = self._orderbook_row_payloads.get(table_row)
         if not place:
             return
@@ -3429,14 +3479,11 @@ class OrderBookWidget(QWidget):
         """Take a resting offer on Novig. `place` is the orderbook row
         payload stamped by _normalized_order_to_dict.
 
-        TODO: auto-refresh the Novig geolocationTransactionId. Currently
-        it lives statically in Creds.NOVIG_GEO_TX_ID and the user has to
-        re-paste it from DevTools when Novig's GeoComply SDK rotates it
-        (hours-to-days cadence). Mirror the existing PX playwright auth
-        bridge: headless-launch novig.com, intercept the outgoing
-        /nbx/v1/orders payload to read geolocationTransactionId, stash
-        in novig_async._NOVIG_GEO_TX_CACHE, and kick a refresh on the
-        "No Novig geolocationTransactionId" NovigError raised below."""
+        Geo-token expiry is handled transparently downstream: a 400
+        "Geolocation validation has expired" inside place_order_async
+        calls NovigClient.geo_harvester.force_refresh_geo_async() and
+        retries once. One-time bootstrap if no cached token exists:
+        `python NovigClient.py --refresh-geo`."""
         from novig_async import (place_order_async, stake_to_qty_centi,
                                  REQUEST_TIMEOUT, NovigError)
         market_id = place.get("nv_market_id")
@@ -3466,6 +3513,101 @@ class OrderBookWidget(QWidget):
         if status in ("FILLED", "PENDING", "OPEN"):
             return True, f"{status.title()} ${actual_stake:.2f}", actual_stake
         return False, f"status={status!r}", 0.0
+
+
+_EVENT_SOURCE_ROLE = Qt.ItemDataRole.UserRole + 1
+# Mint green = ProphetX accent (matches OrderBookWidget.SOURCE_ACCENT_COLOR
+# convention). Blue = Novig CASH "blue chip". Same hex values used
+# elsewhere in this file so the event list reads consistently with the
+# order-book badge once an event is selected.
+_PX_COLOR = QColor("#5eead4")
+_NV_COLOR = QColor("#3b82f6")
+
+
+class _EventSourceDelegate(QStyledItemDelegate):
+    """Paints a colored accent stripe on the left edge AND the row's
+    text itself in a source-matched color. Painting the text directly
+    bypasses two stubborn Qt quirks at once:
+      - QComboBox QAbstractItemView { color: ... } QSS rules override
+        per-item Qt.ItemDataRole.ForegroundRole, so setItemData(...,
+        ForegroundRole) silently does nothing on a styled combo.
+      - Even with the QSS rule removed, some Qt platforms/styles
+        ignore ForegroundRole on combo views entirely.
+    Source classes:
+      'PX'   → mint-green stripe + mint-green text
+      'NV'   → blue stripe + blue text
+      'BOTH' → split stripe (top green / bottom blue) + light-grey text
+              so the bicolor stripe is the visual anchor
+    """
+
+    STRIPE_WIDTH = 4
+    TEXT_PAD_LEFT = 6   # gap between stripe and text
+    TEXT_PAD_RIGHT = 6
+
+    _NEUTRAL = QColor(230, 230, 230)
+
+    def paint(self, painter: QPainter, option, index):
+        # Render default background + selection + hover, but suppress
+        # the default text draw — we'll paint the text ourselves
+        # below in the correct color. Mutating a copy of option keeps
+        # us from clobbering the caller's struct.
+        from PyQt6.QtWidgets import QStyleOptionViewItem, QStyle
+        from PyQt6.QtWidgets import QApplication
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = (opt.widget.style() if opt.widget
+                 else QApplication.style())
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem,
+                          opt, painter, opt.widget)
+
+        source = index.data(_EVENT_SOURCE_ROLE) or ""
+        rect = option.rect
+
+        # Stripe
+        if source:
+            stripe = rect.adjusted(0, 0,
+                                   -(rect.width() - self.STRIPE_WIDTH),
+                                   0)
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            if source == "PX":
+                painter.setBrush(_PX_COLOR)
+                painter.drawRect(stripe)
+            elif source == "NV":
+                painter.setBrush(_NV_COLOR)
+                painter.drawRect(stripe)
+            elif source == "BOTH":
+                half = stripe.height() // 2
+                painter.setBrush(_PX_COLOR)
+                painter.drawRect(stripe.adjusted(0, 0, 0, -half))
+                painter.setBrush(_NV_COLOR)
+                painter.drawRect(stripe.adjusted(0, half, 0, 0))
+            painter.restore()
+
+        if not text:
+            return
+
+        # Text in source color
+        text_color = (_PX_COLOR if source == "PX"
+                      else _NV_COLOR if source == "NV"
+                      else self._NEUTRAL if source == "BOTH"
+                      else QColor(255, 255, 255))
+        text_rect = rect.adjusted(self.STRIPE_WIDTH + self.TEXT_PAD_LEFT,
+                                  0, -self.TEXT_PAD_RIGHT, 0)
+        painter.save()
+        painter.setPen(text_color)
+        painter.setFont(opt.font)
+        flags = (Qt.AlignmentFlag.AlignLeft
+                 | Qt.AlignmentFlag.AlignVCenter)
+        # Multi-line items (the QListWidget uses "\n" in display)
+        # need word-wrap-ish handling; AlignVCenter on a multi-line
+        # rect with TextWordWrap works for both single + multi line.
+        if "\n" in text:
+            flags |= Qt.TextFlag.TextWordWrap
+        painter.drawText(text_rect, int(flags), text)
+        painter.restore()
 
 
 class ProphetXBrowser(QWidget):
@@ -3518,6 +3660,12 @@ class ProphetXBrowser(QWidget):
         self._novig_book_worker: Optional[NovigMarketBookWorker] = None
         # Async dump scraper — runs on init if no fresh dump on disk.
         self._novig_dump_worker: Optional[NovigDumpWorker] = None
+        # Async match-map builder (load+normalize+match off the main thread).
+        # _match_map_pending coalesces overlapping requests: the 2-3 startup
+        # callers collapse into at most one in-flight build plus one queued
+        # rebuild, so the freshest data always wins without stacking threads.
+        self._match_map_worker: Optional[MatchMapWorker] = None
+        self._match_map_pending: bool = False
 
         self.initUI()
         # Defer Novig bootstrap: both calls must run AFTER the parent
@@ -3530,7 +3678,13 @@ class ProphetXBrowser(QWidget):
         # fast (and the dump worker is itself a QThread) so the user-
         # facing impact is zero.
         QTimer.singleShot(250, self._loadNovigMatchMap)
-        QTimer.singleShot(350, self._kickoffNovigDumpRefreshIfStale)
+        # Dump-refresh is now CHAINED off the match-map worker's completion
+        # (see _onMatchMapReady), not a blind +350ms timer. The old timer
+        # raced the 38MB parse: it fired before _novig_event_map was built,
+        # so the "skip re-scrape if a fresh dump already covers us" guard saw
+        # an empty map and scraped a fresh 38MB dump *unnecessarily* — while
+        # the parse was still holding the GIL. Chaining serialises the two
+        # heavy ops and lets the skip actually work. ([PERF-DIAG] herd fix)
 
     # ------------------------------------------------------------------
     # Novig dump bootstrap (async)
@@ -3544,10 +3698,14 @@ class ProphetXBrowser(QWidget):
     # below forces a refresh sooner if PX events go unmatched.
     _NOVIG_DUMP_FRESH_SECONDS = 3600  # 1 hour
 
-    # Leagues Novig actually covers. Used by coverage check so we don't
-    # count PX-only sports (tennis, soccer outside EPL, etc.) as missing.
+    # Leagues/tournaments Novig actually covers. Used by the coverage
+    # check so we don't count PX-only events as "missing a Novig match".
+    # PX labels these by tournament name (e.g. "French Open (M)") rather
+    # than league code, so the set is matched against the canonical sport
+    # bucket (see _novig_coverage_ok), not the raw tournament string.
     _NOVIG_LEAGUES = frozenset({
-        "MLB", "NBA", "NHL", "NFL", "NCAAF", "NCAAB", "WNBA", "EPL",
+        "MLB", "NBA", "NHL", "NFL", "NCAAF", "NCAAB", "NCAABSB", "WNBA",
+        "EPL", "MLS", "ATP", "WTA", "PGA", "UFC",
     })
 
     # Minimum match-rate (PX events in Novig leagues paired to a Novig
@@ -3562,11 +3720,24 @@ class ProphetXBrowser(QWidget):
         if not self.all_events:
             # Nothing to compare against yet — defer to the time TTL.
             return True
-        eligible = [
-            eid for eid, ev in self.all_events.items()
-            if (ev.get("event_metadata") or {}).get("tournament")
-            in self._NOVIG_LEAGUES
-        ]
+        # PX labels non-team sports by tournament name ("French Open (M)"),
+        # not league code, so compare the canonical sport bucket against
+        # the set of buckets Novig covers rather than the raw string.
+        try:
+            from exchange_market_keys import canonical_sport
+            covered = {canonical_sport(lg, None) for lg in self._NOVIG_LEAGUES}
+        except Exception:
+            covered, canonical_sport = self._NOVIG_LEAGUES, None
+        eligible = []
+        for eid, ev in self.all_events.items():
+            meta = ev.get("event_metadata") or {}
+            if canonical_sport is not None:
+                bucket = canonical_sport(meta.get("tournament"),
+                                         meta.get("sport"))
+            else:
+                bucket = meta.get("tournament")
+            if bucket in covered:
+                eligible.append(eid)
         if not eligible:
             return True
         if not self._novig_event_map:
@@ -3658,60 +3829,66 @@ class ProphetXBrowser(QWidget):
         print(f"[LiquidityWidget] Novig dump refresh failed: {err}")
 
     def _loadNovigMatchMap(self) -> None:
-        """Load the latest Novig dump from disk, normalize both sources,
-        and build the {prophetx_event_id_str: EventPair} lookup used by
-        the event-selection handler. Silent no-op when either dump is
-        absent — the widget continues to work as a PX-only viewer."""
-        try:
-            from NovigClient import NovigQueries
-            import exchange_market_keys as emk
-        except Exception:
+        """Kick off an off-thread build of the {prophetx_event_id_str:
+        EventPair} lookup used by the event-selection handler.
+
+        The actual load+normalize+match (a ~270-570ms GIL-bound burst on
+        startup) runs in MatchMapWorker; the result is applied on the main
+        thread in _onMatchMapReady. Silent no-op semantics are preserved —
+        an absent dump or failed build emits an empty list and the widget
+        keeps working as a PX-only viewer.
+
+        Calls that arrive while a build is in flight set a pending flag
+        instead of spawning a second thread; one final rebuild then runs
+        with the freshest data once the current one finishes (covers the
+        startup case where the refresh slot and the dump-ready slot both
+        request a build moments apart)."""
+        if self._match_map_worker is not None and self._match_map_worker.isRunning():
+            self._match_map_pending = True
             return
 
-        nv_data = NovigQueries.load_latest_dump()
-        if not nv_data:
+        # Snapshot the PX side now (main thread) so the worker reads a
+        # stable dict. self.all_events is preferred; the worker falls back
+        # to the latest on-disk dump if it's empty (very early init).
+        worker = MatchMapWorker(self.all_events, parent=self)
+        worker.map_ready.connect(self._onMatchMapReady)
+        self._match_map_worker = worker
+        worker.start()
+
+    def _onMatchMapReady(self, pairs: list) -> None:
+        """Main-thread slot: apply the freshly-built match map and re-render
+        the current market. Runs the only widget-touching part of the old
+        _loadNovigMatchMap; everything before this happened off-thread."""
+        if pairs:
+            self._novig_event_map = {
+                ep.event_a.source_event_id: ep for ep in pairs}
+            # The event list/combo was populated before this map existed,
+            # so every row is still badged [PX]. Re-stamp the badges in
+            # place now that matches are known — otherwise the menu keeps
+            # claiming PX-only even as the orderbook renders the NV side.
+            self._refreshEventSourceBadges()
+            # The map may now contain a match for the market the user is
+            # already looking at (it commonly renders PX-only on the very
+            # first event because this map is built async, after the first
+            # market is auto-selected). Re-render so the dual-source view
+            # engages without a manual event re-selection.
+            self._rerenderCurrentMarketForMatchMap()
+        # else: empty result — keep any existing map, stay PX-only.
+
+        self._match_map_worker = None
+        # A request arrived mid-build; run one more pass with current data.
+        if self._match_map_pending:
+            self._match_map_pending = False
+            self._loadNovigMatchMap()
             return
 
-        # ProphetX side: prefer the in-memory `self.all_events` once the
-        # browser has loaded it. If empty (very early init), pull from
-        # the latest combined dump on disk.
-        px_data = self.all_events
-        if not px_data:
-            dump_dir = Path.cwd() / "prophetx_dumps"
-            if dump_dir.exists():
-                files = sorted(dump_dir.glob("all_markets_combined_*.json"),
-                               key=lambda p: p.stat().st_mtime)
-                if files:
-                    try:
-                        px_data = json.loads(files[-1].read_text())
-                    except Exception:
-                        px_data = {}
-        if not px_data:
-            return
-
-        try:
-            px_events = emk.load_prophetx_normalized_events(
-                px_data, league_filter=None)
-            nv_events = emk.load_novig_normalized_events(
-                nv_data, league_filter=None, currency="CASH")
-            pairs = emk.match_events(px_events, nv_events)
-        except Exception as e:
-            # Do not swallow silently — a broken match build degrades the
-            # widget to PX-only, which is exactly the kind of failure
-            # that should be visible rather than mysterious.
-            import traceback
-            print(f"[LiquidityWidget] Novig match-map build failed: {e!r}")
-            traceback.print_exc()
-            return
-
-        self._novig_event_map = {ep.event_a.source_event_id: ep for ep in pairs}
-
-        # The map may now contain a match for the market the user is
-        # already looking at (it commonly renders PX-only on the very
-        # first event because this map is built async, after the first
-        # market is auto-selected). Re-render so the dual-source view
-        # engages without a manual event re-selection.
-        self._rerenderCurrentMarketForMatchMap()
+        # [PERF-DIAG] One-shot startup dump-refresh, chained here so it runs
+        # AFTER the 38MB parse (map now populated) instead of overlapping it on
+        # a +350ms timer. _kickoffNovigDumpRefreshIfStale's fresh-dump skip now
+        # works, so a normal restart with a recent dump won't re-scrape 38MB.
+        if not getattr(self, "_dump_refresh_kicked", False):
+            self._dump_refresh_kicked = True
+            self._kickoffNovigDumpRefreshIfStale()
 
     def initUI(self):
         main_layout = QVBoxLayout(self)
@@ -3818,6 +3995,12 @@ class ProphetXBrowser(QWidget):
         # Compact event selector
         self.event_combo = QComboBox()
         self.event_combo.currentIndexChanged.connect(self.onCompactEventSelected)
+        # NOTE: no `color:` rule on QComboBox QAbstractItemView — that
+        # selector overrides per-item Qt.ItemDataRole.ForegroundRole,
+        # which is what refreshCompactEventCombo() uses to tint rows
+        # by source (PX = mint, NV = blue, BOTH = neutral). The
+        # closed-state `QComboBox { color: #ffffff }` only affects the
+        # currently-selected line in the collapsed combo.
         self.event_combo.setStyleSheet("""
             QComboBox {
                 background-color: #1a1d24;
@@ -3839,7 +4022,6 @@ class ProphetXBrowser(QWidget):
                 background-color: #1a1d24;
                 border: 1px solid #2a2d34;
                 selection-background-color: #2a4a7a;
-                color: #ffffff;
                 font-size: 9px;
             }
         """)
@@ -3967,9 +4149,12 @@ class ProphetXBrowser(QWidget):
         # Load stale data as fallback (populates event list but orderbook stays in loading)
         self._loadStaleDataAsFallback()
 
-        # Request fresh data fetch - parent widget should connect to this signal
-        # Use a short delay to let the UI settle before emitting
-        QTimer.singleShot(100, self._requestFreshData)
+        # Request fresh data fetch - parent widget should connect to this signal.
+        # Delayed to 1.5s as part of startup staggering: the full FetchAllEventsAsync
+        # scrape + orjson parse of ~28 events is a ~0.5s loop burst, so we let the
+        # window paint and the ticker start scrolling first. Stale data (loaded above)
+        # keeps the event list populated in the meantime.
+        QTimer.singleShot(1500, self._requestFreshData)
 
     def _requestFreshData(self):
         """Emit signal to request fresh data fetch"""
@@ -4013,7 +4198,10 @@ class ProphetXBrowser(QWidget):
             stake = metadata.get('stake', 0)
             tournament = metadata.get('tournament', '')
 
-            display_text = f"{event_name}\n{sport}"
+            source = self._event_source_for(event_id)
+            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
+                     "NV": "[NV] "}.get(source, "")
+            display_text = f"{badge}{event_name}\n{sport}"
             if tournament:
                 display_text += f" • {tournament}"
             display_text += f" • ${stake:,.0f} volume"
@@ -4022,7 +4210,8 @@ class ProphetXBrowser(QWidget):
                 'id': event_id,
                 'metadata': metadata,
                 'data': event_data,
-                'display': display_text
+                'display': display_text,
+                'source': source,
             })
 
         # Sort by stake/volume
@@ -4051,31 +4240,6 @@ class ProphetXBrowser(QWidget):
         self._initial_load_complete = True
         self.loading_state_changed.emit(False)
 
-    def loadLatestData(self):
-        """Load the most recent ProphetX data dump (legacy method for compatibility)"""
-        dump_dir = Path.cwd() / "prophetx_dumps"
-        if not dump_dir.exists():
-            return
-
-        # Find latest combined data file
-        combined_files = list(dump_dir.glob("all_markets_combined_*.json"))
-        if not combined_files:
-            return
-
-        latest_file = max(combined_files, key=lambda p: p.stat().st_mtime)
-        self.loadDataFromFile(latest_file)
-
-    def loadDataFromFile(self, filepath: Path):
-        """Load ProphetX data from JSON file"""
-        try:
-            with open(filepath, 'r') as f:
-                self.all_events = json.load(f)
-
-            self.populateEventList()
-
-        except Exception as e:
-            print(f"Error loading data: {e}")
-
     def populateEventList(self):
         """Populate event list from loaded data"""
         self.filtered_events = []
@@ -4089,7 +4253,10 @@ class ProphetXBrowser(QWidget):
             stake = metadata.get('stake', 0)
             tournament = metadata.get('tournament', '')
 
-            display_text = f"{event_name}\n{sport}"
+            source = self._event_source_for(event_id)
+            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
+                     "NV": "[NV] "}.get(source, "")
+            display_text = f"{badge}{event_name}\n{sport}"
             if tournament:
                 display_text += f" • {tournament}"
             display_text += f" • ${stake:,.0f} volume"
@@ -4098,7 +4265,8 @@ class ProphetXBrowser(QWidget):
                 'id': event_id,
                 'metadata': metadata,
                 'data': event_data,
-                'display': display_text
+                'display': display_text,
+                'source': source,
             })
 
         # Sort by stake/volume
@@ -4114,44 +4282,153 @@ class ProphetXBrowser(QWidget):
             total_stake = sum(e['metadata'].get('stake', 0) for e in self.filtered_events)
             self.stats_label.setText(f"{total_events} events • ${total_stake:,.0f} total volume")
 
+    def _event_source_for(self, event_id) -> str:
+        """Classify an event as 'PX', 'NV', or 'BOTH' based on whether
+        it has a Novig match in self._novig_event_map. all_events is
+        currently always PX-sourced (populated by
+        ProphetXQuery.ScrapeAllMarkets), so the only two real states
+        today are PX-only and BOTH; the 'NV' branch exists so that if
+        the widget ever merges NV-only events into all_events the
+        delegate already knows how to render them."""
+        sid = str(event_id)
+        has_nv = bool(self._novig_event_map
+                      and sid in self._novig_event_map)
+        # If we ever start ingesting NV-native events, tag them on the
+        # event_data side (e.g. event_data['exchange'] == 'NV') and
+        # branch here. For now everything in all_events came from PX.
+        return "BOTH" if has_nv else "PX"
+
+    def _refreshEventSourceBadges(self) -> None:
+        """Re-classify every listed event against the current Novig match
+        map and update its [PX]/[PX/NV] badge IN PLACE.
+
+        The event list/combo is populated before the async match map is
+        built (_loadNovigMatchMap runs on a worker thread), so all rows
+        are first badged [PX]. When _onMatchMapReady lands the map we
+        must restamp the badges — but WITHOUT clear()+repopulate, which
+        would reset the user's current selection and re-fire the
+        orderbook render. So we walk the existing items and swap only the
+        leading badge token, leaving selection and ordering untouched."""
+        badges = {"BOTH": "[PX/NV] ", "PX": "[PX] ", "NV": "[NV] "}
+        known = tuple(badges.values())
+
+        def _swap(text: str, source: str) -> str:
+            for b in known:
+                if text.startswith(b):
+                    text = text[len(b):]
+                    break
+            return f"{badges.get(source, '')}{text}"
+
+        # Keep the cached filtered_events source/display in sync so a
+        # later full repopulate (refreshEventList) starts from truth.
+        for ev in getattr(self, "filtered_events", None) or []:
+            source = self._event_source_for(ev['id'])
+            ev['source'] = source
+            if isinstance(ev.get('display'), str):
+                ev['display'] = _swap(ev['display'], source)
+
+        # Compact combo path.
+        combo = getattr(self, "event_combo", None)
+        if combo is not None and combo.count():
+            combo.blockSignals(True)
+            try:
+                for i in range(combo.count()):
+                    data = combo.itemData(i)
+                    eid = data.get('id') if isinstance(data, dict) else None
+                    if eid is None:
+                        continue
+                    source = self._event_source_for(eid)
+                    combo.setItemText(i, _swap(combo.itemText(i), source))
+                    combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
+            finally:
+                combo.blockSignals(False)
+
+        # Full list path.
+        lst = getattr(self, "event_list", None)
+        if lst is not None and lst.count():
+            for i in range(lst.count()):
+                item = lst.item(i)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                eid = data.get('id') if isinstance(data, dict) else None
+                if eid is None:
+                    continue
+                source = self._event_source_for(eid)
+                item.setText(_swap(item.text(), source))
+                item.setData(_EVENT_SOURCE_ROLE, source)
+                if source == "PX":
+                    item.setForeground(_PX_COLOR)
+                elif source == "NV":
+                    item.setForeground(_NV_COLOR)
+                else:  # BOTH
+                    item.setForeground(QColor(230, 230, 230))
+
     def refreshEventList(self):
-        """Refresh the event list widget display"""
+        """Refresh the event list widget display. Source-coloring is
+        done by _EventSourceDelegate (left-edge stripe) plus a small
+        text badge prefix in event['display'] so the indication
+        survives even when the delegate isn't installed (e.g. in the
+        compact combo)."""
         self.event_list.clear()
+        # Install delegate idempotently — setItemDelegate replaces
+        # whatever was there. _EventSourceDelegate is cheap; only
+        # paints the stripe and defers everything else.
+        if not isinstance(self.event_list.itemDelegate(),
+                          _EventSourceDelegate):
+            self.event_list.setItemDelegate(
+                _EventSourceDelegate(self.event_list))
 
         for event in self.filtered_events:
             item = QListWidgetItem(event['display'])
             item.setData(Qt.ItemDataRole.UserRole, event)
-
-            # Color code by sport
-            sport = event['metadata'].get('sport', '').lower()
-            if 'football' in sport or 'nfl' in sport:
-                item.setForeground(QColor(255, 165, 0))
-            elif 'basketball' in sport or 'nba' in sport:
-                item.setForeground(QColor(255, 100, 100))
-            elif 'baseball' in sport or 'mlb' in sport:
-                item.setForeground(QColor(100, 150, 255))
-            elif 'hockey' in sport or 'nhl' in sport:
-                item.setForeground(QColor(100, 200, 255))
-            else:
-                item.setForeground(QColor(200, 200, 200))
+            source = event.get('source', 'PX')
+            item.setData(_EVENT_SOURCE_ROLE, source)
+            # Foreground tint matches the stripe so single-source rows
+            # read at a glance. BOTH rows stay neutral so the bicolor
+            # stripe is the differentiator.
+            if source == "PX":
+                item.setForeground(_PX_COLOR)
+            elif source == "NV":
+                item.setForeground(_NV_COLOR)
+            else:  # BOTH
+                item.setForeground(QColor(230, 230, 230))
 
             self.event_list.addItem(item)
 
     def refreshCompactEventCombo(self):
-        """Refresh the compact event combo box"""
+        """Refresh the compact event combo box. Uses the same
+        _EventSourceDelegate as the QListWidget — installed on the
+        combo's popup view so the delegate's custom text painting
+        wins over the combo's stylesheet (which would otherwise
+        force all rows white)."""
         # Block signals to prevent auto-selection when populating with stale data
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
 
+        # Install delegate idempotently. setItemDelegate on the combo
+        # forwards to its view; we also set it on the view explicitly
+        # because some Qt builds need both for the closed-state
+        # display + popup-state list to agree.
+        view = self.event_combo.view()
+        if not isinstance(view.itemDelegate(),
+                          _EventSourceDelegate):
+            delegate = _EventSourceDelegate(view)
+            view.setItemDelegate(delegate)
+            self.event_combo.setItemDelegate(delegate)
+
         for event in self.filtered_events:
             metadata = event['metadata']
             event_name = metadata.get('name', 'Unknown Event')
-            sport = metadata.get('sport', '')
             stake = metadata.get('stake', 0)
+            source = event.get('source', 'PX')
+            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
+                     "NV": "[NV] "}.get(source, "")
 
-            # Compact display
-            display = f"{event_name} (${stake:,.0f})"
+            display = f"{badge}{event_name} (${stake:,.0f})"
             self.event_combo.addItem(display, event)
+            i = self.event_combo.count() - 1
+            # Stash the source on the same role the delegate reads.
+            self.event_combo.setItemData(i, source,
+                                         _EVENT_SOURCE_ROLE)
 
         # Re-enable signals - don't auto-select, wait for fresh data
         self.event_combo.blockSignals(False)
@@ -4368,14 +4645,27 @@ class ProphetXBrowser(QWidget):
 
         new_sig = self._marketContentSignature(selected_market)
         if not force_orderbook_render and new_sig == self._last_selected_market_sig:
-            # Selected market's orders, sizes, and labels are identical to
-            # the last render. Nothing to repaint.
+            # ProphetX side is byte-identical to the last render, so the
+            # PX repaint is skipped. BUT the Novig book is fetched live
+            # per /book/batch and has no refresh trigger of its own — it
+            # only rode along on a PX-sig change. On a quiet PX market
+            # that froze the NV ladder indefinitely. So refresh the NV
+            # depth here too, decoupled from PX movement, reusing the
+            # 20s ProphetX refresh cadence. Skip if a fetch is already in
+            # flight so periodic ticks don't stack workers.
+            mp = self._current_market_pair
+            if mp is not None:
+                w = self._novig_book_worker
+                if w is None or not w.isRunning():
+                    self._launchNovigBookRefresh(mp)
             return
         self._last_selected_market_sig = new_sig
 
         # Render exactly once via the existing selection handler so the
         # Novig-pair lookup and dual-source render path are exercised
-        # the same way as a user-initiated change.
+        # the same way as a user-initiated change. onMarketSelected also
+        # fires its own _launchNovigBookRefresh, so the NV side refreshes
+        # whenever the PX side moves.
         self.onMarketSelected(idx)
 
     def calculateActiveMarketLiquidity(self, market: Dict) -> float:
@@ -4439,33 +4729,34 @@ class ProphetXBrowser(QWidget):
         market_pair = self._lookupCurrentMarketPair(market)
         self._current_market_pair = market_pair
 
-        if market_pair is None:
-            # No Novig match — preserve the existing PX-only render.
-            self.orderbook.setMarket(market)
-            return
-
-        # Normalize the selected PX market on the fly so the dual
-        # renderer has a uniform input.
+        # Normalize the selected PX market so the renderer always sees
+        # a NormalizedMarket regardless of whether a Novig match exists.
+        # setMarketDual falls through to setNormalizedMarket when
+        # nv_norm is None, so the PX-only and dual paths share one
+        # render pipeline.
         try:
             import exchange_market_keys as emk
             px_norm = emk.from_prophetx_market(
                 market,
                 event_meta=(self.current_event_data or {}).get("event_metadata") or {},
             )
-        except Exception:
-            self.orderbook.setMarket(market)
+        except Exception as e:
+            print(f"[LiquidityWidget] PX market normalize failed: {e}")
             return
 
         self._current_px_norm = px_norm
-
+        nv_norm = market_pair.market_b if market_pair is not None else None
         # Render immediately with whatever Novig depth is currently
         # cached on the matched NV market (dump-level top-of-book).
-        self.orderbook.setMarketDual(px_norm, market_pair.market_b)
+        self.orderbook.setMarketDual(px_norm, nv_norm)
 
-        # Then refresh in the background: pull /book/batch for each
-        # Novig line under this market, and re-render when results
-        # arrive. Cancel any previous worker first so stale results
-        # don't overwrite the fresh display.
+        if market_pair is None:
+            return  # PX-only, no async book to refresh.
+
+        # Refresh in the background: pull /book/batch for each Novig
+        # line under this market, and re-render when results arrive.
+        # Cancel any previous worker first so stale results don't
+        # overwrite the fresh display.
         self._launchNovigBookRefresh(market_pair)
 
     def _lookupCurrentMarketPair(self, prophetx_market: Dict):
@@ -4513,8 +4804,21 @@ class ProphetXBrowser(QWidget):
             parent=self,
         )
         worker.books_ready.connect(self._onNovigBooksReady)
+        # Reap the QThread once it finishes — this path now fires on every
+        # 20s refresh tick, so without cleanup the finished workers would
+        # accumulate as children of self for the session's lifetime. Clear
+        # the handle BEFORE deleteLater so the next tick's isRunning()
+        # probe never touches a deleted C++ object.
+        worker.finished.connect(lambda w=worker: self._reapNovigBookWorker(w))
         self._novig_book_worker = worker
         worker.start()
+
+    def _reapNovigBookWorker(self, worker) -> None:
+        """finished-signal handler: drop our handle (if it's still this
+        worker) and schedule the QThread for deletion."""
+        if self._novig_book_worker is worker:
+            self._novig_book_worker = None
+        worker.deleteLater()
 
     def _onNovigBooksReady(self, prophetx_event_id: str, books: dict) -> None:
         """Slot fired when async /book/batch results arrive. Rebuilds

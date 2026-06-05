@@ -388,7 +388,16 @@ class NormalizedEvent:
 
 # A trailing American-odds suffix on a ProphetX order's display name
 # ("Edas Butvilas +160"). Stripped to recover the side identity alone.
-_TRAILING_PRICE_RE = re.compile(r"\s*[+-]?\d+(?:\.\d+)?\s*$")
+#
+# Must NOT match spread strikes like "OKC -1.5" or "OKC +12.5" — those
+# are the side's actual strike, not a price suffix, and stripping them
+# causes the dual-source renderer to mislabel underdog spread rows (the
+# two sides of one PX marketLine have opposite-signed strikes, so the
+# renderer needs the per-side strike preserved on s.label).
+#
+# American odds are always integers with |value| >= 100 and an explicit
+# sign — that's enough to disambiguate from spread/total fractions.
+_TRAILING_PRICE_RE = re.compile(r"\s*[+-]\d{3,}\s*$")
 
 # ProphetX wraps the strike in descriptive text: "Fixed total 0.5",
 # "Alternate spread -3.5". Extract the trailing signed decimal.
@@ -653,13 +662,27 @@ def from_prophetx_market(market: dict,
                 total_liquidity_usd=total,
             ))
     else:
-        # Simple market (moneyline / single-line). One synthetic Line
-        # with strike=None always.
+        # Simple market (no marketLines). Usually a moneyline (strike
+        # None), but ProphetX also ships some over/under totals this way
+        # (e.g. "1st Inning Total Runs" with sides "Over 0.5"/"Under 0.5",
+        # which classify as MTYPE_OTHER). Recover the strike from an
+        # over/under side label so the line isn't rendered strike-less —
+        # otherwise the dual renderer buckets it under None and shows a
+        # bare "over"/"under" with no number. Moneyline sides carry team
+        # names (no parseable number), so this stays None for them.
         sides = _prophetx_build_sides(market.get("selections") or [])
         total = sum(s.total_size_usd for s in sides)
+        strike_val: Optional[float] = None
+        if mtype != MTYPE_MONEYLINE:
+            for s in sides:
+                if s.side_type in (SIDE_OVER, SIDE_UNDER):
+                    cand = _parse_strike(s.label)
+                    if cand is not None:
+                        strike_val = cand
+                        break
         lines.append(NormalizedLine(
-            strike=None,
-            line_label="",
+            strike=strike_val,
+            line_label="" if strike_val is None else _format_strike(strike_val),
             source_line_id=raw_market_id,
             sides=sides,
             total_liquidity_usd=total,
@@ -735,6 +758,14 @@ def _novig_market_type(market: dict) -> tuple[str, Optional[str]]:
     if market.get("playerId"):
         canon = _NOVIG_PROP_TYPE_MAP.get(raw_type)
         return MTYPE_PLAYER_PROP, canon or raw_type
+    # Golf round matchups are single-round head-to-heads: Novig types the
+    # result market "<ORDINAL>_ROUND_MONEYLINE" (FIRST/.../FOURTH), which
+    # is the whole-matchup moneyline and pairs with ProphetX's plain
+    # matchup moneyline. Fold to (MONEYLINE, "MONEY"). Tennis set markets
+    # use "_SET_" (e.g. 1ST_SET_MONEYLINE), so they're unaffected and stay
+    # distinct from the full-match line.
+    if raw_type.endswith("_ROUND_MONEYLINE"):
+        return MTYPE_MONEYLINE, "MONEY"
     mtype = _NOVIG_GAME_TYPES.get(raw_type)
     if mtype is not None:
         return mtype, raw_type
@@ -866,6 +897,65 @@ def _novig_market_display_name(group_markets: list[dict],
     return mtype.title()
 
 
+def _novig_back_side_from_opposite(outcome: dict,
+                                   opp_ladder: Optional[dict],
+                                   market_id: Optional[str] = None
+                                   ) -> NormalizedSide:
+    """Build outcome X's takeable BACK ladder from the OPPOSITE outcome
+    Y's resting bids.
+
+    On Novig's NBX book each outcome's ladder only ever carries `bids`
+    (the `asks` array is always empty). A bid is a resting order from
+    someone wanting to BACK that outcome — same side as you, so it can't
+    fill your back order. The liquidity that actually fills a back of X
+    is a bid on Y: a "bid Y @ p" crosses a "bid X @ (1 - p)" because the
+    two stakes sum to the $1 contract. So X's best available back price
+    is the complement of Y's best bid, with Y's bid size as the matchable
+    depth.
+
+    Reading X's own bids as X's back-odds (the old _novig_outcome_to_
+    side_from_book path) inverts the market — both sides print better
+    than fair, an impossible sub-100% book. This complement read instead
+    matches the outcome-level `available` field (which Novig already
+    derives from the opposite side) and the paired ProphetX line.
+
+    Falls back to the no-book top-of-book side when Y's ladder is missing
+    or has no usable bids.
+    """
+    label = outcome.get("description") or outcome.get("type") or "?"
+    outcome_id = outcome.get("id")
+    orders: list[NormalizedOrder] = []
+    for o in ((opp_ladder or {}).get("bids") or []):
+        try:
+            opp_prob = float(o.get("price"))
+            qty = float(o.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        prob = 1.0 - opp_prob
+        if not (0.0 < prob < 1.0):
+            continue
+        american = prob_to_american(prob)
+        if american is None:
+            continue
+        # Stamp the order so it reflects THIS outcome (the one being
+        # backed) at the complement price — the honest representation of
+        # what the displayed row means.
+        raw = dict(o)
+        raw["price"] = prob
+        raw["_opp_price"] = opp_prob
+        raw["_market_id"] = market_id
+        raw["_outcome_id"] = outcome_id
+        raw["_is_bid"] = True
+        orders.append(NormalizedOrder(prob=prob, american=american,
+                                      size_usd=qty / _NBX_QTY_SCALE, raw=raw))
+    if not orders:
+        return _novig_outcome_to_top_level_side(outcome)
+    orders = _sort_side_orders(orders)
+    return NormalizedSide(label=label, side_type=classify_side(label),
+                          orders=orders,
+                          total_size_usd=sum(o.size_usd for o in orders))
+
+
 def _novig_line_from_market(market: dict,
                             book_entry: Optional[dict],
                             mtype: str) -> NormalizedLine:
@@ -873,13 +963,31 @@ def _novig_line_from_market(market: dict,
     outcomes = market.get("outcomes") or []
     ladders = (book_entry or {}).get("ladders") or {}
     sides: list[NormalizedSide] = []
-    for o in outcomes:
-        ladder = ladders.get(o.get("id"))
-        if ladder is not None:
-            sides.append(_novig_outcome_to_side_from_book(
-                o, ladder, market_id=market.get("id")))
-        else:
-            sides.append(_novig_outcome_to_top_level_side(o))
+    if len(outcomes) == 2 and ladders:
+        # Binary market with a live book: cross-map each outcome's back
+        # ladder from the OPPOSITE outcome's bids (see
+        # _novig_back_side_from_opposite). Reading an outcome's own bids
+        # inverts the price, so this is required for the displayed odds
+        # to match `available` / ProphetX.
+        o_a, o_b = outcomes
+        lad_a = ladders.get(o_a.get("id"))
+        lad_b = ladders.get(o_b.get("id"))
+        sides.append(_novig_back_side_from_opposite(
+            o_a, lad_b, market_id=market.get("id")))
+        sides.append(_novig_back_side_from_opposite(
+            o_b, lad_a, market_id=market.get("id")))
+    else:
+        # Non-binary (3-way, or markets with no live book): fall back to
+        # the per-outcome read. Top-of-book `available` is already a
+        # correct (opposite-derived) back price, so the no-book path is
+        # fine; only the multi-outcome book path lacks a clean complement.
+        for o in outcomes:
+            ladder = ladders.get(o.get("id"))
+            if ladder is not None:
+                sides.append(_novig_outcome_to_side_from_book(
+                    o, ladder, market_id=market.get("id")))
+            else:
+                sides.append(_novig_outcome_to_top_level_side(o))
     total = sum(s.total_size_usd for s in sides)
 
     # Moneyline guard: ignore source strike (Novig MONEY ships strike=0).
@@ -1340,6 +1448,114 @@ def _team_to_symbol_in_table(s: str,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Cross-source sport canonicalization
+# ---------------------------------------------------------------------------
+# The two feeds label the same contest differently: ProphetX tags a tennis
+# match tournament="French Open (M)" / sport="Tennis"; Novig tags it
+# league="ATP". A plain league-string equality (the old gate) can never pair
+# them. canonical_sport() collapses both into a shared bucket. Team leagues
+# return their own code unchanged, so MLB<->MLB and friends behave exactly as
+# before — only non-team sports gain new matching ability.
+
+_TEAM_LEAGUES = frozenset({
+    "MLB", "NBA", "NHL", "NFL", "WNBA", "NCAAF", "NCAAB", "NCAABSB",
+})
+
+# Canonical buckets whose participants are individual people — matched by
+# surname rather than a team-symbol table.
+INDIVIDUAL_SPORTS = frozenset({"TENNIS", "GOLF", "MMA"})
+
+
+def canonical_sport(league: Optional[str], sport: Optional[str],
+                    event_name: Optional[str] = None) -> str:
+    """Map a (league, sport) pair from either source to a shared bucket.
+
+    Team leagues return their own uppercased code (so existing matching is
+    untouched). Non-team sports collapse ATP/WTA->TENNIS, PGA->GOLF,
+    UFC->MMA, MLS/EPL/soccer->SOCCER. Unknown inputs fall back to the
+    league code, then the sport, so two genuinely-unrelated leagues still
+    can't accidentally share a bucket.
+    """
+    lg = (league or "").upper().strip()
+    sp = (sport or "").lower().strip()
+    if lg in _TEAM_LEAGUES:
+        return lg
+    if lg in ("ATP", "WTA") or sp == "tennis":
+        return "TENNIS"
+    if lg == "PGA" or sp == "golf":
+        return "GOLF"
+    if lg == "UFC" or sp in ("mma", "mixed martial arts"):
+        return "MMA"
+    if lg in ("MLS", "EPL") or sp == "soccer":
+        return "SOCCER"
+    return lg or sp.upper()
+
+
+# Trailing tournament-stage / round descriptors that Novig appends to the
+# home player's name ("Ethan Quinn Round of 128") and that ProphetX appends
+# as a parenthetical to golf matchups ("J.T. Poston (Round 4 Matchup)").
+# Stripped before surname extraction so they don't pollute the last token.
+_STAGE_RX = re.compile(
+    r"\b("
+    r"round of \d+|"
+    r"\d+(?:st|nd|rd|th) qualifying round|"
+    r"qualifying(?: round)?|qualification|"
+    r"round \d+ matchup|matchup|"
+    r"final|semifinal|quarterfinal"
+    r")\b.*$"
+)
+
+
+def _person_surname(side: str) -> Optional[str]:
+    """Normalize one participant name and return its surname (last token),
+    after stripping any trailing tournament-stage descriptor."""
+    norm = normalize_person_name(side)
+    norm = _STAGE_RX.sub("", norm).strip()
+    toks = norm.split()
+    return toks[-1] if toks else None
+
+
+def _extract_person_surnames(event: "NormalizedEvent") -> set[str]:
+    """Surname set for an individual-sport event (tennis/golf/MMA).
+
+    Parses '<A> @ <B>' / '<A> at <B>' / '<A> vs. <B>' out of the event
+    name and reduces each side to its surname so divergent spellings
+    ('Ketlen Souza' / 'K. Souza' / 'Souza') collapse to one key."""
+    name = event.event_name or ""
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    meta = raw.get("event_metadata") if isinstance(raw, dict) else None
+    if isinstance(meta, dict):
+        name = meta.get("name") or name
+    out: set[str] = set()
+    for sep in (" at ", " @ ", " vs. ", " vs "):
+        if sep in name.lower():
+            idx = name.lower().find(sep)
+            for side in (name[:idx], name[idx + len(sep):]):
+                sn = _person_surname(side)
+                if sn:
+                    out.add(sn)
+            return out
+    # No separator — fall back to a single surname (rare; e.g. an outright).
+    sn = _person_surname(name)
+    return {sn} if sn else set()
+
+
+def extract_participants(event: "NormalizedEvent",
+                         csport: Optional[str] = None) -> set[str]:
+    """Unified participant key set for event matching.
+
+    Team sports -> set of team symbols (via extract_team_symbols).
+    Individual sports (TENNIS/GOLF/MMA) -> set of player surnames.
+    """
+    if csport is None:
+        csport = canonical_sport(event.league, event.sport, event.event_name)
+    if csport in INDIVIDUAL_SPORTS:
+        return _extract_person_surnames(event)
+    h, a = extract_team_symbols(event)
+    return {s for s in (h, a) if s}
+
+
 def extract_team_symbols(event: "NormalizedEvent"
                          ) -> tuple[Optional[str], Optional[str]]:
     """Extract (home_symbol, away_symbol) from a NormalizedEvent.
@@ -1440,15 +1656,16 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
 def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
                        max_delta: timedelta) -> tuple[float, float]:
     """Return (confidence, time_delta_minutes) or (-1, +inf) if no match."""
-    league_a = (ev_a.league or "").upper()
-    league_b = (ev_b.league or "").upper()
-    sport_a = (ev_a.sport or "").lower()
-    sport_b = (ev_b.sport or "").lower()
-    if league_a and league_b and league_a != league_b:
+    # Gate on a canonical sport bucket rather than raw league strings, so
+    # the two feeds' divergent labels for the same contest (PX "French
+    # Open (M)"/Tennis vs NV "ATP") still pair. Team leagues canonicalize
+    # to their own code, so MLB<->MLB etc. is unchanged. An empty bucket
+    # on either side means "unknown" — we don't reject on it, deferring to
+    # the team/time signals below (preserves prior no-league behavior).
+    csport_a = canonical_sport(ev_a.league, ev_a.sport, ev_a.event_name)
+    csport_b = canonical_sport(ev_b.league, ev_b.sport, ev_b.event_name)
+    if csport_a and csport_b and csport_a != csport_b:
         return (-1.0, float("inf"))
-    if not (league_a or league_b):
-        if sport_a and sport_b and sport_a != sport_b:
-            return (-1.0, float("inf"))
 
     t_a = _parse_iso(ev_a.scheduled_start)
     t_b = _parse_iso(ev_b.scheduled_start)
@@ -1466,10 +1683,10 @@ def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
         time_delta_min = delta.total_seconds() / 60.0
         time_conf = max(0.0, 1.0 - (delta.total_seconds() / max_delta.total_seconds()))
 
-    home_a, away_a = extract_team_symbols(ev_a)
-    home_b, away_b = extract_team_symbols(ev_b)
-    set_a = {s for s in (home_a, away_a) if s}
-    set_b = {s for s in (home_b, away_b) if s}
+    # Participant keys: team symbols for team sports, player surnames for
+    # individual sports (tennis/golf/MMA, which have no team table).
+    set_a = extract_participants(ev_a, csport_a)
+    set_b = extract_participants(ev_b, csport_b)
     if not set_a or not set_b:
         team_conf = 0.0
         if time_delta_min > 30.0:
