@@ -342,6 +342,14 @@ def parse_nhl_boxscore_stats(soup):
         return stats_data
 
 
+def _safe_int(value, default=0):
+    """Parse an int from an ESPN stat value, tolerating '--', '', None, etc."""
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError, AttributeError):
+        return default
+
+
 def get_top_players_mlb(stats_data):
     """
     Extract top players for MLB games.
@@ -378,9 +386,9 @@ def get_top_players_mlb(stats_data):
         batters = team_stats.get('Batting', [])
         scored_batters = []
         for batter in batters:
-            hits = int(batter['stats'].get('H', '0') or '0')
-            rbi = int(batter['stats'].get('RBI', '0') or '0')
-            hr = int(batter['stats'].get('HR', '0') or '0')
+            hits = _safe_int(batter['stats'].get('H', '0'))
+            rbi = _safe_int(batter['stats'].get('RBI', '0'))
+            hr = _safe_int(batter['stats'].get('HR', '0'))
             score = hits * 10 + rbi * 5 + hr * 15  # Weighted scoring
 
             if hits > 0 or rbi > 0 or hr > 0:
@@ -390,7 +398,7 @@ def get_top_players_mlb(stats_data):
         top_players[display_key]['hitters'] = [
             {
                 'name': b[0]['name'],
-                'stats': f"{b[0]['stats'].get('AB', '0')}-{b[0]['stats'].get('H', '0')}, {b[0]['stats'].get('RBI', '0')} RBI, {b[0]['stats'].get('HR', '0')} HR"
+                'stats': f"{b[0]['stats'].get('H', '0')}-{b[0]['stats'].get('AB', '0')}, {b[0]['stats'].get('RBI', '0')} RBI, {b[0]['stats'].get('HR', '0')} HR"
             }
             for b in scored_batters[:3]
         ]
@@ -476,7 +484,7 @@ def get_top_players_nfl(stats_data):
         # Get top rusher (by yards)
         rushers = team_stats.get('Rushing', [])
         if rushers:
-            top_rusher = max(rushers, key=lambda r: int(r['stats'].get('YDS', '0') or '0'))
+            top_rusher = max(rushers, key=lambda r: _safe_int(r['stats'].get('YDS', '0')))
             td = top_rusher['stats'].get('TD', '0')
             td_str = f", {td} TD" if td != '0' else ""
             top_players[display_key]['rusher'] = {
@@ -487,7 +495,7 @@ def get_top_players_nfl(stats_data):
         # Get top receiver (by yards)
         receivers = team_stats.get('Receiving', [])
         if receivers:
-            top_receiver = max(receivers, key=lambda r: int(r['stats'].get('YDS', '0') or '0'))
+            top_receiver = max(receivers, key=lambda r: _safe_int(r['stats'].get('YDS', '0')))
             td = top_receiver['stats'].get('TD', '0')
             td_str = f", {td} TD" if td != '0' else ""
             top_players[display_key]['receiver'] = {
@@ -520,15 +528,16 @@ def get_top_players_nhl(stats_data):
                 'stats': f"{goalie['stats'].get('SA', '0')} SA, {goalie['stats'].get('SV', '0')} SV, {goalie['stats'].get('SV%', '.000')} SV%"
             }
 
-        # Get goal scorers (players with goals)
+        # Get point scorers (players with a goal or 2 assists)
         skaters = team_stats.get('Skaters', [])
         scorers = []
         for skater in skaters:
-            goals = int(skater['stats'].get('G', '0') or '0')
-            assists = int(skater['stats'].get('A', '0') or '0')
+            goals = _safe_int(skater['stats'].get('G', '0'))
+            assists = _safe_int(skater['stats'].get('A', '0'))
             if goals > 0:
                 scorers.append((skater, goals * 10 + assists * 5))
-
+            if assists > 1: # this needs to be adjusted
+                scorers.append((skater, assists))
         scorers.sort(key=lambda x: x[1], reverse=True)
         top_players[display_key]['scorers'] = [
             {
@@ -541,10 +550,112 @@ def get_top_players_nhl(stats_data):
     return top_players
 
 
+# Maps an ESPN summary-API statistics group to the bucket key the get_top_players_*
+# functions expect. The group identifier lives in `type` for some sports (MLB) and
+# in `name` for others (NFL/NHL); NBA has neither. Returning None ignores the group.
+def _normalize_group_name(sport_name, raw_name, raw_type=None):
+    sport = (sport_name or '').upper()
+    name = (raw_type or raw_name or '').lower()
+    if sport == 'MLB':
+        return {'batting': 'Batting', 'pitching': 'Pitching'}.get(name)
+    if sport == 'NBA':
+        # NBA returns a single unnamed group of all players; get_top_players_nba
+        # merges 'Starters' + 'Bench', so dumping everything into 'Starters' works.
+        return 'Starters'
+    if sport == 'NFL':
+        return {'passing': 'Passing', 'rushing': 'Rushing', 'receiving': 'Receiving'}.get(name)
+    if sport == 'NHL':
+        if name in ('forwards', 'defenses', 'skaters'):
+            return 'Skaters'
+        if name == 'goalies':
+            return 'Goaltending'
+    return None
+
+
+def _parse_summary_players(summary, sport_name):
+    """Convert an ESPN summary API payload into the stats_data dict shape that the
+    get_top_players_* functions consume:
+        {'away_team_stats': {GroupKey: [{'name', 'stats': {label: value}}]}, 'home_team_stats': {...}}
+    """
+    boxscore = summary.get('boxscore', {}) or {}
+    # team id -> homeAway ('away'/'home') comes from boxscore.teams
+    side_by_id = {
+        (t.get('team') or {}).get('id'): t.get('homeAway')
+        for t in (boxscore.get('teams') or [])
+    }
+
+    stats_data = {'away_team_stats': {}, 'home_team_stats': {}}
+    for team_block in (boxscore.get('players') or []):
+        tid = (team_block.get('team') or {}).get('id')
+        side = side_by_id.get(tid)
+        if side == 'away':
+            dest = stats_data['away_team_stats']
+        elif side == 'home':
+            dest = stats_data['home_team_stats']
+        else:
+            continue
+
+        for group in team_block.get('statistics', []):
+            key = _normalize_group_name(sport_name, group.get('name'), group.get('type'))
+            if not key:
+                continue
+            labels = group.get('labels', []) or []
+            bucket = dest.setdefault(key, [])
+            for ath in group.get('athletes', []):
+                athlete = ath.get('athlete', {}) or {}
+                name = athlete.get('shortName') or athlete.get('displayName') or ''
+                sdict = dict(zip(labels, ath.get('stats', []) or []))
+                # NHL skater feed has no PTS column; derive it from G + A.
+                if (sport_name or '').upper() == 'NHL' and key == 'Skaters':
+                    try:
+                        sdict['PTS'] = str(int(sdict.get('G', '0') or 0) + int(sdict.get('A', '0') or 0))
+                    except (ValueError, TypeError):
+                        pass
+                bucket.append({'name': name, 'stats': sdict})
+
+    return stats_data
+
+
+def _dispatch_top_players(stats_data, sport_name):
+    sp = (sport_name or '').lower()
+    if sp == 'mlb':
+        return get_top_players_mlb(stats_data)
+    if sp == 'nba':
+        return get_top_players_nba(stats_data)
+    if sp == 'nfl':
+        return get_top_players_nfl(stats_data)
+    if sp == 'nhl':
+        return get_top_players_nhl(stats_data)
+    return None
+
+
+def get_boxscore_stats_api(game_id, sport_name, timeout=15):
+    """Fetch detailed box score stats from ESPN's JSON summary API.
+
+    This is the same backend ESPN's own site renders from, so the data is at the
+    same (or lower) latency than the old HTML scrape, and far more robust.
+    Returns a top_players dict or None on failure.
+    """
+    api_path = _api_path_for_sport(sport_name)
+    if not api_path:
+        return None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{api_path}/summary?event={game_id}"
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    stats_data = _parse_summary_players(response.json(), sport_name)
+    return _dispatch_top_players(stats_data, sport_name)
+
+
 def get_boxscore_stats(game_id, sport_name):
     """
     Fetch box score stats from ESPN and extract top players.
     This is called separately when we want detailed player stats.
+
+    Primary source is ESPN's JSON summary API; falls back to the legacy HTML
+    boxscore scrape if the API call fails.
 
     Args:
         game_id: ESPN game ID (e.g., "401772749")
@@ -553,6 +664,15 @@ def get_boxscore_stats(game_id, sport_name):
     Returns:
         Dictionary with top players or None if error
     """
+    # Primary: JSON summary API
+    try:
+        top_players = get_boxscore_stats_api(game_id, sport_name)
+        if top_players:
+            return top_players
+    except Exception as e:
+        print(f"Summary API failed for {sport_name} game {game_id}, falling back to HTML: {e}")
+
+    # Fallback: legacy HTML boxscore scrape
     try:
         soup = _fetch_boxscore_soup(game_id, sport_name, timeout=10)
         if not soup:
@@ -560,19 +680,7 @@ def get_boxscore_stats(game_id, sport_name):
 
         # Parse box score stats
         stats_data = parse_boxscore_stats(soup, sport_name)
-
-        # Get top players based on sport
-        top_players = None
-        if sport_name.lower() == 'mlb':
-            top_players = get_top_players_mlb(stats_data)
-        elif sport_name.lower() == 'nba':
-            top_players = get_top_players_nba(stats_data)
-        elif sport_name.lower() == 'nfl':
-            top_players = get_top_players_nfl(stats_data)
-        elif sport_name.lower() == 'nhl':
-            top_players = get_top_players_nhl(stats_data)
-
-        return top_players
+        return _dispatch_top_players(stats_data, sport_name)
 
     except Exception as e:
         print(f"Error fetching boxscore stats for game {game_id}: {e}")
@@ -671,13 +779,52 @@ def get_game_status_from_scoreboard(section):
         print(f"Error extracting game status: {e}")
         return 'Unknown'
 
-def scrape_espn_scores(url="https://www.espn.com/mlb/scoreboard", max_workers=5, sport_name="MLB", include_stats=False):
+# ESPN's public JSON scoreboard API. Maps our sport names to the league paths.
+# This replaces the old HTML/CSS-class scraping, which broke when ESPN renamed
+# its scoreboard CSS classes (e.g. ScoreCell__Score no longer exists), causing
+# every game to be silently dropped and the ticker to show nothing.
+ESPN_API_PATHS = {
+    "MLB": "baseball/mlb",
+    "NBA": "basketball/nba",
+    "NFL": "football/nfl",
+    "NHL": "hockey/nhl",
+}
+
+
+def _api_path_for_sport(sport_name, url=""):
+    """Resolve the ESPN JSON API league path from a sport name (or fall back to URL)."""
+    if sport_name and sport_name.upper() in ESPN_API_PATHS:
+        return ESPN_API_PATHS[sport_name.upper()]
+    # Fall back to inferring from a legacy scoreboard URL like .../mlb/scoreboard
+    for name, path in ESPN_API_PATHS.items():
+        if f"/{name.lower()}/" in (url or "").lower():
+            return path
+    return None
+
+
+def _status_from_event(status_type):
+    """Translate an ESPN status block into the strings the ticker expects.
+
+    Returns 'Final' for completed games, 'Pre-Game' for scheduled games, and
+    the human-readable live detail (e.g. 'Bottom 7th', '10:18 - 1st Quarter')
+    for in-progress games.
     """
-    Scrape scores from ESPN scoreboard.
+    state = (status_type or {}).get('state')
+    if state == 'post':
+        return 'Final'
+    if state == 'pre':
+        return 'Pre-Game'
+    # In-progress: prefer the full detail, fall back to the short detail.
+    return (status_type or {}).get('detail') or (status_type or {}).get('shortDetail') or 'Live'
+
+
+def scrape_espn_scores(url="https://www.espn.com/mlb/scoreboard", max_workers=10, sport_name="MLB", include_stats=False):
+    """
+    Fetch scores from ESPN's public JSON scoreboard API.
 
     Args:
-        url: ESPN scoreboard URL
-        max_workers: Reserved for future parallel boxscore fetching (currently unused)
+        url: Legacy ESPN scoreboard URL (only used to infer the league if sport_name is unknown)
+        max_workers: Thread pool size for fetching per-game box score stats in parallel
         sport_name: Sport name (e.g., "MLB", "NBA", "NFL", "NHL")
         include_stats: If True, fetches detailed box score stats for each game (slower)
 
@@ -688,89 +835,93 @@ def scrape_espn_scores(url="https://www.espn.com/mlb/scoreboard", max_workers=5,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.content, 'html.parser')
+    api_path = _api_path_for_sport(sport_name, url)
+    if not api_path:
+        print(f"scrape_espn_scores: unknown sport '{sport_name}' (url={url})")
+        return []
+
+    api_url = f"https://site.api.espn.com/apis/site/v2/sports/{api_path}/scoreboard"
+    response = requests.get(api_url, headers=headers, timeout=15)
+    response.raise_for_status()
+    data = response.json()
 
     games = []
-    game_containers = soup.find_all('section', class_='Card gameModules')
+    for event in data.get('events', []):
+        competitions = event.get('competitions') or []
+        if not competitions:
+            continue
+        competition = competitions[0]
+        competitors = competition.get('competitors') or []
+        if len(competitors) != 2:
+            continue
 
-    # Extract game data from scoreboard - single pass with status extraction
-    for container in game_containers:
-        scoreboard_sections = container.find_all('section', class_='Scoreboard')
+        # ESPN lists competitors in arbitrary order; key by homeAway.
+        by_side = {c.get('homeAway'): c for c in competitors}
+        away = by_side.get('away')
+        home = by_side.get('home')
+        if not away or not home:
+            continue
 
-        for section in scoreboard_sections:
-            game_id = section.get('id')
-            scorecells = section.find_all('div', class_='ScoreboardScoreCell')
+        game_id = event.get('id')
+        game_status = _status_from_event(event.get('status', {}).get('type', {}))
 
-            for cell in scorecells:
-                teams = cell.find_all('li', class_='ScoreboardScoreCell__Item')
+        def _team_name(comp):
+            team = comp.get('team') or {}
+            return team.get('shortDisplayName') or team.get('displayName') or team.get('abbreviation') or ''
 
-                if len(teams) == 2:
-                    away_team = teams[0]
-                    home_team = teams[1]
+        def _record(comp):
+            records = comp.get('records') or []
+            return records[0].get('summary', '') if records else ''
 
-                    away_name = away_team.find('div', class_='ScoreCell__TeamName')
-                    home_name = home_team.find('div', class_='ScoreCell__TeamName')
+        def _period_scores(comp):
+            return [str(ls.get('value', '')) for ls in (comp.get('linescores') or [])]
 
-                    away_record = away_team.find('span', class_='ScoreboardScoreCell__Record')
-                    home_record = home_team.find('span', class_='ScoreboardScoreCell__Record')
+        game_data = {
+            'game_id': game_id,
+            'away_team': _team_name(away),
+            'home_team': _team_name(home),
+            'away_record': _record(away),
+            'home_record': _record(home),
+            'away_score': {
+                'runs': str(away.get('score', '')),
+                'period_scores': _period_scores(away),
+            },
+            'home_score': {
+                'runs': str(home.get('score', '')),
+                'period_scores': _period_scores(home),
+            },
+            'status': game_status,
+        }
 
-                    # Get total scores - consistent across all sports
-                    away_total_score = away_team.find('div', class_='ScoreCell__Score')
-                    home_total_score = home_team.find('div', class_='ScoreCell__Score')
+        games.append(game_data)
 
-                    # Get period/quarter scores - these exist for all sports
-                    away_period_scores = away_team.find_all('div', class_='ScoreboardScoreCell__Value')
-                    home_period_scores = home_team.find_all('div', class_='ScoreboardScoreCell__Value')
-
-                    if away_name and home_name and away_total_score and home_total_score:
-                        # Extract game status directly from the scoreboard section (not the cell)
-                        game_status = get_game_status_from_scoreboard(section)
-
-                        # If game is "Live" but no detailed status, try boxscore
-                        if game_status == 'Live' and game_id:
-                            boxscore_status = get_game_status_from_boxscore(game_id, sport_name)
-                            if boxscore_status:
-                                game_status = boxscore_status
-
-                        away_team_name = away_name.text.strip()
-                        home_team_name = home_name.text.strip()
-                        away_score = away_total_score.text.strip()
-                        home_score = home_total_score.text.strip()
-
-                        game_data = {
-                            'game_id': game_id,
-                            'away_team': away_team_name,
-                            'home_team': home_team_name,
-                            'away_record': away_record.text.strip() if away_record else '',
-                            'home_record': home_record.text.strip() if home_record else '',
-                            'away_score': {
-                                'runs': away_score,
-                                'period_scores': [score.text.strip() for score in away_period_scores]
-                            },
-                            'home_score': {
-                                'runs': home_score,
-                                'period_scores': [score.text.strip() for score in home_period_scores]
-                            },
-                            'status': game_status  # Use the unified status extraction
-                        }
-
-                        # Optionally fetch detailed box score stats
-                        if include_stats and game_id:
-                            top_players = get_boxscore_stats(game_id, sport_name)
-                            if top_players:
-                                game_data['top_players'] = top_players
-
-                        games.append(game_data)
+    # Fetch detailed box score stats in parallel. Pre-game events have no stats
+    # yet, so skip them entirely (saves a wasted request per scheduled game).
+    if include_stats:
+        stat_games = [g for g in games if g.get('game_id') and g['status'] != 'Pre-Game']
+        if stat_games:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_game = {
+                    executor.submit(get_boxscore_stats, g['game_id'], sport_name): g
+                    for g in stat_games
+                }
+                for future in as_completed(future_to_game):
+                    g = future_to_game[future]
+                    try:
+                        top_players = future.result()
+                        if top_players:
+                            g['top_players'] = top_players
+                    except Exception as e:
+                        print(f"Error fetching boxscore stats for {sport_name} game {g['game_id']}: {e}")
 
     return games
 
-def scrape_all_sports(max_workers=5, include_stats=True):
+def scrape_all_sports(max_workers=10, include_stats=True):
     """
     Scrape live scores from all major sports leagues.
 
     Args:
-        max_workers: Reserved for future parallel boxscore fetching (currently unused)
+        max_workers: Thread pool size for parallel per-game box score stat fetches
         include_stats: If True, fetches detailed box score stats for each game (default: True)
 
     Returns:
@@ -785,23 +936,33 @@ def scrape_all_sports(max_workers=5, include_stats=True):
 
     all_scores = {}
 
-    for sport_name, config in sports_config.items():
-        try:
-            scores = scrape_espn_scores(
+    # Scrape all sports concurrently; each call also fetches its games' stats in
+    # parallel internally, so the whole multi-sport pull overlaps end to end.
+    with ThreadPoolExecutor(max_workers=len(sports_config)) as executor:
+        future_to_sport = {
+            executor.submit(
+                scrape_espn_scores,
                 url=config['url'],
                 max_workers=max_workers,
                 sport_name=sport_name,
-                include_stats=include_stats
-            )
-            if scores:
-                all_scores[sport_name] = {
-                    "games": scores,
-                    "icon": config["icon"]
-                }
-        except Exception as e:
-            print(f"Error scraping {sport_name}: {e}")
+                include_stats=include_stats,
+            ): (sport_name, config)
+            for sport_name, config in sports_config.items()
+        }
+        for future in as_completed(future_to_sport):
+            sport_name, config = future_to_sport[future]
+            try:
+                scores = future.result()
+                if scores:
+                    all_scores[sport_name] = {
+                        "games": scores,
+                        "icon": config["icon"],
+                    }
+            except Exception as e:
+                print(f"Error scraping {sport_name}: {e}")
 
-    return all_scores
+    # Preserve the original MLB/NBA/NFL/NHL ordering (as_completed returns out of order)
+    return {name: all_scores[name] for name in sports_config if name in all_scores}
 
 def save_to_json(data, filename='espn_scores.json'):
     with open(filename, 'w') as f:
