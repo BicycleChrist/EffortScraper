@@ -29,6 +29,9 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 import requests
+import orjson  # C-level JSON: ~6-10x faster than stdlib + eats bytes directly,
+              # so the 38MB dump parse stops holding the GIL long enough to
+              # stutter the ticker (see PERF_DIAGNOSTICS.md, [PERF-DIAG]).
 
 try:
     from Creds import NOVIG_AUTH_TOKEN
@@ -123,7 +126,7 @@ class NovigClient:
             raise NovigError(
                 f"NBX HTTP {r.status_code} for {r.url}\n  body: {r.text[:500]}"
             )
-        return r.json()
+        return orjson.loads(r.content)  # C-level parse off the GIL faster than r.json()
 
     def price_parlay(self, outcome_ids: list[str],
                      boost_id: Optional[str] = None) -> dict:
@@ -578,16 +581,22 @@ class NovigQueries:
     def __init__(self, client: "NovigClient"):
         self.client = client
 
-    def list_events(self, league: str = "MLB",
+    def list_events(self, league: Optional[str] = "MLB",
                     status_in: tuple[str, ...] = ("OPEN_PREGAME", "OPEN_INGAME"),
                     visible_only: bool = True,
                     limit: int = 200) -> list[dict]:
-        """List top-level events for a league. Filters out child/sub events."""
+        """List top-level events. Filters out child/sub events.
+
+        Pass league=None to fetch every league in one round-trip (used
+        by scrape_all_leagues to avoid maintaining a hard-coded enum
+        of Novig's league codes and silently dropping tennis/UFC/PGA/
+        most soccer comps the way the old per-league loop did)."""
         where: dict = {
-            "league": {"_eq": league},
             "status": {"_in": list(status_in)},
             "parent_event_id": {"_is_null": True},  # top-level only
         }
+        if league is not None:
+            where["league"] = {"_eq": league}
         if visible_only:
             # PREGAME events use is_visible_pregame; INGAME use is_visible_live.
             where["_or"] = [
@@ -717,7 +726,7 @@ class NovigQueries:
             only_available: passed to get_event_markets. False = all
                 markets even empty ones; True = website's
                 consensus-OR-has-liquidity filter.
-            save: if True, writes <dump_dir>/all_events_combined_<ts>.json.
+            save: if True, overwrites <dump_dir>/all_events_combined_latest.json.
             dump_dir: override write location (default NOVIG_DUMP_DIR).
         """
         return self.scrape_all_leagues(
@@ -729,9 +738,7 @@ class NovigQueries:
         )
 
     def scrape_all_leagues(self, *,
-                           leagues: tuple[str, ...] = (
-                               "MLB", "NBA", "NHL", "NFL",
-                               "NCAAF", "NCAAB", "WNBA", "EPL"),
+                           leagues: Optional[tuple[str, ...]] = None,
                            with_books: bool = False,
                            currency: str = "CASH",
                            max_workers: int = 4,
@@ -741,23 +748,45 @@ class NovigQueries:
                            save: bool = True,
                            dump_dir: Optional[pathlib.Path] = None,
                            progress: bool = True) -> dict:
-        """Same as scrape_all_mlb but iterates a list of leagues. Output
-        dump shape is identical (event_metadata.tournament carries the
-        league code), so LiquidityWidget consumes it unchanged."""
+        """Scrape every Novig event into a single combined dump.
+
+        leagues=None (the default) fetches across ALL leagues Novig
+        currently exposes in two round-trips (one pregame, one ingame)
+        — tennis, UFC, PGA, every soccer comp, etc. Pass an explicit
+        tuple like ("MLB", "NBA") to scope to a subset.
+
+        Output dump shape is identical to scrape_all_mlb
+        (event_metadata.tournament carries the league code), so
+        LiquidityWidget consumes it unchanged."""
         dump_dir = dump_dir or NOVIG_DUMP_DIR
 
         events: list[dict] = []
-        for lg in leagues:
+        if leagues is None:
             if progress:
-                print(f"[novig.scrape] listing {lg} events...")
+                print("[novig.scrape] listing ALL leagues (one shot)...")
             try:
+                # Bumped limits because the no-filter response covers
+                # every sport on the slate — easily 200+ matches on a
+                # tennis-heavy afternoon between ATP + WTA + Challenger.
                 events += self.list_events(
-                    league=lg, status_in=("OPEN_PREGAME",), limit=200)
+                    league=None, status_in=("OPEN_PREGAME",), limit=1000)
                 events += self.list_events(
-                    league=lg, status_in=("OPEN_INGAME",), limit=100)
+                    league=None, status_in=("OPEN_INGAME",), limit=500)
             except NovigError as e:
                 if progress:
-                    print(f"  {lg} listing failed: {e}")
+                    print(f"  all-leagues listing failed: {e}")
+        else:
+            for lg in leagues:
+                if progress:
+                    print(f"[novig.scrape] listing {lg} events...")
+                try:
+                    events += self.list_events(
+                        league=lg, status_in=("OPEN_PREGAME",), limit=200)
+                    events += self.list_events(
+                        league=lg, status_in=("OPEN_INGAME",), limit=100)
+                except NovigError as e:
+                    if progress:
+                        print(f"  {lg} listing failed: {e}")
         seen_ids: set[str] = set()
         unique_events: list[dict] = []
         for ev in events:
@@ -778,17 +807,23 @@ class NovigQueries:
                               only_available, throttle_s, jitter_s): ev["id"]
                     for ev in unique_events}
             for i, fut in enumerate(as_completed(futs), 1):
-                eid, entry = fut.result()
-                if entry is None:
+                eid, entries = fut.result()
+                if not entries:
                     if progress:
                         print(f"  [{i}/{len(unique_events)}] {eid} (empty)")
                     continue
-                dump[eid] = entry
+                # One listed event can explode into several matchable
+                # entries (tennis/golf tournament -> per-match children).
+                for sub_id, entry in entries:
+                    dump[sub_id] = entry
                 if progress:
-                    n_mkts = len((entry.get("data") or {}).get("markets") or [])
+                    head = entries[0][1]
+                    extra = (f" +{len(entries) - 1} more"
+                             if len(entries) > 1 else "")
+                    n_mkts = len((head.get("data") or {}).get("markets") or [])
                     print(f"  [{i}/{len(unique_events)}] "
-                          f"{entry['event_metadata']['name']:30s} "
-                          f"({n_mkts} markets)")
+                          f"{head['event_metadata']['name']:30s} "
+                          f"({n_mkts} markets){extra}")
 
         if with_books:
             if progress:
@@ -809,9 +844,12 @@ class NovigQueries:
 
         if save and dump:
             dump_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = dump_dir / f"all_events_combined_{ts}.json"
-            out.write_text(json.dumps(dump, indent=2, default=str))
+            # Single overwritten file (atomic temp+replace), not archived — see
+            # _save_dump_sync in novig_async for the why. ([PERF-DIAG])
+            out = dump_dir / "all_events_combined_latest.json"
+            tmp = dump_dir / "all_events_combined_latest.json.tmp"
+            tmp.write_text(json.dumps(dump, indent=2, default=str))
+            tmp.replace(out)
             if progress:
                 size_mb = out.stat().st_size / (1024 * 1024)
                 print(f"[novig.scrape] wrote {out}  ({size_mb:.2f} MB)")
@@ -820,9 +858,11 @@ class NovigQueries:
     def _fetch_one_event_for_dump(self, event_id: str,
                                   only_available: bool,
                                   throttle_s: float, jitter_s: float
-                                  ) -> tuple[str, Optional[dict]]:
-        """Worker for scrape_all_mlb. Returns (event_id, dump_entry|None).
-        Always sleeps post-request to throttle the aggregate rate."""
+                                  ) -> tuple[str, list[tuple[str, dict]]]:
+        """Worker for scrape_all_leagues. Returns (event_id, entries),
+        where entries is a list of (entry_id, dump_entry) — usually one,
+        but several for tournament containers that expand into per-match
+        children. Always sleeps post-request to throttle the rate."""
         try:
             ev = self.get_event_markets(event_id, only_available=only_available)
         except NovigError:
@@ -830,8 +870,8 @@ class NovigQueries:
         finally:
             time.sleep(throttle_s + random.uniform(0.0, jitter_s))
         if not ev:
-            return event_id, None
-        return event_id, _event_to_dump_entry(ev)
+            return event_id, []
+        return event_id, _event_to_dump_entries(ev)
 
     def _fetch_books_for_event(self, entry: dict, *,
                                currency: str,
@@ -878,39 +918,125 @@ class NovigQueries:
                        key=lambda p: p.stat().st_mtime)
         if not files:
             return None
-        return json.loads(files[-1].read_text())
+        # orjson on raw bytes: the dump is ~38MB; stdlib json.loads(read_text())
+        # held the GIL ~500ms here and stuttered the ticker. read_bytes() also
+        # skips a full-file UTF-8 decode. ([PERF-DIAG] — see PERF_DIAGNOSTICS.md)
+        return orjson.loads(files[-1].read_bytes())
 
 
-def _event_to_dump_entry(event_node: dict) -> dict:
+# League code -> sport label, used as the sport default when a node has
+# no `game` block (true for tennis/golf child matches, whose game is
+# null). Keeps the dump's event_metadata.sport meaningful for display;
+# matching keys off the league code regardless (see canonical_sport in
+# exchange_market_keys.py), so a wrong default here can't break pairing.
+_LEAGUE_SPORT: dict[str, str] = {
+    "MLB": "Baseball", "NCAABSB": "Baseball",
+    "NBA": "Basketball", "WNBA": "Basketball", "NCAAB": "Basketball",
+    "NHL": "Ice Hockey",
+    "NFL": "American Football", "NCAAF": "American Football",
+    "ATP": "Tennis", "WTA": "Tennis",
+    "PGA": "Golf",
+    "UFC": "Mixed Martial Arts",
+    "MLS": "Soccer", "EPL": "Soccer",
+}
+
+
+def _event_to_dump_entry(event_node: dict,
+                         markets_override: Optional[list] = None) -> dict:
     """Build the per-event dump entry. Mirrors ProphetX's
     {event_metadata, data:{markets}} shape so the widget's loader can
-    consume both sources via one code path."""
+    consume both sources via one code path.
+
+    markets_override: when given, use exactly these markets instead of
+    flattening the node's subtree. Used to emit a tournament-level
+    futures entry from a container's *direct* markets without absorbing
+    its per-match child events (which become their own entries)."""
     game = event_node.get("game") or {}
     home = game.get("homeTeam") or {}
     away = game.get("awayTeam") or {}
+    league = event_node.get("league") or game.get("league") or ""
+    # No game block (tennis/golf child matches) -> participant names live
+    # in the description ("<Away> @ <Home> <round>"). Parse them so the
+    # matcher has something to pair on; leave symbols None (no team table
+    # for individual sports).
+    away_name = away.get("name")
+    home_name = home.get("name")
+    if not (home_name and away_name):
+        a, h = _parse_at_names(event_node.get("description") or "")
+        away_name = away_name or a
+        home_name = home_name or h
     meta = {
         "id": event_node.get("id") or "",
         "name": event_node.get("description") or "",
         "startTime": event_node.get("scheduled_start") or "",
         "status": event_node.get("status") or "",
-        "tournament": event_node.get("league") or game.get("league") or "",
-        "sport": game.get("sport") or "Baseball",
+        "tournament": league,
+        "sport": game.get("sport") or _LEAGUE_SPORT.get(league) or "Baseball",
         # Novig has no per-event total volume on the GraphQL surface;
         # 0 keeps stake-sort downstream sane.
         "stake": 0.0,
         "home_team_symbol": home.get("symbol"),
-        "home_team_name": home.get("name"),
+        "home_team_name": home_name,
         "away_team_symbol": away.get("symbol"),
-        "away_team_name": away.get("name"),
+        "away_team_name": away_name,
         "game_status": game.get("status"),
         "game_period": game.get("period"),
         "home_score": game.get("home_score"),
         "away_score": game.get("away_score"),
     }
+    markets = (markets_override if markets_override is not None
+               else NovigQueries.flatten_markets(event_node))
     return {
         "event_metadata": meta,
-        "data": {"markets": NovigQueries.flatten_markets(event_node)},
+        "data": {"markets": markets},
     }
+
+
+def _parse_at_names(desc: str) -> tuple[Optional[str], Optional[str]]:
+    """Split a Novig '<Away> @ <Home>' description into (away, home).
+    Used for individual-sport child matches whose game block is null.
+    Returns (None, None) when no separator is found."""
+    if not desc:
+        return (None, None)
+    for sep in (" @ ", " at ", " vs. ", " vs "):
+        if sep in desc:
+            left, right = desc.split(sep, 1)
+            return (left.strip() or None, right.strip() or None)
+    return (None, None)
+
+
+def _event_to_dump_entries(event_node: dict) -> list[tuple[str, dict]]:
+    """Expand one listed event node into 0..N matchable dump entries.
+
+    Most events (MLB/NBA/UFC games, futures) are a single matchable unit:
+    the whole subtree (game + prop sub-events) collapses into one entry,
+    preserving the prior _event_to_dump_entry behavior.
+
+    Tennis/golf are different: the listed top-level node is a *tournament
+    container* (type=Tournament, no direct markets) whose `events[]`
+    children are the individual matches. For those we recurse and emit
+    one entry per child Game so each match pairs against its ProphetX
+    counterpart — the user's chosen unit of matching.
+    """
+    if not event_node:
+        return []
+    is_tournament = (event_node.get("type") or "").lower() == "tournament"
+    children = event_node.get("events") or []
+    direct_markets = event_node.get("markets") or []
+
+    if is_tournament and children:
+        out: list[tuple[str, dict]] = []
+        # Keep any tournament-level futures/outright markets as their own
+        # entry (e.g. "Championship Winner") so they aren't dropped.
+        if direct_markets:
+            out.append((str(event_node.get("id") or ""),
+                        _event_to_dump_entry(event_node,
+                                             markets_override=direct_markets)))
+        for child in children:
+            out.extend(_event_to_dump_entries(child))
+        return out
+
+    return [(str(event_node.get("id") or ""), _event_to_dump_entry(event_node))]
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1271,12 @@ def _main_cli():
         return ev.get("description") or f"<{ev.get('type','?')}>"
 
     if args.scrape_dump:
-        q.scrape_all_mlb(
+        # leagues=None → every Novig league in one round-trip
+        # (tennis, UFC, PGA, all soccer comps, etc). The --league flag
+        # is intentionally ignored here; use scrape_all_leagues(
+        # leagues=(...)) directly from code if you need to scope.
+        q.scrape_all_leagues(
+            leagues=None,
             with_books=args.with_books,
             currency=args.currency,
             max_workers=args.workers,
@@ -1424,9 +1555,18 @@ class NovigGeoHarvester:
     _LISTEN_PORT = 54321
 
     _SOURCE_CONFIDENCE = {
-        # Highest — SPA literally assigned the tx onto the outbound payload.
-        "proto-setter": 9,
-        # SPA's actual outbound /orders body — gold standard.
+        # DEMOTED (2026-06-02): the proto-setter trap was ranked highest on
+        # the theory it sees the value "assigned onto the outbound payload",
+        # but live evidence shows the opposite — its captured value is
+        # REJECTED by /orders ("Geolocation validation has expired"), and the
+        # trap frequently fails to arm at all (armed=False). When it wins it
+        # clobbers the good token and the placed bet 400s. Kept as a weak
+        # last-resort signal only; it can no longer pass the freshness gate
+        # (>=8) or overwrite a real capture.
+        "proto-setter": 2,
+        # SPA's actual outbound /orders body — gold standard. The GeoComply
+        # geolocation RESULT (captured via json-parse) carries the identical
+        # value and is elevated to this tier in _source_confidence().
         "fetch-req": 8, "xhr-req": 8,
         # SDK events / direct return values, ranked by reason code below.
         "sdk-emit": 7, "sdk-request": 7,
@@ -1456,6 +1596,15 @@ class NovigGeoHarvester:
     _LIVE_PROFILE = pathlib.Path(os.path.expanduser(
         "~/.mozilla/firefox/lumoar1n.default-release"))
     _SNAPSHOT = pathlib.Path(__file__).parent / "novig_ff_snapshot"
+    # The harvester userscript, injected directly via Selenium during the
+    # driven refresh. Tampermonkey does NOT reliably run userscripts under
+    # a Marionette/geckodriver-launched Firefox (verified: none of its
+    # hooks — proto-setter trap, fetch/JSON.parse wraps — are present on
+    # the page), so we can't depend on the profile's extension to harvest.
+    # Because refresh_geo_tx drives the bet itself, the fresh geolocation
+    # is minted AFTER page load, so post-load injection still installs the
+    # proto-setter trap + response hooks before our bet triggers it.
+    _USERSCRIPT = pathlib.Path(__file__).parent / "novig_userscript.js"
     _NOVIG_URL = "https://novig.com/"
     _RSYNC_EXCLUDES = (
         "lock", ".parentlock", "parent.lock",
@@ -1566,6 +1715,22 @@ class NovigGeoHarvester:
         with self._lock:
             self._geo_cache = None
 
+    def clear_geo_cache(self) -> None:
+        """Purge the geo_tx everywhere — in-memory, metadata, and the disk
+        file. Called once at app startup: a PREWAGER geolocationTransactionId
+        is session-bound and a token persisted from a previous run is always
+        stale, so dropping it forces the next place to mint a fresh one
+        (400 → refresh_geo_tx) instead of replaying a token /orders rejects."""
+        with self._lock:
+            self._geo_cache = None
+            self._geo_meta = {"source": None, "ts": None}
+            try:
+                if self._CACHE_PATH.exists():
+                    self._CACHE_PATH.unlink()
+                    self._log("cleared cached geo_tx (startup)")
+            except Exception as e:
+                self._log(f"clear_geo_cache failed: {e}")
+
     def _source_confidence(self, src: Optional[str]) -> int:
         if not src:
             return 0
@@ -1574,6 +1739,17 @@ class NovigGeoHarvester:
         if "rc=2" in src:
             return 10
         head = src.split("|", 1)[0].split(":", 1)[0]
+        # A json-parse capture carrying a GeoComply PREWAGER geolocation
+        # RESULT — shape {"transactionId":...,"success":...,"errorMessage":
+        # ...,"geolocateInSession":...} — is the exact value the SPA sends to
+        # /orders as geolocationTransactionId. Proven canonical: the driven
+        # COIN bet places successfully with it. Elevate to the gold tier so
+        # the freshness gate accepts it and proto-setter can't overwrite it.
+        # Generic json-parse (page-hydration / cross-currency tokens) stays a
+        # low wide-net catch, still guarded by the ts>=start_ts freshness gate.
+        if (head == "json-parse" and "transactionId" in src
+                and ("geolocateIn" in src or "errorMessage" in src)):
+            return 9
         return self._SOURCE_CONFIDENCE.get(head, 1)
 
     def _set_geo_tx(self, geo_tx: str,
@@ -1676,6 +1852,8 @@ class NovigGeoHarvester:
                 tx, source = outer._parse_post_body(raw)
                 if tx:
                     outer._set_geo_tx(tx, source)
+                else:
+                    outer._log(f"POST body parsed to no tx ({length}B)")
                 self.send_response(204)
                 _cors(self)
                 self.end_headers()
@@ -1798,6 +1976,34 @@ class NovigGeoHarvester:
             except Exception: pass
         return driver
 
+    def _inject_harvester(self, driver) -> bool:
+        """Inject the harvester userscript into the live page via
+        Selenium. Stands in for Tampermonkey (which doesn't run under
+        geckodriver). Idempotent within a page: the script's own hooks
+        guard against double-wrapping. Must be called AFTER the page is
+        ready but BEFORE we click the outcome, so the proto-setter trap
+        and Response/JSON.parse/XHR hooks are armed before our bet mints
+        the fresh PREWAGER geolocationTransactionId."""
+        try:
+            js = self._USERSCRIPT.read_text()
+        except Exception as e:
+            self._log(f"could not read userscript for injection: {e}")
+            return False
+        try:
+            driver.execute_script(js)
+            # Confirm the proto-setter trap actually landed — it's the
+            # highest-confidence capture path and the clearest signal the
+            # injection took.
+            armed = driver.execute_script(
+                "return !!Object.getOwnPropertyDescriptor("
+                "Object.prototype, 'geolocationTransactionId');")
+            self._log(f"harvester injected (proto-setter trap "
+                      f"armed={bool(armed)})")
+            return True
+        except Exception as e:
+            self._log(f"harvester injection failed: {e}")
+            return False
+
     # --- Why we use the userscript+listener pattern instead of an
     #     inline Selenium-injected hook -----------------------------------
     #
@@ -1840,7 +2046,16 @@ class NovigGeoHarvester:
     # post-start_ts capture lands.
 
     def _place_coin_bet(self, driver, amount: str = "10",
-                        cta_timeout: int = 120) -> dict:
+                        cta_timeout: int = 120,
+                        place_bet: bool = True) -> dict:
+        # place_bet=False: drive only as far as the geolocation completing
+        # (CTA flips "Retry Geolocation" → "Place Order"), then STOP without
+        # clicking. The GeoComply geo result — and thus the geo_tx — is minted
+        # during the "verifying" phase, before the click, so the token is
+        # already captured. Not clicking leaves it UNCONSUMED so the real
+        # aiohttp bet can spend it (PREWAGER: geolocate, then attach to a
+        # wager). place_bet=True keeps the old behaviour (places a COIN bet,
+        # which spends the token — only useful for proving the SPA path).
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
@@ -2110,7 +2325,15 @@ class NovigGeoHarvester:
         if not wait_cta_ready("post-amount"):
             return fail("cta-never-ready")
 
-        # 6. Click Place Order on the tagged CTA.
+        # 6. Geolocation has completed (CTA is "Place Order"), so the geo_tx
+        # is already minted + captured. In geolocate-only mode, stop here so
+        # the token stays unconsumed for the real bet.
+        if not place_bet:
+            push("geolocated — skipping Place Order (token left unconsumed)")
+            return {"ok": True, "step": "geolocated", "detail": log,
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
+
+        # 7. Click Place Order on the tagged CTA.
         cta_el = driver.find_element(
             By.CSS_SELECTOR, '[data-novig-cta="1"]')
         if not safe_click(cta_el, "Place Order"):
@@ -2121,12 +2344,22 @@ class NovigGeoHarvester:
 
     async def refresh_geo_tx(self, timeout_s: float = 30.0,
                              headless: bool = False,
-                             amount: str = "10") -> bool:
-        """Drive the SPA to fire a /orders POST so the Tampermonkey
-        userscript captures a fresh PREWAGER geo_tx and POSTs it to
-        the local listener. Returns True iff a high-confidence,
-        post-start_ts capture lands in the cache within `timeout_s`
-        of the Place Order click."""
+                             amount: str = "10",
+                             place_bet: bool = True) -> bool:
+        """Drive the SPA through geolocation so the (Selenium-injected)
+        harvester captures a fresh PREWAGER geo_tx and POSTs it to the
+        local listener. Returns True iff a high-confidence, post-start_ts
+        capture lands in the cache within `timeout_s`.
+
+        place_bet=False (preferred): stop once geolocation completes, WITHOUT
+        placing the COIN bet, so the harvested token stays unconsumed and the
+        real aiohttp bet can spend it. place_bet=True (default, legacy): also
+        clicks Place Order — spends the token on a COIN bet, so the harvested
+        token is single-use-consumed and gets rejected on replay.
+
+        Note: Tampermonkey does NOT run under geckodriver, so we inject
+        the harvester ourselves (see _inject_harvester) after page load
+        and before driving the slip."""
         self.start_geo_listener()
         # Snapshot BEFORE invalidating: invalidate_geo_tx() clears
         # in-mem only, then the next get_cached_geo_meta() reloads off
@@ -2143,10 +2376,16 @@ class NovigGeoHarvester:
             ts = meta.get("ts") or 0
             if ts < start_ts:
                 return False
+            # Accept any capture whose confidence is at least that of the
+            # SPA's actual outbound /orders body (conf 8): xhr-req/fetch-req
+            # (8), the GeoComply geolocation RESULT via json-parse (elevated
+            # to 9 in _source_confidence), and any rc=2 PREWAGER tag (10).
+            # The SPA POSTs /orders via XHR, not fetch, so xhr-req — not
+            # fetch-req — is what fires; all carry the identical accepted
+            # token. proto-setter (now 2) is intentionally excluded — its
+            # value is rejected by /orders.
             src = meta.get("source") or ""
-            return (src.startswith("proto-setter")
-                    or src.startswith("fetch-req")
-                    or "rc=2" in src)
+            return self._source_confidence(src) >= 8
 
         def wait_for_page_ready(driver, timeout: float = 15.0) -> bool:
             from selenium.webdriver.common.by import By
@@ -2175,8 +2414,13 @@ class NovigGeoHarvester:
                 if not wait_for_page_ready(driver):
                     self._log("page never became ready; aborting")
                     return False
-                self._log(f"placing {amount} COIN bet ...")
-                r = self._place_coin_bet(driver, amount=amount)
+                # Tampermonkey won't run under geckodriver, so inject the
+                # harvester ourselves before triggering the geolocation.
+                self._inject_harvester(driver)
+                self._log(f"driving slip to geolocation "
+                          f"(amount={amount}, place_bet={place_bet}) ...")
+                r = self._place_coin_bet(driver, amount=amount,
+                                         place_bet=place_bet)
                 self._log(f"place: ok={r['ok']} step={r['step']!r} "
                           f"elapsed_ms={r.get('elapsed_ms')}")
                 for line in r["detail"]:

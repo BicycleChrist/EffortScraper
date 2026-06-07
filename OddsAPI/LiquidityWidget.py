@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QDoubleSpinBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread
-from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath
+from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath, QFontMetrics
 import asyncio
 import json
 import math
@@ -1876,6 +1876,14 @@ class OddsBarDelegate(QStyledItemDelegate):
         font_size = 10 if compact_mode else 16
         self._font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
         self._font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        # Metrics for the base font (built once) drive the fast "does it
+        # fit?" check; shrunk fonts are cached by point size so 4-digit
+        # odds (e.g. -9900) auto-fit a narrow ODDS column instead of
+        # clipping their last digit, without re-allocating per paint.
+        self._base_pt = font_size
+        self._fm = QFontMetrics(self._font)
+        self._shrunk_fonts: dict = {}
+        self._shrunk_fm: dict = {}
         # Color palette pre-built so paint() does no QColor allocation
         # in the hot path.
         self._ask_text = QColor("#f87171")
@@ -1883,6 +1891,25 @@ class OddsBarDelegate(QStyledItemDelegate):
         self._ask_bar = QColor(248, 113, 113)
         self._bid_bar = QColor(52, 211, 153)
         self._transparent = QColor(13, 15, 20, 0)
+
+    def _fontThatFits(self, text: str, avail_w: int):
+        """Return the base font, or the largest shrunk variant that fits
+        `text` within `avail_w` px. Fast path (the common 3-char odds)
+        does a single cached-metrics check and returns the base font."""
+        if avail_w <= 0 or self._fm.horizontalAdvance(text) <= avail_w:
+            return self._font
+        floor = max(7, self._base_pt - 6)
+        for size in range(self._base_pt - 1, floor - 1, -1):
+            fm = self._shrunk_fm.get(size)
+            if fm is None:
+                f = QFont(self._font)
+                f.setPointSize(size)
+                fm = QFontMetrics(f)
+                self._shrunk_fonts[size] = f
+                self._shrunk_fm[size] = fm
+            if fm.horizontalAdvance(text) <= avail_w:
+                return self._shrunk_fonts[size]
+        return self._shrunk_fonts.get(floor, self._font)
 
     def paint(self, painter: QPainter, option, index) -> None:
         odds = index.data(self.ODDS_ROLE)
@@ -1954,14 +1981,17 @@ class OddsBarDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
         # Odds text, left-aligned with the original horizontal padding.
+        # Auto-shrink the font when a long value (4-digit odds like -9900)
+        # wouldn't otherwise fit, so the last digit never gets clipped.
         text_pad = 2 if self.compact_mode else 8
         text_rect = rect.adjusted(text_pad, 0, -text_pad, 0)
+        odds_str = str(odds)
         painter.setPen(text_color)
-        painter.setFont(self._font)
+        painter.setFont(self._fontThatFits(odds_str, text_rect.width()))
         painter.drawText(
             text_rect,
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            str(odds),
+            odds_str,
         )
         painter.restore()
 
@@ -2411,6 +2441,10 @@ class OrderBookWidget(QWidget):
     # the middle, like the moneyline); every other strike collapses to its
     # best price per side under a single ALT LINES section.
     MAIN_LINE_DEPTH = 4   # offers shown per side on the featured main line
+    # Floor for the liquidity bar: any order that has real size behind it
+    # gets at least this much width so a small-but-real order ($19) still
+    # reads as a bar instead of a sliver hugging the odds text.
+    MIN_BAR_WIDTH = 14
 
     def _gridFromLines(self, sources, is_over_under):
         """Build the per-strike grid used by the multi-strike renderer.
@@ -2465,6 +2499,11 @@ class OrderBookWidget(QWidget):
                             label, label, o,
                             source_line_id=ln.source_line_id,
                             source=nm.source)
+                        # Skip dead quotes (Novig indicative top-of-book
+                        # carries $0 size) so the main-line / alt selection
+                        # ranks only takeable orders.
+                        if od.get("value", 0) <= 0:
+                            continue
                         if src_key is not None:
                             od["_source"] = src_key
                         entry["rows"].append(od)
@@ -2667,6 +2706,29 @@ class OrderBookWidget(QWidget):
                     if rows:
                         sections.append((label, rows))
 
+        # Single-strike team markets (moneyline / one-line spread): order
+        # each block by SECTION POSITION so both sides' best prices meet at
+        # the centre separator — the top team's best at the BOTTOM of its
+        # block, the lower team's best at the TOP. Sorting by |american|
+        # only landed the best at the separator when the favourite happened
+        # to be the upper block; with the favourite on the bottom it shoved
+        # its best price (e.g. CAR -102) to the very bottom and its worst
+        # (-175) to the top. Skipped for Over/Under and the multi-strike
+        # path, which arrange their own ordering.
+        if not is_over_under and not lead_header:
+            for _i, (_lbl, _rows) in enumerate(sections):
+                _rows.sort(key=lambda od: od["odds"], reverse=(_i != 0))
+
+        # Drop orders with no liquidity behind them — Novig's indicative
+        # top-of-book quote carries $0 size (a price you can't actually
+        # take), and on a thin/early market those are the "dead" rows that
+        # render as bar-less slivers. Keep the collapsed ALT LINES header,
+        # which is intentionally row-less.
+        sections = [(label, [o for o in rows if o.get("value", 0) > 0])
+                    for label, rows in sections]
+        sections = [(label, rows) for label, rows in sections
+                    if rows or "ALT LINES" in label]
+
         # clearSpans only — clearContents()/setRowCount(0) destroy pooled
         # cell widgets and force costly stylesheet reparses on rebuild.
         self.orderbook_table.clearSpans()
@@ -2691,8 +2753,8 @@ class OrderBookWidget(QWidget):
         self.orderbook_table.setRowCount(total_rows)
 
         total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
-        max_stake = max((o["value"] for _, rows in sections for o in rows
-                        if o["value"] > 0), default=1.0)
+        max_stake = self._barScaleReference(
+            o["value"] for _, rows in sections for o in rows)
 
         current_row = 0
         cumulative = 0.0
@@ -2984,6 +3046,29 @@ class OrderBookWidget(QWidget):
                 if rows:
                     sections.append((team_sym, rows))
 
+        # Single-strike team markets (moneyline / one-line spread): order
+        # each block by SECTION POSITION so both sides' best prices meet at
+        # the centre separator — the top team's best at the BOTTOM of its
+        # block, the lower team's best at the TOP. Sorting by |american|
+        # only landed the best at the separator when the favourite happened
+        # to be the upper block; with the favourite on the bottom it shoved
+        # its best price (e.g. CAR -102) to the very bottom and its worst
+        # (-175) to the top. Skipped for Over/Under and the multi-strike
+        # path, which arrange their own ordering.
+        if not is_over_under and not lead_header:
+            for _i, (_lbl, _rows) in enumerate(sections):
+                _rows.sort(key=lambda od: od["odds"], reverse=(_i != 0))
+
+        # Drop orders with no liquidity behind them — Novig's indicative
+        # top-of-book quote carries $0 size (a price you can't actually
+        # take), and on a thin/early market those are the "dead" rows that
+        # render as bar-less slivers. Keep the collapsed ALT LINES header,
+        # which is intentionally row-less.
+        sections = [(label, [o for o in rows if o.get("value", 0) > 0])
+                    for label, rows in sections]
+        sections = [(label, rows) for label, rows in sections
+                    if rows or "ALT LINES" in label]
+
         # clearSpans only — clearContents()/setRowCount(0) destroy pooled
         # cell widgets and force costly stylesheet reparses on rebuild.
         self.orderbook_table.clearSpans()
@@ -3006,8 +3091,8 @@ class OrderBookWidget(QWidget):
         self.orderbook_table.setRowCount(total_rows)
 
         total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
-        max_stake = max((o["value"] for _, rows in sections for o in rows
-                        if o["value"] > 0), default=1.0)
+        max_stake = self._barScaleReference(
+            o["value"] for _, rows in sections for o in rows)
 
         current_row = 0
         cumulative = 0.0
@@ -3089,6 +3174,23 @@ class OrderBookWidget(QWidget):
         self.orderbook_table.setSpan(row, 0, 1, colspan)
         self.orderbook_table.setRowHeight(row, row_height)
 
+    @staticmethod
+    def _barScaleReference(values, pct: float = 0.90) -> float:
+        """Reference size the liquidity bars scale against.
+
+        Scaling to the raw max lets a single whale / stale order flatten
+        every other bar to a sliver, and makes the whole ladder jump each
+        time that order enters or leaves the view on a live tick (the
+        "bars get small" flicker). Scaling to a high percentile instead
+        keeps ordinary orders readable and simply lets outliers cap at
+        full width, so the scale barely moves between ticks."""
+        vals = sorted(v for v in values if v and v > 0)
+        if not vals:
+            return 1.0
+        idx = min(len(vals) - 1, int(pct * (len(vals) - 1)))
+        ref = vals[idx]
+        return ref if ref > 0 else vals[-1]
+
     def renderOrderRow(self, row: int, order: Dict, max_stake: float, cumulative: float, total_liquidity: float):
         """Render a single order book row with team/selection, odds, liquidity, cumulative, and percentage"""
         display_name = order.get('displayName', order.get('abbreviatedName', '---'))
@@ -3110,8 +3212,16 @@ class OrderBookWidget(QWidget):
         # Determine if this is a favorite (negative odds) or underdog (positive odds)
         side_type = 'bid' if odds_value < 0 else 'ask'
 
-        # Calculate liquidity bar width (0-100%)
-        bar_width = int((value / max_stake) * 100) if max_stake > 0 else 0
+        # Calculate liquidity bar width (0-100%). Clamp because the scale
+        # is a percentile, so orders above it exceed 100% and should just
+        # fill the bar. Floor any order with real size at MIN_BAR_WIDTH so
+        # small orders stay readable; only true $0 dead quotes (already
+        # filtered out upstream) get no bar.
+        if value > 0 and max_stake > 0:
+            bar_width = max(self.MIN_BAR_WIDTH,
+                            min(100, int((value / max_stake) * 100)))
+        else:
+            bar_width = 0
 
         # Calculate percentage of total book
         percentage = (value / total_liquidity * 100) if total_liquidity > 0 else 0
@@ -3635,6 +3745,17 @@ class ProphetXBrowser(QWidget):
         self.compact_mode = compact_mode
         self._initial_load_complete = False
         self._pending_fresh_fetch = False
+        # Orderbook reveal gating: for an event that has a Novig match the
+        # book arrives in stages (PX render -> match-map dual re-render ->
+        # async NV /book/batch depth), each restructuring/resizing the
+        # table. We keep the loading overlay up across that build so the
+        # user sees only the finished book. _reveal_gen tokenises the
+        # in-flight gate so a stale fallback timer can't hide a newer load.
+        self._reveal_gen = 0
+        # Content signature of the last NV book actually painted, so the
+        # 20s /book/batch refresh only re-renders (and re-scales the bars)
+        # when the Novig side genuinely moved. Reset on market change.
+        self._last_nv_render_sig = None
         # State for the refresh-time diff in _refreshMarketSelector:
         #   _last_market_name_order: names in the order they currently
         #     occupy the combo, so we can detect structure changes and
@@ -4240,6 +4361,32 @@ class ProphetXBrowser(QWidget):
         self._initial_load_complete = True
         self.loading_state_changed.emit(False)
 
+    def _gateOrderbookReveal(self):
+        """Reveal the freshly-rendered orderbook only once it has settled
+        into its FINAL form, so the post-data rebuild/resize (match-map
+        dual render + collapsed alt-line config + async NV depth) happens
+        behind the loading overlay instead of on screen.
+
+        For a Novig-matched event the reveal is driven by the NV book
+        landing (_onNovigBooksReady), with a grace-period fallback in case
+        the book fetch is empty/slow. PX-only events have no async second
+        act, so they reveal immediately."""
+        self._reveal_gen += 1
+        eid = str(self.current_event_id or "")
+        has_match = bool(self._novig_event_map and eid in self._novig_event_map)
+        if not has_match:
+            self.hideLoading()
+            return
+        gen = self._reveal_gen
+        QTimer.singleShot(2000, lambda g=gen: self._revealIfCurrent(g))
+
+    def _revealIfCurrent(self, gen: int):
+        """Hide the overlay iff this is still the active load (no newer
+        selection has superseded it) and we're actually still loading."""
+        if gen == self._reveal_gen and getattr(self.orderbook, "is_loading",
+                                               False):
+            self.hideLoading()
+
     def populateEventList(self):
         """Populate event list from loaded data"""
         self.filtered_events = []
@@ -4746,6 +4893,10 @@ class ProphetXBrowser(QWidget):
 
         self._current_px_norm = px_norm
         nv_norm = market_pair.market_b if market_pair is not None else None
+        # New market on screen — drop the NV render signature so the first
+        # /book/batch result for it always paints (rather than being
+        # diffed against the previous market's book).
+        self._last_nv_render_sig = None
         # Render immediately with whatever Novig depth is currently
         # cached on the matched NV market (dump-level top-of-book).
         self.orderbook.setMarketDual(px_norm, nv_norm)
@@ -4880,9 +5031,29 @@ class ProphetXBrowser(QWidget):
             raw=raw_bundle,
         )
         # Replace in the live MarketPair so subsequent renders see the
-        # fresh depth.
+        # fresh depth (data model stays current even when we skip the paint).
         mp.market_b = refreshed
-        self.orderbook.setMarketDual(self._current_px_norm, refreshed)
+
+        # Only repaint when the NV side actually moved — the /book/batch
+        # refresh fires every ~20s, and re-rendering an unchanged book just
+        # rebuilds the table and re-scales every bar for nothing (the flicker
+        # / "bars jump" on a quiet market). Signature = per-line, per-side
+        # (american, size) tuples.
+        sig = tuple(
+            (ln.strike,
+             tuple((s.label,
+                    tuple((o.american, round(o.size_usd, 1)) for o in s.orders))
+                   for s in ln.sides))
+            for ln in new_lines)
+        if sig != self._last_nv_render_sig:
+            self._last_nv_render_sig = sig
+            self.orderbook.setMarketDual(self._current_px_norm, refreshed)
+
+        # If a load was gated waiting on this NV depth, reveal now that the
+        # book is in its final form (deferred a tick so the paint lands
+        # first). Harmless no-op on the periodic 20s refresh ticks.
+        if getattr(self.orderbook, "is_loading", False):
+            QTimer.singleShot(0, self.hideLoading)
 
     def updateEventMarkets(self, markets_data: Dict):
         """
@@ -4957,7 +5128,10 @@ class ProphetXBrowser(QWidget):
         # actually moved between refreshes.
         self._refreshMarketSelector(prev_selected_name=current_market_name,
                                     force_orderbook_render=False)
-        self.hideLoading()
+        # Keep the overlay up until the dual book + NV depth finish
+        # building (see _gateOrderbookReveal) so the user doesn't watch
+        # the table rebuild/resize after data lands.
+        self._gateOrderbookReveal()
 
     def refreshData(self):
         """Refresh data from ProphetX API"""

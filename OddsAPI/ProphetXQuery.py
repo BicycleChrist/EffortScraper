@@ -340,9 +340,9 @@ def _px_kick_playwright_refresh() -> None:
         global _px_playwright_in_flight
         try:
             print("[prophetx_token] extend-session unrecoverable — "
-                  "launching Playwright login (complete OTP in the "
-                  "browser window)")
-            refresh_prophetx_token(headless=False)
+                  "launching headless Playwright login (OTP will be "
+                  "requested via in-app dialog)")
+            refresh_prophetx_token(headless=True)
         except Exception as e:
             print(f"[prophetx_token] Playwright refresh failed: {e}")
         finally:

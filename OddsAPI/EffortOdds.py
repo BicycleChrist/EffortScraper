@@ -1,9 +1,32 @@
+# ── Debug / verbose-output switch ──────────────────────────────────────
+# Master toggle for the app's verbose stdout logging. The worker modules
+# (odds / prophetx / polymarket / kalshi loaders, the league dump, the
+# per-game and per-token loops, etc.) print large volumes to stdout during
+# startup — hundreds of synchronous writes that hold the GIL and stalled
+# the ticker by 100-400ms. With DEBUG = False we install a process-wide
+# gate that drops those stdout prints; flip to True to restore the full
+# diagnostic firehose.
+#
+# Only plain stdout print() is gated. Anything sent to a file/stream
+# explicitly — print(..., file=sys.stderr) — passes through untouched, and
+# exceptions / traceback.print_exc() (stderr) are never affected, so real
+# errors still surface even with DEBUG off.
+DEBUG = False
+
+import builtins as _builtins
+_real_print = _builtins.print  # kept so internal diagnostics (e.g. the loop-lag monitor) can bypass the gate
+def _gated_print(*args, **kwargs):
+    if DEBUG or kwargs.get("file") is not None:
+        _real_print(*args, **kwargs)
+_builtins.print = _gated_print
+# ───────────────────────────────────────────────────────────────────────
+
 import pathlib
 from datetime import datetime, timezone
 import aiohttp
 import json
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPointF, pyqtProperty, QThread
-from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath
+from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPointF, pyqtProperty, QThread, QUrl
+from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QIcon, QFont, QFontMetrics, QLinearGradient, QRadialGradient, QPainterPath, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -73,6 +96,13 @@ class LeagueTabData:
         self.bookmakers = []
         self.previous_data = {}
         self.game_status = {}
+        # Betslip deep-links (from the Odds API includeLinks flag):
+        #   cell_links[(row_label, bm_title)]    -> outcome betslip link (auto-populates a slip)
+        #   bookmaker_links[(game_id, bm_title)] -> event-page link (fallback when no outcome link)
+        # bookmaker_links MUST be keyed by game too: a book's event link differs
+        # per game, so keying by title alone makes every game share the last one.
+        self.cell_links = {}
+        self.bookmaker_links = {}
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -292,6 +322,7 @@ class ModernOddsWindow(QMainWindow):
         self.selected_region = "us" # default region should always be a string
 
         self.icon_frame = 0
+        self._icon_cache = {}  # frame index -> decoded QIcon; avoids re-reading PNG from disk every tick
         self.icon_timer = QTimer(self)
         self.icon_timer.setSingleShot(False)
         self.icon_timer.timeout.connect(self.UpdateIcon)
@@ -300,10 +331,15 @@ class ModernOddsWindow(QMainWindow):
         self.status_timer.timeout.connect(self._update_game_statuses)
         self.status_timer.start(600000) # 10 minutes - makes a request to fetch scores
 
+    # God speed AC
     def UpdateIcon(self):
-        framesdir = pathlib.Path(__file__).parent / "appicon_frames"
-        next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
-        self.setWindowIcon(QIcon(str(next_icon)))
+        icon = self._icon_cache.get(self.icon_frame)
+        if icon is None:
+            framesdir = pathlib.Path(__file__).parent / "appicon_frames"
+            next_icon = framesdir / f"frame{str(self.icon_frame).zfill(3)}.png"
+            icon = QIcon(str(next_icon))
+            self._icon_cache[self.icon_frame] = icon
+        self.setWindowIcon(icon)
         self.icon_frame = ((self.icon_frame + 1) % 200)
         #print(next_icon)
 
@@ -579,8 +615,10 @@ class ModernOddsWindow(QMainWindow):
         self.prediction_markets_worker.data_ready.connect(self.ticker_tape.add_prediction_markets)
         self.prediction_markets_worker.error_occurred.connect(self.handle_prediction_markets_error)
         self.prediction_markets_worker.status_update.connect(self.handle_prediction_markets_status)
-        # Delay prediction markets to let RSS feeds fetch first (they're much faster)
-        QTimer.singleShot(5000, self.prediction_markets_worker.start)  # 5 second delay
+        # Delay prediction markets to let RSS feeds fetch first (they're much faster).
+        # Pushed to 8s as part of startup staggering so the Polymarket scrape doesn't
+        # land in the same window as the news fetch (6s) — see startup-stagger notes.
+        QTimer.singleShot(8000, self.prediction_markets_worker.start)
 
         # Horizontal splitter for action buttons/search (left) and streaming widget (right)
         controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -628,36 +666,8 @@ class ModernOddsWindow(QMainWindow):
         action_buttons_layout.addStretch()
         controls_layout.addWidget(action_buttons_widget)
 
-        # Add search bar below action buttons
-        search_container = QWidget()
-        search_container_layout = QHBoxLayout(search_container)
-        search_container_layout.setContentsMargins(0, 0, 0, 0)
-        search_container_layout.setSpacing(0)
-
-        self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Filter odds table (team names, markets, etc.)")
-        self.search_bar.setStyleSheet("""
-            QLineEdit {
-                background-color: #f8f9fa;
-                border: 1px solid #dee2e6;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 10pt;
-                color: #495057;
-            }
-            QLineEdit:focus {
-                border-color: #007bff;
-                background-color: white;
-                outline: 0;
-                box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
-            }
-        """)
-        self.search_bar.setFixedHeight(28)
-        self.search_bar.setMaximumWidth(500)
-        search_container_layout.addWidget(self.search_bar)
-        search_container_layout.addStretch()
-
-        controls_layout.addWidget(search_container)
+        # NOTE: the odds-table filter bar lives in the tab widget's top-right
+        # corner now (see self.tab_widget setup below) to reclaim vertical space.
 
         # Add controls container to left side of splitter
         controls_streaming_splitter.addWidget(controls_container)
@@ -686,6 +696,34 @@ class ModernOddsWindow(QMainWindow):
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
         self.tab_widget = QTabWidget()
+
+        # Odds-table filter bar. Rather than consuming a row above the table or
+        # riding the tab bar, it's overlaid onto the current table's horizontal
+        # header, hovering at the right edge of the "Market/Outcome" section.
+        # Its geometry is kept in sync by _reposition_search_bar(), driven by
+        # header resize/scroll signals and tab changes (see _attach_search_to_header).
+        self._search_target_width = 240   # desired bar width inside section 0
+        self._wired_headers = set()       # headers we've already hooked up
+        self._current_header = None       # header the bar is currently parented to
+        self.search_bar = QLineEdit(self.tab_widget)
+        self.search_bar.setPlaceholderText("Filter odds table…")
+        self.search_bar.setClearButtonEnabled(True)
+        self.search_bar.setStyleSheet("""
+            QLineEdit {
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 1px 6px;
+                font-size: 9pt;
+                color: #495057;
+            }
+            QLineEdit:focus {
+                border-color: #007bff;
+                background-color: white;
+                outline: 0;
+            }
+        """)
+        self.search_bar.hide()  # shown once a table exists to host it
 
         # Create the team news widget first
         self.team_news_widget = TeamNewsWidget()
@@ -830,28 +868,58 @@ class ModernOddsWindow(QMainWindow):
         # a 10-COIN bet, captures the fresh PREWAGER tx. Runs concurrent
         # with the rest of EffortOdds startup so the UI is interactive
         # immediately; takes ~25-30s wall-time. Best-effort — if it
-        # fails (no userscript, no Firefox profile, network down) we
-        # fall back to whatever's already on disk and let the
-        # in-flight 400-retry path handle expiry later.
+        # fails (no userscript, no Firefox profile, network down) the cache
+        # is empty (we purge it below), so the first place's 400-retry path
+        # drives the refresh on demand instead.
         try:
             from NovigClient import geo_harvester
             geo_harvester.start_geo_listener()
+            # Drop any token persisted from a previous run before anything can
+            # read it. A PREWAGER geo_tx is session-bound, so a carried-over
+            # token is always stale and /orders rejects it. Purging up front
+            # means the worst case is one 400 → refresh on first place; the
+            # startup refresh below normally mints a fresh one well before then.
+            geo_harvester.clear_geo_cache()
 
             def _bg_refresh():
                 import asyncio as _asyncio
                 try:
+                    # place_bet=False: stop at geolocation, don't place a COIN
+                    # bet — leaves the harvested token unconsumed for the real
+                    # bet to spend (PREWAGER model).
                     ok = _asyncio.run(
                         geo_harvester.refresh_geo_tx(
-                            headless=True, timeout_s=30.0))
+                            headless=True, timeout_s=30.0, place_bet=False))
                     print(f"[novig] startup geo refresh: "
                           f"{'OK' if ok else 'FAIL'}")
                 except Exception as ex:
                     print(f"[novig] startup geo refresh crashed: {ex}")
 
+            # Startup staggering: the headless Firefox launch is the single
+            # biggest startup stall (~0.5s of GIL/subprocess contention). It's
+            # a 25-30s best-effort job with on-disk fallback, so nothing needs
+            # it in the first few seconds. Defer the thread start by 4s so the
+            # window paints and the ticker starts scrolling before Firefox
+            # spawns. The HTTP listener above stays immediate (it's cheap).
             import threading as _threading
-            _threading.Thread(target=_bg_refresh,
-                              name="novig-startup-geo-refresh",
-                              daemon=True).start()
+            def _start_geo_refresh_thread():
+                _threading.Thread(target=_bg_refresh,
+                                  name="novig-startup-geo-refresh",
+                                  daemon=True).start()
+            # [PERF-DIAG] Temporarily disabled while triaging the OTHER startup
+            # stutters. The in-process Selenium geo-harvest hogs the GIL for
+            # ~11-30s and masks every other offender in the watchdog dumps
+            # (confirmed root cause — see PERF_DIAGNOSTICS.md). The listener +
+            # cache above stay live, so tokens from the real everyday Firefox
+            # still flow; only the headless Selenium drive is skipped. Worst
+            # case: first Novig single-bet hits the 400 → on-demand refresh path.
+            # Flip back to True (or delete this gate) to restore startup pre-mint.
+            DIAG_STARTUP_GEO_REFRESH = False
+            if DIAG_STARTUP_GEO_REFRESH:
+                QTimer.singleShot(4000, _start_geo_refresh_thread)
+            else:
+                print("[novig] startup geo refresh DISABLED (DIAG) — "
+                      "on-demand refresh still active on first 400")
         except Exception as e:
             print(f"[novig] couldn't start geo listener: {e}")
 
@@ -1156,6 +1224,8 @@ class ModernOddsWindow(QMainWindow):
                 if current_table and isinstance(current_table, QTableWidget):
                     for row in range(current_table.rowCount()):
                         current_table.setRowHidden(row, False)
+                # Move the filter bar onto the now-current tab's header.
+                self._attach_search_to_header(current_table)
 
     def create_league_tab(self, league_name, sport_key, selected_markets=None):
         """Create a new tab for a league with specific markets"""
@@ -1169,11 +1239,15 @@ class ModernOddsWindow(QMainWindow):
 
             # Connect selection signal for the new table
             table_widget.itemSelectionChanged.connect(self.on_market_selection_changed)
+            # Double-click a cell to open that book's betslip deep-link
+            table_widget.cellDoubleClicked.connect(self.on_odds_cell_double_clicked)
 
             self.tab_widget.addTab(table_widget, tab_id)
             self.league_tabs[tab_id] = tab_data
             self.current_league = tab_id
             self.tab_widget.setCurrentIndex(self.tab_widget.count() - 1)
+            # Dock the filter bar onto the new table's header.
+            self._attach_search_to_header(table_widget)
         return self.league_tabs[tab_id]
 
 
@@ -1212,11 +1286,13 @@ class ModernOddsWindow(QMainWindow):
         home_team = odds.get('home_team', 'Unknown')
         away_team = odds.get('away_team', 'Unknown')
 
-        # Collect bookmaker names
+        # Collect bookmaker names and event-page links (fallback betslip target)
         for bm in odds['bookmakers']:
             bm_title = bm['title']
             if bm_title not in tab_data.bookmakers:
                 tab_data.bookmakers.append(bm_title)
+            if bm.get('link'):
+                tab_data.bookmaker_links[(game_id, bm_title)] = bm['link']
 
         # Add a header row for the game if it doesn't exist
         game_header = f"Game: {home_team} vs {away_team}"
@@ -1245,6 +1321,10 @@ class ModernOddsWindow(QMainWindow):
                         tab_data.table_data[unique_label] = {'game_id': game_id}
                     tab_data.table_data[unique_label][bm_title] = price
 
+                    # Stash the outcome's betslip deep-link for this cell (may be None)
+                    if outcome.get('link'):
+                        tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
+
         self.update_table_display(tab_data)
 
 
@@ -1261,6 +1341,11 @@ class ModernOddsWindow(QMainWindow):
         if current_cols != expected_cols:
             table.setColumnCount(expected_cols)
             table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
+            # Left-align the first header label so the docked filter bar (which
+            # sits at the right of this section) never covers a centered label.
+            hdr0 = table.horizontalHeaderItem(0)
+            if hdr0 is not None:
+                hdr0.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         expected_rows = len(tab_data.table_rows)
         if current_rows != expected_rows:
@@ -1318,6 +1403,15 @@ class ModernOddsWindow(QMainWindow):
                     table.setItem(row_idx, col_idx, item)
                     needs_resize = True
 
+                # Attach the betslip deep-link for double-click handling. Prefer
+                # the outcome-specific link (auto-populates a slip); fall back to
+                # the bookmaker's event page (keyed per game) otherwise.
+                link = (tab_data.cell_links.get((row_label, bm))
+                        or tab_data.bookmaker_links.get((game_id, bm)))
+                item.setData(Qt.ItemDataRole.UserRole, link)
+                if link and current_value:
+                    item.setToolTip("Double-click to open betslip")
+
                 # Only update if value has changed
                 if current_value != previous_value and previous_value is not None:
                     item.setText(current_value)
@@ -1365,6 +1459,29 @@ class ModernOddsWindow(QMainWindow):
         if needs_resize:
             table.resizeColumnsToContents()
             table.resizeRowsToContents()
+
+        # Guarantee section 0 is wide enough for the label + docked filter bar,
+        # then snap the bar into place (covers tabs whose contents are narrow,
+        # e.g. KBO team names, where resizeColumnsToContents would shrink it).
+        self._ensure_market_column_width(table)
+        if table is self.tab_widget.currentWidget():
+            self._reposition_search_bar()
+
+
+    def _ensure_market_column_width(self, table):
+        """Widen the 'Market/Outcome' column if needed so the left-anchored
+        label and the right-docked filter bar both fit without overlapping."""
+        if not isinstance(table, QTableWidget) or table.columnCount() == 0:
+            return
+        header = table.horizontalHeader()
+        # Keep the label hugging the left edge so it stays clear of the bar.
+        hdr0 = table.horizontalHeaderItem(0)
+        if hdr0 is not None:
+            hdr0.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        # label reserve + gap + bar width + left/right margins
+        min_w = self._market_label_reserve(header) + 24 + self._search_target_width + 12
+        if table.columnWidth(0) < min_w:
+            table.setColumnWidth(0, int(min_w))
 
 
     def toggle_auto_update(self):
@@ -1524,6 +1641,23 @@ class ModernOddsWindow(QMainWindow):
         else:
             print("No consolidated odds data available for best lines calculation.")
 
+
+    def on_odds_cell_double_clicked(self, row, col):
+        """Double-click an odds cell to open the bookmaker's betslip deep-link."""
+        table = self.sender()
+        if not isinstance(table, QTableWidget):
+            return
+        # Column 0 is the market/outcome label, not a bookmaker price.
+        if col < 1:
+            return
+        item = table.item(row, col)
+        if item is None:
+            return
+        link = item.data(Qt.ItemDataRole.UserRole)
+        if link:
+            QDesktopServices.openUrl(QUrl(link))
+        else:
+            self.statusBar().showMessage("No betslip link available for this cell", 3000)
 
     def on_market_selection_changed(self):
         """Handle market selection in the odds table"""
@@ -1690,7 +1824,9 @@ class ModernOddsWindow(QMainWindow):
                         session,
                         game_id,
                         available_markets,
-                        region=selected_region
+                        region=selected_region,
+                        include_links=True,   # outcome betslip deep-links (double-click to open)
+                        include_sids=True,
                     )
 
                     if odds is None:
@@ -1735,6 +1871,8 @@ class ModernOddsWindow(QMainWindow):
                     for bm in odds.get('bookmakers', []):
                         bm_title = bm['title']
                         bookmakers_seen.add(bm_title)
+                        if bm.get('link'):
+                            tab_data.bookmaker_links[(game_id, bm_title)] = bm['link']
 
                         # Add to consolidated data for best lines widget
                         if bm_title not in bookmakers_map:
@@ -1769,6 +1907,10 @@ class ModernOddsWindow(QMainWindow):
                                 # Update price
                                 price = self.format_price(outcome)
                                 new_table_data[unique_label][bm_title] = price
+
+                                # Stash the outcome's betslip deep-link for this cell
+                                if outcome.get('link'):
+                                    tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
 
                 # Store the consolidated data for the best lines widget
                 self.consolidated_odds_data = consolidated_odds_data
@@ -1966,6 +2108,11 @@ class ModernOddsWindow(QMainWindow):
          if table.columnCount() != expected_cols:
              table.setColumnCount(expected_cols)
              table.setHorizontalHeaderLabels(["Market/Outcome"] + tab_data.bookmakers)
+             # Left-align the first header label so the docked filter bar (which
+             # sits at the right of this section) never covers a centered label.
+             hdr0 = table.horizontalHeaderItem(0)
+             if hdr0 is not None:
+                 hdr0.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
          expected_rows = len(tab_data.table_rows)
          if table.rowCount() != expected_rows:
@@ -2008,6 +2155,13 @@ class ModernOddsWindow(QMainWindow):
                      table.setItem(row_idx, col_idx, item)
                  else:
                      item.setText(current_value)
+
+                 # Attach the betslip deep-link (outcome link, else event page per game)
+                 link = (tab_data.cell_links.get((row_label, bm))
+                         or tab_data.bookmaker_links.get((game_id, bm)))
+                 item.setData(Qt.ItemDataRole.UserRole, link)
+                 if link and current_value:
+                     item.setToolTip("Double-click to open betslip")
 
                  # Check if this cell has changed
                  if row_label in changes and bm in changes[row_label]:
@@ -2114,6 +2268,83 @@ class ModernOddsWindow(QMainWindow):
 
             # Show/hide row based on match
             current_table.setRowHidden(row, not match_found)
+
+    def _attach_search_to_header(self, table=None):
+        """Parent the filter bar onto the given (or current) table's header and
+        keep it positioned over the 'Market/Outcome' section. Hooks the header's
+        resize/scroll signals once so the overlay tracks the section geometry."""
+        if not hasattr(self, 'search_bar'):
+            return
+        if table is None:
+            table = self.tab_widget.currentWidget()
+        if not isinstance(table, QTableWidget):
+            # No real table to host the bar (e.g. empty/placeholder tab)
+            self._current_header = None
+            self.search_bar.hide()
+            return
+
+        header = table.horizontalHeader()
+        self._current_header = header
+        if self.search_bar.parent() is not header:
+            self.search_bar.setParent(header)
+
+        # Wire each header exactly once so we don't stack duplicate connections.
+        if header not in self._wired_headers:
+            header.sectionResized.connect(self._reposition_search_bar)
+            header.geometriesChanged.connect(self._reposition_search_bar)
+            header.installEventFilter(self)
+            sb = table.horizontalScrollBar()
+            if sb is not None:
+                sb.valueChanged.connect(self._reposition_search_bar)
+            self._wired_headers.add(header)
+
+        self.search_bar.show()
+        self._reposition_search_bar()
+
+    def _market_label_reserve(self, header):
+        """Pixel width to reserve at the left of section 0 for the
+        'Market/Outcome' label so the filter bar never overlaps it."""
+        fm = QFontMetrics(header.font())
+        # +16 covers the header's 4px stylesheet padding on each side plus slack.
+        return fm.horizontalAdvance("Market/Outcome") + 16
+
+    def _reposition_search_bar(self, *args):
+        """Right-align the filter bar inside header section 0, but never let it
+        intrude on the left-anchored 'Market/Outcome' label. If the section is
+        too narrow to hold both, the bar hides rather than covering the label."""
+        header = self._current_header
+        if header is None or self.search_bar.parent() is not header:
+            return
+        if header.count() <= 0:
+            return
+
+        section_x = header.sectionViewportPosition(0)
+        section_w = header.sectionSize(0)
+        margin = 6
+        gap = 24  # breathing room between label and bar
+
+        right_edge = section_x + section_w - margin
+        left_edge = section_x + self._market_label_reserve(header) + gap
+        avail = right_edge - left_edge
+
+        # Not enough room for a usable bar without covering the label → hide it.
+        if avail < 60:
+            self.search_bar.hide()
+            return
+
+        bar_w = min(self._search_target_width, avail)
+        bar_h = max(16, header.height() - 6)
+        bar_x = right_edge - bar_w
+        bar_y = (header.height() - bar_h) // 2
+        self.search_bar.setGeometry(bar_x, bar_y, bar_w, bar_h)
+        self.search_bar.show()
+        self.search_bar.raise_()
+
+    def eventFilter(self, obj, event):
+        # Reposition the filter bar when its host header is resized.
+        if event.type() == QEvent.Type.Resize and obj in self._wired_headers:
+            self._reposition_search_bar()
+        return super().eventFilter(obj, event)
 
     def handle_prediction_markets_error(self, error_message):
         """Handle errors from prediction markets worker"""
@@ -2400,8 +2631,77 @@ def main():
     window.show()
     loop.create_task(window.initialize())
 
-    app.dumpObjectTree()
-    app.dumpObjectInfo()
+    # ╔══ [PERF-DIAG] Temporary UI-stutter instrumentation ════════════════╗
+    # Catalogued in OddsAPI/PERF_DIAGNOSTICS.md. Grep "[PERF-DIAG]" to find
+    # every diagnostic block in the codebase; ALL of them are deletable once
+    # the ticker stutter is root-caused and fixed.
+    #
+    # (1) event-loop lag monitor — reports *that* the shared qasync loop
+    #     stalled, but only after it unblocks (the offending call is already
+    #     off the stack by the time this logs). Good for spotting frequency.
+    import time as _time
+    async def _loop_lag_monitor(threshold_ms=100, interval=0.05):
+        while True:
+            t0 = _time.perf_counter()
+            await asyncio.sleep(interval)
+            late_ms = (_time.perf_counter() - t0 - interval) * 1000
+            if late_ms > threshold_ms:
+                # bypass the DEBUG gate so lag readings show regardless
+                _real_print(f"[loop-lag] blocked {late_ms:.0f}ms @ {_time.strftime('%H:%M:%S')}")
+    loop.create_task(_loop_lag_monitor())
+
+    # (2) main-loop watchdog — reports *where* the loop stalled. A heartbeat
+    #     coroutine refreshes a timestamp every 20ms while the loop is healthy;
+    #     an independent OS thread (NOT a QThread, so it keeps running while the
+    #     main thread is parked) watches that timestamp and, the moment it goes
+    #     stale past the threshold, dumps every thread's Python stack mid-stall.
+    #       • MainThread deep in app code (e.g. resizeRowsToContents / pandas
+    #         .at fill)            → synchronous main-loop burst   (Tier-1 fix)
+    #       • MainThread idle in select/poll while a worker thread is busy in
+    #         json/parse           → GIL contention from that worker (Tier-3 fix)
+    #     faulthandler is C-level and dumps all threads regardless of who holds
+    #     the GIL (CPython releases it every ~5ms, so this thread gets scheduled).
+    import faulthandler as _faulthandler
+    import threading as _threading
+    import sys as _sys
+    # Stacks go to a DEDICATED file (not stderr) so they're always captured no
+    # matter how the app is launched — no 2>&1 needed. faulthandler writes via
+    # the raw fd so it lands on disk immediately; line-buffered text mode keeps
+    # the headline ordered with it. Read OddsAPI/stutter_dumps.txt after a run.
+    _wd_path = pathlib.Path(__file__).parent / "stutter_dumps.txt"
+    _wd_file = open(_wd_path, "a", buffering=1)
+    _real_print(f"[watchdog] stall stacks → {_wd_path}")
+    _wd = {"beat": _time.monotonic()}            # dict cell: shared, no nonlocal
+    async def _wd_heartbeat(interval=0.02):
+        while True:
+            _wd["beat"] = _time.monotonic()
+            await asyncio.sleep(interval)
+    def _wd_watch(threshold=0.12, poll=0.02):
+        dumped = False                           # de-dupe: one dump per stall
+        while True:
+            _time.sleep(poll)
+            lag = _time.monotonic() - _wd["beat"]
+            if lag > threshold:
+                if not dumped:
+                    _real_print(
+                        f"\n[watchdog] main loop blocked {lag*1000:.0f}ms @ "
+                        f"{_time.strftime('%H:%M:%S')} — all-thread stacks below:",
+                        file=_wd_file, flush=True)
+                    _faulthandler.dump_traceback(file=_wd_file, all_threads=True)
+                    _wd_file.flush()
+                    # Brief echo to stdout so it's obvious in the console too.
+                    _real_print(f"[watchdog] {lag*1000:.0f}ms stall — stack written "
+                                f"to stutter_dumps.txt")
+                    dumped = True
+            else:
+                dumped = False
+    loop.create_task(_wd_heartbeat())
+    _threading.Thread(target=_wd_watch, daemon=True, name="loop-watchdog").start()
+    # ╚════════════════════════════════════════════════════════════════════╝
+
+    if DEBUG:
+        app.dumpObjectTree()
+        app.dumpObjectInfo()
 
     # Run the event loop (handles both Qt and asyncio)
     with loop:
