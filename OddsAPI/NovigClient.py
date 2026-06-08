@@ -47,6 +47,30 @@ NOVIG_NBX_BASE = "https://api.novig.us/nbx/v1"
 # Novig data uniformly.
 NOVIG_DUMP_DIR = pathlib.Path(__file__).parent / "novig_dumps"
 
+# Slim companion to all_events_combined_latest.json: per-event metadata only
+# (no market/outcome subtrees). The 48MB full dump parses in ~122ms (GIL-held)
+# but the startup match-map build only needs event identity to pair PX↔NV — the
+# markets are 99% of the bytes and are needed only for the handful of events the
+# user actually opens (lazy-hydrated then). This index is ~0.5MB / ~2ms to parse,
+# so reading it instead of the full dump removes the startup stutter. The full
+# dump is still written for the lazy per-event hydration path. (see
+# PERF_DIAGNOSTICS.md / project memory on the LiquidityWidget dump parse)
+NOVIG_EVENTS_INDEX_NAME = "events_index_latest.json"
+
+
+def write_events_index(dump: dict, dump_dir: pathlib.Path) -> None:
+    """Write the slim event-metadata index alongside the full combined dump.
+    Mirrors the dump's {event_id: {...}} keying so a reader can pair PX↔NV
+    on identity without materializing any market subtrees. Atomic temp+replace
+    so a concurrent match-map read never sees a half-written file."""
+    index = {eid: {"event_metadata": (entry or {}).get("event_metadata")}
+             for eid, entry in dump.items()}
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    out = dump_dir / NOVIG_EVENTS_INDEX_NAME
+    tmp = dump_dir / (NOVIG_EVENTS_INDEX_NAME + ".tmp")
+    tmp.write_text(json.dumps(index, default=str))
+    tmp.replace(out)
+
 # qty values on NBX orderbook entries are in cents/centi-units. Display = qty/100.
 # Verified against site UI:
 #   COIN bid qty=950000 price=0.822 -> 9500 display, opposite takeable 1691 COIN
@@ -111,6 +135,35 @@ class NovigClient:
         """
         if not market_ids:
             return []
+
+        # The NBX origin (CloudFront) rejects long request URIs with 414 — a
+        # ~132-id batch (query string ~5.2KB) already trips it, which bites on
+        # outlier events like an NBA-finals slate (500+ markets). Chunk by a
+        # conservative URL-byte budget so NO caller can 414, then aggregate.
+        # Each id is a 36-char UUID + a 3-byte encoded comma; keep the query
+        # string well under the limit. Callers no longer need to pre-chunk
+        # (NovigMarketBookWorker / _fetch_books_for_event still may; their
+        # smaller batches just pass through as a single request here).
+        _MAX_QS_BYTES = 3500
+        if len(market_ids) > 1:
+            batches: list[list[str]] = []
+            cur: list[str] = []
+            cur_len = 0
+            for mid in market_ids:
+                add = len(mid) + 3  # id + encoded "%2C" separator
+                if cur and cur_len + add > _MAX_QS_BYTES:
+                    batches.append(cur)
+                    cur, cur_len = [], 0
+                cur.append(mid)
+                cur_len += add
+            if cur:
+                batches.append(cur)
+            if len(batches) > 1:
+                out: list[dict] = []
+                for b in batches:
+                    out.extend(self.get_market_books(b, currency=currency))
+                return out
+
         url = f"{NOVIG_NBX_BASE}/markets/book/batch"
         params = {"marketIds": ",".join(market_ids), "currency": currency}
         # NBX rejects requests with Content-Type set on a GET; build a clean
@@ -608,6 +661,7 @@ class NovigQueries:
           event(where: $where, limit: $limit, order_by: {{scheduled_start: asc}}) {{
             {_EVENT_FIELDS}
             game {{ {_GAME_FIELDS} }}
+            markets_aggregate {{ aggregate {{ sum {{ volume }} }} }}
           }}
         }}
         """
@@ -850,6 +904,8 @@ class NovigQueries:
             tmp = dump_dir / "all_events_combined_latest.json.tmp"
             tmp.write_text(json.dumps(dump, indent=2, default=str))
             tmp.replace(out)
+            # Slim metadata-only companion for the startup match-map build.
+            write_events_index(dump, dump_dir)
             if progress:
                 size_mb = out.stat().st_size / (1024 * 1024)
                 print(f"[novig.scrape] wrote {out}  ({size_mb:.2f} MB)")
@@ -923,6 +979,33 @@ class NovigQueries:
         # skips a full-file UTF-8 decode. ([PERF-DIAG] — see PERF_DIAGNOSTICS.md)
         return orjson.loads(files[-1].read_bytes())
 
+    @staticmethod
+    def load_events_index(dump_dir: Optional[pathlib.Path] = None
+                          ) -> Optional[dict]:
+        """Load the slim event-metadata index (events_index_latest.json).
+
+        Returns a {event_id: {"event_metadata": {...}}} dict — the same shape
+        as the full dump but with no `data.markets`, so it's a drop-in for the
+        match-map build's event-level pairing. ~0.5MB / ~2ms vs the full dump's
+        ~48MB / ~122ms GIL-held parse.
+
+        Falls back to deriving the index from the full dump when the index file
+        is absent (e.g. an old dump written before this companion existed, or
+        the first run after upgrade), so the caller never has to special-case
+        a missing index. Returns None only when there's no data at all."""
+        dump_dir = dump_dir or NOVIG_DUMP_DIR
+        idx = dump_dir / NOVIG_EVENTS_INDEX_NAME
+        if idx.exists():
+            try:
+                return orjson.loads(idx.read_bytes())
+            except Exception:
+                pass  # fall through to full-dump derivation
+        full = NovigQueries.load_latest_dump(dump_dir)
+        if not full:
+            return None
+        return {eid: {"event_metadata": (e or {}).get("event_metadata")}
+                for eid, e in full.items()}
+
 
 # League code -> sport label, used as the sport default when a node has
 # no `game` block (true for tennis/golf child matches, whose game is
@@ -931,13 +1014,19 @@ class NovigQueries:
 # exchange_market_keys.py), so a wrong default here can't break pairing.
 _LEAGUE_SPORT: dict[str, str] = {
     "MLB": "Baseball", "NCAABSB": "Baseball",
-    "NBA": "Basketball", "WNBA": "Basketball", "NCAAB": "Basketball",
-    "NHL": "Ice Hockey",
-    "NFL": "American Football", "NCAAF": "American Football",
+    "NBA": "Basketball", "WNBA": "Basketball", "NCAAB": "Basketball", "NCAAWB": "Basketball",
+    "NHL": "Ice Hockey", "Olympics Hockey Men": "Ice Hockey",
+    "NFL": "American Football", "NCAAF": "American Football", "NCAA_FB": "American Football",
     "ATP": "Tennis", "WTA": "Tennis",
-    "PGA": "Golf",
+    "PGA": "Golf", "TGL": "Golf",
     "UFC": "Mixed Martial Arts",
     "MLS": "Soccer", "EPL": "Soccer",
+    "Bundesliga": "Soccer", "Champions League": "Soccer", "Europa League": "Soccer",
+    "La Liga": "Soccer", "Ligue 1": "Soccer", "Serie A": "Soccer",
+    "FIFA World Cup": "Soccer",
+    "Boxing": "Boxing", "WBC": "Boxing",
+    "Counter Strike 2": "Esports", "Dota 2": "Esports", "League of Legends": "Esports",
+    "ENTERTAINMENT": "Entertainment",
 }
 
 
@@ -965,16 +1054,44 @@ def _event_to_dump_entry(event_node: dict,
         a, h = _parse_at_names(event_node.get("description") or "")
         away_name = away_name or a
         home_name = home_name or h
+    markets = (markets_override if markets_override is not None
+               else NovigQueries.flatten_markets(event_node))
+    # Per-event volume = sum of each market's `volume` field (USD traded).
+    # Novig has no single event-level total on the GraphQL surface, but every
+    # market carries `volume`; summing them is the figure novig.com shows on
+    # the event card and is what downstream stake-sort / $0-event filtering
+    # rely on. (Previously hardcoded 0.0, which made live games look untraded
+    # and got them filtered out of the dropdown.)
+    total_volume = 0.0
+    for m in markets:
+        try:
+            total_volume += float(m.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    # Listing path (NovigQueries.list_events) ships no market subtree — only
+    # a `markets_aggregate` sum(volume). Fall back to it so dropdown events
+    # carry their traded volume even though their markets are hydrated lazily.
+    if total_volume == 0.0:
+        agg = (((event_node.get("markets_aggregate") or {})
+                .get("aggregate") or {}).get("sum") or {}).get("volume")
+        try:
+            total_volume = float(agg or 0.0)
+        except (TypeError, ValueError):
+            total_volume = 0.0
     meta = {
         "id": event_node.get("id") or "",
         "name": event_node.get("description") or "",
         "startTime": event_node.get("scheduled_start") or "",
         "status": event_node.get("status") or "",
+        # Novig event taxonomy: "Game" (normal matchup, has a game block),
+        # "Future" (outright/futures — Championship Winner, MVP, etc., no
+        # game block, markets typed CHAMPIONSHIP_WINNER/*_WINNER), or
+        # "Tournament" (tennis/golf container expanded into child matches).
+        # Surfaced so the widget can categorize futures separately from games.
+        "event_type": event_node.get("type") or "",
         "tournament": league,
         "sport": game.get("sport") or _LEAGUE_SPORT.get(league) or "Baseball",
-        # Novig has no per-event total volume on the GraphQL surface;
-        # 0 keeps stake-sort downstream sane.
-        "stake": 0.0,
+        "stake": total_volume,
         "home_team_symbol": home.get("symbol"),
         "home_team_name": home_name,
         "away_team_symbol": away.get("symbol"),
@@ -984,8 +1101,6 @@ def _event_to_dump_entry(event_node: dict,
         "home_score": game.get("home_score"),
         "away_score": game.get("away_score"),
     }
-    markets = (markets_override if markets_override is not None
-               else NovigQueries.flatten_markets(event_node))
     return {
         "event_metadata": meta,
         "data": {"markets": markets},

@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem,
     QStyledItemDelegate, QDoubleSpinBox, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath, QFontMetrics
 import asyncio
 import json
@@ -19,9 +19,35 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import ProphetXQuery
+
+#TODO: Remarkable how well this widget works given how weak this code is. Massive refactor required.
+# Delicate, careful refactor that is.
+
+
+# [PX]/[NV]/[PX/NV] prefix tokens for an event's dropdown label, keyed by the
+# source class returned by ProphetXBrowser._event_source_for.
+_SOURCE_BADGES = {"BOTH": "[PX/NV] ", "PX": "[PX] ", "NV": "[NV] "}
+
+
+def _action_button_qss(fs: int, compact: bool) -> str:
+    """Shared mint-green primary-action button stylesheet (Place / Run)."""
+    vpad, hpad = (3, 10) if compact else (6, 16)
+    return f"""
+        QPushButton {{
+            background-color: #1f6f5e; color: #e8fff8;
+            border: 1px solid #5eead4; border-radius: 4px;
+            padding: {vpad}px {hpad}px;
+            font-size: {fs}px; font-weight: 600;
+        }}
+        QPushButton:hover {{ background-color: #2a8c76; }}
+        QPushButton:disabled {{
+            background-color: #1a1d24; color: #555b66;
+            border: 1px solid #2a2d34;
+        }}
+    """
 
 
 # ============================================================================
@@ -165,6 +191,18 @@ def _normalize_nv_order(o: dict) -> Position:
     )
 
 
+def _emit_snapshot(worker: "QThread", snap: "WalletSnapshot", coro) -> None:
+    """Run a wallet/positions coroutine on a fresh loop with a hard timeout,
+    backfilling any uncaught error onto both exchange slots, then emit the
+    snapshot. Shared by the balance + positions workers."""
+    try:
+        asyncio.run(asyncio.wait_for(coro, timeout=15))
+    except Exception as e:
+        snap.px_error = snap.px_error or str(e)
+        snap.nv_error = snap.nv_error or str(e)
+    worker.snapshot_ready.emit(snap)
+
+
 class WalletBalanceWorker(QThread):
     """One-shot balance fetch (PX + NV). Emits a WalletSnapshot with only
     the balance fields populated; positions are left empty so the caller
@@ -203,14 +241,7 @@ class WalletBalanceWorker(QThread):
             except Exception as e:
                 snap.nv_error = str(e)
 
-        try:
-            asyncio.run(asyncio.wait_for(_go(), timeout=15))
-        except Exception as e:
-            if not snap.px_error:
-                snap.px_error = str(e)
-            if not snap.nv_error:
-                snap.nv_error = str(e)
-        self.snapshot_ready.emit(snap)
+        _emit_snapshot(self, snap, _go())
 
 
 class OpenPositionsWorker(QThread):
@@ -261,14 +292,7 @@ class OpenPositionsWorker(QThread):
             except Exception as e:
                 snap.nv_error = str(e)
 
-        try:
-            asyncio.run(asyncio.wait_for(_go(), timeout=15))
-        except Exception as e:
-            if not snap.px_error:
-                snap.px_error = str(e)
-            if not snap.nv_error:
-                snap.nv_error = str(e)
-        self.snapshot_ready.emit(snap)
+        _emit_snapshot(self, snap, _go())
 
 
 class NovigDumpWorker(QThread):
@@ -364,6 +388,78 @@ class NovigMarketBookWorker(QThread):
         self.books_ready.emit(self.prophetx_event_id, books)
 
 
+class NovigEventsWorker(QThread):
+    """Live event-list fetch so Novig events show in the dropdown alongside
+    ProphetX. Uses NovigQueries.list_events (visible_only=True → only events
+    actually live on the site, no phantom pre-listings) and shapes each into
+    the same {event_metadata, data:{markets}} dict all_events uses. Markets are
+    left empty here — they're fetched live when the event is opened."""
+
+    events_ready = pyqtSignal(dict)  # {event_id: dump-style entry}
+
+    def run(self) -> None:
+        try:
+            from NovigClient import (NovigClient, NovigQueries,
+                                     _event_to_dump_entries)
+            q = NovigQueries(NovigClient())
+            nodes = []
+            nodes += q.list_events(league=None,
+                                   status_in=("OPEN_PREGAME",), limit=1000)
+            nodes += q.list_events(league=None,
+                                   status_in=("OPEN_INGAME",), limit=500)
+        except Exception as e:
+            print(f"[LiquidityWidget] Novig event list fetch failed: {e!r}")
+            self.events_ready.emit({})
+            return
+        out: dict = {}
+        for node in nodes:
+            try:
+                for eid, entry in _event_to_dump_entries(node):
+                    if eid:
+                        entry["_exchange"] = "NV"
+                        out[str(eid)] = entry
+            except Exception:
+                continue
+        self.events_ready.emit(out)
+
+
+class NovigEventMarketsWorker(QThread):
+    """Live single-event market fetch for an NV-only event: get_event_markets
+    (only_available=True → OPEN markets with liquidity/consensus) + /book/batch
+    depth, normalized to a NormalizedEvent. Mirrors how a ProphetX event pulls
+    fresh markets on selection, but for the Novig side."""
+
+    markets_ready = pyqtSignal(str, object)  # (event_id, NormalizedEvent|None)
+
+    def __init__(self, event_id: str, parent=None):
+        super().__init__(parent)
+        self.event_id = str(event_id)
+
+    def run(self) -> None:
+        try:
+            from NovigClient import NovigClient, NovigQueries
+            import exchange_market_keys as emk
+            client = NovigClient()
+            q = NovigQueries(client)
+            node = q.get_event_markets(self.event_id, only_available=True)
+            if not node:
+                self.markets_ready.emit(self.event_id, None)
+                return
+            # Live book depth. get_market_books auto-chunks, so passing every
+            # market id is safe even for huge slates (e.g. NBA finals).
+            flat = NovigQueries.flatten_markets(node)
+            ids = [m.get("id") for m in flat if m.get("id")]
+            books_list = client.get_market_books(ids, currency="CASH") if ids else []
+            books = {(b.get("market") or {}).get("id"): b for b in books_list}
+            nev = emk.from_novig_event(node, books=books, currency="CASH")
+        except Exception as e:
+            print(f"[LiquidityWidget] Novig event markets fetch failed "
+                  f"for {self.event_id}: {e!r}")
+            self.markets_ready.emit(self.event_id, None)
+            return
+        self.markets_ready.emit(self.event_id, nev)
+
+
 class MatchMapWorker(QThread):
     """Builds the ProphetX↔Novig event match map off the main thread.
 
@@ -400,7 +496,12 @@ class MatchMapWorker(QThread):
             return
 
         try:
-            nv_data = NovigQueries.load_latest_dump()
+            # Slim metadata-only index (~0.5MB / ~2ms) instead of the full
+            # ~48MB / ~122ms dump: event-level pairing only needs identity, so
+            # the markets are hydrated lazily per-event when the user opens one
+            # (ProphetXBrowser._lookupCurrentMarketPair). This is THE fix for
+            # the startup ticker stutter — the 122ms GIL-held parse is gone.
+            nv_data = NovigQueries.load_events_index()
             if not nv_data:
                 self.map_ready.emit([])
                 return
@@ -424,7 +525,10 @@ class MatchMapWorker(QThread):
                 px_data, league_filter=None)
             nv_events = emk.load_novig_normalized_events(
                 nv_data, league_filter=None, currency="CASH")
-            pairs = emk.match_events(px_events, nv_events)
+            # populate_markets=False: nv_events have no markets (index is
+            # metadata-only); pair on identity now, hydrate markets on demand.
+            pairs = emk.match_events(px_events, nv_events,
+                                     populate_markets=False)
             self.map_ready.emit(pairs)
         except Exception as e:
             import traceback
@@ -658,6 +762,14 @@ class BetSlipDrawer(QWidget):
 
     DEFAULT_PER_LEG_WAGER = 10.00
 
+    _SCROLL_QSS = """
+        QScrollArea {
+            background-color: #0d0f14;
+            border: 1px solid #2a2d34;
+            border-radius: 3px;
+        }
+    """
+
     def __init__(self, parent=None, compact_mode: bool = False):
         super().__init__(parent)
         self.compact_mode = compact_mode
@@ -726,13 +838,7 @@ class BetSlipDrawer(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.legs_container)
         scroll.setMaximumHeight(120 if self.compact_mode else 180)
-        scroll.setStyleSheet("""
-            QScrollArea {
-                background-color: #0d0f14;
-                border: 1px solid #2a2d34;
-                border-radius: 3px;
-            }
-        """)
+        scroll.setStyleSheet(self._SCROLL_QSS)
         body_layout.addWidget(scroll)
 
         # Controls row: stake input + place button.
@@ -776,20 +882,7 @@ class BetSlipDrawer(QWidget):
         self.place_btn = QPushButton("Place All")
         self.place_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.place_btn.clicked.connect(self._onPlaceClicked)
-        self.place_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #1f6f5e; color: #e8fff8;
-                border: 1px solid #5eead4; border-radius: 4px;
-                padding: {3 if self.compact_mode else 6}px
-                         {10 if self.compact_mode else 16}px;
-                font-size: {fs}px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background-color: #2a8c76; }}
-            QPushButton:disabled {{
-                background-color: #1a1d24; color: #555b66;
-                border: 1px solid #2a2d34;
-            }}
-        """)
+        self.place_btn.setStyleSheet(_action_button_qss(fs, self.compact_mode))
         controls.addWidget(self.place_btn)
         body_layout.addLayout(controls)
 
@@ -841,13 +934,7 @@ class BetSlipDrawer(QWidget):
         self._positions_scroll.setWidget(self.positions_container)
         self._positions_scroll.setMaximumHeight(
             120 if self.compact_mode else 180)
-        self._positions_scroll.setStyleSheet("""
-            QScrollArea {
-                background-color: #0d0f14;
-                border: 1px solid #2a2d34;
-                border-radius: 3px;
-            }
-        """)
+        self._positions_scroll.setStyleSheet(self._SCROLL_QSS)
         self._positions_scroll.setVisible(False)
         body_layout.addWidget(self._positions_scroll)
 
@@ -1383,20 +1470,7 @@ class SGPScannerPanel(QWidget):
         self.run_btn = QPushButton("Run EV Scan")
         self.run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.run_btn.clicked.connect(self._onRunClicked)
-        self.run_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #1f6f5e; color: #e8fff8;
-                border: 1px solid #5eead4; border-radius: 4px;
-                padding: {3 if self.compact_mode else 6}px
-                         {10 if self.compact_mode else 16}px;
-                font-size: {fs}px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background-color: #2a8c76; }}
-            QPushButton:disabled {{
-                background-color: #1a1d24; color: #555b66;
-                border: 1px solid #2a2d34;
-            }}
-        """)
+        self.run_btn.setStyleSheet(_action_button_qss(fs, self.compact_mode))
         controls.addWidget(self.run_btn)
         controls.addStretch()
         self.status_label = QLabel("Select events to scan")
@@ -1868,6 +1942,11 @@ class OddsBarDelegate(QStyledItemDelegate):
     ODDS_ROLE = Qt.ItemDataRole.UserRole + 1
     BAR_WIDTH_ROLE = Qt.ItemDataRole.UserRole + 2
     SIDE_TYPE_ROLE = Qt.ItemDataRole.UserRole + 3
+    # Signed flash intensity for the per-tick price-change pulse:
+    # >0 = odds ticked up (green wash), <0 = ticked down (red wash),
+    # magnitude 0..1 is the current (decaying) alpha. Set/decayed by
+    # OrderBookWidget._stepRowAnimations; absent/0 = no flash.
+    FLASH_ROLE = Qt.ItemDataRole.UserRole + 4
 
     def __init__(self, parent=None, compact_mode: bool = False):
         super().__init__(parent)
@@ -1891,6 +1970,10 @@ class OddsBarDelegate(QStyledItemDelegate):
         self._ask_bar = QColor(248, 113, 113)
         self._bid_bar = QColor(52, 211, 153)
         self._transparent = QColor(13, 15, 20, 0)
+        # Price-change flash hues (see FLASH_ROLE). Up = mint-green,
+        # down = red; alpha is scaled per-paint by the decaying intensity.
+        self._flash_up = QColor(74, 222, 128)
+        self._flash_down = QColor(248, 113, 113)
 
     def _fontThatFits(self, text: str, avail_w: int):
         """Return the base font, or the largest shrunk variant that fits
@@ -1980,6 +2063,17 @@ class OddsBarDelegate(QStyledItemDelegate):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
+        # Price-change flash: a brief directional wash over the cell that
+        # decays to nothing. Painted over the bar but under the text so the
+        # odds stay legible. Signed magnitude comes from FLASH_ROLE.
+        flash = index.data(self.FLASH_ROLE) or 0.0
+        if flash:
+            wash = QColor(self._flash_up if flash > 0 else self._flash_down)
+            wash.setAlpha(int(min(abs(flash), 1.0) * 90))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(wash))
+            painter.drawRoundedRect(QRectF(rect), 4.0, 4.0)
+
         # Odds text, left-aligned with the original horizontal padding.
         # Auto-shrink the font when a long value (4-digit odds like -9900)
         # wouldn't otherwise fit, so the last digit never gets clipped.
@@ -2011,8 +2105,17 @@ class OrderBookWidget(QWidget):
         self.current_line = None
         self.compact_mode = compact_mode
         self.is_loading = False
+        # Refresh animation state (see _emitOrderbookRows). _last_plan_sig
+        # captures the structural shape of the last render; when a refresh
+        # produces the same shape we update cells in place (no flash) and
+        # animate the bars/odds instead of tearing the table down.
+        self._last_plan_sig = None
+        self._row_anim: dict = {}   # table_row -> animation state dict
         self.initUI()
         self._setupLoadingOverlay()
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)  # ~60fps while anything animates
+        self._anim_timer.timeout.connect(self._stepRowAnimations)
 
     def _setupLoadingOverlay(self):
         """Setup the loading overlay widget"""
@@ -2122,14 +2225,10 @@ class OrderBookWidget(QWidget):
 
         # Set column widths
         header = self.orderbook_table.horizontalHeader()
-        if self.compact_mode:
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        else:
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        if not self.compact_mode:
             header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
 
@@ -2152,33 +2251,20 @@ class OrderBookWidget(QWidget):
 
         layout.addWidget(self.orderbook_table)
 
-        # Footer with spread info (compact or hidden in compact mode)
-        if not self.compact_mode:
-            self.footer_label = QLabel()
-            self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.footer_label.setStyleSheet("""
-                QLabel {
-                    background-color: #1a1d24;
-                    color: #8a92a3;
-                    padding: 12px;
-                    font-size: 14px;
-                    border-top: 1px solid #2a2d34;
-                }
-            """)
-            layout.addWidget(self.footer_label)
-        else:
-            self.footer_label = QLabel()
-            self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.footer_label.setStyleSheet("""
-                QLabel {
-                    background-color: #1a1d24;
-                    color: #8a92a3;
-                    padding: 2px;
-                    font-size: 8px;
-                    border-top: 1px solid #2a2d34;
-                }
-            """)
-            layout.addWidget(self.footer_label)
+        # Footer with spread info — denser padding/type in compact mode.
+        self.footer_label = QLabel()
+        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fpad, ffs = ("2px", "8px") if self.compact_mode else ("12px", "14px")
+        self.footer_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: #1a1d24;
+                color: #8a92a3;
+                padding: {fpad};
+                font-size: {ffs};
+                border-top: 1px solid #2a2d34;
+            }}
+        """)
+        layout.addWidget(self.footer_label)
 
         # Styling - compact padding in compact mode
         padding = "4px 4px" if self.compact_mode else "12px"
@@ -2466,7 +2552,7 @@ class OrderBookWidget(QWidget):
                 continue
             for ln in nm.lines:
                 sd = grid.setdefault(ln.strike, {})
-                for s in ln.sides:
+                for side_idx, s in enumerate(ln.sides):
                     if is_over_under:
                         if s.side_type == _emk.SIDE_OVER:
                             skey = "over"
@@ -2484,15 +2570,41 @@ class OrderBookWidget(QWidget):
                         if side_strike is None:
                             side_strike = ln.strike
                         bare = _strip.sub("", s.label or "").strip()
-                        team_sym = (_emk.team_to_symbol(bare)
-                                    or bare or s.side_type or "?")
-                        skey = team_sym
+                        sym = _emk.team_to_symbol(bare)
+                        if sym is not None:
+                            skey = sym
+                            team_sym = sym
+                        elif bare:
+                            # Individual sport: normalize to surname so
+                            # "K. Pliskova" and "Karolina Pliskova" bucket together
+                            surname = _emk._person_surname(bare)
+                            skey = surname or bare
+                            team_sym = bare
+                        else:
+                            # Pure numeric label (e.g. NV sends "+4.5"/"-4.5"):
+                            # inject player name from event name using side order
+                            _ev_parts: list = []
+                            _ev = nm.event_name or ""
+                            for _sep in (" at ", " vs ", " v "):
+                                if _sep.lower() in _ev.lower():
+                                    _i = _ev.lower().index(_sep.lower())
+                                    _ev_parts = [_ev[:_i].strip(),
+                                                 _ev[_i + len(_sep):].strip()]
+                                    break
+                            if _ev_parts:
+                                _p = _ev_parts[min(side_idx, len(_ev_parts) - 1)]
+                                _sn = _emk._person_surname(_p)
+                                skey = _sn.lower() if _sn else f"side{side_idx}"
+                                team_sym = _sn or _p
+                            else:
+                                skey = f"side{side_idx}"
+                                team_sym = ""
                         ss = (self._format_strike_short(side_strike)
                               if side_strike is not None else "")
                         if (ss and side_strike is not None and side_strike > 0
                                 and not ss.startswith("+")):
                             ss = f"+{ss}"
-                        label = f"{team_sym} {ss}".strip() if ss else team_sym
+                        label = f"{team_sym} {ss}".strip() if ss else team_sym or skey
                     entry = sd.setdefault(skey, {"label": label, "rows": []})
                     for o in s.orders:
                         od = self._normalized_order_to_dict(
@@ -2706,89 +2818,9 @@ class OrderBookWidget(QWidget):
                     if rows:
                         sections.append((label, rows))
 
-        # Single-strike team markets (moneyline / one-line spread): order
-        # each block by SECTION POSITION so both sides' best prices meet at
-        # the centre separator — the top team's best at the BOTTOM of its
-        # block, the lower team's best at the TOP. Sorting by |american|
-        # only landed the best at the separator when the favourite happened
-        # to be the upper block; with the favourite on the bottom it shoved
-        # its best price (e.g. CAR -102) to the very bottom and its worst
-        # (-175) to the top. Skipped for Over/Under and the multi-strike
-        # path, which arrange their own ordering.
-        if not is_over_under and not lead_header:
-            for _i, (_lbl, _rows) in enumerate(sections):
-                _rows.sort(key=lambda od: od["odds"], reverse=(_i != 0))
-
-        # Drop orders with no liquidity behind them — Novig's indicative
-        # top-of-book quote carries $0 size (a price you can't actually
-        # take), and on a thin/early market those are the "dead" rows that
-        # render as bar-less slivers. Keep the collapsed ALT LINES header,
-        # which is intentionally row-less.
-        sections = [(label, [o for o in rows if o.get("value", 0) > 0])
-                    for label, rows in sections]
-        sections = [(label, rows) for label, rows in sections
-                    if rows or "ALT LINES" in label]
-
-        # clearSpans only — clearContents()/setRowCount(0) destroy pooled
-        # cell widgets and force costly stylesheet reparses on rebuild.
-        self.orderbook_table.clearSpans()
-
-        total_orders = sum(len(rows) for _, rows in sections)
-        if total_orders == 0:
-            self.orderbook_table.setRowCount(1)
-            item = QTableWidgetItem("No orders available")
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.orderbook_table.setItem(0, 0, item)
-            colspan = 3 if self.compact_mode else 5
-            self.orderbook_table.setSpan(0, 0, 1, colspan)
-            if hasattr(self, "footer_label"):
-                self.footer_label.setText(
-                    f"No orders available — {nm.market_name}")
-            return
-
-        # lead_header (multi-strike) labels every section incl. the first.
-        n_separators = (len(sections) if lead_header
-                        else (len(sections) - 1 if len(sections) >= 2 else 0))
-        total_rows = total_orders + n_separators
-        self.orderbook_table.setRowCount(total_rows)
-
-        total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
-        max_stake = self._barScaleReference(
-            o["value"] for _, rows in sections for o in rows)
-
-        current_row = 0
-        cumulative = 0.0
-        first_section = True
-        first_order: Optional[Dict] = None
-        last_order: Optional[Dict] = None
-        for section_label, rows in sections:
-            if (not first_section) or lead_header:
-                self.renderSideSeparatorRow(current_row, f"─ {section_label} ─")
-                if "ALT LINES" in section_label:
-                    self._alt_header_row = current_row
-                current_row += 1
-            first_section = False
-            for od in rows:
-                cumulative += od["value"]
-                self.renderOrderRow(current_row, od, max_stake,
-                                    cumulative, total_liquidity)
-                if first_order is None:
-                    first_order = od
-                last_order = od
-                current_row += 1
-
-        if hasattr(self, "footer_label") and first_order is not None:
-            # Best/worst from odds extremes, not row position (display is
-            # sorted by |american|, so the top row isn't the best price).
-            all_rows = [o for _, rows in sections for o in rows]
-            best_o = max(all_rows, key=lambda o: o["odds"])
-            worst_o = min(all_rows, key=lambda o: o["odds"])
-            self.footer_label.setText(
-                f"Showing {total_orders} price levels • "
-                f"Best Bid: {best_o.get('displayOdds', 'N/A')} • "
-                f"Best Ask: {worst_o.get('displayOdds', 'N/A')} • "
-                f"Spread: {len(sections)} sides • "
-                f"Total Liquidity: ${total_liquidity:,.2f}")
+        sections = self._finalizeSections(sections, is_over_under, lead_header)
+        self._emitOrderbookRows(sections, lead_header, dual=False,
+                                market_name=nm.market_name)
 
     # ------------------------------------------------------------------
     # Dual-source render path
@@ -2973,7 +3005,8 @@ class OrderBookWidget(QWidget):
             # the same section. Within a team, group by strike (desc),
             # sort American-desc within each strike — mirrors the
             # existing single-source ladder behavior.
-            team_strike_groups: dict = {}   # {team_sym: {strike: [(src, order)]}}
+            team_strike_groups: dict = {}   # {team_key: {strike: [(src, order)]}}
+            team_display_names: dict = {}   # team_key → section header label
             team_order: list = []
             # Strip trailing signed decimal from a label so "OKC -1.5"
             # becomes "OKC" for team_to_symbol lookup. This is distinct
@@ -2997,24 +3030,37 @@ class OrderBookWidget(QWidget):
                         if side_strike is None:
                             side_strike = ln.strike
                         bare = _strip_trailing_num.sub("", s.label or "").strip()
-                        team_sym = (_emk.team_to_symbol(bare)
-                                    or bare or s.side_type or "?")
-                        if team_sym not in team_strike_groups:
-                            team_strike_groups[team_sym] = {}
-                            team_order.append(team_sym)
-                        team_strike_groups[team_sym].setdefault(side_strike, [])
+                        sym = _emk.team_to_symbol(bare)
+                        if sym is not None:
+                            team_key = sym
+                        else:
+                            # Individual sport (tennis/UFC/golf): normalize
+                            # to surname so "K. Pliskova", "Karolina
+                            # Pliskova", "Pliskova" all bucket together
+                            # across PX and NV labels.
+                            surname = _emk._person_surname(bare)
+                            team_key = surname or bare or s.side_type or "?"
+                        if team_key not in team_strike_groups:
+                            team_strike_groups[team_key] = {}
+                            team_order.append(team_key)
+                            # First label seen wins as display (PX is
+                            # processed before NV, so full PX name takes
+                            # precedence over NV abbreviation).
+                            team_display_names[team_key] = sym or bare or team_key
+                        team_strike_groups[team_key].setdefault(side_strike, [])
                         for o in s.orders:
-                            team_strike_groups[team_sym][side_strike].append(
+                            team_strike_groups[team_key][side_strike].append(
                                 (src_key, o, ln.source_line_id))
 
-            for team_sym in team_order:
+            for team_key in team_order:
+                display = team_display_names[team_key]
                 strikes_in_team = sorted(
-                    team_strike_groups[team_sym].keys(),
+                    team_strike_groups[team_key].keys(),
                     key=lambda s: (s is None, -(s if s is not None else 0)),
                 )
                 rows = []
                 for strike in strikes_in_team:
-                    tagged = team_strike_groups[team_sym][strike]
+                    tagged = team_strike_groups[team_key][strike]
                     # Sort by ABSOLUTE american so each side's touch (best
                     # price) sits nearest the separator. A favorite
                     # (negative) ascends — its least-juiced top-of-book
@@ -3033,8 +3079,8 @@ class OrderBookWidget(QWidget):
                     if (strike_str and strike is not None and strike > 0
                             and not strike_str.startswith("+")):
                         strike_str = f"+{strike_str}"
-                    row_label = (f"{team_sym} {strike_str}".strip()
-                                 if strike_str else team_sym)
+                    row_label = (f"{display} {strike_str}".strip()
+                                 if strike_str else display)
                     for src_key, o, line_id in tagged:
                         nm_source = (px_norm.source if src_key == "px"
                                      else nv_norm.source)
@@ -3044,111 +3090,354 @@ class OrderBookWidget(QWidget):
                         od["_source"] = src_key
                         rows.append(od)
                 if rows:
-                    sections.append((team_sym, rows))
+                    sections.append((display, rows))
 
-        # Single-strike team markets (moneyline / one-line spread): order
-        # each block by SECTION POSITION so both sides' best prices meet at
-        # the centre separator — the top team's best at the BOTTOM of its
-        # block, the lower team's best at the TOP. Sorting by |american|
-        # only landed the best at the separator when the favourite happened
-        # to be the upper block; with the favourite on the bottom it shoved
-        # its best price (e.g. CAR -102) to the very bottom and its worst
-        # (-175) to the top. Skipped for Over/Under and the multi-strike
-        # path, which arrange their own ordering.
+        sections = self._finalizeSections(sections, is_over_under, lead_header)
+        self._emitOrderbookRows(sections, lead_header, dual=True)
+
+    def _finalizeSections(self, sections, is_over_under: bool,
+                          lead_header: bool):
+        """Shared render-path tail for both the single- and dual-source impls.
+
+        Single-strike team markets (moneyline / one-line spread): order each
+        block by SECTION POSITION so both sides' best prices meet at the centre
+        separator — the top team's best at the BOTTOM of its block, the lower
+        team's best at the TOP. Sorting by |american| only landed the best at
+        the separator when the favourite happened to be the upper block; with
+        the favourite on the bottom it shoved its best price (e.g. CAR -102) to
+        the very bottom and its worst (-175) to the top. Skipped for Over/Under
+        and the multi-strike path, which arrange their own ordering.
+
+        Then drop orders with no liquidity behind them — Novig's indicative
+        top-of-book quote carries $0 size (a price you can't actually take),
+        and on a thin/early market those are the "dead" rows that render as
+        bar-less slivers. The collapsed ALT LINES header is kept even though it
+        is intentionally row-less."""
         if not is_over_under and not lead_header:
-            for _i, (_lbl, _rows) in enumerate(sections):
-                _rows.sort(key=lambda od: od["odds"], reverse=(_i != 0))
-
-        # Drop orders with no liquidity behind them — Novig's indicative
-        # top-of-book quote carries $0 size (a price you can't actually
-        # take), and on a thin/early market those are the "dead" rows that
-        # render as bar-less slivers. Keep the collapsed ALT LINES header,
-        # which is intentionally row-less.
+            for i, (_lbl, rows) in enumerate(sections):
+                rows.sort(key=lambda od: od["odds"], reverse=(i != 0))
         sections = [(label, [o for o in rows if o.get("value", 0) > 0])
                     for label, rows in sections]
-        sections = [(label, rows) for label, rows in sections
-                    if rows or "ALT LINES" in label]
+        return [(label, rows) for label, rows in sections
+                if rows or "ALT LINES" in label]
 
-        # clearSpans only — clearContents()/setRowCount(0) destroy pooled
-        # cell widgets and force costly stylesheet reparses on rebuild.
-        self.orderbook_table.clearSpans()
+    # ==================================================================
+    # Shared row emission + in-place refresh animation (A + D)
+    # ==================================================================
+    # Both render paths (single + dual) funnel their finished `sections`
+    # through _emitOrderbookRows. It computes a structural signature for
+    # the layout; when a refresh produces the SAME shape as the previous
+    # one (same separators, same per-section row counts, same source mix),
+    # it updates the existing cells in place — no setRowCount churn, so no
+    # full-viewport repaint "flash" — and animates the bars/odds that
+    # actually moved. Any structural change falls back to a full rebuild.
+
+    def _emitOrderbookRows(self, sections, lead_header: bool, dual: bool,
+                           market_name: Optional[str] = None) -> None:
+        tbl = self.orderbook_table
 
         total_orders = sum(len(rows) for _, rows in sections)
         if total_orders == 0:
-            self.orderbook_table.setRowCount(1)
+            self._row_anim.clear()
+            self._last_plan_sig = None
+            tbl.clearSpans()
+            tbl.setRowCount(1)
             item = QTableWidgetItem("No orders available")
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.orderbook_table.setItem(0, 0, item)
+            tbl.setItem(0, 0, item)
             colspan = 3 if self.compact_mode else 5
-            self.orderbook_table.setSpan(0, 0, 1, colspan)
+            tbl.setSpan(0, 0, 1, colspan)
+            if hasattr(self, "footer_label"):
+                suffix = f" — {market_name}" if market_name else ""
+                self.footer_label.setText(f"No orders available{suffix}")
             return
 
-        # lead_header (multi-strike) labels every section incl. the first,
-        # so the MAIN LINE block gets its own header row.
-        n_separators = (len(sections) if lead_header
-                        else (len(sections) - 1 if len(sections) >= 2 else 0))
-        total_rows = total_orders + n_separators
-        self.orderbook_table.setRowCount(total_rows)
+        # Flatten sections into an ordered render plan. Each entry is a
+        # separator or an order row carrying a stable identity = (section
+        # label, ordinal-within-section, source). lead_header labels every
+        # section including the first.
+        plan: list[dict] = []
+        cumulative = 0.0
+        first_section = True
+        alt_header_row = None
+        for section_label, rows in sections:
+            if (not first_section) or lead_header:
+                plan.append({"kind": "sep", "label": section_label})
+                if "ALT LINES" in section_label:
+                    alt_header_row = len(plan) - 1
+            first_section = False
+            for ordinal, od in enumerate(rows):
+                cumulative += od["value"]
+                plan.append({"kind": "order", "section": section_label,
+                             "ordinal": ordinal, "od": od,
+                             "source": od.get("_source"),
+                             "cumulative": cumulative})
 
         total_liquidity = sum(o["value"] for _, rows in sections for o in rows)
         max_stake = self._barScaleReference(
             o["value"] for _, rows in sections for o in rows)
 
-        current_row = 0
-        cumulative = 0.0
-        first_section = True
-        first_order = None
-        last_order = None
-        for section_label, rows in sections:
-            if (not first_section) or lead_header:
-                self.renderSideSeparatorRow(current_row, f"─ {section_label} ─")
-                if "ALT LINES" in section_label:
-                    self._alt_header_row = current_row
-                current_row += 1
-            first_section = False
-            for od in rows:
-                cumulative += od["value"]
-                self.renderOrderRow(current_row, od, max_stake,
-                                    cumulative, total_liquidity)
-                # Source differentiation: (a) recolor the SIDE column
-                # text in the source's brand color so each row's origin
-                # is immediately visible; (b) tint the entire row's
-                # background as a softer secondary cue.
-                src = od.get("_source")
-                if src == "px":
-                    text_color = self._PX_TEXT_COLOR
-                    bg_tint = self._PX_ROW_TINT
-                else:
-                    text_color = self._NV_TEXT_COLOR
-                    bg_tint = self._NV_ROW_TINT
-                col_count = self.orderbook_table.columnCount()
-                for c in range(col_count):
-                    cell = self.orderbook_table.item(current_row, c)
-                    if cell is not None:
-                        cell.setBackground(bg_tint)
-                # Override the existing ask/bid color on the side column
-                # (column 0). Ask/bid info is still visible via the
-                # odds column's red/green gradient.
-                side_cell = self.orderbook_table.item(current_row, 0)
-                if side_cell is not None:
-                    side_cell.setForeground(text_color)
-                if first_order is None:
-                    first_order = od
-                last_order = od
-                current_row += 1
+        # Structural signature — if unchanged we can refresh in place.
+        sig = (self.compact_mode, tbl.columnCount(), dual, tuple(
+            (p["kind"], p.get("label"), p.get("section"),
+             p.get("ordinal"), p.get("source"))
+            for p in plan))
+        in_place = (sig == self._last_plan_sig
+                    and tbl.rowCount() == len(plan))
 
-        if hasattr(self, "footer_label") and first_order is not None:
-            # Derive best/worst from the actual odds extremes, not row
-            # position — the display is sorted by |american| so the top
-            # row is no longer the best-paying one.
+        if not in_place:
+            # Full rebuild: clear the old separator spans (they're re-applied
+            # by renderSideSeparatorRow below). On the in-place path the spans
+            # are still valid and MUST be left alone — clearing them without
+            # re-applying lets the unspanned separator text blow out the
+            # ResizeToContents SIDE column and force a horizontal scrollbar.
+            self._row_anim.clear()
+            tbl.clearSpans()
+            tbl.setRowCount(len(plan))
+
+        self._alt_header_row = alt_header_row
+
+        # On a full rebuild every setItem/setData fires a dataChanged signal
+        # through Qt's model internals.  The outer setUpdatesEnabled(False)
+        # already prevents repaints, so those signals are pure overhead — the
+        # view will get one full repaint when setUpdatesEnabled(True) is
+        # restored at the call site.  Block them for the duration of the loop
+        # and leave the in-place path untouched (it updates individual cells
+        # whose signals the view's selective-repaint logic can legitimately use).
+        _model = tbl.model()
+        if not in_place:
+            _model.blockSignals(True)
+        try:
+            for row, p in enumerate(plan):
+                if p["kind"] == "sep":
+                    # Separators never change between same-shape refreshes;
+                    # only (re)build them on a full rebuild.
+                    if not in_place:
+                        self.renderSideSeparatorRow(row, f"─ {p['label']} ─")
+                    continue
+                if in_place:
+                    self._updateOrderRowInPlace(
+                        row, p["od"], max_stake, p["cumulative"],
+                        total_liquidity, dual)
+                else:
+                    self.renderOrderRow(row, p["od"], max_stake,
+                                        p["cumulative"], total_liquidity)
+                    if dual:
+                        self._applyDualRowTint(row, p["source"])
+        finally:
+            if not in_place:
+                _model.blockSignals(False)
+
+        self._last_plan_sig = sig
+
+        if self._row_anim and not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+        if hasattr(self, "footer_label"):
             all_rows = [o for _, rows in sections for o in rows]
             best_o = max(all_rows, key=lambda o: o["odds"])
             worst_o = min(all_rows, key=lambda o: o["odds"])
-            self.footer_label.setText(
-                f"Showing {total_orders} price levels • "
-                f"Best: {best_o.get('displayOdds', 'N/A')} • "
-                f"Worst: {worst_o.get('displayOdds', 'N/A')} • "
-                f"PX+NV • Total Liquidity: ${total_liquidity:,.2f}")
+            if dual:
+                self.footer_label.setText(
+                    f"Showing {total_orders} price levels • "
+                    f"Best: {best_o.get('displayOdds', 'N/A')} • "
+                    f"Worst: {worst_o.get('displayOdds', 'N/A')} • "
+                    f"PX+NV • Total Liquidity: ${total_liquidity:,.2f}")
+            else:
+                self.footer_label.setText(
+                    f"Showing {total_orders} price levels • "
+                    f"Best Bid: {best_o.get('displayOdds', 'N/A')} • "
+                    f"Best Ask: {worst_o.get('displayOdds', 'N/A')} • "
+                    f"Spread: {len(sections)} sides • "
+                    f"Total Liquidity: ${total_liquidity:,.2f}")
+
+    def _applyDualRowTint(self, row: int, source: Optional[str]) -> None:
+        """Source differentiation for the dual path: brand-color the SIDE
+        text and softly tint the whole row's background."""
+        if source == "px":
+            text_color = self._PX_TEXT_COLOR
+            bg_tint = self._PX_ROW_TINT
+        else:
+            text_color = self._NV_TEXT_COLOR
+            bg_tint = self._NV_ROW_TINT
+        for c in range(self.orderbook_table.columnCount()):
+            cell = self.orderbook_table.item(row, c)
+            if cell is not None:
+                cell.setBackground(bg_tint)
+        side_cell = self.orderbook_table.item(row, 0)
+        if side_cell is not None:
+            side_cell.setForeground(text_color)
+
+    def _updateOrderRowInPlace(self, row: int, order: Dict, max_stake: float,
+                               cumulative: float, total_liquidity: float,
+                               dual: bool) -> None:
+        """Refresh one existing row's cells without recreating them. Only
+        cells whose text actually changed are rewritten; the odds bar
+        lerps toward its new width and a price change triggers a directional
+        flash, both driven by _stepRowAnimations."""
+        tbl = self.orderbook_table
+        odds_item = tbl.item(row, 1)
+        if odds_item is None:
+            # Pool slot missing (shouldn't happen on a same-shape refresh);
+            # fall back to a fresh build for just this row.
+            self.renderOrderRow(row, order, max_stake, cumulative,
+                                total_liquidity)
+            if dual:
+                self._applyDualRowTint(row, order.get("_source"))
+            return
+
+        display_name = order.get('displayName', order.get('abbreviatedName', '---'))
+        display_odds = order.get('displayOdds', '---')
+        value = order.get('value', 0)
+        odds_value = order.get('odds', 0)
+        side_type = 'bid' if odds_value < 0 else 'ask'
+
+        # Keep the bet-slip payload current (price/size move every tick).
+        place = order.get("_place")
+        if place is not None and hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads[row] = {
+                **place,
+                "display_name": display_name,
+                "display_odds": display_odds,
+            }
+
+        if value > 0 and max_stake > 0:
+            bar_width = max(self.MIN_BAR_WIDTH,
+                            min(100, int((value / max_stake) * 100)))
+        else:
+            bar_width = 0
+        percentage = (value / total_liquidity * 100) if total_liquidity > 0 else 0
+
+        # --- Odds cell: animate bar, flash on price change -------------
+        prev_odds = odds_item.data(OddsBarDelegate.ODDS_ROLE)
+        anim = self._row_anim.get(row)
+        if anim is None:
+            cur_bar = odds_item.data(OddsBarDelegate.BAR_WIDTH_ROLE) or bar_width
+            # Previous numeric odds: carried in the anim across frames; on
+            # a cold row parse it back from the displayed string.
+            try:
+                prev_num = int(str(prev_odds))
+            except (TypeError, ValueError):
+                prev_num = odds_value
+            anim = {"bar_cur": float(cur_bar), "bar_tgt": bar_width,
+                    "flash": 0.0, "odds_val": prev_num}
+        else:
+            anim["bar_tgt"] = bar_width
+        if str(prev_odds) != str(display_odds):
+            anim["flash"] = 1.0
+            anim["flash_sign"] = 1 if odds_value > anim["odds_val"] else -1
+            odds_item.setData(OddsBarDelegate.ODDS_ROLE, display_odds)
+        anim["odds_val"] = odds_value
+        if odds_item.data(OddsBarDelegate.SIDE_TYPE_ROLE) != side_type:
+            odds_item.setData(OddsBarDelegate.SIDE_TYPE_ROLE, side_type)
+        # Bar moves via the animator; only seed the role when it isn't already
+        # at the current displayed width, so static rows don't repaint.
+        cur_int = int(round(anim["bar_cur"]))
+        if odds_item.data(OddsBarDelegate.BAR_WIDTH_ROLE) != cur_int:
+            odds_item.setData(OddsBarDelegate.BAR_WIDTH_ROLE, cur_int)
+        if abs(anim["bar_tgt"] - anim["bar_cur"]) > 0.5 or anim["flash"] > 0:
+            self._row_anim[row] = anim
+        else:
+            self._row_anim.pop(row, None)
+
+        # --- Text columns: rewrite only when the string changed --------
+        if self.compact_mode:
+            side_name = order.get('abbreviatedName', display_name)
+            if len(side_name) > 10:
+                parts = side_name.split()
+                if parts:
+                    last = parts[-1]
+                    # Trailing spread/number (e.g. "-4.5", "+1.5"): show
+                    # "Surname ±N.N" so both player and line are visible.
+                    if len(parts) >= 2 and last.lstrip('+-').replace('.', '').isdigit():
+                        side_name = f"{parts[-2]} {last}"
+                    else:
+                        side_name = last
+            self._setCellText(row, 0, side_name)
+            liquidity_text = (f"${value/1000:.1f}k" if value >= 1000
+                              else f"${value:.0f}")
+            self._setCellText(row, 2, liquidity_text)
+        else:
+            self._setCellText(row, 0, display_name)
+            self._setCellText(row, 2, f"${value:,.2f}")
+            self._setCellText(row, 3, f"${cumulative:,.2f}")
+            self._setCellText(row, 4, f"{percentage:.1f}%")
+            pct_cell = tbl.item(row, 4)
+            if pct_cell is not None:
+                pct_cell.setForeground(self._percentageColor(percentage))
+
+        # Re-assert ask/bid side color (dual overrides col 0 separately).
+        side_cell = tbl.item(row, 0)
+        if side_cell is not None and not dual:
+            side_cell.setForeground(QColor(252, 165, 165) if side_type == 'ask'
+                                    else QColor(110, 231, 183))
+
+    def _setCellText(self, row: int, col: int, text: str) -> None:
+        """Set an existing cell's text only when it differs — avoids
+        needless repaints of unchanged cells."""
+        cell = self.orderbook_table.item(row, col)
+        if cell is None:
+            cell = QTableWidgetItem()
+            self.orderbook_table.setItem(row, col, cell)
+        if cell.text() != text:
+            cell.setText(text)
+
+    @staticmethod
+    def _percentageColor(percentage: float) -> QColor:
+        if percentage >= 10:
+            return QColor(251, 191, 36)
+        if percentage >= 5:
+            return QColor(252, 211, 77)
+        return QColor(156, 163, 175)
+
+    def _stepRowAnimations(self) -> None:
+        """Per-frame tick: lerp each animating row's bar toward its target
+        and decay its flash. Repaints only the odds column of rows still in
+        flight, then stops the timer once everything has settled."""
+        if not self._row_anim:
+            self._anim_timer.stop()
+            return
+        tbl = self.orderbook_table
+        done: list[int] = []
+        for row, anim in self._row_anim.items():
+            if row >= tbl.rowCount():
+                done.append(row)
+                continue
+            odds_item = tbl.item(row, 1)
+            if odds_item is None:
+                done.append(row)
+                continue
+            cur = anim["bar_cur"]
+            tgt = anim["bar_tgt"]
+            cur += (tgt - cur) * 0.30
+            if abs(tgt - cur) < 0.5:
+                cur = float(tgt)
+            anim["bar_cur"] = cur
+            odds_item.setData(OddsBarDelegate.BAR_WIDTH_ROLE, int(round(cur)))
+
+            flash = anim.get("flash", 0.0)
+            if flash > 0:
+                flash *= 0.88
+                if flash < 0.03:
+                    flash = 0.0
+                anim["flash"] = flash
+                odds_item.setData(OddsBarDelegate.FLASH_ROLE,
+                                  flash * anim.get("flash_sign", 1))
+            else:
+                odds_item.setData(OddsBarDelegate.FLASH_ROLE, 0.0)
+
+            # Repaint just this row's odds cell.
+            idx = tbl.model().index(row, 1)
+            rect = tbl.visualRect(idx)
+            if rect.isValid():
+                tbl.viewport().update(rect)
+
+            if cur == float(tgt) and anim.get("flash", 0.0) <= 0:
+                done.append(row)
+        for row in done:
+            self._row_anim.pop(row, None)
+        if not self._row_anim:
+            self._anim_timer.stop()
 
     def renderSideSeparatorRow(self, row: int, label: str):
         """Render a separator row between the two market sides"""
@@ -3169,6 +3458,14 @@ class OrderBookWidget(QWidget):
         separator.setFont(sep_font)
         separator.setForeground(QColor(96, 165, 250))  # Professional blue
         separator.setBackground(QColor(31, 41, 55))  # Darker gray-blue
+        # The separator cell lives in column 0 and spans the whole row. With
+        # column 0 on ResizeToContents, Qt's sizeHintForColumn(0) otherwise
+        # counts this long separator text and blows the SIDE column out to the
+        # width of "─ ▸ ALT LINES (N) • tap to expand ─" (pushing ODDS to the
+        # right edge, dropping LIQ off-screen). An explicit narrow size hint
+        # keeps the text out of the column-width calc; the span still paints
+        # the full string across all columns.
+        separator.setSizeHint(QSize(1, row_height))
 
         self.orderbook_table.setItem(row, 0, separator)
         self.orderbook_table.setSpan(row, 0, 1, colspan)
@@ -3238,9 +3535,16 @@ class OrderBookWidget(QWidget):
             # Compact mode: only 3 columns - SIDE, ODDS, LIQ
             # Use abbreviated name for side column
             side_name = order.get('abbreviatedName', display_name)
-            # Shorten even more if too long
             if len(side_name) > 10:
-                side_name = side_name[:8] + ".."
+                parts = side_name.split()
+                if parts:
+                    last = parts[-1]
+                    # Trailing spread/number (e.g. "-4.5", "+1.5"): show
+                    # "Surname ±N.N" so both player and line are visible.
+                    if len(parts) >= 2 and last.lstrip('+-').replace('.', '').isdigit():
+                        side_name = f"{parts[-2]} {last}"
+                    else:
+                        side_name = last
 
             selection_item = self.createSelectionItem(side_name, side_type)
 
@@ -3267,56 +3571,35 @@ class OrderBookWidget(QWidget):
             self.orderbook_table.setItem(row, 3, cumulative_item)
             self.orderbook_table.setItem(row, 4, percentage_item)
 
-    def createSelectionItem(self, text: str, side_type: str) -> QTableWidgetItem:
-        """Create selection/team name item with color coding"""
+    def _mono_item(self, text: str, align: Qt.AlignmentFlag,
+                   weight=QFont.Weight.DemiBold) -> QTableWidgetItem:
+        """SF-Mono table item sized for the current mode, vertically centred.
+        Shared font/alignment setup for the three item creators below."""
         item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        item.setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+        font = QFont("SF Mono", 8 if self.compact_mode else 13, weight)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+        item.setFont(font)
+        return item
 
-        # Use smaller font in compact mode with better font
-        font_size = 8 if self.compact_mode else 13
-        selection_font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
-        selection_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
-        item.setFont(selection_font)
-
-        if side_type == 'ask':
-            item.setForeground(QColor(252, 165, 165))  # Softer red for underdogs
-        else:
-            item.setForeground(QColor(110, 231, 183))  # Softer green for favorites
-
+    def createSelectionItem(self, text: str, side_type: str) -> QTableWidgetItem:
+        """Selection/team name item, colored by side (ask=red, bid=green)."""
+        item = self._mono_item(text, Qt.AlignmentFlag.AlignLeft)
+        item.setForeground(QColor(252, 165, 165) if side_type == 'ask'
+                           else QColor(110, 231, 183))
         return item
 
     def createPlainItem(self, text: str) -> QTableWidgetItem:
-        """Create plain text table item"""
-        item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        item.setForeground(QColor(209, 213, 219))  # Professional gray
-
-        # Use smaller font in compact mode with better font
-        font_size = 8 if self.compact_mode else 13
-        plain_font = QFont("SF Mono", font_size, QFont.Weight.Normal)
-        plain_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
-        item.setFont(plain_font)
+        """Plain right-aligned gray table item."""
+        item = self._mono_item(text, Qt.AlignmentFlag.AlignRight,
+                               QFont.Weight.Normal)
+        item.setForeground(QColor(209, 213, 219))
         return item
 
     def createPercentageItem(self, text: str, percentage: float) -> QTableWidgetItem:
-        """Create percentage item with color intensity based on percentage"""
-        item = QTableWidgetItem(text)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        # Use smaller font in compact mode with better font
-        font_size = 8 if self.compact_mode else 13
-        pct_font = QFont("SF Mono", font_size, QFont.Weight.DemiBold)
-        pct_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
-        item.setFont(pct_font)
-
-        # Refined color coding - more professional amber/gold tones
-        if percentage >= 10:
-            item.setForeground(QColor(251, 191, 36))  # Professional amber for large orders
-        elif percentage >= 5:
-            item.setForeground(QColor(252, 211, 77))  # Lighter amber for medium orders
-        else:
-            item.setForeground(QColor(156, 163, 175))  # Muted gray for small orders
-
+        """Percentage item, amber/gold intensity scaled by share of book."""
+        item = self._mono_item(text, Qt.AlignmentFlag.AlignRight)
+        item.setForeground(self._percentageColor(percentage))
         return item
 
     # ==================================================================
@@ -3720,6 +4003,54 @@ class _EventSourceDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+# --- Event dropdown volume gating --------------------------------------------
+# The event list is decluttered by traded volume (metadata["stake"], in USD):
+#   * untraded events ($0 / dust) are hidden outright;
+#   * events more than _FAR_HORIZON_DAYS away are hidden UNLESS they already
+#     carry real volume — so a futures market or an early-listed game people
+#     are actually trading (e.g. a World Cup game 4 days out with $6k) stays,
+#     but the long tail of empty pre-listings doesn't crowd the menu.
+# Near-term events only need to clear the dust floor.
+_MIN_EVENT_VOLUME = 1.0       # $ below this counts as untraded -> hide
+_FAR_HORIZON_DAYS = 2.0       # events beyond this need real volume to show
+_FAR_MIN_VOLUME = 1000.0      # "some trading going on" floor for far events
+
+
+def _parse_event_start(ts: Optional[str]) -> Optional[datetime]:
+    """Parse a Novig ('...+00:00') or ProphetX ('...Z') ISO start time into
+    an aware UTC datetime. Returns None when absent/unparseable."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _event_passes_volume_filter(metadata: dict,
+                                now: Optional[datetime] = None) -> bool:
+    """Decide whether an event is worth listing in the dropdown. See the
+    _MIN_EVENT_VOLUME / _FAR_* constants for the policy. Events with an
+    unknown start time are kept as long as they clear the dust floor."""
+    try:
+        stake = float(metadata.get("stake") or 0.0)
+    except (TypeError, ValueError):
+        stake = 0.0
+    if stake < _MIN_EVENT_VOLUME:
+        return False
+    start = _parse_event_start(metadata.get("startTime"))
+    if start is None:
+        return True
+    now = now or datetime.now(timezone.utc)
+    days_out = (start - now).total_seconds() / 86400.0
+    if days_out > _FAR_HORIZON_DAYS and stake < _FAR_MIN_VOLUME:
+        return False
+    return True
+
+
 class ProphetXBrowser(QWidget):
     """
     Complete ProphetX exchange browser widget.
@@ -3787,6 +4118,48 @@ class ProphetXBrowser(QWidget):
         # rebuild, so the freshest data always wins without stacking threads.
         self._match_map_worker: Optional[MatchMapWorker] = None
         self._match_map_pending: bool = False
+        # Lazy market hydration: the match map is built from a metadata-only
+        # index, so a paired event's markets are loaded from the full dump
+        # only when the user opens it. The full dump is parsed at most once per
+        # map build (cached here, ~122ms one-time off the startup path) and the
+        # set tracks which events have already been hydrated so we don't redo
+        # the per-event pairing on every re-render. Both reset in
+        # _loadNovigMatchMap when a fresh map (and possibly fresh dump) lands.
+        self._novig_full_dump_cache: Optional[dict] = None
+        self._hydrated_event_ids: set = set()
+        # Novig events that ProphetX doesn't list. Fetched live (list_events),
+        # merged into all_events so they show in the dropdown like any other
+        # event; their markets are fetched live on selection. Keyed by str id.
+        self._nv_events: dict = {}
+        self._nv_events_worker: Optional[NovigEventsWorker] = None
+        self._nv_markets_worker: Optional[NovigEventMarketsWorker] = None
+        self._current_nv_norm = None  # selected NV-only NormalizedMarket
+
+        # --- Single initial populate gate ----------------------------------
+        # The dropdown used to paint three times on startup: stale PX, then
+        # fresh PX, then the NV merge — a visible PX-only -> combined flip.
+        # We now hold the FIRST event-list build until all three inputs are
+        # in: PX events, the live NV event list, and the PX<->NV match map
+        # (so paired events are deduped/badged on the very first paint). A
+        # watchdog forces the build if NV/map never arrive, so a slow or
+        # failed Novig fetch can't leave the menu empty. Once the initial
+        # build runs, later refreshes repopulate normally (already combined).
+        self._initial_events_populated = False
+        self._px_data_ready = False
+        self._nv_data_ready = False
+        self._match_map_ready = False
+        # Bounded retry counter for the initial-populate watchdog so it can
+        # wait out an in-progress Novig dump scrape without giving up forever.
+        self._force_populate_attempts = 0
+        # When a fresh Novig dump is being scraped on startup, the match map
+        # builds twice — once from the stale on-disk index, then again after
+        # the scrape writes + the new dump is parsed. The gate must wait for
+        # that SECOND build (the dump is current), so the dropdown paints once
+        # with final pairing. _dump_ready flips when the dump is confirmed
+        # current: either the staleness check skipped the scrape, or the
+        # scrape finished. Set eagerly by the watchdog so a failed scrape
+        # can't wedge the gate.
+        self._dump_ready = False
 
         self.initUI()
         # Defer Novig bootstrap: both calls must run AFTER the parent
@@ -3799,6 +4172,9 @@ class ProphetXBrowser(QWidget):
         # fast (and the dump worker is itself a QThread) so the user-
         # facing impact is zero.
         QTimer.singleShot(250, self._loadNovigMatchMap)
+        # Live fetch of Novig's own event list so NV-only events appear in the
+        # dropdown alongside ProphetX. Deferred past the PX wiring like above.
+        QTimer.singleShot(300, self._loadNovigEvents)
         # Dump-refresh is now CHAINED off the match-map worker's completion
         # (see _onMatchMapReady), not a blind +350ms timer. The old timer
         # raced the 38MB parse: it fired before _novig_event_map was built,
@@ -3825,8 +4201,16 @@ class ProphetXBrowser(QWidget):
     # than league code, so the set is matched against the canonical sport
     # bucket (see _novig_coverage_ok), not the raw tournament string.
     _NOVIG_LEAGUES = frozenset({
-        "MLB", "NBA", "NHL", "NFL", "NCAAF", "NCAAB", "NCAABSB", "WNBA",
-        "EPL", "MLS", "ATP", "WTA", "PGA", "UFC",
+        "MLB", "NBA", "NHL", "NFL", "NCAAF", "NCAAB", "NCAABSB", "WNBA", "NCAAWB",
+        "NCAA_FB",
+        "EPL", "MLS", "Bundesliga", "Champions League", "Europa League",
+        "La Liga", "Ligue 1", "Serie A", "FIFA World Cup",
+        "ATP", "WTA",
+        "PGA", "TGL",
+        "UFC", "Boxing", "WBC",
+        "Counter Strike 2", "Dota 2", "League of Legends",
+        "Olympics Hockey Men",
+        "ENTERTAINMENT",
     })
 
     # Minimum match-rate (PX events in Novig leagues paired to a Novig
@@ -3875,6 +4259,10 @@ class ProphetXBrowser(QWidget):
         try:
             from NovigClient import NOVIG_DUMP_DIR
         except Exception:
+            # Can't evaluate staleness — release the gate so we don't hang
+            # waiting on a scrape that will never run.
+            self._dump_ready = True
+            self._maybePopulateInitialEvents()
             return
 
         # Skip if we already have a fresh dump and the match map is
@@ -3887,10 +4275,20 @@ class ProphetXBrowser(QWidget):
                 if (age < self._NOVIG_DUMP_FRESH_SECONDS
                         and self._novig_event_map
                         and self._novig_coverage_ok()):
+                    # On-disk dump is current; the first (index) match map
+                    # already reflects it. Open the gate now — no scrape.
+                    self._dump_ready = True
+                    self._maybePopulateInitialEvents()
                     return
 
         if self._novig_dump_worker is not None and self._novig_dump_worker.isRunning():
-            return  # already scraping
+            return  # already scraping (its completion will release the gate)
+
+        # A scrape is needed. Before the first paint, hold the gate closed so
+        # the loading overlay persists through it (the dump is the slow step);
+        # _onNovigDumpReady / _onNovigDumpFailed reopen it when the scrape ends.
+        if not self._initial_events_populated:
+            self._dump_ready = False
 
         print("[LiquidityWidget] Starting Novig dump worker (async)...")
         worker = NovigDumpWorker(parent=self)
@@ -3908,12 +4306,41 @@ class ProphetXBrowser(QWidget):
         self._loadNovigMatchMap()
         self._kickoffNovigDumpRefreshIfStale()
 
+    def load_fresh_prophetx_dump(self, all_markets: dict) -> None:
+        """Single entry point for a freshly-scraped full PX dump (called by
+        EffortOdds on startup + manual refresh).
+
+        On the FIRST load this feeds the dump through the gated coordinator:
+        the event list is NOT painted and the loading overlay is NOT dropped
+        until the Novig event list + match map + (re)scraped NV dump are all
+        in. The coordinator then paints once — already combined — and
+        auto-opens the top event itself (see _autoSelectTopEvent). This is
+        what makes startup a single 'one fell swoop' load instead of a
+        PX-only paint followed by a matched repaint. Later loads (after the
+        initial build) repopulate normally."""
+        self.all_events = all_markets
+        self._px_data_ready = True
+        # Rebuild the match map against the fresh PX set + re-evaluate NV dump
+        # staleness (a newly-listed PX event may be unmatched -> re-scrape).
+        self.onProphetxDataRefreshed()
+        if self._initial_events_populated:
+            self._populateEventListOnly()
+            self.hideLoading()
+        else:
+            # Gated: paints + reveals only once every source is ready.
+            self._maybePopulateInitialEvents()
+
     def _onNovigDumpReady(self, n_events: int) -> None:
         """Slot fired when the async Novig scrape completes. Rebuilds
         the match map from the freshly-written dump; _loadNovigMatchMap
         itself re-renders the displayed market if one is selected."""
         print(f"[LiquidityWidget] Novig dump ready: {n_events} events. "
               f"Rebuilding match map...")
+        # The dump is now current. Force the initial-populate gate to wait
+        # for the map rebuilt from THIS dump (not the earlier stale-index
+        # one) so the dropdown's first paint reflects final pairing.
+        self._dump_ready = True
+        self._match_map_ready = False
         self._loadNovigMatchMap()
         print(f"[LiquidityWidget] Match map built: "
               f"{len(self._novig_event_map)} paired events")
@@ -3948,6 +4375,79 @@ class ProphetXBrowser(QWidget):
         # Quiet failure — widget stays PX-only, user can retry by
         # restarting EffortOdds or running the scraper manually.
         print(f"[LiquidityWidget] Novig dump refresh failed: {err}")
+        # Don't wedge the initial-populate gate on a failed scrape: release
+        # it with whatever data we already have (the stale-index match map
+        # from the first build is still in place).
+        self._dump_ready = True
+        self._maybePopulateInitialEvents()
+
+    def _loadNovigEvents(self) -> None:
+        """Kick off the live Novig event-list fetch (off-thread)."""
+        if (self._nv_events_worker is not None
+                and self._nv_events_worker.isRunning()):
+            return
+        worker = NovigEventsWorker(parent=self)
+        worker.events_ready.connect(self._onNvEventsReady)
+        self._nv_events_worker = worker
+        worker.start()
+
+    def _onNvEventsReady(self, events: dict) -> None:
+        """Store the live Novig event list and rebuild the dropdown so the
+        NV-only events appear. Paired events are dropped from the NV set in
+        _mergeNvEvents — they already show under their ProphetX entry."""
+        self._nv_events = events or {}
+        self._nv_events_worker = None
+        # Mark NV ready even on an empty result so the gate can still open
+        # (PX-only is a valid combined state — Novig simply listed nothing).
+        self._nv_data_ready = True
+        if not self._initial_events_populated:
+            self._maybePopulateInitialEvents()
+            return
+        if not self._nv_events:
+            return
+        # Rebuild the list (merge happens inside the populate path). Preserve
+        # the user's current selection across the rebuild.
+        sel = self.current_event_id
+        if self.compact_mode:
+            self._populateEventListOnly()
+        else:
+            self.populateEventList()
+        self._reselectEventById(sel)
+
+    def _mergeNvEvents(self) -> None:
+        """Fold the live Novig events into all_events (the dropdown's source).
+        Skips events that paired with ProphetX — those already show as [PX/NV]
+        under their PX entry. Called at the top of the list-build path so it
+        survives ProphetX overwriting all_events on each refresh."""
+        if not self._nv_events:
+            return
+        paired_nv = {ep.event_b.source_event_id
+                     for ep in self._novig_event_map.values()}
+        for eid, entry in self._nv_events.items():
+            if eid in paired_nv:
+                self.all_events.pop(eid, None)
+            elif eid not in self.all_events:
+                self.all_events[eid] = entry
+
+    def _reselectEventById(self, event_id) -> None:
+        """Re-select an event by id after a list rebuild without firing the
+        selection handler (the caller re-renders if needed)."""
+        if event_id is None:
+            return
+        target = str(event_id)
+        if self.compact_mode:
+            combo = getattr(self, "event_combo", None)
+            if combo is None:
+                return
+            combo.blockSignals(True)
+            try:
+                for i in range(combo.count()):
+                    ev = combo.itemData(i)
+                    if ev and str((ev.get("metadata") or {}).get("id")) == target:
+                        combo.setCurrentIndex(i)
+                        break
+            finally:
+                combo.blockSignals(False)
 
     def _loadNovigMatchMap(self) -> None:
         """Kick off an off-thread build of the {prophetx_event_id_str:
@@ -3968,6 +4468,12 @@ class ProphetXBrowser(QWidget):
             self._match_map_pending = True
             return
 
+        # A rebuild means a (possibly) fresh dump on disk — drop the cached
+        # full dump and per-event hydration markers so the next event opened
+        # re-reads current market data rather than a stale snapshot.
+        self._novig_full_dump_cache = None
+        self._hydrated_event_ids.clear()
+
         # Snapshot the PX side now (main thread) so the worker reads a
         # stable dict. self.all_events is preferred; the worker falls back
         # to the latest on-disk dump if it's empty (very early init).
@@ -3983,11 +4489,12 @@ class ProphetXBrowser(QWidget):
         if pairs:
             self._novig_event_map = {
                 ep.event_a.source_event_id: ep for ep in pairs}
-            # The event list/combo was populated before this map existed,
-            # so every row is still badged [PX]. Re-stamp the badges in
-            # place now that matches are known — otherwise the menu keeps
-            # claiming PX-only even as the orderbook renders the NV side.
-            self._refreshEventSourceBadges()
+            # Before the initial gated build there's no list to restamp —
+            # the coordinator below will build it once with correct badges.
+            # After it, restamp in place (a periodic dump refresh rebuilt the
+            # map) without a full repopulate.
+            if self._initial_events_populated:
+                self._refreshEventSourceBadges()
             # The map may now contain a match for the market the user is
             # already looking at (it commonly renders PX-only on the very
             # first event because this map is built async, after the first
@@ -3995,6 +4502,12 @@ class ProphetXBrowser(QWidget):
             # engages without a manual event re-selection.
             self._rerenderCurrentMarketForMatchMap()
         # else: empty result — keep any existing map, stay PX-only.
+
+        # Match map is in (even when empty): release the initial-populate
+        # gate. The first build needs it so paired events are deduped and
+        # badged [PX/NV] on the very first paint.
+        self._match_map_ready = True
+        self._maybePopulateInitialEvents()
 
         self._match_map_worker = None
         # A request arrived mid-build; run one more pass with current data.
@@ -4267,8 +4780,14 @@ class ProphetXBrowser(QWidget):
         self.showLoading("Initializing ProphetX...")
         self._pending_fresh_fetch = True
 
-        # Load stale data as fallback (populates event list but orderbook stays in loading)
+        # Load stale data as fallback (marks PX ready; the dropdown build is
+        # gated on NV + match map via the coordinator below).
         self._loadStaleDataAsFallback()
+
+        # Watchdog: never leave the dropdown empty if the NV list or match
+        # map are slow/fail. 4s comfortably clears the 250/300ms Novig
+        # bootstrap + its network round-trip in the common case.
+        QTimer.singleShot(4000, self._forceInitialPopulate)
 
         # Request fresh data fetch - parent widget should connect to this signal.
         # Delayed to 1.5s as part of startup staggering: the full FetchAllEventsAsync
@@ -4280,6 +4799,88 @@ class ProphetXBrowser(QWidget):
     def _requestFreshData(self):
         """Emit signal to request fresh data fetch"""
         self.refresh_all_requested.emit()
+
+    # ------------------------------------------------------------------
+    # Single initial-populate coordinator
+    # ------------------------------------------------------------------
+    def _maybePopulateInitialEvents(self) -> None:
+        """Run the FIRST event-list build only once PX events, the NV event
+        list, and the match map are all ready — so the dropdown paints once,
+        already combined and deduped, instead of flipping PX-only ->
+        combined. After the first build this is inert; callers fall back to
+        their normal repopulate path (see the `_initial_events_populated`
+        guards at each hook)."""
+        if self._initial_events_populated:
+            return
+        if not (self._px_data_ready and self._nv_data_ready
+                and self._match_map_ready and self._dump_ready):
+            return
+        self._initial_events_populated = True
+        self._populateEventListOnly()
+        # All sources are in and the menu is painted once. Auto-open the top
+        # event from the dump in hand, then let _gateOrderbookReveal drop the
+        # overlay — immediately for a PX-only top event, or once the matched
+        # event's Novig book depth lands, so the first frame is the finished
+        # combined view rather than a list+book that keep restructuring.
+        self._autoSelectTopEvent()
+
+    def _autoSelectTopEvent(self) -> None:
+        """Open the highest-volume event after the initial gated populate so
+        the orderbook renders on first load — straight from the dump already
+        in hand, no per-event refetch. Reveal is delegated to
+        _gateOrderbookReveal. No-op (just reveals) if the user already has a
+        selection or there are no events."""
+        if self.current_event_id is not None or not self.filtered_events:
+            self.hideLoading()
+            return
+        top = self.filtered_events[0]
+        self.current_event_data = top['data']
+        self.current_event_id = top['metadata'].get('id')
+        if self.compact_mode:
+            self.event_combo.blockSignals(True)
+            self.event_combo.setCurrentIndex(0)
+            self.event_combo.blockSignals(False)
+        else:
+            if self.event_list.count() > 0:
+                self.event_list.blockSignals(True)
+                self.event_list.setCurrentRow(0)
+                self.event_list.blockSignals(False)
+            name = top['metadata'].get('name', 'Unknown Event')
+            dt = _parse_event_start(top['metadata'].get('startTime'))
+            if dt is not None:
+                name += f" • {dt.strftime('%b %d, %Y %I:%M %p')}"
+            self.event_header.setText(name)
+        # Renders the orderbook from the dump (and fires the NV /book/batch
+        # refresh for a matched event) without a per-event refetch.
+        self.populateMarketSelector()
+        # Tell the worker which event to track for the periodic refresh.
+        if self.current_event_id:
+            self.event_selected.emit(self.current_event_id)
+        self._gateOrderbookReveal()
+
+    def _forceInitialPopulate(self) -> None:
+        """Watchdog: ensure the dropdown is never stuck empty if a Novig input
+        is slow or fails — WITHOUT cutting the intended single-load short. If
+        PX isn't in yet or a Novig dump scrape is genuinely still running, the
+        gate is being held on purpose, so reschedule rather than force an
+        early PX-only paint. A bounded retry count (~24s total) still forces a
+        build if a scrape hangs or the NV list/map never arrive."""
+        if self._initial_events_populated:
+            return
+        self._force_populate_attempts += 1
+        scraping = (self._novig_dump_worker is not None
+                    and self._novig_dump_worker.isRunning())
+        if ((not self._px_data_ready or scraping)
+                and self._force_populate_attempts <= 6):
+            QTimer.singleShot(4000, self._forceInitialPopulate)
+            return
+        if not self._px_data_ready:
+            return  # no PX data at all — nothing to paint yet
+        # Treat the missing inputs as "done" so the coordinator proceeds.
+        self._nv_data_ready = True
+        self._match_map_ready = True
+        self._dump_ready = True
+        self._maybePopulateInitialEvents()
 
     def _loadStaleDataAsFallback(self):
         """Load stale JSON data to populate event list (but don't populate orderbook yet)"""
@@ -4301,18 +4902,28 @@ class ProphetXBrowser(QWidget):
             with open(filepath, 'r') as f:
                 self.all_events = json.load(f)
 
-            # Only populate the event list, not the orderbook
-            self._populateEventListOnly()
+            # PX side is in. Defer the actual build to the coordinator so we
+            # paint once both sources are ready (or the watchdog fires). Once
+            # the initial build has happened, this is a normal refresh.
+            self._px_data_ready = True
+            if self._initial_events_populated:
+                self._populateEventListOnly()
+            else:
+                self._maybePopulateInitialEvents()
 
         except Exception as e:
             print(f"Error loading fallback data: {e}")
 
     def _populateEventListOnly(self):
         """Populate only the event selector/list without touching the orderbook"""
+        self._mergeNvEvents()
         self.filtered_events = []
 
         for event_id, event_data in self.all_events.items():
             metadata = event_data.get('event_metadata', {})
+
+            if not _event_passes_volume_filter(metadata):
+                continue
 
             event_name = metadata.get('name', 'Unknown Event')
             sport = metadata.get('sport', 'Unknown')
@@ -4320,8 +4931,7 @@ class ProphetXBrowser(QWidget):
             tournament = metadata.get('tournament', '')
 
             source = self._event_source_for(event_id)
-            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
-                     "NV": "[NV] "}.get(source, "")
+            badge = _SOURCE_BADGES.get(source, "")
             display_text = f"{badge}{event_name}\n{sport}"
             if tournament:
                 display_text += f" • {tournament}"
@@ -4335,8 +4945,14 @@ class ProphetXBrowser(QWidget):
                 'source': source,
             })
 
-        # Sort by stake/volume
-        self.filtered_events.sort(key=lambda x: x['metadata'].get('stake', 0), reverse=True)
+        # Sort games first (by volume desc), then futures (Championship
+        # Winner / MVP / etc.) below them — the dropdown drops in a "FUTURES"
+        # separator at the boundary. event_type=="Future" is the Novig flag;
+        # ProphetX events lack it and read as games.
+        self.filtered_events.sort(key=lambda x: (
+            (x['metadata'].get('event_type') == 'Future'),
+            -float(x['metadata'].get('stake') or 0.0),
+        ))
 
         # Update UI based on mode
         if self.compact_mode:
@@ -4368,9 +4984,12 @@ class ProphetXBrowser(QWidget):
         behind the loading overlay instead of on screen.
 
         For a Novig-matched event the reveal is driven by the NV book
-        landing (_onNovigBooksReady), with a grace-period fallback in case
-        the book fetch is empty/slow. PX-only events have no async second
-        act, so they reveal immediately."""
+        WORKER FINISHING (_reapNovigBookWorker) — that's when the dual book
+        is in its final form. The timer here is only a safety net for a hung
+        worker; it must sit comfortably ABOVE the typical 2-3s /book/batch
+        latency, otherwise it reveals the pre-book PX-only render early (the
+        original 2s value did exactly that). PX-only events have no async
+        second act, so they reveal immediately."""
         self._reveal_gen += 1
         eid = str(self.current_event_id or "")
         has_match = bool(self._novig_event_map and eid in self._novig_event_map)
@@ -4378,7 +4997,7 @@ class ProphetXBrowser(QWidget):
             self.hideLoading()
             return
         gen = self._reveal_gen
-        QTimer.singleShot(2000, lambda g=gen: self._revealIfCurrent(g))
+        QTimer.singleShot(9000, lambda g=gen: self._revealIfCurrent(g))
 
     def _revealIfCurrent(self, gen: int):
         """Hide the overlay iff this is still the active load (no newer
@@ -4387,62 +5006,22 @@ class ProphetXBrowser(QWidget):
                                                False):
             self.hideLoading()
 
-    def populateEventList(self):
-        """Populate event list from loaded data"""
-        self.filtered_events = []
-
-        for event_id, event_data in self.all_events.items():
-            metadata = event_data.get('event_metadata', {})
-
-            # Create display item
-            event_name = metadata.get('name', 'Unknown Event')
-            sport = metadata.get('sport', 'Unknown')
-            stake = metadata.get('stake', 0)
-            tournament = metadata.get('tournament', '')
-
-            source = self._event_source_for(event_id)
-            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
-                     "NV": "[NV] "}.get(source, "")
-            display_text = f"{badge}{event_name}\n{sport}"
-            if tournament:
-                display_text += f" • {tournament}"
-            display_text += f" • ${stake:,.0f} volume"
-
-            self.filtered_events.append({
-                'id': event_id,
-                'metadata': metadata,
-                'data': event_data,
-                'display': display_text,
-                'source': source,
-            })
-
-        # Sort by stake/volume
-        self.filtered_events.sort(key=lambda x: x['metadata'].get('stake', 0), reverse=True)
-
-        # Update UI based on mode
-        if self.compact_mode:
-            self.refreshCompactEventCombo()
-        else:
-            self.refreshEventList()
-            # Update stats
-            total_events = len(self.filtered_events)
-            total_stake = sum(e['metadata'].get('stake', 0) for e in self.filtered_events)
-            self.stats_label.setText(f"{total_events} events • ${total_stake:,.0f} total volume")
+    # populateEventList and _populateEventListOnly built the dropdown
+    # identically; they're now one implementation. The name is retained for
+    # the call sites that read as "(re)build the event list".
+    populateEventList = _populateEventListOnly
 
     def _event_source_for(self, event_id) -> str:
-        """Classify an event as 'PX', 'NV', or 'BOTH' based on whether
-        it has a Novig match in self._novig_event_map. all_events is
-        currently always PX-sourced (populated by
-        ProphetXQuery.ScrapeAllMarkets), so the only two real states
-        today are PX-only and BOTH; the 'NV' branch exists so that if
-        the widget ever merges NV-only events into all_events the
-        delegate already knows how to render them."""
+        """Classify an event as 'PX', 'NV', or 'BOTH'.
+        - NV: a Novig-native event merged in by _mergeNvEvents (ProphetX
+          doesn't list it).
+        - BOTH: a ProphetX event that paired with a Novig event.
+        - PX: ProphetX only."""
         sid = str(event_id)
+        if sid in self._nv_events:
+            return "NV"
         has_nv = bool(self._novig_event_map
                       and sid in self._novig_event_map)
-        # If we ever start ingesting NV-native events, tag them on the
-        # event_data side (e.g. event_data['exchange'] == 'NV') and
-        # branch here. For now everything in all_events came from PX.
         return "BOTH" if has_nv else "PX"
 
     def _refreshEventSourceBadges(self) -> None:
@@ -4456,15 +5035,14 @@ class ProphetXBrowser(QWidget):
         would reset the user's current selection and re-fire the
         orderbook render. So we walk the existing items and swap only the
         leading badge token, leaving selection and ordering untouched."""
-        badges = {"BOTH": "[PX/NV] ", "PX": "[PX] ", "NV": "[NV] "}
-        known = tuple(badges.values())
+        known = tuple(_SOURCE_BADGES.values())
 
         def _swap(text: str, source: str) -> str:
             for b in known:
                 if text.startswith(b):
                     text = text[len(b):]
                     break
-            return f"{badges.get(source, '')}{text}"
+            return f"{_SOURCE_BADGES.get(source, '')}{text}"
 
         # Keep the cached filtered_events source/display in sync so a
         # later full repopulate (refreshEventList) starts from truth.
@@ -4524,7 +5102,22 @@ class ProphetXBrowser(QWidget):
             self.event_list.setItemDelegate(
                 _EventSourceDelegate(self.event_list))
 
+        futures_separator_added = False
         for event in self.filtered_events:
+            is_future = (event['metadata'].get('event_type') == 'Future')
+            # filtered_events is sorted games-first, futures last, so the
+            # first future marks the boundary. Drop a non-selectable header
+            # once (only when games precede it) signalling everything below
+            # is a futures/outright market.
+            if (is_future and not futures_separator_added
+                    and self.event_list.count() > 0):
+                sep = QListWidgetItem("──────  FUTURES  ──────")
+                sep.setFlags(Qt.ItemFlag.NoItemFlags)
+                sep.setForeground(QColor(140, 140, 150))
+                sep.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.event_list.addItem(sep)
+                futures_separator_added = True
+
             item = QListWidgetItem(event['display'])
             item.setData(Qt.ItemDataRole.UserRole, event)
             source = event.get('source', 'PX')
@@ -4562,13 +5155,27 @@ class ProphetXBrowser(QWidget):
             view.setItemDelegate(delegate)
             self.event_combo.setItemDelegate(delegate)
 
+        futures_separator_added = False
         for event in self.filtered_events:
             metadata = event['metadata']
+            is_future = (metadata.get('event_type') == 'Future')
+            # Boundary header between games and futures (see refreshEventList).
+            # A disabled item so it can't be selected; onCompactEventSelected
+            # already no-ops on items whose data is None.
+            if (is_future and not futures_separator_added
+                    and self.event_combo.count() > 0):
+                self.event_combo.addItem("──────  FUTURES  ──────", None)
+                sep_i = self.event_combo.count() - 1
+                sep_model_item = self.event_combo.model().item(sep_i)
+                if sep_model_item is not None:
+                    sep_model_item.setEnabled(False)
+                    sep_model_item.setForeground(QColor(140, 140, 150))
+                futures_separator_added = True
+
             event_name = metadata.get('name', 'Unknown Event')
             stake = metadata.get('stake', 0)
             source = event.get('source', 'PX')
-            badge = {"BOTH": "[PX/NV] ", "PX": "[PX] ",
-                     "NV": "[NV] "}.get(source, "")
+            badge = _SOURCE_BADGES.get(source, "")
 
             display = f"{badge}{event_name} (${stake:,.0f})"
             self.event_combo.addItem(display, event)
@@ -4600,12 +5207,22 @@ class ProphetXBrowser(QWidget):
         self.current_event_data = event['data']
         self.current_event_id = new_event_id
 
+        # Novig-only event: ProphetX has no worker for it, so fetch its
+        # markets live from Novig and render them ourselves.
+        if event.get('source') == 'NV':
+            self._fetchNvEventMarkets(self.current_event_id)
+            return
+
+        # Populate immediately from dump data so market_combo is always in
+        # sync with current_event_id. Without this, any match-map callback
+        # that fires _rerenderCurrentMarketForMatchMap() during the async PX
+        # fetch would re-render the PREVIOUS event's market (still in the
+        # combo) and, for PX-only markets, also drop the loading overlay early.
+        self.populateMarketSelector()
+
         # Emit signal for external listeners (e.g., worker to refresh data)
         if self.current_event_id:
             self.event_selected.emit(self.current_event_id)
-
-        # Don't populate market selector yet - wait for fresh data
-        # The updateEventMarkets method will be called when fresh data arrives
 
     def filterEvents(self):
         """Filter events based on search text"""
@@ -4646,20 +5263,26 @@ class ProphetXBrowser(QWidget):
 
         # Update header
         event_name = metadata.get('name', 'Unknown Event')
-        start_time = metadata.get('startTime', '')
-        if start_time:
-            dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-            time_str = dt.strftime('%b %d, %Y %I:%M %p')
-            event_name += f" • {time_str}"
+        dt = _parse_event_start(metadata.get('startTime'))
+        if dt is not None:
+            event_name += f" • {dt.strftime('%b %d, %Y %I:%M %p')}"
 
         self.event_header.setText(event_name)
+
+        # Novig-only event: ProphetX has no worker for it, so fetch its
+        # markets live from Novig and render them ourselves.
+        if event.get('source') == 'NV':
+            self._fetchNvEventMarkets(self.current_event_id)
+            return
+
+        # Populate immediately from dump data — keeps market_combo in sync
+        # with current_event_id so any async callback that fires during the
+        # live fetch renders the correct event.
+        self.populateMarketSelector()
 
         # Emit signal for external listeners (e.g., worker to refresh data)
         if self.current_event_id:
             self.event_selected.emit(self.current_event_id)
-
-        # Don't populate market selector yet - wait for fresh data
-        # The updateEventMarkets method will be called when fresh data arrives
 
     def populateMarketSelector(self):
         """Initial-load entry point. Resets the diff state so the next
@@ -4858,6 +5481,44 @@ class ProphetXBrowser(QWidget):
 
         return total_active
 
+    def _fetchNvEventMarkets(self, event_id) -> None:
+        """Kick off a live Novig markets fetch for an NV-only event."""
+        prev = self._nv_markets_worker
+        if prev is not None and prev.isRunning():
+            try:
+                prev.markets_ready.disconnect()
+            except Exception:
+                pass
+        worker = NovigEventMarketsWorker(str(event_id), parent=self)
+        worker.markets_ready.connect(self._onNvMarketsReady)
+        self._nv_markets_worker = worker
+        worker.start()
+
+    def _onNvMarketsReady(self, event_id: str, nev) -> None:
+        """Populate the market selector + orderbook from a live Novig event
+        fetch. Drops stale results if the user has navigated away."""
+        self._nv_markets_worker = None
+        if event_id != str(self.current_event_id or ""):
+            return
+        markets = list(nev.markets) if nev is not None else []
+        markets.sort(key=lambda nm: nm.total_liquidity_usd, reverse=True)
+        # Force the PX diff-path to fully rebuild next time a PX event loads
+        # (its in-place update assumes PX dict combo items).
+        self._last_market_name_order = None
+        self._last_selected_market_sig = None
+        self.market_combo.blockSignals(True)
+        self.market_combo.clear()
+        for nm in markets:
+            self.market_combo.addItem(
+                f"{nm.market_name} (${nm.total_liquidity_usd:,.0f})", nm)
+        self.market_combo.blockSignals(False)
+        if self.market_combo.count() > 0:
+            self.market_combo.setCurrentIndex(0)
+            self.onMarketSelected(0)
+        else:
+            self._current_nv_norm = None
+            self.hideLoading()
+
     def onMarketSelected(self, index: int):
         """Handle market selection - displays all available lines.
 
@@ -4872,6 +5533,22 @@ class ProphetXBrowser(QWidget):
         market = self.market_combo.itemData(index)
         if not market:
             return
+
+        # Novig-only event: the combo holds a NormalizedMarket directly (no PX
+        # dict to normalize, no pair to look up). Render through the same
+        # pipeline — setMarketDual tints by source, so it shows as [NV].
+        try:
+            import exchange_market_keys as emk
+            if isinstance(market, emk.NormalizedMarket):
+                self._current_px_norm = None
+                self._current_market_pair = None
+                self._current_nv_norm = market
+                self.orderbook.setMarketDual(market, None)
+                if getattr(self.orderbook, "is_loading", False):
+                    self.hideLoading()
+                return
+        except Exception:
+            pass
 
         market_pair = self._lookupCurrentMarketPair(market)
         self._current_market_pair = market_pair
@@ -4902,7 +5579,12 @@ class ProphetXBrowser(QWidget):
         self.orderbook.setMarketDual(px_norm, nv_norm)
 
         if market_pair is None:
-            return  # PX-only, no async book to refresh.
+            # PX-only market — no async book to wait on, so this render IS
+            # the final form. Reveal now instead of leaving the overlay up
+            # for the grace timer.
+            if getattr(self.orderbook, "is_loading", False):
+                self.hideLoading()
+            return
 
         # Refresh in the background: pull /book/batch for each Novig
         # line under this market, and re-render when results arrive.
@@ -4918,6 +5600,10 @@ class ProphetXBrowser(QWidget):
         ep = self._novig_event_map.get(str(self.current_event_id))
         if ep is None:
             return None
+        # Lazy market hydration: the match map was built from a metadata-only
+        # index, so this pair's market_pairs are empty until we fill in the NV
+        # markets from the full dump. Done once per event, on first open.
+        self._hydrateEventPairMarkets(ep)
         # Match by ProphetX market id — that's stable across calls.
         px_market_id = str(prophetx_market.get("id") or "")
         if not px_market_id:
@@ -4926,6 +5612,37 @@ class ProphetXBrowser(QWidget):
             if mp.market_a.source_market_id == px_market_id:
                 return mp
         return None
+
+    def _hydrateEventPairMarkets(self, ep) -> None:
+        """Fill in the Novig markets + market pairs for one paired event.
+
+        The startup match map is built from a metadata-only index for speed, so
+        every EventPair starts with empty market_pairs. The first time the user
+        opens a paired event we read its markets out of the full dump and run
+        the deferred market/line pairing. The full dump is parsed at most once
+        per map build (cached); each event is hydrated at most once. On any
+        failure we still mark it hydrated so we don't thrash on every render —
+        the event simply stays PX-only, same as a genuine no-match."""
+        eid = getattr(ep.event_b, "source_event_id", None)
+        if not eid or eid in self._hydrated_event_ids:
+            return
+        self._hydrated_event_ids.add(eid)
+        if self._novig_full_dump_cache is None:
+            try:
+                from NovigClient import NovigQueries
+                self._novig_full_dump_cache = (
+                    NovigQueries.load_latest_dump() or {})
+            except Exception as e:
+                print(f"[LiquidityWidget] full dump load failed: {e!r}")
+                self._novig_full_dump_cache = {}
+        entry = self._novig_full_dump_cache.get(eid)
+        if not entry:
+            return
+        try:
+            import exchange_market_keys as emk
+            emk.hydrate_event_pair_markets(ep, entry, currency="CASH")
+        except Exception as e:
+            print(f"[LiquidityWidget] market hydration failed for {eid}: {e!r}")
 
     def _launchNovigBookRefresh(self, market_pair) -> None:
         """Fire a NovigMarketBookWorker for the lines on the matched NV
@@ -4966,9 +5683,25 @@ class ProphetXBrowser(QWidget):
 
     def _reapNovigBookWorker(self, worker) -> None:
         """finished-signal handler: drop our handle (if it's still this
-        worker) and schedule the QThread for deletion."""
+        worker) and schedule the QThread for deletion.
+
+        This also drives the orderbook reveal: the worker's `finished` fires
+        AFTER its books_ready slot (_onNovigBooksReady) has re-rendered the
+        dual book, so by here the table is in its FINAL combined form. Lift
+        the loading overlay now — the old fixed 2s grace timer fired BEFORE
+        the 2-3s /book/batch landed, exposing the pre-book PX-only dump
+        render and producing the visible PX-only -> combined flip. Guard on
+        event id so a superseded selection's late worker can't reveal a load
+        the user has navigated away from."""
         if self._novig_book_worker is worker:
             self._novig_book_worker = None
+        try:
+            if (getattr(self.orderbook, "is_loading", False)
+                    and str(getattr(worker, "prophetx_event_id", "")) ==
+                        str(self.current_event_id or "")):
+                self.hideLoading()
+        except Exception:
+            pass
         worker.deleteLater()
 
     def _onNovigBooksReady(self, prophetx_event_id: str, books: dict) -> None:
@@ -5076,8 +5809,18 @@ class ProphetXBrowser(QWidget):
             if isinstance(markets_data, dict) and 'data' not in markets_data:
                 # This looks like a full events dump
                 self.all_events = markets_data
-                self._populateEventListOnly()
-            self.hideLoading()
+                # Gate the first build on NV + match map + dump; afterwards
+                # this is a normal (already-combined) refresh.
+                self._px_data_ready = True
+                if self._initial_events_populated:
+                    self._populateEventListOnly()
+                    self.hideLoading()
+                else:
+                    # Keep the loading overlay up — the coordinator hides it
+                    # once every source is in and the menu paints once.
+                    self._maybePopulateInitialEvents()
+            else:
+                self.hideLoading()
             return
 
         # Store currently selected market name to restore after refresh
@@ -5085,8 +5828,14 @@ class ProphetXBrowser(QWidget):
         current_index = self.market_combo.currentIndex()
         if current_index >= 0:
             current_market = self.market_combo.itemData(current_index)
-            if current_market:
+            if isinstance(current_market, dict):
+                # ProphetX market — plain dump dict.
                 current_market_name = current_market.get('name')
+            elif current_market is not None:
+                # NV-native market — a NormalizedMarket object (added by
+                # _onNvMarketsReady), which has no .get(); read its name attr.
+                current_market_name = getattr(
+                    current_market, 'market_name', None)
 
         # Update the stored data for this event.
         #
@@ -5148,7 +5897,11 @@ class ProphetXBrowser(QWidget):
 
             if all_markets:
                 self.all_events = all_markets
-                self.populateEventList()
+                self._px_data_ready = True
+                if self._initial_events_populated:
+                    self.populateEventList()
+                else:
+                    self._maybePopulateInitialEvents()
 
         except Exception as e:
             print(f"Error refreshing data: {e}")

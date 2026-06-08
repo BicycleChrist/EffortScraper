@@ -2445,45 +2445,15 @@ class ModernOddsWindow(QMainWindow):
             )
 
             if all_markets:
-                # Update the widget with fresh data
-                self.liquidity_widget.all_events = all_markets
-                self.liquidity_widget._populateEventListOnly()
-                self.liquidity_widget.onProphetxDataRefreshed()
-
-                # Auto-select the top (highest-volume) event so the
-                # orderbook renders on first load. The full dump already
-                # carries the markets for every event, so we drive the
-                # selection programmatically and call populateMarketSelector
-                # directly — no per-event refetch needed.
-                lw = self.liquidity_widget
-                if lw.filtered_events:
-                    top = lw.filtered_events[0]
-                    lw.current_event_data = top['data']
-                    lw.current_event_id = top['metadata'].get('id')
-                    if not lw.compact_mode and lw.event_list.count() > 0:
-                        lw.event_list.blockSignals(True)
-                        lw.event_list.setCurrentRow(0)
-                        lw.event_list.blockSignals(False)
-                        event_name = top['metadata'].get('name', 'Unknown Event')
-                        start_time = top['metadata'].get('startTime', '')
-                        if start_time:
-                            try:
-                                from datetime import datetime as _dt
-                                dt = _dt.fromisoformat(start_time.replace('Z', '+00:00'))
-                                event_name += f" • {dt.strftime('%b %d, %Y %I:%M %p')}"
-                            except Exception:
-                                pass
-                        lw.event_header.setText(event_name)
-                    elif lw.compact_mode:
-                        lw.event_combo.blockSignals(True)
-                        lw.event_combo.setCurrentIndex(0)
-                        lw.event_combo.blockSignals(False)
-                    lw.populateMarketSelector()
-                    if lw.current_event_id:
-                        lw.event_selected.emit(lw.current_event_id)
-
-                self.liquidity_widget.hideLoading()
-
+                # Feed the fresh dump through the widget's gated startup
+                # coordinator. It holds the single event-list paint AND the
+                # loading overlay until the Novig event list + match map + NV
+                # dump are all in, then paints once (already combined) and
+                # auto-opens the top event itself. Painting / auto-selecting /
+                # revealing from here directly (the old path) bypassed that
+                # gate and is exactly what produced the PX-only-then-matched
+                # two-stage load.
+                self.liquidity_widget.load_fresh_prophetx_dump(all_markets)
                 print(f"ProphetX fresh scrape complete: {len(all_markets)} events")
             else:
                 print("ProphetX fresh scrape returned no data")

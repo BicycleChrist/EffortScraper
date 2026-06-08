@@ -4,6 +4,18 @@ import concurrent.futures
 from urllib.parse import urlparse, urljoin
 import re
 
+# Set True to dump every scraped <a> link to stdout. Off by default: the
+# per-link print loop in get_href_links was ~30 GIL-held, synchronized
+# stdout writes per scrape, which stalled the main-thread ticker (~364ms).
+DEBUG = False
+
+# Prefer lxml
+try:
+    BeautifulSoup("<a></a>", "lxml")
+    _BS_PARSER = "lxml"
+except Exception:
+    _BS_PARSER = "html.parser"
+
 
 def get_site(url):
     """Identify which site we're scraping"""
@@ -69,22 +81,22 @@ def get_href_links(url):
             print(f"Error: Received status code {response.status_code} from {url}")
             return []
 
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, _BS_PARSER)
 
         links = soup.find_all('a', href=True)
 
-        print(f"\nTotal raw links found: {len(links)}")
+        if DEBUG: print(f"\nTotal raw links found: {len(links)}")
 
         href_links = []
 
-        # Debugging output
         for a in links:
             href = a.get('href', '')
-            text = a.get_text(strip=True)
 
             result = filter_game_links(href)
 
-            print(f"[{result}] TEXT={text!r} HREF={href!r}")
+            if DEBUG:
+                text = a.get_text(strip=True)
+                print(f"[{result}] TEXT={text!r} HREF={href!r}")
 
             if result:
                 href_links.append(href)

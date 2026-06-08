@@ -940,14 +940,23 @@ def _novig_back_side_from_opposite(outcome: dict,
         # Stamp the order so it reflects THIS outcome (the one being
         # backed) at the complement price — the honest representation of
         # what the displayed row means.
+        # Takeable stake = the maker's contract qty priced at THIS side's
+        # taker price (the complement `prob`), NOT the raw qty. A bid of Q
+        # contracts resting on Y at opp_prob fills a back of X at price
+        # (1 - opp_prob), so the stake you can actually take is Q * prob.
+        # Bare qty/scale overstates size by 1/prob (~2x near even money) and
+        # was the source of the OB sizes not matching novig.com. Mirrors
+        # summarize_book's `implied_ask_size = o_bb_q * implied_ask_price`.
+        size_usd = (qty * prob) / _NBX_QTY_SCALE
         raw = dict(o)
         raw["price"] = prob
         raw["_opp_price"] = opp_prob
+        raw["_opp_qty"] = qty
         raw["_market_id"] = market_id
         raw["_outcome_id"] = outcome_id
         raw["_is_bid"] = True
         orders.append(NormalizedOrder(prob=prob, american=american,
-                                      size_usd=qty / _NBX_QTY_SCALE, raw=raw))
+                                      size_usd=size_usd, raw=raw))
     if not orders:
         return _novig_outcome_to_top_level_side(outcome)
     orders = _sort_side_orders(orders)
@@ -1459,7 +1468,7 @@ def _team_to_symbol_in_table(s: str,
 # before — only non-team sports gain new matching ability.
 
 _TEAM_LEAGUES = frozenset({
-    "MLB", "NBA", "NHL", "NFL", "WNBA", "NCAAF", "NCAAB", "NCAABSB",
+    "MLB", "NBA", "NHL", "NFL", "WNBA", "NCAAF", "NCAAB", "NCAABSB", "NCAAWB",
 })
 
 # Canonical buckets whose participants are individual people — matched by
@@ -1481,14 +1490,29 @@ def canonical_sport(league: Optional[str], sport: Optional[str],
     sp = (sport or "").lower().strip()
     if lg in _TEAM_LEAGUES:
         return lg
+    # College Baseball: PX sends tournament="College Baseball", NV sends league="NCAABSB"
+    if lg == "COLLEGE BASEBALL":
+        return "NCAABSB"
+    # NCAA_FB is NV's code for college football; map to same bucket as NCAAF
+    if lg == "NCAA_FB":
+        return "NCAAF"
     if lg in ("ATP", "WTA") or sp == "tennis":
         return "TENNIS"
-    if lg == "PGA" or sp == "golf":
+    if lg in ("PGA", "TGL") or sp == "golf":
         return "GOLF"
     if lg == "UFC" or sp in ("mma", "mixed martial arts"):
         return "MMA"
-    if lg in ("MLS", "EPL") or sp == "soccer":
+    _SOCCER_LGS = frozenset({
+        "MLS", "EPL", "BUNDESLIGA", "CHAMPIONS LEAGUE", "EUROPA LEAGUE",
+        "LA LIGA", "LIGUE 1", "SERIE A", "FIFA WORLD CUP",
+    })
+    if lg in _SOCCER_LGS or sp in ("soccer", "football"):
         return "SOCCER"
+    if lg in ("BOXING", "WBC") or sp == "boxing":
+        return "BOXING"
+    _ESPORTS_LGS = frozenset({"COUNTER STRIKE 2", "DOTA 2", "LEAGUE OF LEGENDS", "CS2"})
+    if lg in _ESPORTS_LGS or sp == "esports":
+        return "ESPORTS"
     return lg or sp.upper()
 
 
@@ -1705,10 +1729,18 @@ def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
 def match_events(events_a: list[NormalizedEvent],
                  events_b: list[NormalizedEvent],
                  tolerance_minutes: float = 120.0,
-                 min_confidence: float = 0.55) -> list[EventPair]:
+                 min_confidence: float = 0.55,
+                 populate_markets: bool = True) -> list[EventPair]:
     """For each event in `events_a`, find its best match in `events_b`
     (each B-event consumed at most once). Returns sorted by confidence
-    descending."""
+    descending.
+
+    populate_markets: when False, the per-pair market/line pairing is
+    skipped — the returned EventPairs carry empty `market_pairs`. Used by
+    the LiquidityWidget startup path, which pairs on event identity from a
+    metadata-only index (no markets present) and lazily fills the markets in
+    for a single event when the user opens it (see hydrate_event_pair_markets).
+    Event-level matching itself only reads identity fields, so this is sound."""
     max_delta = timedelta(minutes=tolerance_minutes)
     consumed_b: set[int] = set()
 
@@ -1732,9 +1764,43 @@ def match_events(events_a: list[NormalizedEvent],
             event_a=events_a[i], event_b=events_b[j],
             confidence=conf, time_delta_minutes=-neg_dmin,
         )
-        _populate_market_pairs(pair)
+        if populate_markets:
+            _populate_market_pairs(pair)
         pairs.append(pair)
     return pairs
+
+
+def hydrate_event_pair_markets(pair: EventPair, nv_dump_entry: dict,
+                               currency: str = "CASH") -> None:
+    """Fill in the Novig side's markets for a single paired event and (re)build
+    its market pairs in place.
+
+    The startup match map is built from a metadata-only index, so paired
+    events come back with `event_b.markets == []` and `market_pairs == []`.
+    When the user opens a paired event, the widget passes that event's full
+    dump entry here to populate the NV markets and run the market/line pairing
+    that `match_events(populate_markets=False)` deferred. `event_a` (ProphetX)
+    already carries its markets from the live PX snapshot, so only the NV side
+    needs hydrating. Idempotent enough — it rebuilds market_pairs from scratch."""
+    meta = nv_dump_entry.get("event_metadata") or {}
+    node = {
+        "id": meta.get("id"),
+        "description": meta.get("name"),
+        "scheduled_start": meta.get("startTime"),
+        "league": meta.get("tournament"),
+        "game": {"sport": meta.get("sport"),
+                 "homeTeam": {"symbol": meta.get("home_team_symbol"),
+                              "name": meta.get("home_team_name")},
+                 "awayTeam": {"symbol": meta.get("away_team_symbol"),
+                              "name": meta.get("away_team_name")}},
+        "markets": (nv_dump_entry.get("data") or {}).get("markets") or [],
+        "events": [],
+    }
+    nev = from_novig_event(node, books=None, currency=currency,
+                           league=meta.get("tournament"))
+    pair.event_b.markets = nev.markets
+    pair.market_pairs = []
+    _populate_market_pairs(pair)
 
 
 # ---------------------------------------------------------------------------

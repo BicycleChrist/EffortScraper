@@ -10,13 +10,142 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea
 )
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QPixmap, QPainter
 
 from KalshiClient import KalshiClient, KalshiStreamClient
 from polymarket_sports_client import PolymarketSportsClient
 import re
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
+
+# Smoother lines/markers for the historical odds plot.
+pg.setConfigOptions(antialias=True)
+
+# Central team-logo asset root (shared repo dir), resolved relative to THIS
+# file so it works regardless of the host app's working directory.
+LOGO_DIR = Path(__file__).resolve().parent.parent / "TeamLogos"
+
+# Canonical team name (as produced by EventMatcher.normalize_team_name) ->
+# logo filename under LOGO_DIR/<LEAGUE>/. Verified against the on-disk assets;
+# the three teams without a dedicated PNG (Phillies, Kraken, Utah) fall back to
+# their league logo. See generation note: built from EventMatcher canonicals.
+LOGO_FILE_BY_TEAM = {
+    'MLB': {
+        'arizona diamondbacks': 'Diamondbacks.png', 'atlanta braves': 'Braves.png',
+        'baltimore orioles': 'Orioles.png', 'boston red sox': 'Redsox.png',
+        'chicago white sox': 'WhiteSox.png', 'chicago cubs': 'Cubs.png',
+        'cincinnati reds': 'Reds.png', 'cleveland guardians': 'Guardians.png',
+        'colorado rockies': 'Rockies.png', 'detroit tigers': 'Tigers.png',
+        'houston astros': 'Astros.png', 'kansas city royals': 'Royals.png',
+        'los angeles angels': 'Angels.png', 'los angeles dodgers': 'Dodgers.png',
+        'miami marlins': 'Marlins.png', 'milwaukee brewers': 'Brewers.png',
+        'minnesota twins': 'Twins.png', 'new york yankees': 'Yankees.png',
+        'new york mets': 'Mets.png', 'oakland athletics': 'Athletics.png',
+        'philadelphia phillies': 'MLBleague.png', 'pittsburgh pirates': 'Pirates.png',
+        'san diego padres': 'Padres.png', 'san francisco giants': 'Giants.png',
+        'seattle mariners': 'Mariners.png', 'st. louis cardinals': 'Cardinals.png',
+        'tampa bay rays': 'Rays.png', 'texas rangers': 'RangersTX.png',
+        'toronto blue jays': 'BlueJays.png', 'washington nationals': 'Nationals.png',
+    },
+    'NBA': {
+        'atlanta hawks': 'Hawks.png', 'boston celtics': 'Celtics.png',
+        'brooklyn nets': 'Nets.png', 'charlotte hornets': 'Hornets.png',
+        'chicago bulls': 'Bulls.png', 'cleveland cavaliers': 'Cavaliers.png',
+        'dallas mavericks': 'Mavericks.png', 'denver nuggets': 'Nuggets.png',
+        'detroit pistons': 'Pistons.png', 'golden state warriors': 'Warriors.png',
+        'houston rockets': 'Rockets.png', 'indiana pacers': 'Pacers.png',
+        'la clippers': 'Clippers.png', 'la lakers': 'Lakers.png',
+        'memphis grizzlies': 'Grizzles.png', 'milwaukee bucks': 'Bucks.png',
+        'minnesota timberwolves': 'Timberwolves.png', 'new orleans pelicans': 'Pelicans.png',
+        'new york knicks': 'Knicks.png', 'oklahoma city thunder': 'Thunder.png',
+        'orlando magic': 'Magic.png', 'philadelphia 76ers': '76ers.png',
+        'phoenix suns': 'Suns.png', 'portland trail blazers': 'TrailBlazers.png',
+        'sacramento kings': 'SACKings.png', 'san antonio spurs': 'Spurs.png',
+        'toronto raptors': 'Raptors.png', 'utah jazz': 'Jazz.png',
+        'washington wizards': 'Wizards.png',
+    },
+    'NFL': {
+        'arizona cardinals': 'Cardinals.png', 'atlanta falcons': 'Falcons.png',
+        'baltimore ravens': 'Ravens.png', 'buffalo bills': 'Bills.png',
+        'carolina panthers': 'Panthers.png', 'chicago bears': 'Bears.png',
+        'cincinnati bengals': 'Bengals.png', 'cleveland browns': 'Browns.png',
+        'dallas cowboys': 'Cowboys.png', 'denver broncos': 'Broncos.png',
+        'detroit lions': 'Lions.png', 'green bay packers': 'Packers.png',
+        'houston texans': 'Texans.png', 'indianapolis colts': 'Colts.png',
+        'jacksonville jaguars': 'Jaguars.png', 'kansas city chiefs': 'Chiefs.png',
+        'las vegas raiders': 'Raiders.png', 'los angeles chargers': 'Chargers.png',
+        'los angeles rams': 'Rams.png', 'miami dolphins': 'Dolphins.png',
+        'minnesota vikings': 'Vikings.png', 'new england patriots': 'Patriots.png',
+        'new orleans saints': 'Saints.png', 'new york giants': 'NYGiants.png',
+        'new york jets': 'NYJets.png', 'philadelphia eagles': 'Eagles.png',
+        'pittsburgh steelers': 'Steelers.png', 'san francisco 49ers': '49ers.png',
+        'seattle seahawks': 'Seahawks.png', 'tampa bay buccaneers': 'Buccaneers.png',
+        'tennessee titans': 'Titans.png', 'washington commanders': 'Commanders.png',
+    },
+    'NHL': {
+        'carolina hurricanes': 'Hurricanes.png', 'columbus blue jackets': 'BlueJackets.png',
+        'new jersey devils': 'Devils.png', 'new york islanders': 'Islanders.png',
+        'new york rangers': 'Rangers.png', 'philadelphia flyers': 'Flyers.png',
+        'pittsburgh penguins': 'Penguins.png', 'washington capitals': 'Capitals.png',
+        'boston bruins': 'Bruins.png', 'buffalo sabres': 'Sabers.png',
+        'detroit red wings': 'RedWings.png', 'florida panthers': 'Panthers.png',
+        'montreal canadiens': 'Canadiens.png', 'ottawa senators': 'Senators.png',
+        'tampa bay lightning': 'Lightning.png', 'toronto maple leafs': 'MapleLeafs.png',
+        'arizona coyotes': 'Coyotes.png', 'chicago blackhawks': 'Blackhawks.png',
+        'colorado avalanche': 'Avalanche.png', 'dallas stars': 'Stars.png',
+        'minnesota wild': 'Wild.png', 'nashville predators': 'Predators.png',
+        'st. louis blues': 'Blues.png', 'winnipeg jets': 'Jets.png',
+        'anaheim ducks': 'Ducks.png', 'calgary flames': 'Flames.png',
+        'edmonton oilers': 'Oilers.png', 'los angeles kings': 'Kings.png',
+        'san jose sharks': 'Sharks.png', 'seattle kraken': 'NHLleague.png',
+        'utah hockey club': 'NHLleague.png', 'vancouver canucks': 'Canucks.png',
+        'vegas golden knights': 'GoldenKnights.png',
+    },
+}
+
+# Per-process pixmap cache so repeated market switches never re-decode a PNG.
+_LOGO_PIXMAP_CACHE = {}
+
+
+def resolve_team_logo(team_name, sport, size=64, opacity=0.72):
+    """Return a dimmed QPixmap for a team's logo, or None if unavailable.
+
+    Lookup chain: canonical name -> per-team PNG -> league PNG. Results
+    (including misses) are cached by (sport, canonical, size, opacity) so the
+    per-tick plot path never pays decode/scale cost.
+    """
+    sport = (sport or '').upper()
+    canonical = EventMatcher.normalize_team_name(team_name, sport)
+    cache_key = (sport, canonical, size, opacity)
+    if cache_key in _LOGO_PIXMAP_CACHE:
+        return _LOGO_PIXMAP_CACHE[cache_key]
+
+    filename = LOGO_FILE_BY_TEAM.get(sport, {}).get(canonical)
+    if not filename:
+        # Unknown team (e.g. an Over/Under or spread outcome): no logo.
+        _LOGO_PIXMAP_CACHE[cache_key] = None
+        return None
+
+    path = LOGO_DIR / sport / filename
+    src = QPixmap(str(path))
+    if src.isNull():
+        _LOGO_PIXMAP_CACHE[cache_key] = None
+        return None
+
+    scaled = src.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+    # Pre-dim into a transparent canvas so the watermark reads without
+    # fighting the odds lines (cheaper than per-paint opacity at render time).
+    dimmed = QPixmap(scaled.size())
+    dimmed.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(dimmed)
+    painter.setOpacity(opacity)
+    painter.drawPixmap(0, 0, scaled)
+    painter.end()
+
+    _LOGO_PIXMAP_CACHE[cache_key] = dimmed
+    return dimmed
 
 #TODO: Refactor TEAM_ALIASES dict so each league; everything is under the NFL right now LOL
 @dataclass
@@ -792,8 +921,13 @@ class MarketMatcher:
 
         # Polymarket moneyline: Simple format with just teams and vs/@ separator
         # Pattern: "Team1 vs. Team2" or "Team1 vs Team2" or "Team1 @ Team2"
-        # Note: [\w\s] allows numbers in team names (49ers, 76ers)
-        if re.match(r'^[\w\s]+\s+(?:vs\.?|@)\s+[\w\s]+$', text.strip()):
+        # Char class allows numbers (49ers, 76ers) AND punctuation that appears
+        # inside real team names: '.' (St. Louis), apostrophe (Oakland A's),
+        # '-' / '&'. Without the period, "Cincinnati Reds vs. St. Louis
+        # Cardinals" failed to match and never paired with the Kalshi moneyline.
+        # ':' / '?' are intentionally excluded so totals ("...: O/U 10.5") and
+        # prop questions ("...inning?: ...") still fall through to None.
+        if re.match(r"^[\w\s.'&-]+\s+(?:vs\.?|@)\s+[\w\s.'&-]+$", text.strip()):
             # Make sure it's not a spread or total (those have extra info)
             if 'spread' not in text and 'o/u' not in text and not re.search(r'\([+-]?\d+', text):
                 return 'moneyline'
@@ -1591,7 +1725,37 @@ class HistoricalOddsWidget(QWidget):
         self.plot_widget.setLabel('left', 'Odds')
         self.plot_widget.setLabel('bottom', 'Time')
         #self.plot_widget.addLegend()
-        self.plot_widget.addItem(pg.GridItem())
+        # showGrid draws gridlines aligned to the real axis ticks instead of a
+        # GridItem, which previously painted raw-unit ghost labels (e.g.
+        # "1.7807e+09") over the plot.
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
+
+        # Team-logo watermarks: one per side (top band = positive-odds team,
+        # bottom band = negative-odds team). Parented to the plot so they float
+        # in viewport pixels — never pan/zoom/distort. Built on market change,
+        # repositioned cheaply per update. See _update_side_logos().
+        self._logo_size = 64
+        self.logo_label_top = QLabel(self.plot_widget)
+        self.logo_label_bottom = QLabel(self.plot_widget)
+        for lbl in (self.logo_label_top, self.logo_label_bottom):
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            lbl.setStyleSheet("background: transparent;")
+            lbl.hide()
+
+        # Per-band summary overlays (net move + range + last-updated). Also
+        # fixed widget-space corner labels, docked just left of each logo, so
+        # they can NEVER overlap the graph lines no matter how the odds move.
+        # Content set in _draw_series_annotations; positioned in
+        # _position_overlays. See also the in-scene peak/trough triangles.
+        self.summary_label_top = QLabel(self.plot_widget)
+        self.summary_label_bottom = QLabel(self.plot_widget)
+        for lbl in (self.summary_label_top, self.summary_label_bottom):
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setStyleSheet(
+                "background: rgba(18,22,28,210); border:1px solid #39414b;"
+                " border-radius:3px; padding:3px 5px;")
+            lbl.hide()
 
         self.plot_layout.addWidget(self.plot_widget)
         content_layout.addWidget(self.plot_panel, 4)
@@ -1870,12 +2034,18 @@ class HistoricalOddsWidget(QWidget):
         all_unified_events = []
 
         # Load events from all 4 major sports
+        import time as _tp_all, sys as _sp_all
         for sport in ['NFL', 'NBA', 'MLB', 'NHL']:
             print(f"\nLoading {sport}...")
+            _all_t = _tp_all.perf_counter()
             events = await self._load_unified_events_for_sport(sport)
+            print(f"[allsports-probe] {sport} total await={(_tp_all.perf_counter()-_all_t)*1000:.0f}ms",
+                  file=_sp_all.stderr)
             all_unified_events.extend(events)
 
         print(f"\n📊 Total events loaded from all sports: {len(all_unified_events)}")
+        import time as _tp_post, sys as _sp_post
+        _post_t0 = _tp_post.perf_counter()
 
         # Filter out past events if configured to do so
         if not SHOW_PAST_EVENTS:
@@ -1919,6 +2089,7 @@ class HistoricalOddsWidget(QWidget):
                 print(f"🗑️  Filtered out {filtered_count} past events (older than {PAST_EVENT_CUTOFF_HOURS} hours)")
             print(f"📊 Showing {len(all_unified_events)} events")
 
+        _post_t1 = _tp_post.perf_counter()
         # Populate event selector with all events
         self.event_selector.blockSignals(True)
         self.event_selector.clear()
@@ -1928,6 +2099,10 @@ class HistoricalOddsWidget(QWidget):
             self.event_selector.addItem(display_title, userData=event)
 
         self.event_selector.blockSignals(False)
+        _post_t2 = _tp_post.perf_counter()
+        print(f"[post-probe] filter={(_post_t1-_post_t0)*1000:.0f}ms "
+              f"populate_selector={(_post_t2-_post_t1)*1000:.0f}ms "
+              f"(n={len(all_unified_events)})", file=_sp_post.stderr)
 
         # Enable controls
         self.set_enabled(True)
@@ -1983,10 +2158,22 @@ class HistoricalOddsWidget(QWidget):
                     break
             return {'events': events, 'count': len(events)}
 
+        import time as _tp_sync, sys as _sp_sync
+        # PROBE: time each task separately to see which holds the loop.
+        # A high "loop-starve" reading = wall time minus a 5ms-tick budget
+        # the monitor *should* have gotten; if the executor work holds the
+        # GIL, ticks during this await are delayed.
+        _kt0 = _tp_sync.perf_counter()
         kalshi_task = loop.run_in_executor(None, fetch_kalshi_moneylines)
         polymarket_task = self.polymarket_client.get_sport_games(sport)
 
-        kalshi_data, polymarket_games = await asyncio.gather(kalshi_task, polymarket_task)
+        kalshi_data = await kalshi_task
+        _kt1 = _tp_sync.perf_counter()
+        polymarket_games = await polymarket_task
+        _pt1 = _tp_sync.perf_counter()
+        print(f"[task-probe] {sport} kalshi_await={(_kt1-_kt0)*1000:.0f}ms "
+              f"poly_await={(_pt1-_kt1)*1000:.0f}ms", file=_sp_sync.stderr)
+        _sync_t0 = _tp_sync.perf_counter()
 
         kalshi_events = kalshi_data.get('events', [])
 
@@ -2068,6 +2255,10 @@ class HistoricalOddsWidget(QWidget):
         # Events without start_time go to the end
         unified_events.sort(key=lambda e: e.start_time if e.start_time else 'Z' * 30)
 
+        print(f"[sportmatch-probe] {sport} sync match/build="
+              f"{(_tp_sync.perf_counter()-_sync_t0)*1000:.0f}ms "
+              f"(k={len(kalshi_events)} p={len(active_polymarket_games)})",
+              file=_sp_sync.stderr)
         return unified_events
 
     async def load_unified_events(self, sport= None):
@@ -3705,8 +3896,17 @@ class HistoricalOddsWidget(QWidget):
     async def update_plot(self, snapshots):
         """Enhanced plotting with point change visualization"""
         self.plot_widget.clear()
-        self.plot_widget.addItem(pg.GridItem())
+        # Grid is drawn by showGrid() on the axes (set once in init_ui) and
+        # survives clear(), so no GridItem re-add is needed here.
+        # Track which outcome bands already got peak/trough + net-move
+        # annotations so the kalshi and polymarket series of the same band
+        # don't double them up (reset each redraw; clear() wiped the old items).
+        self._annotated_bands = set()
+        # Corner summary overlays are widget-space (clear() doesn't touch them),
+        # so hide them up front; bands that are still present re-show their own.
+        self._hide_summaries()
         if not snapshots:
+            self._hide_side_logos()
             await self._show_no_data_message()
             return
 
@@ -3731,6 +3931,120 @@ class HistoricalOddsWidget(QWidget):
                 await self._plot_outcome_series(bookmaker, outcome_key, points_data, color)
 
         await self.configure_plot_axes(snapshots)
+
+        # Position team-logo watermarks for the two outcomes (moneyline only;
+        # auto-hidden for Over/Under or spread markets where sides aren't teams).
+        self._update_side_logos(plot_data)
+
+    def _latest_value_by_team(self, plot_data):
+        """Collapse plot_data to {canonical_team: (display_name, latest_value)}.
+
+        Aggregates across bookmakers, keeping the most recent numeric American
+        value per team. Only outcomes that resolve to a known team are kept, so
+        non-team markets (totals/spreads) naturally yield <2 teams.
+        """
+        sport = getattr(self.current_unified_event, 'sport', None)
+        latest = {}  # canonical -> (display_name, timestamp, value)
+        for outcomes in plot_data.values():
+            for (name, _desc), data in outcomes.items():
+                if not name:
+                    continue
+                canonical = EventMatcher.normalize_team_name(name, sport)
+                if canonical not in LOGO_FILE_BY_TEAM.get((sport or '').upper(), {}):
+                    continue
+                ts = data.get('timestamps') or []
+                vals = data.get('american_prices') or []
+                if not ts or not vals:
+                    continue
+                try:
+                    value = float(str(vals[-1]).replace('+', ''))
+                except (ValueError, TypeError):
+                    continue
+                prev = latest.get(canonical)
+                if prev is None or ts[-1] >= prev[1]:
+                    latest[canonical] = (name, ts[-1], value)
+        return {c: (n, v) for c, (n, _t, v) in latest.items()}
+
+    def _update_side_logos(self, plot_data):
+        """Show each team's logo in its odds band (top=underdog, bottom=favorite).
+
+        Falls back to a static top/bottom split for neutral (pick'em) markets.
+        Resolution is cached, so the only per-call cost is two setPixmap/move.
+        """
+        sport = getattr(self.current_unified_event, 'sport', None)
+        teams = self._latest_value_by_team(plot_data)
+        if len(teams) != 2:
+            self._hide_side_logos()
+            return
+
+        (ca, (na, va)), (cb, (nb, vb)) = teams.items()
+        # Clear favorite/underdog: opposite signs => the negative (favorite)
+        # team sits in the bottom band, matching its line cluster. Otherwise
+        # (same sign / near pick'em) keep a stable top/bottom split by name.
+        if (va < 0) != (vb < 0):
+            top_team, bottom_team = (na, nb) if va > vb else (nb, na)
+        else:
+            top_team, bottom_team = (na, nb) if na <= nb else (nb, na)
+
+        pm_top = resolve_team_logo(top_team, sport, self._logo_size)
+        pm_bottom = resolve_team_logo(bottom_team, sport, self._logo_size)
+
+        self._apply_logo(self.logo_label_top, pm_top)
+        self._apply_logo(self.logo_label_bottom, pm_bottom)
+        self._position_side_logos()
+
+    def _apply_logo(self, label, pixmap):
+        if pixmap is None:
+            label.hide()
+            return
+        label.setPixmap(pixmap)
+        label.resize(pixmap.size())
+        label.show()
+
+    def _position_overlays(self):
+        """Pin logos to the corners and dock each summary just left of its logo.
+
+        Both are widget-space, so they stay clear of the graph lines regardless
+        of the data. Summaries fall back to the corner when a logo is hidden.
+        """
+        margin, gap = 10, 8
+        w = self.plot_widget.width()
+        h = self.plot_widget.height()
+
+        # Logos flush to the right edge; remember their left edge for the summary.
+        logo_top_left = w - margin
+        if self.logo_label_top.isVisible() and self.logo_label_top.pixmap():
+            pm = self.logo_label_top.pixmap()
+            logo_top_left = w - pm.width() - margin
+            self.logo_label_top.move(logo_top_left, margin)
+        logo_bot_left = w - margin
+        if self.logo_label_bottom.isVisible() and self.logo_label_bottom.pixmap():
+            pm = self.logo_label_bottom.pixmap()
+            logo_bot_left = w - pm.width() - margin
+            self.logo_label_bottom.move(logo_bot_left, h - pm.height() - margin)
+
+        if self.summary_label_top.isVisible():
+            s = self.summary_label_top
+            s.move(logo_top_left - gap - s.width(), margin)
+        if self.summary_label_bottom.isVisible():
+            s = self.summary_label_bottom
+            s.move(logo_bot_left - gap - s.width(), h - s.height() - margin)
+
+    # Back-compat alias: older call sites used the logo-only name.
+    _position_side_logos = _position_overlays
+
+    def _hide_side_logos(self):
+        self.logo_label_top.hide()
+        self.logo_label_bottom.hide()
+
+    def _hide_summaries(self):
+        self.summary_label_top.hide()
+        self.summary_label_bottom.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep watermarks + summaries pinned when the widget (and plot) resizes.
+        self._position_overlays()
 
     async def _organize_plot_data(self, snapshots):
         """Organize snapshot data using American odds directly"""
@@ -3869,6 +4183,12 @@ class HistoricalOddsWidget(QWidget):
 
                     prev_american_value = current_value
 
+            # Additive overlays: peak/trough markers (noise-gated) and a
+            # net-since-open badge. Drawn once per outcome band, independent of
+            # the change-label swarm above.
+            self._draw_series_annotations(
+                timestamps, american_values, color, outcome_key[0])
+
         # If we only have points data (no prices), plot those instead
         elif 'points' in points_data and points_data['points'] and len(points_data['points']) > 0:
             points = np.array(points_data['points'])
@@ -3885,6 +4205,95 @@ class HistoricalOddsWidget(QWidget):
                 symbolSize=6,
                 symbolBrush=color
             )
+
+    # Minimum swing (in American-odds points) before peak/trough markers are
+    # drawn. Below this a band is treated as flat and gets no markers, which
+    # suppresses minute-level jitter and dead-quiet markets.
+    PEAK_TROUGH_MIN_SWING = 6.0
+
+    def _draw_series_annotations(self, timestamps, american_values, color, outcome_name):
+        """Draw noise-gated peak/trough markers + a net-move summary badge.
+
+        Additive only — at most one ScatterPlotItem (the two triangles) and one
+        summary TextItem per outcome band. Deduped per BAND so the kalshi and
+        polymarket series of the same side don't double up. Safe to no-op on
+        short/degenerate series; on flat bands it shows the badge but no markers.
+        """
+        try:
+            ts = np.asarray(timestamps, dtype=float)
+            vals = np.asarray(american_values, dtype=float)
+        except (ValueError, TypeError):
+            return
+        n = vals.size
+        if n < 2 or ts.size != n:
+            return
+
+        # Dedup by BAND, not raw outcome name: kalshi/poly label the same side
+        # differently ("St. Louis" vs "St. Louis Cardinals"), so keying on the
+        # name annotated both. The two visible bands are the positive- and
+        # negative-odds clusters, so the sign is a stable per-band key.
+        band_key = 'pos' if float(vals[-1]) >= 0 else 'neg'
+        bands = getattr(self, '_annotated_bands', set())
+        if band_key in bands:
+            return
+        bands.add(band_key)
+
+        # --- Net move since open (density-agnostic: first vs last) ---
+        open_v, cur_v = float(vals[0]), float(vals[-1])
+        delta = cur_v - open_v
+        if delta > 0:
+            arrow, dcolor = '▲', (80, 200, 120)
+        elif delta < 0:
+            arrow, dcolor = '▼', (220, 90, 90)
+        else:
+            arrow, dcolor = '■', (170, 170, 170)
+
+        # --- Peak/trough (noise-gated, smoothed) ---
+        win = max(1, n // 50)
+        smoothed = np.convolve(vals, np.ones(win) / win, mode='same') if win > 1 else vals
+
+        def _snap(center, want_max):
+            lo = max(0, center - win)
+            hi = min(n, center + win + 1)
+            seg = vals[lo:hi]
+            return lo + (int(np.argmax(seg)) if want_max else int(np.argmin(seg)))
+
+        hi_i = _snap(int(np.argmax(smoothed)), True)
+        lo_i = _snap(int(np.argmin(smoothed)), False)
+        peak_v, trough_v = float(vals[hi_i]), float(vals[lo_i])
+        swing = peak_v - trough_v
+
+        if swing >= self.PEAK_TROUGH_MIN_SWING:
+            # Triangles mark WHERE the extremes are (on the line, by design); the
+            # numbers live in the fixed corner overlay, never over the lines.
+            markers = pg.ScatterPlotItem(
+                x=[float(ts[hi_i]), float(ts[lo_i])],
+                y=[peak_v, trough_v],
+                symbol=['t1', 't'],  # up-triangle = peak, down-triangle = trough
+                size=12,
+                brush=pg.mkBrush(color),
+                pen=pg.mkPen('w', width=1),
+            )
+            self.plot_widget.addItem(markers)
+
+        # Summary -> fixed corner overlay (top-right for +odds band, bottom-right
+        # for -odds band). Widget-space, so it can't collide with the graph.
+        updated = datetime.fromtimestamp(float(ts[-1])).strftime('%H:%M:%S')
+        dhex = '#%02x%02x%02x' % dcolor
+        summary_html = (
+            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:+.0f}&#8594;{cur_v:+.0f} "
+            f"<span style='color:{dhex}'>{arrow}{abs(delta):.0f}</span></div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>range {swing:.0f}</div>"
+            f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
+        )
+        self._set_summary_label(band_key, summary_html)
+
+    def _set_summary_label(self, band_key, html):
+        label = self.summary_label_top if band_key == 'pos' else self.summary_label_bottom
+        label.setText(html)
+        label.adjustSize()
+        label.show()
+        self._position_overlays()
 
     async def configure_plot_axes(self, snapshots):
         """Configure plot axes optimized for American odds display"""

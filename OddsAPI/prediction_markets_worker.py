@@ -126,8 +126,7 @@ class PredictionMarketsWorker(QThread):
         if hasattr(self, 'cancellation_flag'):
             self.cancellation_flag['should_stop'] = True
         self.quit()
-        # Don't wait indefinitely - give it 2 seconds max then force quit
-        if not self.wait(2000):  # 2 second timeout
-            print("Prediction markets worker didn't stop gracefully, terminating...")
+        # 500ms is enough for the sleep(1) loop to notice should_stop; the
+        # app is exiting at this point so we don't need to confirm termination.
+        if not self.wait(500):
             self.terminate()
-            self.wait(1000)  # Wait up to 1 more second for termination
