@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit,
-    QInputDialog
+    QInputDialog, QScrollArea
 )
 from propQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -249,6 +249,419 @@ class DataManager(QObject):
         return await odds_query(sport, region, markets, odds_format, date_format, session)
 
 
+# ── QueryList panel ───────────────────────────────────────────────────────────
+# Flat ordered list of (display_label, sport_key) for the sport picker,
+# restricted to sports that have GAME_MARKETS entries.
+_QUERY_SPORT_LIST = [
+    (label, key)
+    for _cat, _leagues in SPORTS_MARKETS.items()
+    for label, key in _leagues.items()
+    if key in GAME_MARKETS
+]
+
+_QL_BG      = "#0b1520"
+_QL_BG2     = "#101e2e"
+_QL_BORDER  = "#1e3048"
+_QL_HOVER   = "#1a2d42"
+_QL_DIM     = "#4a6070"
+_QL_MID     = "#8a9db5"
+_QL_BRIGHT  = "#c8daf0"
+_QL_ACCENT  = "#00c896"
+_QL_F       = "8pt"
+_QL_ROW_H   = 19
+_QL_SCROLL_H = 4 * _QL_ROW_H + 3 * 2   # 4 visible rows + gaps = 82px
+
+_QL_CB_STYLE = f"""
+QCheckBox {{
+    color:{_QL_MID}; background:transparent; padding:2px 2px; spacing:5px; font-size:{_QL_F};
+}}
+QCheckBox:hover {{ color:{_QL_BRIGHT}; }}
+QCheckBox::indicator {{
+    width:9px; height:9px; border:1px solid {_QL_DIM}; border-radius:1px; background:transparent;
+}}
+QCheckBox::indicator:checked {{
+    background-color:{_QL_ACCENT}; border-color:{_QL_ACCENT};
+}}
+"""
+
+_QL_BTN_STYLE = f"""
+QPushButton {{
+    background:{_QL_BG2}; color:{_QL_BRIGHT}; border:1px solid {_QL_BORDER};
+    border-radius:1px; padding:0 3px; text-align:left; font-size:{_QL_F};
+}}
+QPushButton:hover {{ background:{_QL_HOVER}; border-color:#2a4060; }}
+"""
+
+
+class _QLDropPanel(QFrame):
+    """Frameless floating panel that closes on outside click."""
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet(f"QFrame{{background:{_QL_BG};border:1px solid {_QL_BORDER};}}")
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if not self.geometry().contains(event.globalPosition().toPoint()):
+                self.hide()
+        return False
+
+    def popup_below(self, btn):
+        gp = btn.mapToGlobal(QPoint(0, btn.height() + 1))
+        self.move(gp)
+        self.show()
+        self.raise_()
+
+
+from PyQt6.QtCore import QPoint
+
+class _QLSportPanel(_QLDropPanel):
+    def __init__(self, slot, parent=None):
+        super().__init__(parent)
+        self.slot = slot
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(0)
+        for label, key in _QUERY_SPORT_LIST:
+            b = QPushButton(label)
+            b.setFixedHeight(19)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{_QL_MID};border:none;"
+                f"text-align:left;padding:0 6px;font-size:{_QL_F};}}"
+                f"QPushButton:hover{{background:{_QL_HOVER};color:{_QL_BRIGHT};}}"
+            )
+            b.clicked.connect(lambda _, l=label, k=key: (self.slot.set_sport(l, k), self.hide()))
+            lay.addWidget(b)
+        self.setFixedWidth(160)
+
+
+class _QLMarketsPanel(_QLDropPanel):
+    def __init__(self, slot, parent=None):
+        super().__init__(parent)
+        self.slot = slot
+        self.setFixedWidth(160)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(3)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("search…")
+        self._search.setFixedHeight(18)
+        self._search.setStyleSheet(
+            f"QLineEdit{{background:{_QL_BG2};color:{_QL_BRIGHT};"
+            f"border:1px solid {_QL_BORDER};border-radius:1px;"
+            f"padding:0 4px;font-size:{_QL_F};}}"
+            f"QLineEdit:focus{{border-color:#2a5080;}}"
+        )
+        self._search.textChanged.connect(self._filter)
+        outer.addWidget(self._search)
+
+        rule = QFrame()
+        rule.setFrameShape(QFrame.Shape.HLine)
+        rule.setFixedHeight(1)
+        rule.setStyleSheet(f"background:{_QL_BORDER};border:none;")
+        outer.addWidget(rule)
+
+        self._cb_widget = QWidget()
+        self._cb_widget.setStyleSheet("background:transparent;")
+        self._cb_lay = QVBoxLayout(self._cb_widget)
+        self._cb_lay.setContentsMargins(0, 0, 0, 0)
+        self._cb_lay.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self._cb_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(220)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            f"QScrollArea{{border:none;background:transparent;}}"
+            f"QScrollBar:vertical{{background:{_QL_BG};width:3px;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{_QL_DIM};border-radius:1px;min-height:12px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+        )
+        outer.addWidget(scroll)
+        self._sections: list = []
+        self.rebuild()
+
+    def rebuild(self):
+        while self._cb_lay.count():
+            w = self._cb_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self._sections = []
+        self._search.clear()
+        mmap = GAME_MARKETS.get(self.slot.sport_key,
+                                {"GAME LINES": ["h2h", "spreads", "totals"],
+                                 "ALT LINES": [], "SECONDARY": []})
+        populated = [s for s, keys in mmap.items() if keys]
+        for i, section in enumerate(populated):
+            keys = mmap[section]
+            sep = None
+            if i > 0:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setFixedHeight(1)
+                sep.setStyleSheet(f"background:{_QL_BORDER};border:none;margin:2px 0;")
+                self._cb_lay.addWidget(sep)
+            hdr = QLabel(section)
+            hdr.setStyleSheet(
+                f"color:{_QL_DIM};font-size:7pt;letter-spacing:2px;"
+                f"background:transparent;padding:3px 2px 1px 2px;"
+            )
+            self._cb_lay.addWidget(hdr)
+            rows = []
+            for key in keys:
+                cb = QCheckBox(GAME_MARKET_LABELS.get(key, key))
+                cb.setChecked(key in self.slot.markets)
+                cb.setStyleSheet(_QL_CB_STYLE)
+                cb.toggled.connect(lambda chk, k=key: self._toggle(k, chk))
+                self._cb_lay.addWidget(cb)
+                rows.append((cb, key))
+            self._sections.append((hdr, sep, rows))
+
+    def _filter(self, text):
+        query = text.strip().lower()
+        for hdr, sep, rows in self._sections:
+            any_vis = False
+            for cb, key in rows:
+                vis = not query or query in GAME_MARKET_LABELS.get(key, key).lower() or query in key.lower()
+                cb.setVisible(vis)
+                if vis:
+                    any_vis = True
+            hdr.setVisible(any_vis)
+            if sep:
+                sep.setVisible(any_vis)
+
+    def popup_below(self, btn):
+        super().popup_below(btn)
+        self._search.setFocus()
+        self._search.selectAll()
+
+    def _toggle(self, key, checked):
+        self.slot.markets.add(key) if checked else self.slot.markets.discard(key)
+        self.slot.refresh_mkts()
+
+
+class _QLRegionPanel(_QLDropPanel):
+    def __init__(self, rw, parent=None):
+        super().__init__(parent)
+        self.rw = rw
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(0)
+        hdr = QLabel("REGIONS")
+        hdr.setStyleSheet(
+            f"color:{_QL_DIM};font-size:7pt;letter-spacing:2px;"
+            f"background:transparent;padding:0 2px 2px 2px;"
+        )
+        lay.addWidget(hdr)
+        self._checks = {}
+        for r in ["us", "us2", "eu", "au", "uk"]:
+            cb = QCheckBox(r.upper())
+            cb.setChecked(r in rw.selected)
+            cb.setStyleSheet(_QL_CB_STYLE)
+            cb.toggled.connect(lambda chk, reg=r: self._toggle(reg, chk))
+            self._checks[r] = cb
+            lay.addWidget(cb)
+        self.setFixedWidth(110)
+
+    def _toggle(self, region, checked):
+        self.rw.selected.add(region) if checked else self.rw.selected.discard(region)
+        self.rw.refresh()
+
+    def sync(self):
+        for r, cb in self._checks.items():
+            cb.setChecked(r in self.rw.selected)
+
+
+class _QLRegionWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected = {"us"}
+        self._panel = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.btn = QPushButton()
+        self.btn.setFixedHeight(_QL_ROW_H)
+        self.btn.setStyleSheet(_QL_BTN_STYLE)
+        self.btn.clicked.connect(self._toggle)
+        lay.addWidget(self.btn)
+        self.refresh()
+
+    def refresh(self):
+        s = "·".join(r.upper() for r in sorted(self.selected)) or "—"
+        self.btn.setText(f"REGION  {s}  ▾")
+
+    def _toggle(self):
+        if not self._panel:
+            self._panel = _QLRegionPanel(self, self.window())
+        if self._panel.isVisible():
+            self._panel.hide()
+        else:
+            self._panel.sync()
+            self._panel.popup_below(self.btn)
+
+
+class _QLSlot(QWidget):
+    def __init__(self, qlist, parent=None):
+        super().__init__(parent)
+        self.qlist      = qlist
+        self.sport_key  = "baseball_mlb"
+        self.sport_label = "MLB"
+        self.markets    = {"spreads", "totals"}
+
+        self.setFixedHeight(_QL_ROW_H)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+
+        self.sport_btn = QPushButton("MLB")
+        self.sport_btn.setFixedWidth(64)
+        self.sport_btn.setFixedHeight(_QL_ROW_H)
+        self.sport_btn.setStyleSheet(_QL_BTN_STYLE)
+        self.sport_btn.clicked.connect(self._open_sport)
+        row.addWidget(self.sport_btn)
+
+        self.mkts_btn = QPushButton()
+        self.mkts_btn.setFixedWidth(118)
+        self.mkts_btn.setFixedHeight(_QL_ROW_H)
+        self.mkts_btn.setStyleSheet(_QL_BTN_STYLE)
+        self.mkts_btn.clicked.connect(self._open_mkts)
+        row.addWidget(self.mkts_btn)
+
+        rm = QPushButton("×")
+        rm.setFixedWidth(16)
+        rm.setFixedHeight(_QL_ROW_H)
+        rm.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{_QL_DIM};border:none;font-size:10pt;}}"
+            f"QPushButton:hover{{color:#e05555;}}"
+        )
+        rm.clicked.connect(lambda: qlist.remove_slot(self))
+        row.addWidget(rm)
+
+        self._sp = None
+        self._mp = None
+        self.refresh_mkts()
+
+    def set_sport(self, label, key):
+        self.sport_label = label
+        self.sport_key   = key
+        fm = QFontMetrics(self.sport_btn.font())
+        self.sport_btn.setText(
+            fm.elidedText(label, Qt.TextElideMode.ElideRight, self.sport_btn.width() - 10)
+        )
+        defaults = GAME_MARKETS.get(key, {}).get("GAME LINES", [])
+        self.markets = set(defaults[:2])
+        if self._mp:
+            self._mp.rebuild()
+        self.refresh_mkts()
+
+    def refresh_mkts(self):
+        order = list(GAME_MARKET_LABELS.keys())
+        parts = sorted(self.markets, key=lambda k: order.index(k) if k in order else 99)
+        text = ("·".join(GAME_MARKET_LABELS.get(k, k) for k in parts) or "—") + " ▾"
+        fm = QFontMetrics(self.mkts_btn.font())
+        self.mkts_btn.setText(
+            fm.elidedText(text, Qt.TextElideMode.ElideRight, self.mkts_btn.width() - 4)
+        )
+
+    def _open_sport(self):
+        if not self._sp:
+            self._sp = _QLSportPanel(self, self.window())
+        self._sp.hide() if self._sp.isVisible() else self._sp.popup_below(self.sport_btn)
+
+    def _open_mkts(self):
+        if not self._mp:
+            self._mp = _QLMarketsPanel(self, self.window())
+        if self._mp.isVisible():
+            self._mp.hide()
+        else:
+            self._mp.rebuild()
+            self._mp.popup_below(self.mkts_btn)
+
+
+class QueryList(QWidget):
+    """Compact query-slot panel: replaces region pills + market buttons."""
+
+    _ADD_STYLE = (
+        f"QPushButton{{background:{_QL_BG2};color:{_QL_ACCENT};"
+        f"border:1px solid {_QL_ACCENT};border-radius:2px;"
+        f"padding:1px 6px;font-size:7pt;letter-spacing:1px;font-weight:bold;}}"
+        f"QPushButton:hover{{background:{_QL_ACCENT};color:#000;}}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(208)
+        self.slots: list[_QLSlot] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Fixed-height scrollable slot area
+        self._slot_area = QWidget()
+        self._slot_area.setStyleSheet("background:transparent;")
+        self._slot_lay = QVBoxLayout(self._slot_area)
+        self._slot_lay.setContentsMargins(0, 0, 0, 0)
+        self._slot_lay.setSpacing(2)
+        self._slot_lay.addStretch()
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._slot_area)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFixedHeight(_QL_SCROLL_H)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setStyleSheet(
+            f"QScrollArea{{border:none;background:transparent;}}"
+            f"QScrollBar:vertical{{background:{_QL_BG};width:3px;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{_QL_DIM};border-radius:1px;min-height:12px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+        )
+        outer.addWidget(self._scroll)
+
+        self.add_btn = QPushButton("＋ ADD")
+        self.add_btn.setFixedHeight(16)
+        self.add_btn.setStyleSheet(self._ADD_STYLE)
+        self.add_btn.clicked.connect(self.add_slot)
+        outer.addWidget(self.add_btn)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{_QL_BORDER};border:none;")
+        outer.addWidget(sep)
+
+        self.region = _QLRegionWidget()
+        outer.addWidget(self.region)
+
+        self.add_slot()
+
+    def add_slot(self):
+        s = _QLSlot(self, self._slot_area)
+        self.slots.append(s)
+        self._slot_lay.insertWidget(self._slot_lay.count() - 1, s)
+        self._scroll.verticalScrollBar().setValue(
+            self._scroll.verticalScrollBar().maximum()
+        )
+
+    def remove_slot(self, slot):
+        if slot in self.slots:
+            self.slots.remove(slot)
+            self._slot_lay.removeWidget(slot)
+            slot.deleteLater()
+
+    def get_queries(self):
+        """Return list of (sport_key, sport_label, markets, regions) for non-empty slots."""
+        region_set = self.region.selected.copy()
+        return [
+            (s.sport_key, s.sport_label, s.markets.copy(), region_set)
+            for s in self.slots if s.markets
+        ]
+
+
 class ModernOddsWindow(QMainWindow):
     """Main window for displaying and managing odds data"""
 
@@ -316,10 +729,8 @@ class ModernOddsWindow(QMainWindow):
         self.leagues_loaded = False
         self.league_tabs = {}  # {league_name: LeagueTabData}
         self.current_league = None
-        self.selected_markets = {"spreads"}  # Initialize with default market
         self.init_ui()
         self.connect_signals()
-        self.selected_region = "us" # default region should always be a string
 
         self.icon_frame = 0
         self._icon_cache = {}  # frame index -> decoded QIcon; avoids re-reading PNG from disk every tick
@@ -358,14 +769,14 @@ class ModernOddsWindow(QMainWindow):
         self.layout.setContentsMargins(5, 5, 5, 5)  # Tight margins
 
         # --------- TOP SECTION ---------
-        # League selection dropdown
-        league_layout = QHBoxLayout()
-        league_layout.addWidget(QLabel("Select League:"))
+        # league_selector kept headless — still used by populate_leagues / handle_league_change
         self.league_selector = QComboBox()
-        league_layout.addWidget(self.league_selector)
 
-        # Add streaming toggle button to the right of league selector
-        league_layout.addStretch(1)  # Push the button to the right
+        league_layout = QHBoxLayout()
+        league_layout.setContentsMargins(0, 0, 0, 0)
+        league_layout.setSpacing(4)
+        self.query_list = QueryList()
+        league_layout.addWidget(self.query_list, 0, Qt.AlignmentFlag.AlignBottom)
 
         # Create toggle buttons
         self.stream_toggle_button = QPushButton("Show Streaming Links ▼")
@@ -434,8 +845,9 @@ class ModernOddsWindow(QMainWindow):
         right_side_layout.setContentsMargins(0, 0, 0, 0)  # No margins
         right_side_layout.setSpacing(2)  # Minimal spacing between buttons and widget
 
-        # Create a horizontal layout for the buttons
+        # Create a horizontal layout for the buttons — stretch pushes them to the right
         buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch(1)
         buttons_layout.addWidget(self.stream_toggle_button)
         buttons_layout.addWidget(self.news_toggle_button)
         buttons_layout.addWidget(self.history_toggle_button)  # Add historical odds toggle button
@@ -491,115 +903,12 @@ class ModernOddsWindow(QMainWindow):
         # Add the buttons layout to the right side layout
         right_side_layout.addLayout(buttons_layout)
 
-        # Add the right side container to the league layout
-        league_layout.addWidget(right_side_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+        # right_side_container gets stretch=1 so ticker fills the remaining width
+        league_layout.addWidget(right_side_container, 1)
+        # NOTE: self.layout.addLayout(league_layout) is deferred until ticker_section
+        # is built so it can be parented into right_side_layout before we commit.
 
-        self.layout.addLayout(league_layout)
-
-        # --------- REGION AND TICKER SECTION ---------
-        # Create horizontal layout for region selection and ticker tape
-        region_ticker_layout = QHBoxLayout()
-
-        # Left side: Region selection
-        region_section = QWidget()
-        region_section_layout = QVBoxLayout(region_section)
-        region_section_layout.setContentsMargins(0, 0, 0, 0)
-        region_section_layout.setSpacing(2)
-
-        # Region container (label removed)
-        region_container = QWidget()
-        region_layout = QGridLayout(region_container)
-        region_layout.setSpacing(6)
-        region_layout.setContentsMargins(0, 2, 0, 0)
-
-        # Define toggle pill style (original sizing)
-        toggle_pill_style = """
-            QPushButton {
-                background-color: #2C3E50;
-                color: white;
-                border: 1px solid #34495E;
-                padding: 3px 8px;
-                border-radius: 12px;
-                font-size: 9pt;
-                font-weight: bold;
-                min-width: 28px;
-                max-width: 44px;
-                min-height: 20px;
-                max-height: 20px;
-            }
-            QPushButton:checked {
-                background-color: #28a745;
-                color: white;
-                border: 1px solid #218838;
-            }
-            QPushButton:hover {
-                background-color: #34495E;
-            }
-            QPushButton:checked:hover {
-                background-color: #218838;
-            }
-        """
-
-        self.region_checkboxes = {}
-        regions = ['us', 'us2', 'eu', 'au', 'uk', 'all']
-
-        # Create toggle pill buttons in a 3x2 grid (3 columns, 2 rows)
-        for i, region in enumerate(regions):
-            pill_button = QPushButton(region.upper())
-            pill_button.setCheckable(True)
-            pill_button.setStyleSheet(toggle_pill_style)
-            if region == 'us':
-                pill_button.setChecked(True)
-            pill_button.clicked.connect(lambda checked, r=region: self.handle_region_change(r))
-            self.region_checkboxes[region] = pill_button
-            region_layout.addWidget(pill_button, i // 3, i % 3)
-
-        region_container.setFixedHeight(66)
-        region_container.setFixedWidth(200)
-        region_section_layout.addWidget(region_container)
-
-        # Add market buttons below region (H2h, Spreads, Totals)
-        market_buttons_widget = QWidget()
-        market_buttons_layout = QHBoxLayout(market_buttons_widget)
-        market_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        market_buttons_layout.setSpacing(4)
-
-        # Create regular market buttons
-        self.market_buttons = {}
-        for market in ["h2h", "spreads", "totals"]:
-            btn = QPushButton(market.capitalize())
-            btn.setCheckable(True)
-            btn.setChecked(market in self.selected_markets)
-            btn.setObjectName(f"market_{market}")
-            self.market_buttons[market] = btn
-            btn.setStyleSheet(self.BUTTON_STYLE)
-            market_buttons_layout.addWidget(btn)
-
-        market_buttons_layout.addStretch()
-        region_section_layout.addWidget(market_buttons_widget)
-
-        region_section.setFixedWidth(220)
-
-        region_ticker_layout.addWidget(region_section)
-
-        # Add vertical separator
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.VLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        separator.setStyleSheet("""
-            QFrame {
-                color: #34495E;
-                background-color: #34495E;
-                border: none;
-            }
-        """)
-        separator.setFixedWidth(2)
-        region_ticker_layout.addWidget(separator)
-
-        # Add some spacing after separator
-        region_ticker_layout.addSpacing(15)
-
-        # Right side: Ticker tape section with controls below
+        # --------- TICKER + CONTROLS SECTION ---------
         ticker_section = QWidget()
         ticker_section_layout = QVBoxLayout(ticker_section)
         ticker_section_layout.setContentsMargins(0, 0, 0, 0)
@@ -648,7 +957,6 @@ class ModernOddsWindow(QMainWindow):
         self.props_button.setObjectName("market_props")
         self.props_button.setEnabled(False)
         self.props_button.setStyleSheet(self.props_button_style)
-        self.market_buttons["props"] = self.props_button
         action_buttons_layout.addWidget(self.props_button)
 
         # Add Table Tennis Button
@@ -689,9 +997,10 @@ class ModernOddsWindow(QMainWindow):
         # Add controls_streaming_splitter to ticker_section
         ticker_section_layout.addWidget(controls_streaming_splitter)
 
-        region_ticker_layout.addWidget(ticker_section, 1)  # Give ticker section stretch
-
-        self.layout.addLayout(region_ticker_layout)
+        # Now that ticker_section is complete, nest it in right_side_layout so it
+        # sits to the RIGHT of query_list in the same horizontal row.
+        right_side_layout.addWidget(ticker_section, 1)
+        self.layout.addLayout(league_layout)
 
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
@@ -1004,12 +1313,6 @@ class ModernOddsWindow(QMainWindow):
         self.layout.addLayout(update_controls_layout)
 
 
-    def update_market_selection(self):
-        """Update selected markets based on button states"""
-        self.selected_markets = {market for market, btn in self.market_buttons.items()
-                               if btn.isChecked() and btn.isEnabled()}
-        print("Selected markets:", self.selected_markets)
-
     def handle_league_change(self):
         """Handle league selection changes"""
 
@@ -1035,36 +1338,6 @@ class ModernOddsWindow(QMainWindow):
         # Historical odds widget is self-contained and handles its own sport selection
 
         return
-
-    def handle_region_change(self, region):
-        """Handle region selection changes"""
-        if region == 'all' and self.region_checkboxes['all'].isChecked():
-            # Check all other regions when all is selected
-            for r, pill in self.region_checkboxes.items():
-                if r != 'all':
-                    pill.setChecked(True)
-            self.selected_region = "us,us2,eu,au,uk"  # Ensure it's a string, not a set
-        else:
-            # If all is unchecked, uncheck it when selecting individual regions
-            if region != 'all':
-                self.region_checkboxes['all'].setChecked(False)
-
-            # Get all selected regions except 'all'
-            selected = [r for r, pill in self.region_checkboxes.items()
-                       if pill.isChecked() and r != 'all']
-
-            # Join selected regions with commas or default to "us"
-            self.selected_region = ",".join(selected) if selected else "us"  # Ensure string format
-
-        print(f"Selected regions: {self.selected_region}")
-        return
-
-    def get_valid_markets(self, sport_key):
-        """Get valid markets for the selected sport"""
-        valid_markets = REGULAR_MARKETS.copy()
-        if sport_key in MAJOR_PROP_LEAGUES:
-            valid_markets.update(MAJOR_PROP_LEAGUES[sport_key].keys())
-        return valid_markets
 
     def handle_props_button(self):
         """Handle Props button click to open PropsWindow."""
@@ -1118,8 +1391,6 @@ class ModernOddsWindow(QMainWindow):
     def connect_signals(self):
         """Connect UI signals to their respective slots"""
         self.league_selector.currentTextChanged.connect(self.handle_league_change)
-        for btn in self.market_buttons.values():
-            btn.toggled.connect(self.update_market_selection)
         self.fetch_odds_button.clicked.connect(self.refresh_data)
         self.auto_update_check.stateChanged.connect(self.toggle_auto_update)
         self.update_interval.valueChanged.connect(self.update_timer_interval)
@@ -1204,10 +1475,11 @@ class ModernOddsWindow(QMainWindow):
             # Extract the league name without the market info
             if "(" in self.current_league:
                 base_league = self.current_league.split(" (")[0]
-                # Update league selector without triggering change event
                 self.league_selector.blockSignals(True)
                 self.league_selector.setCurrentText(base_league)
                 self.league_selector.blockSignals(False)
+                # Manually sync props button / team news since signal was blocked
+                self.handle_league_change()
 
             # UPDATE BEST LINES FOR CURRENT TAB - defer to avoid blocking tab switch
             if hasattr(self, 'best_lines_widget') and self.current_league in self.league_tabs:
@@ -1752,237 +2024,151 @@ class ModernOddsWindow(QMainWindow):
         self.update_status.setText("Updating odds...")
 
         try:
-            selected_league = self.league_selector.currentText()
-            sport_key = self.data_manager.league_map.get(selected_league)
-            if not sport_key:
-                print(f"No valid sport key found for the selected league: {selected_league}")
+            queries = self.query_list.get_queries()
+            if not queries:
                 self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-                self.update_status.setText("Error: Invalid league selection")
+                self.update_status.setText("No queries configured")
                 return
 
-            # Create a unique tab based on league and currently selected markets
-            current_markets = self.selected_markets.copy()
+            total_slots = len(queries)
+            changes = {}
 
-            # Create or get existing tab (now with markets parameter)
-            tab_data = self.create_league_tab(selected_league, sport_key, current_markets)
-
-            # Store current table state in a DataFrame before updating
-            current_df = None
-            if tab_data.table_rows:
-                current_df = tab_data.to_dataframe()
-
-            self.data_manager.sport_key = sport_key
-            self.data_manager.prop_client = PropClient(sport_key)
-
-            # Create a single aiohttp session for all API calls
             async with aiohttp.ClientSession() as session:
-                # Fetch scores data for live status detection - now uses session
-                scores_data = await scores_query(sport_key, session=session)
+                for slot_idx, (sport_key, league_name, current_markets, region_set) in enumerate(queries):
+                    region_str = ",".join(sorted(region_set)) if region_set else "us"
+                    slot_base = slot_idx / total_slots
 
-                # Create a new DataFrame for the updated data
-                new_table_rows = []
-                new_table_data = {}
+                    tab_data = self.create_league_tab(league_name, sport_key, current_markets)
+                    current_df = tab_data.to_dataframe() if tab_data.table_rows else None
 
-                games = await self.data_manager.prop_client.get_games(session)
-                print(f"Fetched games response: {games}")
+                    self.data_manager.sport_key = sport_key
+                    self.data_manager.prop_client = PropClient(sport_key)
 
-                if not isinstance(games, list):
-                    print(f"Unexpected response from get_games(): {games}")
-                    self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-                    self.update_status.setText("Error: Invalid response format")
-                    return
+                    scores_data = await scores_query(sport_key, session=session)
 
-                # Process odds data for each game
-                total_games = len(games)
-                bookmakers_seen = set()
-                game_odds_data = {}
+                    games = await self.data_manager.prop_client.get_games(session)
+                    print(f"[{league_name}] Fetched {len(games) if isinstance(games, list) else 0} games")
 
-                # Create a consolidated odds data structure for the best lines widget
-                consolidated_odds_data = {
-                    'bookmakers': []
-                }
-                bookmakers_map = {}  # To track and merge bookmakers across games
-
-                for index, game in enumerate(games):
-                    game_id = game.get('id', '')
-                    if not game_id:
-                        print("No game ID found in the response.")
+                    if not isinstance(games, list):
+                        print(f"[{league_name}] Unexpected response from get_games(): {games}")
                         continue
 
-                    # Update progress based on game processing
-                    progress_value = int((index + 1) / total_games * 100)
-                    self.progress.setValue(progress_value)
+                    total_games = len(games)
+                    new_table_rows = []
+                    new_table_data = {}
+                    bookmakers_seen = set()
+                    consolidated_odds_data = {'bookmakers': []}
+                    bookmakers_map = {}
 
-                    # Reuse the same session for prop client calls
-                    available_markets = current_markets.copy()  # Use the current_markets variable
-                    selected_region = self.selected_region
-                    # Throttle to stay under 30 req/s API limit
-                    if index > 0:
-                        await asyncio.sleep(0.034)
+                    for index, game in enumerate(games):
+                        game_id = game.get('id', '')
+                        if not game_id:
+                            continue
 
-                    odds = await self.data_manager.prop_client.get_event_odds(
-                        session,
-                        game_id,
-                        available_markets,
-                        region=selected_region,
-                        include_links=True,   # outcome betslip deep-links (double-click to open)
-                        include_sids=True,
-                    )
+                        slot_progress = (index + 1) / total_games if total_games else 1
+                        self.progress.setValue(int((slot_base + slot_progress / total_slots) * 100))
 
-                    if odds is None:
-                        print(f"No odds returned for game {game_id}, skipping...")
-                        continue
+                        if index > 0:
+                            await asyncio.sleep(0.034)
 
-                    game_odds_data[game_id] = odds
+                        odds = await self.data_manager.prop_client.get_event_odds(
+                            session, game_id, current_markets,
+                            region=region_str, include_links=True, include_sids=True,
+                        )
 
-                    # Extract key info from this game
-                    home_team = odds.get('home_team', 'Unknown')
-                    away_team = odds.get('away_team', 'Unknown')
+                        if odds is None:
+                            continue
 
-                    # Get game status using the new function
-                    status_result = get_game_status(odds, scores_data)
-                    if status_result is None:
-                        # Skip games that are completed or too old
-                        continue
-                    status_text, is_live, scores_text = status_result
+                        home_team = odds.get('home_team', 'Unknown')
+                        away_team = odds.get('away_team', 'Unknown')
 
-                    # Store status info in tab_data
-                    if not hasattr(tab_data, 'game_status'):
-                        tab_data.game_status = {}
-                    tab_data.game_status[game_id] = {
-                        'text': status_text,
-                        'is_live': is_live,
-                        'scores_text': scores_text
-                    }
+                        status_result = get_game_status(odds, scores_data)
+                        if status_result is None:
+                            continue
+                        status_text, is_live, scores_text = status_result
 
-                    # Create game header with status and scores
-                    game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
-                    if scores_text:
-                        game_header += f" - {scores_text}"
+                        if not hasattr(tab_data, 'game_status'):
+                            tab_data.game_status = {}
+                        tab_data.game_status[game_id] = {
+                            'text': status_text, 'is_live': is_live, 'scores_text': scores_text
+                        }
 
-                    new_table_rows.append(game_header)
-                    new_table_data[game_header] = {
-                        'is_header': True,
-                        'game_id': game_id,
-                        'status_info': tab_data.game_status[game_id]
-                    }
+                        game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
+                        if scores_text:
+                            game_header += f" - {scores_text}"
+                        new_table_rows.append(game_header)
+                        new_table_data[game_header] = {
+                            'is_header': True, 'game_id': game_id,
+                            'status_info': tab_data.game_status[game_id]
+                        }
 
-                    # Process all bookmakers and markets
-                    for bm in odds.get('bookmakers', []):
-                        bm_title = bm['title']
-                        bookmakers_seen.add(bm_title)
-                        if bm.get('link'):
-                            tab_data.bookmaker_links[(game_id, bm_title)] = bm['link']
+                        for bm in odds.get('bookmakers', []):
+                            bm_title = bm['title']
+                            bookmakers_seen.add(bm_title)
+                            if bm.get('link'):
+                                tab_data.bookmaker_links[(game_id, bm_title)] = bm['link']
+                            if bm_title not in bookmakers_map:
+                                bookmakers_map[bm_title] = {'title': bm_title, 'markets': []}
+                                consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
+                            for market in bm.get('markets', []):
+                                market_key = market['key']
+                                for outcome in market.get('outcomes', []):
+                                    outcome['game_id'] = game_id
+                                    outcome['game_name'] = f"{home_team} vs {away_team}"
+                                bookmakers_map[bm_title]['markets'].append(market)
+                                for outcome in market.get('outcomes', []):
+                                    unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
+                                    if unique_label not in new_table_rows:
+                                        new_table_rows.append(unique_label)
+                                        new_table_data[unique_label] = {'game_id': game_id}
+                                    new_table_data[unique_label][bm_title] = self.format_price(outcome)
+                                    if outcome.get('link'):
+                                        tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
 
-                        # Add to consolidated data for best lines widget
-                        if bm_title not in bookmakers_map:
-                            bookmakers_map[bm_title] = {
-                                'title': bm_title,
-                                'markets': []
-                            }
-                            consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
+                    self.consolidated_odds_data = consolidated_odds_data
+                    tab_data.consolidated_odds_data = consolidated_odds_data
 
-                        for market in bm.get('markets', []):
-                            market_key = market['key']
+                    new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
+                    for row_label in new_table_rows:
+                        row_data = new_table_data.get(row_label, {})
+                        for bm in bookmakers_seen:
+                            new_df.at[row_label, bm] = row_data.get(bm, "")
+                    new_df['game_id'] = [new_table_data.get(r, {}).get('game_id', '') for r in new_table_rows]
+                    new_df['is_header'] = [new_table_data.get(r, {}).get('is_header', False) for r in new_table_rows]
 
-                            # Add game_id to each outcome for reference (needed for best lines)
-                            # Also attach the game name so the best lines widget can label
-                            # totals rows (whose outcome 'name' is Over/Under, not a team).
-                            for outcome in market.get('outcomes', []):
-                                outcome['game_id'] = game_id
-                                outcome['game_name'] = f"{home_team} vs {away_team}"
+                    slot_changes = {}
+                    if current_df is not None:
+                        for row in new_df.index:
+                            if row in current_df.index:
+                                for bm in bookmakers_seen:
+                                    if bm in current_df.columns:
+                                        old_val = current_df.at[row, bm]
+                                        new_val = new_df.at[row, bm]
+                                        if old_val != new_val and old_val != "" and new_val != "":
+                                            slot_changes.setdefault(row, {})[bm] = (old_val, new_val)
+                    changes.update(slot_changes)
 
-                            # Add to consolidated data
-                            bookmakers_map[bm_title]['markets'].append(market)
+                    tab_data.bookmakers  = list(bookmakers_seen)
+                    tab_data.table_rows  = new_table_rows
+                    tab_data.table_data  = new_table_data
+                    self.update_table_with_changes(tab_data, slot_changes)
 
-                            for outcome in market.get('outcomes', []):
-                                # Create the row label
-                                unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
+                    if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
+                        try:
+                            self.best_lines = self.best_lines_widget.update_display(consolidated_odds_data)
+                        except Exception as e:
+                            print(f"Error updating best lines widget: {e}")
+                            traceback.print_exc()
 
-                                # Add row if not already present
-                                if unique_label not in new_table_rows:
-                                    new_table_rows.append(unique_label)
-                                    new_table_data[unique_label] = {'game_id': game_id}
-
-                                # Update price
-                                price = self.format_price(outcome)
-                                new_table_data[unique_label][bm_title] = price
-
-                                # Stash the outcome's betslip deep-link for this cell
-                                if outcome.get('link'):
-                                    tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
-
-                # Store the consolidated data for the best lines widget
-                self.consolidated_odds_data = consolidated_odds_data
-
-                tab_data.consolidated_odds_data = consolidated_odds_data  # Update bestlines when tab switched
-                # Create a new DataFrame from the collected data
-                new_df = pd.DataFrame(index=new_table_rows, columns=list(bookmakers_seen))
-
-                # Fill the new DataFrame
-                for row_label in new_table_rows:
-                    row_data = new_table_data.get(row_label, {})
-                    for bm in bookmakers_seen:
-                        new_df.at[row_label, bm] = row_data.get(bm, "")
-
-                # Add game_id and is_header columns
-                new_df['game_id'] = [new_table_data.get(row, {}).get('game_id', '') for row in new_table_rows]
-                new_df['is_header'] = [new_table_data.get(row, {}).get('is_header', False) for row in new_table_rows]
-
-                # Identify changes between current and new data
-                changes = {}
-                if current_df is not None:
-                    # Look for changed odds
-                    for row in new_df.index:
-                        if row in current_df.index:
-                            for bm in bookmakers_seen:
-                                if bm in current_df.columns:
-                                    old_val = current_df.at[row, bm]
-                                    new_val = new_df.at[row, bm]
-                                    if old_val != new_val and old_val != "" and new_val != "":
-                                        if row not in changes:
-                                            changes[row] = {}
-                                        changes[row][bm] = (old_val, new_val)
-
-                # Update tab_data with the new data
-                tab_data.bookmakers = list(bookmakers_seen)
-                tab_data.table_rows = new_table_rows
-                tab_data.table_data = new_table_data
-
-                # Update the table display with highlighting changes
-                self.update_table_with_changes(tab_data, changes)
-
-                # Print a debug message before updating best lines widget
-                print("About to update best lines widget with consolidated data")
-                print(f"Number of bookmakers in consolidated data: {len(consolidated_odds_data['bookmakers'])}")
-
-                # Update best lines widget with the consolidated data
-                if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
-                    print("Updating best lines widget...")
-                    try:
-                        self.best_lines = self.best_lines_widget.update_display(consolidated_odds_data)
-                        print("Best lines widget updated successfully")
-                    except Exception as e:
-                        print(f"Error updating best lines widget: {e}")
-
-                        traceback.print_exc()
-                else:
-                    print("Best lines widget not available")
-
-                self.progress.setValue(100)
-
-                # Reset status text if auto-update is enabled
-                if self.auto_update_check.isChecked():
-                    self.update_status_text()
-                    self.RestartTimer()
-                else:
-                    self.update_status.setStyleSheet("background-color: #28a745; color: white;")
-                    self.update_status.setText("Update complete")
-
-                # Log the number of changed lines
-                if changes:
-                    total_changes = sum(len(changes_dict) for changes_dict in changes.values())
-                    print(f"Total lines changed: {total_changes}")
+            self.progress.setValue(100)
+            if self.auto_update_check.isChecked():
+                self.update_status_text()
+                self.RestartTimer()
+            else:
+                self.update_status.setStyleSheet("background-color: #28a745; color: white;")
+                self.update_status.setText("Update complete")
+            if changes:
+                print(f"Total lines changed: {sum(len(v) for v in changes.values())}")
 
         except aiohttp.ClientError as e:
             print(f"Network error: {e}")
