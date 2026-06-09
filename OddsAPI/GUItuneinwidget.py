@@ -1,11 +1,11 @@
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import GUItunein
-from PyQt6.QtCore import Qt, QObject, QUrl, pyqtSignal, pyqtSlot, QThread
+from PyQt6.QtCore import Qt, QUrl, QPoint, QRect, pyqtSignal, pyqtSlot, QThread, QEvent
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QScrollBar,
-    QComboBox, QLabel, QPushButton, QLineEdit, QFrame, QListWidgetItem, QSizePolicy
+    QApplication, QVBoxLayout, QHBoxLayout, QListWidget,
+    QPushButton, QLineEdit, QFrame, QListWidgetItem, QSizePolicy
 )
 
 
@@ -85,14 +85,21 @@ class StreamLoadWorker(QThread):
             self.error_occurred.emit(f"Worker error: {e}")
 
 
-class TuneInWidget(QWidget):
-    """PyQt6 implementation of TuneIn widget for displaying streaming links"""
+class TuneInWidget(QFrame):
+    """Floating streaming-links dropdown. Drops below the toggle button on show."""
 
-    # Signal emitted when links are loaded
     linksLoaded = pyqtSignal(list)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self, toggle_btn=None):
+        # Parent to the main window so we can use mapTo() for correct positioning
+        # on both X11 and Wayland — no separate top-level window needed.
+        parent_win = toggle_btn.window() if toggle_btn else None
+        super().__init__(parent_win)
+        self._toggle_btn = toggle_btn
+        self.hide()
+        QApplication.instance().installEventFilter(self)
+        if parent_win:
+            parent_win.installEventFilter(self)  # reposition on resize/move
 
         # URLs to be parsed (streaming aggregator main pages)
         self.urls = [
@@ -179,58 +186,69 @@ class TuneInWidget(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Links list - takes up all the space
+        # Header row: search + refresh
+        header = QHBoxLayout()
+        header.setContentsMargins(2, 2, 2, 2)
+        header.setSpacing(4)
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Filter streams...")
+        self.search_box.setFixedHeight(22)
+        self.search_box.textChanged.connect(self.filter_links)
+        header.addWidget(self.search_box)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setFixedSize(70, 22)
+        self.refresh_button.clicked.connect(self.load_links)
+        header.addWidget(self.refresh_button)
+        main_layout.addLayout(header)
+
+        # Stream list — single-click to open, always-on scrollbar
         self.links_list = QListWidget(self)
         self.links_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.links_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.links_list.itemDoubleClicked.connect(self.open_stream_link)
+        self.links_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.links_list.itemClicked.connect(self.open_stream_link)
         self.links_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        # Calculate height for exactly 4 rows (each row ~20px + spacing)
-        row_height = 20
-        visible_rows = 4
-        self.links_list.setFixedHeight(row_height * visible_rows)
-
         main_layout.addWidget(self.links_list)
 
-        # Search box - floating/overlaid at top-right corner
-        self.search_box = QLineEdit(self.links_list)
-        self.search_box.setPlaceholderText("Filter streams...")
-        self.search_box.textChanged.connect(self.filter_links)
-        self.search_box.setFixedSize(200, 24)
-        self.search_box.raise_()  # Ensure it's on top
-
-        # Refresh button - floating/overlaid at bottom-right corner
-        self.refresh_button = QPushButton("Refresh", self.links_list)
-        self.refresh_button.clicked.connect(self.load_links)
-        self.refresh_button.setFixedSize(70, 24)
-        self.refresh_button.raise_()  # Ensure it's on top
-
-        # Fixed height to prevent distortion - reduced for more compact display
-        self.setFixedHeight(80)
-
-        # Set size policy
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setFixedWidth(460)
 
         # Start loading links in background (non-blocking)
         self.start_background_load()
 
-    def resizeEvent(self, event):
-        """Reposition floating controls when widget is resized"""
-        super().resizeEvent(event)
+    def _reposition(self):
+        if self._toggle_btn and self.parent():
+            btn = self._toggle_btn
+            pos = btn.mapTo(self.parent(), QPoint(0, btn.height() + 2))
+            # Cap height so we never exceed the parent's lower boundary
+            parent_bottom = self.parent().height()
+            available_h = max(100, parent_bottom - pos.y() - 4)
+            self.setFixedHeight(available_h)
+            self.move(pos)
 
-        # Get the listbox geometry
-        list_width = self.links_list.width()
-        list_height = self.links_list.height()
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonPress and self.isVisible():
+            gp = event.globalPosition().toPoint()
+            in_panel = self.rect().contains(self.mapFromGlobal(gp))
+            in_btn   = (self._toggle_btn is not None and
+                        self._toggle_btn.rect().contains(self._toggle_btn.mapFromGlobal(gp)))
+            if not in_panel and not in_btn:
+                self.hide()
+        # Stay anchored under the button when parent resizes or moves
+        if obj is self.parent() and self.isVisible():
+            if event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+                self._reposition()
+        return False
 
-        # Position search box at top-right, inside the listbox with small padding from top
-        search_x = list_width - self.search_box.width() - 8
-        self.search_box.move(search_x, 2)  # Small padding from top, stays inside
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if self._toggle_btn:
+            self._toggle_btn.setChecked(False)
+            self._toggle_btn.setText("Show Streaming Links ▼")
 
-        # Position refresh button at bottom-right corner with more padding
-        refresh_x = list_width - self.refresh_button.width() - 12  # More padding from right
-        refresh_y = list_height - self.refresh_button.height() - 4
-        self.refresh_button.move(refresh_x, refresh_y)
+    def popup_below(self, btn):
+        self._reposition()
+        self.show()
+        self.raise_()
 
     def start_background_load(self):
         """Start loading streams in background thread"""

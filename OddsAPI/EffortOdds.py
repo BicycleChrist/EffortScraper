@@ -39,8 +39,8 @@ from Creds import SUPER_KEY
 from marketKeys import *
 from EffortOddsPropsWindow import PropsWindow
 import pandas as pd
-from GUItuneinwidget import TuneInWidget
 from GUIteamnewswidget import TeamNewsWidget
+from GUItuneinwidget import TuneInWidget
 from GUIbestlineswidget import *
 from HistoricalOddsClient import *
 from TTwindow import TableTennisGUI
@@ -662,6 +662,8 @@ class QueryList(QWidget):
         ]
 
 
+
+
 class ModernOddsWindow(QMainWindow):
     """Main window for displaying and managing odds data"""
 
@@ -929,43 +931,35 @@ class ModernOddsWindow(QMainWindow):
         # land in the same window as the news fetch (6s) — see startup-stagger notes.
         QTimer.singleShot(8000, self.prediction_markets_worker.start)
 
-        # Horizontal splitter for action buttons/search (left) and streaming widget (right)
-        controls_streaming_splitter = QSplitter(Qt.Orientation.Horizontal)
-        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
-
-        # LEFT SIDE: Container for action buttons and search bar
+        # Action buttons row (Fetch Odds, Props, TT) — no splitter needed now that
+        # streaming widget is TuneInWidget — a self-contained floating dropdown.
         controls_container = QWidget()
         if DEBUG_OUTLINES: controls_container.setStyleSheet(""" QWidget { border: 4px solid #00FFFF; } """);
         controls_layout = QVBoxLayout(controls_container)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(2)
 
-        # Add action buttons (Fetch Odds, Props, TT)
         action_buttons_widget = QWidget()
         if DEBUG_OUTLINES: action_buttons_widget.setStyleSheet(""" QWidget { border: 4px solid #00FF00; } """);
         action_buttons_layout = QHBoxLayout(action_buttons_widget)
         action_buttons_layout.setContentsMargins(0, 0, 0, 0)
         action_buttons_layout.setSpacing(4)
 
-        # Add fetch button
         self.fetch_odds_button = QPushButton("Fetch Odds 🎰")
         self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)
         action_buttons_layout.addWidget(self.fetch_odds_button)
 
-        # Add props button
         self.props_button = QPushButton("Props ➣➣")
         self.props_button.setObjectName("market_props")
         self.props_button.setEnabled(False)
         self.props_button.setStyleSheet(self.props_button_style)
         action_buttons_layout.addWidget(self.props_button)
 
-        # Add Table Tennis Button
         self.tt_button = QPushButton("TT🏓")
         self.tt_button.setObjectName("market_tt")
         self.tt_button.setStyleSheet(self.props_button_style)
         action_buttons_layout.addWidget(self.tt_button)
 
-        # Add props availability label
         self.props_availability_label = QLabel("No Props available for this league")
         self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
         self.props_availability_label.setVisible(False)
@@ -974,28 +968,10 @@ class ModernOddsWindow(QMainWindow):
         action_buttons_layout.addStretch()
         controls_layout.addWidget(action_buttons_widget)
 
-        # NOTE: the odds-table filter bar lives in the tab widget's top-right
-        # corner now (see self.tab_widget setup below) to reclaim vertical space.
+        # TuneInWidget is itself the floating dropdown — no wrapper needed
+        self.tune_in_widget = TuneInWidget(self.stream_toggle_button)
 
-        # Add controls container to left side of splitter
-        controls_streaming_splitter.addWidget(controls_container)
-        if DEBUG_OUTLINES: controls_streaming_splitter.setStyleSheet(""" QWidget { border: 4px solid #FF0000; } """);
-
-        # RIGHT SIDE: Streaming widget - height should match controls_container
-        self.tune_in_widget = TuneInWidget()
-        self.tune_in_widget.setVisible(False)  # Hidden by default
-        self.tune_in_widget.setFixedWidth(650)
-        # Set maximum height to match the controls container height (not expanding)
-        self.tune_in_widget.setMaximumHeight(100)  # Height of action buttons + search bar
-        controls_streaming_splitter.addWidget(self.tune_in_widget)
-
-        # Configure splitter
-        controls_streaming_splitter.setSizes([1000, 650])
-        controls_streaming_splitter.setCollapsible(0, False)  # Controls can't collapse
-        controls_streaming_splitter.setCollapsible(1, True)  # Streaming widget can collapse
-
-        # Add controls_streaming_splitter to ticker_section
-        ticker_section_layout.addWidget(controls_streaming_splitter)
+        ticker_section_layout.addWidget(controls_container)
 
         # Now that ticker_section is complete, nest it in right_side_layout so it
         # sits to the RIGHT of query_list in the same horizontal row.
@@ -1806,15 +1782,13 @@ class ModernOddsWindow(QMainWindow):
         # self.update_status_text() # crashes
 
     def toggle_streaming_links(self):
-        """Toggle visibility of the streaming links widget"""
-        visible = self.stream_toggle_button.isChecked()
-        self.tune_in_widget.setVisible(visible)
-
-        # Update button text
-        if visible:
-            self.stream_toggle_button.setText("Hide Streaming Links ▲")
+        """Toggle the floating streaming-links dropdown."""
+        if self.tune_in_widget.isVisible():
+            self.tune_in_widget.hide()
         else:
-            self.stream_toggle_button.setText("Show Streaming Links ▼")
+            self.tune_in_widget.popup_below(self.stream_toggle_button)
+            self.stream_toggle_button.setChecked(True)
+            self.stream_toggle_button.setText("Hide Streaming Links ▲")
 
 
     def toggle_news_feed(self):
