@@ -255,7 +255,10 @@ SPORTS_MARKETS = {
         "NCAAB": "basketball_ncaab",
         "WNCAAB": "basketball_wncaab",
         "NCAAB Championship Winner": "basketball_ncaab_championship_winner",
-        "NBL (Australia)": "basketball_nbl"
+        "NBL (Australia)": "basketball_nbl",
+        "NBA Preseason": "basketball_nba_preseason",
+        "NBA Summer League": "basketball_nba_summer_league",
+        "NBA All Star": "basketball_nba_all_stars"
     },
     "Boxing": {
         "Boxing": "boxing_boxing"
@@ -269,7 +272,12 @@ SPORTS_MARKETS = {
         "One Day Internationals": "cricket_odi",
         "Pakistan Super League": "cricket_psl",
         "T20 Blast": "cricket_t20_blast",
-        "Test Matches": "cricket_test_match"
+        "Test Matches": "cricket_test_match",
+        "Asia Cup": "cricket_asia_cup",
+        "ICC Champions Trophy": "cricket_icc_trophy",
+        "ICC Women's World Cup": "cricket_icc_world_cup_womens",
+        "T20 World Cup": "cricket_t20_world_cup",
+        "The Hundred": "cricket_the_hundred"
     },
     "Golf": {
         "Masters Tournament Winner": "golf_masters_tournament_winner",
@@ -281,10 +289,15 @@ SPORTS_MARKETS = {
         "NHL": "icehockey_nhl",
         "NHL Championship Winner": "icehockey_nhl_championship_winner",
         "SHL": "icehockey_sweden_hockey_league",
-        "HockeyAllsvenskan": "icehockey_sweden_allsvenskan"
+        "HockeyAllsvenskan": "icehockey_sweden_allsvenskan",
+        "AHL": "icehockey_ahl",
+        "Liiga": "icehockey_liiga",
+        "Mestis": "icehockey_mestis",
+        "NHL Preseason": "icehockey_nhl_preseason"
     },
     "Lacrosse": {
-        "Premier Lacrosse League": "lacrosse_pll"
+        "Premier Lacrosse League": "lacrosse_pll",
+        "NCAA Lacrosse": "lacrosse_ncaa"
     },
     "Mixed Martial Arts": {
         "MMA": "mma_mixed_martial_arts"
@@ -293,7 +306,14 @@ SPORTS_MARKETS = {
         "US Presidential Elections Winner": "politics_us_presidential_election_winner"
     },
     "Rugby League": {
-        "NRL": "rugbyleague_nrl"
+        "NRL": "rugbyleague_nrl",
+        "State of Origin": "rugbyleague_nrl_state_of_origin"
+    },
+    "Rugby Union": {
+        "Six Nations": "rugbyunion_six_nations"
+    },
+    "Handball": {
+        "Handball-Bundesliga": "handball_germany_bundesliga"
     },
     "Soccer": {
         "Africa Cup of Nations": "soccer_africa_cup_of_nations",
@@ -348,7 +368,21 @@ SPORTS_MARKETS = {
         "UEFA Nations League": "soccer_uefa_nations_league",
         "Copa América": "soccer_conmebol_copa_america",
         "Copa Libertadores": "soccer_conmebol_copa_libertadores",
-        "MLS": "soccer_usa_mls"
+        "MLS": "soccer_usa_mls",
+        "Saudi Pro League": "soccer_saudi_arabia_pro_league",
+        "Premier League - Russia": "soccer_russia_premier_league",
+        "DFB-Pokal": "soccer_germany_dfb_pokal",
+        "Coppa Italia": "soccer_italy_coppa_italia",
+        "Copa del Rey": "soccer_spain_copa_del_rey",
+        "Coupe de France": "soccer_france_coupe_de_france",
+        "Leagues Cup": "soccer_concacaf_leagues_cup",
+        "CONCACAF Gold Cup": "soccer_concacaf_gold_cup",
+        "Copa Sudamericana": "soccer_conmebol_copa_sudamericana",
+        "FIFA Club World Cup": "soccer_fifa_club_world_cup",
+        "FIFA World Cup Qualifiers - Europe": "soccer_fifa_world_cup_qualifiers_europe",
+        "FIFA World Cup Qualifiers - South America": "soccer_fifa_world_cup_qualifiers_south_america",
+        "Frauen-Bundesliga": "soccer_germany_bundesliga_women",
+        "UEFA Champions League Women": "soccer_uefa_champs_league_women"
     },
     "Tennis": {
         "ATP Australian Open": "tennis_atp_aus_open_singles",
@@ -367,48 +401,124 @@ SPORTS_MARKETS = {
         "WTA French Open": "tennis_wta_french_open",
         "WTA US Open": "tennis_wta_us_open",
         "WTA Wimbledon": "tennis_wta_wimbledon",
-        "WTA Wuhan Open": "tennis_wta_wuhan_open"
+        "WTA Wuhan Open": "tennis_wta_wuhan_open",
+        "ATP Indian Wells": "tennis_atp_indian_wells",
+        "ATP Miami Open": "tennis_atp_miami_open",
+        "ATP Monte-Carlo Masters": "tennis_atp_monte_carlo_masters",
+        "ATP Madrid Open": "tennis_atp_madrid_open",
+        "ATP Italian Open": "tennis_atp_italian_open",
+        "ATP Barcelona Open": "tennis_atp_barcelona_open",
+        "ATP Hamburg Open": "tennis_atp_hamburg_open",
+        "ATP Munich": "tennis_atp_munich",
+        "ATP Dubai": "tennis_atp_dubai",
+        "ATP Qatar Open": "tennis_atp_qatar_open",
+        "WTA Indian Wells": "tennis_wta_indian_wells",
+        "WTA Miami Open": "tennis_wta_miami_open",
+        "WTA Madrid Open": "tennis_wta_madrid_open",
+        "WTA Italian Open": "tennis_wta_italian_open",
+        "WTA Charleston Open": "tennis_wta_charleston_open",
+        "WTA Stuttgart Open": "tennis_wta_stuttgart_open",
+        "WTA Dubai Championships": "tennis_wta_dubai",
+        "WTA Qatar Open": "tennis_wta_qatar_open",
+        "WTA Internationaux de Strasbourg": "tennis_wta_strasbourg",
+        "WTA Queen's Club Championships": "tennis_wta_queens_club_champ"
     }
 }
 
-# Redundant mightt delete later
+# Player-prop market set per league. A prop set is shared by every league of the
+# same sport (e.g. NFL props also apply to NCAAF/CFL/UFL), so map each table to
+# all relevant sport keys. Built programmatically so it stays in sync with
+# SPORTS_MARKETS and can't drift on a typo (the old "football_nfl" key never
+# matched the real sport key "americanfootball_nfl", so NFL props never loaded).
+_PROP_TABLE_LEAGUES = [
+    (NFL_MARKETS, ["americanfootball_nfl", "americanfootball_nfl_preseason",
+                   "americanfootball_ncaaf", "americanfootball_cfl",
+                   "americanfootball_ufl"]),
+    (NBA_MARKETS, ["basketball_nba", "basketball_wnba", "basketball_ncaab",
+                   "basketball_wncaab"]),
+    (MLB_MARKETS, ["baseball_mlb", "baseball_mlb_preseason"]),
+    (NHL_MARKETS, ["icehockey_nhl"]),
+    (AFL_MARKETS, ["aussierules_afl"]),
+    (RUGBY_LEAGUE_MARKETS, ["rugbyleague_nrl"]),
+    # Soccer props apply to every soccer league we track
+    (SOCCER_MARKETS, list(SPORTS_MARKETS["Soccer"].values())),
+]
 MAJOR_PROP_MARKETS = {
-    "basketball_nba": NBA_MARKETS,
-    "football_nfl": NFL_MARKETS,
-    "baseball_mlb": MLB_MARKETS,
-    "icehockey_nhl": NHL_MARKETS,
-    "aussierules_afl": AFL_MARKETS,
-    "rugbyleague_nrl": RUGBY_LEAGUE_MARKETS,
-    "soccer_usa_mls": SOCCER_MARKETS,
+    sport_key: table
+    for table, sport_keys in _PROP_TABLE_LEAGUES
+    for sport_key in sport_keys
 }
 
 # ── Game-level markets for the QueryList panel ────────────────────────────────
-# Each entry: {"GAME LINES": [...], "ALT LINES": [...], "SECONDARY": [...]}
-# GAME LINES  = core h2h/spreads/totals
-# ALT LINES   = half/period/inning splits
-# SECONDARY   = non-standard game markets (corners, cards, etc.)
+# Each entry is an ordered dict of {SECTION_NAME: [market_key, ...]}. The
+# QueryList panel renders one header per non-empty section, so section names are
+# free-form (GAME LINES / QUARTERS / HALVES / PERIODS / INNINGS / SETS / SECONDARY).
+#
+# Market-key naming follows the CURRENT Odds API docs:
+#   https://the-odds-api.com/sports-odds-data/betting-markets.html
+# The legacy "_1st_quarter / _1st_half / _1st_period" keys this file used before
+# are REJECTED by the live API (HTTP 422 INVALID_MARKET, verified 2026-06-09).
+# Period/quarter/half/inning markets are "additional markets" — they only return
+# data from the per-event endpoint /sports/{sport}/events/{id}/odds, not bulk /odds.
+#
+# Period suffixes:  quarters q1-q4, halves h1-h2, hockey periods p1-p3,
+#                   baseball innings 1st_1/1st_3/1st_5/1st_7_innings, tennis sets s1-s2.
 
-_NFL_GAME   = {"GAME LINES": ["h2h","spreads","totals"],
-               "ALT LINES":  ["h2h_1st_half","spreads_1st_half","totals_1st_half",
-                               "h2h_1st_quarter","spreads_1st_quarter","totals_1st_quarter"],
-               "SECONDARY":  []}
-_MLB_GAME   = {"GAME LINES": ["h2h","spreads","totals"],
-               "ALT LINES":  ["h2h_1st_5_innings","spreads_1st_5_innings","totals_1st_5_innings"],
-               "SECONDARY":  []}
-_NBA_GAME   = {"GAME LINES": ["h2h","spreads","totals"],
-               "ALT LINES":  ["h2h_1st_half","spreads_1st_half","totals_1st_half",
-                               "h2h_1st_quarter","spreads_1st_quarter","totals_1st_quarter"],
-               "SECONDARY":  []}
-_NHL_GAME   = {"GAME LINES": ["h2h","spreads","totals"],
-               "ALT LINES":  ["h2h_3way","h2h_1st_period","totals_1st_period",
-                               "h2h_2nd_period","totals_2nd_period"],
-               "SECONDARY":  []}
-_SOCCER_GAME = {"GAME LINES": ["h2h","spreads","totals"],
-                "ALT LINES":  ["h2h_3way","draw_no_bet","h2h_1st_half","totals_1st_half"],
-                "SECONDARY":  ["alternate_spreads_corners","alternate_totals_corners",
-                                "alternate_spreads_cards","alternate_totals_cards","double_chance"]}
-_TENNIS_GAME = {"GAME LINES": ["h2h","spreads"], "ALT LINES": [], "SECONDARY": []}
-_BASIC_GAME  = {"GAME LINES": ["h2h","spreads","totals"], "ALT LINES": [], "SECONDARY": []}
+# Documented full set of period market bases, in docs order. Quarters/halves/
+# periods support team totals; innings do not.
+_PERIOD_BASES = ["h2h", "h2h_3_way", "spreads", "alternate_spreads",
+                 "totals", "alternate_totals", "team_totals", "alternate_team_totals"]
+_INNING_BASES = ["h2h", "h2h_3_way", "spreads", "alternate_spreads",
+                 "totals", "alternate_totals"]
+
+def _period_markets(suffixes, bases=_PERIOD_BASES):
+    """Expand period suffixes into every documented market key, grouped by period."""
+    return [f"{base}_{suf}" for suf in suffixes for base in bases]
+
+_FOOTBALL_GAME = {
+    "GAME LINES": ["h2h", "spreads", "totals", "alternate_spreads",
+                   "alternate_totals", "team_totals", "alternate_team_totals"],
+    "QUARTERS":   _period_markets(["q1", "q2", "q3", "q4"]),
+    "HALVES":     _period_markets(["h1", "h2"]),
+    "SECONDARY":  [],
+}
+_NBA_GAME = {
+    "GAME LINES": ["h2h", "spreads", "totals", "alternate_spreads",
+                   "alternate_totals", "team_totals", "alternate_team_totals"],
+    "QUARTERS":   _period_markets(["q1", "q2", "q3", "q4"]),
+    "HALVES":     _period_markets(["h1", "h2"]),
+    "SECONDARY":  [],
+}
+_MLB_GAME = {
+    "GAME LINES": ["h2h", "spreads", "alternate_spreads", "totals",
+                   "alternate_totals", "team_totals", "alternate_team_totals"],
+    "INNINGS":    _period_markets(["1st_1_innings", "1st_3_innings",
+                                   "1st_5_innings", "1st_7_innings"], _INNING_BASES),
+    "SECONDARY":  [],
+}
+_NHL_GAME = {
+    "GAME LINES": ["h2h", "h2h_3_way", "spreads", "alternate_spreads", "totals",
+                   "alternate_totals", "team_totals", "alternate_team_totals"],
+    "PERIODS":    _period_markets(["p1", "p2", "p3"]),
+    "SECONDARY":  [],
+}
+_SOCCER_GAME = {
+    "GAME LINES": ["h2h", "h2h_3_way", "draw_no_bet", "double_chance", "btts",
+                   "spreads", "alternate_spreads", "totals", "alternate_totals",
+                   "team_totals", "alternate_team_totals"],
+    "SECONDARY":  ["alternate_spreads_corners", "alternate_totals_corners",
+                   "alternate_spreads_cards", "alternate_totals_cards"],
+}
+_TENNIS_GAME = {
+    "GAME LINES": ["h2h", "spreads", "totals"],
+    "SETS":       ["h2h_s1", "h2h_s2", "spreads_s1", "totals_s1", "alternate_totals_s1"],
+    "SECONDARY":  [],
+}
+_BASIC_GAME   = {"GAME LINES": ["h2h"], "SECONDARY": []}
+_CRICKET_GAME = {"GAME LINES": ["h2h", "spreads", "totals"], "SECONDARY": []}
+
+# Back-compat aliases (older code referenced _NFL_GAME)
+_NFL_GAME = _FOOTBALL_GAME
 
 GAME_MARKETS = {
     "americanfootball_nfl":              _NFL_GAME,
@@ -470,37 +580,114 @@ GAME_MARKETS = {
     "tennis_wta_cincinnati_open":        _TENNIS_GAME,
     "mma_mixed_martial_arts":            _BASIC_GAME,
     "boxing_boxing":                     _BASIC_GAME,
-    "rugbyleague_nrl":                   _BASIC_GAME,
-    "lacrosse_pll":                      _BASIC_GAME,
-    "cricket_ipl":                       _BASIC_GAME,
-    "cricket_big_bash":                  _BASIC_GAME,
-    "cricket_test_match":                _BASIC_GAME,
-    "cricket_caribbean_premier_league":  _BASIC_GAME,
+    "rugbyleague_nrl":                   _CRICKET_GAME,
+    "lacrosse_pll":                      _CRICKET_GAME,
+    "cricket_ipl":                       _CRICKET_GAME,
+    "cricket_big_bash":                  _CRICKET_GAME,
+    "cricket_test_match":                _CRICKET_GAME,
+    "cricket_caribbean_premier_league":  _CRICKET_GAME,
+    # ── Leagues added from the live /v4/sports listing ──
+    "basketball_nba_preseason":          _NBA_GAME,
+    "basketball_nba_summer_league":      _NBA_GAME,
+    "basketball_nba_all_stars":          _NBA_GAME,
+    "icehockey_ahl":                     _NHL_GAME,
+    "icehockey_liiga":                   _NHL_GAME,
+    "icehockey_mestis":                  _NHL_GAME,
+    "icehockey_nhl_preseason":           _NHL_GAME,
+    "cricket_asia_cup":                  _CRICKET_GAME,
+    "cricket_icc_trophy":                _CRICKET_GAME,
+    "cricket_icc_world_cup_womens":      _CRICKET_GAME,
+    "cricket_t20_world_cup":             _CRICKET_GAME,
+    "cricket_the_hundred":               _CRICKET_GAME,
+    "lacrosse_ncaa":                     _CRICKET_GAME,
+    "rugbyleague_nrl_state_of_origin":   _CRICKET_GAME,
+    "rugbyunion_six_nations":            _CRICKET_GAME,
+    "handball_germany_bundesliga":       _CRICKET_GAME,
+    "soccer_saudi_arabia_pro_league":    _SOCCER_GAME,
+    "soccer_russia_premier_league":      _SOCCER_GAME,
+    "soccer_germany_dfb_pokal":          _SOCCER_GAME,
+    "soccer_italy_coppa_italia":         _SOCCER_GAME,
+    "soccer_spain_copa_del_rey":         _SOCCER_GAME,
+    "soccer_france_coupe_de_france":     _SOCCER_GAME,
+    "soccer_concacaf_leagues_cup":       _SOCCER_GAME,
+    "soccer_concacaf_gold_cup":          _SOCCER_GAME,
+    "soccer_conmebol_copa_sudamericana": _SOCCER_GAME,
+    "soccer_fifa_club_world_cup":        _SOCCER_GAME,
+    "soccer_fifa_world_cup_qualifiers_europe":         _SOCCER_GAME,
+    "soccer_fifa_world_cup_qualifiers_south_america":  _SOCCER_GAME,
+    "soccer_germany_bundesliga_women":   _SOCCER_GAME,
+    "soccer_uefa_champs_league_women":   _SOCCER_GAME,
+    "tennis_atp_indian_wells":           _TENNIS_GAME,
+    "tennis_atp_miami_open":             _TENNIS_GAME,
+    "tennis_atp_monte_carlo_masters":    _TENNIS_GAME,
+    "tennis_atp_madrid_open":            _TENNIS_GAME,
+    "tennis_atp_italian_open":           _TENNIS_GAME,
+    "tennis_atp_barcelona_open":         _TENNIS_GAME,
+    "tennis_atp_hamburg_open":           _TENNIS_GAME,
+    "tennis_atp_munich":                 _TENNIS_GAME,
+    "tennis_atp_dubai":                  _TENNIS_GAME,
+    "tennis_atp_qatar_open":             _TENNIS_GAME,
+    "tennis_wta_indian_wells":           _TENNIS_GAME,
+    "tennis_wta_miami_open":             _TENNIS_GAME,
+    "tennis_wta_madrid_open":            _TENNIS_GAME,
+    "tennis_wta_italian_open":           _TENNIS_GAME,
+    "tennis_wta_charleston_open":        _TENNIS_GAME,
+    "tennis_wta_stuttgart_open":         _TENNIS_GAME,
+    "tennis_wta_dubai":                  _TENNIS_GAME,
+    "tennis_wta_qatar_open":             _TENNIS_GAME,
+    "tennis_wta_strasbourg":             _TENNIS_GAME,
+    "tennis_wta_queens_club_champ":      _TENNIS_GAME,
 }
 
-# Human-readable abbreviations used in the QueryList markets button summary
-GAME_MARKET_LABELS = {
-    "h2h":                       "ML",
-    "spreads":                   "SPR",
-    "totals":                    "TOT",
-    "h2h_1st_5_innings":         "F5-ML",
-    "spreads_1st_5_innings":     "F5-SPR",
-    "totals_1st_5_innings":      "F5-TOT",
-    "h2h_1st_half":              "1H-ML",
-    "spreads_1st_half":          "1H-SPR",
-    "totals_1st_half":           "1H-TOT",
-    "h2h_1st_quarter":           "1Q-ML",
-    "spreads_1st_quarter":       "1Q-SPR",
-    "totals_1st_quarter":        "1Q-TOT",
-    "h2h_3way":                  "3-Way",
-    "draw_no_bet":               "DNB",
-    "h2h_1st_period":            "P1-ML",
-    "totals_1st_period":         "P1-TOT",
-    "h2h_2nd_period":            "P2-ML",
-    "totals_2nd_period":         "P2-TOT",
+# ── QueryList market labels ───────────────────────────────────────────────────
+# Short abbreviations shown on the QueryList checkboxes / markets-button summary.
+# Generated from each key so the full documented period set stays in sync.
+
+# Base market → abbreviation
+_BASE_LABELS = {
+    "h2h":                   "ML",
+    "h2h_3_way":             "3W",
+    "spreads":               "SPR",
+    "alternate_spreads":     "ALT-SPR",
+    "totals":                "TOT",
+    "alternate_totals":      "ALT-TOT",
+    "team_totals":           "TM-TOT",
+    "alternate_team_totals": "ALT-TM-TOT",
+    "draw_no_bet":           "DNB",
+    "btts":                  "BTTS",
+    "double_chance":         "DC",
+}
+# Period suffix → prefix abbreviation
+_PERIOD_LABELS = {
+    "q1": "1Q", "q2": "2Q", "q3": "3Q", "q4": "4Q",
+    "h1": "1H", "h2": "2H",
+    "p1": "P1", "p2": "P2", "p3": "P3",
+    "s1": "S1", "s2": "S2",
+    "1st_1_innings": "I1", "1st_3_innings": "I3",
+    "1st_5_innings": "F5", "1st_7_innings": "I7",
+}
+# Non-period markets that don't decompose into base+suffix
+_MANUAL_LABELS = {
     "alternate_spreads_corners": "CRN-H",
     "alternate_totals_corners":  "CRN-T",
     "alternate_spreads_cards":   "CRD-H",
     "alternate_totals_cards":    "CRD-T",
-    "double_chance":             "DC",
+}
+
+def _label_for(key):
+    if key in _MANUAL_LABELS:
+        return _MANUAL_LABELS[key]
+    # longest suffix first so "1st_5_innings" wins over any shorter match
+    for suf in sorted(_PERIOD_LABELS, key=len, reverse=True):
+        if key.endswith("_" + suf):
+            base = key[: -(len(suf) + 1)]
+            return f"{_PERIOD_LABELS[suf]}-{_BASE_LABELS.get(base, base)}"
+    return _BASE_LABELS.get(key, key)
+
+# Build the label map from every key referenced by GAME_MARKETS.
+GAME_MARKET_LABELS = {
+    key: _label_for(key)
+    for mmap in GAME_MARKETS.values()
+    for keys in mmap.values()
+    for key in keys
 }

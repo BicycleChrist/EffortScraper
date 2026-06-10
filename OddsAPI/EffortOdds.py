@@ -294,9 +294,18 @@ QPushButton:hover {{ background:{_QL_HOVER}; border-color:#2a4060; }}
 
 
 class _QLDropPanel(QFrame):
-    """Frameless floating panel that closes on outside click."""
+    """Dropdown panel anchored beneath its toggle button, closes on outside click.
+
+    Uses Qt.Popup (the same window type QMenu / QComboBox dropdowns use) rather
+    than a separate Qt.Tool top-level window. On Wayland the compositor ignores
+    move() on top-level Tool windows and places them centered, which made these
+    menus float in the middle of the screen. A Qt.Popup maps to an xdg_popup that
+    is anchored to its parent surface (and auto-flipped to stay on-screen), so
+    popup_below() positions it correctly. Qt.Popup also dismisses itself on an
+    outside click; the eventFilter below is kept as a harmless safety net.
+    """
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.Popup)
         self.setStyleSheet(f"QFrame{{background:{_QL_BG};border:1px solid {_QL_BORDER};}}")
         QApplication.instance().installEventFilter(self)
 
@@ -307,10 +316,13 @@ class _QLDropPanel(QFrame):
         return False
 
     def popup_below(self, btn):
+        # adjustSize() first so the popup geometry is final before it is anchored.
+        self.adjustSize()
         gp = btn.mapToGlobal(QPoint(0, btn.height() + 1))
         self.move(gp)
         self.show()
         self.raise_()
+        self.activateWindow()
 
 
 from PyQt6.QtCore import QPoint
@@ -319,10 +331,65 @@ class _QLSportPanel(_QLDropPanel):
     def __init__(self, slot, parent=None):
         super().__init__(parent)
         self.slot = slot
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(0)
+        self.setFixedWidth(160)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(3)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("search…")
+        self._search.setFixedHeight(18)
+        self._search.setStyleSheet(
+            f"QLineEdit{{background:{_QL_BG2};color:{_QL_BRIGHT};"
+            f"border:1px solid {_QL_BORDER};border-radius:1px;"
+            f"padding:0 4px;font-size:{_QL_F};}}"
+            f"QLineEdit:focus{{border-color:#2a5080;}}"
+        )
+        self._search.textChanged.connect(self._filter)
+        outer.addWidget(self._search)
+
+        rule = QFrame()
+        rule.setFrameShape(QFrame.Shape.HLine)
+        rule.setFixedHeight(1)
+        rule.setStyleSheet(f"background:{_QL_BORDER};border:none;")
+        outer.addWidget(rule)
+
+        self._inner = QWidget()
+        self._inner.setStyleSheet("background:transparent;")
+        self._lay = QVBoxLayout(self._inner)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(0)
+        self._lay.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(self._inner)
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(220)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            f"QScrollArea{{border:none;background:transparent;}}"
+            f"QScrollBar:vertical{{background:{_QL_BG};width:3px;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{_QL_DIM};border-radius:1px;min-height:12px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+        )
+        outer.addWidget(scroll)
+        self._populate("")
+
+    def _populate(self, query):
+        """Rebuild the button list from the filtered set so hidden rows don't
+        leave gaps (setVisible doesn't reliably collapse slots inside a
+        widgetResizable scroll area)."""
+        # Drop everything (buttons + trailing stretch), then re-add matches.
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        q = query.strip().lower()
         for label, key in _QUERY_SPORT_LIST:
+            if q and q not in label.lower():
+                continue
             b = QPushButton(label)
             b.setFixedHeight(19)
             b.setStyleSheet(
@@ -331,8 +398,16 @@ class _QLSportPanel(_QLDropPanel):
                 f"QPushButton:hover{{background:{_QL_HOVER};color:{_QL_BRIGHT};}}"
             )
             b.clicked.connect(lambda _, l=label, k=key: (self.slot.set_sport(l, k), self.hide()))
-            lay.addWidget(b)
-        self.setFixedWidth(160)
+            self._lay.addWidget(b)
+        self._lay.addStretch()
+
+    def _filter(self, text):
+        self._populate(text)
+
+    def popup_below(self, btn):
+        super().popup_below(btn)
+        self._search.clear()
+        self._search.setFocus()
 
 
 class _QLMarketsPanel(_QLDropPanel):
@@ -385,25 +460,43 @@ class _QLMarketsPanel(_QLDropPanel):
         self.rebuild()
 
     def rebuild(self):
+        # Called when the panel opens (sport may have changed): reset to the full
+        # unfiltered view. Blocking signals avoids re-triggering _filter via clear().
+        self._search.blockSignals(True)
+        self._search.clear()
+        self._search.blockSignals(False)
+        self._populate("")
+
+    def _populate(self, query):
+        """Rebuild the section/checkbox tree from the filtered set. Rebuilding
+        (rather than setVisible) keeps hidden rows from leaving gaps inside the
+        widgetResizable scroll area; a section header only shows when it has at
+        least one matching market."""
         while self._cb_lay.count():
-            w = self._cb_lay.takeAt(0).widget()
+            item = self._cb_lay.takeAt(0)
+            w = item.widget()
             if w:
                 w.deleteLater()
         self._sections = []
-        self._search.clear()
+        q = query.strip().lower()
         mmap = GAME_MARKETS.get(self.slot.sport_key,
                                 {"GAME LINES": ["h2h", "spreads", "totals"],
                                  "ALT LINES": [], "SECONDARY": []})
-        populated = [s for s, keys in mmap.items() if keys]
-        for i, section in enumerate(populated):
-            keys = mmap[section]
-            sep = None
-            if i > 0:
+        first = True
+        for section, keys in mmap.items():
+            keys = [k for k in keys
+                    if not q
+                    or q in GAME_MARKET_LABELS.get(k, k).lower()
+                    or q in k.lower()]
+            if not keys:
+                continue
+            if not first:
                 sep = QFrame()
                 sep.setFrameShape(QFrame.Shape.HLine)
                 sep.setFixedHeight(1)
                 sep.setStyleSheet(f"background:{_QL_BORDER};border:none;margin:2px 0;")
                 self._cb_lay.addWidget(sep)
+            first = False
             hdr = QLabel(section)
             hdr.setStyleSheet(
                 f"color:{_QL_DIM};font-size:7pt;letter-spacing:2px;"
@@ -418,20 +511,11 @@ class _QLMarketsPanel(_QLDropPanel):
                 cb.toggled.connect(lambda chk, k=key: self._toggle(k, chk))
                 self._cb_lay.addWidget(cb)
                 rows.append((cb, key))
-            self._sections.append((hdr, sep, rows))
+            self._sections.append((hdr, None, rows))
+        self._cb_lay.addStretch()
 
     def _filter(self, text):
-        query = text.strip().lower()
-        for hdr, sep, rows in self._sections:
-            any_vis = False
-            for cb, key in rows:
-                vis = not query or query in GAME_MARKET_LABELS.get(key, key).lower() or query in key.lower()
-                cb.setVisible(vis)
-                if vis:
-                    any_vis = True
-            hdr.setVisible(any_vis)
-            if sep:
-                sep.setVisible(any_vis)
+        self._populate(text)
 
     def popup_below(self, btn):
         super().popup_below(btn)
@@ -591,6 +675,10 @@ class QueryList(QWidget):
         f"QPushButton:hover{{background:{_QL_ACCENT};color:#000;}}"
     )
 
+    # Thin border around just the query-slot box (the scroll area).
+    # Teal accent matches the ADD button's border below it.
+    _BORDER_COLOR = _QL_ACCENT
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(208)
@@ -615,14 +703,14 @@ class QueryList(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setStyleSheet(
-            f"QScrollArea{{border:none;background:transparent;}}"
+            f"QScrollArea{{border:1px solid {self._BORDER_COLOR};border-radius:2px;background:transparent;}}"
             f"QScrollBar:vertical{{background:{_QL_BG};width:3px;border:none;}}"
             f"QScrollBar::handle:vertical{{background:{_QL_DIM};border-radius:1px;min-height:12px;}}"
             f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
         )
         outer.addWidget(self._scroll)
 
-        self.add_btn = QPushButton("＋ ADD")
+        self.add_btn = QPushButton("+ ADD")
         self.add_btn.setFixedHeight(16)
         self.add_btn.setStyleSheet(self._ADD_STYLE)
         self.add_btn.clicked.connect(self.add_slot)
@@ -1504,7 +1592,7 @@ class ModernOddsWindow(QMainWindow):
         """Format the market label based on market type and outcome"""
         if market_key == 'h2h':
             return f"Moneyline: {outcome['name']}"
-        elif market_key == 'h2h_3way':
+        elif market_key in ('h2h_3way', 'h2h_3_way'):
             return f"3-Way Moneyline: {outcome['name']}"
         elif market_key == 'spreads':
             return f"Spread: {outcome['name']} {outcome.get('point', '')}"
