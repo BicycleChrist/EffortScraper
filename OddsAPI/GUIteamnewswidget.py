@@ -1,16 +1,43 @@
 import asyncio
 import aiohttp
 import feedparser
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+import feedparse_worker
 from datetime import datetime
+import calendar
 import re
 import sys
+import webbrowser
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
+from PyQt6.QtCore import (
+    Qt, QTimer, pyqtSignal, QObject, QThread,
+    QAbstractListModel, QModelIndex, QSize, QRect, QEvent
+)
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QScrollArea, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox
+    QComboBox, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox,
+    QLineEdit, QListView, QStyledItemDelegate, QStyle
 )
 from fpscraper import FantasyProsScraper
+
+# Shared single-child process pool for feedparser parses. Parsing in a
+# thread (the old run_in_executor(None, ...) path) held the GIL for the
+# whole pure-Python parse and starved the qasync main loop — the stall
+# watchdog kept catching feedparser/sgmllib as the lone busy thread while
+# the main thread sat idle. A child process has its own GIL, so the parse
+# costs the UI nothing; one worker is plenty for a handful of feeds per
+# refresh. Created lazily so importers that never fetch news don't spawn
+# a process. (see PERF_DIAGNOSTICS.md "ROUND 5")
+_FEED_PARSE_POOL = None
+
+
+def _feed_parse_pool():
+    global _FEED_PARSE_POOL
+    if _FEED_PARSE_POOL is None:
+        _FEED_PARSE_POOL = ProcessPoolExecutor(max_workers=1)
+    return _FEED_PARSE_POOL
 
 #TODO: Manually scrape Fantasy pros as their Rss feed keeps returning errors despite being populated
 # Below is an example "player-news-item" div
@@ -214,6 +241,46 @@ class NewsWorker(QObject):
         self.compiled_hard_news = [re.compile(p, re.IGNORECASE) for p in hard_news_terms]
         self.compiled_fluff = [re.compile(p, re.IGNORECASE) for p in fluff_terms]
 
+        # --- Category classification (terminal-feed chips) ---------------
+        # Each item gets a single category tag for the dense feed UI.
+        # Precedence matters: an IL-move headline mentions both the injury
+        # and the roster move — INJ wins.
+        category_terms = [
+            ("INJ", [
+                r'\binjur\w+', r'\b(injured|disabled)\s+list\b',
+                r'\b(7|10|15|60)[\- ]day\b', r'\bIL\b', r'\bIR\b', r'\bDL\b',
+                r'\bsurger\w+', r'\bMRI\b', r'\bfractur\w+', r'\bstrain\w*\b',
+                r'\bsprain\w*\b', r'\btorn\b', r'\bconcussion\b',
+                r'\bruled out\b', r'\bday[\- ]to[\- ]day\b', r'\bout for\b',
+                r'\bseason[\- ]ending\b', r'\bexits?\b', r'\bleft (the )?game\b',
+                r'\bquestionable\b', r'\bdoubtful\b', r'\bgame[\- ]time decision\b',
+                r'\brehab\b', r'\bhamstring\b', r'\bankle\b', r'\bknee\b',
+                r'\boblique\b', r'\bshoulder\b', r'\belbow\b', r'\bwrist\b',
+            ]),
+            ("SUSP", [
+                r'\bsuspend\w+', r'\bsuspension\b', r'\bfined?\b',
+                r'\bbanned?\b', r'\bappeal\w*\b',
+            ]),
+            ("SIGN", [
+                r'\bsign(s|ed|ing)?\b', r'\bre-?sign\w+', r'\bextension\b',
+                r'\bcontract\b', r'\bdeal\b', r'\bagreement\b',
+            ]),
+            ("TXN", [
+                r'\btrade[ds]?\b', r'\bacquir\w+', r'\breleas\w+', r'\bwaiv\w+',
+                r'\bclaim\w+', r'\bDFA\b', r'\bdesignated\b', r'\boption(ed|s)?\b',
+                r'\brecall\w+', r'\bcall(ed)?[\- ]?up\b', r'\bpromot\w+',
+                r'\bdemot\w+', r'\bactivat\w+', r'\breinstat\w+', r'\bretir\w+',
+            ]),
+            ("LINEUP", [
+                r'\bstarting\b', r'\blineup\b', r'\bbench(ed)?\b',
+                r'\bscratch\w*\b', r'\bstarter\b', r'\bprobable\b',
+            ]),
+        ]
+        self.compiled_categories = [
+            (name, [re.compile(p, re.IGNORECASE) for p in pats])
+            for name, pats in category_terms
+        ]
+
     def set_league(self, league_key):
         """Set the current league to fetch news for"""
         self.league_key = league_key
@@ -315,6 +382,19 @@ class NewsWorker(QObject):
                 score -= 1
         return score
 
+    def classify_category(self, title, description=""):
+        """Single category tag for the feed UI. Title hits beat body hits;
+        within a field, list order (INJ > SUSP > SIGN > TXN > LINEUP) is the
+        precedence. Worker-thread only — precompiled regex."""
+        for name, patterns in self.compiled_categories:
+            if any(rx.search(title) for rx in patterns):
+                return name
+        if description:
+            for name, patterns in self.compiled_categories:
+                if any(rx.search(description) for rx in patterns):
+                    return name
+        return ""
+
     def dedupe_news(self, news_items):
         """Collapse the same story repeated across wire-sharing sources
         (ESPN/CBS/Yahoo/Fox), keeping the first occurrence. Normalizes the
@@ -350,6 +430,8 @@ class NewsWorker(QObject):
             s = self._score_headline(item.get('title', ''),
                                      item.get('description', ''))
             item['relevance_score'] = s
+            item['category'] = self.classify_category(item.get('title', ''),
+                                                      item.get('description', ''))
             # Exclude net-negative (fluff) from the ticker, but always let
             # injury items ride even if phrased softly ("Why is X hurt?").
             item['ticker_worthy'] = (s >= 0) or item.get('is_injury_news', False)
@@ -360,7 +442,7 @@ class NewsWorker(QObject):
               f"{ticker_n} ticker-worthy, {len(news_items) - ticker_n} fluff")
         return news_items
 
-    async def fetch_rss_feed_with_session(self, session, url):
+    async def fetch_rss_feed_with_session(self, session, url, league=""):
         """Fetch and parse an RSS feed using provided session"""
         if self.print_fetches: print(f"fetching rss feed: {url}");
         try:
@@ -374,10 +456,18 @@ class NewsWorker(QObject):
 
                 content = await response.text()
 
-                # Parse feedparser in thread pool to avoid blocking the event loop
-                # feedparser.parse() is synchronous and CPU-bound, so we run it in executor
+                # Parse out-of-process: feedparser.parse() is synchronous and
+                # CPU-bound, and in a thread it competes for THIS process's
+                # GIL with the UI loop. Falls back to the old in-thread parse
+                # if the child process died (e.g. OOM-killed).
                 loop = asyncio.get_event_loop()
-                feed = await loop.run_in_executor(None, feedparser.parse, content)
+                try:
+                    feed = await loop.run_in_executor(
+                        _feed_parse_pool(), feedparse_worker.parse_feed, content)
+                except BrokenProcessPool:
+                    global _FEED_PARSE_POOL
+                    _FEED_PARSE_POOL = None
+                    feed = await loop.run_in_executor(None, feedparser.parse, content)
 
             # Check if feed parsed correctly
             if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
@@ -390,7 +480,10 @@ class NewsWorker(QObject):
                 # Extract date (handling various formats)
                 pub_date = entry.get('published_parsed', None)
                 if pub_date:
-                    date = datetime(*pub_date[:6])
+                    # published_parsed is a UTC struct_time — convert to
+                    # local time. The old datetime(*pub_date[:6]) kept it as
+                    # naive UTC, so articles displayed hours in the future.
+                    date = datetime.fromtimestamp(calendar.timegm(pub_date))
                 else:
                     # Default to current time if no date available
                     date = datetime.now()
@@ -422,7 +515,8 @@ class NewsWorker(QObject):
                     'link': entry.link,
                     'date': date,
                     'source': feed.feed.title if hasattr(feed, 'feed') and hasattr(feed.feed, 'title') else url.split('/')[2],
-                    'image_url': image_url
+                    'image_url': image_url,
+                    'league': league
                 })
             
             if self.print_fetches: print(f"items parsed: {len(fetched_news_items)}");
@@ -458,17 +552,19 @@ class NewsWorker(QObject):
             all_leagues = ["basketball_nba", "football_nfl", "baseball_mlb", "icehockey_nhl"]
             sources = []
 
-            # Add RSS feeds for all leagues
+            # Add RSS feeds for all leagues, tagged with their league so each
+            # item carries a 'league' key (drives the feed's league chips)
             for league in all_leagues:
                 league_feeds = self.rss_urls.get(league, {})
-                if league_feeds:
-                    sources.extend(league_feeds.get('general', []))
+                for url in league_feeds.get('general', []):
+                    sources.append((league, url))
 
             # If we have a specific league_key set, also add team-specific feeds for that league
             if self.league_key:
                 league_feeds = self.rss_urls.get(self.league_key, {})
                 if league_feeds and self.team_name and self.team_name in league_feeds.get('teams', {}):
-                    sources.extend(league_feeds['teams'][self.team_name])
+                    for url in league_feeds['teams'][self.team_name]:
+                        sources.append((self.league_key, url))
 
             # Use single session for all requests - much faster!
             # Set comprehensive timeouts to prevent any blocking
@@ -515,7 +611,8 @@ class NewsWorker(QObject):
             async with aiohttp.ClientSession(timeout=timeout, connector=connector,
                                              headers=headers) as session:
                 # Fetch from all RSS sources in parallel
-                tasks = [self.fetch_rss_feed_with_session(session, url) for url in sources]
+                tasks = [self.fetch_rss_feed_with_session(session, url, league)
+                         for league, url in sources]
                 
                 # Add FantasyPros scraping (no longer async)
                 # Skip FantasyPros for now to avoid blocking - can add back later if needed
@@ -593,279 +690,696 @@ class NewsWorker(QObject):
         thread.start()
 
 
-class NewsArticleWidget(QFrame):
-    """Widget to display a single news article"""
+# ---------------------------------------------------------------------------
+# Terminal-style news feed UI
+#
+# Dense delegate-painted rows (QListView + QStyledItemDelegate) instead of
+# one QFrame per article. The old card UI needed a 15-per-30ms batch loader
+# plus show/hide deferral just to mask widget-construction cost; a delegate
+# paints only the visible rows, so thousands of items scroll smoothly and
+# all of that machinery is gone.
+# ---------------------------------------------------------------------------
 
-    def __init__(self, news_item, parent=None):
+ACCENT = "#e55717"          # app accent (matches the old title orange)
+ACCENT_BRIGHT = "#ff8a4a"
+
+CATEGORY_COLORS = {
+    # tag: (foreground, chip background)
+    "INJ":    ("#ff5d5d", "#3a1518"),
+    "SUSP":   ("#ff9e3d", "#3a2a12"),
+    "SIGN":   ("#3fd68c", "#10301f"),
+    "TXN":    ("#58a6ff", "#122a44"),
+    "LINEUP": ("#d2a8ff", "#2a1f3d"),
+}
+
+LEAGUE_CHIPS = [
+    ("all", "ALL"),
+    ("baseball_mlb", "MLB"),
+    ("basketball_nba", "NBA"),
+    ("football_nfl", "NFL"),
+    ("icehockey_nhl", "NHL"),
+]
+
+
+def _rel_age(dt):
+    """Compact relative age: 'now', '4m', '2h', '3d'."""
+    secs = (datetime.now() - dt).total_seconds()
+    if secs < 60:
+        return "now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+NEWS_TERMINAL_QSS = """
+QWidget#newsTerminal { background: #0b0f14; }
+QWidget#newsHeader, QWidget#newsToolbar {
+    background: #0e141c;
+    border-bottom: 1px solid #1c2430;
+}
+QLabel#newsTitle {
+    color: """ + ACCENT + """;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: bold;
+    letter-spacing: 2px;
+}
+QLabel#newsStatus, QLabel#newsToolbarLabel {
+    color: #4d5866;
+    font-family: monospace;
+    font-size: 10px;
+}
+QPushButton#leagueChip, QPushButton#catChip, QPushButton#sortChip {
+    background: #131a24;
+    color: #7d8590;
+    border: 1px solid #232c3a;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-family: monospace;
+    font-size: 10px;
+    font-weight: bold;
+}
+QPushButton#leagueChip:hover, QPushButton#catChip:hover, QPushButton#sortChip:hover {
+    border-color: #3a4656;
+}
+QPushButton#leagueChip:checked {
+    background: #2a1812;
+    color: """ + ACCENT_BRIGHT + """;
+    border-color: """ + ACCENT + """;
+}
+QPushButton#sortChip:checked {
+    background: #16202e;
+    color: #58a6ff;
+    border-color: #58a6ff;
+}
+QPushButton#catChip[cat="INJ"]:checked    { color: #ff5d5d; border-color: #ff5d5d; background: #1f1012; }
+QPushButton#catChip[cat="SUSP"]:checked   { color: #ff9e3d; border-color: #ff9e3d; background: #201708; }
+QPushButton#catChip[cat="SIGN"]:checked   { color: #3fd68c; border-color: #3fd68c; background: #0c2016; }
+QPushButton#catChip[cat="TXN"]:checked    { color: #58a6ff; border-color: #58a6ff; background: #0d1c30; }
+QPushButton#catChip[cat="LINEUP"]:checked { color: #d2a8ff; border-color: #d2a8ff; background: #1c1429; }
+QLineEdit#newsSearch {
+    background: #0b1018;
+    color: #dbe4ee;
+    border: 1px solid #232c3a;
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-family: monospace;
+    font-size: 11px;
+    selection-background-color: #2a3b55;
+}
+QLineEdit#newsSearch:focus { border-color: """ + ACCENT + """; }
+QWidget#newsToolbar QComboBox, QWidget#newsToolbar QSpinBox {
+    background: #131a24;
+    color: #aab4c0;
+    border: 1px solid #232c3a;
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-family: monospace;
+    font-size: 10px;
+}
+QWidget#newsToolbar QComboBox QAbstractItemView {
+    background: #131a24;
+    color: #aab4c0;
+    selection-background-color: #2a3b55;
+}
+QWidget#newsToolbar QCheckBox {
+    color: #ff5d5d;
+    font-family: monospace;
+    font-size: 10px;
+    font-weight: bold;
+}
+QToolButton#newsRefresh {
+    background: #131a24;
+    color: """ + ACCENT_BRIGHT + """;
+    border: 1px solid #232c3a;
+    border-radius: 3px;
+    font-size: 13px;
+    padding: 1px 6px;
+}
+QToolButton#newsRefresh:hover { border-color: """ + ACCENT + """; }
+QListView#newsList {
+    background: #0b0f14;
+    border: none;
+    outline: none;
+}
+QListView#newsList QScrollBar:vertical {
+    background: #0b0f14;
+    width: 8px;
+    margin: 0;
+}
+QListView#newsList QScrollBar::handle:vertical {
+    background: #232c3a;
+    border-radius: 4px;
+    min-height: 24px;
+}
+QListView#newsList QScrollBar::add-line:vertical,
+QListView#newsList QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+
+class NewsFeedModel(QAbstractListModel):
+    """Flat list model over the worker's news-item dicts."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.news_item = news_item
-        
-        # Set up frame style
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setFrameShadow(QFrame.Shadow.Raised)
-        
-        # Set standard styling with smaller margins
-        if news_item.get('is_injury_news', False):
-            # Highlight injury news with a different background
-            self.setStyleSheet("""
-                NewsArticleWidget {
-                    background-color: #fdf4f4;
-                    border-radius: 6px;
-                    border: 1px solid #f1c0c0;
-                    margin: 4px;  /* Reduced margin */
-                }
-                QLabel {
-                    color: #212529;
-                }
-            """)
+        self.items = []
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.items)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self.items)):
+            return None
+        if role == Qt.ItemDataRole.UserRole:
+            return self.items[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self.items[index.row()].get('title', '')
+        return None
+
+    def set_items(self, items):
+        self.beginResetModel()
+        self.items = list(items)
+        self.endResetModel()
+
+
+class NewsRowDelegate(QStyledItemDelegate):
+    """Paints one dense terminal row per item:
+        HH:MM │ SOURCE │ [CAT] │ headline …            ●NEW  4m
+    The expanded row (owner.expanded_row) additionally paints the wrapped
+    description plus an OPEN ARTICLE link. Single click toggles expansion,
+    click on the link (or double-click anywhere) opens the article."""
+
+    ROW_H = 24
+    PAD = 8
+    TIME_W = 46
+    SRC_W = 64
+    CAT_W = 58
+    AGE_W = 44
+    NEW_W = 40
+    DESC_INDENT = 56
+    LINK_H = 18
+    LINK_W = 110
+
+    SOURCE_ABBREVS = [
+        ("rotowire", "ROTO"), ("espn", "ESPN"), ("cbs", "CBS"),
+        ("yahoo", "YAHOO"), ("fox", "FOX"), ("mlb trade", "MLBTR"),
+        ("mlbtraderumors", "MLBTR"), ("closer", "CLOSER"), ("nfl", "NFL"),
+    ]
+
+    def __init__(self, view, owner):
+        super().__init__(view)
+        self.view = view
+        self.owner = owner
+        mono = QFont()
+        mono.setFamilies(["JetBrains Mono", "Fira Code", "DejaVu Sans Mono", "Monospace"])
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPixelSize(12)
+        self.mono = mono
+        self.mono_bold = QFont(mono)
+        self.mono_bold.setBold(True)
+        self.mono_small = QFont(mono)
+        self.mono_small.setPixelSize(10)
+        self.mono_small_bold = QFont(self.mono_small)
+        self.mono_small_bold.setBold(True)
+        self._src_cache = {}
+
+    def _abbrev(self, source):
+        cached = self._src_cache.get(source)
+        if cached:
+            return cached
+        s = (source or "").lower()
+        out = next((abbr for key, abbr in self.SOURCE_ABBREVS if key in s), None)
+        if out is None:
+            out = (source or "WIRE").split()[0][:6].upper()
+        self._src_cache[source] = out
+        return out
+
+    def _link_rect(self, rect):
+        return QRect(rect.left() + self.DESC_INDENT,
+                     rect.bottom() - self.LINK_H - 4,
+                     self.LINK_W, self.LINK_H)
+
+    def paint(self, painter, option, index):
+        item = index.data(Qt.ItemDataRole.UserRole)
+        if not item:
+            return
+        painter.save()
+        r = option.rect
+        row = index.row()
+        expanded = (row == self.owner.expanded_row)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        if expanded:
+            painter.fillRect(r, QColor("#121a26"))
+        elif hovered:
+            painter.fillRect(r, QColor("#101722"))
         else:
-            self.setStyleSheet("""
-                NewsArticleWidget {
-                    background-color: #f8f9fa;
-                    border-radius: 6px;
-                    border: 1px solid #e9ecef;
-                    margin: 4px;  /* Reduced margin */
-                }
-                QLabel {
-                    color: #212529;
-                }
-            """)
-        
-        # Create layout with smaller margins
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0) 
-        layout.setSpacing(0)  
-        
-        # Add an "INJURY UPDATE" indicator if relevant, with smaller font
-        if news_item.get('is_injury_news', False):
-            injury_label = QLabel("⚠️ INJURY UPDATE")
-            injury_label.setStyleSheet("color: #d9534f; font-weight: bold; font-size: 11px;")  # Smaller font
-            layout.addWidget(injury_label)
-        
-        # Create header with source and date
-        header_layout = QHBoxLayout()
-        
-        source_label = QLabel(news_item['source'])
-        source_label.setStyleSheet("font-weight: bold; color: #495057; font-size: 11px;")  # Smaller font
-        header_layout.addWidget(source_label)
-        
-        header_layout.addStretch()
-        
-        # Format date with smaller font
-        date_str = news_item['date'].strftime('%m/%d/%Y %H:%M')
-        date_label = QLabel(date_str)
-        date_label.setStyleSheet("color: #6c757d; font-size: 9px;")  # Smaller font
-        header_layout.addWidget(date_label)
-        
-        layout.addLayout(header_layout)
-        
-        # Create title with smaller font
-        title_label = QLabel(news_item['title'])
-        title_label.setWordWrap(True)
-        title_label.setStyleSheet("font-weight: bold; font-size: 12px;")  # Smaller font
-        layout.addWidget(title_label)
+            painter.fillRect(r, QColor("#0b0f14") if row % 2 == 0 else QColor("#0d1219"))
 
-        # Skip the image section to save space
-        # Only add description if it's injury news or particularly important
-        if news_item.get('is_injury_news', False) or news_item.get('injury_score', 0) > 1:
-            desc_label = QLabel(news_item['description'])
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #495057; font-size: 11px;")  # Smaller font
-            layout.addWidget(desc_label)
-        
-        # Create "Read More" button with smaller size
-        read_more_button = QPushButton("Read Article")  # Shortened text
-        read_more_button.setStyleSheet("""
-            QPushButton {
-                background-color: #007bff;
-                color: white;
-                border: none;
-                padding: 3px 8px;  /* Smaller padding */
-                border-radius: 3px;
-                font-size: 10px;  /* Smaller font */
-            }
-            QPushButton:hover {
-                background-color: #0069d9;
-            }
-        """)
-        read_more_button.clicked.connect(self.open_article)
-        layout.addWidget(read_more_button, 0, Qt.AlignmentFlag.AlignRight)
-        
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        if item.get('_is_new'):
+            painter.fillRect(r.left(), r.top(), 2, self.ROW_H, QColor(ACCENT))
 
-    def open_article(self):
-        """Open the article URL in the default browser"""
-        url = self.news_item.get('link', '')
+        y = r.top()
+        x = r.left() + self.PAD
+
+        painter.setFont(self.mono)
+        painter.setPen(QColor("#6e7a8a"))
+        painter.drawText(QRect(x, y, self.TIME_W, self.ROW_H),
+                         int(Qt.AlignmentFlag.AlignVCenter),
+                         item['date'].strftime('%H:%M'))
+        x += self.TIME_W
+
+        painter.setPen(QColor("#b8862d"))
+        painter.drawText(QRect(x, y, self.SRC_W, self.ROW_H),
+                         int(Qt.AlignmentFlag.AlignVCenter),
+                         self._abbrev(item.get('source', '')))
+        x += self.SRC_W
+
+        cat = item.get('category', '')
+        if cat:
+            fg, bg = CATEGORY_COLORS.get(cat, ("#7d8590", "#161d28"))
+            chip = QRect(x, y + (self.ROW_H - 16) // 2, self.CAT_W - 8, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(bg))
+            painter.drawRoundedRect(chip, 3, 3)
+            painter.setPen(QColor(fg))
+            painter.setFont(self.mono_small_bold)
+            painter.drawText(chip, int(Qt.AlignmentFlag.AlignCenter), cat)
+        x += self.CAT_W
+
+        right_w = self.AGE_W + (self.NEW_W if item.get('_is_new') else 0)
+        head_rect = QRect(x, y, r.right() - right_w - x - 4, self.ROW_H)
+        if item.get('relevance_score', 0) < 0:
+            head_color = "#566070"   # fluff: dimmed but present
+        elif cat == "INJ":
+            head_color = "#ff8484"
+        else:
+            head_color = "#dbe4ee"
+        head_font = self.mono_bold if cat == "INJ" else self.mono
+        painter.setFont(head_font)
+        painter.setPen(QColor(head_color))
+        title = QFontMetrics(head_font).elidedText(
+            item.get('title', ''), Qt.TextElideMode.ElideRight, head_rect.width())
+        painter.drawText(head_rect, int(Qt.AlignmentFlag.AlignVCenter), title)
+
+        age_rect = QRect(r.right() - self.AGE_W, y, self.AGE_W - self.PAD, self.ROW_H)
+        painter.setFont(self.mono_small)
+        painter.setPen(QColor("#4d5866"))
+        painter.drawText(age_rect,
+                         int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight),
+                         _rel_age(item['date']))
+        if item.get('_is_new'):
+            painter.setFont(self.mono_small_bold)
+            painter.setPen(QColor(ACCENT_BRIGHT))
+            painter.drawText(QRect(age_rect.left() - self.NEW_W, y, self.NEW_W - 4, self.ROW_H),
+                             int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight),
+                             "●NEW")
+
+        if expanded:
+            desc = (item.get('description') or '').strip() or "(no summary available)"
+            painter.setFont(self.mono_small)
+            painter.setPen(QColor("#9aa7b8"))
+            desc_rect = QRect(r.left() + self.DESC_INDENT, y + self.ROW_H + 2,
+                              r.width() - self.DESC_INDENT - 16,
+                              r.height() - self.ROW_H - self.LINK_H - 10)
+            painter.drawText(desc_rect, int(Qt.TextFlag.TextWordWrap), desc)
+
+            link_rect = self._link_rect(r)
+            painter.setFont(self.mono_small_bold)
+            painter.setPen(QColor(ACCENT_BRIGHT))
+            painter.drawText(link_rect, int(Qt.AlignmentFlag.AlignVCenter), "OPEN ARTICLE ↗")
+
+            painter.setFont(self.mono_small)
+            painter.setPen(QColor("#4d5866"))
+            meta = f"{item['date'].strftime('%m/%d %H:%M')} · {item.get('source', '')}"
+            painter.drawText(QRect(link_rect.right() + 12, link_rect.top(),
+                                   r.right() - link_rect.right() - 24, self.LINK_H),
+                             int(Qt.AlignmentFlag.AlignVCenter), meta)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        if index.row() != self.owner.expanded_row:
+            return QSize(0, self.ROW_H)
+        item = index.data(Qt.ItemDataRole.UserRole) or {}
+        desc = (item.get('description') or '').strip() or "(no summary available)"
+        width = max(200, self.view.viewport().width() - self.DESC_INDENT - 16)
+        br = QFontMetrics(self.mono_small).boundingRect(
+            0, 0, width, 2000, int(Qt.TextFlag.TextWordWrap), desc)
+        return QSize(0, self.ROW_H + br.height() + self.LINK_H + 12)
+
+    def editorEvent(self, event, model, option, index):
+        if (event.type() == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._open(index)
+            return True
+        if (event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton):
+            row = index.row()
+            if row == self.owner.expanded_row:
+                if self._link_rect(option.rect).contains(event.position().toPoint()):
+                    self._open(index)
+                    return True
+                self.owner.set_expanded(-1)
+            else:
+                self.owner.set_expanded(row)
+            return True
+        return super().editorEvent(event, model, option, index)
+
+    def _open(self, index):
+        item = index.data(Qt.ItemDataRole.UserRole) or {}
+        url = item.get('link')
         if url:
-            import webbrowser
             webbrowser.open(url)
 
 
 class TeamNewsWidget(QWidget):
-    """Widget for displaying team news and updates"""
+    """Terminal-style news feed over the NewsWorker pipeline.
+
+    Public surface consumed elsewhere (EffortOdds / tickertape) and kept
+    stable: .worker (+ news_fetched signal, .news_items, .running),
+    .worker_thread, .handle_league_change(), .get_teams_for_league(),
+    .all_news_items."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.refresh_disabled = False
-
         self.current_league = None
         self.current_team = None
         self.show_injuries_only = False
-        self.all_news_items = []  # Store all news items for filtering
-        self.filtered_news_items = []  # Store filtered items for batched loading
-        self.current_widget_index = 0  # Track current position in batch loading
-        self.is_batch_loading = False  # Flag to track if batch loading is in progress
+        self.all_news_items = []
+        self.expanded_row = -1
+        self.active_league_chip = "all"
+        self._seen_keys = set()       # first-seen tracking for ●NEW markers
+        self._last_update = None
         self.setup_ui()
         self.setup_worker()
 
-        # Auto-refresh timer (10 minutes). Start is offset by 60s in
-        # refresh_news_offset() below so we don't tick at the exact same
-        # second as ModernOddsWindow.status_timer (also 10min).
+        # Auto-refresh timer (10 minutes). Start is offset by 60s so we
+        # don't tick at the exact same second as ModernOddsWindow.status_timer
+        # (also 10min).
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_news)
         self.current_refresh_interval = 10  # minutes
         QTimer.singleShot(60 * 1000,
                           lambda: self.refresh_timer.start(10 * 60 * 1000))
 
-        # Delay initial news fetch to avoid blocking during UI initialization
-        # This prevents DNS/network blocking from affecting app startup
-        QTimer.singleShot(3000, self.refresh_news)  # 5 second delay after UI is fully loaded
+        # Delay initial news fetch to avoid blocking during UI initialization.
+        # Set to 4.25s as part of startup staggering so the regex scoring
+        # (score_and_rank) doesn't collide with the Novig dump's match-map
+        # rebuild. Also prevents DNS/network blocking at startup.
+        QTimer.singleShot(4250, self.refresh_news)
+
+        # Keep relative ages ("4m") current; repaint is cheap and skipped
+        # entirely while the panel is hidden.
+        self.age_timer = QTimer(self)
+        self.age_timer.timeout.connect(self._tick_ages)
+        self.age_timer.start(30 * 1000)
+
+    # ------------------------------------------------------------------ UI
 
     def setup_ui(self):
-        """Set up the UI components"""
+        self.setObjectName("newsTerminal")
+        self.setStyleSheet(NEWS_TERMINAL_QSS)
         self.layout = QVBoxLayout(self)
-        # Remove all margins to eliminate the spacing completely
         self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)  # Minimal spacing between elements
-        
-        # Title and controls - move them into the same line as content begins
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(5, 0, 5, 0)  # Small horizontal margins only
-        
-        title_label = QLabel("Team News & Injury Updates")
-        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e55717;")
-        header_layout.addWidget(title_label)
-        
-        # Add padding space between title and refresh controls
-        header_layout.addSpacing(20)
-        
-        # Add refresh interval spinner
-        refresh_layout = QHBoxLayout()
-        refresh_layout.setSpacing(2)
-        refresh_layout.addWidget(QLabel("Refresh Freq"))
+        self.layout.setSpacing(0)
+
+        # -- Row 1: title, league chips, category chips, sort, status
+        header = QWidget()
+        header.setObjectName("newsHeader")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(4)
+
+        title_label = QLabel("NEWSWIRE")
+        title_label.setObjectName("newsTitle")
+        h.addWidget(title_label)
+        h.addSpacing(10)
+
+        self.league_chips = {}
+        for key, label in LEAGUE_CHIPS:
+            chip = QPushButton(label)
+            chip.setObjectName("leagueChip")
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(lambda _, k=key: self.on_league_chip(k))
+            self.league_chips[key] = chip
+            h.addWidget(chip)
+        self.league_chips["all"].setChecked(True)
+        h.addSpacing(12)
+
+        self.category_chips = {}
+        for cat in CATEGORY_COLORS:
+            chip = QPushButton(cat)
+            chip.setObjectName("catChip")
+            chip.setProperty("cat", cat)
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setToolTip(f"Show only {cat} items (none checked = all)")
+            chip.toggled.connect(self.apply_filters)
+            self.category_chips[cat] = chip
+            h.addWidget(chip)
+        h.addSpacing(12)
+
+        # Default order is relevance-ranked (fluff sinks); CHRONO flips to
+        # strict newest-first like a wire feed.
+        self.chrono_sort = QPushButton("CHRONO")
+        self.chrono_sort.setObjectName("sortChip")
+        self.chrono_sort.setCheckable(True)
+        self.chrono_sort.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chrono_sort.setToolTip("Checked: strict newest-first. Unchecked: relevance-ranked, fluff last.")
+        self.chrono_sort.toggled.connect(self.apply_filters)
+        h.addWidget(self.chrono_sort)
+
+        h.addStretch()
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("newsStatus")
+        h.addWidget(self.status_label)
+        self.layout.addWidget(header)
+
+        # -- Row 2: search, team, injuries-only, refresh controls
+        toolbar = QWidget()
+        toolbar.setObjectName("newsToolbar")
+        t = QHBoxLayout(toolbar)
+        t.setContentsMargins(8, 3, 8, 3)
+        t.setSpacing(6)
+
+        self.search_box = QLineEdit()
+        self.search_box.setObjectName("newsSearch")
+        self.search_box.setPlaceholderText("⌕ filter headlines — player, team, keyword…")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self.apply_filters)
+        t.addWidget(self.search_box, 1)
+
+        self.injury_filter = QCheckBox("INJ ONLY")
+        self.injury_filter.toggled.connect(self.toggle_injury_filter)
+        t.addWidget(self.injury_filter)
+
+        team_label = QLabel("TEAM")
+        team_label.setObjectName("newsToolbarLabel")
+        t.addWidget(team_label)
+        self.team_filter = QComboBox()
+        self.team_filter.addItem("All Teams")
+        self.team_filter.currentTextChanged.connect(self.on_team_changed)
+        t.addWidget(self.team_filter)
+
+        refresh_label = QLabel("EVERY")
+        refresh_label.setObjectName("newsToolbarLabel")
+        t.addWidget(refresh_label)
         self.refresh_interval = QSpinBox()
         self.refresh_interval.setRange(0, 30)
         self.refresh_interval.setValue(10)
         self.refresh_interval.setSuffix(" min")
         self.refresh_interval.valueChanged.connect(self.update_refresh_interval)
         self.refresh_interval.setFixedWidth(70)
-        self.refresh_interval.setStyleSheet("font-size: 10px;")
-        refresh_layout.addWidget(self.refresh_interval)
-        header_layout.addLayout(refresh_layout)
-        
-        # Add injury filter checkbox
-        self.injury_filter = QCheckBox("Injuries Only")
-        self.injury_filter.setStyleSheet("""
-            QCheckBox {
-                font-size: 10px;
-                color: #d9534f;
-                padding: 4px
-                font-weight: bold;
-            }
-        """)
-        self.injury_filter.toggled.connect(self.toggle_injury_filter)
-        header_layout.addWidget(self.injury_filter)
-        
-        header_layout.addStretch()
-        
-        # Team filter dropdown
-        self.team_filter = QComboBox()
-        self.team_filter.addItem("All Teams")
-        self.team_filter.currentTextChanged.connect(self.on_team_changed)
-        header_layout.addWidget(QLabel("Team:"))
-        header_layout.addWidget(self.team_filter)
-        
-        # Refresh button
+        t.addWidget(self.refresh_interval)
+
         self.refresh_button = QToolButton()
+        self.refresh_button.setObjectName("newsRefresh")
         self.refresh_button.setText("⟳")
         self.refresh_button.setToolTip("Refresh News")
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.refresh_news)
-        self.refresh_button.setStyleSheet("""
-            QToolButton {
-                background-color: #28a745;
-                color: white;
-                font-size: 14px;
-                padding: 2px;
-                border-radius: 3px;
-            }
-            QToolButton:hover {
-                background-color: #218838;
-            }
-        """)
-        header_layout.addWidget(self.refresh_button)
-        
-        self.layout.addLayout(header_layout)
-        
-        # Status label - make it more compact
-        self.status_label = QLabel("Loading news...")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet("color: #6c757d; font-style: italic; font-size: 11px;")
-        self.status_label.setMaximumHeight(20)  # Limit height
-        self.layout.addWidget(self.status_label)
-        
-        # Scroll area for news items - remove any frame or border
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setContentsMargins(0, 0, 0, 1)
-        
-        self.scroll_content = QWidget()
-        self.scroll_layout = QVBoxLayout(self.scroll_content)
-        self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.scroll_layout.setSpacing(4)  # Minimal spacing
-        self.scroll_layout.setContentsMargins(5, 0, 5, 0)  # Small horizontal margins only
-        
-        self.scroll_area.setWidget(self.scroll_content)
-        self.layout.addWidget(self.scroll_area)
+        t.addWidget(self.refresh_button)
+        self.layout.addWidget(toolbar)
+
+        # -- Feed
+        self.news_model = NewsFeedModel(self)
+        self.list_view = QListView()
+        self.list_view.setObjectName("newsList")
+        self.list_view.setModel(self.news_model)
+        self.delegate = NewsRowDelegate(self.list_view, self)
+        self.list_view.setItemDelegate(self.delegate)
+        self.list_view.setSelectionMode(QListView.SelectionMode.NoSelection)
+        self.list_view.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
+        self.list_view.setUniformItemSizes(False)
+        self.list_view.setMouseTracking(True)
+        self.list_view.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.layout.addWidget(self.list_view)
+
+        self.status_label.setText("LOADING…")
 
     def setup_worker(self):
         """Set up the background worker for fetching news"""
         self.worker = NewsWorker()
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
-
-        # Connect signals
         self.worker.news_fetched.connect(self.on_news_fetched)
         self.worker.error_occurred.connect(self.show_error)
-
-        # Start the thread
         self.worker_thread.start()
 
+    # ------------------------------------------------------------ filtering
+
+    def on_league_chip(self, key):
+        """League chips behave as a radio group. The team dropdown follows
+        the chip — not just the app-level league push from EffortOdds — so
+        manually switching to NFL offers NFL teams; ALL offers every team."""
+        self.active_league_chip = key
+        for k, chip in self.league_chips.items():
+            chip.setChecked(k == key)
+        self.update_team_dropdown(key)
+        self.apply_filters()
+
+    def toggle_injury_filter(self, checked):
+        self.show_injuries_only = checked
+        self.apply_filters()
+
+    def on_team_changed(self, team_name):
+        if team_name == "All Teams":
+            self.current_team = None
+            self.worker.set_team(None)
+        else:
+            self.current_team = team_name
+            self.worker.set_team(team_name)
+        self.apply_filters()
+
+    def apply_filters(self, *_):
+        """Recompute the visible item list from all active filters and feed
+        the model. Pure-Python list filtering over a few hundred dicts —
+        cheap enough to run on every keystroke of the search box."""
+        items = self.all_news_items or []
+        total = len(items)
+
+        if self.active_league_chip != "all":
+            items = [i for i in items if i.get('league') == self.active_league_chip]
+
+        active_cats = [c for c, chip in self.category_chips.items() if chip.isChecked()]
+        if active_cats:
+            items = [i for i in items if i.get('category') in active_cats]
+
+        if self.show_injuries_only:
+            items = [i for i in items if i.get('is_injury_news', False)]
+
+        if self.current_team:
+            team = self.current_team.lower()
+            items = [i for i in items
+                     if team in i.get('title', '').lower()
+                     or team in i.get('description', '').lower()]
+
+        query = self.search_box.text().strip().lower()
+        if query:
+            items = [i for i in items
+                     if query in i.get('title', '').lower()
+                     or query in i.get('description', '').lower()]
+
+        if self.chrono_sort.isChecked():
+            items = sorted(items, key=lambda x: x['date'], reverse=True)
+        else:
+            items = sorted(items,
+                           key=lambda x: (x.get('relevance_score', 0), x['date']),
+                           reverse=True)
+
+        self.expanded_row = -1
+        self.news_model.set_items(items)
+
+        if not total:
+            return  # initial state; status says LOADING…/FETCHING…
+        upd = f" · UPD {self._last_update}" if self._last_update else ""
+        self.status_label.setText(f"{len(items)}/{total}{upd}")
+
+    def set_expanded(self, row):
+        """Toggle the expanded (description + link) row in the feed."""
+        old = self.expanded_row
+        self.expanded_row = row
+        for r in (old, row):
+            if 0 <= r < self.news_model.rowCount():
+                self.delegate.sizeHintChanged.emit(self.news_model.index(r))
+        self.list_view.viewport().update()
+
+    def _tick_ages(self):
+        if self.isVisible():
+            self.list_view.viewport().update()
+
+    # ------------------------------------------------------------ data flow
+
+    def refresh_news(self):
+        """Refresh news data"""
+        self.status_label.setText("FETCHING…")
+        if hasattr(self.worker, 'news_items'):
+            self.worker.news_items = None
+        # Make sure the running flag is reset (in case it got stuck)
+        self.worker.running = False
+        QTimer.singleShot(0, self.worker.run_fetch)
+
+    def on_news_fetched(self, news_items):
+        """Handle a completed fetch: mark first-seen items for the ●NEW
+        flag, store everything, re-apply the active filters."""
+        keys = set()
+        first_fetch = not self._seen_keys
+        for item in news_items:
+            key = (item.get('title') or '')[:80]
+            keys.add(key)
+            item['_is_new'] = (not first_fetch) and key not in self._seen_keys
+        self._seen_keys = keys
+        self.all_news_items = news_items
+        self._last_update = datetime.now().strftime('%H:%M')
+        self.apply_filters()
+
+    def update_news_items(self, news_items):
+        """Compatibility entry point: replace the item set and re-filter."""
+        self.all_news_items = news_items
+        self.apply_filters()
+
+    def clear_news_items(self):
+        self.expanded_row = -1
+        self.news_model.set_items([])
+
+    def show_error(self, error_message):
+        self.status_label.setText(f"ERR: {error_message}")
+
+    # -------------------------------------------------------- league / teams
+
     def set_league(self, league_key):
-        """Set the current league and update the team dropdown"""
+        """Set the current league (pushed from EffortOdds on app-level sport
+        change): updates the worker and selects the matching league chip,
+        which repopulates the team dropdown. User can re-select any chip."""
         self.current_league = league_key
         self.worker.set_league(league_key)
-
-        # Update team dropdown with teams for this league
-        self.update_team_dropdown(league_key)
-
-        # Apply filter to existing news items instead of fetching new ones
-        if hasattr(self.worker, 'news_items') and self.worker.news_items:
-            self.update_news_items(self.worker.news_items)
+        self.on_league_chip(league_key if league_key in self.league_chips else "all")
 
     def update_team_dropdown(self, league_key):
-        """Update the team dropdown with teams for the current league"""
+        """Repopulate the team dropdown for one league, or for 'all' the
+        union of every league's teams (sorted, so it stays scannable)."""
+        if league_key == "all":
+            teams = sorted({t for key, _ in LEAGUE_CHIPS if key != "all"
+                            for t in self.get_teams_for_league(key)})
+        else:
+            teams = self.get_teams_for_league(league_key)
+        self.team_filter.blockSignals(True)
         self.team_filter.clear()
         self.team_filter.addItem("All Teams")
-
-        # Add teams for the selected league
-        teams = self.get_teams_for_league(league_key)
         for team in teams:
             self.team_filter.addItem(team)
+        self.team_filter.blockSignals(False)
+        self.current_team = None
+        self.worker.set_team(None)
 
     def get_teams_for_league(self, league_key):
         """Get list of teams for the specified league"""
-        # You can expand this with a more complete list for each league
         teams = {
             "basketball_nba": [
                 "Hawks", "Celtics", "Nets", "Hornets", "Bulls", "Cavaliers",
@@ -906,143 +1420,16 @@ class TeamNewsWidget(QWidget):
                 "Seattle Sounders", "Sporting Kansas City", "St. Louis City", "Toronto FC", "Vancouver Whitecaps"
             ]
         }
-
         return teams.get(league_key, [])
 
-    def on_team_changed(self, team_name):
-        """Handle team selection change"""
-        if team_name == "All Teams":
-            self.current_team = None
-            self.worker.set_team(None)
-        else:
-            self.current_team = team_name
-            self.worker.set_team(team_name)
+    def handle_league_change(self, league_key):
+        """Public method to update when the main app changes leagues"""
+        if league_key in ["basketball_nba", "football_nfl", "baseball_mlb",
+                          "icehockey_nhl", "soccer_usa_mls"]:
+            self.set_league(league_key)
 
-        # Apply filter to existing news items instead of refreshing
-        if hasattr(self.worker, 'news_items') and self.worker.news_items:
-            self.update_news_items(self.worker.news_items)
+    # ----------------------------------------------------------------- misc
 
-    def toggle_injury_filter(self, checked):
-        """Toggle showing only injury news"""
-        self.show_injuries_only = checked
-        
-        # Apply filter to existing news items
-        if self.all_news_items:
-            self.update_news_items(self.all_news_items)
-            
-        # Update status to reflect filter status
-        if checked and not self.all_news_items:
-            self.status_label.setText("No injury news found")
-            self.status_label.setVisible(True)
-
-    def refresh_news(self):
-        """Refresh news data"""
-        self.status_label.setText("Loading news...")
-        self.status_label.setVisible(True)
-
-        # Clear current news items
-        self.clear_news_items()
-        
-        # Force the worker to reset its cached news_items
-        if hasattr(self.worker, 'news_items'):
-            self.worker.news_items = None
-        
-        # Make sure the running flag is reset (in case it got stuck)
-        self.worker.running = False
-
-        # Start the worker using QTimer to avoid blocking
-        QTimer.singleShot(0, self.worker.run_fetch)
-
-    def clear_news_items(self):
-        """Clear all news items from the display"""
-        # Cancel any pending batch loading by setting index to end
-        self.current_widget_index = len(self.filtered_news_items) if self.filtered_news_items else 0
-        self.is_batch_loading = False  # Stop batch loading flag
-
-        while self.scroll_layout.count():
-            item = self.scroll_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-
-    def on_news_fetched(self, news_items):
-        """Handle when news is fetched - store all items first"""
-        # Store all news items before filtering
-        self.all_news_items = news_items
-        self.update_news_items(news_items)
-
-    def update_news_items(self, news_items):
-        """Update the display with news items, applying filters as needed"""
-        self.clear_news_items()
-
-        # Apply injury filter if enabled
-        filtered_items = news_items
-        if self.show_injuries_only:
-            filtered_items = [item for item in news_items if item.get('is_injury_news', False)]
-
-        # Rank by relevance score first (so fluff/speculation sinks to the
-        # bottom), then by date. The worker already sorted this way; re-sort
-        # here as a safeguard since the injuries-only filter may have run.
-        filtered_items.sort(
-            key=lambda x: (x.get('relevance_score', 0), x['date']),
-            reverse=True)
-
-        if not filtered_items:
-            message = "No injury news found" if self.show_injuries_only else "No news items found"
-            self.status_label.setText(message)
-            self.status_label.setVisible(True)
-            return
-
-        self.status_label.setVisible(False)
-
-        # Store filtered items for lazy loading
-        self.filtered_news_items = filtered_items
-        self.current_widget_index = 0
-        self.is_batch_loading = True  # Enable batch loading
-
-        # Load widgets in batches to prevent UI blocking
-        # Delay even the first batch to prevent any blocking during initial load
-        QTimer.singleShot(10, self.load_news_batch)  # 10ms delay before first batch
-
-    def load_news_batch(self):
-        """Load a batch of news widgets to prevent UI blocking"""
-        # Check if batch loading was cancelled
-        if not self.is_batch_loading:
-            return
-
-        batch_size = 15  # Load 15 widgets at a time (reduced for smoother loading)
-        end_index = min(self.current_widget_index + batch_size, len(self.filtered_news_items))
-
-        # Add widgets for this batch
-        for i in range(self.current_widget_index, end_index):
-            # Double-check flag in case it changed during loop
-            if not self.is_batch_loading:
-                break
-
-            item = self.filtered_news_items[i]
-            news_widget = NewsArticleWidget(item)
-            # Insert before the stretch (if it exists)
-            if self.scroll_layout.count() > 0 and self.scroll_layout.itemAt(self.scroll_layout.count() - 1).spacerItem():
-                self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, news_widget)
-            else:
-                self.scroll_layout.addWidget(news_widget)
-
-        self.current_widget_index = end_index
-
-        # If there are more items to load, schedule next batch
-        if self.current_widget_index < len(self.filtered_news_items) and self.is_batch_loading:
-            # Use QTimer to load next batch without blocking
-            QTimer.singleShot(30, self.load_news_batch)  # 30ms delay between batches
-        else:
-            # All widgets loaded, add stretch at the end
-            self.scroll_layout.addStretch()
-            self.is_batch_loading = False  # Mark batch loading as complete
-
-    def show_error(self, error_message):
-        """Display an error message"""
-        self.status_label.setText(f"Error: {error_message}")
-        self.status_label.setVisible(True)
-        
     def update_refresh_interval(self):
         """Update the timer interval when spinbox value changes"""
         new_interval = self.refresh_interval.value()
@@ -1053,17 +1440,11 @@ class TeamNewsWidget(QWidget):
             self.refresh_timer.stop()
         elif new_interval != self.current_refresh_interval:
             self.current_refresh_interval = new_interval
-            interval_ms = new_interval * 60 * 1000  # Convert minutes to milliseconds
+            interval_ms = new_interval * 60 * 1000
             self.refresh_disabled = False
             self.refresh_timer.stop()
             self.refresh_timer.start(interval_ms)
             print(f"News refresh interval updated to {new_interval} minutes")
-
-    def handle_league_change(self, league_key):
-        """Public method to update when the main app changes leagues"""
-        if league_key in ["basketball_nba", "football_nfl", "baseball_mlb",
-                         "icehockey_nhl", "soccer_usa_mls"]:
-            self.set_league(league_key)
 
 
 # For testing the widget standalone
@@ -1071,7 +1452,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     widget = TeamNewsWidget()
-    widget.set_league("basketball_nba")  # Set initial league
+    widget.set_league("baseball_mlb")  # Set initial league
+    widget.resize(1100, 700)
     widget.show()
 
     sys.exit(app.exec())

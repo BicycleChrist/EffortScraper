@@ -307,7 +307,20 @@ class _QLDropPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Popup)
         self.setStyleSheet(f"QFrame{{background:{_QL_BG};border:1px solid {_QL_BORDER};}}")
+
+    # The outside-click safety net only matters while the popup is on
+    # screen, so the app-wide filter is installed on show and removed on
+    # hide. Installing it permanently in __init__ (the old behavior) meant
+    # EVERY event in the entire application ran this Python method for
+    # every panel ever created — a per-event tax that showed up in stall
+    # watchdog dumps during widget-show event storms.
+    def showEvent(self, event):
         QApplication.instance().installEventFilter(self)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
+        super().hideEvent(event)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -1885,39 +1898,16 @@ class ModernOddsWindow(QMainWindow):
 
         # Defer the heavy layout work to avoid blocking during Polymarket fetching
         def do_layout_work():
-            # Make the widget visible first (needed for proper layout calculations)
-            self.news_container.setVisible(visible)
-            self.team_news_widget.setVisible(visible)
-
-            # Update button text and adjust container size
-            if visible:
-                self.news_toggle_button.setText("Hide Injury News ▲")
-
-                # Calculate exact height for 3 articles
-                article_height = 85
-                container_height = (article_height * 3)
-                self.news_container.setMinimumHeight(container_height)
-
-                # KEY FIX: Set negative top margin on progress bar to pull it upward
-                prog_margins = self.progress.contentsMargins()
-                prog_margins.setTop(-100)  # Adjust this value as needed
-                self.progress.setContentsMargins(prog_margins)
-
-                # Set minimal spacing in main layout
-                self.layout.setSpacing(0)
-            else:
-                self.news_toggle_button.setText("Show Injury News ▼")
-
-                # Reset progress bar margins to normal
-                prog_margins = self.progress.contentsMargins()
-                prog_margins.setTop(0)
-                self.progress.setContentsMargins(prog_margins)
-
-                # Reset layout spacing
-                self.layout.setSpacing(0)
-
-            # Force update to apply changes
-            self.update()
+            # Coalesce the show-storm into one repaint: making the container
+            # visible polishes + lays out every accumulated article widget
+            # (they're batch-inserted while hidden), and without this the
+            # window repaints incrementally through the whole cascade.
+            self.setUpdatesEnabled(False)
+            try:
+                self._do_news_layout_work(visible)
+            finally:
+                self.setUpdatesEnabled(True)
+                self.update()
 
         # Update button text immediately for responsive feedback
         if visible:
@@ -1928,6 +1918,37 @@ class ModernOddsWindow(QMainWindow):
         # Defer the heavy layout work by 1ms to avoid blocking
         QTimer.singleShot(1, do_layout_work)
 
+    def _do_news_layout_work(self, visible):
+        # Make the widget visible first (needed for proper layout calculations)
+        self.news_container.setVisible(visible)
+        self.team_news_widget.setVisible(visible)
+
+        # Update button text and adjust container size
+        if visible:
+            self.news_toggle_button.setText("Hide Injury News ▲")
+
+            # Calculate exact height for 3 articles
+            article_height = 85
+            container_height = (article_height * 3)
+            self.news_container.setMinimumHeight(container_height)
+
+            # KEY FIX: Set negative top margin on progress bar to pull it upward
+            prog_margins = self.progress.contentsMargins()
+            prog_margins.setTop(-100)  # Adjust this value as needed
+            self.progress.setContentsMargins(prog_margins)
+
+            # Set minimal spacing in main layout
+            self.layout.setSpacing(0)
+        else:
+            self.news_toggle_button.setText("Show Injury News ▼")
+
+            # Reset progress bar margins to normal
+            prog_margins = self.progress.contentsMargins()
+            prog_margins.setTop(0)
+            self.progress.setContentsMargins(prog_margins)
+
+            # Reset layout spacing
+            self.layout.setSpacing(0)
 
     def toggle_historical_odds(self):
         """Toggle visibility of the historical odds widget"""
@@ -2834,6 +2855,16 @@ class ModernOddsWindow(QMainWindow):
 
 
 def main():
+    # The remaining stutter class is GIL starvation: pure-Python worker
+    # parses (match-map PX normalize, feedparser RSS, py_clob_client JSON)
+    # hold the GIL in default 5ms slices, and with several busy at once the
+    # qasync loop's turn comes around late (~120-200ms observed). 1ms slices
+    # make the handoff to the main loop ~5x more frequent for a small
+    # throughput cost on the workers — latency over throughput is the right
+    # trade for a UI process. (see PERF_DIAGNOSTICS.md "ROUND 5")
+    import sys as _sys_si
+    _sys_si.setswitchinterval(0.001)
+
     app = QApplication([])
 
     # Create qasync event loop FIRST, before any async operations
@@ -2849,72 +2880,79 @@ def main():
     window.show()
     loop.create_task(window.initialize())
 
-    # ╔══ [PERF-DIAG] Temporary UI-stutter instrumentation ════════════════╗
-    # Catalogued in OddsAPI/PERF_DIAGNOSTICS.md. Grep "[PERF-DIAG]" to find
-    # every diagnostic block in the codebase; ALL of them are deletable once
-    # the ticker stutter is root-caused and fixed.
-    #
-    # (1) event-loop lag monitor — reports *that* the shared qasync loop
-    #     stalled, but only after it unblocks (the offending call is already
-    #     off the stack by the time this logs). Good for spotting frequency.
-    import time as _time
-    async def _loop_lag_monitor(threshold_ms=100, interval=0.05):
-        while True:
-            t0 = _time.perf_counter()
-            await asyncio.sleep(interval)
-            late_ms = (_time.perf_counter() - t0 - interval) * 1000
-            if late_ms > threshold_ms:
-                # bypass the DEBUG gate so lag readings show regardless
-                _real_print(f"[loop-lag] blocked {late_ms:.0f}ms @ {_time.strftime('%H:%M:%S')}")
-    loop.create_task(_loop_lag_monitor())
+    # ╔══ [PERF-DIAG] UI-stutter instrumentation (DORMANT by default) ═════╗
+    # Re-arm with:  EFFORTODDS_PERF_DIAG=1 python EffortOdds.py
+    # Catalogued in OddsAPI/PERF_DIAGNOSTICS.md (history + how to read the
+    # dumps). Zero runtime cost when the env var is unset — no tasks, no
+    # threads, no file handle. This caught and killed the 2026-06 stutter
+    # epidemic; keep it for the next one.
+    import os as _os
+    # TEMP: default-ON while investigating the injury-news toggle hitch
+    # (2026-06-10). Revert default to "0"-when-unset once resolved.
+    if _os.environ.get("EFFORTODDS_PERF_DIAG", "1") == "1":
+        # (1) event-loop lag monitor — reports *that* the shared qasync loop
+        #     stalled, but only after it unblocks (the offending call is
+        #     already off the stack by the time this logs). Good for spotting
+        #     frequency.
+        import time as _time
+        async def _loop_lag_monitor(threshold_ms=100, interval=0.05):
+            while True:
+                t0 = _time.perf_counter()
+                await asyncio.sleep(interval)
+                late_ms = (_time.perf_counter() - t0 - interval) * 1000
+                if late_ms > threshold_ms:
+                    # bypass the DEBUG gate so lag readings show regardless
+                    _real_print(f"[loop-lag] blocked {late_ms:.0f}ms @ {_time.strftime('%H:%M:%S')}")
+        loop.create_task(_loop_lag_monitor())
 
-    # (2) main-loop watchdog — reports *where* the loop stalled. A heartbeat
-    #     coroutine refreshes a timestamp every 20ms while the loop is healthy;
-    #     an independent OS thread (NOT a QThread, so it keeps running while the
-    #     main thread is parked) watches that timestamp and, the moment it goes
-    #     stale past the threshold, dumps every thread's Python stack mid-stall.
-    #       • MainThread deep in app code (e.g. resizeRowsToContents / pandas
-    #         .at fill)            → synchronous main-loop burst   (Tier-1 fix)
-    #       • MainThread idle in select/poll while a worker thread is busy in
-    #         json/parse           → GIL contention from that worker (Tier-3 fix)
-    #     faulthandler is C-level and dumps all threads regardless of who holds
-    #     the GIL (CPython releases it every ~5ms, so this thread gets scheduled).
-    import faulthandler as _faulthandler
-    import threading as _threading
-    import sys as _sys
-    # Stacks go to a DEDICATED file (not stderr) so they're always captured no
-    # matter how the app is launched — no 2>&1 needed. faulthandler writes via
-    # the raw fd so it lands on disk immediately; line-buffered text mode keeps
-    # the headline ordered with it. Read OddsAPI/stutter_dumps.txt after a run.
-    _wd_path = pathlib.Path(__file__).parent / "stutter_dumps.txt"
-    _wd_file = open(_wd_path, "a", buffering=1)
-    _real_print(f"[watchdog] stall stacks → {_wd_path}")
-    _wd = {"beat": _time.monotonic()}            # dict cell: shared, no nonlocal
-    async def _wd_heartbeat(interval=0.02):
-        while True:
-            _wd["beat"] = _time.monotonic()
-            await asyncio.sleep(interval)
-    def _wd_watch(threshold=0.12, poll=0.02):
-        dumped = False                           # de-dupe: one dump per stall
-        while True:
-            _time.sleep(poll)
-            lag = _time.monotonic() - _wd["beat"]
-            if lag > threshold:
-                if not dumped:
-                    _real_print(
-                        f"\n[watchdog] main loop blocked {lag*1000:.0f}ms @ "
-                        f"{_time.strftime('%H:%M:%S')} — all-thread stacks below:",
-                        file=_wd_file, flush=True)
-                    _faulthandler.dump_traceback(file=_wd_file, all_threads=True)
-                    _wd_file.flush()
-                    # Brief echo to stdout so it's obvious in the console too.
-                    _real_print(f"[watchdog] {lag*1000:.0f}ms stall — stack written "
-                                f"to stutter_dumps.txt")
-                    dumped = True
-            else:
-                dumped = False
-    loop.create_task(_wd_heartbeat())
-    _threading.Thread(target=_wd_watch, daemon=True, name="loop-watchdog").start()
+        # (2) main-loop watchdog — reports *where* the loop stalled. A
+        #     heartbeat coroutine refreshes a timestamp every 20ms while the
+        #     loop is healthy; an independent OS thread (NOT a QThread, so it
+        #     keeps running while the main thread is parked) watches that
+        #     timestamp and, the moment it goes stale past the threshold,
+        #     dumps every thread's Python stack mid-stall.
+        #       • MainThread deep in app code  → synchronous main-loop burst
+        #       • MainThread idle in select/poll while a worker is busy in
+        #         json/parse                   → GIL contention from that worker
+        #     faulthandler is C-level and dumps all threads regardless of who
+        #     holds the GIL (CPython releases it every ~5ms, so this thread
+        #     gets scheduled).
+        import faulthandler as _faulthandler
+        import threading as _threading
+        # Stacks go to a DEDICATED file (not stderr) so they're always
+        # captured no matter how the app is launched — no 2>&1 needed.
+        # faulthandler writes via the raw fd so it lands on disk immediately;
+        # line-buffered text mode keeps the headline ordered with it. Read
+        # OddsAPI/stutter_dumps.txt after a run.
+        _wd_path = pathlib.Path(__file__).parent / "stutter_dumps.txt"
+        _wd_file = open(_wd_path, "a", buffering=1)
+        _real_print(f"[watchdog] stall stacks → {_wd_path}")
+        _wd = {"beat": _time.monotonic()}        # dict cell: shared, no nonlocal
+        async def _wd_heartbeat(interval=0.02):
+            while True:
+                _wd["beat"] = _time.monotonic()
+                await asyncio.sleep(interval)
+        def _wd_watch(threshold=0.12, poll=0.02):
+            dumped = False                       # de-dupe: one dump per stall
+            while True:
+                _time.sleep(poll)
+                lag = _time.monotonic() - _wd["beat"]
+                if lag > threshold:
+                    if not dumped:
+                        _real_print(
+                            f"\n[watchdog] main loop blocked {lag*1000:.0f}ms @ "
+                            f"{_time.strftime('%H:%M:%S')} — all-thread stacks below:",
+                            file=_wd_file, flush=True)
+                        _faulthandler.dump_traceback(file=_wd_file, all_threads=True)
+                        _wd_file.flush()
+                        # Brief echo to stdout so it's obvious in the console too.
+                        _real_print(f"[watchdog] {lag*1000:.0f}ms stall — stack written "
+                                    f"to stutter_dumps.txt")
+                        dumped = True
+                else:
+                    dumped = False
+        loop.create_task(_wd_heartbeat())
+        _threading.Thread(target=_wd_watch, daemon=True, name="loop-watchdog").start()
     # ╚════════════════════════════════════════════════════════════════════╝
 
     if DEBUG:
