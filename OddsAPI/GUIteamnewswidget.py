@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox,
     QLineEdit, QListView, QStyledItemDelegate, QStyle
 )
-from fpscraper import FantasyProsScraper
+import GUIMLBlineups
 
 # Shared single-child process pool for feedparser parses. Parsing in a
 # thread (the old run_in_executor(None, ...) path) held the GIL for the
@@ -39,33 +39,6 @@ def _feed_parse_pool():
         _FEED_PARSE_POOL = ProcessPoolExecutor(max_workers=1)
     return _FEED_PARSE_POOL
 
-#TODO: Manually scrape Fantasy pros as their Rss feed keeps returning errors despite being populated
-# Below is an example "player-news-item" div
-"""
-<div class="player-news-item">
-    <div class="clearfix">
-        <div class="two columns player-news-image" style="padding: 8px 8px 0; background-color: #f7f7f7;">
-            <a href="/nfl/players/trey-mcbride.php"><img src="https://images.fantasypros.com/images/players/nfl/22936/headshot/100x100.png" alt="Trey McBride" style="width: 100%;"></a><p style="font-size:11px; line-height:15px; margin-top:10px;"><a href="/nfl/players/trey-mcbride.php">» Rankings</a><br><a href="/nfl/stats/trey-mcbride.php">» Stats</a><br><a href="/nfl/news/trey-mcbride.php">» More News</a></p>        </div>
-        <div class="ten columns">
-            <div class="player-news-header clearfix"><div class="ten columns"><span style="font-size:16px; font-weight:bold;"><a href="/nfl/news/509904/trey-mcbride-signs-four-year-extension-with-cardinals-.php" target="_blank">Trey McBride signs four-year extension with Cardinals </a></span><br><p>Thu, Apr 3rd 6:33pm EDT<br>
-By <a href="/news/correspondents/ari-koslow.php" target="_blank">Ari Koslow</a></p></div></div><p>The Cardinals signed TE Trey McBride to a four-year, $76 million extension.</p><p><b><em>Fantasy Impact:</em></b> The extension makes McBride the highest paid tight end in NFL history. It also includes $43 million in guaranteed money. McBride is coming off a career season and remains one of the top tight ends in fantasy football. </p><span class="pull-left"><p>Category: 
-<a href="/nfl/transactions.php">Transactions</a></p></span>
-<span class="pull-right fp-vote-container" data-itemid="n-509904"></span>        </div>
-    </div>
-</div>
-
-"""
-
-
-# not actually RSS feeds
-fantasypros_links = {
-    "NBA": "https://www.fantasypros.com/nba/player-news",
-    "NFL": "https://www.fantasypros.com/nfl/player-news",
-    "MLB": "https://www.fantasypros.com/mlb/injury-news",
-    "NHL": "https://www.fantasypros.com/nhl/player-news",
-}
-
-
 class NewsWorker(QObject):
     """Background worker to fetch news without blocking the UI"""
     news_fetched = pyqtSignal(list)
@@ -80,8 +53,10 @@ class NewsWorker(QObject):
         self.news_items = None
         self.news_by_league = {}  # Store headlines by league for ticker tape
         self.print_fetches = False
-        self.scraper = FantasyProsScraper()
         self.current_thread = None  # Track current fetch thread
+        # gamePk/side → datetime we first saw that official MLB lineup, so
+        # synthesized lineup items keep a stable timestamp across refreshes
+        self._lineup_seen = {}
         print(f"[NewsWorker] printing_fetches: {self.print_fetches}")
 
         # Pre-compile regex patterns for filtering - MAJOR PERFORMANCE OPTIMIZATION
@@ -107,7 +82,9 @@ class NewsWorker(QObject):
                     "https://www.espn.com/espn/rss/nfl/news",
                     "https://www.cbssports.com/rss/headlines/nfl",
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nfl",
-                    "https://sports.yahoo.com/nfl/rss/"
+                    "https://sports.yahoo.com/nfl/rss/",
+                    # PFF also has per-team feeds: pff.com/feed/teams/<1-32>
+                    "https://www.pff.com/feed",
                 ]
             },
             # MLB
@@ -134,7 +111,41 @@ class NewsWorker(QObject):
                     "https://api.foxsports.com/v2/content/optimized-rss?partnerKey=MB0Wehpmuj2lUhuRhQaafhBjAJqaPU244mlTDK1i&size=30&tags=fs/nhl",
                     "https://sports.yahoo.com/nhl/rss/"
                 ]
-            }
+            },
+            # Soccer — one global bucket; EPL/MLS/transfer news all flow
+            # through these. (CBS soccer feed omitted: its items ship empty
+            # <pubDate> tags, which our parser would stamp as "now".)
+            "soccer": {
+                "general": [
+                    "https://feeds.bbci.co.uk/sport/football/rss.xml",
+                    "https://www.theguardian.com/football/rss",
+                    "https://www.espn.com/espn/rss/soccer/news",
+                    "https://sports.yahoo.com/soccer/rss/",
+                    # Sky Sports football headlines
+                    "https://www.skysports.com/rss/11095",
+                    "https://www.rotowire.com/rss/news.php?sport=soccer",
+                    "https://www.101greatgoals.com/rss",
+                ]
+            },
+            # Tennis
+            "tennis": {
+                "general": [
+                    "https://feeds.bbci.co.uk/sport/tennis/rss.xml",
+                    "https://www.theguardian.com/sport/tennis/rss",
+                    "https://www.espn.com/espn/rss/tennis/news",
+                    "https://www.tennis365.com/feed",
+                    "https://www.tennis.com/roots/rss-feeds/news/",
+                ]
+            },
+            # Rugby (union + league in one bucket)
+            "rugby": {
+                "general": [
+                    "https://feeds.bbci.co.uk/sport/rugby-union/rss.xml",
+                    "https://feeds.bbci.co.uk/sport/rugby-league/rss.xml",
+                    "https://www.theguardian.com/sport/rugby-union/rss",
+                    "https://www.espn.com/espn/rss/rugby/news",
+                ]
+            },
         }
 
 
@@ -456,18 +467,23 @@ class NewsWorker(QObject):
 
                 content = await response.text()
 
-                # Parse out-of-process: feedparser.parse() is synchronous and
-                # CPU-bound, and in a thread it competes for THIS process's
-                # GIL with the UI loop. Falls back to the old in-thread parse
-                # if the child process died (e.g. OOM-killed).
-                loop = asyncio.get_event_loop()
-                try:
-                    feed = await loop.run_in_executor(
-                        _feed_parse_pool(), feedparse_worker.parse_feed, content)
-                except BrokenProcessPool:
-                    global _FEED_PARSE_POOL
-                    _FEED_PARSE_POOL = None
-                    feed = await loop.run_in_executor(None, feedparser.parse, content)
+            # Parse out-of-process: feedparser.parse() is synchronous and
+            # CPU-bound, and in a thread it competes for THIS process's
+            # GIL with the UI loop. Falls back to the old in-thread parse
+            # if the child process died (e.g. OOM-killed).
+            # NOTE: deliberately outside the `async with` — the single
+            # parse worker serializes all feeds' parses, and queue time
+            # spent inside the response context counts against the 3s
+            # HTTP timeout (it was killing the bigger feeds once enough
+            # sources were configured).
+            loop = asyncio.get_event_loop()
+            try:
+                feed = await loop.run_in_executor(
+                    _feed_parse_pool(), feedparse_worker.parse_feed, content)
+            except BrokenProcessPool:
+                global _FEED_PARSE_POOL
+                _FEED_PARSE_POOL = None
+                feed = await loop.run_in_executor(None, feedparser.parse, content)
 
             # Check if feed parsed correctly
             if hasattr(feed, 'bozo_exception') and feed.bozo_exception:
@@ -514,7 +530,8 @@ class NewsWorker(QObject):
                     'description': description,
                     'link': entry.link,
                     'date': date,
-                    'source': feed.feed.title if hasattr(feed, 'feed') and hasattr(feed.feed, 'title') else url.split('/')[2],
+                    # `or` fallback: some feeds (Yahoo soccer) ship an empty <title>
+                    'source': (feed.feed.get('title', '') if hasattr(feed, 'feed') else '') or url.split('/')[2],
                     'image_url': image_url,
                     'league': league
                 })
@@ -525,37 +542,35 @@ class NewsWorker(QObject):
             print(f"Error fetching RSS feed {url}: {str(e)}")
             return []
             
-    def fetch_fantasypros_news(self):
-        """Fetch news from FantasyPros website using HTML scraping"""
+    async def fetch_mlb_lineup_news(self, session):
+        """Synthesize LINEUP news items from the official MLB Stats API.
+        The schedule endpoint hydrates posted batting orders + probable
+        pitchers (free JSON, no scraping); GUIMLBlineups turns the payload
+        into news-item dicts. self._lineup_seen pins each lineup's timestamp
+        to when we first saw it so items age normally across refreshes."""
         try:
-            # Use the appropriate method based on league
-            if self.league_key == "basketball_nba":
-                return self.scraper.scrape_nba_news()
-            elif self.league_key == "football_nfl":
-                return self.scraper.scrape_nfl_news()
-            elif self.league_key == "baseball_mlb":
-                return self.scraper.scrape_mlb_news()
-            elif self.league_key == "icehockey_nhl":
-                return self.scraper.scrape_nhl_news()
-            else:
-                return []
+            async with session.get(GUIMLBlineups.statsapi_schedule_url()) as response:
+                if response.status != 200:
+                    if self.print_fetches:
+                        print(f"MLB Stats API returned status {response.status}")
+                    return []
+                data = await response.json()
         except Exception as e:
-            print(f"Error fetching FantasyPros news: {str(e)}")
+            print(f"Error fetching MLB lineups: {e}")
             return []
+        return GUIMLBlineups.lineup_news_items(data, self._lineup_seen)
 
     async def fetch_news(self):
         """Fetch news from all configured sources with connection pooling"""
         try:
 
 
-            # Fetch news for all 4 sports leagues for ticker tape
-            all_leagues = ["basketball_nba", "football_nfl", "baseball_mlb", "icehockey_nhl"]
+            # Fetch news for every configured sport for the ticker tape
             sources = []
 
             # Add RSS feeds for all leagues, tagged with their league so each
             # item carries a 'league' key (drives the feed's league chips)
-            for league in all_leagues:
-                league_feeds = self.rss_urls.get(league, {})
+            for league, league_feeds in self.rss_urls.items():
                 for url in league_feeds.get('general', []):
                     sources.append((league, url))
 
@@ -613,9 +628,9 @@ class NewsWorker(QObject):
                 # Fetch from all RSS sources in parallel
                 tasks = [self.fetch_rss_feed_with_session(session, url, league)
                          for league, url in sources]
-                
-                # Add FantasyPros scraping (no longer async)
-                # Skip FantasyPros for now to avoid blocking - can add back later if needed
+
+                # Official MLB lineup announcements (Stats API JSON, not RSS)
+                tasks.append(self.fetch_mlb_lineup_news(session))
 
                 # Execute all tasks with faster concurrency
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -718,6 +733,9 @@ LEAGUE_CHIPS = [
     ("basketball_nba", "NBA"),
     ("football_nfl", "NFL"),
     ("icehockey_nhl", "NHL"),
+    ("soccer", "SOC"),
+    ("tennis", "TEN"),
+    ("rugby", "RUG"),
 ]
 
 
@@ -1410,22 +1428,39 @@ class TeamNewsWidget(QWidget):
                 "Rangers", "Senators", "Flyers", "Penguins", "Sharks", "Kraken",
                 "Blues", "Lightning", "Maple Leafs", "Canucks", "Golden Knights", "Capitals"
             ],
-            "soccer_usa_mls": [
+            # One bucket for all soccer feeds: MLS clubs + the EPL sides that
+            # dominate the global wires, so the team filter stays useful.
+            "soccer": [
                 "Atlanta United", "Austin FC", "Charlotte FC", "Chicago Fire",
                 "Colorado Rapids", "Columbus Crew", "D.C. United", "FC Cincinnati",
                 "FC Dallas", "Houston Dynamo", "Inter Miami", "LA Galaxy",
                 "LAFC", "Minnesota United", "Nashville SC", "New England Revolution",
                 "New York City FC", "New York Red Bulls", "Orlando City", "Philadelphia Union",
                 "Portland Timbers", "Real Salt Lake", "San Jose Earthquakes",
-                "Seattle Sounders", "Sporting Kansas City", "St. Louis City", "Toronto FC", "Vancouver Whitecaps"
+                "Seattle Sounders", "Sporting Kansas City", "St. Louis City", "Toronto FC", "Vancouver Whitecaps",
+                "Arsenal", "Aston Villa", "Chelsea", "Everton", "Liverpool",
+                "Manchester City", "Manchester United", "Newcastle",
+                "Tottenham", "West Ham"
             ]
+            # tennis/rugby have no team lists — the dropdown just shows
+            # "All Teams" and the text filter covers player/club names
         }
         return teams.get(league_key, [])
 
     def handle_league_change(self, league_key):
         """Public method to update when the main app changes leagues"""
+        if not league_key:
+            return
+        # OddsAPI sport keys are granular (soccer_epl, soccer_usa_mls,
+        # tennis_atp_french_open, rugbyleague_nrl...); news feeds use one
+        # bucket per sport, so collapse by prefix first.
+        for prefix, bucket in (("soccer", "soccer"), ("tennis", "tennis"),
+                               ("rugby", "rugby")):
+            if league_key.startswith(prefix):
+                league_key = bucket
+                break
         if league_key in ["basketball_nba", "football_nfl", "baseball_mlb",
-                          "icehockey_nhl", "soccer_usa_mls"]:
+                          "icehockey_nhl", "soccer", "tennis", "rugby"]:
             self.set_league(league_key)
 
     # ----------------------------------------------------------------- misc

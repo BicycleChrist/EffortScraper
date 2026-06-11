@@ -1,6 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import traceback
+from datetime import datetime, timezone
 
 def get_page(url) -> BeautifulSoup | None:
     """Fetch a web page and return a BeautifulSoup object, or None if the request fails."""
@@ -245,6 +246,111 @@ def get_todays_pitchers():
         print(f"Error getting today's pitchers: {e}")
         traceback.print_exc()
         return [], {}
+
+
+# --------------------------------------------------------------------------
+# Official lineups via the MLB Stats API
+#
+# statsapi.mlb.com is the source of record: the schedule endpoint hydrated
+# with `lineups` returns each game's posted batting order (in order, with
+# positions) plus probable pitchers, as free JSON — no scraping, no
+# Rotowire lag. Lineups appear per-side as managers post them (usually
+# 2-4 hours before first pitch).
+# --------------------------------------------------------------------------
+
+def statsapi_schedule_url(date=None):
+    """Schedule URL hydrated with lineups + probable pitchers.
+    date: YYYY-MM-DD string, defaults to today (local)."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    return ("https://statsapi.mlb.com/api/v1/schedule"
+            f"?sportId=1&date={date}&hydrate=lineups,probablePitcher")
+
+
+def fetch_official_lineups(date=None):
+    """Fetch the hydrated schedule JSON synchronously. Returns the parsed
+    dict, or {} on failure. (The news widget fetches the same URL through
+    its aiohttp session instead — see NewsWorker.fetch_mlb_lineup_news.)"""
+    try:
+        response = requests.get(statsapi_schedule_url(date), timeout=5)
+        if response.status_code != 200:
+            print(f"[fetch_official_lineups] status {response.status_code}")
+            return {}
+        return response.json()
+    except Exception as e:
+        print(f"Error fetching official lineups: {e}")
+        return {}
+
+
+def lineup_news_items(schedule_json, first_seen=None):
+    """Convert a hydrated schedule payload into news-item dicts (same shape
+    as the RSS items in GUIteamnewswidget): one item per posted team lineup.
+
+    first_seen: optional dict mapping (gamePk, side) -> datetime, mutated in
+    place so an item keeps the timestamp of when its lineup was first seen
+    instead of re-stamping "now" on every refresh. Final games are skipped
+    (their lineups are no longer announcements); stale keys are pruned.
+    """
+    if first_seen is None:
+        first_seen = {}
+    items = []
+    games = []
+    for date_block in schedule_json.get("dates", []):
+        games.extend(date_block.get("games", []))
+
+    live_keys = set()
+    for game in games:
+        if game.get("status", {}).get("abstractGameState") == "Final":
+            continue
+        lineups = game.get("lineups") or {}
+        game_pk = game.get("gamePk")
+        teams = game.get("teams", {})
+
+        # Local first-pitch time for the title
+        time_str = ""
+        try:
+            game_dt = datetime.fromisoformat(
+                game.get("gameDate", "").replace("Z", "+00:00"))
+            time_str = game_dt.astimezone().strftime("%I:%M %p").lstrip("0")
+        except ValueError:
+            pass
+
+        for side, prep in (("away", "at"), ("home", "vs")):
+            players = lineups.get(f"{side}Players") or []
+            if not players:
+                continue
+            key = (game_pk, side)
+            live_keys.add(key)
+            seen_at = first_seen.setdefault(key, datetime.now())
+
+            opp = "home" if side == "away" else "away"
+            team_name = teams.get(side, {}).get("team", {}).get("name", "?")
+            opp_name = teams.get(opp, {}).get("team", {}).get("name", "?")
+
+            order = " · ".join(
+                f"{i}. {p.get('fullName', '?')} "
+                f"{p.get('primaryPosition', {}).get('abbreviation', '')}".rstrip()
+                for i, p in enumerate(players, 1))
+            pitcher = teams.get(side, {}).get("probablePitcher", {}).get("fullName")
+            if pitcher:
+                order += f" — SP: {pitcher}"
+
+            when = f", {time_str}" if time_str else ""
+            items.append({
+                "title": f"{team_name} official lineup ({prep} {opp_name}{when})",
+                "description": order,
+                "link": f"https://www.mlb.com/gameday/{game_pk}",
+                "date": seen_at,
+                "source": "MLB.com",
+                "image_url": None,
+                "league": "baseball_mlb",
+            })
+
+    # Drop timestamps for games that have finished / fallen off the slate
+    for key in list(first_seen):
+        if key not in live_keys:
+            del first_seen[key]
+    return items
 
 
 def get_weather_by_team_matchup():

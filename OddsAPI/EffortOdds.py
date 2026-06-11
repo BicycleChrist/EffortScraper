@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit,
-    QInputDialog, QScrollArea
+    QInputDialog, QScrollArea, QToolButton
 )
 from propQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -206,7 +206,8 @@ class LeagueTabData:
 class UpdateProgressIndicator(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(20, 20)
+        # Sized to sit inside the 20px instance banner (14px ring + breathing room)
+        self.setFixedSize(14, 14)
         self.progress = 0
 
     def setProgress(self, value):
@@ -218,13 +219,13 @@ class UpdateProgressIndicator(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Draw background circle
-        painter.setPen(QPen(QColor("#e9ecef"), 2))
-        painter.drawEllipse(2, 2, 16, 16)
+        painter.setPen(QPen(QColor("#232c3a"), 2))
+        painter.drawEllipse(2, 2, 10, 10)
 
         # Draw progress arc
         painter.setPen(QPen(QColor("#007bff"), 2))
         angle = int(-self.progress * 360)
-        painter.drawArc(2, 2, 16, 16, 90 * 16, angle * 16)
+        painter.drawArc(2, 2, 10, 10, 90 * 16, angle * 16)
 
 
 
@@ -867,7 +868,15 @@ class ModernOddsWindow(QMainWindow):
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        self.layout = QVBoxLayout(main_widget)
+        # Zero-margin outer column so the instance banner runs edge-to-edge
+        # and flush with the bottom; everything else keeps the tight 5px
+        # margins via the inner content layout.
+        self._outer_layout = QVBoxLayout(main_widget)
+        self._outer_layout.setContentsMargins(0, 0, 0, 0)
+        self._outer_layout.setSpacing(0)
+        content_widget = QWidget()
+        self._outer_layout.addWidget(content_widget, 1)
+        self.layout = QVBoxLayout(content_widget)
         self.layout.setSpacing(1)  # Minimize spacing between all main layout elements
         self.layout.setContentsMargins(5, 5, 5, 5)  # Tight margins
 
@@ -1067,6 +1076,9 @@ class ModernOddsWindow(QMainWindow):
         action_buttons_layout.addWidget(self.props_availability_label)
 
         action_buttons_layout.addStretch()
+        # Auto-update controls get appended (right-aligned) into this same row
+        # later in init — they belong with the odds table, not the window foot.
+        self._toolbar_layout = action_buttons_layout
         controls_layout.addWidget(action_buttons_widget)
 
         # TuneInWidget is itself the floating dropdown — no wrapper needed
@@ -1137,49 +1149,13 @@ class ModernOddsWindow(QMainWindow):
         best_lines_layout = QVBoxLayout(self.best_lines_container)
         best_lines_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Create header layout with label and buttons
-        best_lines_header_layout = QHBoxLayout()
-
-        # Add the header label
-        best_lines_header = QLabel("Best Lines ⮟")
-        best_lines_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #7bd419")
-        best_lines_header_layout.addWidget(best_lines_header)
-
-        # Add spacer to push buttons to the right
-        best_lines_header_layout.addStretch(1)
-
-        # Add refresh button for splits data
-        self.splits_refresh_button = QPushButton("↻")
-        self.splits_refresh_button.setToolTip("Refresh Betting Splits Data")
-        self.splits_refresh_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2C3E50;
-                color: white;
-                border: none;
-                padding: 2px 4px;
-                border-radius: 3px;
-                font-size: 10pt;
-            }
-            QPushButton:hover {
-                background-color: #34495E;
-            }
-        """)
-        self.splits_refresh_button.setFixedWidth(25)
+        # Create the best lines widget (CRT blotter; legacy BestLinesWidget
+        # remains in use by EffortOddsPropsWindow as a raw QTableWidget).
+        # Mode label, splits refresh, and the lines/splits toggle all live in
+        # the widget's own control bar — no external header row.
+        self.best_lines_widget = CRTBestLinesWidget()
+        self.splits_refresh_button = self.best_lines_widget.refresh_button
         self.splits_refresh_button.clicked.connect(self.refresh_splits_data)
-        best_lines_header_layout.addWidget(self.splits_refresh_button)
-
-        # Create the best lines widget
-        self.best_lines_widget = BestLinesWidget()
-
-        def UpdateBestLinesHeader():
-            best_lines_header.setText("Splits ⮟" if self.best_lines_widget.show_splits else "Best Lines ⮟")
-
-        # Add the toggle button from the BestLinesWidget
-        best_lines_header_layout.addWidget(self.best_lines_widget.toggle_button)
-        self.best_lines_widget.toggle_button.clicked.connect(UpdateBestLinesHeader)
-
-        # Add the header layout and the widget to the container
-        best_lines_layout.addLayout(best_lines_header_layout)
         best_lines_layout.addWidget(self.best_lines_widget)
 
         # Create the historical odds container
@@ -1330,64 +1306,158 @@ class ModernOddsWindow(QMainWindow):
         self.layout.addWidget(self.vertical_splitter, 1)  # The 1 gives it stretch
 
         # --------- AUTO-UPDATE CONTROLS ---------
-        # Auto-update controls
-        update_controls_layout = QHBoxLayout()
-
+        # Checkbox + interval live in a popup behind a ⚙ button parked in the
+        # odds tab bar's corner: tied to the table they control, zero layout
+        # footprint, auto-closes on outside click. The gear glows green while
+        # auto-update is armed. Last-update timestamp lives in the bottom banner.
         self.auto_update_check = QCheckBox("Auto-Update Odds")
-        update_controls_layout.addWidget(self.auto_update_check)
 
         self.update_interval = QSpinBox()
         self.update_interval.setRange(1, 60)
         self.update_interval.setSuffix(" min")
         self.update_interval.setValue(30)
         self.update_interval.setEnabled(True)
-        update_controls_layout.addWidget(QLabel("Update Interval:"))
-        update_controls_layout.addWidget(self.update_interval)
 
-        self.status_frame = QFrame()
-        self.status_frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        self.status_frame_layout = QHBoxLayout(self.status_frame)
+        self.auto_update_popup = QWidget(self, Qt.WindowType.Popup)
+        self.auto_update_popup.setObjectName("autoUpdatePopup")
+        self.auto_update_popup.setStyleSheet("""
+            QWidget#autoUpdatePopup {
+                background-color: #15191f;
+                border: 1px solid #232c3a;
+            }
+            QLabel, QCheckBox { color: #aab4c0; font-size: 9pt; }
+        """)
+        popup_layout = QVBoxLayout(self.auto_update_popup)
+        popup_layout.setContentsMargins(12, 10, 12, 10)
+        popup_layout.setSpacing(8)
+        popup_layout.addWidget(self.auto_update_check)
+        interval_row = QHBoxLayout()
+        interval_row.setSpacing(6)
+        interval_row.addWidget(QLabel("Update Interval:"))
+        interval_row.addWidget(self.update_interval)
+        interval_row.addStretch()
+        popup_layout.addLayout(interval_row)
 
-        self.last_update_label = QLabel("Last Update: Never")
-        self.last_update_label.setStyleSheet("color: #6c757d;")
+        self.odds_settings_button = QToolButton()
+        self.odds_settings_button.setText("⚙")
+        self.odds_settings_button.setToolTip("Auto-update settings")
+        self.odds_settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.odds_settings_button.setStyleSheet(self._gear_style(False))
+        self.odds_settings_button.clicked.connect(self._show_auto_update_popup)
+        self.tab_widget.setCornerWidget(self.odds_settings_button,
+                                        Qt.Corner.TopRightCorner)
+        self.auto_update_check.stateChanged.connect(
+            lambda _: self.odds_settings_button.setStyleSheet(
+                self._gear_style(self.auto_update_check.isChecked())))
 
-        self.update_status = QLabel("")
-        self.update_status.setStyleSheet("""
+        # --------- INSTANCE BANNER ---------
+        # Slim strip across the very bottom of the window for indicators about
+        # the running instance: instance state, auto-update ring, fetch status
+        # chip and progress bar (left); last-update time and live OddsAPI quota
+        # from the last response headers (right).
+        self.instance_banner = QWidget()
+        self.instance_banner.setObjectName("instanceBanner")
+        self.instance_banner.setFixedHeight(20)
+        self.instance_banner.setStyleSheet("""
+            QWidget#instanceBanner {
+                background-color: #0d1117;
+                border-top: 1px solid #232c3a;
+            }
             QLabel {
-                padding: 5px;
-                border-radius: 3px;
-                background-color: #f8f9fa;
+                color: #5d6a7a;
+                font-family: monospace;
+                font-size: 9px;
             }
         """)
+        banner_layout = QHBoxLayout(self.instance_banner)
+        banner_layout.setContentsMargins(8, 0, 8, 0)
+        banner_layout.setSpacing(16)
+        self.banner_state_label = QLabel("● IDLE")
+        banner_layout.addWidget(self.banner_state_label)
 
-        # Progress indicator
+        # Auto-update countdown ring + fetch status chip
         self.progress_indicator = UpdateProgressIndicator()
-        self.status_frame_layout.addWidget(self.progress_indicator)
-        self.status_frame_layout.addWidget(self.last_update_label)
-        self.status_frame_layout.addWidget(self.update_status)
+        banner_layout.addWidget(self.progress_indicator)
+        self.update_status = QLabel("")
+        banner_layout.addWidget(self.update_status)
 
-        # Add progress bar (hidden by default)
+        # Fetch progress bar (hidden by default)
         self.progress = QProgressBar()
-        self.progress.setVisible(False)  # Hidden by default
-        self.progress.setMaximumHeight(15)  # Make it more compact
+        self.progress.setVisible(False)
+        self.progress.setFixedSize(160, 12)
+        self.progress.setTextVisible(False)
         self.progress.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #dee2e6;
+                border: 1px solid #232c3a;
                 border-radius: 3px;
-                text-align: center;
-                font-size: 9pt;
+                background-color: #15191f;
             }
             QProgressBar::chunk {
                 background-color: #007bff;
                 border-radius: 2px;
             }
         """)
-        self.status_frame_layout.addWidget(self.progress)
+        banner_layout.addWidget(self.progress)
+        banner_layout.addStretch()
+        # refresh_data stamps this with the fetch time; banner QSS styles it
+        self.last_update_label = QLabel("Last Update: Never")
+        banner_layout.addWidget(self.last_update_label)
+        self.banner_api_label = QLabel("API QUOTA: —")
+        self.banner_api_label.setToolTip("OddsAPI credits (from x-requests-remaining/used headers)")
+        banner_layout.addWidget(self.banner_api_label)
+        # Goes in the outer layout so it spans the full window width and sits
+        # flush against the bottom edge (content layout has 5px margins).
+        self._outer_layout.addWidget(self.instance_banner)
 
-        update_controls_layout.addWidget(self.status_frame)
-        update_controls_layout.addStretch()
+    def _gear_style(self, armed):
+        color = "#28a745" if armed else "#aab4c0"
+        return (f"QToolButton {{ background: transparent; color: {color}; "
+                "font-size: 13pt; border: none; padding: 0 8px; } "
+                "QToolButton:hover { color: #ffffff; }")
 
-        self.layout.addLayout(update_controls_layout)
+    def _show_auto_update_popup(self):
+        """Open the auto-update settings popup anchored under the ⚙ button,
+        right-edge aligned so it never overhangs the window."""
+        btn = self.odds_settings_button
+        self.auto_update_popup.adjustSize()
+        pos = btn.mapToGlobal(btn.rect().bottomRight())
+        pos.setX(pos.x() - self.auto_update_popup.width())
+        self.auto_update_popup.move(pos)
+        self.auto_update_popup.show()
+
+    def _set_status_chip(self, text, bg=None, fg="white"):
+        """Set the banner fetch-status chip. With a bg color it renders as a
+        small pill sized for the 20px banner; without, plain banner text."""
+        self.update_status.setText(text)
+        if bg is None:
+            self.update_status.setStyleSheet("")
+        else:
+            self.update_status.setStyleSheet(
+                f"background-color: {bg}; color: {fg}; padding: 1px 6px; "
+                "border-radius: 3px; font-family: monospace; font-size: 9px;")
+
+    def _set_banner_state(self, text, color="#5d6a7a"):
+        self.banner_state_label.setText(f"● {text}")
+        self.banner_state_label.setStyleSheet(
+            f"color: {color}; font-family: monospace; font-size: 9px;")
+
+    def _update_banner_quota(self):
+        """Pull quota numbers off the PropClient's last response headers."""
+        client = getattr(self.data_manager, 'prop_client', None)
+        remaining = getattr(client, 'requests_remaining', None)
+        used = getattr(client, 'requests_used', None)
+        if remaining is None:
+            return
+        if remaining <= 0:
+            color = "#dc3545"
+        elif remaining < 1000:
+            color = "#ffb000"
+        else:
+            color = "#5d6a7a"
+        used_str = f"{used:,}" if used is not None else "?"
+        self.banner_api_label.setText(f"API QUOTA: {remaining:,} LEFT · {used_str} USED")
+        self.banner_api_label.setStyleSheet(
+            f"color: {color}; font-family: monospace; font-size: 9px;")
 
 
     def handle_league_change(self):
@@ -1494,7 +1564,7 @@ class ModernOddsWindow(QMainWindow):
     def update_status_text(self):
         """Update the status text showing time until next update"""
         if not self.auto_update_check.isChecked():
-            self.update_status.setText("")
+            self._set_status_chip("")
             self.progress_indicator.setProgress(0)
             return
 
@@ -1507,13 +1577,13 @@ class ModernOddsWindow(QMainWindow):
 
         # Color coding based on remaining time
         if remaining_time < 60:  # Less than 1 minute
-            self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
+            bg, fg = "#dc3545", "white"
         elif remaining_time < 180:  # Less than 3 minutes
-            self.update_status.setStyleSheet("background-color: #ffc107; color: #000;")
+            bg, fg = "#ffc107", "#000"
         else:
-            self.update_status.setStyleSheet("background-color: #28a745; color: white;")
+            bg, fg = "#28a745", "white"
 
-        self.update_status.setText(f"Next update in: {minutes}m {seconds}s")
+        self._set_status_chip(f"Next update in: {minutes}m {seconds}s", bg, fg)
         self.progress_indicator.setProgress(progress)
 
 
@@ -1932,20 +2002,10 @@ class ModernOddsWindow(QMainWindow):
             container_height = (article_height * 3)
             self.news_container.setMinimumHeight(container_height)
 
-            # KEY FIX: Set negative top margin on progress bar to pull it upward
-            prog_margins = self.progress.contentsMargins()
-            prog_margins.setTop(-100)  # Adjust this value as needed
-            self.progress.setContentsMargins(prog_margins)
-
             # Set minimal spacing in main layout
             self.layout.setSpacing(0)
         else:
             self.news_toggle_button.setText("Show Injury News ▼")
-
-            # Reset progress bar margins to normal
-            prog_margins = self.progress.contentsMargins()
-            prog_margins.setTop(0)
-            self.progress.setContentsMargins(prog_margins)
 
             # Reset layout spacing
             self.layout.setSpacing(0)
@@ -2103,14 +2163,13 @@ class ModernOddsWindow(QMainWindow):
         self.last_update_label.setText(f"Last Update: {current_time}")
 
         # Update status during refresh
-        self.update_status.setStyleSheet("background-color: #007bff; color: white;")
-        self.update_status.setText("Updating odds...")
+        self._set_status_chip("Updating odds...", "#007bff")
+        self._set_banner_state("FETCHING", "#ffb000")
 
         try:
             queries = self.query_list.get_queries()
             if not queries:
-                self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-                self.update_status.setText("No queries configured")
+                self._set_status_chip("No queries configured", "#dc3545")
                 return
 
             total_slots = len(queries)
@@ -2248,23 +2307,22 @@ class ModernOddsWindow(QMainWindow):
                 self.update_status_text()
                 self.RestartTimer()
             else:
-                self.update_status.setStyleSheet("background-color: #28a745; color: white;")
-                self.update_status.setText("Update complete")
+                self._set_status_chip("Update complete", "#28a745")
             if changes:
                 print(f"Total lines changed: {sum(len(v) for v in changes.values())}")
 
         except aiohttp.ClientError as e:
             print(f"Network error: {e}")
-            self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-            self.update_status.setText("Network error occurred")
+            self._set_status_chip("Network error occurred", "#dc3545")
         except Exception as e:
             print(f"Error: {e}")
-            self.update_status.setStyleSheet("background-color: #dc3545; color: white;")
-            self.update_status.setText("An error occurred")
+            self._set_status_chip("An error occurred", "#dc3545")
 
             traceback.print_exc()
         finally:
             self.fetch_odds_button.setEnabled(True)
+            self._set_banner_state("IDLE")
+            self._update_banner_quota()
             # Hide and reset progress bar
             QTimer.singleShot(2000, lambda: (
                 self.progress.setValue(0),
@@ -2272,7 +2330,7 @@ class ModernOddsWindow(QMainWindow):
             ))
             # Reset error messages after a delay
             if not self.auto_update_check.isChecked():
-                QTimer.singleShot(5000, lambda: self.update_status.setText(""))
+                QTimer.singleShot(5000, lambda: self._set_status_chip(""))
 
 
     # These two functions are for live game indication
