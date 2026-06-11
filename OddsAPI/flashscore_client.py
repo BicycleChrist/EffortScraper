@@ -30,8 +30,6 @@ Event-detail feed key format:
     g_<sportId>_<eventId>
 """
 
-#TODO: Add set scores beyond first set for Tennis
-
 import argparse
 import json
 import re
@@ -224,14 +222,13 @@ def format_progress(sport_id: int, decoded: Dict[str, Any]) -> str:
         return "LIVE"
 
     if sport_id == SPORT_IDS["tennis"]:
-        games = (d.get("periods") or [("", "")])[0]   # current-set games (df_sur)
+        # df_sur carries one B-pair per set, in order; the last pair is the
+        # current set. DP/DQ is the live game point, which applies to that set.
+        sets = [f"{h}-{a}" for (h, a) in (d.get("periods") or []) if h not in ("", None)]
         gp = d.get("game_points") or ("", "")
-        parts = []
-        if games[0] not in ("", None):
-            parts.append(f"{games[0]}-{games[1]}")
-        if gp[0] not in ("", None) and (gp[0], gp[1]) != ("0", "0"):
-            parts.append(f"({gp[0]}-{gp[1]})")
-        return " · ".join(parts) if parts else "LIVE"
+        if gp[0] not in ("", None) and (gp[0], gp[1]) != ("0", "0") and sets:
+            sets[-1] = f"{sets[-1]} ({gp[0]}-{gp[1]})"
+        return ", ".join(sets) if sets else "LIVE"
 
     if sport_id == SPORT_IDS["football"]:
         return f"{d['minute']}'" if d.get("minute") is not None else "LIVE"
@@ -422,7 +419,8 @@ class FlashscoreClient:
         lang: str = "en",
         tz: int = 0,
         project_id: int = 1,
-        max_workers: int = 12,
+        max_workers: int = 24,
+        conn_pool: int = 30,
         timeout: int = 20,
         verbose: bool = True,
     ):
@@ -449,6 +447,13 @@ class FlashscoreClient:
                 "Accept": "*/*",
             }
         )
+        # Default urllib3 pool is 10 connections/host, which throttles the live
+        # detail fan-out (N events × 2 feeds). Match the pool to max_workers so
+        # concurrent requests aren't serialized waiting for a free connection.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=conn_pool, pool_maxsize=conn_pool)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     # -- raw fetch ----------------------------------------------------------
     def fetch_feed(self, feed_key: str, retries: int = 3, backoff: float = 1.5) -> str:
@@ -769,8 +774,42 @@ class FlashscoreClient:
         out["scoreboard"] = scoreboard
         out["summary"] = summary
         out["available_tabs"] = [t for t in scoreboard.get("DX", "").split(",") if t]
+        out["decoded"] = self._decode_live(sport_id, scoreboard, summary)
+        return out
 
-        # ---- decode the common, reliable bits ----
+    # Sports whose live progress is fully derivable from the dc_ scoreboard, so
+    # the second (df_sur) request can be skipped: baseball inning = dc_ DB,
+    # football minute = dc_ DK. Everything else needs per-period/set data.
+    _PROGRESS_DC_ONLY = {SPORT_IDS["baseball"], SPORT_IDS["football"]}
+
+    def get_live_progress(self, sport_id: int, event_id: str) -> Dict[str, Any]:
+        """Lean variant of get_live_detail for the table progress cell: fetches
+        only the sub-feed(s) the sport's progress needs (one request instead of
+        two for baseball/football). Returns {"decoded": {...}}."""
+        keys = [f"dc_{sport_id}_{event_id}"]
+        if sport_id not in self._PROGRESS_DC_ONLY:
+            keys.append(f"df_sur_{sport_id}_{event_id}")
+
+        def pull(key):
+            raw = self.fetch_feed(key)
+            if not raw or raw.strip() == "0":
+                return []
+            return [d for d in (self._parse_record(r) for r in raw.split(REC_SEP)) if d]
+
+        if len(keys) == 1:
+            recs = [pull(keys[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=len(keys)) as ex:
+                recs = list(ex.map(pull, keys))
+        scoreboard = recs[0][0] if recs[0] else {}
+        summary = recs[1] if len(recs) > 1 else []
+        return {"sport_id": sport_id, "event_id": event_id,
+                "decoded": self._decode_live(sport_id, scoreboard, summary)}
+
+    def _decode_live(self, sport_id: int, scoreboard: Dict[str, str],
+                     summary: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Decode the dc_ scoreboard + df_sur summary into a structured block.
+        Shared by get_live_detail (full) and get_live_progress (lean)."""
         decoded: Dict[str, Any] = {}
         # tennis has no running total (DE/DF are 0); its score is sets + games.
         if sport_id != SPORT_IDS["tennis"] and scoreboard.get("DE") not in (None, ""):
@@ -789,14 +828,11 @@ class FlashscoreClient:
                     period_vals.append(v)
                 elif len(k) == 2 and k[0] == "W" and k[1].isalpha():
                     situation[k] = v
-        # pair them up: (home, away), (home, away), ...
         periods = [(period_vals[i], period_vals[i + 1])
                    for i in range(0, len(period_vals) - 1, 2)]
         if periods:
             decoded["periods"] = periods  # first pair is current period / total
-            # for quarter/period sports the count of period rows == current period
-            # (e.g. basketball in Q4 returns current + Q1..Q3 = 4 rows)
-            decoded["num_periods"] = len(periods)
+            decoded["num_periods"] = len(periods)  # == current period for Q/P sports
         if situation:
             decoded["situation"] = situation
 
@@ -814,16 +850,12 @@ class FlashscoreClient:
                     decoded["minute"] = int(minute)
 
         if sport_id == SPORT_IDS["tennis"]:
-            # DP/DQ = current game points (reliable). Games-in-set come from the
-            # df_sur period pair (decoded["periods"][0]); DL is a constant
-            # (best-of) and DN/DO are unreliable, so don't use them.
+            # DP/DQ = current game points (reliable); set scores come from periods.
             decoded["game_points"] = (scoreboard.get("DP"), scoreboard.get("DQ"))
 
         if sport_id == SPORT_IDS["baseball"]:
-            # Flashscore baseball has no balls/strikes/outs/bases in the feed —
-            # only score + inning. The inning is encoded in the status code:
-            # empirically code 26 == 1st inning (confirmed: code 28 == 3rd), so
-            # inning = code - 25. DR is the half: 1 = top, 2 = bottom.
+            # inning encoded in status code: code 26 == 1st (confirmed 28 == 3rd),
+            # so inning = code - 25. DR is the half: 1 = top, 2 = bottom.
             code = scoreboard.get("DB") or ""
             if code.isdigit():
                 inning = int(code) - BASEBALL_INNING_BASE + 1
@@ -831,8 +863,7 @@ class FlashscoreClient:
                     decoded["inning"] = inning
                     decoded["inning_half"] = {"1": "top", "2": "bot"}.get(scoreboard.get("DR"))
 
-        out["decoded"] = decoded
-        return out
+        return decoded
 
     # -- live polling -------------------------------------------------------
     def snapshot_live(self, sports: Optional[List[Any]] = None) -> List[Event]:

@@ -141,7 +141,8 @@ class ScheduleWorker(QObject):
     def fetch_detail(self, token: int, sport_id: int, event_id: str):
         def run():
             try:
-                detail = self.client.get_live_detail(sport_id, event_id)
+                # lean: fetches only the sub-feed(s) the progress cell needs
+                detail = self.client.get_live_progress(sport_id, event_id)
                 self.detailReady.emit(token, event_id, detail)
             except Exception as e:
                 self.failed.emit(token, str(e))
@@ -169,6 +170,11 @@ class LiveScoresWidget(QWidget):
         self._live_items = {}           # event_id -> QTreeWidgetItem (live rows)
         self._golf_boards = []          # cached leaderboards (for in-place filter)
         self._participant_events = []   # cached participant events (for filter)
+        # stale-while-revalidate cache: view-key -> (kind, data). Lets a sport
+        # switch render instantly from the last result while a fresh fetch runs.
+        self._cache = {}
+        self._cache_days = 0
+        self._suppress_progress = False  # skip live-progress fan-out on cached render
 
         self._build_ui()
         self._populate_nav()
@@ -178,8 +184,10 @@ class LiveScoresWidget(QWidget):
         self.refresh_timer.timeout.connect(self.refresh)
         self._apply_autorefresh()
 
-        # initial selection
+        # initial selection + background prefetch of the priority sports so the
+        # first switch to each is instant (served from cache).
         self._select_sport(DEFAULT_SPORT)
+        self._prefetch_priority()
 
     # -- UI -----------------------------------------------------------------
     def _build_ui(self):
@@ -219,7 +227,7 @@ class LiveScoresWidget(QWidget):
         self.days_spin.setPrefix("+")
         self.days_spin.setSuffix(" d")
         self.days_spin.setToolTip("Days ahead to include in the schedule")
-        self.days_spin.valueChanged.connect(lambda _: self.refresh())
+        self.days_spin.valueChanged.connect(self._on_days_changed)
 
         self.auto_chk = QCheckBox("Auto")
         self.auto_chk.setChecked(True)
@@ -328,9 +336,33 @@ class LiveScoresWidget(QWidget):
         self.refresh()
 
     # -- data flow ----------------------------------------------------------
+    def _cache_key(self):
+        return self._current_sport if self._current_sport is not None else "__live__"
+
+    def _render_from_cache(self, cached):
+        """Render the previously-fetched data instantly (no progress fan-out)."""
+        kind, data = cached
+        self._suppress_progress = True
+        try:
+            if kind == "golf":
+                self._golf_boards = data
+                self._render_golf(data)
+            elif kind == "part":
+                self._participant_events = data
+                self._render_participants(data, self._current_sport)
+            else:  # "sched" or "live"
+                self._events = data
+                self._render()
+        finally:
+            self._suppress_progress = False
+
     def refresh(self):
         self._token += 1
-        self.status_lbl.setText("loading…")
+        cached = self._cache.get(self._cache_key())
+        if cached is not None:
+            self._render_from_cache(cached)  # instant; fresh data replaces it below
+        else:
+            self.status_lbl.setText("loading…")
         if self._current_sport is None:
             self.title.setText("🔴  LIVE — All Sports")
             self.worker.fetch_live_all(self._token)
@@ -346,7 +378,25 @@ class LiveScoresWidget(QWidget):
             self.title.setText(label)
             self.worker.fetch_schedule(self._token, self._current_sport, self.days_spin.value())
 
+    def _on_days_changed(self, _value):
+        # cached data is for the old window; drop it and re-warm the priority set
+        self._cache.clear()
+        self.refresh()
+        self._prefetch_priority()
+
+    def _prefetch_priority(self):
+        """Warm the cache for the priority sports in the background (token -1 =
+        cache-only, never rendered) so the first switch to each is instant."""
+        for s in PRIORITY_SPORTS:
+            if s in self._cache or s == self._current_sport:
+                continue
+            if s in PARTICIPANT_SPECS:
+                self.worker.fetch_participants(-1, s, self.days_spin.value())
+            else:
+                self.worker.fetch_schedule(-1, s, self.days_spin.value())
+
     def _on_schedule(self, token, sport, events):
+        self._cache[sport] = ("sched", events)  # cache even prefetched results
         if token != self._token or sport != self._current_sport:
             return
         self._events = events
@@ -354,12 +404,14 @@ class LiveScoresWidget(QWidget):
         self._render()
 
     def _on_live(self, token, events):
+        self._cache["__live__"] = ("live", events)
         if token != self._token or self._current_sport is not None:
             return
         self._events = events
         self._render()
 
     def _on_golf(self, token, boards):
+        self._cache["golf"] = ("golf", boards)
         if token != self._token or self._current_sport != "golf":
             return
         self._golf_boards = boards
@@ -377,6 +429,7 @@ class LiveScoresWidget(QWidget):
                 break
 
     def _on_participants(self, token, sport, events):
+        self._cache[sport] = ("part", events)
         if token != self._token or self._current_sport != sport:
             return
         self._participant_events = events
@@ -640,7 +693,7 @@ class LiveScoresWidget(QWidget):
             f"{len(live)} live · {len(upcoming)} upcoming · "
             f"{len(finished)} finished · updated {stamp}"
         )
-        if self._live_items:
+        if self._live_items and not self._suppress_progress:
             self._fetch_live_progress()
 
     def _render_grouped(self, events, key, section, color):
