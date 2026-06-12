@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from requests.auth import HTTPBasicAuth
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer
-from database_manager import DatabaseManager, TeamInfo
+from database_manager import DatabaseManager, TeamInfo, CITY_TZ
 from opensky import NBAFlightTracker
 import logging
 
@@ -1308,6 +1308,24 @@ class TeamFlightDetector:
         # VALIDATION 3: Arrival should be before required arrival time
         if estimated_arrival > travel_window['required_arrival']:
             return None
+
+        # VALIDATION 4: overnight dead-zone. Team departures are bimodal —
+        # wheels-up within ~4h of the final out, OR overnight stay and a
+        # morning flight. Nobody departs 1-7 AM local hours after the game,
+        # but red-eye corridor traffic does, and it kept matching all night.
+        dep_delay_for_gate = (estimated_departure -
+                              travel_window['last_game_end']).total_seconds() / 3600
+        if dep_delay_for_gate > 4.5:
+            machine_off = datetime.now().astimezone().utcoffset()
+            origin_off = timedelta(hours=CITY_TZ.get(
+                travel_window['origin_city'],
+                round((travel_window['origin_lon'] or 0) / 15.0)))
+            origin_local_dep = estimated_departure - machine_off + origin_off
+            # Midnight counts: a 00:30 departure 10h after a day game is
+            # corridor noise, not a charter (prompt post-night-game
+            # departures have delay < 4.5h and never reach this gate)
+            if origin_local_dep.hour < 7:
+                return None
 
         # BONUS: how closely THIS flight's estimated departure matches the
         # charter pattern (wheels-up 1-3.5h after the final out). Must use the

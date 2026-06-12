@@ -11,7 +11,7 @@
 # explicitly — print(..., file=sys.stderr) — passes through untouched, and
 # exceptions / traceback.print_exc() (stderr) are never affected, so real
 # errors still surface even with DEBUG off.
-DEBUG = False
+DEBUG = True
 
 import builtins as _builtins
 _real_print = _builtins.print  # kept so internal diagnostics (e.g. the loop-lag monitor) can bypass the gate
@@ -31,7 +31,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit,
-    QInputDialog, QScrollArea, QToolButton
+    QInputDialog, QScrollArea, QToolButton, QStyledItemDelegate, QStyle,
+    QStyleOptionViewItem
 )
 from propQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -80,6 +81,82 @@ class ColoredTableItem(QTableWidgetItem):
         self.game_id = game_id
 
 
+# Custom data role carrying the formatted bet-limit tag for a cell.
+# Kept out of the display text so liquidity ticks don't trip the
+# line-change highlighter or the float(value.split()[0]) odds parsing.
+BET_LIMIT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+def format_bet_limit(value) -> str:
+    """Compact $ form for a bet limit: 750 -> $750, 2500 -> $2.5k, 40000 -> $40k."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if v >= 1_000_000:
+        return f"${f'{v / 1_000_000:.1f}'.rstrip('0').rstrip('.')}M"
+    if v >= 1_000:
+        return f"${f'{v / 1_000:.1f}'.rstrip('0').rstrip('.')}k"
+    return f"${v:.0f}"
+
+
+class OddsCellDelegate(QStyledItemDelegate):
+    """Plain cells paint as usual; cells carrying a bet limit (exchanges +
+    Pinnacle) are split: odds on the left over the normal game-color
+    background, limit on the right over its own light segment, with the
+    exact figure in the tooltip."""
+    SEG_FILL = QColor("#f2f5f8")   # light segment behind the limit
+    SEG_TEXT = QColor("#1f2a38")   # dark navy limit text
+    SEG_EDGE = QColor(0, 0, 0, 70) # hairline divider between odds and limit
+
+    def paint(self, painter, option, index):
+        tag = index.data(BET_LIMIT_ROLE)
+        if not tag:
+            super().paint(painter, option, index)
+            return
+
+        # Paint background/selection through the style, but with no text
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        odds_text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+        painter.save()
+
+        # Right segment: full-height block with its own background
+        tag_font = QFont(opt.font)
+        tag_font.setPointSizeF(max(6.0, tag_font.pointSizeF() - 1.0))
+        fm = QFontMetrics(tag_font)
+        seg_w = fm.horizontalAdvance(tag) + 10
+        seg = QRect(opt.rect.right() - seg_w + 1, opt.rect.top(),
+                    seg_w, opt.rect.height())
+        painter.fillRect(seg, self.SEG_FILL)
+        painter.setPen(self.SEG_EDGE)
+        painter.drawLine(seg.topLeft(), seg.bottomLeft())
+        painter.setFont(tag_font)
+        painter.setPen(self.SEG_TEXT)
+        painter.drawText(seg, Qt.AlignmentFlag.AlignCenter, tag)
+
+        # Odds text, left-aligned over the normal background
+        painter.setFont(opt.font)
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        painter.setPen(fg.color() if isinstance(fg, QBrush) else opt.palette.text().color())
+        odds_rect = QRect(opt.rect.left() + 5, opt.rect.top(),
+                          opt.rect.width() - seg_w - 8, opt.rect.height())
+        painter.drawText(odds_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, odds_text)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        hint = super().sizeHint(option, index)
+        tag = index.data(BET_LIMIT_ROLE)
+        if tag:
+            fm = QFontMetrics(option.font)
+            hint.setWidth(hint.width() + fm.horizontalAdvance(tag) + 18)
+        return hint
+
+
 
 
 class LeagueTabData:
@@ -103,6 +180,10 @@ class LeagueTabData:
         # per game, so keying by title alone makes every game share the last one.
         self.cell_links = {}
         self.bookmaker_links = {}
+        # Bet limits (from the Odds API includeBetLimits flag), keyed like
+        # cell_links: (row_label, bm_title) -> raw dollar limit. Only the
+        # exchanges + Pinnacle return these.
+        self.cell_limits = {}
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -132,6 +213,7 @@ class LeagueTabData:
         """Create and configure a new table widget for this league"""
         self.table_widget = QTableWidget()
         self.table_widget.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table_widget.setItemDelegate(OddsCellDelegate(self.table_widget))
         self.table_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table_widget.updateGeometry()
         # Style the header
@@ -1725,6 +1807,8 @@ class ModernOddsWindow(QMainWindow):
             bm_title = bm['title']
             for market in bm['markets']:
                 market_key = market['key']
+                if market_key.endswith('_lay'):
+                    continue
                 for outcome in market['outcomes']:
                     unique_label = f"{home_team} vs {away_team} | {self.format_market_label(market_key, outcome)}"
 
@@ -1739,6 +1823,9 @@ class ModernOddsWindow(QMainWindow):
                     if unique_label not in tab_data.table_data:
                         tab_data.table_data[unique_label] = {'game_id': game_id}
                     tab_data.table_data[unique_label][bm_title] = price
+
+                    if outcome.get('bet_limit'):
+                        tab_data.cell_limits[(unique_label, bm_title)] = outcome['bet_limit']
 
                     # Stash the outcome's betslip deep-link for this cell (may be None)
                     if outcome.get('link'):
@@ -1828,8 +1915,17 @@ class ModernOddsWindow(QMainWindow):
                 link = (tab_data.cell_links.get((row_label, bm))
                         or tab_data.bookmaker_links.get((game_id, bm)))
                 item.setData(Qt.ItemDataRole.UserRole, link)
+
+                # Liquidity tag for books that report bet limits
+                limit = tab_data.cell_limits.get((row_label, bm))
+                item.setData(BET_LIMIT_ROLE, format_bet_limit(limit) if limit else None)
+
+                tips = []
                 if link and current_value:
-                    item.setToolTip("Double-click to open betslip")
+                    tips.append("Double-click to open betslip")
+                if limit:
+                    tips.append(f"Bet limit: ${float(limit):,.0f}")
+                item.setToolTip("\n".join(tips))
 
                 # Only update if value has changed
                 if current_value != previous_value and previous_value is not None:
@@ -2198,6 +2294,7 @@ class ModernOddsWindow(QMainWindow):
                     total_games = len(games)
                     new_table_rows = []
                     new_table_data = {}
+                    new_cell_limits = {}
                     bookmakers_seen = set()
                     consolidated_odds_data = {'bookmakers': []}
                     bookmakers_map = {}
@@ -2216,6 +2313,7 @@ class ModernOddsWindow(QMainWindow):
                         odds = await self.data_manager.prop_client.get_event_odds(
                             session, game_id, current_markets,
                             region=region_str, include_links=True, include_sids=True,
+                            include_bet_limits=True,
                         )
 
                         if odds is None:
@@ -2254,6 +2352,11 @@ class ModernOddsWindow(QMainWindow):
                                 consolidated_odds_data['bookmakers'].append(bookmakers_map[bm_title])
                             for market in bm.get('markets', []):
                                 market_key = market['key']
+                                # Exchanges bundle their lay side (h2h_lay etc.)
+                                # with h2h responses; lay quotes aren't backable
+                                # prices, so keep them out of the grid/best-lines.
+                                if market_key.endswith('_lay'):
+                                    continue
                                 for outcome in market.get('outcomes', []):
                                     outcome['game_id'] = game_id
                                     outcome['game_name'] = f"{home_team} vs {away_team}"
@@ -2264,6 +2367,8 @@ class ModernOddsWindow(QMainWindow):
                                         new_table_rows.append(unique_label)
                                         new_table_data[unique_label] = {'game_id': game_id}
                                     new_table_data[unique_label][bm_title] = self.format_price(outcome)
+                                    if outcome.get('bet_limit'):
+                                        new_cell_limits[(unique_label, bm_title)] = outcome['bet_limit']
                                     if outcome.get('link'):
                                         tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
 
@@ -2293,6 +2398,7 @@ class ModernOddsWindow(QMainWindow):
                     tab_data.bookmakers  = list(bookmakers_seen)
                     tab_data.table_rows  = new_table_rows
                     tab_data.table_data  = new_table_data
+                    tab_data.cell_limits = new_cell_limits
                     self.update_table_with_changes(tab_data, slot_changes)
 
                     if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
@@ -2487,8 +2593,17 @@ class ModernOddsWindow(QMainWindow):
                  link = (tab_data.cell_links.get((row_label, bm))
                          or tab_data.bookmaker_links.get((game_id, bm)))
                  item.setData(Qt.ItemDataRole.UserRole, link)
+
+                 # Liquidity tag for books that report bet limits
+                 limit = tab_data.cell_limits.get((row_label, bm))
+                 item.setData(BET_LIMIT_ROLE, format_bet_limit(limit) if limit else None)
+
+                 tips = []
                  if link and current_value:
-                     item.setToolTip("Double-click to open betslip")
+                     tips.append("Double-click to open betslip")
+                 if limit:
+                     tips.append(f"Bet limit: ${float(limit):,.0f}")
+                 item.setToolTip("\n".join(tips))
 
                  # Check if this cell has changed
                  if row_label in changes and bm in changes[row_label]:
