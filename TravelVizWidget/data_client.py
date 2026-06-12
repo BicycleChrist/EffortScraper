@@ -17,6 +17,8 @@ import threading
 from pathlib import Path
 import amadeus
 from database_manager import DatabaseManager, GameStatus, TeamInfo, Venue, GameData, TeamTravelData
+
+logger = logging.getLogger(__name__)
 # from amadeus import analytics, airline, airport
 
 # Update mapping for LA kings (schedule url uses la not lak)
@@ -27,7 +29,7 @@ from database_manager import DatabaseManager, GameStatus, TeamInfo, Venue, GameD
 
 # Teams that own their own planes: Detroit Tigers, Los Angeles Lakers, Dallas Mavericks, 
 # Boston Celtics, Houston Rockets, Golden State Warriors, and Cleveland Cavaliers
-
+# Try out openskynetwork API for live flight data and by plane filtering to find team charter flights
 
 
 @dataclass
@@ -203,7 +205,7 @@ class AmadeusAnalyzer:
                 if result:
                     route_insights.append(result)
             except Exception as e:
-                print(f"⚠️ Route failed: {route_name} - {e}")
+                logger.warning(f"⚠️ Route failed: {route_name} - {e}")
         
         return route_insights
     
@@ -252,8 +254,8 @@ class AmadeusAnalyzer:
         self._hotel_cache[cache_key] = matched_hotels
         
         # Concise debug output
-        print(f"🏨 {venue.city}: {len(amadeus_hotels)} Amadeus → {len(forbes_hotels)} Forbes → {len(matched_hotels)} final hotels")
-        print(f"matched_hotels: {matched_hotels}")
+        logger.debug(f"🏨 {venue.city}: {len(amadeus_hotels)} Amadeus → {len(forbes_hotels)} Forbes → {len(matched_hotels)} final hotels")
+        logger.debug(f"matched_hotels: {matched_hotels}")
         return matched_hotels
     
     def _get_amadeus_hotels_by_coordinates(self, venue: Venue) -> List[Dict]:
@@ -266,7 +268,7 @@ class AmadeusAnalyzer:
             )
             return response.data if response.data else []
         except Exception as e:
-            print(f"❌ Amadeus API error for {venue.city}: {e}")
+            logger.error(f"❌ Amadeus API error for {venue.city}: {e}")
             return []
     
     def _match_forbes_to_amadeus(self, forbes_hotels: List[ForbesHotel], amadeus_hotels: List[Dict], venue: Venue) -> List[HotelOption]:
@@ -279,7 +281,7 @@ class AmadeusAnalyzer:
                 continue
             
             best_match, confidence = self._find_best_amadeus_match(forbes_hotel, amadeus_hotels)
-            print(f'{best_match}')
+            logger.debug(f'{best_match}')
             if (best_match and best_match['hotelId'] not in matched_ids and confidence >= self.CONFIDENCE_THRESHOLD):
                 distance = self._calculate_hotel_distance(best_match, venue)
                 if distance <= self.HOTEL_RADIUS_KM:
@@ -513,7 +515,7 @@ class AmadeusAnalyzer:
     def _calculate_hotel_distance(self, hotel_data: Dict, venue: Venue) -> float:
         """Calculate distance between hotel and venue"""
         if ('geoCode' not in hotel_data):
-            print(f"could not calculate distance: {hotel_data}")
+            logger.debug(f"could not calculate distance: {hotel_data}")
             return 999999
         geo = hotel_data.get('geoCode', {})
         
@@ -737,7 +739,7 @@ class AmadeusWorker(QThread):
     def run(self):
         """Simplified run method using travel_data table"""
         try:
-            print(f"🔍 AmadeusWorker starting analysis for team {self.team_abbr}")
+            logger.debug(f"🔍 AmadeusWorker starting analysis for team {self.team_abbr}")
             
             if self.cancelled:
                 return
@@ -768,7 +770,7 @@ class AmadeusWorker(QThread):
                 if travel.travel_date and now <= travel.travel_date <= cutoff
             ]
             
-            print(f"📊 Found {len(upcoming_travel)} upcoming travel segments")
+            logger.debug(f"📊 Found {len(upcoming_travel)} upcoming travel segments")
             
             if self.cancelled:
                 return
@@ -817,10 +819,10 @@ class AmadeusWorker(QThread):
                         route_insights.append(route)
                         total_distance += route.travel_distance
                         
-                        print(f"📊 Analyzed: {travel.departure_city} → {travel.arrival_city}")
+                        logger.debug(f"📊 Analyzed: {travel.departure_city} → {travel.arrival_city}")
                     
                 except Exception as e:
-                    print(f"⚠️ Route analysis failed for {travel.departure_city} → {travel.arrival_city}: {e}")
+                    logger.warning(f"⚠️ Route analysis failed for {travel.departure_city} → {travel.arrival_city}: {e}")
                     continue
             
             self.progressUpdated.emit(95, "Compiling intelligence...")
@@ -840,12 +842,12 @@ class AmadeusWorker(QThread):
             
             if not self.cancelled:
                 self.intelligenceReady.emit(intelligence)
-                print(f"✅ Amadeus analysis complete for {self.team_abbr}")
+                logger.info(f"✅ Amadeus analysis complete for {self.team_abbr}")
             
         except Exception as e:
             if not self.cancelled:
                 error_msg = f"Amadeus analysis failed: {str(e)}"
-                print(f"❌ {error_msg}")
+                logger.error(f"❌ {error_msg}")
                 self.errorOccurred.emit(error_msg)
     
     def _create_venue_from_city(self, city_name: str):
@@ -1187,12 +1189,12 @@ class ESPNScheduleScraper:
         
         if league == 'MLB':
             # MLB SPECIAL HANDLING: ESPN divides MLB season into two halves
-            print(f"Scraping MLB {team_abbrev} schedule for {season} season (both halves)...")
+            logger.debug(f"Scraping MLB {team_abbrev} schedule for {season} season (both halves)...")
             
             for half in [1, 2]:
                 try:
                     url = self.url_patterns['MLB'].format(team=team_abbrev, half=half)
-                    print(f"  → Scraping MLB {team_abbrev} half {half}: {url}")
+                    logger.debug(f"  → Scraping MLB {team_abbrev} half {half}: {url}")
                     
                     response = self.session.get(url, timeout=15)
                     response.raise_for_status()
@@ -1202,20 +1204,20 @@ class ESPNScheduleScraper:
                     if table_rows and len(table_rows) > 1:
                         half_games = self.parse_table_to_games(table_rows, team_abbrev, league, season)
                         all_games.extend(half_games)
-                        print(f"  ✓ Half {half}: Found {len(half_games)} games")
+                        logger.debug(f"  ✓ Half {half}: Found {len(half_games)} games")
                     else:
-                        print(f"  ✗ Half {half}: No schedule data found")
+                        logger.debug(f"  ✗ Half {half}: No schedule data found")
                     
                     time.sleep(0.25)
                     
                 except requests.exceptions.RequestException as e:
-                    print(f"  ✗ Network error scraping MLB {team_abbrev} half {half}: {e}")
+                    logger.debug(f"  ✗ Network error scraping MLB {team_abbrev} half {half}: {e}")
                     continue
                 except Exception as e:
-                    print(f"  ✗ Error parsing MLB {team_abbrev} half {half}: {e}")
+                    logger.debug(f"  ✗ Error parsing MLB {team_abbrev} half {half}: {e}")
                     continue
             
-            print(f"MLB {team_abbrev} total games scraped: {len(all_games)}")
+            logger.debug(f"MLB {team_abbrev} total games scraped: {len(all_games)}")
         
         else:  # NBA or NHL - Single schedule page
             try:
@@ -1225,12 +1227,12 @@ class ESPNScheduleScraper:
                 if season == current_season:
                     # Use simple URL for current season (ESPN default)
                     url = f"https://www.espn.com/{league.lower()}/team/schedule/_/name/{team_abbrev}/seasontype/2"
-                    print(f"Scraping {league} {team_abbrev} current season ({season}): {url}")
+                    logger.debug(f"Scraping {league} {team_abbrev} current season ({season}): {url}")
                 else:
                     # Use season-specific URL for historical data
                     year = season.split('-')[0] if '-' in season else season
                     url = self.url_patterns[league].format(team=team_abbrev, year=year)
-                    print(f"Scraping {league} {team_abbrev} historical season ({season}): {url}")
+                    logger.debug(f"Scraping {league} {team_abbrev} historical season ({season}): {url}")
 
                 response = self.session.get(url, timeout=15)
                 response.raise_for_status()
@@ -1240,16 +1242,16 @@ class ESPNScheduleScraper:
                 if table_rows and len(table_rows) > 1:
                     games = self.parse_table_to_games(table_rows, team_abbrev, league, season)
                     all_games.extend(games)
-                    print(f"  ✓ Found {len(games)} {league} games")
+                    logger.debug(f"  ✓ Found {len(games)} {league} games")
                 else:
-                    print(f"  ✗ No {league} schedule data found")
+                    logger.debug(f"  ✗ No {league} schedule data found")
 
                 time.sleep(0.75)
 
             except requests.exceptions.RequestException as e:
-                print(f"  ✗ Network error scraping {league} {team_abbrev}: {e}")
+                logger.debug(f"  ✗ Network error scraping {league} {team_abbrev}: {e}")
             except Exception as e:
-                print(f"  ✗ Error parsing {league} {team_abbrev}: {e}")
+                logger.debug(f"  ✗ Error parsing {league} {team_abbrev}: {e}")
         
         return all_games
     
@@ -1261,7 +1263,7 @@ class ESPNScheduleScraper:
         if season is None:
             season = self.get_current_season_for_league(league)
         
-        print(f"\n=== Scraping {league} {season} League Schedule ===")
+        logger.debug(f"\n=== Scraping {league} {season} League Schedule ===")
         
         all_games = []
         seen_games = set()
@@ -1270,7 +1272,7 @@ class ESPNScheduleScraper:
         
         for team_idx, (team_abbrev, team_info) in enumerate(league_teams.items(), 1):
             try:
-                print(f"\n[{team_idx}/{total_teams}] Scraping {league} {team_info['name']} ({team_abbrev})...")
+                logger.debug(f"\n[{team_idx}/{total_teams}] Scraping {league} {team_info['name']} ({team_abbrev})...")
                 
                 team_games = self.scrape_team_schedule(team_abbrev, league, season)
                 
@@ -1283,17 +1285,17 @@ class ESPNScheduleScraper:
                         seen_games.add(game_key)
                         games_added += 1
                 
-                print(f"  → Added {games_added} unique games (found {len(team_games)} total)")
+                logger.debug(f"  → Added {games_added} unique games (found {len(team_games)} total)")
                 
                 if team_idx < total_teams:
                     time.sleep(1.5)
                 
             except Exception as e:
-                print(f"  ✗ Error scraping {league} team {team_abbrev}: {e}")
+                logger.debug(f"  ✗ Error scraping {league} team {team_abbrev}: {e}")
                 continue
         
-        print(f"\n=== {league} {season} Scraping Complete ===")
-        print(f"Total unique games scraped: {len(all_games)}")
+        logger.debug(f"\n=== {league} {season} Scraping Complete ===")
+        logger.debug(f"Total unique games scraped: {len(all_games)}")
         
         return all_games
     
@@ -1320,7 +1322,7 @@ class ESPNScheduleScraper:
                 if len(all_rows) > 5:
                     rows = all_rows
                 else:
-                    print(f"  ✗ No schedule data found for {league} {team_abbrev}")
+                    logger.debug(f"  ✗ No schedule data found for {league} {team_abbrev}")
                     return []
             else:
                 rows = schedule_table.find_all('tr')
@@ -1370,11 +1372,11 @@ class ESPNScheduleScraper:
                     if cell_texts and len(cell_texts) >= 3:
                         table_data.append(cell_texts)
             
-            print(f"  → Extracted {len(table_data)} rows from schedule page")
+            logger.debug(f"  → Extracted {len(table_data)} rows from schedule page")
             return table_data
             
         except Exception as e:
-            print(f"  ✗ Error parsing schedule page for {league} {team_abbrev}: {e}")
+            logger.debug(f"  ✗ Error parsing schedule page for {league} {team_abbrev}: {e}")
             return []
     
     def parse_table_to_games(self, table_rows: List[List[str]], team_abbrev: str, league: str, season: str) -> List[GameData]:
@@ -1384,7 +1386,7 @@ class ESPNScheduleScraper:
         if not table_rows or len(table_rows) < 2:
             return games
         
-        print(f"  → Processing {len(table_rows)-1} {league} game rows for {team_abbrev}...")
+        logger.debug(f"  → Processing {len(table_rows)-1} {league} game rows for {team_abbrev}...")
         
         valid_games = 0
         rejected_games = 0
@@ -1396,9 +1398,9 @@ class ESPNScheduleScraper:
                     games.append(game)
                     valid_games += 1
                     if valid_games <= 3:
-                        print(f"    ✓ Game {valid_games}: {game.away_team.abbreviation} @ {game.home_team.abbreviation} on {game.date.strftime('%m/%d')}")
+                        logger.debug(f"    ✓ Game {valid_games}: {game.away_team.abbreviation} @ {game.home_team.abbreviation} on {game.date.strftime('%m/%d')}")
                     elif valid_games == 4:
-                        print(f"    ... processing remaining games ...")
+                        logger.debug(f"    ... processing remaining games ...")
                 else:
                     rejected_games += 1
                         
@@ -1406,9 +1408,9 @@ class ESPNScheduleScraper:
                 rejected_games += 1
                 continue
         
-        print(f"  → Successfully parsed {valid_games} valid {league} games for {team_abbrev}")
+        logger.debug(f"  → Successfully parsed {valid_games} valid {league} games for {team_abbrev}")
         if rejected_games > 0:
-            print(f"  ⚠️  Rejected {rejected_games} rows")
+            logger.warning(f"  ⚠️  Rejected {rejected_games} rows")
                 
         return games
     
@@ -1428,13 +1430,13 @@ class ESPNScheduleScraper:
         # ✅ Skip postponed games  
         if 'postponed' in result_str.lower():
             if league == 'MLB':
-                print(f"    📅 Skipped postponed: '{opponent_str}'")
+                logger.debug(f"    📅 Skipped postponed: '{opponent_str}'")
             return None
         
         # ✅ Skip live games - they're already happening
         if 'live' in result_str.lower() or 'live' in date_str.lower():
             if league == 'MLB':
-                print(f"    ⏰ Skipped live game: '{opponent_str}'")
+                logger.debug(f"    ⏰ Skipped live game: '{opponent_str}'")
             return None
         
         if not date_str or not opponent_str:
@@ -1442,18 +1444,18 @@ class ESPNScheduleScraper:
         
         # ✅ DEBUG: Show what we're trying to parse
         if league in ['NHL', 'MLB']:
-            print(f"    🔍 Parsing: '{date_str}' | '{opponent_str}' | '{result_str}'")
+            logger.debug(f"    🔍 Parsing: '{date_str}' | '{opponent_str}' | '{result_str}'")
         
         # Parse game date
         try:
             game_date = self.parse_date_for_league(date_str, league, season)
             if not game_date:
                 if league in ['NHL', 'MLB']:
-                    print(f"    ❌ Date parse failed: '{date_str}'")
+                    logger.error(f"    ❌ Date parse failed: '{date_str}'")
                 return None
         except Exception as e:
             if league in ['NHL', 'MLB']:
-                print(f"    ❌ Date parse exception: '{date_str}' - {e}")
+                logger.error(f"    ❌ Date parse exception: '{date_str}' - {e}")
             return None
             
         # Parse opponent
@@ -1461,11 +1463,11 @@ class ESPNScheduleScraper:
             is_home, opponent_abbrev = self.parse_opponent(opponent_str, league)
             if not opponent_abbrev:
                 if league in ['NHL', 'MLB']:
-                    print(f"    ❌ Opponent parse failed: '{opponent_str}'")
+                    logger.error(f"    ❌ Opponent parse failed: '{opponent_str}'")
                 return None
         except Exception as e:
             if league in ['NHL', 'MLB']:
-                print(f"    ❌ Opponent parse exception: '{opponent_str}' - {e}")
+                logger.error(f"    ❌ Opponent parse exception: '{opponent_str}' - {e}")
             return None
             
         # Determine home/away teams
@@ -1693,7 +1695,7 @@ class ESPNScheduleScraper:
                 return abbrev
         
         # Debug output for still-unmatched teams
-        print(f"⚠️  Could not match '{team_name}' to any {league} team")
+        logger.warning(f"⚠️  Could not match '{team_name}' to any {league} team")
         return None
     
     def create_team_info(self, team_abbrev: str, league: str) -> TeamInfo:
@@ -1748,8 +1750,8 @@ class TravelInferenceEngine:
     def infer_travel_from_games(self, games: List[GameData], focus_team_id: str, league: str) -> List[TeamTravelData]:
         """Process ONLY the focus team - not all 30 teams"""
         
-        print(f"🐛 DEBUG: focus_team_id = '{focus_team_id}', league = '{league}'")
-        print(f"🐛 DEBUG: Total games passed in = {len(games)}")
+        logger.debug(f"🐛 DEBUG: focus_team_id = '{focus_team_id}', league = '{league}'")
+        logger.debug(f"🐛 DEBUG: Total games passed in = {len(games)}")
         
         # Get only games where the focus team plays
         team_games = []
@@ -1757,14 +1759,14 @@ class TravelInferenceEngine:
             if game.home_team.team_id == focus_team_id or game.away_team.team_id == focus_team_id:
                 team_games.append(game)
         
-        print(f"🐛 DEBUG: Games for team '{focus_team_id}' = {len(team_games)}")
+        logger.debug(f"🐛 DEBUG: Games for team '{focus_team_id}' = {len(team_games)}")
         
         # Sort by date
         team_games.sort(key=lambda x: x.date)
         
         # Process venue changes for JUST this team
         travel_results = self._infer_venue_changes(focus_team_id, team_games, league)
-        print(f"🐛 DEBUG: Travel records generated = {len(travel_results)}")
+        logger.debug(f"🐛 DEBUG: Travel records generated = {len(travel_results)}")
         
         return travel_results
 
@@ -1784,7 +1786,7 @@ class TravelInferenceEngine:
         }
         pattern = travel_patterns.get(league, travel_patterns['MLB'])
         
-        print(f"🔍 Processing {len(games_list)} games for team {team_id}")
+        logger.debug(f"🔍 Processing {len(games_list)} games for team {team_id}")
         
         # Compare consecutive games
         venue_changes = 0
@@ -1834,10 +1836,25 @@ class TravelInferenceEngine:
                     )
                     
                     travel_data.append(travel_record)
-                    print(f"   ✈️  {departure_city} → {arrival_city} (venue changed)")
+                    logger.debug(f"   ✈️  {departure_city} → {arrival_city} (venue changed)")
         
-        print(f"   📊 Team {team_id}: {venue_changes} venue changes = {len(travel_data)} travel records")
+        logger.debug(f"   📊 Team {team_id}: {venue_changes} venue changes = {len(travel_data)} travel records")
         return travel_data
+
+
+class _LoaderWorker(QThread):
+    """Runs one schedule-load callable off the GUI thread. Results flow back
+    through the aggregator's existing signals (queued to the main thread)."""
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self._fn()
+        except Exception as e:
+            logger.exception("Background load failed: %s", e)
 
 
 class ESPNSportsDataAggregator(QObject):
@@ -1848,6 +1865,7 @@ class ESPNSportsDataAggregator(QObject):
     progressUpdated = pyqtSignal(int)
     errorOccurred = pyqtSignal(str)
     seasonDataLoaded = pyqtSignal(str, str, int)  # season, league, game_count
+    scheduleRefreshed = pyqtSignal(str, str, dict)  # league, season, summary
     amadeusIntelligenceReady = pyqtSignal(object)  # Flight/Airport/Hotel data
     amadeusProgressUpdated = pyqtSignal(int, str)
     
@@ -1867,10 +1885,41 @@ class ESPNSportsDataAggregator(QObject):
         self.all_season_games = []
         self.current_travel_data = []
         self.teams_cache = {}
-        
+
+        # Single background worker for schedule loads. Loads can cascade into
+        # a full ESPN scrape (minutes), which must never block the GUI thread.
+        self._loader_worker = None
+
+        # Flashscore: fast rolling-window refresh + live scores. Lazy client;
+        # only touched from the loader worker / poller threads.
+        from flashscore_source import FlashscoreScheduleSource
+        self.flashscore = FlashscoreScheduleSource(self.db)
+
         self.load_teams_for_all_leagues()
         self.set_league(self.current_league)
-    
+
+    def _start_loader(self, fn, description: str) -> bool:
+        """Run a load function on a background thread. One at a time; returns
+        False (and emits a status error) if a load is already running."""
+        if self._loader_worker is not None and self._loader_worker.isRunning():
+            logger.warning("Loader busy, ignoring request: %s", description)
+            return False
+
+        # No deleteLater: we hold the only reference, and the next assignment
+        # releases the finished worker. deleteLater would leave a dead wrapper
+        # whose isRunning() raises.
+        worker = _LoaderWorker(fn, self)
+        self._loader_worker = worker
+        worker.start()
+        logger.debug("Started background load: %s", description)
+        return True
+
+    def shutdown(self):
+        """Wait for any in-flight background load before teardown."""
+        if self._loader_worker is not None and self._loader_worker.isRunning():
+            logger.info("Waiting for background schedule load to finish...")
+            self._loader_worker.wait(5000)
+
     def set_league(self, league: str):
         """Set current league and update current season"""
         if league not in ['MLB', 'NBA', 'NHL']:
@@ -1878,7 +1927,7 @@ class ESPNSportsDataAggregator(QObject):
         
         self.current_league = league
         self.current_season = self.espn_scraper.get_current_season_for_league(league)
-        print(f"Set league to {league}, current season: {self.current_season}")
+        logger.debug(f"Set league to {league}, current season: {self.current_season}")
     
     
     def set_amadeus_credentials(self, api_key: str, api_secret: str):
@@ -1888,7 +1937,7 @@ class ESPNSportsDataAggregator(QObject):
             self.amadeus_analyzer = AmadeusAnalyzer(api_key, api_secret, aggregator=self)
             return True
         except Exception as e:
-            print(f"Failed to initialize Amadeus: {e}")
+            logger.debug(f"Failed to initialize Amadeus: {e}")
             return False
     
     
@@ -1900,7 +1949,7 @@ class ESPNSportsDataAggregator(QObject):
             teams = self.db.load_teams(league)
             
             if not teams:
-                print(f"No {league} teams found in database, initializing from scraper...")
+                logger.debug(f"No {league} teams found in database, initializing from scraper...")
                 teams = []
                 league_teams = self.espn_scraper.league_teams.get(league, {})
                 
@@ -1922,9 +1971,73 @@ class ESPNSportsDataAggregator(QObject):
                     self.db.save_teams(teams, league)
             
             self.teams_cache[league] = {team.team_id: team for team in teams}
-            print(f"Loaded {len(teams)} {league} teams")
+            logger.debug(f"Loaded {len(teams)} {league} teams")
     
-    def load_full_season_schedule(self, season: str = None, league: str = None, force_refresh: bool = False):
+    def load_full_season_schedule(self, season: str = None, league: str = None,
+                                  force_refresh: bool = False) -> bool:
+        """Load complete season schedule on a background thread.
+
+        May cascade into a full ESPN scrape; never blocks the GUI. Completion
+        is reported via seasonDataLoaded / dataUpdated / errorOccurred."""
+        return self._start_loader(
+            lambda: self._load_full_season_schedule_sync(season, league, force_refresh),
+            f"full season {league} {season}")
+
+    def load_team_season_schedule(self, team_id: str, season: str = None,
+                                  league: str = None) -> bool:
+        """Load one team's schedule on a background thread."""
+        return self._start_loader(
+            lambda: self._load_team_season_schedule_sync(team_id, season, league),
+            f"team {team_id} {league} {season}")
+
+    def get_current_week_schedule(self, league: str = None) -> bool:
+        """Load the current week's travel on a background thread."""
+        return self._start_loader(
+            lambda: self._get_current_week_schedule_sync(league),
+            f"current week {league}")
+
+    def refresh_upcoming_schedule(self, league: str = None, days_ahead: int = 7) -> bool:
+        """Flashscore rolling-window refresh on a background thread (~1s).
+
+        Fixes dates/postponements/statuses for the upcoming window, inserts
+        newly scheduled games (playoffs!), bumps the cache freshness stamp so
+        the staleness check stops cascading into ESPN re-scrapes, and rebuilds
+        travel inference when game days actually moved. Completion is reported
+        via scheduleRefreshed(league, season, summary)."""
+        return self._start_loader(
+            lambda: self._refresh_upcoming_schedule_sync(league, days_ahead),
+            f"flashscore refresh {league}")
+
+    def _refresh_upcoming_schedule_sync(self, league: str = None, days_ahead: int = 7):
+        if league is None:
+            league = self.current_league
+        season = self.espn_scraper.get_current_season_for_league(league)
+
+        try:
+            summary = self.flashscore.refresh_upcoming(
+                league, season, days_ahead=days_ahead)
+        except Exception as e:
+            logger.warning("Flashscore refresh failed for %s: %s", league, e)
+            return
+
+        if summary.get("travel_relevant"):
+            self._rebuild_travel_sync(season, league)
+
+        self.scheduleRefreshed.emit(league, season, summary)
+
+    def _rebuild_travel_sync(self, season: str, league: str):
+        """Re-run travel inference for every team from the games table."""
+        games = self.db.load_games(season, league)
+        if not games:
+            return
+        travel_data = []
+        for team in self.get_all_teams(league):
+            travel_data.extend(
+                self.inference_engine.infer_travel_from_games(games, team.team_id, league))
+        self.db.save_travel_data(travel_data, season, league)
+        logger.info("Rebuilt %d travel records for %s %s", len(travel_data), league, season)
+
+    def _load_full_season_schedule_sync(self, season: str = None, league: str = None, force_refresh: bool = False):
         """Load complete season schedule for specified league"""
         if league is None:
             league = self.current_league
@@ -1934,7 +2047,7 @@ class ESPNSportsDataAggregator(QObject):
         
         try:
             if not self.db.should_refresh_season(season, league, force_refresh):
-                print(f"Loading {league} {season} season from database cache...")
+                logger.debug(f"Loading {league} {season} season from database cache...")
                 self.progressUpdated.emit(20)
                 
                 games = self.db.load_games(season, league)
@@ -1946,12 +2059,12 @@ class ESPNSportsDataAggregator(QObject):
                     self.dataUpdated.emit(travel_data)
                     self.seasonDataLoaded.emit(season, league, len(games))
                     self.progressUpdated.emit(100)
-                    print(f"Loaded {len(games)} {league} games and {len(travel_data)} travel records from database")
+                    logger.debug(f"Loaded {len(games)} {league} games and {len(travel_data)} travel records from database")
                     return
                 else:
-                    print(f"No cached {league} data found for {season}, will scrape...")
+                    logger.debug(f"No cached {league} data found for {season}, will scrape...")
             
-            print(f"Scraping {league} {season} season schedule from ESPN...")
+            logger.debug(f"Scraping {league} {season} season schedule from ESPN...")
             self.progressUpdated.emit(10)
             
             #self.db.clear_season_data(season, league)
@@ -1968,18 +2081,18 @@ class ESPNSportsDataAggregator(QObject):
                 travel_data = []
                 all_teams = self.get_all_teams(league)  # Get all teams for this league
                 
-                print(f"🔄 Processing travel data for all {len(all_teams)} {league} teams...")
+                logger.debug(f"🔄 Processing travel data for all {len(all_teams)} {league} teams...")
                 
                 for i, team in enumerate(all_teams, 1):
                     team_travel = self.inference_engine.infer_travel_from_games(season_games, team.team_id, league)
                     travel_data.extend(team_travel)
-                    print(f"  [{i}/{len(all_teams)}] ✅ {team.display_name}: {len(team_travel)} travel records")
+                    logger.info(f"  [{i}/{len(all_teams)}] ✅ {team.display_name}: {len(team_travel)} travel records")
                     
                     # Update progress during team processing
                     team_progress = 70 + int((i / len(all_teams)) * 15)  # Progress from 70% to 85%
                     self.progressUpdated.emit(team_progress)
                 
-                print(f"🏆 TOTAL: Generated {len(travel_data)} travel records for ALL {league} teams")
+                logger.debug(f"🏆 TOTAL: Generated {len(travel_data)} travel records for ALL {league} teams")
                 
                 self.db.save_travel_data(travel_data, season, league)
                 self.progressUpdated.emit(90)
@@ -1990,18 +2103,18 @@ class ESPNSportsDataAggregator(QObject):
                 self.dataUpdated.emit(travel_data)
                 self.seasonDataLoaded.emit(season, league, len(season_games))
                 
-                print(f"Scraped and saved {len(season_games)} {league} games and {len(travel_data)} travel records")
+                logger.debug(f"Scraped and saved {len(season_games)} {league} games and {len(travel_data)} travel records")
                 self.progressUpdated.emit(100)
             else:
                 self.errorOccurred.emit(f"No {league} games found for {season} season")
                 
         except Exception as e:
             error_msg = f"Failed to load {league} {season} season: {str(e)}"
-            print(error_msg)
+            logger.debug(error_msg)
             self.errorOccurred.emit(error_msg)
             self.progressUpdated.emit(0)
     
-    def load_team_season_schedule(self, team_id: str, season: str = None, league: str = None):
+    def _load_team_season_schedule_sync(self, team_id: str, season: str = None, league: str = None):
         """Load schedule for specific team"""
         if league is None:
             league = self.current_league
@@ -2015,14 +2128,14 @@ class ESPNSportsDataAggregator(QObject):
             team_travel = self.db.load_travel_data(season, league, team_id)
             
             if team_travel:
-                print(f"Loaded {len(team_travel)} {league} travel records for {team_id} from database")
+                logger.debug(f"Loaded {len(team_travel)} {league} travel records for {team_id} from database")
                 self.dataUpdated.emit(team_travel)
                 self.progressUpdated.emit(100)
                 return
             
             is_cached, _ = self.db.is_season_cached(season, league)
             if not is_cached:
-                self.load_full_season_schedule(season, league)
+                self._load_full_season_schedule_sync(season, league)
                 return
             
             team_travel = self.db.load_travel_data(season, league, team_id)
@@ -2035,7 +2148,7 @@ class ESPNSportsDataAggregator(QObject):
         except Exception as e:
             self.errorOccurred.emit(f"Failed to load {league} team schedule: {str(e)}")
     
-    def get_current_week_schedule(self, league: str = None):
+    def _get_current_week_schedule_sync(self, league: str = None):
         """Get current week games from database for specified league"""
         if league is None:
             league = self.current_league
@@ -2046,8 +2159,8 @@ class ESPNSportsDataAggregator(QObject):
             is_cached, _ = self.db.is_season_cached(season, league)
             
             if not is_cached:
-                print(f"No {league} {season} season data found, loading full season...")
-                self.load_full_season_schedule(season, league)
+                logger.debug(f"No {league} {season} season data found, loading full season...")
+                self._load_full_season_schedule_sync(season, league)
                 return
             
             today = datetime.now()
@@ -2062,7 +2175,7 @@ class ESPNSportsDataAggregator(QObject):
             
             if current_week_travel:
                 self.dataUpdated.emit(current_week_travel)
-                print(f"Loaded {len(current_week_travel)} {league} travel records for current week")
+                logger.debug(f"Loaded {len(current_week_travel)} {league} travel records for current week")
             else:
                 self.errorOccurred.emit(f"No {league} current week travel found")
                 
@@ -2086,7 +2199,7 @@ class ESPNSportsDataAggregator(QObject):
             return filtered_travel
             
         except Exception as e:
-            print(f"Error filtering {league} travel by date range: {e}")
+            logger.debug(f"Error filtering {league} travel by date range: {e}")
             return []
     
      
@@ -2151,26 +2264,28 @@ class ESPNSportsDataAggregator(QObject):
         
         try:
             self.db.clear_season_data(season, league)
-            print(f"Cleared {league} cache for {season} season")
+            logger.debug(f"Cleared {league} cache for {season} season")
         except Exception as e:
-            print(f"Error clearing {league} season cache: {e}")
+            logger.debug(f"Error clearing {league} season cache: {e}")
+    
+    
 
 
 def run_scraper():
     """Run scraper for all leagues - concise multi-league version"""
-    print("🏃‍♂️ Running ESPN Sports Scraper for All Leagues...")
+    logger.debug("🏃‍♂️ Running ESPN Sports Scraper for All Leagues...")
     
     config = {}
     aggregator = ESPNSportsDataAggregator(config)
     
     # Scrape all supported leagues
     for league in ["NBA", "NHL", "MLB"]:# "NBA", "NHL", "MLB" 
-        print(f"\n📊 Scraping {league}...")
+        logger.debug(f"\n📊 Scraping {league}...")
         aggregator.set_league(league)
         aggregator.load_full_season_schedule(force_refresh=True)
     
     stats = aggregator.get_database_stats()
-    print(f"\n✅ Multi-league scraping complete. Database stats: {stats}")
+    logger.info(f"\n✅ Multi-league scraping complete. Database stats: {stats}")
 
 
 

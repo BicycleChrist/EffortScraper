@@ -7,12 +7,15 @@ from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime, timedelta
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture
-from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal, QVariantAnimation, QEasingCurve
 from PyQt6.QtGui import (QMatrix4x4, QVector3D, QQuaternion, QMouseEvent,
                          QWheelEvent, QColor, QImage, QVector4D)
 from pathlib import Path
 import math
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 class TeamTravelAnimation:
     """Manages animated team travel sequences - Essential for UI"""
@@ -177,7 +180,7 @@ class TeamTravelAnimation:
                 )
                 if (self.debug): print(f"🛩️ Calculated orientation at progress {self.segment_progress:.3f}");
             except Exception as e:
-                print(f"⚠️ Failed to calculate airplane orientation: {e}")
+                logger.warning(f"⚠️ Failed to calculate airplane orientation: {e}")
                 orientation = None
         
         return {
@@ -310,7 +313,8 @@ class FlightGlobeWidget(QOpenGLWidget):
     animationStatusChanged = pyqtSignal(bool, str)
     animationProgressChanged = pyqtSignal(float, dict)
     markerClicked = pyqtSignal(str, dict)  # marker_id, marker_data
-    
+    fpsUpdated = pyqtSignal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.debug = False # enables prints extra info in terminal
@@ -319,18 +323,22 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.shader_program = None
         self.travel_shader = None
         self.marker_shader = None
+        self.stars_shader = None
+        self._stars_vao = None
         self.vao = None
         self.vbo = None
         self.ebo = None
         self.earth_texture = None
+        self.night_texture = None  # optional city-lights map (night side)
         
         # Marker resources
         self.marker_vao = None
         self.marker_vbo = None
         self.marker_geometry = None
         
-        # Team logo textures
+        # Team logo textures (+ small QImages for QPainter overlay chips)
         self.team_logo_textures = {}
+        self.team_logo_images = {}
         self.default_marker_texture = None
         
         # Sphere geometry
@@ -344,7 +352,29 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.rotation_matrix = QMatrix4x4()
         self.zoom_level = 1.0
         self.min_zoom = 0.3
-        self.max_zoom = 5.0
+        self.max_zoom = 8.0
+
+        # Semantic LOD tier (0=far clusters, 1=mid logos, 2=near detail)
+        self._lod = 1
+        self._cluster_cache_key = None
+        self._cluster_cache = []
+
+        # Game card target: set by clicking a game cube, cleared by clicking
+        # the same cube / empty space. Keyed by game id, NOT marker object —
+        # marker dicts are rebuilt on schedule refreshes, which both killed
+        # the card "on a timer" and broke second-click dismissal.
+        self._selected_game_key = None
+
+        # Cached per-path GL buffers (rebuilt when travel_paths changes)
+        self._path_buffers = []          # [(vao, vbo, point_count), ...]
+        self._path_buffer_key = None
+
+        # Cached per-flight route arcs (charter origin->destination)
+        self._flight_route_cache = {}    # icao24 -> (vao, vbo, count, color)
+        # Remembered label slot per flight so chips don't reshuffle each frame
+        self._flight_label_slots = {}    # icao24 -> slot index
+        # Route arcs are opt-in: click a plane to toggle its arc
+        self._shown_route_icaos = set()
         
         # Mouse interaction
         self.last_mouse_pos = QPoint()
@@ -361,6 +391,13 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.render_timer.timeout.connect(self.update)
         self.animation_time = 0.0
         self.last_frame_time = time.time()
+
+        # FPS accounting (emitted via fpsUpdated about once per second)
+        self._fps_frame_count = 0
+        self._fps_last_emit = time.time()
+
+        # Eased fly-to animation (center_on_location)
+        self._flyto_animation = None
         
         # Sports travel data
         self.travel_data = []
@@ -398,7 +435,21 @@ class FlightGlobeWidget(QOpenGLWidget):
         # Initialize default view
         self.setup_default_view()
         self.setMouseTracking(True)
-        self.render_timer.start(16)  # 60 FPS
+        # Render timer is started/stopped by showEvent/hideEvent so a hidden
+        # tab doesn't burn CPU/GPU at 60fps (important when embedded).
+        self.render_interval_ms = 16  # ~60 FPS
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.render_timer.isActive():
+            self.last_frame_time = time.time()
+            self._fps_last_emit = time.time()
+            self._fps_frame_count = 0
+            self.render_timer.start(self.render_interval_ms)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.render_timer.stop()
     
     def setup_default_view(self):
         """Setup default globe view focused on North America"""
@@ -422,11 +473,13 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.setup_earth_texture()
         self.load_team_logo_textures()
         self.setup_marker_vao()
-        self.setup_marker_vao()
         self.plane_model.setup_airplane_model()
         
         self.gl_initialized = bool(self.marker_vao)
-        print("✅ Globe OpenGL initialized" if self.gl_initialized else "❌ Globe OpenGL failed")
+        if self.gl_initialized:
+            logger.info("✅ Globe OpenGL initialized")
+        else:
+            logger.error("❌ Globe OpenGL failed")
     
     def generate_sphere_geometry(self):
         """Generate sphere geometry with correct UV mapping for Earth textures"""
@@ -515,17 +568,15 @@ class FlightGlobeWidget(QOpenGLWidget):
             shader_path = Path(filepath)
             return shader_path.read_text(encoding='utf-8')
         except FileNotFoundError:
-            print(f"❌ Shader file not found: {filepath}")
+            logger.error(f"❌ Shader file not found: {filepath}")
             return None
         except Exception as e:
-            print(f"❌ Error loading shader file {filepath}: {e}")
+            logger.error(f"❌ Error loading shader file {filepath}: {e}")
             return None
 
     def setup_shaders(self):
         """Setup all OpenGL shaders - now loading from separate files"""
-        
-        # Define shader directory path (adjust as needed for your project structure)
-        shader_dir = Path("shaders")
+        shader_dir = Path(__file__).resolve().parent / "shaders"
         
         # Earth shader
         earth_vertex = self.load_shader_from_file(shader_dir / "earth.vert")
@@ -536,11 +587,11 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, earth_vertex)
             self.shader_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, earth_fragment)
             if not self.shader_program.link():
-                print("❌ Failed to link Earth shader")
+                logger.error("❌ Failed to link Earth shader")
             else:
-                print("✅ Earth shader linked successfully")
+                logger.info("✅ Earth shader linked successfully")
         else:
-            print("❌ Failed to load Earth shader files")
+            logger.error("❌ Failed to load Earth shader files")
         
         # Travel path shader
         travel_vertex = self.load_shader_from_file(shader_dir / "travel_path.vert")
@@ -551,11 +602,11 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, travel_vertex)
             self.travel_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, travel_fragment)
             if not self.travel_shader.link():
-                print("❌ Failed to link Travel shader")
+                logger.error("❌ Failed to link Travel shader")
             else:
-                print("✅ Travel shader linked successfully")
+                logger.info("✅ Travel shader linked successfully")
         else:
-            print("❌ Failed to load Travel shader files")
+            logger.error("❌ Failed to load Travel shader files")
         
         # Marker shader
         marker_vertex = self.load_shader_from_file(shader_dir / "marker.vert")
@@ -566,11 +617,11 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, marker_vertex)
             self.marker_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, marker_fragment)
             if not self.marker_shader.link():
-                print("❌ Failed to link Marker shader")
+                logger.error("❌ Failed to link Marker shader")
             else:
-                print("✅ Marker shader linked successfully")
+                logger.info("✅ Marker shader linked successfully")
         else:
-            print("❌ Failed to load Marker shader files")
+            logger.error("❌ Failed to load Marker shader files")
         
         # Airplane shader
         airplane_vertex = self.load_shader_from_file(shader_dir / "airplane.vert")
@@ -581,13 +632,27 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, airplane_vertex)
             self.airplane_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, airplane_fragment)
             if not self.airplane_shader.link():
-                print("❌ Failed to link Airplane shader")
+                logger.error("❌ Failed to link Airplane shader")
                 self.airplane_shader = None
             else:
-                print("✅ Airplane shader linked successfully")
+                logger.info("✅ Airplane shader linked successfully")
         else:
-            print("❌ Failed to load Airplane shader files")
+            logger.error("❌ Failed to load Airplane shader files")
             self.airplane_shader = None
+
+        # Starfield shader (optional ambiance; missing files just skip it)
+        stars_vertex = self.load_shader_from_file(shader_dir / "stars.vert")
+        stars_fragment = self.load_shader_from_file(shader_dir / "stars.frag")
+
+        if stars_vertex and stars_fragment:
+            self.stars_shader = QOpenGLShaderProgram()
+            self.stars_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, stars_vertex)
+            self.stars_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, stars_fragment)
+            if not self.stars_shader.link():
+                logger.warning("Failed to link Stars shader")
+                self.stars_shader = None
+        else:
+            self.stars_shader = None
 
         # Contrail shader
         contrail_vertex = self.load_shader_from_file(shader_dir / "contrail.vert")
@@ -598,29 +663,38 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.contrail_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, contrail_vertex)
             self.contrail_shader.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, contrail_fragment)
             if not self.contrail_shader.link():
-                print("❌ Failed to link Contrail shader")
+                logger.error("❌ Failed to link Contrail shader")
                 self.contrail_shader = None
             else:
-                print("✅ Contrail shader linked successfully")
+                logger.info("✅ Contrail shader linked successfully")
         else:
-            print("⚠️  Contrail shader files not found (optional feature)")
+            logger.warning("⚠️  Contrail shader files not found (optional feature)")
             self.contrail_shader = None
 
     def setup_earth_texture(self):
-        """Load Earth texture"""
+        """Load Earth texture (and optional night city-lights map)"""
+        base_dir = Path(__file__).resolve().parent
         texture_files = ["no_ice_clouds_8k.jpg", "earth.jpg"]
-        
+
         image = None
         for texture_file in texture_files:
-            image = QImage(texture_file)
+            image = QImage(str(base_dir / texture_file))
             if not image.isNull():
                 break
-        
+
         if image and not image.isNull():
             image = image.convertToFormat(QImage.Format.Format_RGB888)
             self.earth_texture = QOpenGLTexture(image)
             self.earth_texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
             self.earth_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+
+        # Night-side city lights (optional asset; globe works without it)
+        night_image = QImage(str(base_dir / "earth_nightmap.jpg"))
+        if not night_image.isNull():
+            night_image = night_image.convertToFormat(QImage.Format.Format_RGB888)
+            self.night_texture = QOpenGLTexture(night_image)
+            self.night_texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
+            self.night_texture.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
     
     def setup_marker_vao(self):
         """Create reusable marker VAO and VBO"""
@@ -760,8 +834,9 @@ class FlightGlobeWidget(QOpenGLWidget):
         total_loaded = 0
         
         # Load logos for all leagues with unique keys
+        base_dir = Path(__file__).resolve().parent
         for league, config in league_configs.items():
-            logos_path = Path(config["folder"])
+            logos_path = base_dir / config["folder"]
             
             if not logos_path.exists():
                 continue
@@ -778,7 +853,12 @@ class FlightGlobeWidget(QOpenGLWidget):
                             
                             # Create league-specific key to avoid conflicts
                             texture_key = f"{league}_{team_id}".lower()
-                            
+
+                            # Small copy for QPainter overlay chips
+                            self.team_logo_images[texture_key] = image.scaled(
+                                18, 18, Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+
                             # Create OpenGL texture
                             texture = QOpenGLTexture(image)
                             texture.setMinificationFilter(QOpenGLTexture.Filter.LinearMipMapLinear)
@@ -791,7 +871,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                     except Exception:
                         pass  # Silent fail for missing logos
         
-        print(f"✅ Loaded {total_loaded} team logos")
+        logger.info(f"✅ Loaded {total_loaded} team logos")
         
         # Create default marker texture if none exists
         if not self.default_marker_texture:
@@ -1067,7 +1147,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             self._create_sequential_team_path(travel_records, team_name, team_abbrev, 
                                             league, team_color, cities_seen)
         
-        print(f"✅ Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers")
+        logger.info(f"✅ Generated {len(self.travel_paths)} travel paths, {len(self.team_city_markers)} city markers")
 
     def _create_sequential_team_path(self, travel_records, team_name, team_abbrev, 
                                    league, team_color, cities_seen):
@@ -1202,7 +1282,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         if not todays_games:
             return
         
-        print(f"🏈 Found {len(todays_games)} games today!")
+        logger.debug(f"🏈 Found {len(todays_games)} games today!")
         
         # Add split cube markers for today's games
         for game in todays_games:
@@ -1233,7 +1313,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                                         if not (m.get('city_name') == venue_city and m.get('type') == 'todays_game')]
                 
                 self.team_city_markers.append(split_marker)
-                print(f"   🏟️  {game['away_team']} @ {game['home_team']} in {venue_city}")
+                logger.debug(f"   🏟️  {game['away_team']} @ {game['home_team']} in {venue_city}")
         
         self.update()
 
@@ -1290,7 +1370,13 @@ class FlightGlobeWidget(QOpenGLWidget):
         frame_time = current_time - self.last_frame_time
         self.last_frame_time = current_time
         self.animation_time += frame_time
-        
+
+        self._fps_frame_count += 1
+        if current_time - self._fps_last_emit >= 1.0:
+            self.fpsUpdated.emit(self._fps_frame_count / (current_time - self._fps_last_emit))
+            self._fps_frame_count = 0
+            self._fps_last_emit = current_time
+
         # Update travel animation
         if self.show_travel_animation:
             animation_state = self.travel_animation.update_animation(frame_time)
@@ -1316,20 +1402,22 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.decay_momentum()
         
         model = self.rotation_matrix
+        camera_pos = QVector3D(0, 0, self.camera_distance())
         view = QMatrix4x4()
-        view.lookAt(QVector3D(0, 0, 3 / self.zoom_level), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
+        view.lookAt(camera_pos, QVector3D(0, 0, 0), QVector3D(0, 1, 0))
         projection = QMatrix4x4()
         aspect_ratio = self.width() / max(self.height(), 1)
         projection.perspective(45.0, aspect_ratio, 0.1, 100.0)
         mvp = projection * view * model
-        
+
         normal_matrix = model.normalMatrix()
-        
-        self.render_earth(mvp, model, normal_matrix)
+
+        self.render_starfield(projection, view)
+        self.render_earth(mvp, model, normal_matrix, camera_pos)
 
         # Render travel visualization
         if self.show_travel_paths:
-            self.render_travel_paths(mvp)
+            self.render_travel_paths(mvp, model, camera_pos)
 
         if self.show_team_cities:
             self.render_markers(mvp, model)
@@ -1339,92 +1427,212 @@ class FlightGlobeWidget(QOpenGLWidget):
             self.render_contrails(mvp)
 
         # Render live flights (always on top)
+        self.render_flight_routes(mvp, model, camera_pos)
         if self.live_flights:
             self.render_live_flights(mvp)
             # Render 2D labels for live flights
             self.render_flight_labels(mvp)
+
+        # 2D marker overlays: cluster badges, live-score chips, fatigue rings
+        if self.show_team_cities and not self.show_travel_animation:
+            self.render_marker_overlays(mvp)
 
     def render_flight_labels(self, mvp: QMatrix4x4):
         """Render 2D team labels above live flight planes"""
         if not self.live_flights:
             return
 
-        from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush
-        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtCore import Qt, QRect
+        from PyQt6.QtGui import (QPainter, QColor, QFont, QPen, QBrush,
+                                 QLinearGradient)
+
+        # Same GL-state caveat as render_marker_overlays
+        self._prepare_gl_for_qpainter()
 
         # Begin QPainter for 2D overlay
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Font setup
-        label_font = QFont("Arial", 10, QFont.Weight.Bold)
-        painter.setFont(label_font)
+        title_font = QFont("Arial", 9, QFont.Weight.Bold)
+        small_font = QFont("Arial", 8)
+        placed_rects = []
 
-        for icao24, flight_data in self.live_flights.items():
+        # Stable iteration order (by icao24) + remembered slots keep each chip
+        # parked in the same spot relative to its plane across frames
+        self._flight_label_slots = {
+            k: v for k, v in self._flight_label_slots.items()
+            if k in self.live_flights}
+
+        for icao24, flight_data in sorted(self.live_flights.items()):
             try:
                 lat = flight_data['latitude']
                 lon = flight_data['longitude']
                 altitude_ft = flight_data.get('altitude_ft', 35000)
                 team_id = flight_data.get('team_id')
                 confidence = flight_data.get('confidence', 50)
-                aircraft_type = flight_data.get('aircraft_type', '')
+                dest_city = flight_data.get('dest_city')
+                progress = flight_data.get('route_progress')
 
-                if not team_id:
-                    continue  # Skip flights without team assignment
-
-                # Convert to 3D position (same as render_live_flights)
+                # Position above the plane
                 altitude_scale = 1.0 + (altitude_ft / 40000.0) * 0.12
-                pos_3d = self.lat_lon_to_3d(lat, lon, altitude_scale + 0.02)  # Slightly above plane
-
-                # Project 3D to 2D screen coordinates
+                pos_3d = self.lat_lon_to_3d(lat, lon, altitude_scale + 0.02)
+                # Cull labels for planes on the far side of the globe —
+                # without this they project anyway and pin to the screen edge
+                if not self._marker_front_facing(pos_3d):
+                    continue
                 screen_pos = self.project_to_screen(pos_3d, mvp)
                 if screen_pos is None:
                     continue
-
                 x, y = screen_pos
-
-                # Skip if off-screen
                 if x < 0 or x > self.width() or y < 0 or y > self.height():
                     continue
 
-                # Get team color
-                team_color = self.get_team_color(team_id.upper())
-                qcolor = QColor(int(team_color[0]*255), int(team_color[1]*255), int(team_color[2]*255))
+                # Team look-and-feel (watchlist flights may have no team)
+                if team_id:
+                    league = (flight_data.get('league')
+                              or self.infer_league_from_team_id(team_id) or '')
+                    logo = self.team_logo_images.get(
+                        f"{league.lower()}_{team_id.lower()}")
+                    tc = self.get_team_color(team_id.upper())
+                    accent = QColor(int(tc[0] * 255), int(tc[1] * 255), int(tc[2] * 255))
+                    title = team_id.upper()
+                else:
+                    logo = None
+                    accent = QColor(150, 180, 220)
+                    title = (flight_data.get('label')
+                             or flight_data.get('callsign') or icao24).strip()
 
-                # Draw background pill
-                label_text = f"{team_id.upper()}"
-                conf_text = f"{confidence}%"
+                if dest_city:
+                    title += f"  →  {dest_city}"
 
-                metrics = painter.fontMetrics()
-                text_width = metrics.horizontalAdvance(label_text)
-                text_height = metrics.height()
+                painter.setFont(title_font)
+                title_w = painter.fontMetrics().horizontalAdvance(title)
 
-                pill_width = text_width + 16
-                pill_height = text_height + 8
-                pill_x = int(x - pill_width / 2)
-                pill_y = int(y - pill_height - 10)  # Above the plane
+                logo_w = 18 if logo is not None else 0
+                pad = 7
+                gap = 5 if logo is not None else 0
+                w = max(86, pad + logo_w + gap + title_w + pad)
+                h = 36 if progress is not None else 26
+                px, py = int(x), int(y)
 
-                # Background
-                painter.setPen(QPen(qcolor.darker(150), 2))
-                painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
-                painter.drawRoundedRect(pill_x, pill_y, pill_width, pill_height, 4, 4)
+                # Anchored placement: fixed candidate slots around the plane,
+                # tried in priority order; the chosen slot is remembered per
+                # flight so chips stay parked instead of reshuffling
+                def slot_rect(slot):
+                    return {
+                        0: QRect(px - w // 2, py - h - 20, w, h),       # above
+                        1: QRect(px + 22, py - h // 2, w, h),           # right
+                        2: QRect(px - w - 22, py - h // 2, w, h),       # left
+                        3: QRect(px - w // 2, py + 22, w, h),           # below
+                        4: QRect(px - w // 2, py - 2 * h - 30, w, h),   # high above
+                        5: QRect(px + 22, py - 3 * h // 2 - 12, w, h),  # right-up
+                        6: QRect(px - w - 22, py - 3 * h // 2 - 12, w, h),
+                        7: QRect(px - w // 2, py + h + 32, w, h),       # low below
+                    }[slot]
 
-                # Team text
-                painter.setPen(QPen(qcolor))
-                painter.drawText(pill_x + 8, pill_y + text_height, label_text)
+                def collides(r):
+                    pad_r = r.adjusted(-3, -3, 3, 3)
+                    return any(pad_r.intersects(o) for o in placed_rects)
 
-                # Confidence below (smaller)
-                small_font = QFont("Arial", 8)
-                painter.setFont(small_font)
-                conf_color = QColor(100, 255, 100) if confidence >= 80 else QColor(255, 200, 100)
-                painter.setPen(QPen(conf_color))
-                painter.drawText(int(x - 15), int(y + 5), conf_text)
-                painter.setFont(label_font)  # Reset font
+                remembered = self._flight_label_slots.get(icao24, 0)
+                chosen = None
+                for slot in [remembered] + [s for s in range(8) if s != remembered]:
+                    r = slot_rect(slot)
+                    if not collides(r):
+                        chosen = slot
+                        rect = r
+                        break
+                if chosen is None:  # everything collides; keep remembered slot
+                    chosen = remembered
+                    rect = slot_rect(chosen)
+                self._flight_label_slots[icao24] = chosen
 
-            except Exception as e:
+                # Keep on screen
+                rect.moveLeft(max(4, min(rect.left(), self.width() - w - 4)))
+                rect.moveTop(max(4, min(rect.top(), self.height() - h - 4)))
+                placed_rects.append(rect)
+                cx, cy = rect.left(), rect.top()
+
+                # Soft pulsing glow halo around the plane (matches the model's
+                # brightness throb, desynced per aircraft)
+                from PyQt6.QtGui import QRadialGradient
+                phase = (sum(map(ord, icao24)) % 628) / 100.0
+                pulse = max(0.0, math.sin(self.animation_time * 2.2 + phase))
+                glow_r = 14 + 5 * pulse
+                glow = QRadialGradient(px, py, glow_r)
+                gc = QColor(accent)
+                gc.setAlpha(int(55 + 60 * pulse))
+                glow.setColorAt(0.0, gc)
+                gc2 = QColor(accent)
+                gc2.setAlpha(0)
+                glow.setColorAt(1.0, gc2)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(glow))
+                painter.drawEllipse(int(px - glow_r), int(py - glow_r),
+                                    int(2 * glow_r), int(2 * glow_r))
+
+                # Leader line from plane to chip (drawn first, card covers
+                # its far end) with a small anchor dot at the plane
+                line_color = QColor(accent)
+                line_color.setAlpha(150)
+                painter.setPen(QPen(line_color, 1))
+                painter.drawLine(px, py, rect.center().x(), rect.center().y())
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(line_color))
+                painter.drawEllipse(px - 2, py - 2, 5, 5)
+
+                # Card
+                grad = QLinearGradient(cx, cy, cx, cy + h)
+                grad.setColorAt(0.0, QColor(22, 34, 56, 240))
+                grad.setColorAt(1.0, QColor(10, 16, 30, 240))
+                painter.setBrush(QBrush(grad))
+                border = QColor(accent)
+                border.setAlpha(190)
+                painter.setPen(QPen(border, 1.2))
+                painter.drawRoundedRect(cx, cy, w, h, 6, 6)
+
+                # Logo well + title row
+                tx = cx + pad
+                if logo is not None:
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(QColor(233, 237, 243, 240)))
+                    painter.drawRoundedRect(tx - 1, cy + 4, logo_w + 2, logo_w + 2, 4, 4)
+                    painter.drawImage(tx + (logo_w - logo.width()) // 2,
+                                      cy + 5 + (logo_w - logo.height()) // 2, logo)
+                    tx += logo_w + gap
+                painter.setFont(title_font)
+                painter.setPen(QColor(245, 250, 255))
+                painter.drawText(QRect(tx, cy, w - (tx - cx) - pad, 26),
+                                 Qt.AlignmentFlag.AlignVCenter, title)
+
+                # Route progress bar with confidence dot
+                if progress is not None:
+                    bar_x, bar_y = cx + pad + 10, cy + 28
+                    bar_w = w - 2 * pad - 10
+                    conf_color = QColor(60, 220, 110) if confidence >= 80 \
+                        else QColor(235, 190, 60)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(conf_color))
+                    painter.drawEllipse(cx + pad, bar_y - 1, 5, 5)
+
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 45)))
+                    painter.drawRoundedRect(bar_x, bar_y, bar_w, 3, 1, 1)
+                    fill = QColor(accent)
+                    fill.setAlpha(230)
+                    painter.setBrush(QBrush(fill))
+                    painter.drawRoundedRect(bar_x, bar_y,
+                                            max(4, int(bar_w * progress)), 3, 1, 1)
+                    # position tick
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+                    painter.drawEllipse(bar_x + int(bar_w * progress) - 2,
+                                        bar_y - 1, 5, 5)
+
+            except Exception:
                 continue
 
         painter.end()
+        gl.glEnable(gl.GL_CULL_FACE)
+        gl.glEnable(gl.GL_DEPTH_TEST)
 
     def project_to_screen(self, pos_3d: tuple, mvp: QMatrix4x4) -> tuple:
         """Project 3D world position to 2D screen coordinates"""
@@ -1473,14 +1681,40 @@ class FlightGlobeWidget(QOpenGLWidget):
         dec_rad = math.radians(declination)
         ha_rad = math.radians(hour_angle)
 
-        # Sun direction in world coordinates (Y-up coordinate system)
+        # Sun direction in EARTH frame (same lat/lon convention as the sphere
+        # geometry: x=cos(lat)cos(lon), z=-cos(lat)sin(lon)). Solar noon sits
+        # at longitude -hour_angle, so the sun points at (dec, -ha); the old
+        # +ha sign put noon on the wrong side of Greenwich.
         x = math.cos(dec_rad) * math.cos(ha_rad)
         y = math.sin(dec_rad)
-        z = -math.cos(dec_rad) * math.sin(ha_rad)
+        z = math.cos(dec_rad) * math.sin(ha_rad)
 
         return QVector3D(x, y, z).normalized()
 
-    def render_earth(self, mvp, model, normal_matrix):
+    def render_starfield(self, projection: QMatrix4x4, view: QMatrix4x4):
+        """Fullscreen hash-star background, drawn before the earth."""
+        if not self.stars_shader:
+            return
+        if self._stars_vao is None:
+            self._stars_vao = gl.glGenVertexArrays(1)
+
+        inv_vp, ok = (projection * view).inverted()
+        if not ok:
+            return
+
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(gl.GL_FALSE)
+        self.stars_shader.bind()
+        self.stars_shader.setUniformValue("invVP", inv_vp)
+        self.stars_shader.setUniformValue("time", self.animation_time)
+        gl.glBindVertexArray(self._stars_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+        gl.glBindVertexArray(0)
+        self.stars_shader.release()
+        gl.glDepthMask(gl.GL_TRUE)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+    def render_earth(self, mvp, model, normal_matrix, camera_pos=None):
         """Render Earth sphere with day/night cycle"""
         if not self.shader_program or not self.vao:
             return
@@ -1491,68 +1725,106 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.shader_program.setUniformValue("model", model)
         self.shader_program.setUniformValue("normalMatrix", normal_matrix)
 
-        # Day/night cycle uniforms
+        # Day/night cycle uniforms (sun direction also drives city lights).
+        # The sun is computed in the earth frame and rotated by the model
+        # matrix so the terminator sticks to geography while the globe spins —
+        # the night side is genuinely "where it's night right now".
         self.shader_program.setUniformValue("showDayNight", self.show_day_night)
-        if self.show_day_night:
-            sun_dir = self.calculate_sun_direction()
-            self.shader_program.setUniformValue("sunDirection", sun_dir)
-            self.shader_program.setUniformValue("terminatorWidth", self.terminator_width)
+        sun_dir = model.mapVector(self.calculate_sun_direction()).normalized()
+        self.shader_program.setUniformValue("sunDirection", sun_dir)
+        self.shader_program.setUniformValue("terminatorWidth", self.terminator_width)
 
         # Fallback light direction for non-day/night mode
         light_direction = QVector3D(1.0, 0.3, 0.5).normalized()
         self.shader_program.setUniformValue("lightDir", light_direction)
         self.shader_program.setUniformValue("showAtmosphere", self.show_atmosphere)
+        self.shader_program.setUniformValue(
+            "cameraPos", camera_pos if camera_pos is not None else QVector3D(0, 0, 3))
 
         if self.earth_texture:
             self.earth_texture.bind(0)
             self.shader_program.setUniformValue("earthTexture", 0)
+
+        has_night = self.night_texture is not None
+        self.shader_program.setUniformValue("hasNightTexture", has_night)
+        if has_night:
+            self.night_texture.bind(1)
+            self.shader_program.setUniformValue("nightTexture", 1)
 
         gl.glBindVertexArray(self.vao)
         gl.glDrawElements(gl.GL_TRIANGLES, len(self.indices), gl.GL_UNSIGNED_INT, None)
 
         self.shader_program.release()
     
-    def render_travel_paths(self, mvp):
-        """Render travel paths"""
+    def render_travel_paths(self, mvp, model=None, camera_pos=None):
+        """Render travel paths (with horizon fade on the globe's far side)"""
         if not self.travel_paths or not self.travel_shader:
             return
-        
+
         gl.glEnable(gl.GL_LINE_SMOOTH)
         gl.glLineWidth(2.5)
-        
+        # Depth test off: far-side segments are alpha-faded by the shader's
+        # horizon test instead of being hard-clipped by the sphere
+        gl.glDisable(gl.GL_DEPTH_TEST)
+
         self.travel_shader.bind()
         self.travel_shader.setUniformValue("mvp", mvp)
-        
-        for path_data in self.travel_paths:
-            points = path_data.get('points', [])
-            color = path_data.get('color', (1.0, 0.8, 0.2))
-            alpha = path_data.get('alpha', 0.9)
-            
-            if len(points) < 2:
-                continue
-            
+        self.travel_shader.setUniformValue(
+            "model", model if model is not None else QMatrix4x4())
+        self.travel_shader.setUniformValue(
+            "cameraPos", camera_pos if camera_pos is not None else QVector3D(0, 0, 3))
+
+        # Per-path buffers are cached across frames; the old code created and
+        # destroyed a VAO+VBO per path per frame.
+        self._ensure_path_buffers()
+        for (vao, _vbo, count, color, alpha) in self._path_buffers:
             self.travel_shader.setUniformValue("pathColor", QVector3D(*color))
             self.travel_shader.setUniformValue("pathAlpha", alpha)
-            
+            gl.glBindVertexArray(vao)
+            gl.glDrawArrays(gl.GL_LINE_STRIP, 0, count)
+        gl.glBindVertexArray(0)
+
+        self.travel_shader.release()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_LINE_SMOOTH)
+
+    def _ensure_path_buffers(self):
+        """(Re)build cached GL buffers when the travel path set changes."""
+        key = (id(self.travel_paths), len(self.travel_paths))
+        if key == self._path_buffer_key:
+            return
+        self._release_path_buffers()
+
+        for path_data in self.travel_paths:
+            points = path_data.get('points', [])
+            if len(points) < 2:
+                continue
+            color = path_data.get('color', (1.0, 0.8, 0.2))
+            alpha = path_data.get('alpha', 0.9)
+
             path_array = np.array(points, dtype=np.float32).flatten()
-            
-            path_vao = gl.glGenVertexArrays(1)
-            path_vbo = gl.glGenBuffers(1)
-            
-            gl.glBindVertexArray(path_vao)
-            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, path_vbo)
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, path_array.nbytes, path_array, gl.GL_DYNAMIC_DRAW)
-            
+            vao = gl.glGenVertexArrays(1)
+            vbo = gl.glGenBuffers(1)
+            gl.glBindVertexArray(vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, path_array.nbytes, path_array,
+                            gl.GL_STATIC_DRAW)
             gl.glEnableVertexAttribArray(0)
             gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, None)
-            
-            gl.glDrawArrays(gl.GL_LINE_STRIP, 0, len(points))
-            
-            gl.glDeleteBuffers(1, [path_vbo])
-            gl.glDeleteVertexArrays(1, [path_vao])
-        
-        self.travel_shader.release()
-        gl.glDisable(gl.GL_LINE_SMOOTH)
+            self._path_buffers.append((vao, vbo, len(points), color, alpha))
+
+        gl.glBindVertexArray(0)
+        self._path_buffer_key = key
+
+    def _release_path_buffers(self):
+        for (vao, vbo, _count, _color, _alpha) in self._path_buffers:
+            try:
+                gl.glDeleteBuffers(1, [vbo])
+                gl.glDeleteVertexArrays(1, [vao])
+            except Exception:
+                pass
+        self._path_buffers = []
+        self._path_buffer_key = None
 
     def render_contrails(self, mvp):
         """Render contrail/wake effects behind animated planes"""
@@ -1620,22 +1892,487 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.marker_shader.bind()
         self.marker_shader.setUniformValue("mvp", mvp)
         self.marker_shader.setUniformValue("time", self.animation_time)
-        
-        # Render static cube markers only when NOT showing travel animation
+
+        # Render static markers only when NOT showing travel animation
         if self.team_city_markers and not self.show_travel_animation:
-            for marker in self.team_city_markers:
-                marker_type = marker.get('type', 'generic')
-                
-                if marker_type in ['home_today', 'away_today']:
-                    rotation_speed = 0.3
-                else:
-                    rotation_speed = 1.0
-                
-                self.render_single_marker(marker, rotation_speed)
-        
+            if self._lod == self.LOD_FAR:
+                # Far tier: collapse to small cluster dots (logos unreadable)
+                for cluster in self._get_marker_clusters():
+                    self.render_cluster_marker(cluster)
+            else:
+                # Near tier shrinks markers so they keep a sane screen size
+                size_scale = 1.0 if self._lod == self.LOD_MID \
+                    else max(2.2 / self.zoom_level, 0.35)
+                for marker in self.team_city_markers:
+                    marker_type = marker.get('type', 'generic')
+
+                    if marker_type in ['home_today', 'away_today']:
+                        rotation_speed = 0.3
+                    else:
+                        rotation_speed = 1.0
+
+                    self.render_single_marker(marker, rotation_speed, size_scale)
+
         self.marker_shader.release()
+
+    LEAGUE_COLORS = {
+        'MLB': (0.85, 0.30, 0.25),
+        'NBA': (0.95, 0.55, 0.15),
+        'NHL': (0.35, 0.60, 0.95),
+    }
+
+    def _get_marker_clusters(self):
+        """Greedy angular clustering of markers for the far LOD tier."""
+        key = (id(self.team_city_markers), len(self.team_city_markers))
+        if key == self._cluster_cache_key:
+            return self._cluster_cache
+
+        clusters = []
+        threshold = 0.10  # radians between cluster centroid and marker (~6°)
+        for marker in self.team_city_markers:
+            pos = marker.get('position')
+            if not pos:
+                continue
+            v = QVector3D(*pos).normalized()
+            placed = False
+            for cluster in clusters:
+                if math.acos(max(-1.0, min(1.0,
+                        QVector3D.dotProduct(v, cluster['dir'])))) < threshold:
+                    cluster['markers'].append(marker)
+                    cluster['has_live'] = cluster['has_live'] or ('live' in marker)
+                    placed = True
+                    break
+            if not placed:
+                p = v * 1.03
+                clusters.append({
+                    'dir': v,
+                    'position': (p.x(), p.y(), p.z()),
+                    'league': marker.get('league', ''),
+                    'markers': [marker],
+                    'has_live': 'live' in marker,
+                })
+
+        self._cluster_cache_key = key
+        self._cluster_cache = clusters
+        return clusters
+
+    def invalidate_marker_clusters(self):
+        """Force cluster rebuild (markers were mutated in place, e.g. live
+        score stamping)."""
+        self._cluster_cache_key = None
+
+    def render_cluster_marker(self, cluster):
+        """Small untextured dot-cube for a far-tier cluster."""
+        if not self.marker_vao:
+            return
+        count = len(cluster['markers'])
+        color = self.LEAGUE_COLORS.get((cluster['league'] or '').upper(),
+                                       (0.9, 0.8, 0.3))
+        if cluster['has_live']:
+            color = (0.25, 0.95, 0.45)  # live games pop green
+
+        self.marker_shader.setUniformValue("isSplitCube", False)
+        self.marker_shader.setUniformValue("isAnimated", False)
+        self.marker_shader.setUniformValue("useTexture", False)
+        self.marker_shader.setUniformValue("useHomeTexture", False)
+        self.marker_shader.setUniformValue("useAwayTexture", False)
+        self.marker_shader.setUniformValue("teamColor", QVector3D(*color))
+        self.marker_shader.setUniformValue("markerCenter", QVector3D(*cluster['position']))
+        self.marker_shader.setUniformValue("markerSize", min(0.55 + 0.10 * count, 1.0))
+        self.marker_shader.setUniformValue("rotationSpeed", 0.15)
+        self.marker_shader.setUniformValue("markerAlpha", 0.95)
+        self.marker_shader.setUniformValue("time", self.animation_time)
+
+        gl.glBindVertexArray(self.marker_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 36)
+        gl.glBindVertexArray(0)
+
+    @staticmethod
+    def _prepare_gl_for_qpainter():
+        """Reset the GL state Qt's paint engine assumes but does not set.
+
+        Two verified failure modes when this is skipped:
+        - GL_CULL_FACE enabled -> QPainter fills (rects/images/gradients)
+          silently vanish while text still renders.
+        - A leftover texture bound on the active unit (e.g. the last marker
+          cube's team logo) -> QPainter samples OUR texture for its image and
+          gradient draws, painting the wrong logo / striped backgrounds.
+        """
+        gl.glDisable(gl.GL_CULL_FACE)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glActiveTexture(gl.GL_TEXTURE1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        gl.glUseProgram(0)
+        gl.glBindVertexArray(0)
+
+    def _marker_front_facing(self, pos) -> bool:
+        """True when a model-space marker is on the camera-facing hemisphere.
+        project_to_screen alone happily projects far-side points."""
+        world = self.rotation_matrix.map(QVector3D(*pos)).normalized()
+        return world.z() > (1.0 / self.camera_distance()) - 0.05
+
+    def render_marker_overlays(self, mvp: QMatrix4x4):
+        """2D overlay pass: cluster count badges (far) and live-score chips
+        (mid/near), drawn with QPainter like the flight labels."""
+        from PyQt6.QtCore import QRect
+        from PyQt6.QtGui import (QPainter, QColor, QFont, QPen, QBrush,
+                                 QLinearGradient)
+
+        far_clusters = []
+        if self._lod == self.LOD_FAR:
+            far_clusters = [c for c in self._get_marker_clusters()
+                            if len(c['markers']) > 1]
+
+        # Game card shows only for an explicitly clicked game cube. Resolved
+        # by stable game key so it survives marker rebuilds (refreshes/live
+        # stamping); cleared only when the game leaves the board entirely.
+        focus_marker = None
+        if self._selected_game_key is not None:
+            focus_marker = next(
+                (m for m in self.team_city_markers
+                 if m.get('game_info')
+                 and self._marker_game_key(m) == self._selected_game_key), None)
+            if focus_marker is None:
+                self._selected_game_key = None
+            elif not self._marker_front_facing(focus_marker['position']):
+                focus_marker = None  # rotated away; key kept for when it returns
+
+        live_markers = [] if self._lod == self.LOD_FAR else \
+            [m for m in self.team_city_markers
+             if m.get('live') and m is not focus_marker]
+        fatigue_markers = [] if self._lod != self.LOD_NEAR else \
+            [m for m in self.team_city_markers
+             if m.get('fatigue_max', 0) >= 40 and not m.get('live')
+             and m is not focus_marker]
+
+        if not (far_clusters or live_markers or fatigue_markers or focus_marker):
+            return
+
+        self._prepare_gl_for_qpainter()
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Cluster count badges
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        for cluster in far_clusters:
+            if not self._marker_front_facing(cluster['position']):
+                continue
+            screen = self.project_to_screen(cluster['position'], mvp)
+            if not screen:
+                continue
+            x, y = screen
+            painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
+            painter.setPen(QPen(QColor(100, 150, 200, 200), 1))
+            painter.drawEllipse(int(x) + 8, int(y) - 18, 18, 18)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(int(x) + 8, int(y) - 18, 18, 18,
+                             Qt.AlignmentFlag.AlignCenter, str(len(cluster['markers'])))
+
+        # Live score chips: [away logo] 3–0 [home logo] · Bot 3rd, with a
+        # leader stem down to the marker and collision stacking between chips
+        score_font = QFont("Arial", 10, QFont.Weight.Bold)
+        progress_font = QFont("Arial", 8, QFont.Weight.DemiBold)
+        placed_rects = []
+        projected = []
+        for marker in live_markers:
+            if not self._marker_front_facing(marker['position']):
+                continue
+            screen = self.project_to_screen(marker['position'], mvp)
+            if screen:
+                projected.append((screen[1], screen[0], marker))
+        for sy, sx, marker in sorted(projected, key=lambda t: t[0]):
+            x, y = int(sx), int(sy)
+            live = marker['live']
+            league = (marker.get('league') or '').lower()
+
+            away_img = self.team_logo_images.get(f"{league}_{live.get('away_id', '')}")
+            home_img = self.team_logo_images.get(f"{league}_{live.get('home_id', '')}")
+            score_text = f"{live.get('away_score', '?')}–{live.get('home_score', '?')}"
+            progress = live.get('progress') or ''
+            if progress.upper() == 'LIVE':
+                progress = ''
+
+            painter.setFont(score_font)
+            score_w = painter.fontMetrics().horizontalAdvance(score_text)
+            painter.setFont(progress_font)
+            prog_w = painter.fontMetrics().horizontalAdvance(progress) if progress else 0
+
+            logo_w = 18
+            pad = 7
+            gap = 5
+            w = pad + logo_w + gap + score_w + gap + logo_w + \
+                ((gap + 3 + gap + prog_w) if progress else 0) + pad
+            h = 26
+            cx = x - w // 2
+            cy = y - h - 22
+
+            # Stack upward if overlapping a chip we already placed
+            rect = QRect(cx, cy, w, h)
+            for _ in range(5):
+                if not any(rect.intersects(r) for r in placed_rects):
+                    break
+                cy -= h + 4
+                rect = QRect(cx, cy, w, h)
+            placed_rects.append(rect)
+
+            # Leader stem from chip to marker
+            painter.setPen(QPen(QColor(120, 170, 220, 110), 1))
+            painter.drawLine(x, cy + h, x, y - 8)
+
+            # Card: subtle vertical gradient, soft border, green pulse accent
+            grad = QLinearGradient(cx, cy, cx, cy + h)
+            grad.setColorAt(0.0, QColor(22, 34, 56, 242))
+            grad.setColorAt(1.0, QColor(10, 16, 30, 242))
+            painter.setBrush(QBrush(grad))
+            pulse = 110 + int(70 * abs(math.sin(self.animation_time * 2.2)))
+            painter.setPen(QPen(QColor(46, 204, 113, pulse), 1.2))
+            painter.drawRoundedRect(rect, 7, 7)
+
+            def draw_logo_well(px, py, img):
+                """Light backing pad so dark/navy logos stay visible on the
+                dark card (e.g. the Dodgers script)."""
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(233, 237, 243, 240)))
+                painter.drawRoundedRect(px - 2, py - 2, logo_w + 4, logo_w + 4, 4, 4)
+                painter.drawImage(px + (logo_w - img.width()) // 2,
+                                  py + (logo_w - img.height()) // 2, img)
+
+            # Contents
+            tx = cx + pad
+            iy = cy + (h - logo_w) // 2
+            if away_img:
+                draw_logo_well(tx, iy, away_img)
+            else:
+                painter.setFont(progress_font)
+                painter.setPen(QColor(200, 210, 225))
+                painter.drawText(QRect(tx, cy, logo_w, h),
+                                 Qt.AlignmentFlag.AlignCenter,
+                                 (live.get('away_id') or '?').upper()[:3])
+            tx += logo_w + gap
+
+            painter.setFont(score_font)
+            painter.setPen(QColor(245, 250, 255))
+            painter.drawText(QRect(tx, cy, score_w, h),
+                             Qt.AlignmentFlag.AlignVCenter, score_text)
+            tx += score_w + gap
+
+            if home_img:
+                draw_logo_well(tx, iy, home_img)
+            else:
+                painter.setFont(progress_font)
+                painter.setPen(QColor(200, 210, 225))
+                painter.drawText(QRect(tx, cy, logo_w, h),
+                                 Qt.AlignmentFlag.AlignCenter,
+                                 (live.get('home_id') or '?').upper()[:3])
+            tx += logo_w
+
+            if progress:
+                tx += gap
+                painter.setBrush(QBrush(QColor(46, 204, 113, 230)))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(tx, cy + h // 2 - 2, 4, 4)
+                tx += 3 + gap
+                painter.setFont(progress_font)
+                painter.setPen(QColor(80, 230, 140))
+                painter.drawText(QRect(tx, cy, prog_w + 2, h),
+                                 Qt.AlignmentFlag.AlignVCenter, progress)
+
+        # Fatigue rings (near tier): amber/red halo on heavy-schedule games
+        for marker in fatigue_markers:
+            if not self._marker_front_facing(marker['position']):
+                continue
+            screen = self.project_to_screen(marker['position'], mvp)
+            if not screen:
+                continue
+            x, y = screen
+            score = marker.get('fatigue_max', 0)
+            color = QColor(220, 60, 50, 200) if score >= 60 \
+                else QColor(235, 170, 40, 180)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(color, 2))
+            r = 16
+            painter.drawEllipse(int(x) - r, int(y) - r, 2 * r, 2 * r)
+
+        if focus_marker is not None:
+            self._draw_game_card(painter, focus_marker, mvp)
+
+        painter.end()
+        gl.glEnable(gl.GL_CULL_FACE)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+    @staticmethod
+    def _marker_game_key(marker):
+        """Stable identity for a game marker across marker-list rebuilds."""
+        game = (marker.get('game_info') or {}).get('game')
+        game_id = getattr(game, 'game_id', None)
+        if game_id:
+            return game_id
+        return (marker.get('league'), marker.get('home_team_id'),
+                marker.get('away_team_id'))
+
+    def _draw_game_card(self, painter, marker, mvp):
+        """Full game card for the focused near-tier marker: matchup, score or
+        start time, venue weather, and both teams' fatigue."""
+        from PyQt6.QtCore import QRect
+        from PyQt6.QtGui import QColor, QFont, QPen, QBrush, QLinearGradient
+
+        screen = self.project_to_screen(marker['position'], mvp)
+        if not screen:
+            return
+        mx, my = int(screen[0]), int(screen[1])
+
+        league = (marker.get('league') or '').upper()
+        away_id = (marker.get('away_team_id') or '?')
+        home_id = (marker.get('home_team_id') or '?')
+        away_img = self.team_logo_images.get(f"{league.lower()}_{away_id.lower()}")
+        home_img = self.team_logo_images.get(f"{league.lower()}_{home_id.lower()}")
+        live = marker.get('live')
+        game = (marker.get('game_info') or {}).get('game')
+        weather = marker.get('weather')
+        fatigue = marker.get('fatigue_detail') or {}
+
+        header_font = QFont("Arial", 11, QFont.Weight.Bold)
+        score_font = QFont("Arial", 14, QFont.Weight.Bold)
+        detail_font = QFont("Arial", 9)
+
+        # ---- assemble lines (text, font, color)
+        if live:
+            status_text = f"{live.get('away_score', '?')} – {live.get('home_score', '?')}"
+            progress = live.get('progress') or ''
+            sub_text = progress if progress.upper() != 'LIVE' else 'LIVE'
+        else:
+            status_text = None
+            game_status = getattr(getattr(game, 'status', None), 'value', '')
+            if game_status == 'final':
+                sub_text = "Final"
+            elif game_status in ('postponed', 'cancelled'):
+                sub_text = game_status.capitalize()
+            else:
+                sub_text = game.date.strftime("%a %b %d  ·  %I:%M %p") if game else ''
+
+        weather_text = None
+        if weather:
+            weather_text = (f"{weather.get('temperature', 0):.0f}°F  ·  "
+                            f"{weather.get('condition', '?')}  ·  "
+                            f"wind {weather.get('wind_speed', 0):.0f} mph")
+
+        fatigue_text = None
+        if fatigue:
+            parts = []
+            for side, tid in (('away', away_id), ('home', home_id)):
+                tf = fatigue.get(side)
+                if tf:
+                    parts.append(f"{tid.upper()} {tf.score:.0f}")
+            if parts:
+                fatigue_text = "⚡ fatigue  " + "  ·  ".join(parts)
+
+        # ---- measure
+        pad = 12
+        well = 24
+        painter.setFont(header_font)
+        header_text = f"{away_id.upper()}  @  {home_id.upper()}"
+        header_w = painter.fontMetrics().horizontalAdvance(header_text)
+        w = max(200, pad + well + 8 + header_w + 8 + well + pad)
+
+        h = pad + well + 6
+        if status_text:
+            h += 26
+        h += 18  # sub_text line
+        if weather_text:
+            h += 17
+        if fatigue_text:
+            h += 17
+        h += pad - 4
+
+        # ---- placement: beside the marker, flipped/clamped at edges
+        cx = mx + 30
+        if cx + w > self.width() - 8:
+            cx = mx - w - 30
+        cy = my - h // 2
+        cy = max(8, min(cy, self.height() - h - 8))
+
+        # stem
+        painter.setPen(QPen(QColor(120, 170, 220, 130), 1))
+        edge_x = cx if cx > mx else cx + w
+        painter.drawLine(mx, my, edge_x, cy + h // 2)
+
+        # card body
+        grad = QLinearGradient(cx, cy, cx, cy + h)
+        grad.setColorAt(0.0, QColor(24, 36, 58, 246))
+        grad.setColorAt(1.0, QColor(10, 16, 30, 246))
+        painter.setBrush(QBrush(grad))
+        painter.setPen(QPen(QColor(100, 150, 200, 150), 1.2))
+        painter.drawRoundedRect(cx, cy, w, h, 9, 9)
+
+        # league accent line along the top
+        accent = self.LEAGUE_COLORS.get(league, (0.4, 0.6, 0.9))
+        painter.setPen(QPen(QColor(int(accent[0] * 255), int(accent[1] * 255),
+                                   int(accent[2] * 255), 230), 3))
+        painter.drawLine(cx + 10, cy + 1, cx + w - 10, cy + 1)
+
+        # ---- header row: logo wells + matchup
+        ty = cy + pad
+
+        def well_at(px, img, fallback):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(233, 237, 243, 240)))
+            painter.drawRoundedRect(px, ty, well, well, 5, 5)
+            if img:
+                painter.drawImage(px + (well - img.width()) // 2,
+                                  ty + (well - img.height()) // 2, img)
+            else:
+                painter.setFont(detail_font)
+                painter.setPen(QColor(40, 50, 70))
+                painter.drawText(QRect(px, ty, well, well),
+                                 Qt.AlignmentFlag.AlignCenter, fallback[:3].upper())
+
+        well_at(cx + pad, away_img, away_id)
+        well_at(cx + w - pad - well, home_img, home_id)
+        painter.setFont(header_font)
+        painter.setPen(QColor(245, 250, 255))
+        painter.drawText(QRect(cx + pad + well, ty, w - 2 * (pad + well), well),
+                         Qt.AlignmentFlag.AlignCenter, header_text)
+        ty += well + 6
+
+        # ---- score (live) and status line
+        if status_text:
+            painter.setFont(score_font)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(QRect(cx, ty, w, 24), Qt.AlignmentFlag.AlignCenter,
+                             status_text)
+            ty += 26
+
+        painter.setFont(detail_font)
+        if live:
+            pulse = 150 + int(90 * abs(math.sin(self.animation_time * 2.2)))
+            painter.setBrush(QBrush(QColor(46, 204, 113, pulse)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            sub_w = painter.fontMetrics().horizontalAdvance(sub_text)
+            painter.drawEllipse(cx + w // 2 - sub_w // 2 - 11, ty + 5, 6, 6)
+            painter.setPen(QColor(80, 230, 140))
+        else:
+            painter.setPen(QColor(150, 170, 195))
+        painter.drawText(QRect(cx, ty, w, 16), Qt.AlignmentFlag.AlignCenter, sub_text)
+        ty += 18
+
+        if weather_text:
+            painter.setPen(QColor(140, 175, 210))
+            painter.drawText(QRect(cx, ty, w, 15), Qt.AlignmentFlag.AlignCenter,
+                             weather_text)
+            ty += 17
+
+        if fatigue_text:
+            worst = max((tf.score for tf in fatigue.values()), default=0)
+            color = QColor(225, 90, 70) if worst >= 60 else \
+                QColor(235, 180, 60) if worst >= 40 else QColor(120, 200, 140)
+            painter.setPen(color)
+            painter.drawText(QRect(cx, ty, w, 15), Qt.AlignmentFlag.AlignCenter,
+                             fatigue_text)
     
-    def render_single_marker(self, marker, rotation_speed=1.0):
+    def render_single_marker(self, marker, rotation_speed=1.0, size_scale=1.0):
         """Render a single marker with split cube support"""
         if not self.marker_vao:
             return
@@ -1744,7 +2481,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         
         # Set common uniforms
         self.marker_shader.setUniformValue("markerCenter", QVector3D(*pos))
-        self.marker_shader.setUniformValue("markerSize", size)
+        self.marker_shader.setUniformValue("markerSize", size * size_scale)
         self.marker_shader.setUniformValue("rotationSpeed", rotation_speed)
         self.marker_shader.setUniformValue("markerAlpha", 0.9)
         self.marker_shader.setUniformValue("time", self.animation_time)
@@ -1820,7 +2557,7 @@ class FlightGlobeWidget(QOpenGLWidget):
 
         # Recreate the matrices from paintGL
         view = QMatrix4x4()
-        view.lookAt(QVector3D(0, 0, 3 / self.zoom_level), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
+        view.lookAt(QVector3D(0, 0, self.camera_distance()), QVector3D(0, 0, 0), QVector3D(0, 1, 0))
 
         projection = QMatrix4x4()
         aspect_ratio = width / max(height, 1)
@@ -1875,6 +2612,32 @@ class FlightGlobeWidget(QOpenGLWidget):
         t = (-b - math.sqrt(discriminant)) / (2.0 * a)
         return t if t > 0 else None
 
+    def find_clicked_flight(self, screen_x: int, screen_y: int):
+        """Return the icao24 of the plane model under the cursor, or None."""
+        origin, direction = self.screen_to_ray(screen_x, screen_y)
+        if origin is None:
+            return None
+
+        closest, closest_t = None, float('inf')
+        for icao24, fd in self.live_flights.items():
+            lat, lon = fd.get('latitude'), fd.get('longitude')
+            if lat is None or lon is None:
+                continue
+            altitude_scale = 1.0 + (fd.get('altitude_ft', 35000) / 40000.0) * 0.12
+            pos = self.lat_lon_to_3d(lat, lon, altitude_scale)
+            t = self.ray_sphere_intersect(origin, direction,
+                                          QVector3D(*pos), 0.05)
+            if t is not None and t < closest_t:
+                closest, closest_t = icao24, t
+        return closest
+
+    def toggle_flight_route(self, icao24: str):
+        if icao24 in self._shown_route_icaos:
+            self._shown_route_icaos.discard(icao24)
+        else:
+            self._shown_route_icaos.add(icao24)
+        self.update()
+
     def find_clicked_marker(self, screen_x: int, screen_y: int):
         """Find which marker (if any) was clicked"""
         ray_result = self.screen_to_ray(screen_x, screen_y)
@@ -1905,16 +2668,32 @@ class FlightGlobeWidget(QOpenGLWidget):
     def mousePressEvent(self, event):
         """Handle mouse press for rotation and marker selection"""
         if event.button() == Qt.MouseButton.LeftButton:
-            # Check for marker click first
+            # Planes first (drawn on top): click toggles that charter's arc
+            clicked_flight = self.find_clicked_flight(event.pos().x(), event.pos().y())
+            if clicked_flight:
+                self.toggle_flight_route(clicked_flight)
+                return
+
+            # Check for marker click
             clicked_marker = self.find_clicked_marker(event.pos().x(), event.pos().y())
 
             if clicked_marker:
+                # Toggle the game card: click a game cube to show it, click
+                # the same cube again to dismiss
+                if clicked_marker.get('game_info'):
+                    key = self._marker_game_key(clicked_marker)
+                    self._selected_game_key = None if key == self._selected_game_key else key
+                    self.update()
+
                 # Emit signal with marker data
                 marker_id = clicked_marker.get('team_id', clicked_marker.get('city_name', 'unknown'))
                 self.markerClicked.emit(marker_id, clicked_marker)
                 return  # Don't start globe rotation
 
-            # No marker clicked - start rotation
+            # No marker clicked - dismiss any open game card, start rotation
+            if self._selected_game_key is not None:
+                self._selected_game_key = None
+                self.update()
             self.is_grabbed = True
             self.last_mouse_pos = event.pos()
             self.rotation_momentum = QVector3D(0, 0, 0)
@@ -1965,34 +2744,120 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.rotation_matrix = momentum_rotation * self.rotation_matrix
         self.rotation_momentum *= self.momentum_decay
         
+    def camera_distance(self) -> float:
+        """Camera distance from globe center. Asymptotes toward the surface
+        (radius 1.0) instead of passing through it — the old 3/zoom put the
+        camera INSIDE the sphere for zoom > 3. zoom 1 still gives 3.0."""
+        return 1.0 + 2.0 / self.zoom_level
+
+    def _model_point_under_cursor(self, screen_x: int, screen_y: int):
+        """Model-space point on the globe surface under the cursor, or None."""
+        origin, direction = self.screen_to_ray(screen_x, screen_y)
+        if origin is None:
+            return None
+        t = self.ray_sphere_intersect(origin, direction, QVector3D(0, 0, 0), 1.0)
+        if t is None:
+            return None
+        return origin + direction * t
+
     def wheelEvent(self, event):
-        """Handle mouse wheel for zooming"""
+        """Zoom toward the point under the cursor (Google-Earth style)."""
         delta = event.angleDelta().y()
         zoom_factor = 1.05 if delta > 0 else 0.95
-        old_zoom = self.zoom_level
-        new_zoom = self.zoom_level * zoom_factor
-        self.zoom_level = max(self.min_zoom, min(self.max_zoom, new_zoom))
-        if (self.debug and (old_zoom != self.zoom_level)):
-            print(f"zoom level: {self.zoom_level:.3f}x")
+        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom_level * zoom_factor))
+        if new_zoom == self.zoom_level:
+            return
+
+        pos = event.position()
+        before = self._model_point_under_cursor(int(pos.x()), int(pos.y()))
+        self.zoom_level = new_zoom
+        after = self._model_point_under_cursor(int(pos.x()), int(pos.y()))
+
+        if before is not None and after is not None:
+            # Keep the surface point under the cursor: post-multiply by the
+            # model-space rotation taking the old hit point to the new one.
+            q = QQuaternion.rotationTo(before.normalized(), after.normalized())
+            spin = QMatrix4x4()
+            spin.rotate(q)
+            self.rotation_matrix = self.rotation_matrix * spin
+
+        self._update_lod()
         self.update()
-    
+
+    # ------------------------------------------------------------ LOD tiers
+    LOD_FAR, LOD_MID, LOD_NEAR = 0, 1, 2
+
+    def _update_lod(self):
+        """Semantic level-of-detail from zoom, with hysteresis at boundaries.
+        far (<~0.8): clustered dots; mid: logo cubes + live chips;
+        near (>~2.2): scaled pins + detail chips."""
+        z = self.zoom_level
+        cur = self._lod
+        H = 0.08
+        new = cur
+        if z < 0.8 - H:
+            new = self.LOD_FAR
+        elif z > 2.2 + H:
+            new = self.LOD_NEAR
+        elif (cur == self.LOD_FAR and z > 0.8 + H) or \
+             (cur == self.LOD_NEAR and z < 2.2 - H):
+            new = self.LOD_MID
+        if new != cur:
+            self._lod = new
+            logger.debug("LOD tier -> %d (zoom %.2f)", new, z)
+
     def reset_view(self):
         """Reset view to default"""
         self.setup_default_view()
         self.zoom_level = 1.0
         self.rotation_momentum = QVector3D(0, 0, 0)
+        self._update_lod()
         self.update()
 
-    def center_on_location(self, lat: float, lon: float):
-        """Center the globe view on a specific latitude/longitude"""
-        # Convert lat/lon to rotation angles
-        # Longitude controls Y-axis rotation (horizontal spin)
-        # Latitude controls X-axis rotation (tilt)
-        self.rotation_matrix = QMatrix4x4()
-        self.rotation_matrix.rotate(-lat, 1, 0, 0)  # Tilt for latitude
-        self.rotation_matrix.rotate(-lon - 90, 0, 1, 0)  # Spin for longitude
+    def center_on_location(self, lat: float, lon: float, animate: bool = True,
+                           duration_ms: int = 900):
+        """Center the globe view on a specific latitude/longitude.
+
+        Animates with an eased quaternion slerp from the current orientation;
+        pass animate=False for the old instant snap."""
+        target = QMatrix4x4()
+        # Tilt +lat: the longitude spin leaves the target +lat above the
+        # camera axis in the YZ plane; Rx(+lat) brings it to center.
+        # (The old -lat sign centered on the mirrored latitude.)
+        target.rotate(lat, 1, 0, 0)
+        target.rotate(-lon - 90, 0, 1, 0)  # Spin for longitude
         self.rotation_momentum = QVector3D(0, 0, 0)
-        self.update()
+
+        if not animate:
+            self.rotation_matrix = target
+            self.update()
+            return
+
+        # normalMatrix() is the upper-left 3x3 inverse-transpose, which equals
+        # the rotation itself for the pure-rotation matrices used here
+        start_q = QQuaternion.fromRotationMatrix(self.rotation_matrix.normalMatrix())
+        end_q = QQuaternion.fromRotationMatrix(target.normalMatrix())
+
+        if self._flyto_animation:
+            self._flyto_animation.stop()
+
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(duration_ms)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def on_tick(t):
+            q = QQuaternion.slerp(start_q, end_q, float(t))
+            m = QMatrix4x4()
+            m.rotate(q)
+            self.rotation_matrix = m
+            self.update()
+
+        anim.valueChanged.connect(on_tick)
+        anim.finished.connect(lambda: setattr(self, '_flyto_animation', None))
+        self._flyto_animation = anim
+        anim.start()
 
     def resizeGL(self, width, height):
         """Handle window resize"""
@@ -2018,7 +2883,7 @@ class FlightGlobeWidget(QOpenGLWidget):
 
         if self.debug:
             label = flight_data.get('label', flight_data.get('callsign', icao24))
-            print(f"🛫 Added live flight: {label}")
+            logger.info(f"🛫 Added live flight: {label}")
 
         self.update()  # Trigger redraw
 
@@ -2034,7 +2899,7 @@ class FlightGlobeWidget(QOpenGLWidget):
                 lat = flight_data['latitude']
                 lon = flight_data['longitude']
                 alt = flight_data.get('altitude_ft', 0)
-                print(f"📍 Updated flight {icao24}: ({lat:.2f}, {lon:.2f}) @ {alt:.0f}ft")
+                logger.debug(f"📍 Updated flight {icao24}: ({lat:.2f}, {lon:.2f}) @ {alt:.0f}ft")
 
             self.update()  # Trigger redraw
 
@@ -2044,7 +2909,7 @@ class FlightGlobeWidget(QOpenGLWidget):
             del self.live_flights[icao24]
 
             if self.debug:
-                print(f"🛬 Removed live flight: {icao24}")
+                logger.debug(f"🛬 Removed live flight: {icao24}")
 
             self.update()  # Trigger redraw
 
@@ -2053,9 +2918,93 @@ class FlightGlobeWidget(QOpenGLWidget):
         self.live_flights.clear()
 
         if self.debug:
-            print("🧹 Cleared all live flights")
+            logger.debug("🧹 Cleared all live flights")
 
         self.update()  # Trigger redraw
+
+    def render_flight_routes(self, mvp, model=None, camera_pos=None):
+        """Team-colored great-circle arcs for tracked charters
+        (origin -> destination from schedule correlation)."""
+        if not self.travel_shader:
+            return
+
+        # Arcs are opt-in (click a plane to toggle); drop toggles for landed
+        # flights and prune unneeded GL buffers (needs GL context — here)
+        self._shown_route_icaos &= set(self.live_flights)
+        stale = [k for k in self._flight_route_cache
+                 if k not in self.live_flights or k not in self._shown_route_icaos]
+        for k in stale:
+            vao, vbo, _count, _color = self._flight_route_cache.pop(k)
+            try:
+                gl.glDeleteBuffers(1, [vbo])
+                gl.glDeleteVertexArrays(1, [vao])
+            except Exception:
+                pass
+
+        if not self._shown_route_icaos:
+            return
+
+        # Build missing arcs (only for toggled-on flights)
+        for icao24 in self._shown_route_icaos:
+            fd = self.live_flights[icao24]
+            if icao24 in self._flight_route_cache:
+                continue
+            o_lat, o_lon = fd.get('origin_lat'), fd.get('origin_lon')
+            d_lat, d_lon = fd.get('dest_lat'), fd.get('dest_lon')
+            if None in (o_lat, o_lon, d_lat, d_lon):
+                continue
+            points = self.generate_great_circle_path(o_lat, o_lon, d_lat, d_lon, 60)
+            if len(points) < 2:
+                continue
+            arr = np.array(points, dtype=np.float32).flatten()
+            vao = gl.glGenVertexArrays(1)
+            vbo = gl.glGenBuffers(1)
+            gl.glBindVertexArray(vao)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, arr.nbytes, arr, gl.GL_STATIC_DRAW)
+            gl.glEnableVertexAttribArray(0)
+            gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, None)
+            color = self.get_team_color((fd.get('team_id') or '').upper())
+            self._flight_route_cache[icao24] = (vao, vbo, len(points), color)
+
+        if not self._flight_route_cache:
+            return
+
+        gl.glEnable(gl.GL_LINE_SMOOTH)
+        gl.glLineWidth(1.5)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+
+        self.travel_shader.bind()
+        self.travel_shader.setUniformValue("mvp", mvp)
+        self.travel_shader.setUniformValue(
+            "model", model if model is not None else QMatrix4x4())
+        self.travel_shader.setUniformValue(
+            "cameraPos", camera_pos if camera_pos is not None else QVector3D(0, 0, 3))
+
+        # Two-tone transparency split at the plane's position: the flown
+        # portion is a faint ghost, the portion ahead is slightly stronger —
+        # shows direction without the full-strength spaghetti of the
+        # single-team travel paths
+        for icao24, (vao, _vbo, count, color) in self._flight_route_cache.items():
+            fd = self.live_flights.get(icao24, {})
+            progress = fd.get('route_progress')
+            split = int(max(1, min(count - 1, (progress or 0.0) * count)))
+
+            self.travel_shader.setUniformValue("pathColor", QVector3D(*color))
+            gl.glBindVertexArray(vao)
+            if progress is not None:
+                self.travel_shader.setUniformValue("pathAlpha", 0.14)
+                gl.glDrawArrays(gl.GL_LINE_STRIP, 0, split + 1)      # flown
+                self.travel_shader.setUniformValue("pathAlpha", 0.45)
+                gl.glDrawArrays(gl.GL_LINE_STRIP, split, count - split)  # ahead
+            else:
+                self.travel_shader.setUniformValue("pathAlpha", 0.25)
+                gl.glDrawArrays(gl.GL_LINE_STRIP, 0, count)
+        gl.glBindVertexArray(0)
+
+        self.travel_shader.release()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_LINE_SMOOTH)
 
     def render_live_flights(self, mvp):
         """Render all tracked live flights as airplanes"""
@@ -2129,14 +3078,21 @@ class FlightGlobeWidget(QOpenGLWidget):
                 if team_id and confidence >= 65:
                     team_color = self.get_team_color(team_id.upper())
 
-                # Create animation state dict for render_animated_airplane
+                # Create animation state dict for render_animated_airplane.
+                # Live charters render at ~45% model scale: several planes can
+                # share a region and the full-size model swamps the map.
+                # Brightness pulses softly, desynced per aircraft.
+                phase = (sum(map(ord, icao24)) % 628) / 100.0
+                pulse = 1.0 + 0.30 * max(0.0, math.sin(self.animation_time * 2.2 + phase))
                 animation_state = {
                     'position': position_3d,
                     'orientation': orientation,
                     'team_id': team_id,
                     'team_color': team_color,
                     'confidence': confidence,
-                    'is_live_flight': True
+                    'is_live_flight': True,
+                    'scale': 0.45,
+                    'brightness': pulse,
                 }
 
                 # Render airplane using existing method
@@ -2144,7 +3100,7 @@ class FlightGlobeWidget(QOpenGLWidget):
 
             except Exception as e:
                 if self.debug:
-                    print(f"⚠️  Error rendering live flight {icao24}: {e}")
+                    logger.warning(f"⚠️  Error rendering live flight {icao24}: {e}")
                 continue
 
     def render_live_flights_as_markers(self, mvp):
@@ -2202,7 +3158,7 @@ class FlightGlobeWidget(QOpenGLWidget):
 
             except Exception as e:
                 if self.debug:
-                    print(f"⚠️  Error rendering live flight marker {icao24}: {e}")
+                    logger.warning(f"⚠️  Error rendering live flight marker {icao24}: {e}")
                 continue
 
         self.marker_shader.release()
@@ -2267,7 +3223,7 @@ class AirplaneGeometry:
             normals = []
             faces = []
             
-            print(f"📁 Loading airplane model: {filepath}")
+            logger.debug(f"📁 Loading airplane model: {filepath}")
             
             with open(filepath, 'r') as file:
                 lines = file.readlines()
@@ -2304,20 +3260,20 @@ class AirplaneGeometry:
                             faces.append(face_vertices)
                 
                 except (ValueError, IndexError) as e:
-                    print(f"⚠️ Skipping invalid line {line_num}: {line} ({e})")
+                    logger.warning(f"⚠️ Skipping invalid line {line_num}: {line} ({e})")
                     continue
             
             # Validation
             if not vertices or not faces:
-                print(f"❌ Invalid .obj file: no vertices or faces found")
+                logger.error(f"❌ Invalid .obj file: no vertices or faces found")
                 return False
             
-            print(f"📊 Loaded: {len(vertices)} vertices, {len(normals)} normals, {len(faces)} faces")
+            logger.debug(f"📊 Loaded: {len(vertices)} vertices, {len(normals)} normals, {len(faces)} faces")
             
             # Generate normals if none provided
             if not normals:
                 normals = self._generate_face_normals_vectorized(vertices, faces)
-                print("🔧 Generated face normals (vectorized)")
+                logger.debug("🔧 Generated face normals (vectorized)")
             
             # Convert to OpenGL-ready format with optimization
             self.geometry_data = self._create_vertex_array_optimized(vertices, normals, faces)
@@ -2328,14 +3284,14 @@ class AirplaneGeometry:
             self.bounding_box = self._calculate_bounding_box_fast(vertices)
             self.is_loaded = True
             
-            print(f"✅ Airplane geometry loaded: {self.vertex_count} vertices")
+            logger.info(f"✅ Airplane geometry loaded: {self.vertex_count} vertices")
             return True
             
         except FileNotFoundError:
-            print(f"❌ Airplane model file not found: {filepath}")
+            logger.error(f"❌ Airplane model file not found: {filepath}")
             return False
         except Exception as e:
-            print(f"❌ Failed to load airplane model: {e}")
+            logger.error(f"❌ Failed to load airplane model: {e}")
             return False
     
     def _generate_face_normals_vectorized(self, vertices, faces):
@@ -2403,7 +3359,7 @@ class AirplaneGeometry:
             return vertex_data[:vertex_idx].flatten()
             
         except Exception as e:
-            print(f"❌ Failed to create vertex array: {e}")
+            logger.error(f"❌ Failed to create vertex array: {e}")
             return None
     
     def _calculate_bounding_box_fast(self, vertices):
@@ -2464,16 +3420,17 @@ class PlaneModel:
         possible_files = ["pj_airplane_0degx.obj", "paper_airplane.obj"]
         model_path = None
         
+        plane_dir = Path(__file__).resolve().parent / "plane_model"
         for filename in possible_files:
-            test_path = Path("plane_model") / filename
+            test_path = plane_dir / filename
             if test_path.exists():
                 model_path = test_path
-                print(f"✅ Found airplane model: {model_path}")
+                logger.info(f"✅ Found airplane model: {model_path}")
                 break
         
         if not model_path:
-            print(f"⚠️ No airplane model found in plane_model/ directory")
-            print(f"   Looked for: {possible_files}")
+            logger.warning(f"⚠️ No airplane model found in plane_model/ directory")
+            logger.debug(f"   Looked for: {possible_files}")
             return False
         
         # Load geometry
@@ -2485,7 +3442,7 @@ class PlaneModel:
             return False
         
         self.is_loaded = True
-        print("✅ Airplane model setup complete")
+        logger.info("✅ Airplane model setup complete")
         return True
     
     def is_ready(self) -> bool:
@@ -2529,8 +3486,16 @@ class PlaneModel:
         else:
             color = self.airplane_color
 
+        # Soft pulse for tracked charters (brightness throb)
+        brightness = animation_state.get('brightness', 1.0)
+        if brightness != 1.0:
+            color = (min(1.0, color[0] * brightness),
+                     min(1.0, color[1] * brightness),
+                     min(1.0, color[2] * brightness))
+
         # Create transformation matrix (cached if state unchanged)
-        model_matrix = self._get_cached_transform_matrix(position, orientation)
+        model_matrix = self._get_cached_transform_matrix(
+            position, orientation, animation_state.get('scale', 1.0))
         final_mvp = mvp * model_matrix
 
         # Render airplane with color
@@ -2713,26 +3678,27 @@ class PlaneModel:
         
         return orientation
     
-    def _get_cached_transform_matrix(self, position: tuple, orientation: QMatrix4x4) -> QMatrix4x4:
+    def _get_cached_transform_matrix(self, position: tuple, orientation: QMatrix4x4,
+                                     scale: float = 1.0) -> QMatrix4x4:
         """Get cached transformation matrix if state unchanged"""
-        current_state = (position, orientation)
-        
+        current_state = (position, orientation, scale)
+
         # Simple cache check - in production you'd use better hashing
-        if (self._last_animation_state == current_state and 
+        if (self._last_animation_state == current_state and
             self._transform_cache is not None):
             return self._transform_cache
-        
+
         # Create new transformation matrix
         transform = QMatrix4x4()
-        
+
         # 1. Translate to world position
         transform.translate(*position)
-        
+
         # 2. Apply orientation
         transform *= orientation
-        
+
         # 3. Scale
-        transform.scale(self.airplane_scale)
+        transform.scale(self.airplane_scale * scale)
         
         # Cache for next frame
         self._transform_cache = transform
@@ -2743,7 +3709,7 @@ class PlaneModel:
     def _create_opengl_buffers(self) -> bool:
         """Create VAO/VBO for airplane geometry"""
         if self.geometry.geometry_data is None or len(self.geometry.geometry_data) == 0:
-            print("❌ No geometry data for airplane buffers")
+            logger.error("❌ No geometry data for airplane buffers")
             return False
         
         # Generate VAO and VBO
@@ -2751,7 +3717,7 @@ class PlaneModel:
         self.vbo = gl.glGenBuffers(1)
         
         if self.vao == 0 or self.vbo == 0:
-            print("❌ Failed to create airplane OpenGL buffers")
+            logger.error("❌ Failed to create airplane OpenGL buffers")
             return False
         
         # Bind and upload data
@@ -2774,7 +3740,7 @@ class PlaneModel:
         gl.glBindVertexArray(0)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
         
-        print("✅ Airplane OpenGL buffers created")
+        logger.info("✅ Airplane OpenGL buffers created")
         return True
     
     def _render_airplane(self, mvp: QMatrix4x4, model: QMatrix4x4, color: tuple = None) -> bool:
@@ -2806,7 +3772,7 @@ class PlaneModel:
             return True
             
         except Exception as e:
-            print(f"❌ Failed to render airplane: {e}")
+            logger.error(f"❌ Failed to render airplane: {e}")
             return False
         finally:
             shader.release()
@@ -2827,4 +3793,4 @@ class PlaneModel:
         self._transform_cache = None
         self._last_animation_state = None
         
-        print("✅ Airplane resources cleaned up")
+        logger.info("✅ Airplane resources cleaned up")

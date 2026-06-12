@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import logging
 from enum import Enum
 
+logger = logging.getLogger(__name__)
+
 
 
 class GameStatus(Enum):
@@ -88,15 +90,20 @@ class DatabaseManager:
     """Manages SQLite database for multi-league sports schedule and travel data"""
     
     def __init__(self, db_path: str = "sports_data.db"):
-        # Store as absolute path string for thread-safe database access
-        self.db_path = str(Path(db_path).absolute())
+        # Store as absolute path string for thread-safe database access.
+        # Relative paths are anchored to this module's directory, not the CWD,
+        # so embedding hosts launched elsewhere reuse the same database.
+        path = Path(db_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        self.db_path = str(path)
         self.db_version = "2.0"  # Updated for multi-league support
         self.setup_logging()
         self.init_database()
     
     def setup_logging(self):
         """Setup logging for database operations"""
-        logging.basicConfig(level=logging.INFO)
+        # No basicConfig here — the hosting application configures logging
         self.logger = logging.getLogger(__name__)
     
     def init_database(self):
@@ -257,7 +264,7 @@ class DatabaseManager:
                 if year >= 2024:
                     start_year = year - 1
                     season = f"{start_year}-{str(year)[2:]}"
-                    print(f"🔧 FIXED: Converted {league} season '{year}' to '{season}' in cache check")
+                    logger.debug(f"🔧 FIXED: Converted {league} season '{year}' to '{season}' in cache check")
             
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -410,6 +417,48 @@ class DatabaseManager:
             self.logger.error(f"Error saving games: {e}")
             raise
     
+    def upsert_games(self, games: List[GameData], season: str, league: str):
+        """Insert/update a subset of games (e.g. a rolling upcoming window from
+        flashscore) without rewriting season-cache counts from the subset.
+        Bumps last_updated so the staleness check stops demanding a re-scrape,
+        and recounts games_count from the table."""
+        if not games:
+            return
+        try:
+            unique_venues = {g.venue.venue_id: g.venue for g in games}
+            if unique_venues:
+                self.save_venues(list(unique_venues.values()))
+
+            with sqlite3.connect(self.db_path) as conn:
+                for game in games:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO games
+                        (game_id, date, home_team_id, away_team_id, venue_id, status,
+                         week, season_type, league, season, series_description, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        game.game_id, game.date.isoformat(), game.home_team.team_id,
+                        game.away_team.team_id, game.venue.venue_id, game.status.value,
+                        game.week, game.season_type, game.league, game.season,
+                        game.series_description, datetime.now().isoformat()
+                    ))
+
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM games WHERE season = ? AND league = ?",
+                    (season, league)).fetchone()[0]
+                conn.execute("""
+                    UPDATE season_cache
+                    SET games_count = ?, last_updated = ?
+                    WHERE season = ? AND league = ?
+                """, (count, datetime.now().isoformat(), season, league))
+
+                conn.commit()
+                self.logger.info(f"Upserted {len(games)} games for {season} {league}")
+
+        except Exception as e:
+            self.logger.error(f"Error upserting games: {e}")
+            raise
+
     def save_travel_data(self, travel_data: List[TeamTravelData], season: str, league: str):
         """Save travel data to database with league support"""
         try:
@@ -549,7 +598,7 @@ class DatabaseManager:
                     # Convert 2025 -> 2024-25, 2024 -> 2023-24, etc.
                     start_year = year - 1
                     season = f"{start_year}-{str(year)[2:]}"
-                    print(f"🔧 FIXED: Converted {league} season '{year}' to '{season}'")
+                    logger.debug(f"🔧 FIXED: Converted {league} season '{year}' to '{season}'")
             
             # FIX: Convert team_id to lowercase for database query
             if team_id:
@@ -562,10 +611,10 @@ class DatabaseManager:
             }
             team_id = TEAM_ID_FIXES.get(team_id, team_id)
             
-            print(f"🐛 DEBUG - load_travel_data called:")
-            print(f"  season: '{season}' (type: {type(season)})")
-            print(f"  league: '{league}'")
-            print(f"  team_id: '{team_id}'")
+            logger.debug(f"🐛 DEBUG - load_travel_data called:")
+            logger.debug(f"  season: '{season}' (type: {type(season)})")
+            logger.debug(f"  league: '{league}'")
+            logger.debug(f"  team_id: '{team_id}'")
             
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -942,19 +991,19 @@ if __name__ == "__main__":
     
     # Get database stats
     stats = db.get_database_stats()
-    print("Database Stats:", stats)
+    logger.debug("Database Stats:", stats)
     
     # Check if season is cached for different leagues
     for league in ['MLB', 'NBA', 'NHL']:
         current_season = db.get_current_season_for_league(league)
         is_cached, last_updated = db.is_season_cached(current_season, league)
-        print(f"{league} {current_season} season cached: {is_cached}, last updated: {last_updated}")
+        logger.debug(f"{league} {current_season} season cached: {is_cached}, last updated: {last_updated}")
     
     # Get cached seasons for each league
     for league in ['MLB', 'NBA', 'NHL']:
         seasons = db.get_cached_seasons(league)
-        print(f"{league} cached seasons: {len(seasons)}")
+        logger.debug(f"{league} cached seasons: {len(seasons)}")
     
     # Get league statistics
     league_stats = db.get_league_statistics()
-    print("League Statistics:", league_stats)
+    logger.debug("League Statistics:", league_stats)
