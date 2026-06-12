@@ -613,6 +613,8 @@ GAME_MARKETS = {
     "soccer_concacaf_gold_cup":          _SOCCER_GAME,
     "soccer_conmebol_copa_sudamericana": _SOCCER_GAME,
     "soccer_fifa_club_world_cup":        _SOCCER_GAME,
+    "soccer_fifa_world_cup":             _SOCCER_GAME,
+    "soccer_fifa_world_cup_womens":      _SOCCER_GAME,
     "soccer_fifa_world_cup_qualifiers_europe":         _SOCCER_GAME,
     "soccer_fifa_world_cup_qualifiers_south_america":  _SOCCER_GAME,
     "soccer_germany_bundesliga_women":   _SOCCER_GAME,
