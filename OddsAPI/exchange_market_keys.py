@@ -365,6 +365,12 @@ class NormalizedMarket:
     market_type: str                # MTYPE_* enum
     market_subtype: Optional[str]   # finer tag ("HOME_RUNS", "spread", ...)
     player_name: Optional[str]
+    # Non-player participant the market is scoped to: the team of a
+    # TEAM_TOTAL, the fighter of a method-of-victory market, the side of
+    # a 3-way "<Team> to Win". None for whole-game markets. Used by
+    # _market_match_key so two per-participant markets of the same
+    # subtype don't collide.
+    participant: Optional[str] = None
     lines: list[NormalizedLine] = field(default_factory=list)
     total_liquidity_usd: float = 0.0
     raw: Any = None
@@ -483,6 +489,134 @@ _PROPHETX_TYPE_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ProphetX "special" market classifier
+# ---------------------------------------------------------------------------
+# ProphetX types every binary special as a bare `moneyline` (soccer player
+# props, 3-way win/draw legs, BTTS, UFC method-of-victory, "to win a set").
+# Left unclassified they all collide on the (MONEYLINE, MONEY) match key —
+# in a World Cup event ~390 markets share that key and whichever happens to
+# come first steals the genuine Novig moneyline. This classifier recovers
+# the real identity from subType / the market name BEFORE the generic
+# type-token mapping runs. Subtype tokens are chosen to equal Novig's raw
+# `type` enum for the same market so the match keys line up with no
+# further translation.
+
+# subType -> (canonical subtype, regex extracting the participant from the
+# market name, or None when the market isn't participant-scoped).
+_PX_BINARY_SUBTYPE_MAP: dict[str, tuple[str, Optional[re.Pattern]]] = {
+    "fighter_to_win_by_submission":
+        ("VICTORY_BY_SUBMISSION",
+         re.compile(r"^(?P<part>.+?)\s+To Win By Submission$", re.I)),
+    "fighter_to_win_by_decision":
+        ("VICTORY_BY_DECISION",
+         re.compile(r"^(?P<part>.+?)\s+To Win By Decision$", re.I)),
+    "fighter_to_win_by_knockout_tko":
+        ("VICTORY_BY_KO_KTO_OR_DQ",
+         re.compile(r"^(?P<part>.+?)\s+To Win By KO/TKO(?:/DQ)?$", re.I)),
+    "fight_to_go_the_distance": ("GO_THE_DISTANCE", None),
+    "player_a_to_win_a_set":
+        ("TO_WIN_A_SET",
+         re.compile(r"^(?P<part>.+?)\s+To Win At Least One Set$", re.I)),
+    "player_b_to_win_a_set":
+        ("TO_WIN_A_SET",
+         re.compile(r"^(?P<part>.+?)\s+To Win At Least One Set$", re.I)),
+}
+
+# Soccer player props. PX phrases the threshold in the name ("At Least N");
+# the equivalent Novig market is an Over/Under at strike N - 0.5, so the
+# classifier emits that strike for line pairing. Order matters: the more
+# specific "Shots On Target" must precede the bare "Shots" pattern.
+# PLAYER_SHOTS (total shots) has no Novig counterpart today; it's still
+# classified so it can't pollute the moneyline key.
+_PX_SOCCER_PROP_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(?P<p>.+?) To Score At Least (?P<n>\d+) Goals$", re.I),
+     "PLAYER_GOALS"),
+    (re.compile(r"^(?P<p>.+?) To Score a Goal$", re.I), "PLAYER_GOALS"),
+    (re.compile(r"^(?P<p>.+?) To Have At Least (?P<n>\d+) Shots On Target$",
+                re.I), "SHOTS_ON_TARGET"),
+    (re.compile(r"^(?P<p>.+?) To Have At Least (?P<n>\d+) Shots$", re.I),
+     "PLAYER_SHOTS"),
+    (re.compile(r"^(?P<p>.+?) To Score Or Give Assist$", re.I),
+     "GOALS_ASSISTS"),
+    (re.compile(r"^(?P<p>.+?) To Give Assist$", re.I), "ASSISTS"),
+]
+
+# Game-level binary specials keyed off the market name. "(90 Min)" /
+# "(60 Min)" are the regular-time 3-way legs (soccer / NHL).
+_PX_GAME_BINARY_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(?P<part>.+?) to Win \(\d+ Min\)$", re.I),
+     "MONEYLINE_3_WAY_WIN"),
+    (re.compile(r"^Draw \(\d+ Min\)$", re.I), "MONEYLINE_3_WAY_DRAW"),
+    (re.compile(r"^Both Teams To Score$", re.I), "BOTH_TEAMS_TO_SCORE"),
+    (re.compile(r"^(?P<part>Home|Away) Team Clean Sheet$", re.I),
+     "CLEAN_SHEET"),
+    (re.compile(r"^Total Goals Scored Odd or Even$", re.I), "ODD_EVEN"),
+]
+
+# Team totals: "CIN: Team Total Runs" with subType team_total_<stat>.
+_PX_TEAM_TOTAL_NAME_RX = re.compile(r"^(?P<part>[^:]{1,25}):\s*Team Total",
+                                    re.I)
+
+
+def _prophetx_classify_special(market: dict) -> Optional[dict]:
+    """Classify a ProphetX special market that the bare type token gets
+    wrong. Returns None when the market isn't a recognized special, else
+    a dict with: mtype, subtype, player_name, participant, strike."""
+    name = (market.get("name") or "").strip()
+    if not name:
+        return None
+    sub_raw = (market.get("subType") or "").strip().lower()
+
+    # 1) subType-tagged binaries (UFC method-of-victory, tennis set wins).
+    hit = _PX_BINARY_SUBTYPE_MAP.get(sub_raw)
+    if hit is not None:
+        canon, part_rx = hit
+        part = None
+        if part_rx is not None:
+            m = part_rx.match(name)
+            if m:
+                part = m.group("part").strip() or None
+        return {"mtype": MTYPE_OTHER, "subtype": canon,
+                "player_name": None, "participant": part, "strike": None}
+
+    # 2) Team totals — participant from the "SYM:" name prefix.
+    if sub_raw.startswith("team_total"):
+        m = _PX_TEAM_TOTAL_NAME_RX.match(name)
+        part = m.group("part").strip() if m else None
+        return {"mtype": MTYPE_TOTAL, "subtype": "TEAM_TOTAL",
+                "player_name": None, "participant": part, "strike": None}
+
+    # Everything below disambiguates bare `moneyline`-typed binaries; the
+    # genuine moneyline ("Moneyline", "Moneyline (2 Way)", "1st Set
+    # Moneyline") always carries the word and is left alone.
+    raw_type = (market.get("type") or "").lower()
+    if raw_type != "moneyline" or "moneyline" in name.lower():
+        return None
+
+    # 3) Soccer player props phrased as binaries.
+    for rx, canon in _PX_SOCCER_PROP_PATTERNS:
+        m = rx.match(name)
+        if m:
+            try:
+                n = int(m.groupdict().get("n") or 1)
+            except (TypeError, ValueError):
+                n = 1
+            return {"mtype": MTYPE_PLAYER_PROP, "subtype": canon,
+                    "player_name": m.group("p").strip() or None,
+                    "participant": None, "strike": n - 0.5}
+
+    # 4) Game-level binary specials.
+    for rx, canon in _PX_GAME_BINARY_PATTERNS:
+        m = rx.match(name)
+        if m:
+            part = (m.groupdict().get("part") or "").strip() or None
+            return {"mtype": MTYPE_OTHER, "subtype": canon,
+                    "player_name": None, "participant": part,
+                    "strike": None}
+    return None
+
+
 def _prophetx_market_type(market: dict) -> tuple[str, Optional[str]]:
     """Classify a ProphetX market.
 
@@ -498,6 +632,14 @@ def _prophetx_market_type(market: dict) -> tuple[str, Optional[str]]:
     category = (market.get("categoryName") or "").strip()
     cat_lower = category.lower()
     name = (market.get("name") or "").strip()
+
+    # 0) Special binaries / team totals / soccer props — markets whose
+    # bare type token ("moneyline") misrepresents them. Must run first:
+    # left to the generic mapping they all collapse onto the moneyline
+    # match key.
+    special = _prophetx_classify_special(market)
+    if special is not None:
+        return special["mtype"], special["subtype"]
 
     # 1) categoryName match (v2 path). categoryName is the most reliable
     # signal when present.
@@ -631,7 +773,13 @@ def from_prophetx_market(market: dict,
     event_name = event_meta.get("name", "")
     market_name = market.get("name", "Unknown Market")
     mtype, subtype = _prophetx_market_type(market)
-    player_name = _prophetx_player_name(market, mtype)
+    special = _prophetx_classify_special(market)
+    if special is not None:
+        player_name = special["player_name"]
+        participant = special["participant"]
+    else:
+        player_name = _prophetx_player_name(market, mtype)
+        participant = None
     raw_market_id = str(market.get("id", ""))
 
     lines: list[NormalizedLine] = []
@@ -673,7 +821,12 @@ def from_prophetx_market(market: dict,
         sides = _prophetx_build_sides(market.get("selections") or [])
         total = sum(s.total_size_usd for s in sides)
         strike_val: Optional[float] = None
-        if mtype != MTYPE_MONEYLINE:
+        if special is not None and special["strike"] is not None:
+            # Binary-phrased prop ("To Score At Least 2 Goals") — the
+            # implied Over/Under strike (1.5) comes from the classifier,
+            # the side labels are bare Yes/No with nothing to parse.
+            strike_val = special["strike"]
+        elif mtype != MTYPE_MONEYLINE:
             for s in sides:
                 if s.side_type in (SIDE_OVER, SIDE_UNDER):
                     cand = _parse_strike(s.label)
@@ -699,6 +852,7 @@ def from_prophetx_market(market: dict,
         market_type=mtype,
         market_subtype=subtype,
         player_name=player_name,
+        participant=participant,
         lines=lines,
         total_liquidity_usd=market_total,
         raw=market,
@@ -744,6 +898,13 @@ _NOVIG_GAME_TYPES = {
     "TEAM_TOTAL": MTYPE_TOTAL,
     "FIRST_INNING_TOTAL": MTYPE_TOTAL,
     "TOTAL_HOME_RUNS": MTYPE_TOTAL,
+    # Tennis set markets — ProphetX offers the same three under subTypes
+    # 1st_set_moneyline / total_sets / (no set spread yet). Typed as game
+    # lines so they reach the canonical-subtype match key instead of
+    # falling to MTYPE_OTHER (key None, never paired).
+    "FIRST_SET_MONEYLINE": MTYPE_MONEYLINE,
+    "TOTAL_SETS": MTYPE_TOTAL,
+    "SET_SPREAD": MTYPE_SPREAD,
 }
 
 # NBX qty units -> display dollars.
@@ -872,12 +1033,27 @@ def _novig_outcome_to_side_from_book(outcome: dict, ladder: dict,
                           total_size_usd=sum(o.size_usd for o in orders))
 
 
-def _novig_grouping_key(market: dict) -> tuple[str, Optional[str], Optional[str]]:
+def _novig_grouping_key(market: dict
+                        ) -> tuple[str, Optional[str], Optional[str],
+                                   Optional[str]]:
     """Two Novig markets belong to the same display Market iff their
-    (mtype, subtype, player_id) tuples match. Subtype distinguishes
-    MONEY vs MONEY_1H, TEAM_TOTAL vs TOTAL, etc."""
+    (mtype, subtype, player_id, competitor_id) tuples match. Subtype
+    distinguishes MONEY vs MONEY_1H, TEAM_TOTAL vs TOTAL, etc.
+
+    competitor_id participates only for competitor-scoped markets
+    (TEAM_TOTAL and the OTHER-typed binaries: method-of-victory, 3-way
+    win legs, team corners). Grouping those across competitors mashed
+    both fighters'/teams' strikes into one market — un-pairable against
+    ProphetX, which ships one market per participant — and ambiguous to
+    render (two lines at the same strike). Plain game lines keep
+    competitor_id=None so home/away moneyline-spread-total aggregation
+    is unchanged."""
     mtype, subtype = _novig_market_type(market)
-    return (mtype, subtype, market.get("playerId"))
+    comp_id = None
+    if market.get("competitorId") and (
+            mtype == MTYPE_OTHER or subtype == "TEAM_TOTAL"):
+        comp_id = market.get("competitorId")
+    return (mtype, subtype, market.get("playerId"), comp_id)
 
 
 def _novig_market_display_name(group_markets: list[dict],
@@ -1070,7 +1246,7 @@ def from_novig_event(event_node: dict,
         groups.setdefault(key, []).append(m)
 
     markets_out: list[NormalizedMarket] = []
-    for (mtype, subtype, player_id), grp in groups.items():
+    for (mtype, subtype, player_id, comp_id), grp in groups.items():
         # Build one Line per source market in the group
         lines = [_novig_line_from_market(m, books.get(m.get("id")), mtype)
                  for m in grp]
@@ -1081,7 +1257,13 @@ def from_novig_event(event_node: dict,
         market_total = sum(ln.total_liquidity_usd for ln in lines)
         sample = grp[0]
         player_name = _novig_player_name(sample) if player_id else None
+        participant = None
+        if comp_id:
+            comp = sample.get("competitor") or {}
+            participant = comp.get("name") or comp.get("symbol") or None
         display_name = _novig_market_display_name(grp, mtype, subtype)
+        if participant:
+            display_name = f"{participant} {display_name}"
         # source_market_id at the group level: sort-joined ids so the key
         # is stable across calls
         group_id = "+".join(sorted(str(m.get("id") or "") for m in grp))
@@ -1094,6 +1276,7 @@ def from_novig_event(event_node: dict,
             market_type=mtype,
             market_subtype=subtype,
             player_name=player_name,
+            participant=participant,
             lines=lines,
             total_liquidity_usd=market_total,
             raw={"group": grp},
@@ -1160,6 +1343,7 @@ MLB_TEAMS: dict[str, tuple[str, str]] = {
     "CHC": ("Chicago Cubs",               "Cubs"),
     "CHI": ("Chicago Cubs",               "Cubs"),         # Novig sometimes uses CHI
     "CHW": ("Chicago White Sox",          "White Sox"),
+    "CWS": ("Chicago White Sox",          "White Sox"),   # PX/Kalshi style; canonicalizes to CHW
     "CIN": ("Cincinnati Reds",            "Reds"),
     "CLE": ("Cleveland Guardians",        "Guardians"),
     "COL": ("Colorado Rockies",           "Rockies"),
@@ -1344,16 +1528,82 @@ WNBA_TEAMS: dict[str, tuple[str, str]] = {
     "WSH":  ("Washington Mystics",          "Mystics"),
 }
 
+# Soccer national teams (2026 World Cup field). Tuple is
+# (Novig full name, common English alias) — Novig ships the left form in
+# home/away_team_name ("Türkiye", "Côte d'Ivoire", "IR Iran") while
+# ProphetX event names use the plain English form ("Turkey",
+# "Ivory Coast", "Iran"). Secondary symbol keys (NZL/HAI/CUW/...) alias
+# FIFA-standard codes back to the Novig code via the shared full name.
+SOCCER_NATIONAL_TEAMS: dict[str, tuple[str, str]] = {
+    "ALG": ("Algeria",                "Algeria"),
+    "ARG": ("Argentina",              "Argentina"),
+    "AUS": ("Australia",              "Australia"),
+    "AUT": ("Austria",                "Austria"),
+    "BEL": ("Belgium",                "Belgium"),
+    "BIH": ("Bosnia and Herzegovina", "Bosnia"),
+    "BRA": ("Brazil",                 "Brazil"),
+    "CAN": ("Canada",                 "Canada"),
+    "CIV": ("Côte d'Ivoire",          "Ivory Coast"),
+    "COD": ("Congo DR",               "DR Congo"),
+    "COL": ("Colombia",               "Colombia"),
+    "CPV": ("Cabo Verde",             "Cape Verde"),
+    "CRO": ("Croatia",                "Croatia"),
+    "CUR": ("Curacao",                "Curaçao"),
+    "CUW": ("Curacao",                "Curaçao"),
+    "CZE": ("Czechia",                "Czech Republic"),
+    "ECU": ("Ecuador",                "Ecuador"),
+    "EGY": ("Egypt",                  "Egypt"),
+    "ENG": ("England",                "England"),
+    "ESP": ("Spain",                  "Spain"),
+    "FRA": ("France",                 "France"),
+    "GER": ("Germany",                "Germany"),
+    "GHA": ("Ghana",                  "Ghana"),
+    "HTI": ("Haiti",                  "Haiti"),
+    "HAI": ("Haiti",                  "Haiti"),
+    "IRN": ("IR Iran",                "Iran"),
+    "IRQ": ("Iraq",                   "Iraq"),
+    "JOR": ("Jordan",                 "Jordan"),
+    "JPN": ("Japan",                  "Japan"),
+    "KOR": ("Korea Republic",         "South Korea"),
+    "KSA": ("Saudi Arabia",           "Saudi Arabia"),
+    "SAU": ("Saudi Arabia",           "Saudi Arabia"),
+    "MAR": ("Morocco",                "Morocco"),
+    "MEX": ("Mexico",                 "Mexico"),
+    "NED": ("Netherlands",            "Holland"),
+    "NOR": ("Norway",                 "Norway"),
+    "NZ":  ("New Zealand",            "New Zealand"),
+    "NZL": ("New Zealand",            "New Zealand"),
+    "PAN": ("Panama",                 "Panama"),
+    "PAR": ("Paraguay",               "Paraguay"),
+    "POR": ("Portugal",               "Portugal"),
+    "QAT": ("Qatar",                  "Qatar"),
+    "RSA": ("South Africa",           "South Africa"),
+    "ZAF": ("South Africa",           "South Africa"),
+    "SCO": ("Scotland",               "Scotland"),
+    "SEN": ("Senegal",                "Senegal"),
+    "SUI": ("Switzerland",            "Switzerland"),
+    "SWE": ("Sweden",                 "Sweden"),
+    "TUN": ("Tunisia",                "Tunisia"),
+    "TUR": ("Türkiye",                "Turkey"),
+    "URU": ("Uruguay",                "Uruguay"),
+    "USA": ("United States",          "USA"),
+    "UZB": ("Uzbekistan",             "Uzbekistan"),
+}
+
 # League code -> team table. Used by team_to_symbol when a league is
 # known so we don't get cross-league collisions (e.g. "CLE" maps to
 # Cleveland Guardians under MLB, Cleveland Cavaliers under NBA,
-# Cleveland Browns under NFL).
+# Cleveland Browns under NFL). "SOCCER" is keyed by canonical bucket
+# (see canonical_sport) because soccer league labels diverge across
+# feeds ("FIFA World Cup" vs "MLS" vs raw "Soccer"); it must stay LAST
+# so the league=None try-each-table loop consults pro leagues first.
 LEAGUE_TEAM_TABLES: dict[str, dict[str, tuple[str, str]]] = {
     "MLB":  MLB_TEAMS,
     "NBA":  NBA_TEAMS,
     "NHL":  NHL_TEAMS,
     "NFL":  NFL_TEAMS,
     "WNBA": WNBA_TEAMS,
+    "SOCCER": SOCCER_NATIONAL_TEAMS,
 }
 
 # Reverse lookups built at import time, one pair per league.
@@ -1526,7 +1776,7 @@ _STAGE_RX = re.compile(
     r"\d+(?:st|nd|rd|th) qualifying round|"
     r"qualifying(?: round)?|qualification|"
     r"round \d+ matchup|matchup|"
-    r"final|semifinal|quarterfinal"
+    r"finals?|semifinals?|quarterfinals?"
     r")\b.*$"
 )
 
@@ -1565,19 +1815,71 @@ def _extract_person_surnames(event: "NormalizedEvent") -> set[str]:
     return {sn} if sn else set()
 
 
+# Filler tokens dropped from fallback side-name keys so club-name
+# variants collapse ("Inter Miami CF" / "Inter Miami" -> "inter miami").
+_CLUB_SUFFIX_TOKENS = frozenset({"fc", "cf", "sc", "afc"})
+
+
+def _split_event_name_sides(name: str) -> Optional[tuple[str, str]]:
+    """Split '<A> at <B>' / '<A> @ <B>' / '<A> vs <B>' into (left, right),
+    or None when the name isn't a two-sided contest."""
+    if not name:
+        return None
+    for sep in (" at ", " @ ", " vs. ", " vs "):
+        idx = name.lower().find(sep)
+        if idx > 0:
+            return (name[:idx].strip(), name[idx + len(sep):].strip())
+    return None
+
+
+def _side_name_key(side: str) -> Optional[str]:
+    """Normalized whole-name key for one side of a contest. Used when no
+    team table covers the league (club soccer, esports, boxing cards):
+    diacritics/punctuation stripped, club filler tokens dropped."""
+    norm = normalize_person_name(side)
+    toks = [t for t in norm.split() if t not in _CLUB_SUFFIX_TOKENS]
+    return " ".join(toks) or None
+
+
 def extract_participants(event: "NormalizedEvent",
                          csport: Optional[str] = None) -> set[str]:
     """Unified participant key set for event matching.
 
     Team sports -> set of team symbols (via extract_team_symbols).
     Individual sports (TENNIS/GOLF/MMA) -> set of player surnames.
+    Team sports with no symbol table coverage (club soccer, esports, ...)
+    fall back to normalized side-name keys parsed from the event name, so
+    two feeds spelling the same matchup the same way still pair even with
+    no table entry. Sides that DID resolve to a symbol keep the symbol
+    (both feeds resolve through the same tables, so keys stay comparable).
     """
     if csport is None:
         csport = canonical_sport(event.league, event.sport, event.event_name)
     if csport in INDIVIDUAL_SPORTS:
         return _extract_person_surnames(event)
     h, a = extract_team_symbols(event)
-    return {s for s in (h, a) if s}
+    out = {s for s in (h, a) if s}
+    if h and a:
+        return out
+    # Partial / failed symbol resolution — add name keys for what the
+    # tables couldn't resolve. Only two-sided names contribute (a future
+    # like "To Win Group A" must not produce a loose whole-name key).
+    name = event.event_name or ""
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    meta = raw.get("event_metadata") if isinstance(raw, dict) else None
+    if isinstance(meta, dict):
+        name = meta.get("name") or name
+    sides = _split_event_name_sides(name)
+    if sides:
+        lg = (event.league or "").upper() or None
+        if lg and lg not in LEAGUE_TEAM_TABLES and csport in LEAGUE_TEAM_TABLES:
+            lg = csport
+        for side in sides:
+            sym = team_to_symbol(side, league=lg) if lg else None
+            key = sym or _side_name_key(side)
+            if key:
+                out.add(key)
+    return out
 
 
 def extract_team_symbols(event: "NormalizedEvent"
@@ -1595,6 +1897,13 @@ def extract_team_symbols(event: "NormalizedEvent"
          "<Away> @ <Home>") and map each side through team_to_symbol.
     """
     lg = (event.league or "").upper() or None
+    if lg and lg not in LEAGUE_TEAM_TABLES:
+        # League label itself has no table ("FIFA WORLD CUP", "MLS", ...)
+        # but its canonical bucket might (SOCCER). Never falls through to
+        # the try-every-table path, so cross-league collision safety holds.
+        cs = canonical_sport(event.league, event.sport, event.event_name)
+        if cs in LEAGUE_TEAM_TABLES:
+            lg = cs
     raw = event.raw or {}
     meta = raw.get("event_metadata") if isinstance(raw, dict) else None
     if isinstance(meta, dict):
@@ -1677,40 +1986,64 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
 # Event matching
 # ---------------------------------------------------------------------------
 
-def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
-                       max_delta: timedelta) -> tuple[float, float]:
-    """Return (confidence, time_delta_minutes) or (-1, +inf) if no match."""
+def _event_match_profile(ev: NormalizedEvent) -> tuple:
+    """Precompute the per-event values _event_match_score needs:
+    (canonical sport bucket, tz-normalized start datetime or None,
+    participant key set). match_events scores every A×B combination —
+    ~100k for a full slate — and recomputing these per *pair* (ISO
+    parsing, sport canonicalization, participant extraction) was a
+    ~150ms pure-Python GIL burn on the match-map worker. Per-event
+    they're a one-time cost."""
+    csport = canonical_sport(ev.league, ev.sport, ev.event_name)
+    t = _parse_iso(ev.scheduled_start)
+    if t is not None and t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (csport, t, extract_participants(ev, csport))
+
+
+def _event_match_score_profiled(prof_a: tuple, prof_b: tuple,
+                                max_delta: timedelta) -> tuple[float, float]:
+    """Return (confidence, time_delta_minutes) or (-1, +inf) if no match.
+    Same logic as the old per-event-pair _event_match_score, operating on
+    precomputed _event_match_profile tuples."""
     # Gate on a canonical sport bucket rather than raw league strings, so
     # the two feeds' divergent labels for the same contest (PX "French
     # Open (M)"/Tennis vs NV "ATP") still pair. Team leagues canonicalize
     # to their own code, so MLB<->MLB etc. is unchanged. An empty bucket
     # on either side means "unknown" — we don't reject on it, deferring to
     # the team/time signals below (preserves prior no-league behavior).
-    csport_a = canonical_sport(ev_a.league, ev_a.sport, ev_a.event_name)
-    csport_b = canonical_sport(ev_b.league, ev_b.sport, ev_b.event_name)
+    csport_a, t_a, set_a = prof_a
+    csport_b, t_b, set_b = prof_b
     if csport_a and csport_b and csport_a != csport_b:
         return (-1.0, float("inf"))
 
-    t_a = _parse_iso(ev_a.scheduled_start)
-    t_b = _parse_iso(ev_b.scheduled_start)
     if not t_a or not t_b:
         time_delta_min = float("inf")
         time_conf = 0.5
     else:
-        if t_a.tzinfo is None:
-            t_a = t_a.replace(tzinfo=timezone.utc)
-        if t_b.tzinfo is None:
-            t_b = t_b.replace(tzinfo=timezone.utc)
         delta = abs(t_a - t_b)
         if delta > max_delta:
+            # Tournament reschedule window: individual sports shift a
+            # matchup across days (a quarterfinal slated June 14 on one
+            # feed plays June 13 on the other). An identical surname pair
+            # within 48h in tennis/golf/MMA is the same contest, so accept
+            # it at heavily-discounted time confidence — it sorts below
+            # any tighter candidate and only wins when nothing else does.
+            # Team sports are excluded: the same two teams really do play
+            # again the next day (MLB series), so they stay hard-gated.
+            if (csport_a in INDIVIDUAL_SPORTS
+                    and set_a and len(set_a) >= 2 and set_a == set_b
+                    and delta <= timedelta(hours=48)):
+                time_delta_min = delta.total_seconds() / 60.0
+                time_conf = 0.5 * max(
+                    0.0, 1.0 - delta.total_seconds() / (48 * 3600.0))
+                return (0.4 * time_conf + 0.6, time_delta_min)
             return (-1.0, delta.total_seconds() / 60.0)
         time_delta_min = delta.total_seconds() / 60.0
         time_conf = max(0.0, 1.0 - (delta.total_seconds() / max_delta.total_seconds()))
 
     # Participant keys: team symbols for team sports, player surnames for
     # individual sports (tennis/golf/MMA, which have no team table).
-    set_a = extract_participants(ev_a, csport_a)
-    set_b = extract_participants(ev_b, csport_b)
     if not set_a or not set_b:
         team_conf = 0.0
         if time_delta_min > 30.0:
@@ -1724,6 +2057,13 @@ def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
 
     confidence = 0.4 * time_conf + 0.6 * team_conf
     return (confidence, time_delta_min)
+
+
+def _event_match_score(ev_a: NormalizedEvent, ev_b: NormalizedEvent,
+                       max_delta: timedelta) -> tuple[float, float]:
+    """Return (confidence, time_delta_minutes) or (-1, +inf) if no match."""
+    return _event_match_score_profiled(
+        _event_match_profile(ev_a), _event_match_profile(ev_b), max_delta)
 
 
 def match_events(events_a: list[NormalizedEvent],
@@ -1744,10 +2084,12 @@ def match_events(events_a: list[NormalizedEvent],
     max_delta = timedelta(minutes=tolerance_minutes)
     consumed_b: set[int] = set()
 
+    profiles_a = [_event_match_profile(ev) for ev in events_a]
+    profiles_b = [_event_match_profile(ev) for ev in events_b]
     candidates: list[tuple[float, float, int, int]] = []
-    for i, ev_a in enumerate(events_a):
-        for j, ev_b in enumerate(events_b):
-            conf, dmin = _event_match_score(ev_a, ev_b, max_delta)
+    for i, prof_a in enumerate(profiles_a):
+        for j, prof_b in enumerate(profiles_b):
+            conf, dmin = _event_match_score_profiled(prof_a, prof_b, max_delta)
             if conf < min_confidence:
                 continue
             candidates.append((conf, -dmin, i, j))
@@ -1780,8 +2122,10 @@ def hydrate_event_pair_markets(pair: EventPair, nv_dump_entry: dict,
     When the user opens a paired event, the widget passes that event's full
     dump entry here to populate the NV markets and run the market/line pairing
     that `match_events(populate_markets=False)` deferred. `event_a` (ProphetX)
-    already carries its markets from the live PX snapshot, so only the NV side
-    needs hydrating. Idempotent enough — it rebuilds market_pairs from scratch."""
+    is hydrated from its own preserved `raw` dump entry when the map build
+    skipped PX market normalization (load_prophetx_normalized_events with
+    populate_markets=False). Idempotent enough — it rebuilds market_pairs
+    from scratch."""
     meta = nv_dump_entry.get("event_metadata") or {}
     node = {
         "id": meta.get("id"),
@@ -1798,6 +2142,10 @@ def hydrate_event_pair_markets(pair: EventPair, nv_dump_entry: dict,
     }
     nev = from_novig_event(node, books=None, currency=currency,
                            league=meta.get("tournament"))
+    # PX side may itself be identity-only (markets skipped at map build);
+    # normalize this one event's markets from the preserved raw entry.
+    if not pair.event_a.markets and pair.event_a.raw:
+        pair.event_a.markets = from_prophetx_event(pair.event_a.raw).markets
     pair.event_b.markets = nev.markets
     pair.market_pairs = []
     _populate_market_pairs(pair)
@@ -1807,9 +2155,32 @@ def hydrate_event_pair_markets(pair: EventPair, nv_dump_entry: dict,
 # Market matching
 # ---------------------------------------------------------------------------
 
+# OTHER-typed binary specials that ARE matchable across sources, keyed by
+# the shared canonical subtype (the PX classifier emits these tokens; on
+# the NV side they're the raw `type` enum verbatim). Participant-scoped
+# ones (method-of-victory, 3-way win legs) carry the participant in the
+# key; the rest pair on subtype alone.
+_BINARY_MATCH_SUBTYPES = frozenset({
+    "VICTORY_BY_SUBMISSION", "VICTORY_BY_DECISION",
+    "VICTORY_BY_KO_KTO_OR_DQ", "GO_THE_DISTANCE", "DRAW",
+    "MONEYLINE_3_WAY_WIN", "MONEYLINE_3_WAY_DRAW",
+    "BOTH_TEAMS_TO_SCORE", "TO_WIN_A_SET",
+})
+
+
+def _participant_match_key(name: Optional[str]) -> Optional[str]:
+    """Cross-source key for a market's participant. Team names/symbols
+    resolve through the league tables (PX says "USA", NV says "United
+    States" — both land on the USA symbol); person names (fighters)
+    fall back to diacritic-stripped normalization."""
+    if not name:
+        return None
+    return team_to_symbol(name) or normalize_person_name(name) or None
+
+
 def _market_match_key(m: NormalizedMarket) -> Optional[tuple]:
     """Return a tuple usable as a dict key for matching, or None if the
-    market can't be reliably matched (e.g. MTYPE_OTHER)."""
+    market can't be reliably matched (e.g. unrecognized MTYPE_OTHER)."""
     if m.market_type == MTYPE_PLAYER_PROP:
         if not m.player_name or not m.market_subtype:
             return None
@@ -1817,7 +2188,18 @@ def _market_match_key(m: NormalizedMarket) -> Optional[tuple]:
                 normalize_person_name(m.player_name))
     if m.market_type in (MTYPE_MONEYLINE, MTYPE_SPREAD, MTYPE_TOTAL):
         sub = _canonical_game_subtype(m.market_subtype)
+        if sub == "TEAM_TOTAL":
+            # Per-team market: without the team in the key the two
+            # teams' totals collide (and pair across teams).
+            part = _participant_match_key(m.participant)
+            if part is None:
+                return None
+            return (m.market_type, sub, part)
         return (m.market_type, sub)
+    if m.market_type == MTYPE_OTHER:
+        sub = (m.market_subtype or "").upper()
+        if sub in _BINARY_MATCH_SUBTYPES:
+            return ("BINARY", sub, _participant_match_key(m.participant))
     return None
 
 
@@ -1849,6 +2231,10 @@ def _canonical_game_subtype(s: Optional[str]) -> str:
              .replace("1H_", ""))
     if base == "MONEYLINE":
         base = "MONEY"
+    # Tennis: PX spells the first-set line "1st_set_moneyline", Novig
+    # "FIRST_SET_MONEYLINE".
+    elif base == "1ST_SET_MONEYLINE":
+        base = "FIRST_SET_MONEYLINE"
     return f"{base}_1H" if is_1h else base
 
 
@@ -1868,7 +2254,16 @@ def _populate_market_pairs(pair: EventPair) -> None:
         candidates = by_key_b.get(k)
         if not candidates:
             continue
-        m_b = candidates.pop(0)
+        if k[0] == MTYPE_PLAYER_PROP:
+            # Player props pair many-to-one: ProphetX ships one binary
+            # market per threshold ("To Score a Goal", "...At Least 2
+            # Goals") while Novig aggregates the same prop into one
+            # multi-strike market. Each PX threshold market pairs against
+            # that same NV market; _populate_line_pairs picks out the one
+            # NV line whose strike matches.
+            m_b = candidates[0]
+        else:
+            m_b = candidates.pop(0)
         mpair = MarketPair(market_a=m_a, market_b=m_b)
         _populate_line_pairs(mpair)
         pair.market_pairs.append(mpair)
@@ -1882,6 +2277,16 @@ _STRIKE_EPS = 1e-6
 
 
 def _populate_line_pairs(mpair: MarketPair) -> None:
+    # OTHER-typed binaries (method-of-victory, 3-way legs, BTTS) have one
+    # meaningless strike per side — Novig ships 0.0, ProphetX None — so
+    # strike equality can never hold. Each side has exactly one real line;
+    # pair them directly.
+    if (mpair.market_a.market_type == MTYPE_OTHER
+            and len(mpair.market_a.lines) == 1
+            and len(mpair.market_b.lines) == 1):
+        mpair.line_pairs.append(LinePair(line_a=mpair.market_a.lines[0],
+                                         line_b=mpair.market_b.lines[0]))
+        return
     by_strike_b: dict[Optional[float], NormalizedLine] = {}
     for ln in mpair.market_b.lines:
         by_strike_b[ln.strike] = ln
@@ -1917,17 +2322,38 @@ def iter_line_pairs(event_pairs: Iterable[EventPair]
 # ---------------------------------------------------------------------------
 
 def load_prophetx_normalized_events(dump_data: dict,
-                                    league_filter: Optional[str] = "MLB"
+                                    league_filter: Optional[str] = "MLB",
+                                    populate_markets: bool = True
                                     ) -> list[NormalizedEvent]:
     """Convert a ProphetX combined-dump dict into a list of
     NormalizedEvents filtered by tournament. `raw` is preserved on each
-    event so extract_team_symbols can read event_metadata."""
+    event so extract_team_symbols can read event_metadata.
+
+    populate_markets: when False, market/order normalization is skipped and
+    every event comes back with `markets == []` (identity fields + raw only).
+    Used by the LiquidityWidget match-map build, which pairs on event
+    identity only — eagerly normalizing every PX market/order there was a
+    pure-Python GIL burn the stall watchdog kept catching.
+    hydrate_event_pair_markets re-normalizes the one opened event's markets
+    from `raw` on demand."""
     out: list[NormalizedEvent] = []
     for _eid, ev in dump_data.items():
         meta = ev.get("event_metadata") or {}
         if league_filter and meta.get("tournament") != league_filter:
             continue
-        nev = from_prophetx_event(ev)
+        if populate_markets:
+            nev = from_prophetx_event(ev)
+        else:
+            nev = NormalizedEvent(
+                source=SOURCE_PROPHETX,
+                source_event_id=str(meta.get("id", "")),
+                event_name=meta.get("name", ""),
+                sport=meta.get("sport"),
+                league=meta.get("tournament"),
+                scheduled_start=meta.get("startTime"),
+                markets=[],
+                raw=ev,
+            )
         nev.raw = ev
         out.append(nev)
     return out
@@ -1944,6 +2370,14 @@ def load_novig_normalized_events(dump_data: dict,
     for _eid, ev in dump_data.items():
         meta = ev.get("event_metadata") or {}
         if league_filter and meta.get("tournament") != league_filter:
+            continue
+        # Settled/voided events can't be the Novig side of a live pair.
+        # Fresh dumps no longer contain them (the scraper drops FINAL
+        # tournament children), but older dumps on disk carry hundreds of
+        # completed tennis/golf rounds — stale candidates that bloat the
+        # match scoring and can steal a pairing from the real match.
+        status = (meta.get("status") or "").upper()
+        if status in ("FINAL", "CANCELED", "CANCELLED"):
             continue
         node = {
             "id": meta.get("id"),

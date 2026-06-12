@@ -19,6 +19,13 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+# [PERF-DIAG] Timing-probe prints ([task-probe]/[sportmatch-probe]/
+# [allsports-probe]/[post-probe]) are dormant unless the app is launched with
+# EFFORTODDS_PERF_DIAG=1 — same switch as the stall watchdog in EffortOdds
+# main(). See PERF_DIAGNOSTICS.md.
+import os as _os
+PERF_DIAG = _os.environ.get("EFFORTODDS_PERF_DIAG") == "1"
+
 # Smoother lines/markers for the historical odds plot.
 pg.setConfigOptions(antialias=True)
 
@@ -393,6 +400,49 @@ class EventMatcher:
 
         return abs((k_dt - p_dt).total_seconds()) <= tolerance_hours * 3600.0
 
+    @staticmethod
+    def poly_game_is_stale(poly_start_time, max_age_hours: float = 8.0) -> bool:
+        """True when a Polymarket game started more than max_age_hours ago.
+
+        Gamma keeps a game's events active well past the final out, so
+        yesterday's games linger as Polymarket-only rows (the Kalshi side,
+        which is filtered by status='open', is already gone). No game runs
+        8 hours, so anything older is settled — but today's live games stay.
+        Unknown/unparseable start times are NOT stale (kept, to be safe)."""
+        from datetime import datetime, timezone
+        if not poly_start_time:
+            return False
+        try:
+            p_dt = datetime.fromisoformat(str(poly_start_time).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            return False
+        if p_dt.tzinfo is None:
+            p_dt = p_dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - p_dt).total_seconds() / 3600.0
+        return age > max_age_hours
+
+    @staticmethod
+    def start_time_delta_hours(event_ticker: str, poly_start_time) -> float:
+        """|Kalshi start - Polymarket start| in hours, or +inf when either
+        side is missing/unparseable.
+
+        Used to pick the BEST Polymarket candidate instead of the first
+        team-matching one: PM lists each game of a back-to-back series /
+        playoff series / doubleheader separately, all sharing team names.
+        Date-only Kalshi tickers parse to midnight UTC, which still
+        separates consecutive days (24h) cleanly."""
+        from datetime import datetime, timezone
+        k_dt = EventMatcher.parse_kalshi_event_datetime(event_ticker)
+        if k_dt is None or not poly_start_time:
+            return float('inf')
+        try:
+            p_dt = datetime.fromisoformat(str(poly_start_time).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            return float('inf')
+        if p_dt.tzinfo is None:
+            p_dt = p_dt.replace(tzinfo=timezone.utc)
+        return abs((k_dt - p_dt).total_seconds()) / 3600.0
+
     # Team name variations for matching
     TEAM_ALIASES_BY_SPORT = {
     'NFL': {
@@ -510,8 +560,10 @@ class EventMatcher:
         'atlanta braves': ['atlanta', 'braves', 'atl'],
         'baltimore orioles': ['baltimore', 'orioles', 'bal'],
         'boston red sox': ['boston', 'red sox', 'bos'],
-        'chicago white sox': ['chicago white sox', 'white sox', 'cws'],
-        'chicago cubs': ['chicago cubs', 'cubs', 'chc'],
+        # 'chicago ws' / 'los angeles d' / 'new york m' are Kalshi's
+        # truncated event-title forms ("Los Angeles D vs Chicago WS").
+        'chicago white sox': ['chicago white sox', 'white sox', 'cws', 'chicago ws'],
+        'chicago cubs': ['chicago cubs', 'cubs', 'chc', 'chicago c'],
         'cincinnati reds': ['cincinnati', 'reds', 'cin'],
         'cleveland guardians': ['cleveland', 'guardians', 'cle'],
         'colorado rockies': ['colorado', 'rockies', 'col'],
@@ -654,6 +706,18 @@ class EventMatcher:
     @staticmethod
     def parse_kalshi_title(title: str) -> tuple[str, str]:
         """Parse Kalshi event title into (away_team, home_team)"""
+        # Playoff/series titles carry a PREFIX before the matchup
+        # ("Game 6: Carolina at Vegas") while regular-season market rows
+        # carry a SUFFIX after it ("Dallas at Las Vegas: Spread"). A bare
+        # split(':')[0] returns "Game 6" for the former, so every playoff
+        # event parsed both teams as "Game N" and never matched. When the
+        # text after the first colon contains the matchup separator and
+        # the text before it doesn't, the prefix is a descriptor — drop it.
+        if ':' in title:
+            pre, post = title.split(':', 1)
+            sep_in = lambda s: (' at ' in s or ' vs ' in s or ' vs. ' in s)
+            if sep_in(post) and not sep_in(pre):
+                title = post.strip()
         # Remove suffixes like ": Spread", ": Total Points"
         base_title = title.split(':')[0].strip()
 
@@ -765,8 +829,11 @@ class MarketMatcher:
         if poly_match:
             return float(poly_match.group(2))
 
-        # Kalshi spread format: "Team wins by over X.X points?"
-        kalshi_match = re.search(r'(?:over|under)\s+(\d+(?:\.\d+)?)\s+points?', text.lower())
+        # Kalshi spread format: "Team wins by over X.X points?" — the unit
+        # varies by sport: points (NFL/NBA), goals (NHL), runs (MLB).
+        kalshi_match = re.search(
+            r'(?:over|under)\s+(\d+(?:\.\d+)?)\s+(?:points?|goals?|runs?)',
+            text.lower())
         if kalshi_match:
             return float(kalshi_match.group(1))
 
@@ -887,6 +954,22 @@ class MarketMatcher:
 
         text = (kalshi_title or poly_question or '').lower()
 
+        # Player props phrased as O/U lines (Polymarket): the stat comes
+        # straight after the player's name — "Jalen Brunson: Points O/U
+        # 27.5", "Victor Wembanyama: Rebounds O/U 11.5". Must be detected
+        # BEFORE the generic total check or every PM player prop
+        # classifies as a game total (and can never pair with Kalshi's
+        # prop markets, which DO classify as 'prop' via the keyword
+        # check below). Game totals are unaffected: their colon prefix is
+        # the matchup ("Knicks vs. Spurs: O/U 203.5") so the text after
+        # the colon starts with "o/u", not a stat name.
+        if re.match(
+            r"^[^:]+:\s*(?:points|rebounds|assists|threes|three[- ]?pointers|"
+            r"3[- ]?pointers|pra|steals|blocks|turnovers|goals|shots on goal|"
+            r"saves|strikeouts|hits|total bases|home runs|rbis|runs)\s+"
+            r"o/u\s+\d", text.strip()):
+            return 'prop'
+
         # Spread indicators (check first, more specific)
         if 'spread' in text or 'wins by' in text or re.search(r'\([+-]\d+', text):
             return 'spread'
@@ -933,6 +1016,65 @@ class MarketMatcher:
                 return 'moneyline'
 
         return None
+
+    # Stat-token canonicalization shared by the player-prop parsers. Keys are
+    # the phrases each source uses, values a shared token.
+    _PROP_STAT_CANON = {
+        'points': 'points', 'pts': 'points',
+        'rebounds': 'rebounds', 'reb': 'rebounds',
+        'assists': 'assists', 'ast': 'assists',
+        'threes': 'threes', 'three-pointers': 'threes',
+        'three pointers': 'threes', '3-pointers': 'threes',
+        '3 pointers': 'threes', 'threepointers': 'threes',
+        'goals': 'goals', 'shots on goal': 'shots_on_goal',
+        'saves': 'saves',
+        'strikeouts': 'strikeouts', 'hits': 'hits',
+        'total bases': 'total_bases', 'home runs': 'home_runs',
+        'rbis': 'rbis', 'runs': 'runs',
+        'receiving yards': 'rec_yds', 'rushing yards': 'rush_yds',
+        'passing yards': 'pass_yds', 'receptions': 'receptions',
+    }
+
+    @staticmethod
+    def parse_player_prop(text: str):
+        """Parse a player-prop market title from either source into
+        (player_lower, stat_token, strike) or None.
+
+        Kalshi:     "Victor Wembanyama: 25+ points"   -> 24.5 (N+ = over N-0.5)
+        Polymarket: "Victor Wembanyama: Points O/U 24.5" -> 24.5
+        """
+        import re
+        if not text:
+            return None
+        t = text.strip().lower()
+        # Polymarket "Name: Stat O/U X.X"
+        m = re.match(r"^(?P<player>[^:]+):\s*(?P<stat>[\w 3-]+?)\s+o/u\s+"
+                     r"(?P<line>\d+(?:\.\d+)?)", t)
+        if m:
+            stat = MarketMatcher._PROP_STAT_CANON.get(m.group('stat').strip())
+            if stat:
+                return (m.group('player').strip(), stat,
+                        float(m.group('line')))
+        # Kalshi "Name: N+ stat"
+        m = re.match(r"^(?P<player>[^:]+):\s*(?P<n>\d+)\+\s*"
+                     r"(?P<stat>[\w 3-]+?)\s*\??$", t)
+        if m:
+            stat = MarketMatcher._PROP_STAT_CANON.get(m.group('stat').strip())
+            if stat:
+                return (m.group('player').strip(), stat,
+                        float(m.group('n')) - 0.5)
+        return None
+
+    @staticmethod
+    def _prop_players_match(p1: str, p2: str) -> bool:
+        """Diacritic/punctuation-insensitive player name comparison."""
+        import unicodedata
+        def norm(s):
+            s = unicodedata.normalize('NFKD', s)
+            s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+            return ' '.join(re.sub(r"[^\w\s]", '', s.lower()).split())
+        n1, n2 = norm(p1), norm(p2)
+        return bool(n1) and bool(n2) and (n1 == n2 or n1 in n2 or n2 in n1)
 
     @staticmethod
     def markets_match(kalshi_market, poly_market, home_team, away_team, sport=None):
@@ -1037,14 +1179,27 @@ class MarketMatcher:
                 p_total = math.floor(p_total_raw)
 
                 # Now compare
-                matches = abs(k_total - p_total) < 0.01
-                print(f"          DEBUG Total: K={k_total}, P={p_total_raw} (rounded: {p_total}) -> {'MATCH' if matches else 'NO MATCH'}")
-                return matches
+                return abs(k_total - p_total) < 0.01
 
             # If either is missing a value, can't match
             return False
 
-    # Props: would need more sophisticated matching (not implemented yet)
+        # Player props: same player + same stat + same implied strike.
+        # Kalshi phrases the line as "N+" (over N-0.5); Polymarket as
+        # "O/U X.5" — both reduce to the same half-point strike.
+        if k_type == 'prop':
+            k_prop = MarketMatcher.parse_player_prop(k_title)
+            p_prop = MarketMatcher.parse_player_prop(p_question)
+            if not k_prop or not p_prop:
+                return False
+            k_player, k_stat, k_strike = k_prop
+            p_player, p_stat, p_strike = p_prop
+            if k_stat != p_stat:
+                return False
+            if abs(k_strike - p_strike) >= 0.01:
+                return False
+            return MarketMatcher._prop_players_match(k_player, p_player)
+
         return False
 
 
@@ -1220,6 +1375,59 @@ class PolymarketHistoricalOddsClient:
         self.polymarket_client = PolymarketSportsClient()
         self.cache = {}
 
+    @staticmethod
+    def _merge_satellite_games(games):
+        """Fold Polymarket 'satellite' events into their base game.
+
+        The gamma series listing returns extra EVENTS per game whose title
+        is the matchup plus a suffix — "Atlanta Braves vs. Chicago White
+        Sox - Player Props" / "... - First 5 Innings Winner". Those are
+        markets of the same game, not separate events; left alone they
+        clutter the event selector as P-only rows. When a base game with
+        the same title prefix exists (closest start time within 24h), the
+        satellite's markets are appended to it and the satellite event is
+        dropped. Satellites with no base game are kept unchanged.
+        """
+        from datetime import datetime, timezone
+
+        def _ts(g):
+            try:
+                t = datetime.fromisoformat(str(g.start_time).replace('Z', '+00:00'))
+                return t.replace(tzinfo=t.tzinfo or timezone.utc)
+            except (ValueError, TypeError):
+                return None
+
+        bases: dict[str, list] = {}
+        satellites = []
+        for g in games:
+            title = (g.title or '').strip()
+            if ' - ' in title:
+                satellites.append(g)
+            else:
+                bases.setdefault(title.lower(), []).append(g)
+
+        sat_ids = {id(s) for s in satellites}
+        out = [g for g in games if id(g) not in sat_ids]
+        for s in satellites:
+            base_title = (s.title or '').split(' - ')[0].strip().lower()
+            best, best_dt = None, None
+            s_ts = _ts(s)
+            for b in bases.get(base_title, []):
+                b_ts = _ts(b)
+                if s_ts is None or b_ts is None:
+                    delta = 0.0  # no time info — same-title base is fine
+                else:
+                    delta = abs((s_ts - b_ts).total_seconds())
+                    if delta > 24 * 3600:
+                        continue
+                if best is None or delta < best_dt:
+                    best, best_dt = b, delta
+            if best is not None:
+                best.markets.extend(s.markets or [])
+            else:
+                out.append(s)
+        return out
+
     async def get_sport_games(self, sport: str):
         """
         Get all games for a sport from Polymarket (async, non-blocking).
@@ -1237,12 +1445,15 @@ class PolymarketHistoricalOddsClient:
                 None,
                 lambda: self.polymarket_client.get_sport_markets(
                     sport,
-                    limit=50,
+                    limit=100,
                     include_orderbook=False,  # Skip orderbook for faster loading
-                    include_trades=False      # Skip trades for faster loading
+                    include_trades=False,     # Skip trades for faster loading
+                    days_ahead=10,  # Near-term window; the unfiltered series
+                                    # listing is creation-ordered and crowds
+                                    # out games 2-3 days away (K-only rows)
                 )
             )
-            return games
+            return self._merge_satellite_games(games)
         except Exception as e:
             print(f"Error fetching Polymarket games for {sport}: {e}")
             return []
@@ -2033,15 +2244,22 @@ class HistoricalOddsWidget(QWidget):
 
         all_unified_events = []
 
-        # Load events from all 4 major sports
+        # Load events from all 4 major sports concurrently
         import time as _tp_all, sys as _sp_all
-        for sport in ['NFL', 'NBA', 'MLB', 'NHL']:
-            print(f"\nLoading {sport}...")
-            _all_t = _tp_all.perf_counter()
-            events = await self._load_unified_events_for_sport(sport)
-            print(f"[allsports-probe] {sport} total await={(_tp_all.perf_counter()-_all_t)*1000:.0f}ms",
+        _all_t0 = _tp_all.perf_counter()
+        _sports = ['NFL', 'NBA', 'MLB', 'NHL']
+        _sport_results = await asyncio.gather(
+            *[self._load_unified_events_for_sport(s) for s in _sports],
+            return_exceptions=True
+        )
+        for _sport, _result in zip(_sports, _sport_results):
+            if isinstance(_result, Exception):
+                print(f"[allsports-probe] {_sport} FAILED: {_result}", file=_sp_all.stderr)
+            else:
+                all_unified_events.extend(_result)
+        if PERF_DIAG:
+            print(f"[allsports-probe] all sports total={(_tp_all.perf_counter()-_all_t0)*1000:.0f}ms",
                   file=_sp_all.stderr)
-            all_unified_events.extend(events)
 
         print(f"\n📊 Total events loaded from all sports: {len(all_unified_events)}")
         import time as _tp_post, sys as _sp_post
@@ -2100,9 +2318,10 @@ class HistoricalOddsWidget(QWidget):
 
         self.event_selector.blockSignals(False)
         _post_t2 = _tp_post.perf_counter()
-        print(f"[post-probe] filter={(_post_t1-_post_t0)*1000:.0f}ms "
-              f"populate_selector={(_post_t2-_post_t1)*1000:.0f}ms "
-              f"(n={len(all_unified_events)})", file=_sp_post.stderr)
+        if PERF_DIAG:
+            print(f"[post-probe] filter={(_post_t1-_post_t0)*1000:.0f}ms "
+                  f"populate_selector={(_post_t2-_post_t1)*1000:.0f}ms "
+                  f"(n={len(all_unified_events)})", file=_sp_post.stderr)
 
         # Enable controls
         self.set_enabled(True)
@@ -2159,20 +2378,14 @@ class HistoricalOddsWidget(QWidget):
             return {'events': events, 'count': len(events)}
 
         import time as _tp_sync, sys as _sp_sync
-        # PROBE: time each task separately to see which holds the loop.
-        # A high "loop-starve" reading = wall time minus a 5ms-tick budget
-        # the monitor *should* have gotten; if the executor work holds the
-        # GIL, ticks during this await are delayed.
         _kt0 = _tp_sync.perf_counter()
-        kalshi_task = loop.run_in_executor(None, fetch_kalshi_moneylines)
-        polymarket_task = self.polymarket_client.get_sport_games(sport)
-
-        kalshi_data = await kalshi_task
-        _kt1 = _tp_sync.perf_counter()
-        polymarket_games = await polymarket_task
-        _pt1 = _tp_sync.perf_counter()
-        print(f"[task-probe] {sport} kalshi_await={(_kt1-_kt0)*1000:.0f}ms "
-              f"poly_await={(_pt1-_kt1)*1000:.0f}ms", file=_sp_sync.stderr)
+        kalshi_data, polymarket_games = await asyncio.gather(
+            loop.run_in_executor(None, fetch_kalshi_moneylines),
+            self.polymarket_client.get_sport_games(sport)
+        )
+        if PERF_DIAG:
+            print(f"[task-probe] {sport} concurrent_await={(_tp_sync.perf_counter()-_kt0)*1000:.0f}ms",
+                  file=_sp_sync.stderr)
         _sync_t0 = _tp_sync.perf_counter()
 
         kalshi_events = kalshi_data.get('events', [])
@@ -2193,8 +2406,13 @@ class HistoricalOddsWidget(QWidget):
             k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
             event_ticker = k_event.get('event_ticker', '')
 
-            # Try to find matching Polymarket game
+            # Try to find matching Polymarket game. Among all team-matching
+            # candidates take the CLOSEST start time, not the first hit:
+            # PM lists every game of a series/doubleheader separately under
+            # identical team names, and first-hit could bind this Kalshi
+            # event to a different day's game.
             matched_poly_game = None
+            best_delta = float('inf')
             for p_game in active_polymarket_games:
                 if p_game.id in matched_poly_ids:
                     continue
@@ -2207,9 +2425,14 @@ class HistoricalOddsWidget(QWidget):
                 # (untraded) Kalshi event for the same matchup.
                 if (EventMatcher.events_match(k_away, k_home, p_away, p_home, sport)
                         and EventMatcher.dates_compatible(event_ticker, p_game.start_time)):
-                    matched_poly_game = p_game
-                    matched_poly_ids.add(p_game.id)
-                    break
+                    delta = EventMatcher.start_time_delta_hours(
+                        event_ticker, p_game.start_time)
+                    if delta < best_delta or matched_poly_game is None:
+                        matched_poly_game = p_game
+                        best_delta = delta
+
+            if matched_poly_game:
+                matched_poly_ids.add(matched_poly_game.id)
 
             # Create unified event
             # Parse start_time from event_ticker since strike_date doesn't exist
@@ -2236,9 +2459,14 @@ class HistoricalOddsWidget(QWidget):
 
             unified_events.append(unified_event)
 
-        # Second pass: add unmatched Polymarket games
+        # Second pass: add unmatched Polymarket games. Skip ones that
+        # started >8h ago — gamma keeps settled games "active" for a
+        # while, and with no open Kalshi side anchoring them they'd show
+        # as stale P-only rows for yesterday's games.
         for p_game in active_polymarket_games:
             if p_game.id not in matched_poly_ids:
+                if EventMatcher.poly_game_is_stale(p_game.start_time):
+                    continue
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
                 unified_event = UnifiedEvent(
                     sport=sport,
@@ -2255,10 +2483,11 @@ class HistoricalOddsWidget(QWidget):
         # Events without start_time go to the end
         unified_events.sort(key=lambda e: e.start_time if e.start_time else 'Z' * 30)
 
-        print(f"[sportmatch-probe] {sport} sync match/build="
-              f"{(_tp_sync.perf_counter()-_sync_t0)*1000:.0f}ms "
-              f"(k={len(kalshi_events)} p={len(active_polymarket_games)})",
-              file=_sp_sync.stderr)
+        if PERF_DIAG:
+            print(f"[sportmatch-probe] {sport} sync match/build="
+                  f"{(_tp_sync.perf_counter()-_sync_t0)*1000:.0f}ms "
+                  f"(k={len(kalshi_events)} p={len(active_polymarket_games)})",
+                  file=_sp_sync.stderr)
         return unified_events
 
     async def load_unified_events(self, sport= None):
@@ -2332,8 +2561,12 @@ class HistoricalOddsWidget(QWidget):
             k_away, k_home = EventMatcher.parse_kalshi_title(k_title)
             event_ticker = k_event.get('event_ticker', '')
 
-            # Try to find matching Polymarket game
+            # Try to find matching Polymarket game. Among all team-matching
+            # candidates take the CLOSEST start time, not the first hit
+            # (PM lists each series/doubleheader game separately under
+            # identical team names).
             matched_poly_game = None
+            best_delta = float('inf')
             for p_game in active_polymarket_games:
                 if p_game.id in matched_poly_ids:
                     continue
@@ -2346,9 +2579,14 @@ class HistoricalOddsWidget(QWidget):
                 # (untraded) Kalshi event for the same matchup.
                 if (EventMatcher.events_match(k_away, k_home, p_away, p_home)
                         and EventMatcher.dates_compatible(event_ticker, p_game.start_time)):
-                    matched_poly_game = p_game
-                    matched_poly_ids.add(p_game.id)
-                    break
+                    delta = EventMatcher.start_time_delta_hours(
+                        event_ticker, p_game.start_time)
+                    if delta < best_delta or matched_poly_game is None:
+                        matched_poly_game = p_game
+                        best_delta = delta
+
+            if matched_poly_game:
+                matched_poly_ids.add(matched_poly_game.id)
 
             # Create unified event
             # Parse start_time from event_ticker since strike_date doesn't exist
@@ -2378,9 +2616,14 @@ class HistoricalOddsWidget(QWidget):
 
             unified_events.append(unified_event)
 
-        # Second pass: add unmatched Polymarket games
+        # Second pass: add unmatched Polymarket games. Skip ones that
+        # started >8h ago — gamma keeps settled games "active" for a
+        # while, and with no open Kalshi side anchoring them they'd show
+        # as stale P-only rows for yesterday's games.
         for p_game in active_polymarket_games:
             if p_game.id not in matched_poly_ids:
+                if EventMatcher.poly_game_is_stale(p_game.start_time):
+                    continue
                 p_away, p_home = EventMatcher.parse_polymarket_title(p_game.title)
                 unified_event = UnifiedEvent(
                     sport=sport,
@@ -2958,15 +3201,31 @@ class HistoricalOddsWidget(QWidget):
         type_order = {'moneyline': 0, 'spread': 1, 'total': 2, 'prop': 3, 'unknown': 4}
 
         def sort_key(m):
-            # Priority 0 for matched markets, 1 for single-source
+            # Props always sort below the game lines (they live under a
+            # section separator, same pattern as the LiquidityWidget
+            # event menu's FUTURES header). Within each section: matched
+            # markets first, then by type, then by name.
+            is_prop = 1 if m.market_type == 'prop' else 0
             has_both = 0 if (m.has_kalshi() and m.has_polymarket()) else 1
             market_type_order = type_order.get(m.market_type, 4)
-            return (has_both, market_type_order, m.display_name)
+            return (is_prop, has_both, market_type_order, m.display_name)
 
         unified_markets.sort(key=sort_key)
 
-        # Populate market selector
+        # Populate market selector. A disabled header item marks the
+        # game-lines / player-props boundary (only when both sections are
+        # present, so it's never the first row).
+        props_separator_added = False
         for unified_market in unified_markets:
+            if (unified_market.market_type == 'prop'
+                    and not props_separator_added
+                    and self.market_selector.count() > 0):
+                self.market_selector.addItem("──────  PLAYER PROPS  ──────")
+                sep_item = self.market_selector.model().item(
+                    self.market_selector.count() - 1)
+                if sep_item is not None:
+                    sep_item.setEnabled(False)
+                props_separator_added = True
             source_indicator = unified_market.get_source_indicator()
             display_text = f"{source_indicator} {unified_market.display_name}"
             self.market_selector.addItem(display_text, userData=unified_market)

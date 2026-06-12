@@ -71,6 +71,36 @@ def write_events_index(dump: dict, dump_dir: pathlib.Path) -> None:
     tmp.write_text(json.dumps(index, default=str))
     tmp.replace(out)
 
+
+# Per-event sidecar files: <dump_dir>/events/<event_id>.json, each holding one
+# event's full dump entry (~100KB). The widget's lazy market hydration
+# (_hydrateEventPairMarkets) only ever needs ONE event's entry, but used to get
+# it by parsing the whole ~38MB combined dump on the main thread (~175ms
+# GIL-held stall on first paired-event open). Reading the single sidecar is
+# <1ms. The combined dump is still written for any whole-dump consumers.
+NOVIG_EVENT_SIDECAR_DIRNAME = "events"
+
+
+def write_event_sidecars(dump: dict, dump_dir: pathlib.Path) -> None:
+    """Write each event's dump entry to its own sidecar file and prune
+    sidecars for events no longer in the dump. Event ids are UUIDs, so
+    they're filesystem-safe as-is. Atomic per-file temp+replace so a
+    concurrent hydration read never sees a half-written entry."""
+    side_dir = dump_dir / NOVIG_EVENT_SIDECAR_DIRNAME
+    side_dir.mkdir(parents=True, exist_ok=True)
+    for eid, entry in dump.items():
+        out = side_dir / f"{eid}.json"
+        tmp = side_dir / f"{eid}.json.tmp"
+        tmp.write_text(json.dumps(entry, default=str))
+        tmp.replace(out)
+    keep = {f"{eid}.json" for eid in dump}
+    for p in side_dir.glob("*.json"):
+        if p.name not in keep:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
 # qty values on NBX orderbook entries are in cents/centi-units. Display = qty/100.
 # Verified against site UI:
 #   COIN bid qty=950000 price=0.822 -> 9500 display, opposite takeable 1691 COIN
@@ -906,6 +936,8 @@ class NovigQueries:
             tmp.replace(out)
             # Slim metadata-only companion for the startup match-map build.
             write_events_index(dump, dump_dir)
+            # Per-event sidecars for the widget's lazy market hydration.
+            write_event_sidecars(dump, dump_dir)
             if progress:
                 size_mb = out.stat().st_size / (1024 * 1024)
                 print(f"[novig.scrape] wrote {out}  ({size_mb:.2f} MB)")
@@ -978,6 +1010,21 @@ class NovigQueries:
         # held the GIL ~500ms here and stuttered the ticker. read_bytes() also
         # skips a full-file UTF-8 decode. ([PERF-DIAG] — see PERF_DIAGNOSTICS.md)
         return orjson.loads(files[-1].read_bytes())
+
+    @staticmethod
+    def load_event_entry(event_id: str,
+                         dump_dir: Optional[pathlib.Path] = None
+                         ) -> Optional[dict]:
+        """Load ONE event's dump entry from its sidecar file (~100KB / <1ms)
+        instead of parsing the full combined dump. Returns None when the
+        sidecar is absent (dump written before sidecars existed, or the event
+        isn't in the latest dump) — callers fall back to the full-dump parse."""
+        dump_dir = dump_dir or NOVIG_DUMP_DIR
+        p = dump_dir / NOVIG_EVENT_SIDECAR_DIRNAME / f"{event_id}.json"
+        try:
+            return orjson.loads(p.read_bytes())
+        except (FileNotFoundError, ValueError, OSError):
+            return None
 
     @staticmethod
     def load_events_index(dump_dir: Optional[pathlib.Path] = None
@@ -1132,10 +1179,20 @@ def _event_to_dump_entries(event_node: dict) -> list[tuple[str, dict]]:
     children are the individual matches. For those we recurse and emit
     one entry per child Game so each match pairs against its ProphetX
     counterpart — the user's chosen unit of matching.
+
+    Settled/voided nodes are dropped. The LISTING is already filtered to
+    OPEN_PREGAME/OPEN_INGAME, but a tournament container stays open for
+    its whole run while its `events[]` children span every completed
+    round — without this guard a single ATP container exploded into
+    hundreds of FINAL matches (~68% of the dump), bloating the match map
+    and leaving stale candidates for the event matcher to trip on.
     """
     if not event_node:
         return []
     is_tournament = (event_node.get("type") or "").lower() == "tournament"
+    status = (event_node.get("status") or "").upper()
+    if not is_tournament and status in ("FINAL", "CANCELED", "CANCELLED"):
+        return []
     children = event_node.get("events") or []
     direct_markets = event_node.get("markets") or []
 
