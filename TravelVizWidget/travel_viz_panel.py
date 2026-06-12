@@ -27,13 +27,12 @@ from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QVector3D
 
 from data_client import ESPNSportsDataAggregator, TeamTravelData
-from flight_tracker_panel import FlightControlPanel
 from globe_widget import FlightGlobeWidget
-from upcoming_games_overlay import UpcomingGamesOverlay
-from weather_overlay import WeatherOverlay
-from live_flight_tracker import RealTimeFlightTracker, DirectFlightTracker
+from globe_overlays import UpcomingGamesOverlay, WeatherOverlay
+from live_flight_tracker import (RealTimeFlightTracker, DirectFlightTracker,
+                                 FlightControlPanel)
 from venue_tooltip import VenueTooltip
-from fatigue_engine import FatigueEngine
+from database_manager import FatigueEngine
 from flashscore_source import FlashscoreLiveFeed
 
 logger = logging.getLogger(__name__)

@@ -10,10 +10,13 @@ uniform vec3 lightDir;
 
 out vec2 TexCoord;
 out float LightIntensity;
+out vec3 WorldNormal;
+out vec3 WorldPos;
 
 void main() {
     gl_Position = mvp * vec4(position, 1.0);
     TexCoord = texCoord;
-    vec3 Normal = normalize(normalMatrix * normal);
-    LightIntensity = max(dot(Normal, normalize(lightDir)), 0.0);
+    WorldNormal = normalize(normalMatrix * normal);
+    WorldPos = (model * vec4(position, 1.0)).xyz;
+    LightIntensity = max(dot(WorldNormal, normalize(lightDir)), 0.0);
 }

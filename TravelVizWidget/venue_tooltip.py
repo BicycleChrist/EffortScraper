@@ -160,6 +160,11 @@ class VenueTooltip(QWidget):
         # Additional details
         details_lines = []
 
+        # Live score (flashscore feed)
+        live_line = venue_data.get('live_summary')
+        if live_line:
+            details_lines.append(f"🔴 {live_line}")
+
         # Capacity if available
         capacity = venue_data.get('capacity')
         if capacity:
@@ -169,6 +174,10 @@ class VenueTooltip(QWidget):
         team_id = venue_data.get('team_id')
         if team_id and not game_info:
             details_lines.append(f"Team: {team_id}")
+
+        # Schedule-fatigue intel (list of pre-formatted lines)
+        for line in venue_data.get('fatigue_summary', []):
+            details_lines.append(f"⚡ {line}")
 
         self.details_label.setText('\n'.join(details_lines))
         self.details_label.setVisible(bool(details_lines))
