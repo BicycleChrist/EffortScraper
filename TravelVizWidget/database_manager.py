@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import os
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
@@ -221,9 +222,26 @@ class DatabaseManager:
                     )
                 """)
                 
+                # Forbes hotel reference table (curated star ratings by city).
+                # This used to be hand-loaded and got wiped on a DB regen — it
+                # now lives in the schema and self-seeds from forbes_hotels.csv
+                # below, so it survives future rebuilds.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hotels (
+                        hotel_name TEXT NOT NULL,
+                        destination TEXT NOT NULL,
+                        star_rating TEXT,
+                        full_rating_data TEXT,
+                        PRIMARY KEY (hotel_name, destination)
+                    )
+                """)
+
                 # Create indexes for performance
                 self.create_indexes(conn)
-                
+
+                # Seed Forbes hotels if the table is empty
+                self._seed_hotels(conn)
+
                 # Set database version
                 conn.execute("""
                     INSERT OR REPLACE INTO metadata (key, value, updated_at) 
@@ -250,10 +268,50 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_travel_game ON travel_data (game_id)",
             "CREATE INDEX IF NOT EXISTS idx_teams_league ON teams (league)",
             "CREATE INDEX IF NOT EXISTS idx_season_cache_league ON season_cache (league)",
+            "CREATE INDEX IF NOT EXISTS idx_hotels_destination ON hotels (destination)",
         ]
-        
+
         for index_sql in indexes:
             conn.execute(index_sql)
+
+    def _seed_hotels(self, conn: sqlite3.Connection, force: bool = False):
+        """Load the hotels table from forbes_hotels.csv (sibling of this
+        module). By default only seeds when the table is empty (self-heals
+        after a DB wipe without a re-scrape). Pass force=True to overwrite the
+        table with a freshly scraped CSV."""
+        try:
+            if not force and conn.execute("SELECT 1 FROM hotels LIMIT 1").fetchone():
+                return  # already populated
+            import csv as _csv
+            csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "forbes_hotels.csv")
+            if not os.path.exists(csv_path):
+                self.logger.warning("forbes_hotels.csv not found; hotels table left empty")
+                return
+            with open(csv_path, newline='', encoding='utf-8') as f:
+                rows = [(r.get('hotel_name', '').strip(),
+                         r.get('destination', '').strip(),
+                         r.get('star_rating', '').strip(),
+                         r.get('full_rating_data', '').strip())
+                        for r in _csv.DictReader(f)
+                        if r.get('hotel_name') and r.get('destination')]
+            if force:
+                conn.execute("DELETE FROM hotels")
+            conn.executemany(
+                "INSERT OR IGNORE INTO hotels "
+                "(hotel_name, destination, star_rating, full_rating_data) "
+                "VALUES (?, ?, ?, ?)", rows)
+            self.logger.info(f"{'Reloaded' if force else 'Seeded'} "
+                             f"{len(rows)} Forbes hotels into the database")
+        except Exception as e:
+            self.logger.warning(f"Hotel seed skipped: {e}")
+
+    def reload_hotels(self):
+        """Overwrite the hotels table from the current forbes_hotels.csv.
+        Call after a fresh Forbes scrape to publish the new entries."""
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            self._seed_hotels(conn, force=True)
+            conn.commit()
     
     def is_season_cached(self, season: str, league: str) -> Tuple[bool, Optional[datetime]]:
         """Check if season data is cached and get last update time"""
@@ -1086,13 +1144,25 @@ HIGH_ALTITUDE_CITIES = {"Denver", "Salt Lake City", "Calgary", "Mexico City"}
 
 # Per-league scoring weights. MLB plays daily, so density terms (back-to-back,
 # 3-in-4) are normal there and carry no weight; NBA/NHL punish them heavily.
+#
+# `circadian` replaced the old absolute `tz` term: the travel penalty is now
+# the team's EASTWARD body-clock misalignment (hrs), per the jet-lag research
+# (Song/Allada PNAS 2017) and our own 19k-game backtest — eastward/cumulative
+# circadian debt predicts outcomes, raw |tz hops| does not (it washed the
+# direction out). `tz` is kept only for the displayed tz_hops_7d stat.
 LEAGUE_WEIGHTS = {
     "NBA": dict(b2b=20.0, three_in_four=14.0, games_7d_baseline=3.5,
-                density=5.0, miles_div=60.0, tz=6.0, altitude=8.0, rest_relief=6.0),
+                density=5.0, miles_div=60.0, tz=6.0, circadian=6.0,
+                altitude=8.0, rest_relief=6.0),
     "NHL": dict(b2b=18.0, three_in_four=12.0, games_7d_baseline=3.5,
-                density=5.0, miles_div=60.0, tz=6.0, altitude=7.0, rest_relief=6.0),
+                density=5.0, miles_div=60.0, tz=6.0, circadian=6.5,
+                altitude=7.0, rest_relief=6.0),
+    # MLB has no density penalty, so eastward circadian debt is its PRIMARY
+    # travel signal (backtest: a circadian-disadvantaged home team's win rate
+    # drops enough to erase home-field advantage).
     "MLB": dict(b2b=0.0, three_in_four=0.0, games_7d_baseline=6.5,
-                density=3.0, miles_div=55.0, tz=7.0, altitude=8.0, rest_relief=8.0),
+                density=3.0, miles_div=55.0, tz=7.0, circadian=7.0,
+                altitude=8.0, rest_relief=8.0),
 }
 
 
@@ -1107,7 +1177,8 @@ class TeamFatigue:
     rest_days: int = 99            # full off-days since previous game
     miles_7d: float = 0.0          # venue-to-venue great-circle miles
     miles_14d: float = 0.0
-    tz_hops_7d: int = 0            # sum of |tz changes| between venues
+    tz_hops_7d: int = 0            # sum of |tz changes| between venues (display only)
+    circadian: float = 0.0         # signed body-clock misalignment (h); + = eastward = jet-lagged
     games_7d: int = 0              # games played in prior 7 days
     back_to_back: bool = False
     three_in_four: bool = False
@@ -1123,7 +1194,9 @@ class TeamFatigue:
             out.append("3 games in 4 nights")
         if self.miles_7d >= 2000:
             out.append(f"{self.miles_7d:,.0f} mi in 7d")
-        if self.tz_hops_7d >= 3:
+        if self.circadian >= 1.5:
+            out.append(f"{self.circadian:.0f}h eastward jet lag")
+        elif self.tz_hops_7d >= 3:
             out.append(f"{self.tz_hops_7d} tz hops in 7d")
         if self.altitude_shift:
             out.append("altitude arrival")
@@ -1168,6 +1241,9 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 class FatigueEngine:
     """Scores upcoming games from the cached schedule DB."""
 
+    CIRCADIAN_RESET_GAP = 14   # days idle -> body assumed re-synced to home
+    RESYNC_PER_DAY = 1.0       # circadian adjustment per day (hours)
+
     def __init__(self, db):
         self.db = db  # DatabaseManager
 
@@ -1186,6 +1262,46 @@ class FatigueEngine:
         if lon is not None:
             return round(lon / 15.0)
         return 0
+
+    def _home_tz_for(self, timeline, team_id: str) -> int:
+        """Timezone offset of the team's home park (first home game in timeline)."""
+        for g in timeline:
+            if g.home_team.team_id.lower() == team_id:
+                coords = self._venue_coords(g.venue)
+                return self._tz_offset(g.venue.city, coords[1] if coords else None)
+        # Fallback: tz of the team's first venue in the timeline
+        if timeline:
+            coords = self._venue_coords(timeline[0].venue)
+            return self._tz_offset(timeline[0].venue.city, coords[1] if coords else None)
+        return 0
+
+    def _team_circadian(self, timeline, target_game, home_tz: int) -> float:
+        """Reconstruct the team's body clock by walking its venues chronologically
+        and return the signed circadian misalignment at `target_game`'s venue.
+
+        Mirrors fatigue_backtest.enrich_circadian (the 19k-game-validated model):
+        the body clock drifts toward the prior venue's tz at RESYNC_PER_DAY,
+        resets to home after CIRCADIAN_RESET_GAP idle days. misalignment =
+        venue_tz - body_tz; positive = EASTWARD = the jet-lag penalty direction."""
+        state = None  # {"body": float, "venue": float, "date": datetime}
+        mis = 0.0
+        for g in timeline:
+            if g.date > target_game.date:
+                break
+            coords = self._venue_coords(g.venue)
+            venue_tz = self._tz_offset(g.venue.city, coords[1] if coords else None)
+            if state is None or (g.date - state["date"]).days > self.CIRCADIAN_RESET_GAP:
+                body = float(home_tz)  # rested, re-synced to home
+            else:
+                elapsed = max((g.date - state["date"]).days, 0)
+                gap = state["venue"] - state["body"]
+                cap = self.RESYNC_PER_DAY * elapsed
+                body = state["body"] + max(-cap, min(cap, gap))
+            mis = venue_tz - body
+            state = {"body": body, "venue": float(venue_tz), "date": g.date}
+            if g.game_id == target_game.game_id:
+                break
+        return mis
 
     def _build_team_timelines(self, games) -> Dict[str, List]:
         """team_id -> chronological list of that team's games."""
@@ -1254,9 +1370,16 @@ class FatigueEngine:
         tf.altitude_shift = (game.venue.city in HIGH_ALTITUDE_CITIES
                              and last_game.venue.city not in HIGH_ALTITUDE_CITIES)
 
+        # Signed circadian misalignment (validated travel signal; replaces the
+        # washed-out absolute tz-hop term). + = eastward = jet-lagged.
+        home_tz = self._home_tz_for(timeline, tf.team_id)
+        tf.circadian = self._team_circadian(timeline, game, home_tz)
+
         score = 0.0
         score += tf.miles_7d / weights["miles_div"]
-        score += tf.tz_hops_7d * weights["tz"]
+        # Only eastward (positive) misalignment carries a penalty — westward
+        # barely matters per the literature and our backtest.
+        score += max(0.0, tf.circadian) * weights["circadian"]
         if tf.back_to_back:
             score += weights["b2b"]
         if tf.three_in_four:

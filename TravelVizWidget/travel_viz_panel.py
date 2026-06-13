@@ -796,6 +796,7 @@ class TravelVizPanel(QWidget):
         self.control_panel.modeChanged.connect(self.on_league_changed)
         self.control_panel.teamChanged.connect(self.on_control_panel_team_changed)
         self.control_panel.amadeusAnalysisRequested.connect(self.start_amadeus_analysis)
+        self.fatigueReportsReady.connect(self.control_panel.set_fatigue_reports)
 
         self.globe_widget.locationSelected.connect(self.on_location_selected)
         self.globe_widget.markerClicked.connect(self.on_marker_clicked)

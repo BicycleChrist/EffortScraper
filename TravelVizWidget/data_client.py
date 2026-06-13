@@ -245,12 +245,23 @@ class AmadeusAnalyzer:
         else:
             matched_hotels = self._create_hotels_from_amadeus_only(amadeus_hotels, venue)
         
-        # Sort by Forbes rating, then distance
-        matched_hotels.sort(key=lambda h: (
+        # Rank as a TEAM-HOTEL PROXY, not a luxury showcase. A pro team's
+        # actual hotel is unknowable from bookings, but it's reliably (a) close
+        # to the arena — to minimize game-day commute — and (b) above a quality
+        # floor (teams don't book motels). Luxury *rank* is irrelevant to
+        # performance and only matters here as a tiebreaker. So: filter to
+        # credible properties, then sort by proximity. The closest credible
+        # hotel is the best available proxy for where the team sleeps and how
+        # far it has to travel on game day.
+        QUALITY_FLOOR = 60  # overall_rating 0-100; below this = not a team hotel
+        credible = [h for h in matched_hotels if h.overall_rating >= QUALITY_FLOOR]
+        ranked = credible if credible else matched_hotels
+        ranked.sort(key=lambda h: (
+            h.distance_from_venue,
             -(h.forbes_rating.get_numeric_rating() if h.forbes_rating else 3),
-            h.distance_from_venue
         ))
-        
+        matched_hotels = ranked
+
         self._hotel_cache[cache_key] = matched_hotels
         
         # Concise debug output
@@ -803,17 +814,17 @@ class AmadeusWorker(QThread):
                 self.progressUpdated.emit(progress, f"Analyzing route to {travel.arrival_city}...")
                 
                 try:
-                    # Create mock venue objects for Amadeus analysis
+                    # Build venue objects from the trip endpoints
                     origin_venue = self._create_venue_from_city(travel.departure_city)
                     dest_venue = self._create_venue_from_city(travel.arrival_city)
-                    
-                    # Create mock game object
-                    mock_game = self._create_mock_game(travel, team_info)
-                    
+
+                    # Reconstruct the game this trip leads into
+                    game = self._build_game_from_travel(travel, team_info)
+
                     # Use Amadeus to analyze this route
                     if hasattr(self.aggregator, 'amadeus_analyzer') and self.aggregator.amadeus_analyzer:
                         route = self.aggregator.amadeus_analyzer._analyze_route_between_venues(
-                            origin_venue, dest_venue, mock_game
+                            origin_venue, dest_venue, game
                         )
                         route.travel_data = travel  # Attach original travel data
                         route_insights.append(route)
@@ -864,9 +875,15 @@ class AmadeusWorker(QThread):
             longitude=coords[1]
         )
     
-    def _create_mock_game(self, travel, team_info):
-        """Create a mock game object for Amadeus analysis"""
-        
+    def _build_game_from_travel(self, travel, team_info):
+        """Reconstruct the GameData a travel record leads into, for route
+        analysis and the route card.
+
+        A travel record is generated for any city change, INCLUDING the return
+        leg home before a home game — so the destination is not always the
+        opponent's park. Decide home/away by whether the team arrives in its
+        own city; otherwise a return-home trip gets mislabeled as '@ opponent'."""
+
         # Create opponent team info
         opponent_team = TeamInfo(
             team_id="opponent",
@@ -876,20 +893,33 @@ class AmadeusWorker(QThread):
             color="#000000",
             alternate_color="#FFFFFF"
         )
-        
-        # Create venue
+
+        # Create venue (the game is played wherever the team arrives)
         venue = self._create_venue_from_city(travel.arrival_city)
-        
+
+        # Home game iff the team arrived in its own city.
+        is_home = (self._norm_city(travel.arrival_city)
+                   == self._norm_city(getattr(team_info, 'location', '')))
+        if is_home:
+            home_team, away_team = team_info, opponent_team
+        else:
+            home_team, away_team = opponent_team, team_info
+
         return GameData(
-            game_id=travel.game_id or f"mock_{travel.travel_date.strftime('%Y%m%d')}",
+            game_id=travel.game_id or f"synth_{travel.travel_date.strftime('%Y%m%d')}",
             date=travel.game_date,
-            home_team=opponent_team,  # Opponent is home team (we're traveling to them)
-            away_team=team_info,      # Our team is away team  
+            home_team=home_team,
+            away_team=away_team,
             venue=venue,
             status=GameStatus.SCHEDULED,
             league=self.aggregator.current_league,
             season=self.aggregator.current_season
         )
+
+    @staticmethod
+    def _norm_city(city: str) -> str:
+        """Normalize a city name for comparison (case/punctuation/whitespace)."""
+        return ''.join(ch for ch in (city or '').lower() if ch.isalnum())
     
     def _find_highest_risk_route(self, routes):
         """Find route with highest risk"""

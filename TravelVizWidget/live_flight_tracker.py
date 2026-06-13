@@ -758,6 +758,33 @@ class CharterLedger:
             c.execute(f"UPDATE charter_observations SET {','.join(sets)} "
                       "WHERE window_id=? AND icao24=?", vals)
 
+    def confirmed_arrival(self, league: str, team_id: str,
+                          next_game_id: str) -> Optional[datetime]:
+        """Trace-confirmed arrival time of the inbound charter for the game
+        `next_game_id` (window ids are '<league>_<team>_<prevgame>_<nextgame>',
+        so we match on the trailing game id). Returns the arr_time of the
+        best-scoring landed observation, or None when nothing is confirmed."""
+        if not (league and team_id and next_game_id):
+            return None
+        pat = f"{league}_{team_id}_%_{next_game_id}"
+        try:
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT arr_time FROM charter_observations "
+                    "WHERE window_id LIKE ? AND arr_time IS NOT NULL "
+                    "ORDER BY landed DESC, max_score DESC LIMIT 1",
+                    (pat,)).fetchone()
+        except Exception:
+            return None
+        if not row or not row["arr_time"]:
+            return None
+        s = str(row["arr_time"])
+        try:
+            return (datetime.fromisoformat(s.replace('Z', '+00:00'))
+                    if 'Z' in s else datetime.fromisoformat(s))
+        except ValueError:
+            return None
+
     def window_rows(self, window_id: str) -> List[dict]:
         with self._lock, self._conn() as c:
             return [dict(r) for r in c.execute(
@@ -843,6 +870,12 @@ class TeamFlightDetector:
     CHARTER_ALTITUDE_MAX_FT = 43000  # Typical charter cruise ceiling
     CHARTER_SPEED_MIN_KTS = 420      # Minimum cruise speed
     CHARTER_SPEED_MAX_KTS = 540      # Maximum cruise speed
+
+    # Max perpendicular distance (km) a candidate may sit off the team's
+    # origin→dest great circle. Tight enough to reject same-destination flights
+    # from a different origin's corridor (MSP→LAS vs RDU→LAS), loose enough to
+    # allow ATC routing, weather deviations, and arc-vs-rhumb spread.
+    CORRIDOR_MAX_CROSS_TRACK_KM = 185
 
     # Teams with known owned aircraft (rare but high confidence)
     TEAM_OWNED_AIRCRAFT = {
@@ -1597,6 +1630,21 @@ class TeamFlightDetector:
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
 
+    def _cross_track_km(self, plat: float, plon: float,
+                        alat: float, alon: float,
+                        blat: float, blon: float) -> float:
+        """Perpendicular distance (km) from point P to the great circle through
+        A→B. This is the real 'is the plane in the corridor' test — unlike the
+        origin+dest distance-sum (an ellipse ~800km wide for a transcontinental
+        route), it rejects a flight that's heading to the same destination on a
+        DIFFERENT origin's path (e.g. Sun Country MSP→LAS vs the RDU→LAS
+        charter, ~600km apart over the Plains)."""
+        R = 6371.0
+        d13 = self._haversine_distance(alat, alon, plat, plon) / R  # angular A→P
+        theta13 = math.radians(self._calculate_bearing(alat, alon, plat, plon))
+        theta12 = math.radians(self._calculate_bearing(alat, alon, blat, blon))
+        return abs(math.asin(math.sin(d13) * math.sin(theta13 - theta12)) * R)
+
     def _correlate_with_schedule(self, lat: float, lon: float,
                                  heading: float, upcoming_games: List) -> Optional[Dict]:
         """
@@ -1642,7 +1690,10 @@ class TeamFlightDetector:
 
                 # Option 1: Away team traveling to the game
                 away_travel_window = self.get_team_travel_window(game.away_team.team_id)
-                if away_travel_window:
+                if away_travel_window and self._cross_track_km(
+                        lat, lon, away_travel_window['origin_lat'],
+                        away_travel_window['origin_lon'], venue_lat, venue_lon
+                        ) <= self.CORRIDOR_MAX_CROSS_TRACK_KM:
                     confidence = 40
                     if best_confidence < confidence:
                         best_confidence = confidence
@@ -1660,7 +1711,11 @@ class TeamFlightDetector:
                         home_travel_window['origin_lat'], home_travel_window['origin_lon'],
                         venue_lat, venue_lon
                     )
-                    if origin_to_venue > 100:  # Home team IS traveling (returning from road trip)
+                    on_corridor = self._cross_track_km(
+                        lat, lon, home_travel_window['origin_lat'],
+                        home_travel_window['origin_lon'], venue_lat, venue_lon
+                        ) <= self.CORRIDOR_MAX_CROSS_TRACK_KM
+                    if origin_to_venue > 100 and on_corridor:  # Home team IS traveling (returning from road trip)
                         confidence = 40
                         if best_confidence < confidence:
                             best_confidence = confidence
@@ -1781,9 +1836,20 @@ class TeamFlightDetector:
         expected_dist_to_venue = total_route - dist_from_origin
         dist_deviation = abs(dist_to_venue - expected_dist_to_venue) / total_route if total_route > 0 else 1
 
-        if dist_deviation > 0.25:  # More than 25% off route
+        if dist_deviation > 0.25:  # More than 25% off route (coarse along-track sanity)
             return None
         if route_progress < 0.1 or route_progress > 0.95:  # Too close to endpoints
+            return None
+
+        # CROSS-TRACK CORRIDOR GATE: the along-track ellipse above is ~800km
+        # wide on a transcontinental route, so it accepts flights bound for the
+        # same destination from a DIFFERENT origin (the Sun Country MSP→LAS
+        # scheduled flights that masqueraded as the Hurricanes' RDU→LAS charter,
+        # 566-700km off the real corridor). Require the plane to actually lie
+        # near the origin→dest great circle.
+        cross_track = self._cross_track_km(lat, lon, origin_lat, origin_lon,
+                                           venue_lat, venue_lon)
+        if cross_track > self.CORRIDOR_MAX_CROSS_TRACK_KM:
             return None
 
         # Verify heading toward venue
@@ -2268,7 +2334,14 @@ class RealTimeFlightTracker(QThread):
             for row in rows:
                 icao = row['icao24']
                 cur_score = cur.get(icao, (None, 0.0))[1]
-                scored.append((self._window_score(row, cur_score), row))
+                # Trace-confirmation (we actually traced this aircraft flying
+                # origin→dest and landing) is GROUND TRUTH and must dominate any
+                # live corridor heuristic — otherwise an unconfirmed scheduled
+                # flight with a high per-tick score outranks the real, confirmed
+                # charter (the DAL8958 case). Tier on confirmed first, then the
+                # accumulated window score breaks ties among confirmed flights.
+                scored.append(((row.get('confirmed_route') or 0,
+                                self._window_score(row, cur_score)), row))
             scored.sort(key=lambda x: x[0], reverse=True)
             lead_ws, lead_row = scored[0]
             icao = lead_row['icao24']
@@ -2392,12 +2465,22 @@ class RealTimeFlightTracker(QThread):
         # generous recent UTC window straight off the wall clock (catches any
         # same-day departure regardless of tz skew); the per-candidate filters
         # (direct, team-capable, recent departure) do the real selecting.
+        #
+        # Look back far enough to catch a charter that flew the DAY AFTER the
+        # previous game — standard for multi-day playoff gaps (Cup Final venue
+        # swaps), where a 16h lookback misses a >20h-ago arrival entirely. Span
+        # the previous game's end → now, floored at the old 16h and capped to
+        # keep heatmap bandwidth bounded.
+        hours_since_game = (now - w['last_game_end']).total_seconds() / 3600.0
+        hours_back = max(16.0, min(46.0, hours_since_game + 2.0))
+        n_slices = int(hours_back * 2) + 2   # 30-min slices, +headroom
         now_utc = datetime.utcnow()
-        slices = self._utc_slices(now_utc - timedelta(hours=16), now_utc, cap=24)
+        slices = self._utc_slices(now_utc - timedelta(hours=hours_back),
+                                  now_utc, cap=n_slices)
         if not slices:
             return
-        # Departure must be recent (same machine-local frame as leg['dep'])
-        dep_lo = now - timedelta(hours=16)
+        # Departure must fall within the same lookback span (machine-local frame)
+        dep_lo = now - timedelta(hours=hours_back)
 
         o_lat, o_lon = w['origin_lat'], w['origin_lon']
         d_lat, d_lon = w['dest_lat'], w['dest_lon']
@@ -2810,14 +2893,26 @@ class FlightControlPanel(QWidget):
     COLOR_DANGER = "#f85149"
     COLOR_MUTED = "#8b949e"
     COLOR_TEXT = "#e6edf3"
-    
+
+    # Projected-rest travel model (used when no charter arrival is confirmed)
+    _GAME_DURATION_H = 3.0     # postgame departure proxy
+    _GROUND_OVERHEAD_H = 3.0   # postgame->airport, board, deplane->hotel
+    _CRUISE_MPH = 450.0        # effective cruise incl. climb/descent
+    _REST_TIGHT_H = 12.0       # below this = flag a tight turnaround
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_league = "NHL"
         self.current_intelligence = None
         self.live_flight = None
         self.city_timezones = self._load_city_timezones()
-        
+        # Schedule-fatigue reports per league (every league is scored at
+        # startup, so keep them separate and look up by current_league when
+        # rendering). Used for the matchup-differential row + circadian badge.
+        self._fatigue_by_league = {}   # league -> (by_game, by_pair)
+        self.aggregator = None         # set externally by the panel
+        self._rest_ledger = None       # lazy read-only CharterLedger handle
+
         self._init_ui()
         self._apply_styles()
         self._connect_signals()
@@ -3150,7 +3245,115 @@ class FlightControlPanel(QWidget):
         
         return widget
     
-    def _create_route_card(self, route, index: int, total_routes: int, 
+    # ----------------------------------------------------- fatigue join
+
+    def set_fatigue_reports(self, league: str, season: str, reports: list):
+        """Receive schedule-fatigue reports (GameFatigueReport list) and index
+        them so route cards can show the matchup differential + circadian badge.
+        Re-renders the current display if it belongs to this league."""
+        by_game, by_pair = {}, {}
+        for r in reports or []:
+            by_game[r.game_id] = r
+            by_pair[frozenset((r.home.team_id.lower(),
+                               r.away.team_id.lower()))] = r
+        self._fatigue_by_league[(league or '').upper()] = (by_game, by_pair)
+        if (self.current_intelligence
+                and league and league.upper() == (self.current_league or '').upper()):
+            self._update_display(self.current_intelligence)
+
+    def _fatigue_for_game(self, game):
+        """Return GameFatigueReport for a route's game, matching on game_id
+        first then on the team pair (ids can differ across data sources)."""
+        if game is None:
+            return None
+        maps = self._fatigue_by_league.get((self.current_league or '').upper())
+        if not maps:
+            return None
+        by_game, by_pair = maps
+        gid = getattr(game, 'game_id', None)
+        if gid and gid in by_game:
+            return by_game[gid]
+        try:
+            pair = frozenset((game.home_team.team_id.lower(),
+                              game.away_team.team_id.lower()))
+        except AttributeError:
+            return None
+        return by_pair.get(pair)
+
+    @staticmethod
+    def _fatigue_dots(score: float) -> int:
+        """Bucket a 0-100 fatigue score into 1-3 filled dots."""
+        if score is None:
+            return 0
+        if score < 25:
+            return 1
+        if score < 50:
+            return 2
+        return 3
+
+    def _dot_color(self, filled: int) -> str:
+        return (self.COLOR_SUCCESS if filled <= 1
+                else self.COLOR_WARNING if filled == 2
+                else self.COLOR_DANGER)
+
+    # ----------------------------------------------------- rest window
+
+    def _get_rest_ledger(self):
+        """Lazy read-only CharterLedger on the shared DB (independent of the
+        live tracker's lifecycle — the observations persist in the DB)."""
+        if self._rest_ledger is None:
+            try:
+                db_path = self.aggregator.db.db_path
+                self._rest_ledger = CharterLedger(db_path)
+            except Exception:
+                return None
+        return self._rest_ledger
+
+    @staticmethod
+    def _as_naive(dt):
+        return dt.replace(tzinfo=None) if getattr(dt, 'tzinfo', None) else dt
+
+    def _estimate_rest(self, route, index: int, intelligence):
+        """Effective rest hours before THIS game = start − arrival-at-hotel.
+        Uses the charter-confirmed arr_time when the ledger has one, else a
+        projection from the prior game + travel. Returns (hours, confirmed) or
+        None when this isn't a same-trip compressed leg worth flagging."""
+        game = route.game_data
+        if game is None or index <= 0 or not intelligence.upcoming_routes:
+            return None
+        prev_game = intelligence.upcoming_routes[index - 1].game_data
+        if (prev_game is None or not getattr(game, 'date', None)
+                or not getattr(prev_game, 'date', None)):
+            return None
+        gap_h = (game.date - prev_game.date).total_seconds() / 3600.0
+        if gap_h <= 0 or gap_h > 48:   # ample rest — not a tight leg
+            return None
+
+        # Confirmed arrival (rare for far-future games, decisive when present)
+        arrival, confirmed = None, False
+        ledger = self._get_rest_ledger()
+        if ledger is not None and intelligence.team_info:
+            arr = ledger.confirmed_arrival(
+                self.current_league or '',
+                intelligence.team_info.team_id or '',
+                getattr(game, 'game_id', '') or '')
+            if arr is not None:
+                arrival, confirmed = arr, True
+
+        if arrival is None:
+            dist_mi = getattr(route, 'travel_distance', 0) or 0
+            if dist_mi > 50:
+                travel_h = dist_mi / self._CRUISE_MPH + self._GROUND_OVERHEAD_H
+            else:
+                travel_h = 0.5  # same metro: bus, negligible
+            arrival = prev_game.date + timedelta(
+                hours=self._GAME_DURATION_H + travel_h)
+
+        rest_h = ((self._as_naive(game.date) - self._as_naive(arrival))
+                  .total_seconds() / 3600.0)
+        return (max(0.0, rest_h), confirmed)
+
+    def _create_route_card(self, route, index: int, total_routes: int,
                           intelligence: 'TeamTravelIntelligence') -> QFrame:
         """Create a route card with full details"""
         frame = QFrame()
@@ -3167,20 +3370,47 @@ class FlightControlPanel(QWidget):
         
         # Determine game date
         game_date = game.date if game else (travel_data.game_date if travel_data else datetime.now())
-        opponent = game.home_team.display_name if game else (travel_data.opponent if travel_data else "Unknown")
         venue_name = game.venue.name if game and game.venue else "Unknown Venue"
         venue_city = game.venue.city if game and game.venue else (travel_data.arrival_city if travel_data else "Unknown")
-        
+
+        focus_id = ((intelligence.team_info.team_id or '').lower()
+                    if intelligence and intelligence.team_info else None)
+
+        # Opponent + home/away prefix. A travel record exists for return-home
+        # legs too, so the destination isn't always the opponent's park —
+        # derive the opponent as the side that ISN'T the focus team and show
+        # "vs" for a home game, "@" for a road game.
+        if game and focus_id and game.home_team.team_id.lower() == focus_id:
+            opponent = game.away_team.display_name      # focus hosts
+            home_prefix = "vs"
+        elif game:
+            opponent = game.home_team.display_name      # focus visiting
+            home_prefix = "@"
+        else:
+            opponent = travel_data.opponent if travel_data else "Unknown"
+            home_prefix = "@"
+
         # Departure/arrival
         dep_city = travel_data.departure_city if travel_data else "Home"
         arr_city = travel_data.arrival_city if travel_data else venue_city
         dep_airport = travel_data.departure_airport if travel_data else "---"
         arr_airport = travel_data.arrival_airport if travel_data else "---"
-        
+
         # Road trip context
         road_game_num = travel_data.homestand_game_number if travel_data else None
         series_game = travel_data.series_game_number if travel_data else None
-        
+
+        # Schedule-fatigue join: focus team vs opponent for THIS game.
+        report = self._fatigue_for_game(game)
+        focus_tf = opp_tf = None
+        if report:
+            if focus_id and report.home.team_id.lower() == focus_id:
+                focus_tf, opp_tf = report.home, report.away
+            elif focus_id and report.away.team_id.lower() == focus_id:
+                focus_tf, opp_tf = report.away, report.home
+            else:  # focus unknown — the traveling side is the away team
+                focus_tf, opp_tf = report.away, report.home
+
         # === Header Row ===
         header_row = QHBoxLayout()
         
@@ -3226,7 +3456,7 @@ class FlightControlPanel(QWidget):
         
         # Truncate opponent name if needed
         opp_display = opponent[:20] + "…" if len(opponent) > 20 else opponent
-        opp_lbl = QLabel(f"@ {opp_display}")
+        opp_lbl = QLabel(f"{home_prefix} {opp_display}")
         opp_lbl.setFont(self.FONT_BODY)
         opp_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
         venue_row.addWidget(opp_lbl)
@@ -3258,18 +3488,89 @@ class FlightControlPanel(QWidget):
             ctx_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
             route_row.addWidget(ctx_lbl)
         
-        # Timezone change
-        tz_diff = self._calculate_timezone_diff(dep_city, arr_city)
-        if tz_diff != 0:
-            tz_str = f"+{tz_diff}h" if tz_diff > 0 else f"{tz_diff}h"
-            tz_lbl = QLabel(f"· {tz_str} TZ")
-            tz_lbl.setFont(self.FONT_SMALL)
-            tz_lbl.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
-            route_row.addWidget(tz_lbl)
-        
+        # Circadian badge: the validated cumulative body-clock signal (signed,
+        # eastward = jet-lag penalty), NOT the washed-out single-leg tz hop.
+        # Falls back to the raw tz diff only when no fatigue report is joined.
+        circ = focus_tf.circadian if focus_tf else None
+        if circ is not None and abs(circ) >= 1.0:
+            if circ > 0:  # eastward — the penalty direction
+                badge = QLabel(f"· ↻ +{circ:.0f}h E jet lag")
+                badge.setStyleSheet(f"color: {self.COLOR_DANGER}; background: transparent;")
+            else:         # westward — eased, neutral
+                badge = QLabel(f"· ↻ {circ:.0f}h W (eased)")
+                badge.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
+            badge.setFont(self.FONT_SMALL)
+            route_row.addWidget(badge)
+        else:
+            tz_diff = self._calculate_timezone_diff(dep_city, arr_city)
+            if tz_diff != 0:
+                tz_str = f"+{tz_diff}h" if tz_diff > 0 else f"{tz_diff}h"
+                tz_lbl = QLabel(f"· {tz_str} TZ")
+                tz_lbl.setFont(self.FONT_SMALL)
+                tz_lbl.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
+                route_row.addWidget(tz_lbl)
+
         route_row.addStretch()
-        
+
         layout.addLayout(route_row)
+
+        # === Matchup Fatigue Row ===
+        # Both teams' schedule-fatigue at a glance + which side the rested-edge
+        # favors. This is the differential a trader actually bets on.
+        if focus_tf is not None and opp_tf is not None:
+            mf_row = QHBoxLayout()
+            mf_row.setSpacing(6)
+
+            focus_abbr = focus_tf.team_id.upper()
+            opp_abbr = opp_tf.team_id.upper()
+            f_dots = self._fatigue_dots(focus_tf.score)
+            o_dots = self._fatigue_dots(opp_tf.score)
+
+            f_lbl = QLabel(f"{focus_abbr} {'●' * f_dots}{'○' * (3 - f_dots)}")
+            f_lbl.setFont(self.FONT_MONO)
+            f_lbl.setStyleSheet(f"color: {self._dot_color(f_dots)}; background: transparent;")
+            mf_row.addWidget(f_lbl)
+
+            vs_lbl = QLabel("vs")
+            vs_lbl.setFont(self.FONT_SMALL)
+            vs_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
+            mf_row.addWidget(vs_lbl)
+
+            o_lbl = QLabel(f"{opp_abbr} {'●' * o_dots}{'○' * (3 - o_dots)}")
+            o_lbl.setFont(self.FONT_MONO)
+            o_lbl.setStyleSheet(f"color: {self._dot_color(o_dots)}; background: transparent;")
+            mf_row.addWidget(o_lbl)
+
+            mf_row.addStretch()
+
+            # Edge chip: the LESS fatigued side holds the schedule edge. Only
+            # show it when the gap is meaningful (>= 8 pts on the 0-100 scale).
+            diff = focus_tf.score - opp_tf.score
+            if abs(diff) >= 8.0:
+                edge_team = opp_abbr if diff > 0 else focus_abbr
+                edge_lbl = QLabel(f"EDGE {edge_team}  Δ{abs(diff):.0f}")
+                edge_lbl.setFont(self.FONT_TITLE)
+                edge_lbl.setStyleSheet(f"color: {self.COLOR_ACCENT}; background: transparent;")
+                mf_row.addWidget(edge_lbl)
+
+            layout.addLayout(mf_row)
+
+        # === Rest / Ground-Logistics Chip ===
+        # Effective recovery window before this game given the prior game +
+        # travel. The signal a hotel's *location* (not its star rating) feeds:
+        # a tight turnaround compounds the circadian debt above.
+        rest = self._estimate_rest(route, index, intelligence)
+        if rest is not None:
+            rest_h, confirmed = rest
+            tight = rest_h < self._REST_TIGHT_H
+            icon = "⏱" if tight else "🛏"
+            color = self.COLOR_DANGER if tight else self.COLOR_MUTED
+            tag = "confirmed" if confirmed else "proj"
+            num = f"{rest_h:.1f}h" if confirmed else f"~{rest_h:.0f}h"
+            rest_lbl = QLabel(f"{icon} {num} rest · {tag}")
+            rest_lbl.setFont(self.FONT_SMALL)
+            rest_lbl.setStyleSheet(f"color: {color}; background: transparent;")
+            layout.addWidget(rest_lbl)
         
         # === Airport Info ===
         if route.primary_airport:
