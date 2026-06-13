@@ -6,6 +6,7 @@ from concurrent.futures.process import BrokenProcessPool
 import feedparse_worker
 from datetime import datetime
 import calendar
+import html
 import re
 import sys
 import webbrowser
@@ -144,6 +145,51 @@ class NewsWorker(QObject):
                     "https://feeds.bbci.co.uk/sport/rugby-league/rss.xml",
                     "https://www.theguardian.com/sport/rugby-union/rss",
                     "https://www.espn.com/espn/rss/rugby/news",
+                ]
+            },
+            # Korean sports (KBO baseball, KBL basketball) via Google News RSS.
+            # Naver — the obvious source — killed public RSS and 403s its JSON
+            # API, and the reporting on Naver is syndicated from Korean outlets
+            # (조선일보, 뉴스1, Yonhap...). Querying Google News by TOPIC (not
+            # site:naver.com, which only returns Naver's untranslated portal
+            # index pages) returns those same outlets' stories, and the
+            # hl=en-US&ceid=US:en locale makes Google hand back headlines
+            # PRE-TRANSLATED to English — so they flow through the existing
+            # score/category/dedupe regexes (all English) with zero new code.
+            # `when:Nd` bounds recency; KBL widened to 30d since its season is
+            # Oct–Apr (sparse in summer). Translation is headline-only/best
+            # effort — descriptions may stay Korean, which only weakens the
+            # body-text half of relevance scoring, not the headline half.
+            "baseball_kbo": {
+                "general": [
+                    'https://news.google.com/rss/search?q=%22KBO%22+baseball+when:7d&hl=en-US&gl=US&ceid=US:en',
+                    'https://news.google.com/rss/search?q=%22Korea+Baseball%22+OR+%22KBO+League%22+when:7d&hl=en-US&gl=US&ceid=US:en',
+                ]
+            },
+            "basketball_kbl": {
+                "general": [
+                    'https://news.google.com/rss/search?q=%22Korean+Basketball+League%22+OR+%22KBL%22+basketball+when:30d&hl=en-US&gl=US&ceid=US:en',
+                ]
+            },
+            # NPB — Nippon Professional Baseball (Japan). Same Google News
+            # English-locale trick as the Korean buckets. Bare `NPB baseball`
+            # beats the `"Nippon Professional Baseball"` phrase, which pulls
+            # Pokémon/merch noise from Japanese toy sites; the second feed
+            # widens to the Central/Pacific League names for team coverage.
+            "baseball_npb": {
+                "general": [
+                    'https://news.google.com/rss/search?q=NPB+baseball+when:7d&hl=en-US&gl=US&ceid=US:en',
+                    'https://news.google.com/rss/search?q=NPB+OR+%22Central+League%22+OR+%22Pacific+League%22+baseball+when:7d&hl=en-US&gl=US&ceid=US:en',
+                ]
+            },
+            # CBA — Chinese Basketball Association (China). "CBA" alone is
+            # hopelessly ambiguous (collective bargaining agreement, the old
+            # Continental Basketball Association), so the query anchors on the
+            # full league name OR a CBA+basketball+China conjunction. Widened
+            # to 30d — the CBA season runs Oct–Apr, sparse in summer.
+            "basketball_cba": {
+                "general": [
+                    'https://news.google.com/rss/search?q=%22Chinese+Basketball+Association%22+OR+%28CBA+basketball+China%29+when:30d&hl=en-US&gl=US&ceid=US:en',
                 ]
             },
         }
@@ -521,17 +567,31 @@ class NewsWorker(QObject):
                 title = entry.title[:120] if hasattr(entry, 'title') else "No Title"
                 description = entry.get('summary', '')
 
-                # Remove HTML tags from description
+                # Remove HTML tags, then decode entities. Google News RSS
+                # descriptions ship literal &nbsp;/&amp; (the tag-strip alone
+                # left them visible in the expanded row).
                 description = re.sub(r'<[^>]+>', '', description)
+                description = html.unescape(description)
                 description = description[:200] + '...' if len(description) > 200 else description
+
+                # Per-item publisher beats the feed title. Google News
+                # aggregator feeds set every item's feed.title to the search
+                # query ("\"KBO\" baseball... - Google News"); the real outlet
+                # (Yonhap, 조선일보, Korea Times) lives in the item's <source>.
+                entry_source = entry.get('source')
+                item_source = (
+                    (entry_source.get('title') if isinstance(entry_source, dict) else '')
+                    # `or` fallback: some feeds (Yahoo soccer) ship an empty <title>
+                    or (feed.feed.get('title', '') if hasattr(feed, 'feed') else '')
+                    or url.split('/')[2]
+                )
 
                 fetched_news_items.append({
                     'title': title,
                     'description': description,
                     'link': entry.link,
                     'date': date,
-                    # `or` fallback: some feeds (Yahoo soccer) ship an empty <title>
-                    'source': (feed.feed.get('title', '') if hasattr(feed, 'feed') else '') or url.split('/')[2],
+                    'source': item_source,
                     'image_url': image_url,
                     'league': league
                 })
@@ -736,6 +796,10 @@ LEAGUE_CHIPS = [
     ("soccer", "SOC"),
     ("tennis", "TEN"),
     ("rugby", "RUG"),
+    ("baseball_kbo", "KBO"),
+    ("basketball_kbl", "KBL"),
+    ("baseball_npb", "NPB"),
+    ("basketball_cba", "CBA"),
 ]
 
 
@@ -904,6 +968,9 @@ class NewsRowDelegate(QStyledItemDelegate):
         ("rotowire", "ROTO"), ("espn", "ESPN"), ("cbs", "CBS"),
         ("yahoo", "YAHOO"), ("fox", "FOX"), ("mlb trade", "MLBTR"),
         ("mlbtraderumors", "MLBTR"), ("closer", "CLOSER"), ("nfl", "NFL"),
+        # Korean-sport feeds (Google News aggregates these outlets)
+        ("yonhap", "YONHAP"), ("korea times", "KRTIMES"),
+        ("korea herald", "KRHERALD"), ("korea jo", "JOONGANG"),
     ]
 
     def __init__(self, view, owner):
@@ -1441,6 +1508,36 @@ class TeamNewsWidget(QWidget):
                 "Arsenal", "Aston Villa", "Chelsea", "Everton", "Liverpool",
                 "Manchester City", "Manchester United", "Newcastle",
                 "Tottenham", "West Ham"
+            ],
+            # KBO nicknames as they surface in Google News' English-translated
+            # headlines ("KT Wiz sign...", "Samsung Lions Legend..."). The text
+            # search box covers city/sponsor variants the dropdown misses.
+            "baseball_kbo": [
+                "Doosan Bears", "LG Twins", "Kiwoom Heroes", "SSG Landers",
+                "KT Wiz", "NC Dinos", "Samsung Lions", "Lotte Giants",
+                "Hanwha Eagles", "KIA Tigers"
+            ],
+            # KBL clubs — Google's translations vary between city, sponsor and
+            # nickname, so these are the most commonly surfaced forms.
+            "basketball_kbl": [
+                "SK Knights", "KGC", "LG Sakers", "Sono", "KOGAS",
+                "KCC Egis", "Hyundai Mobis", "DB Promy", "KT Sonicboom",
+                "Samsung Thunders"
+            ],
+            # NPB (12 clubs) as the English-translation nicknames surface them
+            # — "Hanshin Tigers", "SoftBank Hawks", "Yokohama DeNA BayStars".
+            "baseball_npb": [
+                "Yomiuri Giants", "Hanshin Tigers", "Yokohama DeNA BayStars",
+                "Hiroshima Toyo Carp", "Tokyo Yakult Swallows", "Chunichi Dragons",
+                "SoftBank Hawks", "Chiba Lotte Marines", "Seibu Lions",
+                "Rakuten Eagles", "Nippon-Ham Fighters", "Orix Buffaloes"
+            ],
+            # CBA team names translate inconsistently (city vs nickname); these
+            # are the most commonly surfaced forms. Text search covers the rest.
+            "basketball_cba": [
+                "Shanghai Sharks", "Zhejiang", "Liaoning Flying Leopards",
+                "Guangdong", "Beijing Ducks", "Xinjiang Flying Tigers",
+                "Shenzhen", "Shandong", "Jiangsu", "Guangzhou", "Qingdao"
             ]
             # tennis/rugby have no team lists — the dropdown just shows
             # "All Teams" and the text filter covers player/club names
