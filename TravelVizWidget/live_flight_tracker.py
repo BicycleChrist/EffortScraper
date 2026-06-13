@@ -5,12 +5,13 @@ Integrates with OpenSky Network and correlates with game schedule
 """
 import requests
 import json
+import os
 import time
 import math
 import sqlite3
 import threading
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from requests.auth import HTTPBasicAuth
@@ -19,7 +20,114 @@ from database_manager import DatabaseManager, TeamInfo, CITY_TZ
 from opensky import NBAFlightTracker
 import logging
 
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+
 logger = logging.getLogger(__name__)
+
+# Heatmap record = 16 bytes: hex(i32), lat(i32 deg*1e6), lon(i32), alt(i16), gs(i16)
+_HEAT_DT = np.dtype([("hex", "<i4"), ("lat", "<i4"), ("lon", "<i4"),
+                     ("alt", "<i2"), ("gs", "<i2")]) if _HAS_NUMPY else None
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _within_km_vec(lat, lon, lat0, lon0, radius_km):
+    """Vectorized point-in-radius mask (numpy arrays in)."""
+    R = 6371.0
+    p1 = np.radians(lat)
+    dp = np.radians(lat0 - lat)
+    dl = np.radians(lon0 - lon)
+    a = (np.sin(dp / 2) ** 2 +
+         math.cos(math.radians(lat0)) * np.cos(p1) * np.sin(dl / 2) ** 2)
+    return (2 * R * np.arcsin(np.sqrt(a))) <= radius_km
+
+
+def parse_heatmap(blob: bytes):
+    """Vectorized parse of a heatmap slice → (hex24[], lat[], lon[], alt_ft[]).
+    Index/marker records (lat==lon==0 / out of range) are dropped. Altitude is
+    raw×25 ft (negative raw = on ground → returned as 0). numpy keeps this at
+    ~tens of ms per ~1.8M-record slice."""
+    if not blob or not _HAS_NUMPY:
+        return (np.empty(0, "i4"), np.empty(0), np.empty(0), np.empty(0)) \
+            if _HAS_NUMPY else ([], [], [], [])
+    arr = np.frombuffer(blob, dtype=_HEAT_DT)
+    lat_i, lon_i = arr["lat"], arr["lon"]
+    good = ((lat_i != 0) & (lon_i != 0) &
+            (np.abs(lat_i) <= 90_000_000) & (np.abs(lon_i) <= 180_000_000))
+    a = arr[good]
+    alt_ft = np.maximum(a["alt"].astype("i4"), 0) * 25
+    return (a["hex"] & 0xFFFFFF), a["lat"] / 1e6, a["lon"] / 1e6, alt_ft
+
+
+def analyze_trace_leg(trace: Dict, o_lat, o_lon, o_r_km,
+                      d_lat, d_lon, d_r_km) -> Optional[Dict]:
+    """Find the origin->dest leg in an aircraft trace. Returns
+    {dep, arr (datetime), dur_h, max_alt, calls[], landed_dest} or None.
+    A point is 'on ground' when alt=='ground' or alt<1000ft."""
+    base = trace.get("timestamp", 0)
+    pts = trace.get("trace", [])
+    if not pts:
+        return None
+
+    def is_ground(alt):
+        return alt == "ground" or (isinstance(alt, (int, float)) and alt < 1000)
+
+    dep_t = dep_idx = None
+    for i, p in enumerate(pts):
+        lat, lon, alt = p[1], p[2], p[3]
+        if _haversine_km(lat, lon, o_lat, o_lon) <= o_r_km and is_ground(alt):
+            dep_t, dep_idx = base + p[0], i
+    if dep_idx is None:  # never seen on the ground at origin (coverage gap)
+        for i, p in enumerate(pts):
+            if _haversine_km(p[1], p[2], o_lat, o_lon) <= o_r_km:
+                dep_t, dep_idx = base + p[0], i
+                break
+    if dep_idx is None:
+        return None
+
+    arr_t = None
+    landed_dest = False
+    for p in pts[dep_idx:]:
+        lat, lon, alt = p[1], p[2], p[3]
+        if _haversine_km(lat, lon, d_lat, d_lon) <= d_r_km and is_ground(alt):
+            arr_t, landed_dest = base + p[0], True
+            break
+    if arr_t is None:
+        best = min(pts[dep_idx:],
+                   key=lambda p: _haversine_km(p[1], p[2], d_lat, d_lon),
+                   default=None)
+        if best is None or _haversine_km(
+                best[1], best[2], d_lat, d_lon) > d_r_km * 2:
+            return None
+        arr_t = base + best[0]
+
+    max_alt = max((p[3] for p in pts[dep_idx:]
+                   if isinstance(p[3], (int, float))), default=0)
+    calls = []
+    for p in pts[dep_idx:]:
+        if len(p) > 8 and isinstance(p[8], dict):
+            f = (p[8].get("flight") or "").strip()
+            if f and f not in calls:
+                calls.append(f)
+    return {
+        "dep": datetime.fromtimestamp(dep_t),
+        "arr": datetime.fromtimestamp(arr_t),
+        "dur_h": (arr_t - dep_t) / 3600.0,
+        "max_alt": max_alt,
+        "calls": calls,
+        "landed_dest": landed_dest,
+    }
 
 
 # Continental US bounding box for efficient API queries
@@ -32,6 +140,17 @@ US_BOUNDING_BOX = {
 
 # Charter aircraft types used by pro sports teams
 CHARTER_AIRCRAFT_TYPES = ['B752', 'B753', 'A21N', 'A321', 'B738', 'B739']
+
+# Aircraft a FULL team (~15 players + staff + media, 40-60 people) can actually
+# fly — narrow/wide-body airliners only. A team never charters a business jet
+# (Citation/Gulfstream/Challenger won't fit them), so bizjets on the corridor
+# are noise, not the charter. Used to filter heatmap-backfill candidates.
+TEAM_CAPABLE_TYPES = {
+    'B712', 'B722', 'B732', 'B733', 'B734', 'B735', 'B736', 'B737', 'B738',
+    'B739', 'B73G', 'B38M', 'B39M', 'B752', 'B753', 'B762', 'B763', 'B764',
+    'A318', 'A319', 'A320', 'A321', 'A19N', 'A20N', 'A21N',
+    'BCS1', 'BCS3', 'E170', 'E175', 'E190', 'E195', 'E290', 'E75L', 'E75S',
+}
 
 
 class AdsbLolClient:
@@ -106,13 +225,20 @@ class AdsbLolClient:
             logger.warning(f"⚠️ adsb.lol error for {type_code}: {e}")
             return []
 
-    def get_charter_aircraft(self, types: List[str] = None) -> List[Dict]:
-        """Get all charter-type aircraft (B752, A21N, etc.)"""
+    def get_charter_aircraft(self, types: List[str] = None,
+                             stop_event: "threading.Event" = None) -> List[Dict]:
+        """Get all charter-type aircraft (B752, A21N, etc.).
+
+        Issues one HTTP GET per type serially. `stop_event`, if given, is
+        checked between requests so shutdown doesn't have to wait out the
+        whole chain of in-flight calls (~3s otherwise)."""
         types = types or CHARTER_AIRCRAFT_TYPES
         all_aircraft = []
         seen_hex = set()
 
         for type_code in types:
+            if stop_event is not None and stop_event.is_set():
+                break
             aircraft = self.get_aircraft_by_type(type_code)
             for ac in aircraft:
                 hex_id = ac.get('hex', '').lower()
@@ -131,6 +257,70 @@ class AdsbLolClient:
             and US_BOUNDING_BOX['lat_min'] <= ac['lat'] <= US_BOUNDING_BOX['lat_max']
             and US_BOUNDING_BOX['lon_min'] <= ac['lon'] <= US_BOUNDING_BOX['lon_max']
         ]
+
+    def get_aircraft_near_point(self, lat: float, lon: float,
+                                radius_nm: float = 250) -> List[Dict]:
+        """All airborne aircraft within radius_nm of a point (live /v2/point).
+        Area enumeration that, unlike type filtering, doesn't miss off-type
+        charters (an A319/A320 team charter the type list would skip)."""
+        try:
+            r = self.session.get(
+                f"{self.BASE_URL}/point/{lat}/{lon}/{int(radius_nm)}", timeout=15)
+            r.raise_for_status()
+            return r.json().get('ac', [])
+        except Exception as e:
+            logger.warning(f"⚠️ adsb.lol point query error: {e}")
+            return []
+
+    # === Historical reconstruction (folded from charter_replay) ============
+    # The live endpoints above are airborne-NOW only. These two sources give
+    # history, used to (a) confirm a candidate's actual origin->dest route and
+    # detect that it has LANDED, and (b) enumerate flights a team already took
+    # earlier in the window (before the app was running) from the day heatmap.
+
+    GLOBE_BASE = "https://globe.adsb.lol"
+
+    def fetch_trace(self, hexid: str) -> Optional[Dict]:
+        """Full-day timestamped track for one aircraft + reg/type/operator.
+        trace['trace'] points = [dt, lat, lon, alt('ground'|ft), gs, track,...]
+        with point[8] a detail dict carrying the callsign when it changed."""
+        hexid = hexid.strip().lower()
+        try:
+            r = self.session.get(
+                f"{self.GLOBE_BASE}/data/traces/{hexid[-2:]}/"
+                f"trace_full_{hexid}.json", timeout=20)
+            if r.status_code != 200:
+                return None
+            return r.json()
+        except Exception as e:
+            logger.debug(f"trace fetch failed for {hexid}: {e}")
+            return None
+
+    HEATMAP_CACHE = Path("/tmp/charter_replay_cache")
+
+    def fetch_heatmap_slice(self, d: "date", idx: int) -> bytes:
+        """One 30-min historical heatmap slice (idx 0..47, UTC). ~7-17MB each
+        — call sparingly (window backfill only, never per poll tick).
+        Disk-cached so a window is only ever downloaded once."""
+        try:
+            self.HEATMAP_CACHE.mkdir(exist_ok=True)
+            fn = self.HEATMAP_CACHE / f"{d.isoformat()}_{idx:02d}.bin"
+            if fn.exists():
+                return fn.read_bytes()
+        except Exception:
+            fn = None
+        try:
+            r = self.session.get(
+                f"{self.GLOBE_BASE}/globe_history/"
+                f"{d.year}/{d.month:02d}/{d.day:02d}/heatmap/{idx:02d}.bin.ttf",
+                timeout=60)
+            blob = r.content if r.status_code == 200 else b""
+            if blob and fn is not None:
+                fn.write_bytes(blob)
+            return blob
+        except Exception as e:
+            logger.debug(f"heatmap slice {idx} fetch failed: {e}")
+            return b""
 
 
 @dataclass
@@ -383,6 +573,11 @@ class LiveFlight:
     dest_lon: Optional[float] = None
     route_progress: Optional[float] = None
 
+    # Charter ledger linkage
+    window_id: Optional[str] = None       # which travel window this matches
+    timing_bonus: float = 0.0             # per-candidate departure-timing fit
+    landed: bool = False                  # trace-confirmed arrival at dest
+
     @property
     def altitude_ft(self) -> float:
         return self.altitude_m * 3.28084 if self.altitude_m else 0
@@ -452,6 +647,131 @@ class LiveGameStateStore:
         """When the team's most recent game was observed to end, if seen."""
         with self._lock:
             return self._finished_at.get((league, team_id.lower()))
+
+
+class CharterLedger:
+    """Per-travel-window observation ledger (sqlite, in sports_data.db).
+
+    The fix for "several different flights per day": instead of picking the
+    best of the CURRENT airborne snapshot every tick, we accumulate evidence
+    per (window, aircraft) across the whole window and pick the argmax of
+    accumulated+current. A charter seen flying the corridor early banks
+    dominant evidence (n_obs, wide route-progress span, prime timing) and
+    keeps winning even after it lands — while later same-corridor scheduled
+    flights can't displace it. Survives app restarts (it's in the DB), which
+    kills the startup-amnesia re-shopping.
+
+    Thread-safe via its own short-lived connections (tracker thread writes).
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_table()
+
+    def _conn(self):
+        c = sqlite3.connect(self.db_path, timeout=30.0)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA busy_timeout=30000")
+        return c
+
+    def _init_table(self):
+        with self._lock, self._conn() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS charter_observations (
+                    window_id     TEXT NOT NULL,
+                    league        TEXT, team_id TEXT,
+                    icao24        TEXT NOT NULL,
+                    callsign      TEXT, registration TEXT,
+                    aircraft_type TEXT, operator TEXT,
+                    first_seen    TIMESTAMP, last_seen TIMESTAMP,
+                    n_obs         INTEGER DEFAULT 0,
+                    max_score     REAL DEFAULT 0,
+                    sum_score     REAL DEFAULT 0,
+                    min_progress  REAL, max_progress REAL,
+                    best_timing   REAL DEFAULT 0,
+                    dep_time      TIMESTAMP, arr_time TIMESTAMP,
+                    landed        INTEGER DEFAULT 0,
+                    confirmed_route INTEGER DEFAULT 0,
+                    origin_city   TEXT, dest_city TEXT,
+                    origin_lat    REAL, origin_lon REAL,
+                    dest_lat      REAL, dest_lon REAL,
+                    last_lat      REAL, last_lon REAL,
+                    PRIMARY KEY (window_id, icao24)
+                )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_obs_window "
+                      "ON charter_observations(window_id)")
+
+    def observe(self, window_id: str, league: str, team_id: str,
+                flight: "LiveFlight", score: float, timing: float,
+                progress: Optional[float]):
+        """Record/accumulate one tick's sighting of a candidate aircraft."""
+        now = datetime.now()
+        prog = progress if progress is not None else 0.0
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT n_obs, min_progress, max_progress, max_score, "
+                "best_timing FROM charter_observations "
+                "WHERE window_id=? AND icao24=?",
+                (window_id, flight.icao24)).fetchone()
+            if row is None:
+                c.execute("""INSERT INTO charter_observations
+                    (window_id, league, team_id, icao24, callsign, registration,
+                     aircraft_type, operator, first_seen, last_seen, n_obs,
+                     max_score, sum_score, min_progress, max_progress, best_timing,
+                     origin_city, dest_city, origin_lat, origin_lon,
+                     dest_lat, dest_lon, last_lat, last_lon)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (window_id, league, team_id, flight.icao24, flight.callsign,
+                     flight.registration, flight.aircraft_type, None, now, now,
+                     1, score, score, prog, prog, timing,
+                     flight.origin_city, flight.dest_city,
+                     flight.origin_lat, flight.origin_lon,
+                     flight.dest_lat, flight.dest_lon,
+                     flight.latitude, flight.longitude))
+            else:
+                c.execute("""UPDATE charter_observations SET
+                     last_seen=?, n_obs=n_obs+1,
+                     max_score=MAX(max_score,?), sum_score=sum_score+?,
+                     min_progress=MIN(min_progress,?), max_progress=MAX(max_progress,?),
+                     best_timing=MAX(best_timing,?), callsign=?,
+                     last_lat=?, last_lon=?
+                     WHERE window_id=? AND icao24=?""",
+                    (now, score, score, prog, prog, timing,
+                     flight.callsign, flight.latitude, flight.longitude,
+                     window_id, flight.icao24))
+
+    def set_route_info(self, window_id: str, icao24: str, *, dep=None, arr=None,
+                       landed=None, confirmed=None, operator=None,
+                       aircraft_type=None):
+        sets, vals = [], []
+        for col, v in (("dep_time", dep), ("arr_time", arr),
+                       ("landed", landed), ("confirmed_route", confirmed),
+                       ("operator", operator), ("aircraft_type", aircraft_type)):
+            if v is not None:
+                sets.append(f"{col}=?")
+                vals.append(int(v) if col in ("landed", "confirmed_route") else v)
+        if not sets:
+            return
+        vals += [window_id, icao24]
+        with self._lock, self._conn() as c:
+            c.execute(f"UPDATE charter_observations SET {','.join(sets)} "
+                      "WHERE window_id=? AND icao24=?", vals)
+
+    def window_rows(self, window_id: str) -> List[dict]:
+        with self._lock, self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM charter_observations WHERE window_id=?",
+                (window_id,)).fetchall()]
+
+    def prune(self, keep_window_ids: Set[str], max_age_days: int = 4):
+        """Drop rows for windows no longer active and not seen recently.
+        Completed-window rows ARE the charter registry; keep them a few days
+        for the team→tail-number history before pruning."""
+        cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM charter_observations WHERE last_seen < ?",
+                      (cutoff,))
 
 
 class TeamFlightDetector:
@@ -868,6 +1188,11 @@ class TeamFlightDetector:
                 'origin_lon': last_game['longitude'],
                 'dest_lat': next_game['latitude'],
                 'dest_lon': next_game['longitude'],
+                # Stable window identity for the charter ledger: same key
+                # across restarts and ticks, changes only when the team's
+                # game pair changes (i.e. they actually played the next game).
+                'window_id': (f"{self.league}_{team_id}_"
+                              f"{last_game['game_id']}_{next_game['game_id']}"),
             }
 
         except Exception as e:
@@ -875,6 +1200,10 @@ class TeamFlightDetector:
             import traceback
             traceback.print_exc()
             return None
+
+    def window_id_for(self, team_id: str) -> Optional[str]:
+        w = self.get_team_travel_window(team_id)
+        return w['window_id'] if w else None
 
     def _observed_finish(self, team_id: str, game_date_str) -> Optional[datetime]:
         """Live-feed observed finish time for the team's game starting at
@@ -1203,15 +1532,17 @@ class TeamFlightDetector:
                         reasons.append(f"{operator} charter")
                         break
 
-            # Check for charter-like flight numbers (8xxx/9xxx = often charters)
-            if callsign and len(callsign) >= 4:
-                try:
-                    flight_num = int(''.join(c for c in callsign[3:] if c.isdigit()))
-                    if flight_num >= 8000:
-                        confidence += 10
-                        reasons.append("charter-range callsign")
-                except ValueError:
-                    pass
+            # Charter callsign SIGNATURE: trailing-letter positioning suffix
+            # (AAL606P, DAL1234P) is a real charter tell — validated against
+            # the Knicks' AAL606P. NOTE: the old "8xxx/9xxx = charter" rule
+            # was DROPPED — it's actively wrong for hometown-airline charters
+            # (the Twins' real charter SCX346 is low-numbered while scheduled
+            # SCX8992/SCX3084 are high), so it favored the impostors.
+            if callsign and len(callsign) >= 5:
+                cs = callsign.upper()
+                if cs[-1].isalpha() and cs[3:-1].isdigit():
+                    confidence += 10
+                    reasons.append(f"positioning callsign ({cs})")
 
             # Schedule correlation with ORIGIN verification (+50 max)
             schedule_match = self._correlate_with_schedule_and_origin(
@@ -1251,6 +1582,8 @@ class TeamFlightDetector:
             dest_lat=route.get('dest_lat'),
             dest_lon=route.get('dest_lon'),
             route_progress=route.get('route_progress'),
+            window_id=route.get('window_id'),
+            timing_bonus=route.get('timing_bonus', 0.0),
         )
 
     def _haversine_distance(self, lat1: float, lon1: float,
@@ -1531,14 +1864,18 @@ class TeamFlightDetector:
         # wall clock, giving every candidate on the corridor the same bonus.
         dep_delay_hours = (estimated_departure -
                            travel_window['last_game_end']).total_seconds() / 3600
+        # Timing is the DOMINANT discriminator (replay lesson: the real
+        # charter departs closest to the actual game end; same-corridor
+        # scheduled flights don't). Weighted heavily so it outranks the
+        # operator/type tiebreakers a flooded corridor can't separate on.
         if 0.75 <= dep_delay_hours <= 3.5:
-            timing_bonus += 15  # Prime getaway-day window
+            timing_bonus += 30  # Prime getaway-day window
         elif dep_delay_hours <= 6:
-            timing_bonus += 8   # Plausible late departure
+            timing_bonus += 16  # Plausible late departure
         elif dep_delay_hours <= 12:
-            timing_bonus += 3   # Overnight stay, morning flight
+            timing_bonus += 6   # Overnight stay, morning flight
         elif in_pregame:
-            timing_bonus += 10  # Classic day-before-game travel
+            timing_bonus += 18  # Classic day-before-game travel
         # else: 0 — valid but weak
 
         # Calculate confidence score
@@ -1567,6 +1904,8 @@ class TeamFlightDetector:
                 'reason': reason,
                 'team_id': team_id,
                 'route_progress': route_progress,
+                'timing_bonus': timing_bonus,
+                'window_id': travel_window['window_id'],
                 'distance_to_venue': dist_to_venue,
                 'total_route': total_route,
                 'is_returning_home': is_home_team,
@@ -1619,6 +1958,23 @@ class RealTimeFlightTracker(QThread):
         self.detectors = {league: TeamFlightDetector(db, league, self.game_state)}
         self.detector = self.detectors[league]
         self.upcoming_by_league: Dict[str, List] = {}
+
+        # Per-window observation ledger — selection authority. Replaces
+        # best-of-current-tick with accumulated window evidence (survives
+        # restarts, suppresses the "several flights per day" re-shopping).
+        self.ledger = CharterLedger(db.db_path)
+        # Aircraft types confirmed via trace this session (avoid re-fetching)
+        self._route_confirmed: Set[str] = set()
+
+        # Heatmap backfill: seed the ledger with the flight a team ALREADY took
+        # earlier in the window (before the app was running) so a team that
+        # flew pre-startup isn't mis-attributed to a later corridor flight.
+        # Heavy (downloads bounded heatmap slices, ~10MB each, cached) — runs
+        # once per displayed window on a background thread. Disable with
+        # TRAVELVIZ_CHARTER_BACKFILL=0.
+        self.enable_backfill = os.getenv('TRAVELVIZ_CHARTER_BACKFILL', '1') != '0'
+        self._backfilled: Set[str] = set()
+        self._backfill_lock = threading.Lock()
 
         # Tracking state
         self.tracked_flights: Dict[str, LiveFlight] = {}  # icao24 -> LiveFlight
@@ -1697,6 +2053,12 @@ class RealTimeFlightTracker(QThread):
         # Back-compat alias (primary league)
         self.upcoming_games = self.upcoming_by_league.get(self.league, [])
         self.statusUpdate.emit(f"📅 Games next 48h — {', '.join(parts)}")
+        # Age out stale ledger rows (completed windows kept a few days as the
+        # team→tail-number charter registry, then dropped)
+        try:
+            self.ledger.prune(set())
+        except Exception as e:
+            logger.debug(f"ledger prune skipped: {e}")
 
     def run(self):
         """Main tracking loop - runs in background thread"""
@@ -1744,8 +2106,8 @@ class RealTimeFlightTracker(QThread):
                 if active_count == 0:
                     self.statusUpdate.emit(
                         "💤 No teams in travel windows — flight polling paused "
-                        "(rechecks every 2 min)")
-                    self._stop_event.wait(120)
+                        "(rechecks every 20 min)")
+                    self._stop_event.wait(1200)
                     continue
 
                 # Collect ALL candidate flights first, then filter to best per team
@@ -1753,7 +2115,10 @@ class RealTimeFlightTracker(QThread):
 
                 if self.use_type_filtering:
                     # Primary: adsb.lol type-based filtering
-                    aircraft_list = self.adsb_lol.get_charter_aircraft(self.aircraft_types)
+                    aircraft_list = self.adsb_lol.get_charter_aircraft(
+                        self.aircraft_types, self._stop_event)
+                    if self._stop_event.is_set():
+                        break
                     aircraft_list = self.adsb_lol.filter_us_aircraft(aircraft_list)
                     aircraft_count = len(aircraft_list)
 
@@ -1863,141 +2228,317 @@ class RealTimeFlightTracker(QThread):
         return count, sample
 
     def _select_best_flight_per_team(self, candidates: List[LiveFlight]) -> List[LiveFlight]:
+        """Ledger-driven selection: ONE flight per travel window, chosen by
+        ACCUMULATED window evidence, not best-of-this-tick.
+
+        Each candidate is observed into the ledger; then per window we pick
+        the argmax of `_window_score` over ALL aircraft ever seen in the
+        window. The real charter (early, full-corridor traversal, prime
+        timing) leads and stays led — a later same-corridor scheduled flight
+        can't displace it, and once the charter lands we show it as ARRIVED
+        rather than flipping to an airborne impostor. Survives restarts.
         """
-        Given a list of candidate flights, select only ONE flight per team.
-        Uses enhanced scoring to pick the best candidate.
+        no_team: List[LiveFlight] = []
+        # Observe candidates; index this tick's airborne candidates per window
+        cand_by_window: Dict[str, Dict[str, tuple]] = {}  # wid -> icao -> (flight, score)
+        for f in candidates:
+            if f.team_id and f.window_id:
+                score = self._calculate_flight_score(f, f.team_id)
+                self.ledger.observe(f.window_id, f.league or '', f.team_id,
+                                    f, score, f.timing_bonus, f.route_progress)
+                cand_by_window.setdefault(f.window_id, {})[f.icao24] = (f, score)
+            elif not f.team_id and f.confidence >= 80:
+                no_team.append(f)
 
-        Scoring factors:
-        - Base confidence score (existing)
-        - Charter callsign pattern (8xxx/9xxx = +points)
-        - Route progress alignment with expected timing
-        """
-        if not candidates:
-            return []
-
-        # Group candidates by (league, team_id) — team ids collide across
-        # leagues ('det' is Tigers and Red Wings)
-        by_team: Dict[tuple, List[LiveFlight]] = {}
-        no_team: List[LiveFlight] = []  # Flights without team attribution
-
-        for flight in candidates:
-            if flight.team_id:
-                key = (flight.league or '', flight.team_id)
-                by_team.setdefault(key, []).append(flight)
-            else:
-                # Keep unattributed flights if they have high confidence
-                if flight.confidence >= 80:
-                    no_team.append(flight)
-
-        # Stickiness: which aircraft is each team currently shown on?
-        incumbents = {}
-        for f in self.tracked_flights.values():
-            if f.team_id:
-                incumbents[(f.league or '', f.team_id)] = f.icao24
-        STICKINESS_MARGIN = 12.0  # new pick must beat the incumbent by this
+        # Windows to resolve: any with an airborne candidate this tick, plus
+        # any we're currently displaying (so a leader that just landed gets
+        # re-resolved to its ARRIVED state instead of vanishing)
+        windows = set(cand_by_window)
+        for fl in self.tracked_flights.values():
+            if fl.window_id:
+                windows.add(fl.window_id)
 
         best_flights: List[LiveFlight] = []
-
-        for key, team_candidates in by_team.items():
-            team_id = key[1]
-            scored = [(self._calculate_flight_score(f, team_id), f)
-                      for f in team_candidates]
+        for window_id in windows:
+            rows = self.ledger.window_rows(window_id)
+            if not rows:
+                continue
+            cur = cand_by_window.get(window_id, {})
+            scored = []
+            for row in rows:
+                icao = row['icao24']
+                cur_score = cur.get(icao, (None, 0.0))[1]
+                scored.append((self._window_score(row, cur_score), row))
             scored.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_flight = scored[0]
+            lead_ws, lead_row = scored[0]
+            icao = lead_row['icao24']
 
-            # Prefer the currently displayed aircraft unless a challenger
-            # clearly outscores it — otherwise the pick flaps between similar
-            # corridor flights every tick and the plane visibly jumps.
-            incumbent_icao = incumbents.get(key)
-            if incumbent_icao and best_flight.icao24 != incumbent_icao:
-                for score, flight in scored:
-                    if flight.icao24 == incumbent_icao:
-                        if best_score < score + STICKINESS_MARGIN:
-                            best_score, best_flight = score, flight
-                        else:
-                            logger.info(
-                                "📊 %s: challenger %s (%.0f) displaced %s (%.0f)",
-                                team_id, best_flight.callsign or best_flight.icao24,
-                                best_score, flight.callsign or flight.icao24, score)
-                        break
+            # First time we resolve a window, backfill it from history (once,
+            # background) UNLESS we already hold a confirmed completed flight —
+            # catches the charter the team took before the app was running.
+            if (self.enable_backfill and window_id not in self._backfilled
+                    and not any(r.get('confirmed_route') for r in rows)):
+                lg = lead_row.get('league') or self.league
+                tid = lead_row.get('team_id')
+                if tid:
+                    threading.Thread(
+                        target=self._backfill_window,
+                        args=(window_id, lg, tid),
+                        daemon=True, name=f"backfill-{tid}").start()
 
-            best_flights.append(best_flight)
-            if len(team_candidates) > 1:
-                logger.debug(
-                    "📊 %s: selected %s (%.1f) from %d candidates", team_id,
-                    best_flight.callsign or best_flight.icao24, best_score,
-                    len(team_candidates))
+            if icao in cur:
+                # Leader is airborne right now — emit the live candidate,
+                # confirm its route via trace once (cheap), tag it
+                flight, _ = cur[icao]
+                self._maybe_confirm_route(window_id, flight)
+                flight.landed = bool(lead_row.get('landed'))
+                best_flights.append(flight)
+            else:
+                # Leader has landed / isn't airborne this tick. Only surface
+                # it as ARRIVED if we actually confirmed it landed at dest —
+                # otherwise suppress (don't fall back to a corridor impostor)
+                if lead_row.get('landed'):
+                    arrived = self._flight_from_ledger_row(lead_row)
+                    if arrived:
+                        best_flights.append(arrived)
+                # else: emit nothing for this window this tick
 
-        # Add high-confidence unattributed flights
         best_flights.extend(no_team)
-
         return best_flights
 
-    def _calculate_flight_score(self, flight: LiveFlight, team_id: str) -> float:
-        """
-        Calculate enhanced score for a flight candidate.
+    def _flight_from_ledger_row(self, row: dict) -> Optional[LiveFlight]:
+        """Reconstruct a minimal LiveFlight for a landed window leader so the
+        globe can render it ARRIVED at the destination."""
+        if row.get('dest_lat') is None:
+            return None
+        return LiveFlight(
+            icao24=row['icao24'], callsign=row.get('callsign'),
+            latitude=row['dest_lat'], longitude=row['dest_lon'],
+            altitude_m=0, velocity_ms=0, heading=0, timestamp=datetime.now(),
+            aircraft_type=row.get('aircraft_type'),
+            registration=row.get('registration'),
+            team_id=row.get('team_id'), league=row.get('league'),
+            confidence=90, raw_score=row.get('max_score') or 0,
+            detection_reasons=['arrived (trace-confirmed)'],
+            origin_city=row.get('origin_city'), dest_city=row.get('dest_city'),
+            origin_lat=row.get('origin_lat'), origin_lon=row.get('origin_lon'),
+            dest_lat=row.get('dest_lat'), dest_lon=row.get('dest_lon'),
+            route_progress=1.0, window_id=row.get('window_id'), landed=True,
+        )
 
-        Scoring components:
-        - Base confidence (0-100)
-        - Charter callsign bonus (0-15)
-        - Timing alignment bonus (0-20)
-        - Known aircraft type bonus (0-10)
+    def _maybe_confirm_route(self, window_id: str, flight: LiveFlight):
+        """Fetch the leader's trace ONCE to confirm origin→dest and set
+        landed/dep/arr in the ledger. Cheap (one ~15KB trace per leader);
+        skipped if already done this session."""
+        if flight.icao24 in self._route_confirmed:
+            return
+        self._route_confirmed.add(flight.icao24)
+        if flight.origin_lat is None or flight.dest_lat is None:
+            return
+        trace = self.adsb_lol.fetch_trace(flight.icao24)
+        if not trace:
+            return
+        leg = analyze_trace_leg(trace, flight.origin_lat, flight.origin_lon, 90,
+                                flight.dest_lat, flight.dest_lon, 90)
+        if not leg:
+            return
+        # Directness gate: reject obviously indirect legs (the replay's 7h
+        # "DTW→MSP" Delta routings) as confirmation evidence
+        gc_km = self.detector._haversine_distance(
+            flight.origin_lat, flight.origin_lon, flight.dest_lat, flight.dest_lon)
+        expected_h = gc_km / 800.0
+        confirmed = leg['dur_h'] <= max(2.0, expected_h * 1.6)
+        self.ledger.set_route_info(
+            window_id, flight.icao24,
+            dep=leg['dep'], arr=leg['arr'],
+            landed=leg['landed_dest'], confirmed=confirmed,
+            operator=(trace.get('ownOp') or None),
+            aircraft_type=(trace.get('t') or None))
+
+    @staticmethod
+    def _utc_slices(start_utc: datetime, end_utc: datetime,
+                    cap: int = 24) -> List[Tuple[date, int]]:
+        """(date, heatmap-slice-idx) pairs covering a UTC time range. Slices
+        are 30 min; idx = hour*2 + (minute>=30). Capped to the most recent
+        `cap` slices to bound bandwidth."""
+        out, t = [], start_utc.replace(
+            minute=(0 if start_utc.minute < 30 else 30), second=0, microsecond=0)
+        while t <= end_utc:
+            out.append((t.date(), t.hour * 2 + (1 if t.minute >= 30 else 0)))
+            t += timedelta(minutes=30)
+        return out[-cap:]
+
+    def _backfill_window(self, window_id: str, league: str, team_id: str):
+        """Seed the ledger from the day heatmap with the flight the team
+        ALREADY took earlier in the window. Fixes the 'ghost' the user saw
+        (NY→SAT charter still shown after the Knicks had landed): without
+        this a team that flew before the app started has no ledger evidence,
+        so a later corridor flight becomes leader by default. Background-only,
+        once per window, bounded + cached."""
+        if not (self.enable_backfill and _HAS_NUMPY):
+            return
+        with self._backfill_lock:
+            if window_id in self._backfilled:
+                return
+            self._backfilled.add(window_id)
+
+        detector = self.detectors.get(league, self.detector)
+        w = detector.get_team_travel_window(team_id)
+        if not w:
+            return
+        now = datetime.now()
+        # Heatmap slices are real UTC; DB game times are venue-local naive, so
+        # converting the window band to UTC slices is tz-fragile. Instead use a
+        # generous recent UTC window straight off the wall clock (catches any
+        # same-day departure regardless of tz skew); the per-candidate filters
+        # (direct, team-capable, recent departure) do the real selecting.
+        now_utc = datetime.utcnow()
+        slices = self._utc_slices(now_utc - timedelta(hours=16), now_utc, cap=24)
+        if not slices:
+            return
+        # Departure must be recent (same machine-local frame as leg['dep'])
+        dep_lo = now - timedelta(hours=16)
+
+        o_lat, o_lon = w['origin_lat'], w['origin_lon']
+        d_lat, d_lon = w['dest_lat'], w['dest_lon']
+        self.statusUpdate.emit(
+            f"🛰️ Backfilling {team_id.upper()} window from history "
+            f"({len(slices)} slices)…")
+
+        # Enumerate ARRIVALS at the destination — low-altitude (descending /
+        # on-ground) aircraft near the dest airport — rather than the full
+        # origin∩dest corridor. The flight may have DEPARTED long before our
+        # slice band (day-before travel viewed the next morning), but its
+        # ARRIVAL is recent; each candidate's full-day trace then confirms the
+        # origin. Far fewer trace fetches than tracing the whole corridor.
+        arrivals = set()
+        for sd, idx in slices:
+            if not self.running:
+                return
+            blob = self.adsb_lol.fetch_heatmap_slice(sd, idx)
+            if not blob:
+                continue
+            hexes, lat, lon, alt = parse_heatmap(blob)
+            m = _within_km_vec(lat, lon, d_lat, d_lon, 40) & (alt < 10000)
+            arrivals.update(np.unique(hexes[m]).tolist())
+
+        gc_km = detector._haversine_distance(o_lat, o_lon, d_lat, d_lon)
+        found = 0
+        for hx in arrivals:
+            if not self.running:
+                return
+            hexid = f"{hx:06x}"
+            trace = self.adsb_lol.fetch_trace(hexid)
+            if not trace:
+                continue
+            # A full team flies a narrowbody airliner — bizjets on the corridor
+            # are noise (the NetJets/Flexjet false leaders we first saw)
+            if (trace.get('t') or '').upper() not in TEAM_CAPABLE_TYPES:
+                continue
+            leg = analyze_trace_leg(trace, o_lat, o_lon, 90, d_lat, d_lon, 90)
+            if not leg:
+                continue
+            dep = leg['dep']
+            # Departure must be recent; flight must be reasonably direct
+            if not (dep_lo <= dep <= now + timedelta(hours=1)):
+                continue
+            if leg['dur_h'] > max(2.0, gc_km / 800.0 * 1.6):
+                continue
+            # Timing tier vs game end (tz-skew tolerant: tiers are coarse and
+            # the positioning-callsign / type signals carry the fine ranking)
+            pg = w.get('pregame_travel_start')
+            delay_h = (dep - w['last_game_end']).total_seconds() / 3600
+            if 0.75 <= delay_h <= 3.5:
+                timing = 30
+            elif delay_h <= 6:
+                timing = 16
+            elif pg is not None:
+                timing = 18
+            else:
+                timing = 6
+            cs = leg['calls'][0] if leg['calls'] else None
+            flight = LiveFlight(
+                icao24=hexid, callsign=cs,
+                latitude=d_lat, longitude=d_lon, altitude_m=0, velocity_ms=0,
+                heading=0, timestamp=now, aircraft_type=trace.get('t'),
+                registration=trace.get('r'), team_id=team_id, league=league,
+                confidence=85, raw_score=50.0 + timing,
+                origin_city=w['origin_city'], dest_city=w['destination_city'],
+                origin_lat=o_lat, origin_lon=o_lon, dest_lat=d_lat, dest_lon=d_lon,
+                route_progress=1.0, window_id=window_id, timing_bonus=timing)
+            score = self._calculate_flight_score(flight, team_id)
+            # Two observations spanning the route → full coverage credit; this
+            # is a CONFIRMED completed leg, so it gets the big confirmed bonus
+            self.ledger.observe(window_id, league, team_id, flight, score, timing, 0.05)
+            self.ledger.observe(window_id, league, team_id, flight, score, timing, 0.95)
+            self.ledger.set_route_info(
+                window_id, hexid, dep=leg['dep'], arr=leg['arr'],
+                landed=leg['landed_dest'], confirmed=True,
+                operator=trace.get('ownOp'), aircraft_type=trace.get('t'))
+            self._route_confirmed.add(hexid)
+            found += 1
+
+        self.statusUpdate.emit(
+            f"🛰️ Backfill {team_id.upper()}: {found} completed flight(s) "
+            f"seeded into ledger")
+
+    def _calculate_flight_score(self, flight: LiveFlight, team_id: str) -> float:
+        """Per-TICK candidate score (fed into the ledger's observe()).
+
+        The replay study (Knicks AAL606P, Twins SCX346) reshaped this:
+        - raw_score already carries the per-candidate route+timing match from
+          _evaluate_team_travel_match — that's the dominant term.
+        - DROPPED the 8xxx/9xxx bonus: actively wrong for hometown-airline
+          charters (real SCX346 low-numbered, scheduled SCX8992 high).
+        - Operator/callsign-pattern bonuses shrink to tiebreakers: useless on
+          a corridor flooded with same-operator scheduled flights (22 SCX
+          DTW→MSP). Timing (in raw_score) must dominate, not these.
         """
-        # Rank on the uncapped detection score: capped confidence ties at 100
-        # on busy corridors, hiding the timing/route spread
         score = float(flight.raw_score or flight.confidence)
 
-        # Charter callsign pattern bonus (8xxx/9xxx flight numbers are often charters)
-        if flight.callsign:
-            callsign = flight.callsign.upper()
-            try:
-                # Extract numeric portion after carrier code
-                numeric_part = ''.join(c for c in callsign[3:] if c.isdigit())
-                if numeric_part:
-                    flight_num = int(numeric_part)
-                    if flight_num >= 9000:
-                        score += 15  # Very likely charter
-                    elif flight_num >= 8000:
-                        score += 10  # Likely charter
-            except (ValueError, IndexError):
-                pass
+        # Positioning-callsign signature (AAL606P) — small, it's a tiebreaker
+        if flight.callsign and len(flight.callsign) >= 5:
+            cs = flight.callsign.upper()
+            if cs[-1].isalpha() and cs[3:-1].isdigit():
+                score += 6
 
-        # Known charter operator bonus
+        # Dedicated charter operator (Omni/Sun Country/etc.) — small tiebreaker
         for operator, patterns in TeamFlightDetector.CHARTER_PATTERNS.items():
-            if flight.callsign and any(flight.callsign.upper().startswith(p) for p in patterns):
-                score += 10
+            if flight.callsign and any(flight.callsign.upper().startswith(p)
+                                       for p in patterns):
+                score += 4
                 break
 
-        # Aircraft type bonus (preferred charter types)
-        if flight.aircraft_type:
-            if flight.aircraft_type in ['B752', 'B753']:
-                score += 10  # Classic team charter aircraft
-            elif flight.aircraft_type in ['A21N', 'A321']:
-                score += 8   # Modern narrow-body charter
-            elif flight.aircraft_type in ['B738', 'B739']:
-                score += 5   # Common charter type
-
-        # Timing alignment with team's travel window (league-correct detector)
-        detector = self.detectors.get(flight.league, self.detector)
-        travel_window = detector.get_team_travel_window(team_id)
-        if travel_window:
-            now = datetime.now()
-            hours_since_game_end = (now - travel_window['last_game_end']).total_seconds() / 3600
-
-            # Prime departure window: 2-6 hours after game end
-            if 2 <= hours_since_game_end <= 6:
-                score += 20
-            # Reasonable window: 6-10 hours (overnight departure)
-            elif 6 < hours_since_game_end <= 10:
-                score += 15
-            # Late window: 10-14 hours
-            elif 10 < hours_since_game_end <= 14:
-                score += 10
-            # Very late: >14 hours (possible but less likely)
-            elif hours_since_game_end > 14:
-                score += 5
+        # Aircraft type (narrow-body airliner > regional/biz) — tiebreaker
+        if flight.aircraft_type in ('B752', 'B753', 'A321', 'A21N'):
+            score += 5
+        elif flight.aircraft_type in ('B738', 'B739', 'A319', 'A320', 'A20N'):
+            score += 3
 
         return score
+
+    # Window-leader scoring weights (replay-tuned: accumulated evidence
+    # dominates so the established leader doesn't flip to a later impostor)
+    W_MAXSCORE   = 1.0    # best per-tick score seen
+    W_OBS        = 4.0    # × log1p(n_obs): repeatedly seen = real
+    W_COVERAGE   = 35.0   # × route-progress span: traversed the corridor
+    W_TIMING     = 1.0    # best timing fit
+    W_CONFIRMED  = 25.0   # trace confirmed origin→dest
+    W_CURRENT    = 0.4    # × current-tick score if airborne right now
+
+    def _window_score(self, row: dict, current_score: float) -> float:
+        """Accumulated window evidence for one aircraft (ledger row). A landed
+        charter keeps a high score via accumulated terms even though its
+        current_score is 0 — so transient airborne impostors can't displace
+        it."""
+        span = max(0.0, (row.get('max_progress') or 0.0)
+                   - (row.get('min_progress') or 0.0))
+        return (self.W_MAXSCORE * (row.get('max_score') or 0.0)
+                + self.W_OBS * math.log1p(row.get('n_obs') or 0)
+                + self.W_COVERAGE * span
+                + self.W_TIMING * (row.get('best_timing') or 0.0)
+                + self.W_CONFIRMED * (row.get('confirmed_route') or 0)
+                + self.W_CURRENT * current_score)
 
     def _process_detected_flight(self, flight: LiveFlight):
         """Handle a detected flight - emit signals as needed"""
@@ -2042,6 +2583,8 @@ class RealTimeFlightTracker(QThread):
             'dest_lat': flight.dest_lat,
             'dest_lon': flight.dest_lon,
             'route_progress': flight.route_progress,
+            'window_id': flight.window_id,
+            'landed': flight.landed,
         }
 
 
@@ -2137,8 +2680,76 @@ def test_single_scan(league: str = "NBA", use_type_filter: bool = True):
     return detected_flights
 
 
+def replay_window(origin: Tuple, dest: Tuple, d: date, slices, cache_dir=None):
+    """Reconstruct a COMPLETED travel window from adsb.lol ground truth and
+    rank the candidate flights (the analysis harness, folded in from the old
+    charter_replay.py). origin/dest = (name, lat, lon, radius_km). `slices` =
+    UTC half-hour heatmap indices (0..47) bracketing the expected departure.
+
+    Enumerates aircraft that touched BOTH metros from the day heatmap, then
+    pulls each one's trace for the real dep/arr/callsign/operator. Prints a
+    ranked table; returns the candidate dicts.
+    """
+    cache = Path(cache_dir or "/tmp/charter_replay_cache")
+    cache.mkdir(exist_ok=True)
+    client = AdsbLolClient()
+    o_name, o_lat, o_lon, o_r = origin
+    s_name, s_lat, s_lon, s_r = dest
+
+    near_o, near_d, total = set(), set(), 0
+    for idx in slices:
+        fn = cache / f"{d.isoformat()}_{idx:02d}.bin"
+        blob = fn.read_bytes() if fn.exists() else client.fetch_heatmap_slice(d, idx)
+        if blob and not fn.exists():
+            fn.write_bytes(blob)
+        if not blob:
+            continue
+        hexes, lat, lon, _alt = parse_heatmap(blob)
+        total += len(hexes)
+        near_o.update(np.unique(hexes[_within_km_vec(lat, lon, o_lat, o_lon, o_r)]).tolist())
+        near_d.update(np.unique(hexes[_within_km_vec(lat, lon, s_lat, s_lon, s_r)]).tolist())
+        print(f"  slice {idx:02d}: near {o_name}={len(near_o)} near {s_name}={len(near_d)}")
+
+    corridor = near_o & near_d
+    print(f"\n{total:,} positions; {len(corridor)} aircraft touched both metros")
+    results = []
+    for hx in corridor:
+        hexid = f"{hx:06x}"
+        tr = client.fetch_trace(hexid)
+        if not tr:
+            continue
+        leg = analyze_trace_leg(tr, o_lat, o_lon, o_r, s_lat, s_lon, s_r)
+        if not leg or not (1.0 < leg['dur_h'] < 8.0):
+            continue
+        results.append({"hex": hexid, "reg": tr.get("r", ""), "type": tr.get("t", ""),
+                        "op": tr.get("ownOp", ""), **leg})
+    results.sort(key=lambda r: r["dep"])
+    print(f"\n{'hex':7} {'reg':9} {'type':5} {'dep':16} {'dur':5} {'callsign':16} operator")
+    print("-" * 96)
+    for r in results:
+        print(f"{r['hex']:7} {r['reg']:9} {r['type']:5} "
+              f"{r['dep'].strftime('%m-%d %H:%M'):16} {r['dur_h']:4.1f}h "
+              f"{','.join(r['calls'][:2]):16} {r['op'][:26]}")
+    return results
+
+
+# Named replay windows for the CLI (origin/dest = name,lat,lon,radius_km)
+_REPLAY_WINDOWS = {
+    "nyk": (("NYC", 40.75, -74.00, 90), ("SAT", 29.45, -98.50, 70),
+            date.today(), range(28, 48)),
+    "min": (("DTW", 42.30, -83.25, 60), ("MSP", 44.88, -93.22, 60),
+            date(2026, 6, 12), range(4, 34)),
+}
+
+
 if __name__ == "__main__":
     import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "replay":
+        key = sys.argv[2] if len(sys.argv) > 2 else "nyk"
+        o, dst, d, sl = _REPLAY_WINDOWS[key]
+        replay_window(o, dst, d, list(sl))
+        sys.exit(0)
 
     league = sys.argv[1].upper() if len(sys.argv) > 1 else "NBA"
     use_opensky = "--opensky" in sys.argv

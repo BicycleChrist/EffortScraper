@@ -2574,10 +2574,14 @@ class FlightGlobeWidget(QOpenGLWidget):
         col_head_font = QFont("Arial", 8, QFont.Weight.Bold)
 
         # ---- text lines
+        final = marker.get('final')
         if live:
             status_text = f"{live.get('away_score', '?')} – {live.get('home_score', '?')}"
             progress = live.get('progress') or ''
             sub_text = progress if progress.upper() != 'LIVE' else 'LIVE'
+        elif final:
+            status_text = f"{final.get('away', '?')} – {final.get('home', '?')}"
+            sub_text = "Final"
         else:
             status_text = None
             game_status = getattr(getattr(game, 'status', None), 'value', '')

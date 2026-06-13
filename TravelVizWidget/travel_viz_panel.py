@@ -476,13 +476,16 @@ class TravelVizPanel(QWidget):
                 marker['live'] = live
             else:
                 marker.pop('live', None)
-            # Re-stamp cached lineups (markers are rebuilt on schedule
-            # refresh; the unfold panel reads marker['lineups'])
+            # Re-stamp cached game details (markers are rebuilt on schedule
+            # refresh; the unfold panel reads marker['lineups'/'final'])
             if marker.get('game_info'):
-                lu = self._lineups_cache.get(
+                cached = self._lineups_cache.get(
                     self.globe_widget._marker_game_key(marker))
-                if lu is not None:
-                    marker['lineups'] = lu
+                if cached is not None:
+                    if cached.get('lineups') is not None:
+                        marker['lineups'] = cached['lineups']
+                    if cached.get('final') is not None:
+                        marker['final'] = cached['final']
 
         self.globe_widget.invalidate_marker_clusters()
 
@@ -1579,8 +1582,15 @@ class TravelVizPanel(QWidget):
     # ------------------------------------------------------------- lineups
 
     def _maybe_fetch_lineups(self, marker: dict):
-        """Fetch flashscore lineups for a clicked game cube (once per game,
-        cached). Stamps marker['lineups'] when they arrive."""
+        """Fetch flashscore game details for a clicked cube: lineups, and the
+        FINAL SCORE for finished games (the day feed keeps finished events
+        with scores; the live feed drops them). Stamps marker['lineups'] /
+        marker['final'] when they arrive.
+
+        Cache policy: a result with a final score is immutable — reuse it.
+        Anything else (pregame/live) is stamped immediately for instant
+        display but still refreshed in the background (lineups post late,
+        games finish)."""
         if not self.sports_aggregator:
             return
         game = (marker.get('game_info') or {}).get('game')
@@ -1591,15 +1601,21 @@ class TravelVizPanel(QWidget):
         key = self.globe_widget._marker_game_key(marker)
         cached = self._lineups_cache.get(key)
         if cached is not None:
-            marker['lineups'] = cached
+            if cached.get('lineups') is not None:
+                marker['lineups'] = cached['lineups']
+            if cached.get('final') is not None:
+                marker['final'] = cached['final']
             self.globe_widget.update()
-            return
+            if cached.get('final') is not None:
+                return  # game over: nothing can change
         if key in self._lineups_pending:
             return
         self._lineups_pending.add(key)
-        marker['lineups_pending'] = True
+        if cached is None:
+            marker['lineups_pending'] = True
 
         live = marker.get('live') or {}
+        is_live = bool(live)
         event_id = live.get('event_id')
         game_id = getattr(game, 'game_id', '') or ''
         if not event_id and game_id.startswith('fs_'):
@@ -1610,32 +1626,43 @@ class TravelVizPanel(QWidget):
         source = self.sports_aggregator.flashscore
 
         def work():
-            data = None
+            lineups = None
+            final = None
             try:
-                eid = event_id or source.resolve_event_id(
-                    league, home_id, away_id, game_date)
+                # Not live: pull the day-feed event — final score for
+                # finished games, event id for ESPN-id games
+                ev = None
+                if not is_live and game_date is not None:
+                    ev = source.find_event(league, home_id, away_id, game_date)
+                eid = event_id or (ev.event_id if ev else None)
+                if ev is not None and ev.stage == 'finished':
+                    final = {'away': ev.away_score, 'home': ev.home_score}
                 if eid:
-                    data = source.fetch_game_lineups(league, eid)
+                    lineups = source.fetch_game_lineups(league, eid)
             except Exception as e:
-                logger.warning("lineups fetch failed for %s: %s", key, e)
-            self._lineupsArrived.emit(key, data)
+                logger.warning("game detail fetch failed for %s: %s", key, e)
+            self._lineupsArrived.emit(key, {'lineups': lineups, 'final': final})
 
         threading.Thread(target=work, daemon=True,
                          name="travelviz-lineups").start()
 
     def _on_lineups_arrived(self, key, data):
-        """GUI-thread: cache lineups and stamp matching markers."""
+        """GUI-thread: cache game details and stamp matching markers."""
         self._lineups_pending.discard(key)
-        if data is not None:
+        lineups = data.get('lineups')
+        final = data.get('final')
+        if lineups is not None or final is not None:
             self._lineups_cache[key] = data
         for marker in self.globe_widget.team_city_markers:
             if not marker.get('game_info'):
                 continue
             if self.globe_widget._marker_game_key(marker) == key:
                 marker.pop('lineups_pending', None)
-                if data is not None:
-                    marker['lineups'] = data
-                else:
+                if final is not None:
+                    marker['final'] = final
+                if lineups is not None:
+                    marker['lineups'] = lineups
+                elif marker.get('lineups') is None:
                     # Signal "tried, nothing available" to the panel
                     marker['lineups'] = {'posted': False,
                                          'home': {'players': [], 'starter': None},
