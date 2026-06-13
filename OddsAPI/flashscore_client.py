@@ -865,6 +865,65 @@ class FlashscoreClient:
 
         return decoded
 
+    # -- lineups -------------------------------------------------------------
+    # df_li_<sport>_<event> record fields (decoded against a live MLB game):
+    #   LB = section name ("Batters", "Pitchers", "Coaches"; other sports use
+    #        their own section names) — starts a new section
+    #   LC = side for subsequent player rows: 1 = home, 2 = away
+    #   LH = row index within the side (batting order - 1 for MLB batters)
+    #   LP = flashscore player id     LI = display name ("Hicks L.")
+    #   LN = last name                LJ = jersey number
+    #   LQ = nationality              LT = note ("(5-4)" pitcher record)
+    #   LK = role code: 54 batter, 50 starting pitcher, 53 reliever, 2 coach
+    PITCHER_STARTER_ROLE = "50"
+
+    def get_lineups(self, sport_id: int, event_id: str) -> Dict[str, Any]:
+        """Fetch + parse the lineups feed for one event.
+
+        Returns {"sections": [{"name": str, "home": [player, ...],
+                               "away": [player, ...]}, ...]} where player =
+        {"name", "last", "number", "country", "note", "role", "row"}.
+        Sections list is empty when lineups aren't posted yet (feed returns
+        "0"). Works pregame — flashscore posts MLB lineups ~1-3h before
+        first pitch.
+        """
+        raw = self.fetch_feed(f"df_li_{sport_id}_{event_id}")
+        out: Dict[str, Any] = {"sport_id": sport_id, "event_id": event_id,
+                               "sections": []}
+        if not raw or raw.strip() == "0":
+            return out
+
+        section = None
+        side = None
+        for rec_str in raw.split(REC_SEP):
+            rec = self._parse_record(rec_str)
+            if not rec:
+                continue
+            if "LB" in rec:  # new section header (also carries initial LC)
+                section = {"name": rec["LB"], "home": [], "away": []}
+                out["sections"].append(section)
+            if "LC" in rec:
+                side = {"1": "home", "2": "away"}.get(rec["LC"], side)
+            if "LP" in rec and section is not None and side is not None:
+                try:
+                    row = int(rec.get("LH", "") or -1)
+                except ValueError:
+                    row = -1
+                section[side].append({
+                    "name": rec.get("LI", ""),
+                    "last": rec.get("LN", ""),
+                    "number": rec.get("LJ", ""),
+                    "country": rec.get("LQ", ""),
+                    "note": rec.get("LT", ""),
+                    "role": rec.get("LK", ""),
+                    "row": row,
+                })
+
+        for sec in out["sections"]:
+            sec["home"].sort(key=lambda p: p["row"])
+            sec["away"].sort(key=lambda p: p["row"])
+        return out
+
     # -- live polling -------------------------------------------------------
     def snapshot_live(self, sports: Optional[List[Any]] = None) -> List[Event]:
         """One-shot fetch of currently-live events for the given sports.
@@ -995,6 +1054,410 @@ class _PollerHandle:
 
     def join(self, timeout=None):
         self.thread.join(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# TravelViz schedule/live-feed adapter (merged from flashscore_source.py)
+# ---------------------------------------------------------------------------
+# Flashscore serves day-offset feeds (today ± N days), not full seasons, so
+# this layer deliberately does NOT replace the ESPN full-season backfill:
+#
+#   - ESPN scrape (existing): one-time full-season cache per league.
+#   - FlashscoreScheduleSource.refresh_upcoming(): fast (~1s/league) refresh
+#     of a rolling window of upcoming games — fixes dates/postponements,
+#     inserts newly scheduled games, and bumps the season cache's
+#     last_updated so the staleness check stops cascading into multi-minute
+#     ESPN re-scrapes.
+#   - FlashscoreLiveFeed: background poller producing live score payloads
+#     mapped onto our team ids, ready for globe markers / tooltips / host
+#     signals.
+#
+# Qt-free on purpose (mirrors fatigue_engine): the panel marshals callbacks
+# onto the GUI thread via pyqtSignal.
+#
+# NOTE: FlashscoreClient() does network credential discovery in __init__, so
+# the client is created lazily and must only be touched off the GUI thread.
+#
+# database_manager lives next to this file in TravelVizWidget; the import is
+# guarded so the protocol client above stays importable standalone (other
+# consumers of this file don't ship database_manager).
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from database_manager import (GameData, GameStatus, TeamInfo, Venue,
+                                  CITY_COORDS)
+    _HAS_DATABASE_MANAGER = True
+except ImportError:
+    _HAS_DATABASE_MANAGER = False
+
+# league -> (flashscore sport name, token that must appear in the tournament
+# header, e.g. "USA: MLB")
+LEAGUE_SPECS: Dict[str, Dict[str, str]] = {
+    "MLB": {"sport": "baseball", "token": "MLB"},
+    "NBA": {"sport": "basketball", "token": "NBA"},
+    "NHL": {"sport": "hockey", "token": "NHL"},
+}
+
+# Flashscore name -> our team_id, for names the heuristic matcher can't place.
+# Populated as mismatches surface; matcher logs every unmatched name.
+NAME_EXCEPTIONS: Dict[str, Dict[str, str]] = {
+    "MLB": {"athletics": "ath"},
+    "NBA": {},
+    "NHL": {},
+}
+
+
+def _normalize_team_name(name: str) -> str:
+    name = name.lower().replace(".", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", name).strip()
+
+
+class _TeamMatcher:
+    """Maps flashscore display names onto our TeamInfo records.
+
+    Strategy: exact normalized name, then longest unique word-suffix
+    ("chicago white sox" -> "white sox" -> "sox"), then explicit exceptions."""
+
+    def __init__(self, league: str, teams: List["TeamInfo"]):
+        self.league = league
+        self.exceptions = NAME_EXCEPTIONS.get(league, {})
+        self.by_id = {t.team_id.lower(): t for t in teams}
+        self.by_full: Dict[str, "TeamInfo"] = {}
+        self.by_suffix: Dict[str, List["TeamInfo"]] = {}
+
+        for team in teams:
+            full = _normalize_team_name(team.display_name)
+            self.by_full[full] = team
+            words = full.split()
+            for k in range(1, len(words) + 1):
+                self.by_suffix.setdefault(" ".join(words[-k:]), []).append(team)
+
+    def match(self, name: Optional[str]) -> Optional["TeamInfo"]:
+        if not name:
+            return None
+        n = _normalize_team_name(name)
+
+        if n in self.exceptions:
+            return self.by_id.get(self.exceptions[n])
+        if n in self.by_full:
+            return self.by_full[n]
+
+        # Longest suffix of the flashscore name that maps to exactly one team
+        words = n.split()
+        for k in range(len(words), 0, -1):
+            candidates = self.by_suffix.get(" ".join(words[-k:]), [])
+            ids = {t.team_id for t in candidates}
+            if len(ids) == 1:
+                return candidates[0]
+
+        logger.warning("flashscore: no %s team match for %r", self.league, name)
+        return None
+
+
+def _to_status(event) -> "GameStatus":
+    if event.status == "postponed":
+        return GameStatus.POSTPONED
+    if event.status == "canceled":
+        return GameStatus.CANCELLED
+    if event.stage == "live":
+        return GameStatus.IN_PROGRESS
+    if event.stage == "finished":
+        return GameStatus.FINAL
+    return GameStatus.SCHEDULED
+
+
+class FlashscoreScheduleSource:
+    """Rolling-window schedule refresh + live-event mapping over flashscore."""
+
+    def __init__(self, db):
+        if not _HAS_DATABASE_MANAGER:
+            raise ImportError(
+                "FlashscoreScheduleSource requires database_manager "
+                "(TravelVizWidget) on the import path")
+        self.db = db  # DatabaseManager
+        self._client: Optional[FlashscoreClient] = None
+        self._client_lock = threading.Lock()
+        self._matchers: Dict[str, _TeamMatcher] = {}
+
+    def client(self) -> FlashscoreClient:
+        """Lazy client; does network credential discovery on first use, so only
+        call from a background thread."""
+        with self._client_lock:
+            if self._client is None:
+                self._client = FlashscoreClient(verbose=False)
+            return self._client
+
+    def matcher(self, league: str) -> _TeamMatcher:
+        if league not in self._matchers:
+            self._matchers[league] = _TeamMatcher(league, self.db.load_teams(league))
+        return self._matchers[league]
+
+    # ------------------------------------------------------------ schedule
+
+    @staticmethod
+    def _tournament_league(tournament: str) -> str:
+        """'USA: NBA - Play Offs' -> 'NBA'. Exact match avoids WNBA/NBL bleed."""
+        name = tournament.split(":", 1)[1] if ":" in tournament else tournament
+        return name.split(" - ", 1)[0].strip().upper()
+
+    def fetch_league_events(self, league: str, days: List[int]) -> List:
+        spec = LEAGUE_SPECS[league]
+        sched = self.client().get_schedule(sports=[spec["sport"]], days=days)
+        events = sched.get(spec["sport"], [])
+        token = spec["token"]
+
+        # Exact league match + dedupe: flashscore day buckets are UTC days, so
+        # events near the boundary can appear in two adjacent buckets.
+        seen = set()
+        out = []
+        for e in events:
+            if self._tournament_league(e.tournament or "") != token:
+                continue
+            if e.event_id in seen:
+                continue
+            seen.add(e.event_id)
+            out.append(e)
+        return out
+
+    def refresh_upcoming(self, league: str, season: str,
+                         days_back: int = 1, days_ahead: int = 7) -> Dict:
+        """Merge flashscore's rolling window into the games table.
+
+        Reuses existing game_ids when the same matchup/day already exists (so
+        ESPN-loaded games are updated, not duplicated); inserts new games with
+        fs_<event_id> ids. Returns a summary dict."""
+        days = list(range(-days_back, days_ahead + 1))
+        events = self.fetch_league_events(league, days)
+
+        matcher = self.matcher(league)
+        existing = self.db.load_games(season, league)
+        by_key = {}
+        venue_by_team: Dict[str, Venue] = {}
+        for g in existing:
+            by_key[(g.home_team.team_id.lower(), g.away_team.team_id.lower(),
+                    g.date.date())] = g
+            venue_by_team[g.home_team.team_id.lower()] = g.venue
+
+        summary = dict(league=league, season=season, fetched=len(events),
+                       inserted=0, updated=0, unchanged=0,
+                       unmatched=[], travel_relevant=0)
+        to_save: List[GameData] = []
+
+        for e in events:
+            home = matcher.match(e.home)
+            away = matcher.match(e.away)
+            if not home or not away or not e.start_ts:
+                summary["unmatched"].append(f"{e.away} @ {e.home}")
+                continue
+
+            # flashscore ts is UTC; games table stores naive local datetimes
+            game_dt = datetime.fromtimestamp(e.start_ts)
+            status = _to_status(e)
+            key = (home.team_id.lower(), away.team_id.lower(), game_dt.date())
+
+            if key in by_key:
+                g = by_key[key]
+                date_changed = abs((g.date - game_dt).total_seconds()) > 60
+                status_changed = g.status != status
+                if not (date_changed or status_changed):
+                    summary["unchanged"] += 1
+                    continue
+                to_save.append(GameData(
+                    game_id=g.game_id, date=game_dt, home_team=g.home_team,
+                    away_team=g.away_team, venue=g.venue, status=status,
+                    league=league, season=season))
+                summary["updated"] += 1
+                if date_changed:
+                    summary["travel_relevant"] += 1
+            else:
+                venue = venue_by_team.get(home.team_id.lower()) \
+                    or self._fallback_venue(home)
+                to_save.append(GameData(
+                    game_id=f"fs_{e.event_id}", date=game_dt, home_team=home,
+                    away_team=away, venue=venue, status=status,
+                    league=league, season=season))
+                summary["inserted"] += 1
+                summary["travel_relevant"] += 1
+
+        if to_save:
+            self.db.upsert_games(to_save, season, league)
+
+        logger.info(
+            "flashscore %s refresh: %d fetched, %d inserted, %d updated, "
+            "%d unchanged, %d unmatched", league, summary["fetched"],
+            summary["inserted"], summary["updated"], summary["unchanged"],
+            len(summary["unmatched"]))
+        return summary
+
+    def _fallback_venue(self, team: "TeamInfo") -> "Venue":
+        city = team.location or ""
+        coords = CITY_COORDS.get(city, (0.0, 0.0))
+        return Venue(
+            venue_id=f"fs_home_{team.team_id.lower()}",
+            name=f"{city} Venue", city=city, state="", country="",
+            latitude=coords[0], longitude=coords[1])
+
+    # ------------------------------------------------------------- lineups
+
+    def resolve_event_id(self, league: str, home_id: str, away_id: str,
+                         game_date: datetime) -> Optional[str]:
+        """Flashscore event id for a game, for game_ids that aren't
+        fs_-prefixed (ESPN-loaded). One day-feed fetch."""
+        delta = (game_date.date() - datetime.now().date()).days
+        if not -1 <= delta <= 7:
+            return None
+        matcher = self.matcher(league)
+        for e in self.fetch_league_events(league, [delta]):
+            h, a = matcher.match(e.home), matcher.match(e.away)
+            if (h and a and h.team_id.lower() == home_id.lower()
+                    and a.team_id.lower() == away_id.lower()):
+                return e.event_id
+        return None
+
+    def fetch_game_lineups(self, league: str, event_id: str) -> Dict:
+        """Panel-ready lineups for the cube-unfold game panel.
+
+        Returns {'home': {'players': [{'name','number'}...], 'starter': str|None},
+                 'away': {...}, 'posted': bool}. MLB: players = batting order,
+        starter = probable/starting pitcher with W-L note. Other leagues: the
+        first roster section the feed provides."""
+        sport_id = SPORT_IDS[LEAGUE_SPECS[league]["sport"]]
+        data = self.client().get_lineups(sport_id, event_id)
+        out = {"home": {"players": [], "starter": None},
+               "away": {"players": [], "starter": None}, "posted": False}
+
+        for sec in data.get("sections") or []:
+            name = (sec.get("name") or "").lower()
+            for side in ("home", "away"):
+                rows = sec.get(side) or []
+                if name == "pitchers":
+                    starter = next(
+                        (p for p in rows
+                         if p["role"] == FlashscoreClient.PITCHER_STARTER_ROLE),
+                        rows[0] if rows else None)
+                    if starter and not out[side]["starter"]:
+                        label = starter["name"]
+                        if starter.get("note"):
+                            label += f" {starter['note']}"
+                        out[side]["starter"] = label
+                elif name == "coaches":
+                    continue
+                elif not out[side]["players"]:  # Batters / first roster section
+                    out[side]["players"] = [
+                        {"name": p["name"], "number": p["number"]} for p in rows]
+
+        out["posted"] = bool(out["home"]["players"] or out["away"]["players"])
+        return out
+
+    # ---------------------------------------------------------------- live
+
+    def map_live_events(self, league: str, events: List) -> List[Dict]:
+        """Map raw flashscore live events onto our team ids for marker lookup."""
+        matcher = self.matcher(league)
+        token = LEAGUE_SPECS[league]["token"]
+        out = []
+        for e in events:
+            if self._tournament_league(e.tournament or "") != token:
+                continue
+            home = matcher.match(e.home)
+            away = matcher.match(e.away)
+            if not home or not away:
+                continue
+            out.append({
+                "league": league,
+                "event_id": e.event_id,
+                "sport_id": e.sport_id,
+                "home_id": home.team_id.lower(),
+                "away_id": away.team_id.lower(),
+                "home": e.home, "away": e.away,
+                "home_score": e.home_score, "away_score": e.away_score,
+                "status": e.status, "stage": e.stage,
+                "start_ts": e.start_ts,
+            })
+        return out
+
+    def attach_progress(self, events: List[Dict]):
+        """Fetch per-event live progress (lean dc_ feed) and attach a compact
+        game-state string: baseball 'Bot 3rd', basketball 'Q4', hockey 'P2'.
+        Threaded; a failed fetch just leaves 'progress' unset."""
+        def fetch(ev):
+            try:
+                result = self.client().get_live_progress(ev["sport_id"], ev["event_id"])
+                ev["progress"] = format_progress(ev["sport_id"], result.get("decoded") or {})
+            except Exception as e:
+                logger.debug("progress fetch failed for %s: %s", ev["event_id"], e)
+
+        live = [ev for ev in events if ev.get("stage") == "live"]
+        if not live:
+            return
+        with ThreadPoolExecutor(max_workers=min(8, len(live))) as pool:
+            list(pool.map(fetch, live))
+
+
+class FlashscoreLiveFeed:
+    """Background live-score poller for our leagues.
+
+    on_update(payload) fires from the poller thread with
+    {league: [mapped event dict, ...]} — marshal to the GUI thread before
+    touching widgets."""
+
+    def __init__(self, source: FlashscoreScheduleSource,
+                 leagues=("MLB", "NBA", "NHL"),
+                 interval: float = 30.0, on_update=None):
+        self.source = source
+        self.leagues = [lg for lg in leagues if lg in LEAGUE_SPECS]
+        self.interval = interval
+        self.on_update = on_update
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="travelviz-live-feed")
+        self._thread.start()
+
+    def stop(self, join_timeout: float = 5.0):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=join_timeout)
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self):
+        sports = sorted({LEAGUE_SPECS[lg]["sport"] for lg in self.leagues})
+        try:
+            client = self.source.client()  # may do credential discovery
+        except Exception as e:
+            logger.error("live feed: client init failed: %s", e)
+            return
+        client.poll_live(
+            sports=sports,
+            interval=self.interval,
+            on_update=self._tick,
+            on_error=lambda exc: logger.warning("live feed tick failed: %s", exc),
+            stop_event=self._stop,
+        )
+
+    def _tick(self, update: Dict):
+        if not self.on_update:
+            return
+        payload = {}
+        for league in self.leagues:
+            mapped = self.source.map_live_events(league, update.get("live", []))
+            if mapped:
+                self.source.attach_progress(mapped)
+                payload[league] = mapped
+        try:
+            self.on_update(payload)
+        except Exception as e:
+            logger.exception("live feed on_update failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
