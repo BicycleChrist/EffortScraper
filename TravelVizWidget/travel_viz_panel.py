@@ -15,6 +15,7 @@ Host integration surface:
 import math
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, List
 from datetime import datetime, timedelta
@@ -33,7 +34,7 @@ from live_flight_tracker import (RealTimeFlightTracker, DirectFlightTracker,
                                  FlightControlPanel)
 from venue_tooltip import VenueTooltip
 from database_manager import FatigueEngine
-from flashscore_source import FlashscoreLiveFeed
+from flashscore_client import FlashscoreLiveFeed
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,8 @@ class TravelVizPanel(QWidget):
 
     # internal: marshals live-poller callbacks (worker thread) onto the GUI thread
     _liveScoresArrived = pyqtSignal(object)
+    # internal: lineup fetch results (worker thread) -> GUI thread
+    _lineupsArrived = pyqtSignal(object, object)  # game key, lineup dict|None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -123,6 +126,8 @@ class TravelVizPanel(QWidget):
 
         self.live_feed = None               # FlashscoreLiveFeed (started on show)
         self._live_payload = {}             # last {league: [live event dict]}
+        self._lineups_cache = {}            # game key -> lineup dict
+        self._lineups_pending = set()       # game keys with an in-flight fetch
 
         self.setup_ui()
         self._create_actions()
@@ -400,6 +405,8 @@ class TravelVizPanel(QWidget):
         # staleness check never falls back to a full ESPN re-scrape.
         self._liveScoresArrived.connect(self._on_live_scores,
                                         Qt.ConnectionType.QueuedConnection)
+        self._lineupsArrived.connect(self._on_lineups_arrived,
+                                     Qt.ConnectionType.QueuedConnection)
         self._fs_refresh_timer = QTimer(self)
         self._fs_refresh_timer.setInterval(15 * 60 * 1000)
         self._fs_refresh_timer.timeout.connect(self._kick_flashscore_refresh)
@@ -441,6 +448,10 @@ class TravelVizPanel(QWidget):
     def _on_live_scores(self, payload: dict):
         """GUI-thread handler for live score ticks."""
         self._live_payload = payload or {}
+        # Feed game states to the flight tracker: "team is live" vetoes its
+        # travel window; a live→finished transition is the exact game end
+        if self.flight_tracker:
+            self.flight_tracker.update_live_states(self._live_payload)
         self._stamp_live_markers()
         self.liveScoresUpdated.emit(self._live_payload)
         total = sum(len(v) for v in self._live_payload.values())
@@ -465,6 +476,13 @@ class TravelVizPanel(QWidget):
                 marker['live'] = live
             else:
                 marker.pop('live', None)
+            # Re-stamp cached lineups (markers are rebuilt on schedule
+            # refresh; the unfold panel reads marker['lineups'])
+            if marker.get('game_info'):
+                lu = self._lineups_cache.get(
+                    self.globe_widget._marker_game_key(marker))
+                if lu is not None:
+                    marker['lineups'] = lu
 
         self.globe_widget.invalidate_marker_clusters()
 
@@ -615,7 +633,10 @@ class TravelVizPanel(QWidget):
         self.globe_widget.remove_live_flight(icao24)
 
     def on_tracker_status(self, message: str):
-        self.statusMessage.emit(message, 3000)
+        # Paused-polling notice stays in the banner until the next status
+        # (it recurs only every 2 min; a 3s timeout would leave it blank)
+        timeout = 0 if message.startswith("💤") else 3000
+        self.statusMessage.emit(message, timeout)
 
     def on_direct_flight_found(self, flight_data: dict):
         self.globe_widget.add_live_flight(flight_data)
@@ -1551,6 +1572,75 @@ class TravelVizPanel(QWidget):
                 'game_date': getattr(game, 'date', None),
             }
             self.gameSelected.emit(league, payload)
+
+            # Feed the cube-unfold panel: fetch flashscore lineups off-thread
+            self._maybe_fetch_lineups(marker_data)
+
+    # ------------------------------------------------------------- lineups
+
+    def _maybe_fetch_lineups(self, marker: dict):
+        """Fetch flashscore lineups for a clicked game cube (once per game,
+        cached). Stamps marker['lineups'] when they arrive."""
+        if not self.sports_aggregator:
+            return
+        game = (marker.get('game_info') or {}).get('game')
+        league = (marker.get('league') or self.current_league).upper()
+        if game is None or league not in ('MLB', 'NBA', 'NHL'):
+            return
+
+        key = self.globe_widget._marker_game_key(marker)
+        cached = self._lineups_cache.get(key)
+        if cached is not None:
+            marker['lineups'] = cached
+            self.globe_widget.update()
+            return
+        if key in self._lineups_pending:
+            return
+        self._lineups_pending.add(key)
+        marker['lineups_pending'] = True
+
+        live = marker.get('live') or {}
+        event_id = live.get('event_id')
+        game_id = getattr(game, 'game_id', '') or ''
+        if not event_id and game_id.startswith('fs_'):
+            event_id = game_id[3:]
+        home_id = (marker.get('home_team_id') or '').lower()
+        away_id = (marker.get('away_team_id') or '').lower()
+        game_date = getattr(game, 'date', None)
+        source = self.sports_aggregator.flashscore
+
+        def work():
+            data = None
+            try:
+                eid = event_id or source.resolve_event_id(
+                    league, home_id, away_id, game_date)
+                if eid:
+                    data = source.fetch_game_lineups(league, eid)
+            except Exception as e:
+                logger.warning("lineups fetch failed for %s: %s", key, e)
+            self._lineupsArrived.emit(key, data)
+
+        threading.Thread(target=work, daemon=True,
+                         name="travelviz-lineups").start()
+
+    def _on_lineups_arrived(self, key, data):
+        """GUI-thread: cache lineups and stamp matching markers."""
+        self._lineups_pending.discard(key)
+        if data is not None:
+            self._lineups_cache[key] = data
+        for marker in self.globe_widget.team_city_markers:
+            if not marker.get('game_info'):
+                continue
+            if self.globe_widget._marker_game_key(marker) == key:
+                marker.pop('lineups_pending', None)
+                if data is not None:
+                    marker['lineups'] = data
+                else:
+                    # Signal "tried, nothing available" to the panel
+                    marker['lineups'] = {'posted': False,
+                                         'home': {'players': [], 'starter': None},
+                                         'away': {'players': [], 'starter': None}}
+        self.globe_widget.update()
 
     def toggle_travel_paths(self, checked: bool):
         self.globe_widget.set_display_options(checked, True, True, True)

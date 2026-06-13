@@ -1892,7 +1892,7 @@ class ESPNSportsDataAggregator(QObject):
 
         # Flashscore: fast rolling-window refresh + live scores. Lazy client;
         # only touched from the loader worker / poller threads.
-        from flashscore_source import FlashscoreScheduleSource
+        from flashscore_client import FlashscoreScheduleSource
         self.flashscore = FlashscoreScheduleSource(self.db)
 
         self.load_teams_for_all_leagues()

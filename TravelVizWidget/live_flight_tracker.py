@@ -392,6 +392,68 @@ class LiveFlight:
         return self.velocity_ms * 1.94384 if self.velocity_ms else 0
 
 
+class LiveGameStateStore:
+    """Observed game states from the flashscore live feed.
+
+    Fed the mapped live-score payload ({league: [event dict, ...]}) each poll
+    tick (~30s). The live set is authoritative for "is this team playing right
+    now", and a team DROPPING OUT of the set is the live→finished transition —
+    i.e. the actual game end, accurate to one tick. Both beat inferring game
+    end as start + 2.75h.
+
+    Thread-safe: written from the GUI thread (live feed tick), read from the
+    tracker thread (travel-window computation).
+    """
+
+    # A live sighting older than this is stale (feed stopped / panel hidden);
+    # readers fall back to schedule inference rather than trusting it.
+    LIVE_TTL_S = 180
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live_seen: Dict[tuple, datetime] = {}    # (league, team_id) -> last live sighting
+        self._finished_at: Dict[tuple, datetime] = {}  # (league, team_id) -> observed finish
+
+    def update(self, payload: Dict):
+        """Ingest one live-score tick: {league: [mapped event dict, ...]}."""
+        now = datetime.now()
+        live_now = set()
+        for league, events in (payload or {}).items():
+            for ev in events:
+                if ev.get('stage') != 'live':
+                    continue
+                for tid in (ev.get('home_id'), ev.get('away_id')):
+                    if tid:
+                        live_now.add((league, tid.lower()))
+
+        with self._lock:
+            for key, seen in list(self._live_seen.items()):
+                if key in live_now:
+                    continue
+                del self._live_seen[key]
+                # Only a RECENT live→absent transition is a finish; a stale
+                # entry (feed was paused) tells us nothing about when it ended
+                if (now - seen).total_seconds() < self.LIVE_TTL_S:
+                    self._finished_at[key] = now
+            for key in live_now:
+                self._live_seen[key] = now
+                # New game went live (e.g. doubleheader game 2) — the old
+                # finish no longer describes the team's current state
+                self._finished_at.pop(key, None)
+
+    def is_live(self, league: str, team_id: str, now: datetime = None) -> bool:
+        """Is this team in a game right now (per a fresh live-feed sighting)?"""
+        now = now or datetime.now()
+        with self._lock:
+            seen = self._live_seen.get((league, team_id.lower()))
+        return seen is not None and (now - seen).total_seconds() < self.LIVE_TTL_S
+
+    def finished_at(self, league: str, team_id: str) -> Optional[datetime]:
+        """When the team's most recent game was observed to end, if seen."""
+        with self._lock:
+            return self._finished_at.get((league, team_id.lower()))
+
+
 class TeamFlightDetector:
     """Detects team charter flights using multiple heuristics"""
 
@@ -469,9 +531,11 @@ class TeamFlightDetector:
         'LAL': {'icao24': ['a1979l'], 'tail': ['N1979L']},  # Lakers (historical)
     }
 
-    def __init__(self, db: DatabaseManager, league: str = "NBA"):
+    def __init__(self, db: DatabaseManager, league: str = "NBA",
+                 game_state: Optional[LiveGameStateStore] = None):
         self.db = db
         self.league = league
+        self.game_state = game_state  # live-feed game states (optional)
         self.team_locations = {}  # team_id -> {'lat': float, 'lon': float, 'city': str}
 
         # Persistent connection for thread-safe database access
@@ -680,7 +744,11 @@ class TeamFlightDetector:
 
             last_game = last_game_cursor.fetchone()
 
-            # Find NEXT upcoming game for this team
+            # Find NEXT non-completed game for this team. Exact complement of
+            # the last-game query (start + 3h >= now) so an IN-PROGRESS game
+            # is never invisible to both queries — when it was, the window
+            # spanned right over a live game (last away game → tomorrow's
+            # home game) and charters got matched to teams mid-at-bat.
             next_game_cursor = conn.execute("""
                 SELECT
                     g.game_id, g.date as game_date, g.venue_id,
@@ -691,7 +759,7 @@ class TeamFlightDetector:
                 WHERE g.league = ?
                 AND g.season = ?
                 AND (g.home_team_id = ? OR g.away_team_id = ?)
-                AND datetime(g.date) > datetime('now', 'localtime')
+                AND datetime(g.date, '+3 hours') >= datetime('now', 'localtime')
                 ORDER BY g.date ASC
                 LIMIT 1
             """, (self.league, current_season, team_id, team_id))
@@ -701,15 +769,60 @@ class TeamFlightDetector:
             if not last_game or not next_game:
                 return None
 
+            # Live feed is authoritative: a team in a game right now cannot
+            # be on a plane (covers extra innings past start+3h, rain delays,
+            # late starts — cases the schedule inference below gets wrong)
+            if self.game_state and self.game_state.is_live(self.league, team_id):
+                return None
+
+            # Has the "next" non-completed game already started?
+            next_game_started = conn.execute(
+                "SELECT datetime(?) <= datetime('now', 'localtime')",
+                (next_game['game_date'],)).fetchone()[0]
+
+            observed_end = None
+            if next_game_started:
+                # SQL thinks this game may still be running (start+3h hasn't
+                # passed). If the live feed SAW it finish, it's actually the
+                # LAST game — the post-game band opens now, not at start+3h.
+                # Otherwise assume the team is still playing: no window.
+                observed_end = self._observed_finish(team_id, next_game['game_date'])
+                if observed_end is None:
+                    return None
+                last_game = next_game
+                next_game = conn.execute("""
+                    SELECT
+                        g.game_id, g.date as game_date, g.venue_id,
+                        g.home_team_id, g.away_team_id,
+                        v.city as venue_city, v.latitude, v.longitude
+                    FROM games g
+                    JOIN venues v ON g.venue_id = v.venue_id
+                    WHERE g.league = ?
+                    AND g.season = ?
+                    AND (g.home_team_id = ? OR g.away_team_id = ?)
+                    AND datetime(g.date) > datetime(?)
+                    ORDER BY g.date ASC
+                    LIMIT 1
+                """, (self.league, current_season, team_id, team_id,
+                      last_game['game_date'])).fetchone()
+                if not next_game:
+                    return None
+            else:
+                observed_end = self._observed_finish(team_id, last_game['game_date'])
+
             # Parse game times
             last_game_start = datetime.fromisoformat(last_game['game_date'].replace('Z', '+00:00')) if 'Z' in str(last_game['game_date']) else datetime.fromisoformat(str(last_game['game_date']))
             next_game_start = datetime.fromisoformat(next_game['game_date'].replace('Z', '+00:00')) if 'Z' in str(next_game['game_date']) else datetime.fromisoformat(str(next_game['game_date']))
 
-            # Calculate game end time (per-league typical length + buffer).
-            # MLB with the pitch clock runs ~2h40; 3h+ overestimates and made
-            # the earliest-departure gate reject real getaway-day charters.
-            game_hours = {'MLB': 2.75, 'NBA': 2.5, 'NHL': 2.75}.get(self.league, 3.0)
-            last_game_end = last_game_start + timedelta(hours=game_hours)
+            # Game end: prefer the live feed's OBSERVED finish (exact to one
+            # poll tick). Fall back to per-league typical length — MLB with
+            # the pitch clock runs ~2h40; 3h+ overestimates and made the
+            # earliest-departure gate reject real getaway-day charters.
+            if observed_end is not None:
+                last_game_end = observed_end
+            else:
+                game_hours = {'MLB': 2.75, 'NBA': 2.5, 'NHL': 2.75}.get(self.league, 3.0)
+                last_game_end = last_game_start + timedelta(hours=game_hours)
 
             # Teams are typically wheels-up 1-2 hours after the final out
             # (getaway day: bus is loaded before the game ends)
@@ -735,10 +848,18 @@ class TeamFlightDetector:
             if last_game['venue_id'] == next_game['venue_id']:
                 return None
 
+            # Multi-day gaps (playoff series, off days): teams that don't
+            # leave within ~12h of the game travel on the DAY BEFORE the next
+            # game instead. Second departure band opens 30h before puck drop.
+            pregame_travel_start = None
+            if (next_game_start - last_game_end) > timedelta(hours=36):
+                pregame_travel_start = next_game_start - timedelta(hours=30)
+
             return {
                 'last_game_end': last_game_end,
                 'earliest_departure': earliest_departure,
                 'latest_departure': latest_departure,
+                'pregame_travel_start': pregame_travel_start,
                 'next_game_start': next_game_start,
                 'required_arrival': required_arrival,
                 'origin_city': origin_city,
@@ -754,6 +875,66 @@ class TeamFlightDetector:
             import traceback
             traceback.print_exc()
             return None
+
+    def _observed_finish(self, team_id: str, game_date_str) -> Optional[datetime]:
+        """Live-feed observed finish time for the team's game starting at
+        game_date_str, or None if the feed didn't see that game end.
+
+        The store keeps one finish per team — validate it belongs to THIS
+        game (after its start, within 8h) so yesterday's finish never opens
+        today's post-game band."""
+        if not self.game_state:
+            return None
+        fin = self.game_state.finished_at(self.league, team_id)
+        if not fin:
+            return None
+        try:
+            s = str(game_date_str)
+            start = (datetime.fromisoformat(s.replace('Z', '+00:00'))
+                     if 'Z' in s else datetime.fromisoformat(s))
+        except ValueError:
+            return None
+        if start <= fin <= start + timedelta(hours=8):
+            return fin
+        return None
+
+    def window_active_now(self, w: Dict, now: datetime = None) -> bool:
+        """Could a charter for this travel window plausibly be AIRBORNE right
+        now? Used to pause adsb polling when the answer is no for every team
+        (e.g. 2-6 AM after the overnight dead-zone closes)."""
+        now = now or datetime.now()
+        total = self._haversine_distance(
+            w['origin_lat'], w['origin_lon'], w['dest_lat'], w['dest_lon'])
+        if total < 300 or total > 4500:
+            return False
+        dur = timedelta(hours=total / 800.0)
+
+        # A flight airborne now departed within [now - dur, now]; the
+        # departure must fall in the post-game band OR the day-before-game
+        # travel band, and clear the overnight dead-zone (30-min sampling)
+        lo = max(w['earliest_departure'] - timedelta(minutes=45), now - dur)
+        hi = now
+        if lo > hi:
+            return False
+
+        pregame_start = w.get('pregame_travel_start')
+        machine_off = now.astimezone().utcoffset()
+        origin_off = timedelta(hours=CITY_TZ.get(
+            w['origin_city'], round((w['origin_lon'] or 0) / 15.0)))
+        t = lo
+        while t <= hi:
+            in_postgame = t <= w['latest_departure']
+            in_pregame = pregame_start is not None and t >= pregame_start
+            if t + dur <= w['required_arrival']:
+                delay = (t - w['last_game_end']).total_seconds() / 3600
+                local = t - machine_off + origin_off
+                if in_postgame and (delay <= 4.5 or local.hour >= 7):
+                    return True
+                # Pregame band: daytime departures only (08-19 origin-local)
+                if in_pregame and not in_postgame and 8 <= local.hour <= 19:
+                    return True
+            t += timedelta(minutes=30)
+        return False
 
     def set_league(self, league: str):
         """Change the league and reload team locations"""
@@ -1295,15 +1476,32 @@ class TeamFlightDetector:
         remaining_hours = flight_duration_hours * (1 - route_progress)
         estimated_arrival = now + timedelta(hours=remaining_hours)
 
-        # VALIDATION 1: Departure should be after earliest possible departure
+        # VALIDATION 1+2: departure must fall in one of the two real-world
+        # bands: post-game getaway [end+1h-45m, end+12h], or day-before-game
+        # travel [next_game - 30h, ...] when there's a multi-day gap.
         # (45 min slack: the constant-cruise-speed estimate ignores
         # taxi/climb, biasing estimated departures early)
-        if estimated_departure < travel_window['earliest_departure'] - timedelta(minutes=45):
+        in_postgame = (
+            travel_window['earliest_departure'] - timedelta(minutes=45)
+            <= estimated_departure <= travel_window['latest_departure'])
+        pregame_start = travel_window.get('pregame_travel_start')
+        in_pregame = (pregame_start is not None
+                      and estimated_departure >= pregame_start)
+        if not (in_postgame or in_pregame):
             return None
 
-        # VALIDATION 2: Departure should be before latest reasonable departure
-        if estimated_departure > travel_window['latest_departure']:
-            return None
+        # Day-before-game travel is a DAYTIME activity: depart 08:00-19:00
+        # origin-local, arrive by evening, sleep at the destination. Without
+        # this, late-night corridor red-eyes match all night once the
+        # pregame band opens.
+        if in_pregame and not in_postgame:
+            machine_off = now.astimezone().utcoffset()
+            origin_off = timedelta(hours=CITY_TZ.get(
+                travel_window['origin_city'],
+                round((travel_window['origin_lon'] or 0) / 15.0)))
+            local_dep = estimated_departure - machine_off + origin_off
+            if not (8 <= local_dep.hour <= 19):
+                return None
 
         # VALIDATION 3: Arrival should be before required arrival time
         if estimated_arrival > travel_window['required_arrival']:
@@ -1339,6 +1537,8 @@ class TeamFlightDetector:
             timing_bonus += 8   # Plausible late departure
         elif dep_delay_hours <= 12:
             timing_bonus += 3   # Overnight stay, morning flight
+        elif in_pregame:
+            timing_bonus += 10  # Classic day-before-game travel
         # else: 0 — valid but weak
 
         # Calculate confidence score
@@ -1412,7 +1612,11 @@ class RealTimeFlightTracker(QThread):
         # stays as the primary-league alias for back-compat.
         self.db = db
         self.leagues = [league]
-        self.detectors = {league: TeamFlightDetector(db, league)}
+        # Shared live game states (fed by the panel's flashscore live feed via
+        # update_live_states) — gives detectors authoritative "team is playing
+        # now" + exact observed game-end times
+        self.game_state = LiveGameStateStore()
+        self.detectors = {league: TeamFlightDetector(db, league, self.game_state)}
         self.detector = self.detectors[league]
         self.upcoming_by_league: Dict[str, List] = {}
 
@@ -1442,6 +1646,14 @@ class RealTimeFlightTracker(QThread):
         """Back-compat single-league setter"""
         self.set_leagues([league])
 
+    def update_live_states(self, payload: Dict):
+        """Ingest a flashscore live-score tick ({league: [event dict, ...]}).
+        Called from the GUI thread; the store is lock-protected. Also drops
+        the travel-window cache so live transitions take effect immediately
+        (a game ending opens the post-game band NOW, not in 60s)."""
+        self.game_state.update(payload)
+        self._window_cache = None
+
     def set_leagues(self, leagues: List[str]):
         """Track charters for several leagues at once (one adsb fetch per
         tick, one schedule-correlation detector per league)."""
@@ -1452,7 +1664,7 @@ class RealTimeFlightTracker(QThread):
         self.league = leagues[0]
         for lg in leagues:
             if lg not in self.detectors:
-                self.detectors[lg] = TeamFlightDetector(self.db, lg)
+                self.detectors[lg] = TeamFlightDetector(self.db, lg, self.game_state)
         self.detector = self.detectors[self.league]
         self._initialized = False
         if self.isRunning():
@@ -1526,6 +1738,16 @@ class RealTimeFlightTracker(QThread):
 
         while self.running:
             try:
+                # Skip adsb polling entirely when no team could plausibly be
+                # in the air (saves API calls overnight / on idle days)
+                active_count, sample = self._active_travel_windows()
+                if active_count == 0:
+                    self.statusUpdate.emit(
+                        "💤 No teams in travel windows — flight polling paused "
+                        "(rechecks every 2 min)")
+                    self._stop_event.wait(120)
+                    continue
+
                 # Collect ALL candidate flights first, then filter to best per team
                 candidate_flights: List[LiveFlight] = []
 
@@ -1602,7 +1824,8 @@ class RealTimeFlightTracker(QThread):
                     )
                 else:
                     self.statusUpdate.emit(
-                        f"🔍 {aircraft_count} {types_str}s in US | {len(self.upcoming_games)} games upcoming"
+                        f"🔍 {aircraft_count} {types_str}s in US | watching "
+                        f"{active_count} travel window(s): {', '.join(sample)}"
                     )
 
             except Exception as e:
@@ -1612,6 +1835,32 @@ class RealTimeFlightTracker(QThread):
             self._stop_event.wait(self.update_interval)
 
         self.statusUpdate.emit("🛑 Flight tracker stopped")
+
+    def _active_travel_windows(self):
+        """(count, sample team ids) of teams whose charter could be airborne
+        right now, across all tracked leagues. Cached for 60s — it's ~2 DB
+        queries per team."""
+        now = datetime.now()
+        cached = getattr(self, '_window_cache', None)
+        if cached and (now - cached[0]).total_seconds() < 60:
+            return cached[1], cached[2]
+
+        count, sample = 0, []
+        for league in self.leagues:
+            detector = self.detectors[league]
+            try:
+                teams = self.db.load_teams(league)
+            except Exception:
+                continue
+            for team in teams:
+                w = detector.get_team_travel_window(team.team_id)
+                if w and detector.window_active_now(w, now):
+                    count += 1
+                    if len(sample) < 6:
+                        sample.append(f"{league}:{team.team_id.upper()}")
+
+        self._window_cache = (now, count, sample)
+        return count, sample
 
     def _select_best_flight_per_team(self, candidates: List[LiveFlight]) -> List[LiveFlight]:
         """

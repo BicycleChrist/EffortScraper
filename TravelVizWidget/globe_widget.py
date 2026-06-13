@@ -373,6 +373,21 @@ class FlightGlobeWidget(QOpenGLWidget):
         self._flight_route_cache = {}    # icao24 -> (vao, vbo, count, color)
         # Remembered label slot per flight so chips don't reshuffle each frame
         self._flight_label_slots = {}    # icao24 -> slot index
+        # Same for live score chips, keyed by stable game key. Each entry:
+        # {'slot': int, 'off': smoothed [dx, dy] offset from the anchor}.
+        # Layout is only re-solved on a slow clock (see _chip_layout_t) —
+        # between solves chips ride rigidly on their anchors.
+        self._score_chip_state = {}      # game key -> placement state
+        self._chip_layout_t = -1.0       # animation_time of last layout solve
+        self._chip_layout_keys = set()   # game keys at last solve
+
+        # Cube-unfold game panel: click a game cube and it unfolds into a
+        # flat panel showing enriched game data (lineups, weather, fatigue).
+        # {'key': game key, 'phase': 'opening'|'closing', 't': 0..1,
+        #  'spin0': (yaw, tilt) captured at click so the net starts at the
+        #  GL cube's current orientation and spins down to face the camera}
+        self._unfold = None
+        self.team_logo_images_big = {}   # 128px QImages for unfold faces/panel
         # Route arcs are opt-in: click a plane to toggle its arc
         self._shown_route_icaos = set()
         
@@ -858,6 +873,8 @@ class FlightGlobeWidget(QOpenGLWidget):
                             self.team_logo_images[texture_key] = image.scaled(
                                 18, 18, Qt.AspectRatioMode.KeepAspectRatio,
                                 Qt.TransformationMode.SmoothTransformation)
+                            # Full-res copy for unfold faces / panel header
+                            self.team_logo_images_big[texture_key] = image
 
                             # Create OpenGL texture
                             texture = QOpenGLTexture(image)
@@ -1370,6 +1387,16 @@ class FlightGlobeWidget(QOpenGLWidget):
         frame_time = current_time - self.last_frame_time
         self.last_frame_time = current_time
         self.animation_time += frame_time
+
+        # Advance the cube-unfold animation
+        if self._unfold is not None:
+            step = frame_time / 0.9  # full unfold ~0.9s
+            if self._unfold['phase'] == 'closing':
+                self._unfold['t'] -= step
+                if self._unfold['t'] <= 0.0:
+                    self._unfold = None
+            else:
+                self._unfold['t'] = min(1.0, self._unfold['t'] + step)
 
         self._fps_frame_count += 1
         if current_time - self._fps_last_emit >= 1.0:
@@ -1903,7 +1930,13 @@ class FlightGlobeWidget(QOpenGLWidget):
                 # Near tier shrinks markers so they keep a sane screen size
                 size_scale = 1.0 if self._lod == self.LOD_MID \
                     else max(2.2 / self.zoom_level, 0.35)
+                unfold_key = self._unfold['key'] if self._unfold else None
                 for marker in self.team_city_markers:
+                    # The unfolding cube is drawn as a 2D net in the overlay
+                    # pass — skip its GL cube
+                    if (unfold_key is not None and marker.get('game_info')
+                            and self._marker_game_key(marker) == unfold_key):
+                        continue
                     marker_type = marker.get('type', 'generic')
 
                     if marker_type in ['home_today', 'away_today']:
@@ -2039,15 +2072,23 @@ class FlightGlobeWidget(QOpenGLWidget):
             elif not self._marker_front_facing(focus_marker['position']):
                 focus_marker = None  # rotated away; key kept for when it returns
 
+        unfold_key = self._unfold['key'] if self._unfold else None
+
+        def _is_unfolding(m):
+            return (unfold_key is not None and m.get('game_info')
+                    and self._marker_game_key(m) == unfold_key)
+
         live_markers = [] if self._lod == self.LOD_FAR else \
             [m for m in self.team_city_markers
-             if m.get('live') and m is not focus_marker]
+             if m.get('live') and m is not focus_marker
+             and not _is_unfolding(m)]
         fatigue_markers = [] if self._lod != self.LOD_NEAR else \
             [m for m in self.team_city_markers
              if m.get('fatigue_max', 0) >= 40 and not m.get('live')
-             and m is not focus_marker]
+             and m is not focus_marker and not _is_unfolding(m)]
 
-        if not (far_clusters or live_markers or fatigue_markers or focus_marker):
+        if not (far_clusters or live_markers or fatigue_markers
+                or focus_marker or self._unfold):
             return
 
         self._prepare_gl_for_qpainter()
@@ -2071,8 +2112,11 @@ class FlightGlobeWidget(QOpenGLWidget):
             painter.drawText(int(x) + 8, int(y) - 18, 18, 18,
                              Qt.AlignmentFlag.AlignCenter, str(len(cluster['markers'])))
 
-        # Live score chips: [away logo] 3–0 [home logo] · Bot 3rd, with a
-        # leader stem down to the marker and collision stacking between chips
+        # Live score chips: [away logo] 3–0 [home logo] · Bot 3rd. Placement
+        # mirrors the flight labels: fixed candidate slots around the marker
+        # tried in priority order, viewport-clamped BEFORE collision testing,
+        # remembered slot per game so chips stay parked across frames. The
+        # marker cubes themselves are obstacles so chips don't sit on them.
         score_font = QFont("Arial", 10, QFont.Weight.Bold)
         progress_font = QFont("Arial", 8, QFont.Weight.DemiBold)
         placed_rects = []
@@ -2082,8 +2126,34 @@ class FlightGlobeWidget(QOpenGLWidget):
                 continue
             screen = self.project_to_screen(marker['position'], mvp)
             if screen:
-                projected.append((screen[1], screen[0], marker))
-        for sy, sx, marker in sorted(projected, key=lambda t: t[0]):
+                projected.append((screen[0], screen[1], marker))
+
+        # Drop placement state for games no longer on the board
+        keys_now = {self._marker_game_key(m) for _, _, m in projected}
+        self._score_chip_state = {k: v for k, v in self._score_chip_state.items()
+                                  if k in keys_now}
+
+        # Layout is re-SOLVED at most ~once a second, or when the set of
+        # visible games changes. Between solves chips keep their slot and
+        # ride rigidly on their anchors — nothing else can move, so nothing
+        # can jitter. (Solving every frame against continuously-moving
+        # anchors made chips reshuffle endlessly during globe rotation:
+        # each chip's fix invalidated a neighbor's spot and the system
+        # never settled.)
+        do_solve = (keys_now != self._chip_layout_keys
+                    or (self.animation_time - self._chip_layout_t) >= 1.0
+                    or self.animation_time < self._chip_layout_t)
+        if do_solve:
+            self._chip_layout_t = self.animation_time
+            self._chip_layout_keys = set(keys_now)
+            # Logo cubes as obstacles (own and neighbors')
+            for sx, sy, _m in projected:
+                placed_rects.append(QRect(int(sx) - 14, int(sy) - 14, 28, 28))
+
+        # Stable iteration order so slot assignment doesn't reshuffle between
+        # frames as the globe drifts
+        for sx, sy, marker in sorted(
+                projected, key=lambda t: str(self._marker_game_key(t[2]))):
             x, y = int(sx), int(sy)
             live = marker['live']
             league = (marker.get('league') or '').lower()
@@ -2106,21 +2176,101 @@ class FlightGlobeWidget(QOpenGLWidget):
             w = pad + logo_w + gap + score_w + gap + logo_w + \
                 ((gap + 3 + gap + prog_w) if progress else 0) + pad
             h = 26
-            cx = x - w // 2
-            cy = y - h - 22
 
-            # Stack upward if overlapping a chip we already placed
-            rect = QRect(cx, cy, w, h)
-            for _ in range(5):
-                if not any(rect.intersects(r) for r in placed_rects):
-                    break
-                cy -= h + 4
-                rect = QRect(cx, cy, w, h)
-            placed_rects.append(rect)
+            def slot_rect(slot):
+                return {
+                    0: QRect(x - w // 2, y - h - 22, w, h),        # above
+                    1: QRect(x + 20, y - h // 2, w, h),            # right
+                    2: QRect(x - w - 20, y - h // 2, w, h),        # left
+                    3: QRect(x - w // 2, y + 22, w, h),            # below
+                    4: QRect(x - w // 2, y - 2 * h - 30, w, h),    # high above
+                    5: QRect(x + 20, y - 3 * h // 2 - 14, w, h),   # right-up
+                    6: QRect(x - w - 20, y - 3 * h // 2 - 14, w, h),  # left-up
+                    7: QRect(x - w // 2, y + h + 32, w, h),        # low below
+                }[slot]
 
-            # Leader stem from chip to marker
+            def clamp(r):
+                r = QRect(r)
+                r.moveLeft(max(4, min(r.left(), self.width() - w - 4)))
+                r.moveTop(max(4, min(r.top(), self.height() - h - 4)))
+                return r
+
+            def collides(r):
+                pad_r = r.adjusted(-3, -3, 3, 3)
+                return any(pad_r.intersects(o) for o in placed_rects)
+
+            def first_free_slot(prefer):
+                for slot in [prefer] + [s for s in range(8) if s != prefer]:
+                    r = clamp(slot_rect(slot))
+                    if not collides(r):
+                        return slot, r
+                return None, None
+
+            def stacked_rect(base_slot):
+                # All slots taken (dense slate): stack upward from the base
+                # slot until a free row appears
+                base = clamp(slot_rect(base_slot))
+                for k in range(1, 9):
+                    r = QRect(base)
+                    r.moveTop(base.top() - k * (h + 6))
+                    if r.top() < 4:
+                        break
+                    if not collides(r):
+                        return r
+                return base
+
+            game_key = self._marker_game_key(marker)
+            st = self._score_chip_state.get(game_key)
+            if st is None:
+                st = {'slot': 0, 'off': None}
+                self._score_chip_state[game_key] = st
+
+            if do_solve:
+                # Full assignment, preferring the current slot so a stable
+                # configuration is kept verbatim across solves
+                slot, rect = first_free_slot(st['slot'])
+                if slot is not None:
+                    st['slot'] = slot
+                else:
+                    rect = stacked_rect(st['slot'])
+                placed_rects.append(rect)
+                # Anchor-relative offset reused on frozen frames (also
+                # captures the stacked-fallback position, which slot_rect
+                # alone can't reproduce)
+                st['solved'] = (rect.left() - x, rect.top() - y)
+            else:
+                # Frozen layout: ride the anchor at the solved offset
+                so = st.get('solved')
+                if so is None:
+                    rect = clamp(slot_rect(st['slot']))
+                else:
+                    rect = clamp(QRect(x + so[0], y + so[1], w, h))
+
+            # Smooth the chip's offset FROM ITS ANCHOR, not its absolute
+            # position: the chip tracks the rotating globe exactly (no lag),
+            # while slot changes / edge-clamp shifts slide in over a few
+            # frames instead of popping.
+            off_x, off_y = rect.left() - x, rect.top() - y
+            if st['off'] is None:
+                st['off'] = [float(off_x), float(off_y)]
+            else:
+                a = 0.28
+                st['off'][0] += (off_x - st['off'][0]) * a
+                st['off'][1] += (off_y - st['off'][1]) * a
+                # Snap when close so the chip doesn't crawl subpixel forever
+                if abs(off_x - st['off'][0]) < 0.75 and \
+                        abs(off_y - st['off'][1]) < 0.75:
+                    st['off'] = [float(off_x), float(off_y)]
+            rect = QRect(x + round(st['off'][0]), y + round(st['off'][1]), w, h)
+            cx, cy = rect.left(), rect.top()
+
+            # Leader line from marker to chip (card drawn after covers the
+            # far end), with a small anchor dot at the marker
             painter.setPen(QPen(QColor(120, 170, 220, 110), 1))
-            painter.drawLine(x, cy + h, x, y - 8)
+            painter.drawLine(x, y, rect.center().x(), rect.center().y())
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(120, 170, 220, 130)))
+            painter.drawEllipse(x - 2, y - 2, 5, 5)
 
             # Card: subtle vertical gradient, soft border, green pulse accent
             grad = QLinearGradient(cx, cy, cx, cy + h)
@@ -2199,6 +2349,9 @@ class FlightGlobeWidget(QOpenGLWidget):
         if focus_marker is not None:
             self._draw_game_card(painter, focus_marker, mvp)
 
+        if self._unfold is not None:
+            self._render_unfold(painter, mvp)
+
         painter.end()
         gl.glEnable(gl.GL_CULL_FACE)
         gl.glEnable(gl.GL_DEPTH_TEST)
@@ -2212,6 +2365,409 @@ class FlightGlobeWidget(QOpenGLWidget):
             return game_id
         return (marker.get('league'), marker.get('home_team_id'),
                 marker.get('away_team_id'))
+
+    def toggle_game_unfold(self, marker):
+        """Click a game cube: unfold it into the enriched game panel; click
+        again (or click empty space) to fold it back."""
+        key = self._marker_game_key(marker)
+        u = self._unfold
+        if u is not None and u['key'] == key and u['phase'] != 'closing':
+            u['phase'] = 'closing'
+        else:
+            # Capture the GL cube's current spin so the net starts at the
+            # cube's orientation and visibly spins down to face the camera
+            speed = 0.3 if marker.get('type') in ('home_today', 'away_today') \
+                else 1.0
+            def _wrap(angle):
+                angle = angle % (2.0 * math.pi)
+                return angle - 2.0 * math.pi if angle > math.pi else angle
+            self._unfold = {
+                'key': key, 'phase': 'opening', 't': 0.0,
+                'spin0': (_wrap(self.animation_time * speed),
+                          _wrap(self.animation_time * speed * 0.7)),
+            }
+        self._selected_game_key = None
+        self.update()
+
+    @staticmethod
+    def _unfold_net_quads(u, yaw, tilt):
+        """Corner geometry of the cube net at unfold progress u (0=closed
+        cube, 1=flat cross), spun by yaw/tilt (rad). Local units: face
+        half-size = 1; +z = away from viewer. Returns [(face_id, [4 corners
+        (x,y,z) in bl,br,tr,tl screen order]), ...]."""
+        a = (math.pi / 2.0) * (1.0 - u)
+        ca, sa = math.cos(a), math.sin(a)
+        c2, s2 = math.cos(2 * a), math.sin(2 * a)
+
+        faces = [
+            # Center (cube front)
+            ('C', [(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)]),
+            # Right: hinge x=+1
+            ('R', [(1, -1, 0), (1 + 2 * ca, -1, 2 * sa),
+                   (1 + 2 * ca, 1, 2 * sa), (1, 1, 0)]),
+            # Left: hinge x=-1 (bl..tl order keeps texture upright)
+            ('L', [(-1 - 2 * ca, -1, 2 * sa), (-1, -1, 0),
+                   (-1, 1, 0), (-1 - 2 * ca, 1, 2 * sa)]),
+            # Top: hinge y=+1
+            ('T', [(-1, 1, 0), (1, 1, 0),
+                   (1, 1 + 2 * ca, 2 * sa), (-1, 1 + 2 * ca, 2 * sa)]),
+            # Bottom: hinge y=-1
+            ('B', [(-1, -1 - 2 * ca, 2 * sa), (1, -1 - 2 * ca, 2 * sa),
+                   (1, -1, 0), (-1, -1, 0)]),
+            # Back: chained to right face's far edge, folds with it
+            ('K', [(1 + 2 * ca, -1, 2 * sa),
+                   (1 + 2 * ca + 2 * c2, -1, 2 * sa + 2 * s2),
+                   (1 + 2 * ca + 2 * c2, 1, 2 * sa + 2 * s2),
+                   (1 + 2 * ca, 1, 2 * sa)]),
+        ]
+
+        cy_, sy_ = math.cos(yaw), math.sin(yaw)
+        cx_, sx_ = math.cos(tilt), math.sin(tilt)
+
+        def rot(p):
+            x, y, z = p
+            # rotX(tilt) then rotY(yaw) — matches the marker shader order
+            y, z = y * cx_ - z * sx_, y * sx_ + z * cx_
+            x, z = x * cy_ + z * sy_, -x * sy_ + z * cy_
+            return (x, y, z)
+
+        return [(fid, [rot(p) for p in corners]) for fid, corners in faces]
+
+    def _render_unfold(self, painter, mvp):
+        """Draw the unfolding cube net, then crossfade into the game panel."""
+        from PyQt6.QtCore import QPointF
+        from PyQt6.QtGui import (QColor, QPen, QBrush, QPolygonF, QTransform)
+
+        u = self._unfold
+        marker = next(
+            (m for m in self.team_city_markers
+             if m.get('game_info') and self._marker_game_key(m) == u['key']),
+            None)
+        if marker is None:  # game left the board
+            self._unfold = None
+            return
+        if not self._marker_front_facing(marker['position']):
+            if u['phase'] != 'closing':
+                u['phase'] = 'closing'
+            return
+        screen = self.project_to_screen(marker['position'], mvp)
+        if not screen:
+            return
+        ax, ay = screen
+
+        t = max(0.0, min(1.0, u['t']))
+        prog = min(1.0, t / 0.65)
+        prog = prog * prog * (3.0 - 2.0 * prog)          # smoothstep
+        yaw = u['spin0'][0] * (1.0 - prog)
+        tilt = u['spin0'][1] * (1.0 - prog)
+        s_px = 14.0 + (46.0 - 14.0) * prog               # face half-size px
+
+        # Pull the anchor onscreen as the net grows (cross spans x∈[-3s,5s],
+        # y∈[-3s,3s] around the anchor)
+        mx_lo, mx_hi = 3 * s_px + 8, self.width() - 5 * s_px - 8
+        my_lo, my_hi = 3 * s_px + 8, self.height() - 3 * s_px - 8
+        if mx_lo < mx_hi:
+            ax = ax + (max(mx_lo, min(ax, mx_hi)) - ax) * prog
+        if my_lo < my_hi:
+            ay = ay + (max(my_lo, min(ay, my_hi)) - ay) * prog
+
+        cross_alpha = 1.0 - max(0.0, min(1.0, (t - 0.70) / 0.18))
+        panel_alpha = max(0.0, min(1.0, (t - 0.68) / 0.22))
+
+        if cross_alpha > 0.01:
+            league = (marker.get('league') or '').lower()
+            away_img = self.team_logo_images_big.get(
+                f"{league}_{(marker.get('away_team_id') or '').lower()}")
+            home_img = self.team_logo_images_big.get(
+                f"{league}_{(marker.get('home_team_id') or '').lower()}")
+            face_imgs = {'C': away_img, 'L': away_img, 'B': away_img,
+                         'R': home_img, 'T': home_img, 'K': home_img}
+            ac = self.get_team_color((marker.get('away_team_id') or '').upper())
+            hc = self.get_team_color((marker.get('home_team_id') or '').upper())
+            face_cols = {f: (ac if face_imgs[f] is away_img else hc)
+                         for f in face_imgs}
+
+            quads = self._unfold_net_quads(prog, yaw, tilt)
+
+            def project(p):
+                x, y, z = p
+                f = 1.0 / max(0.4, 1.0 + z * 0.10)
+                return (ax + x * s_px * f, ay - y * s_px * f)
+
+            # Painter's algorithm: farthest faces first
+            quads.sort(key=lambda q: -sum(c[2] for c in q[1]) / 4.0)
+
+            painter.setOpacity(cross_alpha)
+            for fid, corners in quads:
+                pts = [QPointF(*project(c)) for c in corners]
+                poly = QPolygonF(pts)
+
+                # Face shading from the 3D normal (edge-on -> dark)
+                e1 = tuple(corners[1][i] - corners[0][i] for i in range(3))
+                e2 = tuple(corners[3][i] - corners[0][i] for i in range(3))
+                nx = e1[1] * e2[2] - e1[2] * e2[1]
+                ny = e1[2] * e2[0] - e1[0] * e2[2]
+                nz = e1[0] * e2[1] - e1[1] * e2[0]
+                norm = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+                bright = 0.45 + 0.55 * abs(nz) / norm
+
+                # Dark card backing (logos are transparent PNGs)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(QColor(16, 24, 42, 235)))
+                painter.drawPolygon(poly)
+
+                img = face_imgs.get(fid)
+                if img is not None:
+                    src = QPolygonF([
+                        QPointF(0, img.height()),
+                        QPointF(img.width(), img.height()),
+                        QPointF(img.width(), 0), QPointF(0, 0)])
+                    tr = QTransform()
+                    if QTransform.quadToQuad(src, QPolygonF(pts), tr):
+                        painter.save()
+                        painter.setTransform(tr, True)
+                        painter.drawImage(0, 0, img)
+                        painter.restore()
+                else:
+                    r, g, b = face_cols.get(fid, (0.5, 0.5, 0.6))
+                    painter.setBrush(QBrush(QColor(
+                        int(r * 255), int(g * 255), int(b * 255), 160)))
+                    painter.drawPolygon(poly)
+
+                # Shading overlay + edge
+                shade = int((1.0 - bright) * 170)
+                if shade > 0:
+                    painter.setBrush(QBrush(QColor(0, 0, 0, shade)))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawPolygon(poly)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(140, 180, 230, 120), 1))
+                painter.drawPolygon(poly)
+            painter.setOpacity(1.0)
+
+        if panel_alpha > 0.01:
+            # Panel centered on the cross center (local x=+1)
+            self._draw_unfold_panel(painter, marker,
+                                    ax + s_px, ay, panel_alpha)
+
+    def _draw_unfold_panel(self, painter, marker, px, py, alpha):
+        """The unfolded game panel: matchup, score, venue weather, fatigue,
+        and flashscore lineups."""
+        from PyQt6.QtCore import QRect
+        from PyQt6.QtGui import QColor, QFont, QPen, QBrush, QLinearGradient
+
+        league = (marker.get('league') or '').upper()
+        away_id = (marker.get('away_team_id') or '?')
+        home_id = (marker.get('home_team_id') or '?')
+        away_img = self.team_logo_images_big.get(f"{league.lower()}_{away_id.lower()}")
+        home_img = self.team_logo_images_big.get(f"{league.lower()}_{home_id.lower()}")
+        live = marker.get('live')
+        game = (marker.get('game_info') or {}).get('game')
+        weather = marker.get('weather')
+        fatigue = marker.get('fatigue_detail') or {}
+        lineups = marker.get('lineups')
+
+        header_font = QFont("Arial", 11, QFont.Weight.Bold)
+        score_font = QFont("Arial", 15, QFont.Weight.Bold)
+        detail_font = QFont("Arial", 9)
+        line_font = QFont("Arial", 8)
+        col_head_font = QFont("Arial", 8, QFont.Weight.Bold)
+
+        # ---- text lines
+        if live:
+            status_text = f"{live.get('away_score', '?')} – {live.get('home_score', '?')}"
+            progress = live.get('progress') or ''
+            sub_text = progress if progress.upper() != 'LIVE' else 'LIVE'
+        else:
+            status_text = None
+            game_status = getattr(getattr(game, 'status', None), 'value', '')
+            if game_status == 'final':
+                sub_text = "Final"
+            elif game_status in ('postponed', 'cancelled'):
+                sub_text = game_status.capitalize()
+            else:
+                sub_text = game.date.strftime("%a %b %d  ·  %I:%M %p") if game else ''
+
+        venue_text = None
+        if game is not None and getattr(game, 'venue', None) is not None:
+            venue_text = f"{game.venue.name}  ·  {game.venue.city}"
+
+        weather_text = None
+        if weather:
+            weather_text = (f"{weather.get('temperature', 0):.0f}°F  ·  "
+                            f"{weather.get('condition', '?')}  ·  "
+                            f"wind {weather.get('wind_speed', 0):.0f} mph")
+
+        fatigue_lines = []
+        for side, tid in (('away', away_id), ('home', home_id)):
+            tf = fatigue.get(side)
+            if tf is not None:
+                fatigue_lines.append(f"{tid.upper()} fatigue {tf.score:.0f}")
+        fatigue_text = "  ·  ".join(fatigue_lines) if fatigue_lines else None
+
+        # Lineup rows (capped at 9 — full MLB order; NHL/NBA show first 9)
+        MAX_ROWS = 9
+        away_rows, home_rows = [], []
+        away_starter = home_starter = None
+        if lineups and lineups.get('posted'):
+            def fmt(p):
+                num = f"{p.get('number')} " if p.get('number') else ""
+                return f"{num}{p.get('name', '')}"
+            away_rows = [fmt(p) for p in lineups['away']['players'][:MAX_ROWS]]
+            home_rows = [fmt(p) for p in lineups['home']['players'][:MAX_ROWS]]
+            away_starter = lineups['away'].get('starter')
+            home_starter = lineups['home'].get('starter')
+            lineup_note = None
+        elif lineups is not None:
+            lineup_note = "Lineups not posted yet"
+        elif marker.get('lineups_pending'):
+            lineup_note = "Lineups — loading…"
+        else:
+            lineup_note = None
+
+        # ---- panel size
+        w = 340
+        pad = 12
+        well = 28
+        h = 10 + well + 6                      # header
+        if status_text:
+            h += 26
+        h += 18                                # sub line
+        for txt in (venue_text, weather_text, fatigue_text):
+            if txt:
+                h += 15
+        n_rows = max(len(away_rows), len(home_rows))
+        if n_rows:
+            h += 8 + 14                        # divider + column headers
+            h += n_rows * 14
+            if away_starter or home_starter:
+                h += 16
+        elif lineup_note:
+            h += 8 + 16
+        h += 10
+
+        cx = int(px - w / 2)
+        cy = int(py - h / 2)
+        cx = max(6, min(cx, self.width() - w - 6))
+        cy = max(6, min(cy, self.height() - h - 6))
+
+        painter.setOpacity(alpha)
+
+        # ---- chrome
+        grad = QLinearGradient(cx, cy, cx, cy + h)
+        grad.setColorAt(0.0, QColor(24, 36, 58, 246))
+        grad.setColorAt(1.0, QColor(11, 17, 32, 246))
+        painter.setBrush(QBrush(grad))
+        pulse = 120 + int(60 * abs(math.sin(self.animation_time * 2.2)))
+        border = QColor(46, 204, 113, pulse) if live else QColor(110, 160, 215, 200)
+        painter.setPen(QPen(border, 1.4))
+        painter.drawRoundedRect(QRect(cx, cy, w, h), 9, 9)
+
+        # ---- header: logos + matchup
+        ty = cy + 10
+
+        def logo_well(x0, img, fallback):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(233, 237, 243, 240)))
+            painter.drawRoundedRect(x0 - 2, ty - 2, well + 4, well + 4, 5, 5)
+            if img is not None:
+                scaled = img.scaled(well, well,
+                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+                painter.drawImage(x0 + (well - scaled.width()) // 2,
+                                  ty + (well - scaled.height()) // 2, scaled)
+            else:
+                painter.setFont(detail_font)
+                painter.setPen(QColor(40, 50, 70))
+                painter.drawText(QRect(x0, ty, well, well),
+                                 Qt.AlignmentFlag.AlignCenter, fallback[:3].upper())
+
+        logo_well(cx + pad, away_img, away_id)
+        logo_well(cx + w - pad - well, home_img, home_id)
+        painter.setFont(header_font)
+        painter.setPen(QColor(245, 250, 255))
+        painter.drawText(QRect(cx + pad + well, ty, w - 2 * (pad + well), well),
+                         Qt.AlignmentFlag.AlignCenter,
+                         f"{away_id.upper()}  @  {home_id.upper()}")
+        ty += well + 6
+
+        # ---- score / status
+        if status_text:
+            painter.setFont(score_font)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(QRect(cx, ty, w, 24),
+                             Qt.AlignmentFlag.AlignCenter, status_text)
+            ty += 26
+
+        painter.setFont(detail_font)
+        if live:
+            painter.setPen(QColor(80, 230, 140))
+        else:
+            painter.setPen(QColor(150, 170, 195))
+        painter.drawText(QRect(cx, ty, w, 16),
+                         Qt.AlignmentFlag.AlignCenter, sub_text)
+        ty += 18
+
+        for txt, col in ((venue_text, QColor(150, 170, 195)),
+                         (weather_text, QColor(140, 175, 210))):
+            if txt:
+                painter.setPen(col)
+                painter.drawText(QRect(cx, ty, w, 15),
+                                 Qt.AlignmentFlag.AlignCenter, txt)
+                ty += 15
+        if fatigue_text:
+            worst = max((tf.score for tf in fatigue.values()), default=0)
+            painter.setPen(QColor(225, 90, 70) if worst >= 60 else
+                           QColor(235, 180, 60) if worst >= 40 else
+                           QColor(120, 200, 140))
+            painter.drawText(QRect(cx, ty, w, 15),
+                             Qt.AlignmentFlag.AlignCenter, fatigue_text)
+            ty += 15
+
+        # ---- lineups
+        if n_rows or lineup_note:
+            ty += 4
+            painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
+            painter.drawLine(cx + pad, ty, cx + w - pad, ty)
+            ty += 4
+
+        if n_rows:
+            col_w = (w - 2 * pad - 10) // 2
+            painter.setFont(col_head_font)
+            painter.setPen(QColor(150, 170, 195))
+            painter.drawText(QRect(cx + pad, ty, col_w, 13),
+                             Qt.AlignmentFlag.AlignLeft, away_id.upper())
+            painter.drawText(QRect(cx + w - pad - col_w, ty, col_w, 13),
+                             Qt.AlignmentFlag.AlignRight, home_id.upper())
+            ty += 14
+            painter.setFont(line_font)
+            painter.setPen(QColor(210, 220, 235))
+            for i in range(n_rows):
+                if i < len(away_rows):
+                    painter.drawText(QRect(cx + pad, ty, col_w, 13),
+                                     Qt.AlignmentFlag.AlignLeft, away_rows[i])
+                if i < len(home_rows):
+                    painter.drawText(QRect(cx + w - pad - col_w, ty, col_w, 13),
+                                     Qt.AlignmentFlag.AlignRight, home_rows[i])
+                ty += 14
+            if away_starter or home_starter:
+                painter.setPen(QColor(140, 200, 250))
+                if away_starter:
+                    painter.drawText(QRect(cx + pad, ty, col_w, 14),
+                                     Qt.AlignmentFlag.AlignLeft,
+                                     f"P: {away_starter}")
+                if home_starter:
+                    painter.drawText(QRect(cx + w - pad - col_w, ty, col_w, 14),
+                                     Qt.AlignmentFlag.AlignRight,
+                                     f"P: {home_starter}")
+                ty += 16
+        elif lineup_note:
+            painter.setFont(detail_font)
+            painter.setPen(QColor(150, 170, 195))
+            painter.drawText(QRect(cx, ty, w, 16),
+                             Qt.AlignmentFlag.AlignCenter, lineup_note)
+
+        painter.setOpacity(1.0)
 
     def _draw_game_card(self, painter, marker, mvp):
         """Full game card for the focused near-tier marker: matchup, score or
@@ -2678,19 +3234,21 @@ class FlightGlobeWidget(QOpenGLWidget):
             clicked_marker = self.find_clicked_marker(event.pos().x(), event.pos().y())
 
             if clicked_marker:
-                # Toggle the game card: click a game cube to show it, click
-                # the same cube again to dismiss
+                # Game cube: toggle the unfold panel (cube unfolds into the
+                # enriched game panel; clicking again folds it back)
                 if clicked_marker.get('game_info'):
-                    key = self._marker_game_key(clicked_marker)
-                    self._selected_game_key = None if key == self._selected_game_key else key
-                    self.update()
+                    self.toggle_game_unfold(clicked_marker)
 
                 # Emit signal with marker data
                 marker_id = clicked_marker.get('team_id', clicked_marker.get('city_name', 'unknown'))
                 self.markerClicked.emit(marker_id, clicked_marker)
                 return  # Don't start globe rotation
 
-            # No marker clicked - dismiss any open game card, start rotation
+            # No marker clicked - fold back any open panel, dismiss any
+            # game card, start rotation
+            if self._unfold is not None and self._unfold['phase'] != 'closing':
+                self._unfold['phase'] = 'closing'
+                self.update()
             if self._selected_game_key is not None:
                 self._selected_game_key = None
                 self.update()
