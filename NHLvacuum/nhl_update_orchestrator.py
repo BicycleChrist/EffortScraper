@@ -14,6 +14,8 @@ Data Sources:
 Author: NHL Analytics Database Project
 Date: 2025-12-02
 """
+# NST uses data.naturalstattrick.com API with key from nst_api_key.txt
+# Rate limits: 80 pages/5min (burst), 180 pages/hour (standard)
 
 import sqlite3
 import subprocess
@@ -26,6 +28,10 @@ from enum import Enum
 import sys
 import os
 import glob
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Import data collectors and importers
 import nstparse
@@ -154,6 +160,32 @@ class NHLUpdateOrchestrator:
     # Game Discovery - Find what needs updating
     # =========================================================================
 
+    # NHL public schedule endpoint. Each call to /schedule/{date} returns a full
+    # 7-day "gameWeek" starting on the requested date, so we query weekly anchors
+    # (7-day steps) instead of one call per day (~7x fewer requests), and fan those
+    # anchors out across a small thread pool. The API is undocumented and publishes
+    # no rate-limit headers; SCHEDULE_MAX_WORKERS is kept conservative + retry/backoff
+    # handles the occasional 429.
+    NHL_SCHEDULE_URL = "https://api-web.nhle.com/v1/schedule/{date}"
+    SCHEDULE_MAX_WORKERS = 6
+
+    @staticmethod
+    def _build_nhl_session() -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=3, connect=3, read=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('https://', adapter)
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; NHLvacuum/1.0)',
+            'Accept': 'application/json',
+        })
+        return session
+
     def get_recent_games_from_nhl_api(self) -> List[Dict]:
         """
         Query the NHL API for recent games.
@@ -162,79 +194,87 @@ class NHLUpdateOrchestrator:
         Returns:
             List of game dictionaries with game_id, date, teams, etc.
         """
-        try:
-            from nhlpy import NHLClient
-            client = NHLClient()
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.lookback_days)
+        logger.info(f"Fetching games from NHL API between {start_date.date()} and {end_date.date()}")
 
-            # Get games from the last N days
-            games = []
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=self.lookback_days)
+        # Weekly anchor dates (each fetch covers anchor .. anchor+6 days)
+        anchors = []
+        d = start_date
+        while d <= end_date:
+            anchors.append(d.strftime('%Y-%m-%d'))
+            d += timedelta(days=7)
 
-            logger.info(f"Fetching games from NHL API between {start_date.date()} and {end_date.date()}")
+        session = self._build_nhl_session()
 
-            # Query schedule for each day
-            current_date = start_date
-            while current_date <= end_date:
-                date_str = current_date.strftime('%Y-%m-%d')
-                try:
-                    # Use the correct nhlpy API method
-                    schedule = client.schedule.daily_schedule(date=date_str)
+        def fetch_week(anchor: str) -> List[Dict]:
+            """Fetch one weekly schedule payload and flatten its completed games."""
+            out = []
+            try:
+                resp = session.get(self.NHL_SCHEDULE_URL.format(date=anchor), timeout=30)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                logger.warning(f"Schedule fetch failed for week of {anchor}: {e}")
+                return out
 
-                    # Parse schedule response - daily_schedule returns a dict with 'games' key
-                    if 'games' in schedule and schedule['games']:
-                        for game in schedule['games']:
-                            # Filter for completed games only
-                            if game.get('gameState') not in ['FINAL', 'OFF']:
-                                continue
+            for day in payload.get('gameWeek', []):
+                day_date = day.get('date')
+                for game in day.get('games', []):
+                    # Filter for completed games only
+                    if game.get('gameState') not in ['FINAL', 'OFF']:
+                        continue
 
-                            # Convert season to season string format (20242025 -> "2024-25")
-                            season_int = str(game['season'])
-                            season_str = f"{season_int[:4]}-{season_int[6:]}"
+                    # Convert season to season string format (20242025 -> "2024-25")
+                    season_int = str(game['season'])
+                    season_str = f"{season_int[:4]}-{season_int[6:]}"
 
-                            # Convert NHL API abbreviations to NST format
-                            # NHL API uses LAK, TBL, NJD, SJS but NST uses L.A, T.B, N.J, S.J
-                            away_abbrev = self.convert_nhl_api_abbrev_to_nst(game['awayTeam']['abbrev'])
-                            home_abbrev = self.convert_nhl_api_abbrev_to_nst(game['homeTeam']['abbrev'])
+                    # Convert NHL API abbreviations to NST format
+                    # NHL API uses LAK, TBL, NJD, SJS but NST uses L.A, T.B, N.J, S.J
+                    away_abbrev = self.convert_nhl_api_abbrev_to_nst(game['awayTeam']['abbrev'])
+                    home_abbrev = self.convert_nhl_api_abbrev_to_nst(game['homeTeam']['abbrev'])
 
-                            # Extract full team names for NST scraping
-                            # Use commonName (e.g., "Bruins", "Kings") which works with TEAM_NAME_MAP
-                            away_common = game['awayTeam'].get('commonName', {}).get('default', '')
-                            home_common = game['homeTeam'].get('commonName', {}).get('default', '')
-                            away_place = game['awayTeam'].get('placeName', {}).get('default', '')
-                            home_place = game['homeTeam'].get('placeName', {}).get('default', '')
+                    # Extract full team names for NST scraping
+                    # Use commonName (e.g., "Bruins", "Kings") which works with TEAM_NAME_MAP
+                    away_common = game['awayTeam'].get('commonName', {}).get('default', '')
+                    home_common = game['homeTeam'].get('commonName', {}).get('default', '')
+                    away_place = game['awayTeam'].get('placeName', {}).get('default', '')
+                    home_place = game['homeTeam'].get('placeName', {}).get('default', '')
 
-                            # Full name format: "PlaceName CommonName" (e.g., "Boston Bruins")
-                            away_full = f"{away_place} {away_common}".strip() if away_place or away_common else ""
-                            home_full = f"{home_place} {home_common}".strip() if home_place or home_common else ""
+                    # Full name format: "PlaceName CommonName" (e.g., "Boston Bruins")
+                    away_full = f"{away_place} {away_common}".strip() if away_place or away_common else ""
+                    home_full = f"{home_place} {home_common}".strip() if home_place or home_common else ""
 
-                            game_data = {
-                                'game_id': str(game['id']),
-                                'game_date': schedule['date'],  # YYYY-MM-DD from schedule response
-                                'season': season_str,
-                                'game_type': game['gameType'],
-                                'away_team': away_abbrev,
-                                'home_team': home_abbrev,
-                                'away_team_full': away_full,
-                                'home_team_full': home_full,
-                                'game_state': game['gameState']
-                            }
-                            games.append(game_data)
+                    out.append({
+                        'game_id': str(game['id']),
+                        'game_date': day_date,
+                        'season': season_str,
+                        'game_type': game['gameType'],
+                        'away_team': away_abbrev,
+                        'home_team': home_abbrev,
+                        'away_team_full': away_full,
+                        'home_team_full': home_full,
+                        'game_state': game['gameState'],
+                    })
+            return out
 
-                except Exception as e:
-                    logger.debug(f"No games found for {date_str}: {e}")
+        # Fan weekly anchors out across a small pool; dedupe by game_id since
+        # week windows could overlap at boundaries.
+        games_by_id: Dict[str, Dict] = {}
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+        with ThreadPoolExecutor(max_workers=min(self.SCHEDULE_MAX_WORKERS, len(anchors) or 1)) as executor:
+            futures = {executor.submit(fetch_week, a): a for a in anchors}
+            for future in as_completed(futures):
+                for g in future.result():
+                    # Keep only games within the requested window
+                    if g['game_date'] and not (start_str <= g['game_date'] <= end_str):
+                        continue
+                    games_by_id[g['game_id']] = g
 
-                current_date += timedelta(days=1)
-
-            logger.info(f"Found {len(games)} games from NHL API")
-            return games
-
-        except ImportError:
-            logger.error("nhlpy library not installed. Run: pip install nhlpy")
-            return []
-        except Exception as e:
-            logger.error(f"Error fetching games from NHL API: {e}")
-            return []
+        games = list(games_by_id.values())
+        logger.info(f"Found {len(games)} games from NHL API ({len(anchors)} weekly requests, {self.SCHEDULE_MAX_WORKERS} workers)")
+        return games
 
     def get_downloaded_nst_games(self) -> Set[str]:
         """
@@ -625,7 +665,7 @@ class NHLUpdateOrchestrator:
                 season_code_url = current_season_code # "20252026"
 
             # Construct NST URL
-            # NST URL format: https://www.naturalstattrick.com/game.php?season={season}&game={game_id_suffix}
+            # NST URL format: https://data.naturalstattrick.com/game.php?season={season}&game={game_id_suffix}
             # DB Game ID: 2024020484 -> NST Suffix: 20484 (Game Type + Number)
             if len(game.game_id) == 10:
                 nst_game_suffix = game.game_id[5:]
@@ -633,7 +673,7 @@ class NHLUpdateOrchestrator:
                 logger.warning(f"Invalid Game ID format for NST scraping: {game.game_id}")
                 continue
             
-            full_report_url = f"https://www.naturalstattrick.com/game.php?season={season_code_url}&game={nst_game_suffix}"
+            full_report_url = f"https://data.naturalstattrick.com/game.php?season={season_code_url}&game={nst_game_suffix}"
             
             # Construct game dict for scraper
             game_dict = {
@@ -725,6 +765,12 @@ class NHLUpdateOrchestrator:
         else:
             logger.info(f"Will update MoneyPuck data for {len(games_needing_mp)} games")
 
+        # Detect playoff games among those needing data (game_id digits 5-6 == '03').
+        # MoneyPuck hosts playoff CSVs separately, so they need their own download/import pass.
+        playoff_games_needing_mp = [g for g in games_needing_mp if str(g.game_id)[4:6] == '03']
+        if playoff_games_needing_mp:
+            logger.info(f"  ({len(playoff_games_needing_mp)} of these are playoff games)")
+
         # 1. Download Data
         output_dir = Path("moneypuck_data")
         output_dir.mkdir(exist_ok=True)
@@ -813,6 +859,13 @@ class NHLUpdateOrchestrator:
         if goalie_404s:
             moneypuck_downloader.update_player_ids_with_goalies("player_ids.txt", goalie_404s)
 
+        # Playoff pass: only download playoff CSVs when playoff games actually need data.
+        # These land in moneypuck_data/playoffs/ and do not touch the regular files.
+        if playoff_games_needing_mp:
+            logger.info("Downloading MoneyPuck PLAYOFF data...")
+            moneypuck_downloader.download_team_data(teams, output_dir, max_workers=4, skip_existing=False, season_type='playoffs')
+            moneypuck_downloader.download_player_data(players_dict, output_dir, max_workers=3, skip_existing=False, season_type='playoffs')
+
         # Cleanup temp file
         if temp_players_file and os.path.exists(temp_players_file):
             os.remove(temp_players_file)
@@ -841,6 +894,12 @@ class NHLUpdateOrchestrator:
         # Run imports with filter
         mp_import.MoneyPuckTeamImporter.import_all(game_ids=game_ids_to_import)
         mp_import.MoneyPuckPlayerImporter.import_all(game_ids=game_ids_to_import)
+
+        # Import playoff CSVs (filtered by game_ids, so no table-clear; rows append).
+        if playoff_games_needing_mp:
+            logger.info("Importing MoneyPuck PLAYOFF data...")
+            mp_import.MoneyPuckTeamImporter.import_all(game_ids=game_ids_to_import, season_type='playoffs')
+            mp_import.MoneyPuckPlayerImporter.import_all(game_ids=game_ids_to_import, season_type='playoffs')
 
         # Import current season shots data (updates existing data)
         logger.info(f"Importing shots data for {shots_season_year-1}-{shots_season_year} season...")

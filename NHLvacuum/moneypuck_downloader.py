@@ -18,9 +18,20 @@ import threading
 from collections import deque
 
 # MoneyPuck URL templates
-MP_TEAM_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/teams/{team}.csv"
-MP_SKATER_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/skaters/{player_id}.csv"
-MP_GOALIE_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/goalies/{player_id}.csv"
+# {season_type} is either "regular" or "playoffs" (MoneyPuck hosts both under gameByGame/)
+MP_TEAM_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/{season_type}/teams/{team}.csv"
+MP_SKATER_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/{season_type}/skaters/{player_id}.csv"
+MP_GOALIE_URL = "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/{season_type}/goalies/{player_id}.csv"
+
+
+def season_subdir(output_dir: Path, season_type: str, leaf: str) -> Path:
+    """Resolve the output directory for a given data leaf and season type.
+
+    Regular-season data keeps its historical location (output_dir/<leaf>) so the
+    importer is unaffected; playoff data goes to a parallel output_dir/playoffs/<leaf>.
+    """
+    base = output_dir if season_type == "regular" else output_dir / season_type
+    return base / leaf
 
 # Headers to mimic a browser request (required to avoid 403 Forbidden)
 REQUEST_HEADERS = {
@@ -249,14 +260,14 @@ def get_players_from_file(file_path: str = "player_ids.txt") -> dict:
     }
 
 
-def download_team_data(teams: List[str], output_dir: Path, max_workers: int = None, skip_existing: bool = False):
+def download_team_data(teams: List[str], output_dir: Path, max_workers: int = None, skip_existing: bool = False, season_type: str = "regular"):
     """Download MoneyPuck team data for all teams using threading"""
 
     print(f"\n{'='*60}")
-    print(f"Downloading Team Data ({len(teams)} teams, {max_workers} threads)")
+    print(f"Downloading Team Data [{season_type}] ({len(teams)} teams, {max_workers} threads)")
     print(f"{'='*60}\n")
 
-    team_dir = output_dir / "teams"
+    team_dir = season_subdir(output_dir, season_type, "teams")
     team_dir.mkdir(parents=True, exist_ok=True)
 
     # MoneyPuck changed abbreviations mid-way for these teams
@@ -281,12 +292,12 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
             old_abbr, new_abbr = team_abbr_map[team]
 
             # Download OLD abbreviation file (larger file: 2008-2020)
-            url_old = MP_TEAM_URL.format(team=old_abbr)
+            url_old = MP_TEAM_URL.format(season_type=season_type, team=old_abbr)
             output_path_old = team_dir / f"{old_abbr}_temp.csv"
             result_old, _ = download_file(url_old, output_path_old, f"{team} (historical: {old_abbr})", skip_existing=skip_existing)
 
             # Download NEW abbreviation file (smaller file: 2020-current)
-            url_new = MP_TEAM_URL.format(team=new_abbr)
+            url_new = MP_TEAM_URL.format(season_type=season_type, team=new_abbr)
             output_path_new = team_dir / f"{new_abbr}_temp.csv"
             result_new, _ = download_file(url_new, output_path_new, f"{team} (recent: {new_abbr})", skip_existing=skip_existing)
 
@@ -297,7 +308,7 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
                 return False, team
         else:
             # Standard download for teams without split files
-            url = MP_TEAM_URL.format(team=team)
+            url = MP_TEAM_URL.format(season_type=season_type, team=team)
             output_path = team_dir / f"{team}.csv"
             result, _ = download_file(url, output_path, f"{team} team data", skip_existing=skip_existing)
             return result, team
@@ -334,7 +345,7 @@ def download_team_data(teams: List[str], output_dir: Path, max_workers: int = No
         print(f"\nConcatenation: {concat_success}/{len(concat_teams)} successful")
 
 
-def download_player_data(players: dict, output_dir: Path, limit: int = None, max_workers: int = None, skip_existing: bool = False) -> Set[str]:
+def download_player_data(players: dict, output_dir: Path, limit: int = None, max_workers: int = None, skip_existing: bool = False, season_type: str = "regular") -> Set[str]:
     """Download MoneyPuck player data using threading
 
     Returns:
@@ -346,10 +357,10 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
 
     # Download skaters
     print(f"\n{'='*60}")
-    print(f"Downloading Skater Data ({len(skaters)} players, {max_workers} threads)")
+    print(f"Downloading Skater Data [{season_type}] ({len(skaters)} players, {max_workers} threads)")
     print(f"{'='*60}\n")
 
-    skater_dir = output_dir / "skaters"
+    skater_dir = season_subdir(output_dir, season_type, "skaters")
     skater_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
@@ -360,7 +371,7 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
     def download_skater(player_data: Tuple[str, str]) -> Tuple[bool, str, int]:
         """Download a single skater's data"""
         player_id, name = player_data
-        url = MP_SKATER_URL.format(player_id=player_id)
+        url = MP_SKATER_URL.format(season_type=season_type, player_id=player_id)
         output_path = skater_dir / f"{player_id}.csv"
 
         result, status_code = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
@@ -416,10 +427,10 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
 
     # Download goalies
     print(f"\n{'='*60}")
-    print(f"Downloading Goalie Data ({len(goalies)} goalies, {max_workers} threads)")
+    print(f"Downloading Goalie Data [{season_type}] ({len(goalies)} goalies, {max_workers} threads)")
     print(f"{'='*60}\n")
 
-    goalie_dir = output_dir / "goalies"
+    goalie_dir = season_subdir(output_dir, season_type, "goalies")
     goalie_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
@@ -428,7 +439,7 @@ def download_player_data(players: dict, output_dir: Path, limit: int = None, max
     def download_goalie(player_data: Tuple[str, str]) -> Tuple[bool, str, str]:
         """Download a single goalie's data"""
         player_id, name = player_data
-        url = MP_GOALIE_URL.format(player_id=player_id)
+        url = MP_GOALIE_URL.format(season_type=season_type, player_id=player_id)
         output_path = goalie_dir / f"{player_id}.csv"
 
         result, status_code = download_file(url, output_path, f"{name} ({player_id})", skip_existing=skip_existing)
@@ -599,6 +610,8 @@ def main():
     parser.add_argument('--threads', type=int, default=default_player_threads, help=f'Number of concurrent download threads for players (default: {default_player_threads}, reduced to avoid rate limiting)')
     parser.add_argument('--team-threads', type=int, default=default_team_threads, help=f'Number of threads for team downloads (default: {default_team_threads})')
     parser.add_argument('--use-cache', action='store_true', help='Skip downloading files that already exist (use for testing only)')
+    parser.add_argument('--season-type', choices=['regular', 'playoffs', 'both'], default='regular',
+                        help="Which season type(s) to download. Playoff data goes to <output>/playoffs/ (default: regular)")
 
     args = parser.parse_args()
 
@@ -608,27 +621,31 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    season_types = ['regular', 'playoffs'] if args.season_type == 'both' else [args.season_type]
+
     print(f"\nConfiguration:")
     print(f"  Threads (players): {args.threads}")
     print(f"  Threads (teams): {args.team_threads}")
     print(f"  Refresh mode: {'CACHE (skip existing)' if skip_existing else 'UPDATE (redownload all)'}")
+    print(f"  Season type(s): {', '.join(season_types)}")
     print(f"  Database: {args.db}")
     print(f"  Output: {output_dir}")
 
-    # Download teams
-    if not args.players_only:
-        teams = get_teams_from_db(args.db)
-        download_team_data(teams, output_dir, max_workers=args.team_threads, skip_existing=skip_existing)
+    for season_type in season_types:
+        # Download teams
+        if not args.players_only:
+            teams = get_teams_from_db(args.db)
+            download_team_data(teams, output_dir, max_workers=args.team_threads, skip_existing=skip_existing, season_type=season_type)
 
-    # Download players
-    if not args.teams_only:
-        player_ids_file = "player_ids.txt"
-        players = get_players_from_file(player_ids_file)
-        goalie_404s = download_player_data(players, output_dir, limit=args.limit, max_workers=args.threads, skip_existing=skip_existing)
+        # Download players
+        if not args.teams_only:
+            player_ids_file = "player_ids.txt"
+            players = get_players_from_file(player_ids_file)
+            goalie_404s = download_player_data(players, output_dir, limit=args.limit, max_workers=args.threads, skip_existing=skip_existing, season_type=season_type)
 
-        # Update player_ids.txt with newly identified goalies
-        if goalie_404s:
-            update_player_ids_with_goalies(player_ids_file, goalie_404s)
+            # Update player_ids.txt with newly identified goalies (regular season is the canonical roster source)
+            if goalie_404s and season_type == 'regular':
+                update_player_ids_with_goalies(player_ids_file, goalie_404s)
 
     print(f"\n{'='*60}")
     print(f"Download complete! Data saved to: {output_dir}")

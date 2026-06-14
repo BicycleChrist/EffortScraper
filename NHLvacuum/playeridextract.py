@@ -14,7 +14,7 @@ from datetime import datetime
 NST_URL_TEMPLATE = "https://www.naturalstattrick.com/playerlist.php?fromseason={from_season}&thruseason={thru_season}&stype=2&sit=5v5&stdoi=oi&rate=n"
 
 # First season of data
-START_YEAR = 2007
+START_YEAR = 2025
 # Maximum seasons per request
 MAX_SEASONS_PER_REQUEST = 3
 
@@ -59,9 +59,30 @@ def generate_season_spans(start_year, end_year=None):
     return spans
 
 
-def download_html(url, file_name):
-    """Download HTML content from URL"""
-    response = requests.get(url, timeout=30)
+def _get_nst_session():
+    """Build an authenticated NST session (carries the nst-key header + UA).
+
+    NST now blocks unauthenticated playerlist.php requests with HTTP 403, so we
+    reuse nstparse's session machinery which loads the key from nst_api_key.txt.
+    Falls back to a plain session if nstparse is unavailable.
+    """
+    try:
+        import nstparse
+        return nstparse.create_session()
+    except Exception as e:
+        print(f"Warning: could not build authenticated NST session ({e}); using unauthenticated request.")
+        return requests.Session()
+
+
+def download_html(url, file_name, session=None):
+    """Download HTML content from URL using an authenticated NST session.
+
+    NST requires BOTH the nst-key header (from the session) and a Referer header;
+    nst-key alone still returns HTTP 403 on playerlist.php.
+    """
+    sess = session or _get_nst_session()
+    headers = {'Referer': 'https://www.naturalstattrick.com/'}
+    response = sess.get(url, headers=headers, timeout=30)
     response.raise_for_status()
 
     with open(file_name, 'w', encoding='utf-8') as file:
@@ -103,19 +124,32 @@ def write_players_to_file(players_dict, output_file):
             file.write(f"{name}: {player_id}\n")
 
 
-def main():
-    """Main extraction logic"""
-    print(f"{'='*60}")
-    print("Natural Stat Trick Player ID Extractor")
-    print(f"{'='*60}\n")
-
+def extract_players(start_year, end_year=None):
+    """
+    Extract player IDs from NST for a specific season range.
+    
+    Args:
+        start_year: First year to start from
+        end_year: Last year to end at (defaults to current year)
+        
+    Returns:
+        Dictionary of {player_name: player_id}
+    """
+    print(f"Extraction range: {start_year} to {end_year if end_year else 'Current'}")
+    
     # Generate season spans
-    season_spans = generate_season_spans(START_YEAR)
+    season_spans = generate_season_spans(start_year, end_year)
     print(f"Extracting player IDs from {len(season_spans)} season spans...")
+    
+    if not season_spans:
+        print("No seasons to process.")
+        return {}
+
     print(f"Starting: {season_spans[0][0][:4]}-{season_spans[0][0][4:]}")
     print(f"Ending:   {season_spans[-1][1][:4]}-{season_spans[-1][1][4:]}\n")
 
     all_players = {}
+    session = _get_nst_session()
 
     for i, (from_season, thru_season) in enumerate(season_spans, 1):
         url = NST_URL_TEMPLATE.format(from_season=from_season, thru_season=thru_season)
@@ -124,7 +158,7 @@ def main():
         print(f"[{i}/{len(season_spans)}] Processing {from_season[:4]}-{from_season[4:]} to {thru_season[:4]}-{thru_season[4:]}...", end=' ')
 
         try:
-            download_html(url, temp_file)
+            download_html(url, temp_file, session=session)
             players = parse_player_names_ids(temp_file)
 
             # Merge into master dictionary
@@ -139,9 +173,26 @@ def main():
         except Exception as e:
             print(f"✗ Error: {e}")
             continue
+            
+    # Clean up temp file
+    import os
+    if os.path.exists("playerlist_temp.html"):
+        os.remove("playerlist_temp.html")
+        
+    return all_players
+
+
+def main():
+    """Main extraction logic"""
+    print(f"{'='*60}")
+    print("Natural Stat Trick Player ID Extractor")
+    print(f"{'='*60}\n")
+    
+    # Use global START_YEAR
+    all_players = extract_players(START_YEAR)
 
     # Write final output
-    output_file = 'player_ids.txt'
+    output_file = 'player_ids_new.txt'
     write_players_to_file(all_players, output_file)
 
     print(f"\n{'='*60}")

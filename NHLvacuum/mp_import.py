@@ -12,6 +12,19 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Set
 # Goalie data not being imported
 
+
+def season_data_dir(base_dir: str, season_type: str) -> str:
+    """Resolve a season-type-specific data directory.
+
+    Regular season keeps the historical location; playoff data lives in a parallel
+    'playoffs' subtree written by moneypuck_downloader.season_subdir():
+        'moneypuck_data/teams' + 'playoffs' -> 'moneypuck_data/playoffs/teams'
+    """
+    if season_type == 'regular':
+        return base_dir
+    p = Path(base_dir)
+    return str(p.parent / season_type / p.name)
+
 class MoneyPuckTeamImporter:
     """Imports MoneyPuck team game-by-game data"""
 
@@ -300,7 +313,7 @@ class MoneyPuckTeamImporter:
         return rows_imported, rows_skipped
 
     @staticmethod
-    def import_all(game_ids: Optional[Set[str]] = None):
+    def import_all(game_ids: Optional[Set[str]] = None, season_type: str = 'regular'):
         """Import all team CSV files"""
         conn = sqlite3.connect(MoneyPuckTeamImporter.DB_PATH)
         cursor = conn.cursor()
@@ -312,17 +325,21 @@ class MoneyPuckTeamImporter:
         MoneyPuckTeamImporter.ensure_other_situation(cursor)
         conn.commit()
 
-        # Clear existing data ONLY if not filtering by game_ids
-        if game_ids is None:
+        # Clear existing data ONLY on a full regular-season rebuild.
+        # Never clear on a playoff pass: playoff rows append onto regular ones
+        # (game_ids are disjoint), so clearing would wipe the regular data.
+        if game_ids is None and season_type == 'regular':
             MoneyPuckTeamImporter.clear_table(conn)
 
+        data_dir = season_data_dir(MoneyPuckTeamImporter.MP_TEAM_DATA_DIR, season_type)
+
         print("\n" + "="*80)
-        print("IMPORTING MONEYPUCK TEAM DATA")
+        print(f"IMPORTING MONEYPUCK TEAM DATA [{season_type}] from {data_dir}")
         if game_ids:
             print(f"Filtering for {len(game_ids)} specific games")
         print("="*80 + "\n")
 
-        team_files = sorted(Path(MoneyPuckTeamImporter.MP_TEAM_DATA_DIR).glob('*.csv'))
+        team_files = sorted(Path(data_dir).glob('*.csv'))
 
         total_imported = 0
         total_skipped = 0
@@ -730,24 +747,28 @@ class MoneyPuckPlayerImporter:
         return rows_imported, rows_skipped
 
     @staticmethod
-    def import_all(game_ids: Optional[Set[str]] = None):
+    def import_all(game_ids: Optional[Set[str]] = None, season_type: str = 'regular'):
         """Import all skater and goalie data"""
         conn = sqlite3.connect(MoneyPuckPlayerImporter.DB_PATH)
 
         # Ensure tables exist
         MoneyPuckPlayerImporter.ensure_tables(conn)
 
-        # Clear existing data ONLY if not filtering
-        if game_ids is None:
+        # Clear existing data ONLY on a full regular-season rebuild.
+        # Never clear on a playoff pass (rows append onto regular ones).
+        if game_ids is None and season_type == 'regular':
             MoneyPuckPlayerImporter.clear_tables(conn)
 
+        skater_dir = season_data_dir(MoneyPuckPlayerImporter.MP_SKATER_DATA_DIR, season_type)
+        goalie_dir = season_data_dir(MoneyPuckPlayerImporter.MP_GOALIE_DATA_DIR, season_type)
+
         print("\n" + "="*80)
-        print("IMPORTING MONEYPUCK SKATER DATA")
+        print(f"IMPORTING MONEYPUCK SKATER DATA [{season_type}] from {skater_dir}")
         if game_ids:
             print(f"Filtering for {len(game_ids)} specific games")
         print("="*80 + "\n")
 
-        skater_files = sorted(Path(MoneyPuckPlayerImporter.MP_SKATER_DATA_DIR).glob('*.csv'))
+        skater_files = sorted(Path(skater_dir).glob('*.csv'))
         total_skater_imported = 0
         total_skater_skipped = 0
         skaters_processed = 0
@@ -770,7 +791,7 @@ class MoneyPuckPlayerImporter:
         print("IMPORTING MONEYPUCK GOALIE DATA")
         print("="*80 + "\n")
 
-        goalie_files = sorted(Path(MoneyPuckPlayerImporter.MP_GOALIE_DATA_DIR).glob('*.csv'))
+        goalie_files = sorted(Path(goalie_dir).glob('*.csv'))
         total_goalie_imported = 0
         total_goalie_skipped = 0
         goalies_processed = 0
@@ -1059,7 +1080,7 @@ class MoneyPuckShotsImporter:
     """Imports MoneyPuck shot-level data"""
 
     DB_PATH = 'nhl_analytics.db'
-    MP_SHOTS_DATA_DIR = 'moneypuck_data/shots'
+    MP_SHOTS_DATA_DIR = 'moneypuck_data'
     SCHEMA_PATH = 'moneypuck_schema.sql'
 
     # CSV column → Database column mapping
@@ -1369,32 +1390,45 @@ class MoneyPuckShotsImporter:
 if __name__ == '__main__':
     import sys
 
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
+    # Optional season type as a trailing arg: regular (default) | playoffs | both
+    # e.g. `python mp_import.py teams playoffs`  or  `python mp_import.py all both`
+    season_arg = 'regular'
+    argv = sys.argv[1:]
+    if argv and argv[-1].lower() in ('regular', 'playoffs', 'both'):
+        season_arg = argv.pop().lower()
+    season_types = ['regular', 'playoffs'] if season_arg == 'both' else [season_arg]
+
+    if argv:
+        mode = argv[0].lower()
         if mode == 'teams':
-            MoneyPuckTeamImporter.import_all()
+            for st in season_types:
+                MoneyPuckTeamImporter.import_all(season_type=st)
         elif mode == 'players':
-            MoneyPuckPlayerImporter.import_all()
+            for st in season_types:
+                MoneyPuckPlayerImporter.import_all(season_type=st)
         elif mode == 'shots':
-            MoneyPuckShotsImporter.import_all()
+            MoneyPuckShotsImporter.import_all()  # shots files are not split by season type
         elif mode == 'odds':
             MoneyPuckOddsImporter.import_all()
         elif mode == 'all':
             # Import everything
-            MoneyPuckTeamImporter.import_all()
-            MoneyPuckPlayerImporter.import_all()
+            for st in season_types:
+                MoneyPuckTeamImporter.import_all(season_type=st)
+                MoneyPuckPlayerImporter.import_all(season_type=st)
             MoneyPuckShotsImporter.import_all()
             MoneyPuckOddsImporter.import_all()
         else:
-            print("Usage: python mp_import.py [teams|players|shots|odds|all]")
+            print("Usage: python mp_import.py [teams|players|shots|odds|all] [regular|playoffs|both]")
             print("  teams   - Import only team data")
             print("  players - Import only player data")
             print("  shots   - Import only shot data")
             print("  odds    - Import only odds data")
             print("  all     - Import everything (default)")
+            print("  Trailing season type (default 'regular') controls regular vs playoff CSVs.")
     else:
         # Import everything by default (no args)
-        MoneyPuckTeamImporter.import_all()
-        MoneyPuckPlayerImporter.import_all()
+        for st in season_types:
+            MoneyPuckTeamImporter.import_all(season_type=st)
+            MoneyPuckPlayerImporter.import_all(season_type=st)
         MoneyPuckShotsImporter.import_all()
         MoneyPuckOddsImporter.import_all()
