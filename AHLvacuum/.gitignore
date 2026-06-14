@@ -1,0 +1,13 @@
+# derived database (rebuild with: python load_db.py)
+ahl.db
+ahl.db-wal
+ahl.db-shm
+
+# python
+__pycache__/
+
+# logs
+*.log
+
+# stray raw HTML probe from the old BeautifulSoup scraper
+ahl_data/*_raw.html
