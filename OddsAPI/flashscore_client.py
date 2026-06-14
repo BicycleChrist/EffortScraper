@@ -967,6 +967,7 @@ class FlashscoreClient:
         on_error=None,
         stop_event: Optional[threading.Event] = None,
         max_ticks: Optional[int] = None,
+        idle_interval: Optional[float] = None,
     ) -> None:
         """Blocking poll loop. Each tick fetches live events for `sports`, diffs
         against the previous tick, and invokes on_update(update) with:
@@ -989,8 +990,10 @@ class FlashscoreClient:
         while not stop_event.is_set():
             tick += 1
             t0 = time.time()
+            has_live = False
             try:
                 live = self.snapshot_live(sports=sports)
+                has_live = bool(live)
                 cur = {e.event_id: e for e in live}
                 diff = self._diff_live(prev, cur)
                 by_sport: Dict[str, List[Event]] = {}
@@ -1013,10 +1016,15 @@ class FlashscoreClient:
                     _warn(f"poll tick {tick} failed: {e}")
             if max_ticks and tick >= max_ticks:
                 break
-            # interval measured from tick start, so fetch time is absorbed
-            stop_event.wait(max(0.0, interval - (time.time() - t0)))
+            # Adaptive cadence: poll at `interval` while any game is in-play,
+            # fall back to the slower `idle_interval` when nothing is live (or
+            # the fetch threw). interval measured from tick start so fetch time
+            # is absorbed.
+            wait = interval if has_live else (idle_interval or interval)
+            stop_event.wait(max(0.0, wait - (time.time() - t0)))
 
-    def start_live_poller(self, sports=None, interval=15.0, on_update=None, on_error=None):
+    def start_live_poller(self, sports=None, interval=15.0, on_update=None,
+                          on_error=None, idle_interval=None):
         """Non-blocking variant: spawns a daemon thread running poll_live and
         returns a controller with .stop() / .join() / .is_alive() and .stop_event.
 
@@ -1032,6 +1040,7 @@ class FlashscoreClient:
                 on_update=on_update,
                 on_error=on_error,
                 stop_event=stop_event,
+                idle_interval=idle_interval,
             ),
             daemon=True,
             name="flashscore-live-poller",
@@ -1302,20 +1311,56 @@ class FlashscoreScheduleSource:
 
     # ------------------------------------------------------------- lineups
 
+    def find_event(self, league: str, home_id: str, away_id: str,
+                   game_date: datetime):
+        """The flashscore Event for a game (id, stage, SCORES — the day feed
+        keeps finished events with final scores, unlike the live snapshot).
+
+        Flashscore day buckets are UTC days, so a US-evening game can land in
+        the next UTC bucket; we therefore sweep a small window around the
+        game's local day and pick the SAME matchup whose start time is closest
+        to game_date. This avoids matching a future rematch in the same series
+        (the classic bug: a finished afternoon game matching tomorrow's game)."""
+        delta = (game_date.date() - datetime.now().date()).days
+        if not -2 <= delta <= 8:
+            return None
+        # Sweep the game's day ± a UTC boundary on each side.
+        window = [d for d in (delta - 1, delta, delta + 1) if -2 <= d <= 8]
+        matcher = self.matcher(league)
+        matches = []
+        for e in self.fetch_league_events(league, window):
+            h, a = matcher.match(e.home), matcher.match(e.away)
+            if (h and a and h.team_id.lower() == home_id.lower()
+                    and a.team_id.lower() == away_id.lower()):
+                matches.append(e)
+        if not matches:
+            return None
+
+        def _gap(e):
+            if not e.start_ts:
+                return float('inf')
+            return abs((datetime.fromtimestamp(e.start_ts) - game_date).total_seconds())
+
+        # Closest start time to the actual game wins. A future rematch is
+        # ~hours/days away, so today's game (gap ≈ 0) beats it. Only accept a
+        # match within ~18h — beyond that it's a different game in the series.
+        best = min(matches, key=_gap)
+        if _gap(best) > 18 * 3600:
+            logger.info(
+                "find_event %s %s@%s: nearest match is %.1fh from game_date "
+                "(%s) — rejecting as wrong game in series",
+                league, away_id, home_id, _gap(best) / 3600,
+                datetime.fromtimestamp(best.start_ts).isoformat()
+                if best.start_ts else None)
+            return None
+        return best
+
     def resolve_event_id(self, league: str, home_id: str, away_id: str,
                          game_date: datetime) -> Optional[str]:
         """Flashscore event id for a game, for game_ids that aren't
         fs_-prefixed (ESPN-loaded). One day-feed fetch."""
-        delta = (game_date.date() - datetime.now().date()).days
-        if not -1 <= delta <= 7:
-            return None
-        matcher = self.matcher(league)
-        for e in self.fetch_league_events(league, [delta]):
-            h, a = matcher.match(e.home), matcher.match(e.away)
-            if (h and a and h.team_id.lower() == home_id.lower()
-                    and a.team_id.lower() == away_id.lower()):
-                return e.event_id
-        return None
+        e = self.find_event(league, home_id, away_id, game_date)
+        return e.event_id if e else None
 
     def fetch_game_lineups(self, league: str, event_id: str) -> Dict:
         """Panel-ready lineups for the cube-unfold game panel.
@@ -1406,10 +1451,12 @@ class FlashscoreLiveFeed:
 
     def __init__(self, source: FlashscoreScheduleSource,
                  leagues=("MLB", "NBA", "NHL"),
-                 interval: float = 30.0, on_update=None):
+                 interval: float = 15.0, on_update=None,
+                 idle_interval: float = 30.0):
         self.source = source
         self.leagues = [lg for lg in leagues if lg in LEAGUE_SPECS]
-        self.interval = interval
+        self.interval = interval            # cadence while games are live
+        self.idle_interval = idle_interval  # cadence when nothing is in-play
         self.on_update = on_update
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1440,6 +1487,7 @@ class FlashscoreLiveFeed:
         client.poll_live(
             sports=sports,
             interval=self.interval,
+            idle_interval=self.idle_interval,
             on_update=self._tick,
             on_error=lambda exc: logger.warning("live feed tick failed: %s", exc),
             stop_event=self._stop,
