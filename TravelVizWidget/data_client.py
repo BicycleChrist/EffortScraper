@@ -962,7 +962,8 @@ class ESPNScheduleScraper:
         self.url_patterns = {
             'MLB': "https://www.espn.com/mlb/team/schedule/_/name/{team}/seasontype/2/half/{half}",
             'NBA': "https://www.espn.com/nba/team/schedule/_/name/{team}/season/{year}/seasontype/2",
-            'NHL': "https://www.espn.com/nhl/team/schedule/_/name/{team}/season/{year}/seasontype/2"
+            'NHL': "https://www.espn.com/nhl/team/schedule/_/name/{team}/season/{year}/seasontype/2",
+            'NFL': "https://www.espn.com/nfl/team/schedule/_/name/{team}/season/{year}/seasontype/2"
         }
         
         self.session = requests.Session()
@@ -980,7 +981,8 @@ class ESPNScheduleScraper:
         return {
             'MLB': self.get_mlb_teams(),
             'NBA': self.get_nba_teams(),
-            'NHL': self.get_nhl_teams()
+            'NHL': self.get_nhl_teams(),
+            'NFL': self.get_nfl_teams()
         }
     
     def get_mlb_teams(self) -> Dict[str, Dict[str, str]]:
@@ -1120,7 +1122,58 @@ class ESPNScheduleScraper:
             "van": {"name": "Vancouver Canucks", "city": "Vancouver", "division": "Pacific", "conference": "Western"},
             "vgk": {"name": "Vegas Golden Knights", "city": "Las Vegas", "division": "Pacific", "conference": "Western"},
         }
-    
+
+    def get_nfl_teams(self) -> Dict[str, Dict[str, str]]:
+        """NFL team abbreviations (ESPN scheme) and info for ESPN URLs.
+
+        `city` MUST be a key present in database_manager.CITY_COORDS, since the
+        flashscore venue fallback geolocates games off team.location. Teams that
+        play outside their nominal metro are mapped to the metro city that
+        exists in CITY_COORDS (e.g. Patriots -> Boston, 49ers -> San Francisco,
+        Cowboys -> Dallas, Giants/Jets -> New York)."""
+        return {
+            # AFC East
+            "buf": {"name": "Buffalo Bills", "city": "Buffalo", "division": "AFC East", "conference": "American Football Conference"},
+            "mia": {"name": "Miami Dolphins", "city": "Miami", "division": "AFC East", "conference": "American Football Conference"},
+            "ne": {"name": "New England Patriots", "city": "Boston", "division": "AFC East", "conference": "American Football Conference"},
+            "nyj": {"name": "New York Jets", "city": "New York", "division": "AFC East", "conference": "American Football Conference"},
+            # AFC North
+            "bal": {"name": "Baltimore Ravens", "city": "Baltimore", "division": "AFC North", "conference": "American Football Conference"},
+            "cin": {"name": "Cincinnati Bengals", "city": "Cincinnati", "division": "AFC North", "conference": "American Football Conference"},
+            "cle": {"name": "Cleveland Browns", "city": "Cleveland", "division": "AFC North", "conference": "American Football Conference"},
+            "pit": {"name": "Pittsburgh Steelers", "city": "Pittsburgh", "division": "AFC North", "conference": "American Football Conference"},
+            # AFC South
+            "hou": {"name": "Houston Texans", "city": "Houston", "division": "AFC South", "conference": "American Football Conference"},
+            "ind": {"name": "Indianapolis Colts", "city": "Indianapolis", "division": "AFC South", "conference": "American Football Conference"},
+            "jax": {"name": "Jacksonville Jaguars", "city": "Jacksonville", "division": "AFC South", "conference": "American Football Conference"},
+            "ten": {"name": "Tennessee Titans", "city": "Nashville", "division": "AFC South", "conference": "American Football Conference"},
+            # AFC West
+            "den": {"name": "Denver Broncos", "city": "Denver", "division": "AFC West", "conference": "American Football Conference"},
+            "kc": {"name": "Kansas City Chiefs", "city": "Kansas City", "division": "AFC West", "conference": "American Football Conference"},
+            "lv": {"name": "Las Vegas Raiders", "city": "Las Vegas", "division": "AFC West", "conference": "American Football Conference"},
+            "lac": {"name": "Los Angeles Chargers", "city": "Los Angeles", "division": "AFC West", "conference": "American Football Conference"},
+            # NFC East
+            "dal": {"name": "Dallas Cowboys", "city": "Dallas", "division": "NFC East", "conference": "National Football Conference"},
+            "nyg": {"name": "New York Giants", "city": "New York", "division": "NFC East", "conference": "National Football Conference"},
+            "phi": {"name": "Philadelphia Eagles", "city": "Philadelphia", "division": "NFC East", "conference": "National Football Conference"},
+            "wsh": {"name": "Washington Commanders", "city": "Washington", "division": "NFC East", "conference": "National Football Conference"},
+            # NFC North
+            "chi": {"name": "Chicago Bears", "city": "Chicago", "division": "NFC North", "conference": "National Football Conference"},
+            "det": {"name": "Detroit Lions", "city": "Detroit", "division": "NFC North", "conference": "National Football Conference"},
+            "gb": {"name": "Green Bay Packers", "city": "Green Bay", "division": "NFC North", "conference": "National Football Conference"},
+            "min": {"name": "Minnesota Vikings", "city": "Minneapolis", "division": "NFC North", "conference": "National Football Conference"},
+            # NFC South
+            "atl": {"name": "Atlanta Falcons", "city": "Atlanta", "division": "NFC South", "conference": "National Football Conference"},
+            "car": {"name": "Carolina Panthers", "city": "Charlotte", "division": "NFC South", "conference": "National Football Conference"},
+            "no": {"name": "New Orleans Saints", "city": "New Orleans", "division": "NFC South", "conference": "National Football Conference"},
+            "tb": {"name": "Tampa Bay Buccaneers", "city": "Tampa", "division": "NFC South", "conference": "National Football Conference"},
+            # NFC West
+            "ari": {"name": "Arizona Cardinals", "city": "Phoenix", "division": "NFC West", "conference": "National Football Conference"},
+            "lar": {"name": "Los Angeles Rams", "city": "Los Angeles", "division": "NFC West", "conference": "National Football Conference"},
+            "sf": {"name": "San Francisco 49ers", "city": "San Francisco", "division": "NFC West", "conference": "National Football Conference"},
+            "sea": {"name": "Seattle Seahawks", "city": "Seattle", "division": "NFC West", "conference": "National Football Conference"},
+        }
+
     def load_team_airports(self) -> Dict[str, str]:
         """Load mapping of team cities to airport codes for all leagues"""
         return {
@@ -1206,17 +1259,146 @@ class ESPNScheduleScraper:
                 return self.format_season_for_league(current_year, league)
             else:  # Before October
                 return self.format_season_for_league(current_year - 1, league)
+        elif league == 'NFL':
+            # NFL season is labeled by its START year and runs Sep -> Feb
+            # (playoffs/Super Bowl in Jan-Feb still belong to the prior year's
+            # season). Mar-Aug is the offseason -> the upcoming season.
+            year = current_year if now.month >= 3 else current_year - 1
+            return self.format_season_for_league(year, league)
         else:  # MLB
             # MLB season is calendar year
             return self.format_season_for_league(current_year, league)
     
+    # ESPN's public JSON schedule API (host site.api.espn.com). Replaces the
+    # old www.espn.com HTML scrape, which now returns HTTP 202 + empty body
+    # (anti-bot). The JSON API is unblocked, structured, and faster.
+    ESPN_API_PATHS = {
+        "MLB": "baseball/mlb",
+        "NBA": "basketball/nba",
+        "NHL": "hockey/nhl",
+        "NFL": "football/nfl",
+    }
+    # ESPN JSON team.abbreviation -> our league_teams key, for the few that
+    # differ (verified by diffing the teams endpoints against our seed).
+    ESPN_ABBR_ALIASES = {
+        ("NHL", "nj"): "njd",
+    }
+
+    def _espn_api_year(self, season: str, league: str) -> str:
+        """Map our season string to the ESPN JSON `season` param.
+
+        MLB/NFL use a single calendar/start year ("2025"/"2026"). NBA/NHL use
+        the season's END year on the JSON API — so our "2025-26" -> 2026
+        (the old HTML code passed the START year, which on this API returns the
+        PREVIOUS season)."""
+        if "-" in season:                      # "YYYY-YY" (NBA/NHL)
+            return str(int(season.split("-")[0]) + 1)
+        return season
+
+    def _parse_api_date(self, date_str: str) -> Optional[datetime]:
+        """ESPN ISO UTC (e.g. '2025-09-06T00:15Z') -> naive LOCAL datetime, so
+        date-based 'today's games' comparisons match the user's local day."""
+        if not date_str:
+            return None
+        try:
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            return dt.astimezone().replace(tzinfo=None)
+        except Exception:
+            return None
+
+    def _game_from_api_event(self, ev: dict, league: str, season: str) -> Optional[GameData]:
+        """Map one ESPN JSON schedule event -> GameData (same shape the old
+        HTML parser produced, so save_games / travel inference are unchanged)."""
+        comps = ev.get("competitions") or []
+        if not comps:
+            return None
+        comp = comps[0]
+
+        game_date = self._parse_api_date(comp.get("date") or ev.get("date"))
+        if game_date is None:
+            return None
+
+        home_ab = away_ab = None
+        for c in comp.get("competitors", []):
+            ab = (c.get("team") or {}).get("abbreviation")
+            if not ab:
+                continue
+            ab = self.ESPN_ABBR_ALIASES.get((league, ab.lower()), ab.lower())
+            if c.get("homeAway") == "home":
+                home_ab = ab
+            elif c.get("homeAway") == "away":
+                away_ab = ab
+        if not home_ab or not away_ab:
+            return None
+
+        home_team = self.create_team_info(home_ab, league)
+        away_team = self.create_team_info(away_ab, league)
+        venue = self.create_venue_info(home_ab, league)
+
+        stype = (comp.get("status") or {}).get("type") or {}
+        status = GameStatus.FINAL if stype.get("completed") else GameStatus.SCHEDULED
+        game_id = f"{league}_{season}_{game_date.strftime('%Y%m%d')}_{away_ab}_{home_ab}"
+        week = (ev.get("week") or {}).get("number")
+
+        return GameData(
+            game_id=game_id,
+            date=game_date,
+            home_team=home_team,
+            away_team=away_team,
+            venue=venue,
+            status=status,
+            league=league,
+            season=season,
+            week=week,
+        )
+
     def scrape_team_schedule(self, team_abbrev: str, league: str, season: str = None) -> List[GameData]:
-        """Scrape season schedule for a team in specified league with proper MLB half handling"""
+        """Fetch one team's season schedule from ESPN's JSON API."""
         if season is None:
             season = self.get_current_season_for_league(league)
-        
+
+        path = self.ESPN_API_PATHS.get(league)
+        if not path:
+            logger.warning(f"No ESPN API path for league {league}")
+            return []
+
+        year = self._espn_api_year(season, league)
+        url = (f"https://site.api.espn.com/apis/site/v2/sports/{path}"
+               f"/teams/{team_abbrev.lower()}/schedule?season={year}")
+        # Regular season only — except MLB, whose endpoint returns 0 events when
+        # seasontype=2 is passed (quirk); omitting it yields the 162-game season.
+        if league != "MLB":
+            url += "&seasontype=2"
+
+        try:
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"ESPN API fetch failed for {league} {team_abbrev} {season}: {e}")
+            return []
+
+        games = []
+        for ev in data.get("events", []):
+            try:
+                game = self._game_from_api_event(ev, league, season)
+                if game:
+                    games.append(game)
+            except Exception as e:
+                logger.debug(f"  ✗ Skipped event for {league} {team_abbrev}: {e}")
+
+        logger.debug(f"  ✓ {league} {team_abbrev} {season}: {len(games)} games via JSON API")
+        time.sleep(0.25)
+        return games
+
+    def _scrape_team_schedule_html_legacy(self, team_abbrev: str, league: str, season: str = None) -> List[GameData]:
+        """DEPRECATED HTML scraper (www.espn.com now returns 202 + empty body).
+        Kept for reference; superseded by scrape_team_schedule (JSON API)."""
+        if season is None:
+            season = self.get_current_season_for_league(league)
+
         all_games = []
-        
+
         if league == 'MLB':
             # MLB SPECIAL HANDLING: ESPN divides MLB season into two halves
             logger.debug(f"Scraping MLB {team_abbrev} schedule for {season} season (both halves)...")
@@ -1952,7 +2134,7 @@ class ESPNSportsDataAggregator(QObject):
 
     def set_league(self, league: str):
         """Set current league and update current season"""
-        if league not in ['MLB', 'NBA', 'NHL']:
+        if league not in ['MLB', 'NBA', 'NHL', 'NFL']:
             raise ValueError(f"Unsupported league: {league}")
         
         self.current_league = league
@@ -1973,7 +2155,7 @@ class ESPNSportsDataAggregator(QObject):
     
     def load_teams_for_all_leagues(self):
         """Load team information for all leagues"""
-        supported_leagues = ['MLB', 'NBA', 'NHL']
+        supported_leagues = ['MLB', 'NBA', 'NHL', 'NFL']
         
         for league in supported_leagues:
             teams = self.db.load_teams(league)

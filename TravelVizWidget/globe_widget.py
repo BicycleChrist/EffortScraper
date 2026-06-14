@@ -843,6 +843,22 @@ class FlightGlobeWidget(QOpenGLWidget):
                     "van": "Canucks.png", "vgk": "GoldenKnights.png", "wsh": "Capitals.png",
                     "wpg": "Jets.png", "sea": "Kraken.png"
                 }
+            },
+            "NFL": {
+                "folder": "nfl_logos",
+                "teams": {
+                    "buf": "Bills.png", "mia": "Dolphins.png", "ne": "Patriots.png",
+                    "nyj": "NYJets.png", "bal": "Ravens.png", "cin": "Bengals.png",
+                    "cle": "Browns.png", "pit": "Steelers.png", "hou": "Texans.png",
+                    "ind": "Colts.png", "jax": "Jaguars.png", "ten": "Titans.png",
+                    "den": "Broncos.png", "kc": "Chiefs.png", "lv": "Raiders.png",
+                    "lac": "Chargers.png", "dal": "Cowboys.png", "nyg": "NYGiants.png",
+                    "phi": "Eagles.png", "wsh": "Commanders.png", "chi": "Bears.png",
+                    "det": "Lions.png", "gb": "Packers.png", "min": "Vikings.png",
+                    "atl": "Falcons.png", "car": "Panthers.png", "no": "Saints.png",
+                    "tb": "Buccaneers.png", "ari": "Cardinals.png", "lar": "Rams.png",
+                    "sf": "49ers.png", "sea": "Seahawks.png"
+                }
             }
         }
         
@@ -3085,7 +3101,7 @@ class FlightGlobeWidget(QOpenGLWidget):
         if not team_id:
             return None
         parts = team_id.split('_')
-        if len(parts) >= 1 and parts[0].upper() in ["MLB", "NBA", "NHL"]:
+        if len(parts) >= 1 and parts[0].upper() in ["MLB", "NBA", "NHL", "NFL"]:
             return parts[0].upper()
         return None
     
