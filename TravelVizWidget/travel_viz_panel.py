@@ -324,7 +324,7 @@ class TravelVizPanel(QWidget):
              checkable=True, checked=True)
         make("toggle_day_night", "Day/Night Cycle", self.toggle_day_night,
              checkable=True, checked=False)
-        make("reset_view", "Reset View", lambda: self.globe_widget.reset_view(), "R")
+        make("reset_view", "Reset View", self.reset_to_default_view, "R")
 
         # Context menu for embedded use (right-click anywhere on the panel)
         for key in ("load_season", "refresh", "start_animation", "stop_animation",
@@ -397,6 +397,9 @@ class TravelVizPanel(QWidget):
         self.sports_aggregator.scheduleRefreshed.connect(self.on_schedule_refreshed)
 
         self.control_panel.aggregator = self.sports_aggregator
+        # Default panel view = recently-landed charters (ledger-backed), now
+        # that the aggregator/DB is available. Periodically refreshed too.
+        self.control_panel.refresh_recent_charters()
 
         self.fatigue_engine = FatigueEngine(self.sports_aggregator.db)
 
@@ -1161,8 +1164,11 @@ class TravelVizPanel(QWidget):
         if team_id and self.sports_aggregator:
             self.sports_aggregator.load_team_season_schedule(team_id, season, self.current_league)
             self.teamSelected.emit(self.current_league, team_id)
-        elif not team_id and self.current_travel_data:
-            self.globe_widget.load_flight_data(self.current_travel_data)
+        elif not team_id:
+            # Back to "all teams" — restore the Recent Charters default view
+            self.control_panel.refresh_recent_charters()
+            if self.current_travel_data:
+                self.globe_widget.load_flight_data(self.current_travel_data)
 
         self.update_overlay_games()
 
@@ -1671,14 +1677,64 @@ class TravelVizPanel(QWidget):
         self.globe_widget.update()
 
     def toggle_travel_paths(self, checked: bool):
-        self.globe_widget.set_display_options(checked, True, True, True)
+        g = self.globe_widget
+        g.set_display_options(checked, g.show_team_cities, g.show_atmosphere)
 
     def toggle_team_cities(self, checked: bool):
-        self.globe_widget.set_display_options(True, checked, True, True)
+        g = self.globe_widget
+        g.set_display_options(g.show_travel_paths, checked, g.show_atmosphere)
 
     def toggle_day_night(self, checked: bool):
         self.globe_widget.show_day_night = checked
         self.globe_widget.update()
+
+    def reset_to_default_view(self):
+        """Return to the initial startup view: drop any focused-team travel
+        query (clearing the red travel paths off the globe and resetting the
+        side panel to Recent Charters), restore the live game-cube overlay,
+        and reset the camera + display options to their startup defaults."""
+        g = self.globe_widget
+
+        # 1. Clear a focused-team query → back to the "All Teams" startup state.
+        #    Block the combo signal so we restore explicitly below instead of
+        #    going through the (heavier) on_focus_team_changed reload path.
+        self.focus_team_combo.blockSignals(True)
+        self.focus_team_combo.setCurrentIndex(0)  # "All Teams"
+        self.focus_team_combo.blockSignals(False)
+        self.control_panel.current_intelligence = None
+        self.control_panel.update_team_selection_programmatically("")
+        self.control_panel.refresh_recent_charters()
+
+        # 2. Strip the focused team's red travel paths off the globe. Do NOT
+        #    clear travel_data — that would empty the startup game-cube markers
+        #    too (get_todays_games reads from it). Only the path lines go.
+        g.travel_paths = []
+
+        # 3. Repopulate the live game-cube markers exactly as startup does —
+        #    this reads today's games straight from the DB and overwrites the
+        #    focused-team markers with the all-teams slate.
+        self.display_todays_games_startup()
+        self._stamp_live_markers()
+        self.update_overlay_games()
+
+        # 4. Default display options (paths + cities on, day/night off).
+        g.show_day_night = False
+        g.set_display_options(True, True, g.show_atmosphere)
+
+        # 5. Default camera orientation + zoom + momentum.
+        g.reset_view()
+        g.update()
+
+        # 6. Re-sync the checkable View-menu actions to the restored defaults.
+        for key, val in (("toggle_paths", True), ("toggle_cities", True),
+                         ("toggle_day_night", False)):
+            act = self.actions.get(key)
+            if act:
+                act.blockSignals(True)
+                act.setChecked(val)
+                act.blockSignals(False)
+
+        self.statusMessage.emit("View reset to startup", 2000)
 
     def on_weather_venue_selected(self, lat: float, lon: float, venue_name: str):
         self.globe_widget.center_on_location(lat, lon)

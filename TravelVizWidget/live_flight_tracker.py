@@ -785,6 +785,31 @@ class CharterLedger:
         except ValueError:
             return None
 
+    def recent_landed(self, limit: int = 12) -> List[dict]:
+        """Most recently landed charters across all windows, newest first —
+        the data behind the panel's 'Recent Charters' default view. One row per
+        window (the landed leader), de-duped on (team, dest)."""
+        try:
+            with self._conn() as c:
+                rows = [dict(r) for r in c.execute(
+                    "SELECT window_id, league, team_id, callsign, registration, "
+                    "aircraft_type, origin_city, dest_city, arr_time, "
+                    "confirmed_route, max_score FROM charter_observations "
+                    "WHERE landed=1 AND arr_time IS NOT NULL "
+                    "ORDER BY arr_time DESC", )]
+        except Exception:
+            return []
+        seen, out = set(), []
+        for r in rows:
+            key = (r.get('team_id'), r.get('dest_city'))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+            if len(out) >= limit:
+                break
+        return out
+
     def window_rows(self, window_id: str) -> List[dict]:
         with self._lock, self._conn() as c:
             return [dict(r) for r in c.execute(
@@ -2360,21 +2385,18 @@ class RealTimeFlightTracker(QThread):
                         daemon=True, name=f"backfill-{tid}").start()
 
             if icao in cur:
-                # Leader is airborne right now — emit the live candidate,
-                # confirm its route via trace once (cheap), tag it
+                # Leader is airborne right now — confirm its route via trace
+                # once (cheap), tag it. The globe renders ONLY in-flight
+                # charters; a landed leader is dropped here and surfaces in the
+                # panel's Recent Charters view instead (keeps the globe for live
+                # action, no arrived-plane clutter).
                 flight, _ = cur[icao]
                 self._maybe_confirm_route(window_id, flight)
                 flight.landed = bool(lead_row.get('landed'))
-                best_flights.append(flight)
-            else:
-                # Leader has landed / isn't airborne this tick. Only surface
-                # it as ARRIVED if we actually confirmed it landed at dest —
-                # otherwise suppress (don't fall back to a corridor impostor)
-                if lead_row.get('landed'):
-                    arrived = self._flight_from_ledger_row(lead_row)
-                    if arrived:
-                        best_flights.append(arrived)
-                # else: emit nothing for this window this tick
+                if not flight.landed:
+                    best_flights.append(flight)
+            # else: leader has landed / isn't airborne — not rendered on the
+            # globe; the Recent Charters panel reads it from the ledger.
 
         best_flights.extend(no_team)
         return best_flights
@@ -2859,11 +2881,52 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QSpinBox, QProgressBar, QSizePolicy,
     QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve, QSize
+from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush
 from datetime import datetime, timedelta
 
 from database_manager import TeamInfo, GameData
+
+
+class FatigueBar(QWidget):
+    """A thin instrument-style meter for a 0-100 fatigue score: a dim track
+    with a filled portion that shifts green→amber→red with severity. Rendered
+    pixel-precise (not block glyphs) for a terminal-grade look."""
+
+    TRACK = QColor("#21262d")
+    LOW = QColor("#3fb950")
+    MID = QColor("#d29922")
+    HIGH = QColor("#f85149")
+
+    def __init__(self, score: float, width: int = 64, height: int = 7,
+                 mirror: bool = False, parent=None):
+        super().__init__(parent)
+        self._score = max(0.0, min(100.0, float(score or 0)))
+        self._w, self._h = width, height
+        self._mirror = mirror   # fill from the right (for the opponent side)
+        self.setFixedSize(width, height)
+
+    def _fill_color(self) -> QColor:
+        return self.LOW if self._score < 34 else self.MID if self._score < 60 else self.HIGH
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._w, self._h)
+
+    def paintEvent(self, _evt):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = self._h / 2.0
+        # track
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(self.TRACK))
+        p.drawRoundedRect(0, 0, self._w, self._h, r, r)
+        # fill
+        fill_w = max(0.0, min(1.0, self._score / 100.0)) * self._w
+        if fill_w > 0:
+            p.setBrush(QBrush(self._fill_color()))
+            x = (self._w - fill_w) if self._mirror else 0
+            p.drawRoundedRect(int(x), 0, int(fill_w) or 1, self._h, r, r)
+        p.end()
 
 
 class FlightControlPanel(QWidget):
@@ -2950,11 +3013,7 @@ class FlightControlPanel(QWidget):
         self.route_scroll = self._create_route_timeline()
         layout.addWidget(self.route_scroll, 1)
         
-        # Section 4: Alerts & Recommendations
-        self.alerts_widget = self._create_alerts_section()
-        layout.addWidget(self.alerts_widget)
-        
-        # Section 5: Trip Summary
+        # Section 4: Trip Summary
         self.summary_widget = self._create_summary_section()
         layout.addWidget(self.summary_widget)
     
@@ -2986,7 +3045,7 @@ class FlightControlPanel(QWidget):
         self.league_combo = QComboBox()
         self.league_combo.addItems(["MLB", "NBA", "NHL"])
         self.league_combo.setCurrentText("NHL")
-        self.league_combo.setFixedWidth(58)
+        self.league_combo.setFixedWidth(72)
         top_row.addWidget(self.league_combo)
         
         # Team selector (tight spacing)
@@ -3156,67 +3215,37 @@ class FlightControlPanel(QWidget):
         scroll.setWidget(self.routes_container)
         return scroll
     
-    def _create_alerts_section(self) -> QFrame:
-        """Create the alerts and recommendations section"""
-        frame = QFrame()
-        frame.setObjectName("alertsFrame")
-        frame.setMaximumHeight(100)
-        
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(4)
-        
-        # Header
-        header = QLabel("⚠️ ALERTS & INSIGHTS")
-        header.setFont(self.FONT_TITLE)
-        header.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
-        layout.addWidget(header)
-        
-        # Alerts container
-        self.alerts_container = QVBoxLayout()
-        self.alerts_container.setSpacing(2)
-        
-        placeholder = QLabel("No alerts")
-        placeholder.setFont(self.FONT_SMALL)
-        placeholder.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-        placeholder.setObjectName("alertsPlaceholder")
-        self.alerts_container.addWidget(placeholder)
-        
-        layout.addLayout(self.alerts_container)
-        
-        return frame
-    
     def _create_summary_section(self) -> QFrame:
         """Create the trip summary statistics section"""
         frame = QFrame()
         frame.setObjectName("summaryFrame")
-        frame.setFixedHeight(65)
-        
+        frame.setFixedHeight(72)
+
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
-        
+
         # Header
-        header = QLabel("📊 TRIP STATISTICS")
-        header.setFont(self.FONT_TITLE)
-        header.setStyleSheet(f"color: {self.COLOR_ACCENT}; background: transparent;")
-        layout.addWidget(header)
-        
+        layout.addWidget(self._lbl("TRIP STATISTICS", self.FONT_TITLE,
+                                   self.COLOR_MUTED, spacing=150))
+
         # Stats row
         stats_row = QHBoxLayout()
-        stats_row.setSpacing(24)
-        
+        stats_row.setSpacing(12)
+
         self.stat_total = self._create_stat_item("Total", "--")
-        self.stat_avg = self._create_stat_item("Avg/Game", "--")
+        self.stat_avg = self._create_stat_item("Avg", "--")
         self.stat_longest = self._create_stat_item("Longest", "--")
-        self.stat_rest = self._create_stat_item("Rest Days", "--")
-        self.stat_complexity = self._create_stat_item("Complexity", "--")
-        
+        self.stat_rest = self._create_stat_item("Rest", "--")
+        self.stat_cities = self._create_stat_item("Cities", "--")
+        self.stat_road = self._create_stat_item("Road", "--")
+
         stats_row.addWidget(self.stat_total)
         stats_row.addWidget(self.stat_avg)
         stats_row.addWidget(self.stat_longest)
         stats_row.addWidget(self.stat_rest)
-        stats_row.addWidget(self.stat_complexity)
+        stats_row.addWidget(self.stat_cities)
+        stats_row.addWidget(self.stat_road)
         stats_row.addStretch()
         
         layout.addLayout(stats_row)
@@ -3227,22 +3256,28 @@ class FlightControlPanel(QWidget):
         """Create a stat display item"""
         widget = QWidget()
         widget.setStyleSheet("background: transparent;")
+        # Don't let the row compress an item below the width of its text
+        # (that's what was clipping "4,794 mi" → "4,794 m" and "Road" labels).
+        widget.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        
+
         value_lbl = QLabel(value)
         value_lbl.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
         value_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
         value_lbl.setObjectName(f"stat_{label.replace('/', '_')}_value")
-        
+        value_lbl.setMinimumHeight(16)
+        value_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+
         label_lbl = QLabel(label)
         label_lbl.setFont(QFont("Segoe UI", 7))
         label_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-        
+        label_lbl.setMinimumHeight(12)
+
         layout.addWidget(value_lbl)
         layout.addWidget(label_lbl)
-        
+
         return widget
     
     # ----------------------------------------------------- fatigue join
@@ -3353,16 +3388,57 @@ class FlightControlPanel(QWidget):
                   .total_seconds() / 3600.0)
         return (max(0.0, rest_h), confirmed)
 
+    # ----------------------------------------------------- card rendering
+
+    def _lbl(self, text, font, color, spacing=None):
+        """Compact QLabel factory (font + color, optional letter-spacing)."""
+        if spacing is not None:
+            font = QFont(font)
+            font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, spacing)
+        l = QLabel(text)
+        l.setFont(font)
+        l.setStyleSheet(f"color: {color}; background: transparent;")
+        return l
+
+    def _section_label(self, text):
+        """Small-caps, letter-spaced field key (AIR / STAY / FATIGUE / REST)."""
+        l = self._lbl(text, self.FONT_SMALL, self.COLOR_MUTED, spacing=140)
+        l.setFixedWidth(44)
+        return l
+
+    @staticmethod
+    def _fatigue_hex(score: float) -> str:
+        s = max(0.0, min(100.0, float(score or 0)))
+        return "#3fb950" if s < 34 else "#d29922" if s < 60 else "#f85149"
+
+    def _hotel_rating_num(self, hotel) -> float:
+        if getattr(hotel, 'forbes_rating', None):
+            return float(hotel.forbes_rating.get_numeric_rating())
+        if hasattr(hotel, 'overall_rating'):
+            return round((hotel.overall_rating or 0) / 20.0, 1)
+        return 0.0
+
     def _create_route_card(self, route, index: int, total_routes: int,
                           intelligence: 'TeamTravelIntelligence') -> QFrame:
         """Create a route card with full details"""
         frame = QFrame()
         frame.setObjectName("routeCard")
         frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        
+
+        # Confidence drives a colored LEFT-accent border (replaces the old
+        # [HIGH] bracket): one quiet signal instead of a loud tag.
+        conf = getattr(route, 'travel_confidence', "MEDIUM")
+        accent = (self.COLOR_SUCCESS if conf == "HIGH"
+                  else self.COLOR_WARNING if conf == "MEDIUM" else self.COLOR_DANGER)
+        frame.setStyleSheet(
+            f"QFrame#routeCard {{ background-color: {self.COLOR_CARD};"
+            f" border: 1px solid {self.COLOR_BORDER}; border-left: 3px solid {accent};"
+            f" border-radius: 6px; }}"
+            f" QFrame#routeCard:hover {{ border-color: {self.COLOR_ACCENT}; }}")
+
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
+        layout.setContentsMargins(13, 9, 12, 9)
+        layout.setSpacing(5)
         
         # Get data
         game = route.game_data
@@ -3411,239 +3487,205 @@ class FlightControlPanel(QWidget):
             else:  # focus unknown — the traveling side is the away team
                 focus_tf, opp_tf = report.away, report.home
 
-        # === Header Row ===
-        header_row = QHBoxLayout()
-        
-        # Date badge
-        date_str = game_date.strftime("%a %m/%d")
-        date_lbl = QLabel(date_str)
-        date_lbl.setFont(self.FONT_TITLE)
-        date_lbl.setStyleSheet(f"color: {self.COLOR_ACCENT}; background: transparent;")
-        header_row.addWidget(date_lbl)
-        
-        # Confidence badge
-        conf = route.travel_confidence if hasattr(route, 'travel_confidence') else "MEDIUM"
-        conf_color = self.COLOR_SUCCESS if conf == "HIGH" else self.COLOR_WARNING if conf == "MEDIUM" else self.COLOR_DANGER
-        conf_lbl = QLabel(f"[{conf}]")
-        conf_lbl.setFont(self.FONT_SMALL)
-        conf_lbl.setStyleSheet(f"color: {conf_color}; background: transparent;")
-        header_row.addWidget(conf_lbl)
-        
-        # Back-to-back detection
+        # === Row 1: date + back-to-back tag · distance ===
+        header = QHBoxLayout(); header.setSpacing(7)
+        header.addWidget(self._lbl(game_date.strftime("%a %m/%d").upper(),
+                                   self.FONT_TITLE, self.COLOR_TEXT, spacing=120))
         if index > 0 and intelligence.upcoming_routes:
             prev_route = intelligence.upcoming_routes[index - 1]
             prev_date = prev_route.game_data.date if prev_route.game_data else None
             if prev_date and (game_date - prev_date).total_seconds() < 86400:
-                b2b_lbl = QLabel("⚡ B2B")
-                b2b_lbl.setFont(self.FONT_SMALL)
-                b2b_lbl.setStyleSheet(f"color: {self.COLOR_DANGER}; background: transparent;")
-                header_row.addWidget(b2b_lbl)
-        
-        header_row.addStretch()
-        
-        # Distance
-        distance = route.travel_distance if hasattr(route, 'travel_distance') else 0
-        dist_lbl = QLabel(f"{distance:,.0f} mi")
-        dist_lbl.setFont(self.FONT_MONO)
-        dist_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
-        header_row.addWidget(dist_lbl)
-        
-        layout.addLayout(header_row)
-        
-        # === Opponent & Venue Row ===
-        venue_row = QHBoxLayout()
-        venue_row.setSpacing(4)
-        
-        # Truncate opponent name if needed
-        opp_display = opponent[:20] + "…" if len(opponent) > 20 else opponent
-        opp_lbl = QLabel(f"{home_prefix} {opp_display}")
-        opp_lbl.setFont(self.FONT_BODY)
-        opp_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
-        venue_row.addWidget(opp_lbl)
-        
-        # Truncate venue name
+                header.addWidget(self._lbl("B2B", self.FONT_SMALL, self.COLOR_DANGER, spacing=110))
+        header.addStretch()
+        distance = getattr(route, 'travel_distance', 0) or 0
+        header.addWidget(self._lbl(f"{distance:,.0f} mi", self.FONT_MONO, self.COLOR_MUTED))
+        layout.addLayout(header)
+
+        # === Row 2: opponent · venue ===
+        opp_row = QHBoxLayout(); opp_row.setSpacing(5)
+        opp_display = opponent[:22] + "…" if len(opponent) > 22 else opponent
+        opp_row.addWidget(self._lbl(f"{home_prefix} {opp_display}", self.FONT_BODY, self.COLOR_TEXT))
         venue_display = venue_name[:18] + "…" if len(venue_name) > 18 else venue_name
-        venue_lbl = QLabel(f"· {venue_display}")
-        venue_lbl.setFont(self.FONT_SMALL)
-        venue_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-        venue_row.addWidget(venue_lbl)
-        
-        venue_row.addStretch()
-        
-        layout.addLayout(venue_row)
-        
-        # === Route Row ===
-        route_row = QHBoxLayout()
-        
-        route_str = f"{dep_airport} → {arr_airport}"
-        route_lbl = QLabel(route_str)
-        route_lbl.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        route_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
-        route_row.addWidget(route_lbl)
-        
-        # Road trip context
+        opp_row.addWidget(self._lbl(f"· {venue_display}", self.FONT_SMALL, self.COLOR_MUTED))
+        opp_row.addStretch()
+        layout.addLayout(opp_row)
+
+        # === Row 3: route · circadian ===
+        route_row = QHBoxLayout(); route_row.setSpacing(6)
+        route_row.addWidget(self._lbl(f"{dep_airport} → {arr_airport}",
+                                      QFont("Consolas", 10, QFont.Weight.Bold), self.COLOR_TEXT))
         if road_game_num:
-            ctx_lbl = QLabel(f"· Road Game {road_game_num}")
-            ctx_lbl.setFont(self.FONT_SMALL)
-            ctx_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-            route_row.addWidget(ctx_lbl)
-        
-        # Circadian badge: the validated cumulative body-clock signal (signed,
-        # eastward = jet-lag penalty), NOT the washed-out single-leg tz hop.
-        # Falls back to the raw tz diff only when no fatigue report is joined.
+            route_row.addWidget(self._lbl(f"· road {road_game_num}", self.FONT_SMALL, self.COLOR_MUTED))
+        route_row.addStretch()
+        # Circadian: validated cumulative body-clock signal (signed; eastward =
+        # penalty). Falls back to single-leg tz only when no fatigue report.
         circ = focus_tf.circadian if focus_tf else None
         if circ is not None and abs(circ) >= 1.0:
-            if circ > 0:  # eastward — the penalty direction
-                badge = QLabel(f"· ↻ +{circ:.0f}h E jet lag")
-                badge.setStyleSheet(f"color: {self.COLOR_DANGER}; background: transparent;")
-            else:         # westward — eased, neutral
-                badge = QLabel(f"· ↻ {circ:.0f}h W (eased)")
-                badge.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-            badge.setFont(self.FONT_SMALL)
-            route_row.addWidget(badge)
+            if circ > 0:
+                route_row.addWidget(self._lbl(f"+{circ:.0f}h east · jet lag",
+                                              self.FONT_SMALL, self.COLOR_DANGER))
+            else:
+                route_row.addWidget(self._lbl(f"{abs(circ):.0f}h west · eased",
+                                              self.FONT_SMALL, self.COLOR_MUTED))
         else:
             tz_diff = self._calculate_timezone_diff(dep_city, arr_city)
             if tz_diff != 0:
-                tz_str = f"+{tz_diff}h" if tz_diff > 0 else f"{tz_diff}h"
-                tz_lbl = QLabel(f"· {tz_str} TZ")
-                tz_lbl.setFont(self.FONT_SMALL)
-                tz_lbl.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
-                route_row.addWidget(tz_lbl)
-
-        route_row.addStretch()
-
+                route_row.addWidget(self._lbl(f"{tz_diff:+d}h tz", self.FONT_SMALL, self.COLOR_WARNING))
         layout.addLayout(route_row)
 
-        # === Matchup Fatigue Row ===
-        # Both teams' schedule-fatigue at a glance + which side the rested-edge
-        # favors. This is the differential a trader actually bets on.
+        # === Row 4: fatigue meters + rested edge ===
         if focus_tf is not None and opp_tf is not None:
-            mf_row = QHBoxLayout()
-            mf_row.setSpacing(6)
-
-            focus_abbr = focus_tf.team_id.upper()
-            opp_abbr = opp_tf.team_id.upper()
-            f_dots = self._fatigue_dots(focus_tf.score)
-            o_dots = self._fatigue_dots(opp_tf.score)
-
-            f_lbl = QLabel(f"{focus_abbr} {'●' * f_dots}{'○' * (3 - f_dots)}")
-            f_lbl.setFont(self.FONT_MONO)
-            f_lbl.setStyleSheet(f"color: {self._dot_color(f_dots)}; background: transparent;")
-            mf_row.addWidget(f_lbl)
-
-            vs_lbl = QLabel("vs")
-            vs_lbl.setFont(self.FONT_SMALL)
-            vs_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-            mf_row.addWidget(vs_lbl)
-
-            o_lbl = QLabel(f"{opp_abbr} {'●' * o_dots}{'○' * (3 - o_dots)}")
-            o_lbl.setFont(self.FONT_MONO)
-            o_lbl.setStyleSheet(f"color: {self._dot_color(o_dots)}; background: transparent;")
-            mf_row.addWidget(o_lbl)
-
-            mf_row.addStretch()
-
-            # Edge chip: the LESS fatigued side holds the schedule edge. Only
-            # show it when the gap is meaningful (>= 8 pts on the 0-100 scale).
-            diff = focus_tf.score - opp_tf.score
+            fr = QHBoxLayout(); fr.setSpacing(6)
+            fr.addWidget(self._section_label("FATIGUE"))
+            fr.addWidget(self._lbl(focus_tf.team_id.upper(), self.FONT_MONO, self.COLOR_TEXT))
+            fr.addWidget(FatigueBar(focus_tf.score))
+            fr.addWidget(self._lbl(f"{focus_tf.score:.0f}", self.FONT_MONO,
+                                   self._fatigue_hex(focus_tf.score)))
+            fr.addSpacing(10)
+            fr.addWidget(self._lbl(opp_tf.team_id.upper(), self.FONT_MONO, self.COLOR_MUTED))
+            fr.addWidget(FatigueBar(opp_tf.score))
+            fr.addWidget(self._lbl(f"{opp_tf.score:.0f}", self.FONT_MONO,
+                                   self._fatigue_hex(opp_tf.score)))
+            fr.addStretch()
+            diff = focus_tf.score - opp_tf.score  # +: focus more tired -> edge opp
             if abs(diff) >= 8.0:
-                edge_team = opp_abbr if diff > 0 else focus_abbr
-                edge_lbl = QLabel(f"EDGE {edge_team}  Δ{abs(diff):.0f}")
-                edge_lbl.setFont(self.FONT_TITLE)
-                edge_lbl.setStyleSheet(f"color: {self.COLOR_ACCENT}; background: transparent;")
-                mf_row.addWidget(edge_lbl)
+                edge_team = opp_tf.team_id.upper() if diff > 0 else focus_tf.team_id.upper()
+                fr.addWidget(self._lbl(f"{edge_team} +{abs(diff):.0f}",
+                                       self.FONT_TITLE, self.COLOR_ACCENT))
+            layout.addLayout(fr)
 
-            layout.addLayout(mf_row)
-
-        # === Rest / Ground-Logistics Chip ===
-        # Effective recovery window before this game given the prior game +
-        # travel. The signal a hotel's *location* (not its star rating) feeds:
-        # a tight turnaround compounds the circadian debt above.
+        # === Row 5: rest window (compressed legs only) ===
         rest = self._estimate_rest(route, index, intelligence)
         if rest is not None:
             rest_h, confirmed = rest
             tight = rest_h < self._REST_TIGHT_H
-            icon = "⏱" if tight else "🛏"
             color = self.COLOR_DANGER if tight else self.COLOR_MUTED
-            tag = "confirmed" if confirmed else "proj"
             num = f"{rest_h:.1f}h" if confirmed else f"~{rest_h:.0f}h"
-            rest_lbl = QLabel(f"{icon} {num} rest · {tag}")
-            rest_lbl.setFont(self.FONT_SMALL)
-            rest_lbl.setStyleSheet(f"color: {color}; background: transparent;")
-            layout.addWidget(rest_lbl)
-        
-        # === Airport Info ===
+            tag = "confirmed" if confirmed else "projected"
+            rr = QHBoxLayout(); rr.setSpacing(6)
+            rr.addWidget(self._section_label("REST"))
+            rr.addWidget(self._lbl(f"{num} · {tag}", self.FONT_SMALL, color))
+            rr.addStretch()
+            layout.addLayout(rr)
+
+        # === Row 6: arrival airport ===
         if route.primary_airport:
-            airport_row = QHBoxLayout()
-            airport_row.setSpacing(6)
-            
             primary = route.primary_airport
-            otp = primary.on_time_probability if hasattr(primary, 'on_time_probability') else 0.85
+            otp = getattr(primary, 'on_time_probability', 0.85)
             otp_pct = int(otp * 100) if otp <= 1 else int(otp)
-            otp_color = self.COLOR_SUCCESS if otp_pct >= 80 else self.COLOR_WARNING if otp_pct >= 65 else self.COLOR_DANGER
-            
-            dist_km = primary.distance_from_venue if hasattr(primary, 'distance_from_venue') else 0
-            
-            airport_lbl = QLabel(f"🛫 {primary.iata_code} {otp_pct}% · {dist_km:.0f}km")
-            airport_lbl.setFont(self.FONT_SMALL)
-            airport_lbl.setStyleSheet(f"color: {otp_color}; background: transparent;")
-            airport_row.addWidget(airport_lbl)
-            
-            # Alternate airports - more compact
-            if hasattr(route, 'alternate_airports') and route.alternate_airports:
-                alts = route.alternate_airports[:2]
-                alt_strs = [f"{a.iata_code}" for a in alts]
-                if alt_strs:
-                    alt_lbl = QLabel(f"ALT: {'/'.join(alt_strs)}")
-                    alt_lbl.setFont(self.FONT_SMALL)
-                    alt_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-                    airport_row.addWidget(alt_lbl)
-            
-            airport_row.addStretch()
-            layout.addLayout(airport_row)
-        
-        # === Hotel Info ===
-        if hasattr(route, 'destination_hotels') and route.destination_hotels:
+            otp_color = (self.COLOR_SUCCESS if otp_pct >= 80
+                         else self.COLOR_WARNING if otp_pct >= 65 else self.COLOR_DANGER)
+            dist_km = getattr(primary, 'distance_from_venue', 0) or 0
+            ar = QHBoxLayout(); ar.setSpacing(6)
+            ar.addWidget(self._section_label("AIR"))
+            ar.addWidget(self._lbl(primary.iata_code, self.FONT_MONO, self.COLOR_TEXT))
+            ar.addWidget(self._lbl(f"{otp_pct}% on-time", self.FONT_SMALL, otp_color))
+            ar.addWidget(self._lbl(f"· {dist_km:.0f}km", self.FONT_SMALL, self.COLOR_MUTED))
+            if getattr(route, 'alternate_airports', None):
+                alts = '/'.join(a.iata_code for a in route.alternate_airports[:2])
+                if alts:
+                    ar.addWidget(self._lbl(f"· alt {alts}", self.FONT_SMALL, self.COLOR_MUTED))
+            ar.addStretch()
+            layout.addLayout(ar)
+
+        # === Row 7: lodging (proximity proxy; numeric rating, no stars) ===
+        if getattr(route, 'destination_hotels', None):
             hotel = route.destination_hotels[0]
-            stars = self._get_star_rating(hotel)
-            dist = hotel.distance_from_venue if hasattr(hotel, 'distance_from_venue') else 0
-            
-            hotel_row = QHBoxLayout()
-            hotel_row.setSpacing(4)
-            
-            # Truncate hotel name more aggressively
-            hotel_name = hotel.name[:22] + "…" if len(hotel.name) > 22 else hotel.name
-            hotel_lbl = QLabel(f"🏨 {hotel_name}")
-            hotel_lbl.setFont(self.FONT_SMALL)
-            hotel_lbl.setStyleSheet(f"color: {self.COLOR_TEXT}; background: transparent;")
-            hotel_row.addWidget(hotel_lbl)
-            
-            # Stars and distance
-            detail_lbl = QLabel(f"{stars} {dist:.1f}km")
-            detail_lbl.setFont(self.FONT_SMALL)
-            detail_lbl.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
-            hotel_row.addWidget(detail_lbl)
-            
-            # Additional hotels count
+            rating = self._hotel_rating_num(hotel)
+            dist = getattr(hotel, 'distance_from_venue', 0) or 0
+            name = hotel.name or ""
+            if name.islower():
+                name = name.title()
+            name = name[:24] + "…" if len(name) > 24 else name
+            hr = QHBoxLayout(); hr.setSpacing(6)
+            hr.addWidget(self._section_label("STAY"))
+            hr.addWidget(self._lbl(name, self.FONT_SMALL, self.COLOR_TEXT))
+            rating_str = f"{rating:.1f}" if rating else "—"
+            hr.addWidget(self._lbl(f"· {rating_str} · {dist:.1f}km", self.FONT_SMALL, self.COLOR_MUTED))
             if len(route.destination_hotels) > 1:
-                more_lbl = QLabel(f"+{len(route.destination_hotels) - 1}")
-                more_lbl.setFont(self.FONT_SMALL)
-                more_lbl.setStyleSheet(f"color: {self.COLOR_MUTED}; background: transparent;")
-                hotel_row.addWidget(more_lbl)
-            
-            hotel_row.addStretch()
-            layout.addLayout(hotel_row)
-        
-        # === Risk Factors ===
-        if hasattr(route, 'risk_factors') and route.risk_factors:
+                hr.addWidget(self._lbl(f"+{len(route.destination_hotels) - 1}",
+                                       self.FONT_SMALL, self.COLOR_MUTED))
+            hr.addStretch()
+            layout.addLayout(hr)
+
+        # === Risk factors ===
+        if getattr(route, 'risk_factors', None):
             for risk in route.risk_factors[:2]:
-                risk_lbl = QLabel(f"⚠️ {risk}")
-                risk_lbl.setFont(self.FONT_SMALL)
-                risk_lbl.setStyleSheet(f"color: {self.COLOR_WARNING}; background: transparent;")
-                layout.addWidget(risk_lbl)
-        
+                rk = QHBoxLayout(); rk.setSpacing(6)
+                rk.addWidget(self._section_label("RISK"))
+                rk.addWidget(self._lbl(risk, self.FONT_SMALL, self.COLOR_WARNING))
+                rk.addStretch()
+                layout.addLayout(rk)
+
         return frame
     
+    # ----------------------------------------------------- recent charters
+
+    @staticmethod
+    def _fmt_time(iso) -> str:
+        try:
+            dt = datetime.fromisoformat(str(iso))
+        except (ValueError, TypeError):
+            return ""
+        return dt.strftime("%I:%M%p").lstrip("0").lower().replace("pm", "p").replace("am", "a")
+
+    def refresh_recent_charters(self):
+        """Default panel view (no team analyzed): recently-landed charters from
+        the ledger. Keeps arrived-flight info in the panel, off the globe."""
+        if not hasattr(self, 'routes_layout'):
+            return
+        self._clear_routes()
+        ledger = self._get_rest_ledger()
+        rows = ledger.recent_landed(10) if ledger else []
+
+        hdr = QWidget()
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(2, 0, 2, 2); hl.setSpacing(6)
+        hl.addWidget(self._lbl("RECENT CHARTERS", self.FONT_TITLE, self.COLOR_TEXT, spacing=140))
+        hl.addStretch()
+        hl.addWidget(self._lbl("live", self.FONT_SMALL, self.COLOR_SUCCESS, spacing=120))
+        self.routes_layout.insertWidget(0, hdr)
+
+        if not rows:
+            note = self._lbl("No charters confirmed yet — watching active travel windows.",
+                             self.FONT_SMALL, self.COLOR_MUTED)
+            note.setWordWrap(True)
+            note.setContentsMargins(2, 14, 2, 0)
+            self.routes_layout.insertWidget(1, note)
+            return
+        for i, r in enumerate(rows):
+            self.routes_layout.insertWidget(i + 1, self._recent_charter_row(r))
+
+    def _recent_charter_row(self, r: dict) -> QFrame:
+        frame = QFrame(); frame.setObjectName("routeCard")
+        team = (r.get('team_id') or '').upper()
+        confirmed = bool(r.get('confirmed_route'))
+        accent = self.COLOR_ACCENT if confirmed else self.COLOR_MUTED
+        frame.setStyleSheet(
+            f"QFrame#routeCard {{ background-color: {self.COLOR_CARD};"
+            f" border: 1px solid {self.COLOR_BORDER}; border-left: 3px solid {accent};"
+            f" border-radius: 6px; }}")
+        lay = QVBoxLayout(frame); lay.setContentsMargins(13, 7, 12, 7); lay.setSpacing(3)
+
+        top = QHBoxLayout(); top.setSpacing(7)
+        top.addWidget(self._lbl(team or "—", self.FONT_TITLE, self.COLOR_TEXT, spacing=110))
+        origin = r.get('origin_city') or "—"; dest = r.get('dest_city') or "—"
+        top.addWidget(self._lbl(f"{origin} → {dest}", self.FONT_BODY, self.COLOR_TEXT))
+        top.addStretch()
+        t = self._fmt_time(r.get('arr_time'))
+        time_color = self.COLOR_SUCCESS if confirmed else self.COLOR_MUTED
+        top.addWidget(self._lbl(f"{t} ✓" if confirmed else t, self.FONT_MONO, time_color))
+        lay.addLayout(top)
+
+        bottom = QHBoxLayout(); bottom.setSpacing(6)
+        cs = r.get('callsign') or r.get('registration') or "—"
+        ac = r.get('aircraft_type') or ""
+        bottom.addWidget(self._lbl(f"{cs} · {ac}" if ac else cs, self.FONT_SMALL, self.COLOR_MUTED))
+        bottom.addStretch()
+        bottom.addWidget(self._lbl("landed" if confirmed else "confirming…",
+                                   self.FONT_SMALL, self.COLOR_MUTED))
+        lay.addLayout(bottom)
+        return frame
+
     def _calculate_timezone_diff(self, from_city: str, to_city: str) -> int:
         """Calculate timezone difference between cities"""
         from_tz = self.city_timezones.get(from_city, -5)
@@ -3696,12 +3738,6 @@ class FlightControlPanel(QWidget):
             
             QFrame#routeCard:hover {{
                 border-color: {self.COLOR_ACCENT};
-            }}
-            
-            QFrame#alertsFrame {{
-                background-color: {self.COLOR_CARD};
-                border: 1px solid {self.COLOR_BORDER};
-                border-radius: 8px;
             }}
             
             QFrame#summaryFrame {{
@@ -3943,9 +3979,6 @@ class FlightControlPanel(QWidget):
                 card = self._create_route_card(route, i, len(intelligence.upcoming_routes), intelligence)
                 self.routes_layout.insertWidget(i, card)
         
-        # Update alerts
-        self._update_alerts(intelligence)
-        
         # Update summary stats
         self._update_summary(intelligence)
     
@@ -3975,59 +4008,6 @@ class FlightControlPanel(QWidget):
             item = self.routes_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-    
-    def _update_alerts(self, intelligence):
-        """Update alerts section"""
-        # Clear existing alerts
-        while self.alerts_container.count():
-            item = self.alerts_container.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        alerts = []
-        
-        # Check for high-risk routes
-        high_risk = [r for r in intelligence.upcoming_routes 
-                    if hasattr(r, 'travel_confidence') and r.travel_confidence == "LOW"]
-        if high_risk:
-            alerts.append((f"⚠️ {len(high_risk)} high-risk route(s) flagged", self.COLOR_DANGER))
-        
-        # Check for back-to-backs
-        b2b_count = 0
-        for i, route in enumerate(intelligence.upcoming_routes[1:], 1):
-            prev = intelligence.upcoming_routes[i-1]
-            if route.game_data and prev.game_data:
-                diff = (route.game_data.date - prev.game_data.date).total_seconds()
-                if diff < 86400:
-                    b2b_count += 1
-        if b2b_count:
-            alerts.append((f"⚡ {b2b_count} back-to-back game(s) detected", self.COLOR_WARNING))
-        
-        # Aggregate risk factors
-        all_risks = set()
-        for route in intelligence.upcoming_routes:
-            if hasattr(route, 'risk_factors') and route.risk_factors:
-                all_risks.update(route.risk_factors)
-        for risk in list(all_risks)[:2]:
-            alerts.append((f"⚠️ {risk}", self.COLOR_WARNING))
-        
-        # Add recommendations
-        if hasattr(intelligence, 'recommendations') and intelligence.recommendations:
-            for rec in intelligence.recommendations[:2]:
-                alerts.append((f"💡 {rec}", self.COLOR_ACCENT))
-        
-        # Display alerts
-        if alerts:
-            for text, color in alerts:
-                lbl = QLabel(text)
-                lbl.setFont(self.FONT_SMALL)
-                lbl.setStyleSheet(f"color: {color}; background: transparent;")
-                self.alerts_container.addWidget(lbl)
-        else:
-            lbl = QLabel("✓ No alerts - all routes look good")
-            lbl.setFont(self.FONT_SMALL)
-            lbl.setStyleSheet(f"color: {self.COLOR_SUCCESS}; background: transparent;")
-            self.alerts_container.addWidget(lbl)
     
     def _update_summary(self, intelligence):
         """Update summary statistics"""
@@ -4060,10 +4040,27 @@ class FlightControlPanel(QWidget):
                     if days_between > 1:
                         rest_days += days_between - 1
             self._update_stat(self.stat_rest, f"{rest_days}/{total_days}")
-        
-        # Complexity score
-        complexity = intelligence.travel_complexity_score if hasattr(intelligence, 'travel_complexity_score') else 0
-        self._update_stat(self.stat_complexity, f"{complexity:.0f}/100")
+
+        # Distinct destination cities visited on the trip
+        cities = set()
+        for route in routes:
+            dest = None
+            if getattr(route, 'travel_data', None):
+                dest = route.travel_data.arrival_city
+            elif route.game_data and route.game_data.venue:
+                dest = route.game_data.venue.city
+            if dest:
+                cities.add(dest.strip().lower())
+        self._update_stat(self.stat_cities, str(len(cities)))
+
+        # Road (away) games for this team across the routes
+        team_id = intelligence.team_info.team_id if intelligence.team_info else None
+        road_games = 0
+        for route in routes:
+            g = route.game_data
+            if g and team_id and g.away_team and g.away_team.team_id == team_id:
+                road_games += 1
+        self._update_stat(self.stat_road, f"{road_games}/{len(routes)}")
     
     def _update_stat(self, widget: QWidget, value: str):
         """Update a stat widget's value"""
