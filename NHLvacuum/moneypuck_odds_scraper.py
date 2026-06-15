@@ -623,16 +623,18 @@ def load_playoff_games_from_db(db_path: str, season: Optional[str] = None) -> Li
         if season:
             # Extract the first year from the season (e.g., "2024" from "2024-2025")
             year_prefix = season.split('-')[0]
+            # NOTE: scope by the game_id prefix only. It already uniquely identifies the
+            # season's playoffs (e.g. '202503%'), and avoids a season-string format
+            # mismatch (CLI uses '2025-26' while the games table stores '2025-2026').
             query = """
                 SELECT game_id, season
                 FROM games
                 WHERE game_id LIKE ?
-                AND season = ?
                 ORDER BY game_id
             """
             # Pattern: year + '03' + any 4 digits (e.g., '202403____')
             pattern = f"{year_prefix}03%"
-            cursor.execute(query, (pattern, season))
+            cursor.execute(query, (pattern,))
         else:
             # Load all playoff games
             # Use SUBSTR to check positions 5-6 are '03'
