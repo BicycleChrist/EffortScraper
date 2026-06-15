@@ -789,6 +789,104 @@ def save_results(results: List[GameLine], output_file: str):
     logger.info(f"Saved {len(games_dict)} games ({len(results)} total sportsbook entries) to {output_file}")
 
 
+def merge_results_into_csv(results: List[GameLine], output_file: str):
+    """
+    Merge scraped GameLine results into an existing wide-format CSV, preserving
+    rows already present and adding/updating rows for newly scraped games.
+
+    If the file does not exist yet, it is created via save_results(). This is the
+    accumulation path used by playoff scraping so every run appends onto the one
+    singular playoffs CSV instead of writing a separate per-season file.
+    """
+    if not Path(output_file).exists():
+        save_results(results, output_file)
+        return
+
+    # Load existing rows keyed by game
+    existing_data = {}
+    with open(output_file, 'r') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        for row in reader:
+            game_key = (row['game_id'], row['traditional_game_id'], row['season'])
+            existing_data[game_key] = row
+
+    # Group new results by game
+    new_games_dict = {}
+    for result in results:
+        game_key = (result.game_id, result.traditional_game_id, result.season)
+
+        if game_key not in new_games_dict:
+            new_games_dict[game_key] = {
+                'game_id': result.game_id,
+                'traditional_game_id': result.traditional_game_id,
+                'season': result.season,
+                'away_team': result.away_team,
+                'home_team': result.home_team,
+                'mp_away_win_prob': result.mp_away_win_prob,
+                'mp_home_win_prob': result.mp_home_win_prob,
+                'scrape_status': result.scrape_status,
+                'error_message': result.error_message,
+                'sportsbooks': {}
+            }
+
+        if result.sportsbook and result.sportsbook != 'unknown':
+            new_games_dict[game_key]['sportsbooks'][result.sportsbook] = {
+                'opening_timestamp': result.opening_timestamp,
+                'opening_away_odds': result.opening_away_odds,
+                'opening_home_odds': result.opening_home_odds,
+                'closing_timestamp': result.closing_timestamp,
+                'closing_away_odds': result.closing_away_odds,
+                'closing_home_odds': result.closing_home_odds
+            }
+
+    # Convert new games to row format, replacing any existing row for that game
+    for game_key, game_data in new_games_dict.items():
+        row = {field: '' for field in fieldnames}
+        row['game_id'] = game_data['game_id']
+        row['traditional_game_id'] = game_data['traditional_game_id']
+        row['season'] = game_data['season']
+        row['away_team'] = game_data['away_team'] or ''
+        row['home_team'] = game_data['home_team'] or ''
+        row['mp_away_win_prob'] = game_data['mp_away_win_prob'] or ''
+        row['mp_home_win_prob'] = game_data['mp_home_win_prob'] or ''
+        row['scrape_status'] = game_data['scrape_status']
+        row['error_message'] = game_data['error_message'] or ''
+
+        for sportsbook, sb_data in game_data['sportsbooks'].items():
+            row[f'{sportsbook}_opening_timestamp'] = sb_data['opening_timestamp'] or ''
+            row[f'{sportsbook}_opening_away_odds'] = sb_data['opening_away_odds'] or ''
+            row[f'{sportsbook}_opening_home_odds'] = sb_data['opening_home_odds'] or ''
+            row[f'{sportsbook}_closing_timestamp'] = sb_data['closing_timestamp'] or ''
+            row[f'{sportsbook}_closing_away_odds'] = sb_data['closing_away_odds'] or ''
+            row[f'{sportsbook}_closing_home_odds'] = sb_data['closing_home_odds'] or ''
+
+        existing_data[game_key] = row
+
+    # Rebuild fieldnames to include any new sportsbooks (e.g. kalshi/polymarket)
+    base_fields = [
+        'game_id', 'traditional_game_id', 'season',
+        'away_team', 'home_team',
+        'mp_away_win_prob', 'mp_home_win_prob',
+        'scrape_status', 'error_message'
+    ]
+    all_keys = set()
+    for row in existing_data.values():
+        all_keys.update(row.keys())
+    sportsbook_fields = sorted(k for k in all_keys if k not in base_fields)
+    fieldnames = base_fields + sportsbook_fields
+
+    # Write merged data back
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        for game_key in sorted(existing_data.keys()):
+            writer.writerow(existing_data[game_key])
+
+    logger.info(f"Merged {len(new_games_dict)} games into {output_file} "
+                f"({len(existing_data)} total games)")
+
+
 def update_unique_game_ids(season: str) -> str:
     """
     Update the unique_game_ids CSV file for a given season.
@@ -897,7 +995,7 @@ def identify_missing_games_from_lists(unique_game_ids_csv: str, moneypuck_odds_c
 def scrape_season(csv_file: Optional[str] = None, games_list: Optional[List[Tuple[str, str, str]]] = None,
                   output_file: str = None, max_workers: int = 10,
                   headless: bool = True, delay: float = 0.33, max_retries: int = 3,
-                  timeout: int = 20):
+                  timeout: int = 20, merge: bool = False):
     """
     Scrape all games from a season using multithreading.
 
@@ -958,8 +1056,11 @@ def scrape_season(csv_file: Optional[str] = None, games_list: Optional[List[Tupl
             if i < len(games):
                 time.sleep(delay)
 
-    # Save results
-    save_results(results, output_file)
+    # Save results: merge into an existing accumulator (playoffs) or overwrite
+    if merge:
+        merge_results_into_csv(results, output_file)
+    else:
+        save_results(results, output_file)
 
     # Print summary
     status_counts = {}
@@ -1319,18 +1420,18 @@ if __name__ == '__main__':
                         (f" for season {args.season}" if args.season else ""))
             exit(1)
 
-        # Determine output filename
-        if args.season:
-            output_file = f"moneypuck_odds_{args.season}_playoffs.csv"
-            season_label = args.season
-        else:
-            output_file = "moneypuck_odds_all_playoffs.csv"
-            season_label = "all seasons"
+        # All playoff scrapes accumulate into ONE singular CSV regardless of
+        # season. The games_list is filtered by --season above, but the output
+        # is always merged into the shared file so we never spawn per-season
+        # playoff CSVs (which duplicated rows across files on import).
+        output_file = "moneypuck_odds_all_playoffs.csv"
+        season_label = args.season if args.season else "all seasons"
 
         logger.info("")
         logger.info("=" * 60)
         logger.info(f"STARTING PLAYOFF SCRAPE: {season_label}")
         logger.info(f"Found {len(playoff_games)} playoff games")
+        logger.info(f"Merging results into {output_file}")
         logger.info("=" * 60)
 
         scrape_season(
@@ -1340,7 +1441,8 @@ if __name__ == '__main__':
             headless=not args.no_headless,
             delay=args.delay,
             max_retries=args.retries,
-            timeout=args.timeout
+            timeout=args.timeout,
+            merge=True
         )
 
         logger.info("")
