@@ -151,6 +151,66 @@ class KalshiClient:
                 print(f"Response: {e.response.text}")
             raise
 
+    # ------------------------------------------------------------------
+    # AUTHENTICATED REST (RSA-PSS signed) — required for portfolio/orders
+    # ------------------------------------------------------------------
+    def _get_private_key(self):
+        if getattr(self, "_priv_key", None) is None:
+            self._priv_key = serialization.load_pem_private_key(
+                Kalshi_Private_Key.encode(), password=None)
+        return self._priv_key
+
+    def _signed_request(self, method: str, endpoint: str,
+                        params: Dict = None, data: Dict = None) -> Dict:
+        """Authenticated request signed per Kalshi's scheme:
+        sign `timestamp + METHOD + /trade-api/v2<endpoint-path>` with RSA-PSS/SHA256."""
+        url = f"{self.BASE_URL}{endpoint}"
+        ts = str(int(time.time() * 1000))
+        path = "/trade-api/v2" + endpoint.split("?")[0]
+        signature = self._get_private_key().sign(
+            (ts + method + path).encode("utf-8"),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                        salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256())
+        headers = {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.api_key,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
+        resp = self.session.request(method, url, headers=headers,
+                                    params=params, json=data)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    def create_order(self, ticker: str, action: str, side: str, count: int,
+                     price_cents: int = None, order_type: str = "limit",
+                     client_order_id: str = None) -> Dict:
+        """Place an order. action='buy'|'sell', side='yes'|'no', price in cents."""
+        import uuid
+        body = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": int(count),
+            "type": order_type,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+        }
+        if order_type == "limit" and price_cents is not None:
+            body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
+        return self._signed_request("POST", "/portfolio/orders", data=body)
+
+    def get_orders(self, ticker: str = None, status: str = "resting") -> Dict:
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        return self._signed_request("GET", "/portfolio/orders", params=params)
+
+    def cancel_order(self, order_id: str) -> Dict:
+        return self._signed_request("DELETE", f"/portfolio/orders/{order_id}")
+
     def get_events(
         self,
         limit: int = 100,
@@ -627,12 +687,59 @@ class KalshiClient:
   
       return {'events': all_events, 'count': len(all_events)}
 
+
+    # Module saved from deleted test file
+    def get_all_series() -> Dict:
+        """
+        Fetch all series from Kalshi API.
+
+        Returns:
+            Dictionary with series data
+        """
+
+        BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+        url = f"{BASE_URL}/series"
+        all_series = []
+        cursor = None
+
+        print("Fetching all series from Kalshi API...")
+
+        while True:
+            params = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                response = requests.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                series = data.get('series', [])
+                all_series.extend(series)
+
+                print(f"  Fetched {len(series)} series (total: {len(all_series)})")
+
+                cursor = data.get('cursor')
+                if not cursor or len(series) < 200:
+                    break
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching series: {e}")
+                break
+
+        return {'series': all_series, 'count': len(all_series)}
+
 class KalshiStreamClient(QObject):
     connected = pyqtSignal()
     disconnected = pyqtSignal()
     error = pyqtSignal(object)
     raw_message = pyqtSignal(object)
     tick = pyqtSignal(object)
+    # Sub-second feed signals (additive; ticker/`tick` path is unchanged).
+    # `trade` carries individual executions; `orderbook` carries both the
+    # initial orderbook_snapshot and subsequent orderbook_delta messages.
+    trade = pyqtSignal(object)
+    orderbook = pyqtSignal(object)
 
     def __init__(
         self,
@@ -789,11 +896,34 @@ class KalshiStreamClient(QObject):
         self._subscriptions.discard((tuple(channels), tuple(tickers) if tickers else None))
         self.send(json.dumps(self.build_unsubscribe(channels, tickers)))
 
+    def unsubscribe_sids(self, sids):
+        """Unsubscribe by subscription id (Kalshi's unsubscribe keys on `sids`)."""
+        sids = [s for s in sids if s is not None]
+        if not sids:
+            return
+        self.send(json.dumps({
+            "id": self._msg_id(),
+            "cmd": "unsubscribe",
+            "params": {"sids": list(sids)},
+        }))
+
     # Convenience helpers
     def subscribe_ticker(self, tickers):
         self.subscribe(["ticker"], tickers)
 
     def subscribe_orderbook(self, tickers):
+        self.subscribe(["orderbook_delta"], tickers)
+
+    def subscribe_trade(self, tickers):
+        self.subscribe(["trade"], tickers)
+
+    def subscribe_live(self, tickers):
+        """Subscribe to the full sub-second feed: trades + orderbook deltas.
+
+        Sent as two separate subscriptions so each channel gets its own seq
+        stream (a combined subscription interleaves trade messages into the
+        orderbook seq counter, which looks like constant gaps)."""
+        self.subscribe(["trade"], tickers)
         self.subscribe(["orderbook_delta"], tickers)
 
     # -------------------------------------------------------------------
@@ -855,9 +985,16 @@ class KalshiStreamClient(QObject):
             except Exception as ex:
                 self.error.emit({"action": "callback_fail", "exception": ex})
 
-        # Emit tick messages
-        if isinstance(msg, dict) and msg.get("type") == "ticker":
-            self.tick.emit(msg)
+        # Emit typed messages. ticker -> tick (legacy path, unchanged);
+        # trade/orderbook -> dedicated signals for the sub-second Live feed.
+        if isinstance(msg, dict):
+            mtype = msg.get("type")
+            if mtype == "ticker":
+                self.tick.emit(msg)
+            elif mtype == "trade":
+                self.trade.emit(msg)
+            elif mtype in ("orderbook_snapshot", "orderbook_delta"):
+                self.orderbook.emit(msg)
 
     def _on_error(self, ws, error):
         self.error.emit({"action": "ws_error", "error": error})
@@ -865,6 +1002,215 @@ class KalshiStreamClient(QObject):
     def _on_close(self, ws, code, reason):
         self.disconnected.emit()
 
+
+
+class KalshiLiveBook:
+    """
+    Maintains a live YES orderbook for one or more Kalshi markets from the
+    `orderbook_snapshot` / `orderbook_delta` websocket stream, and tracks the
+    last executed trade price from the `trade` stream.
+
+    Kalshi book convention (prices in integer cents, 1-99):
+      - `yes` levels are resting bids to buy YES at that price.
+      - `no`  levels are resting bids to buy NO at that price, which is
+        equivalently an offer to SELL YES at (100 - price).
+    So for the YES outcome:
+      - best YES bid  = max(yes price levels)
+      - best YES ask  = 100 - max(no price levels)
+
+    Sequence handling: Kalshi's `seq` is per-SUBSCRIPTION (per `sid`), not per
+    market or per connection. The book binds to the `sid` of its most recent
+    snapshot and IGNORES deltas carrying any other sid. This makes duplicate /
+    stale subscriptions (e.g. left over from a market switch or a resubscribe)
+    harmless instead of producing interleaved seqs that look like constant gaps.
+    Within the bound sid each delta must be prev seq + 1; a real gap fires
+    `on_gap(market_ticker)` (caller debounces) and we realign best-effort.
+    """
+
+    def __init__(self, on_gap: Optional[Callable[[str], None]] = None):
+        # market_ticker -> {"yes": {price:int qty:int}, "no": {...}, "sid": int,
+        #                   "seq": int, "last_trade": int|None, "stale": bool}
+        self._books: Dict[str, Dict] = {}
+        self._on_gap = on_gap
+
+    def _blank(self):
+        return {"yes": {}, "no": {}, "sid": None, "seq": None,
+                "last_trade": None, "stale": False}
+
+    @staticmethod
+    def _to_cents(p):
+        """Normalize a price to integer cents. Accepts int cents (1-99), a
+        dollar string like '0.2300', or a float. Kalshi mixes both forms."""
+        if isinstance(p, bool):
+            return None
+        if isinstance(p, int):
+            return p
+        try:
+            f = float(p)
+        except (TypeError, ValueError):
+            return None
+        # dollar-denominated (<= $1) -> cents; otherwise already cents
+        return int(round(f * 100)) if f <= 1.0 else int(round(f))
+
+    @staticmethod
+    def _to_qty(q):
+        """Quantities arrive as floats or float strings (e.g. '801545.83')."""
+        try:
+            return float(q)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _parse_levels(cls, inner, side):
+        """Parse a snapshot side into {cents: qty_float}. Kalshi's live schema
+        uses `<side>_dollars_fp` ([[dollar_str, qty_str], ...]); older/other forms
+        (`<side>` integer-cent, `<side>_dollars`) are accepted as fallbacks."""
+        arr = (inner.get(f"{side}_dollars_fp")
+               or inner.get(side)
+               or inner.get(f"{side}_dollars"))
+        out = {}
+        for entry in (arr or []):
+            try:
+                price, qty = entry[0], entry[1]
+            except (TypeError, IndexError):
+                continue
+            c = cls._to_cents(price)
+            if c is not None:
+                out[c] = cls._to_qty(qty)
+        return out
+
+    def current_sid(self, ticker: str):
+        book = self._books.get(ticker)
+        return book.get("sid") if book else None
+
+    def apply(self, msg: dict) -> Optional[dict]:
+        """Apply a trade/orderbook message. Returns the normalized state for the
+        affected market, or None if the message was ignored."""
+        if not isinstance(msg, dict):
+            return None
+        mtype = msg.get("type")
+        inner = msg.get("msg", {}) or {}
+        ticker = inner.get("market_ticker")
+        if not ticker:
+            return None
+
+        if mtype == "orderbook_snapshot":
+            book = self._books.get(ticker)
+            last = book.get("last_trade") if book else None
+            book = self._blank()
+            book["last_trade"] = last  # preserve last trade across resnapshots
+            book["yes"] = self._parse_levels(inner, "yes")
+            book["no"] = self._parse_levels(inner, "no")
+            book["sid"] = msg.get("sid")
+            book["seq"] = msg.get("seq")
+            self._books[ticker] = book
+            return self.state(ticker)
+
+        if mtype == "orderbook_delta":
+            book = self._books.get(ticker)
+            seq = msg.get("seq")
+            sid = msg.get("sid")
+            # No snapshot established yet (book absent, or only a trade has been
+            # seen so seq is unset) -> can't apply a delta. Ask for a snapshot.
+            if book is None or book.get("seq") is None:
+                if self._on_gap:
+                    self._on_gap(ticker)
+                return None
+            # Ignore deltas from any sid other than the one our snapshot bound to
+            # (stale/duplicate subscription). This is what prevents the false-gap
+            # cascade when multiple orderbook subscriptions exist for one market.
+            if book.get("sid") is not None and sid is not None and sid != book["sid"]:
+                return None
+            # Real sequence gap within the bound sid -> notify (debounced upstream)
+            # and realign best-effort so we don't storm.
+            prev_seq = book.get("seq")
+            if prev_seq is not None and seq is not None and seq != prev_seq + 1:
+                book["stale"] = True
+                if self._on_gap:
+                    self._on_gap(ticker)
+                book["seq"] = seq
+            side = inner.get("side")
+            price = self._to_cents(
+                inner.get("price") if inner.get("price") is not None
+                else inner.get("price_dollars"))
+            # Live schema uses `delta_fp` (string float); accept `delta` as fallback.
+            raw_delta = inner.get("delta_fp")
+            if raw_delta is None:
+                raw_delta = inner.get("delta")
+            if side in ("yes", "no") and price is not None and raw_delta is not None:
+                levels = book[side]
+                new_qty = levels.get(price, 0.0) + self._to_qty(raw_delta)
+                if new_qty <= 1e-9:
+                    levels.pop(price, None)
+                else:
+                    levels[price] = new_qty
+            book["seq"] = seq
+            return self.state(ticker)
+
+        if mtype == "trade":
+            book = self._books.setdefault(ticker, self._blank())
+            yp = inner.get("yes_price_dollars")
+            if yp is not None:
+                try:
+                    book["last_trade"] = int(round(float(yp) * 100))
+                except (TypeError, ValueError):
+                    pass
+            return self.state(ticker)
+
+        return None
+
+    def state(self, ticker: str) -> Optional[dict]:
+        """Return normalized YES-outcome state in cents: best bid/ask, mid, last."""
+        book = self._books.get(ticker)
+        if not book:
+            return None
+        best_bid = max(book["yes"]) if book["yes"] else None
+        best_ask = (100 - max(book["no"])) if book["no"] else None
+        mid = None
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2.0
+        elif best_bid is not None:
+            mid = best_bid
+        elif best_ask is not None:
+            mid = best_ask
+        return {
+            "market_ticker": ticker,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "last_trade": book["last_trade"],
+            "stale": book["stale"],
+        }
+
+    def ladder(self, ticker: str, depth: int = 10) -> Optional[dict]:
+        """YES-outcome depth ladder in cents.
+
+        bids = resting YES bids (book['yes']) sorted best (highest) first.
+        asks = YES offers derived from NO bids: ask price = 100 - no_price,
+               size = no_size; sorted best (lowest) first.
+        Returns {'bids': [(price, qty)], 'asks': [(price, qty)],
+                 'best_bid', 'best_ask', 'last_trade', 'stale'}.
+        """
+        book = self._books.get(ticker)
+        if not book:
+            return None
+        bids = sorted(book["yes"].items(), key=lambda x: -x[0])[:depth]
+        asks = sorted(((100 - p, q) for p, q in book["no"].items()),
+                      key=lambda x: x[0])[:depth]
+        return {
+            "bids": [(int(p), int(round(q))) for p, q in bids],
+            "asks": [(int(p), int(round(q))) for p, q in asks],
+            "best_bid": bids[0][0] if bids else None,
+            "best_ask": asks[0][0] if asks else None,
+            "last_trade": book["last_trade"],
+            "stale": book["stale"],
+        }
+
+    def reset(self, ticker: str = None):
+        if ticker is None:
+            self._books.clear()
+        else:
+            self._books.pop(ticker, None)
 
 
 def main():

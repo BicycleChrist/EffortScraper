@@ -8,11 +8,12 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
-    QProgressBar, QCheckBox, QHBoxLayout, QScrollArea
+    QProgressBar, QCheckBox, QHBoxLayout, QScrollArea, QSizePolicy,
+    QSpinBox, QMessageBox, QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QColor, QPixmap, QPainter
+from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics
 
-from KalshiClient import KalshiClient, KalshiStreamClient
+from KalshiClient import KalshiClient, KalshiStreamClient, KalshiLiveBook
 from polymarket_sports_client import PolymarketSportsClient
 import re
 from pathlib import Path
@@ -1798,6 +1799,95 @@ class KalshiHistoricalOddsClient:
             return []
 
 
+class OrderbookLadderWidget(QWidget):
+    """Compact live depth ladder for the YES outcome, Bloomberg-terminal styling.
+
+    Custom-painted so the per-tick update is cheap (one repaint, no widget churn):
+    asks (red) stacked on top with the best ask just above the mid row, a mid row
+    showing spread + last trade, then bids (green) below. A translucent horizontal
+    bar behind each level encodes size relative to the largest visible level.
+    Fed via set_data(asks, bids, last, stale); cents-denominated.
+    """
+
+    def __init__(self, levels: int = 8, parent=None):
+        super().__init__(parent)
+        self._levels = levels
+        self._asks = []   # [(price_cents, qty)] best (lowest) first
+        self._bids = []   # [(price_cents, qty)] best (highest) first
+        self._last = None
+        self._spread = None
+        self._stale = False
+        self.row_h = 16
+        self._font = QFont("monospace", 9)
+        self._font_b = QFont("monospace", 9); self._font_b.setBold(True)
+        self.setMinimumWidth(150)
+        self.setFixedHeight((levels * 2 + 1) * self.row_h + 4)
+
+    def set_data(self, asks, bids, last, stale=False):
+        self._asks = list(asks)[:self._levels]
+        self._bids = list(bids)[:self._levels]
+        self._last = last
+        self._spread = (self._asks[0][0] - self._bids[0][0]) \
+            if (self._asks and self._bids) else None
+        self._stale = stale
+        self.update()
+
+    def clear(self):
+        self._asks, self._bids = [], []
+        self._last = self._spread = None
+        self._stale = False
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        w, rh = self.width(), self.row_h
+        p.fillRect(self.rect(), QColor(13, 17, 23))
+
+        maxq = 1
+        for _, q in (self._asks + self._bids):
+            if q > maxq:
+                maxq = q
+
+        red, green = QColor(220, 90, 90), QColor(80, 200, 120)
+        y = 2
+        # Asks: reversed so the best (lowest) ask sits directly above the mid row.
+        for price, qty in reversed(self._asks):
+            self._row(p, y, w, rh, price, qty, maxq, red)
+            y += rh
+        # Mid row: spread (left) + last (right)
+        p.fillRect(0, y, w, rh, QColor(22, 27, 34))
+        p.setFont(self._font_b)
+        spr = f"spr {self._spread}¢" if self._spread is not None else "spr —"
+        p.setPen(QColor(150, 160, 170))
+        p.drawText(QRectF(6, y, w - 12, rh),
+                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), spr)
+        last = f"last {self._last}¢" if self._last is not None else "last —"
+        if self._stale:
+            last += " ·resync"
+        p.setPen(QColor(224, 176, 80))
+        p.drawText(QRectF(6, y, w - 12, rh),
+                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), last)
+        y += rh
+        # Bids: best (highest) first, directly below the mid row.
+        for price, qty in self._bids:
+            self._row(p, y, w, rh, price, qty, maxq, green)
+            y += rh
+        p.end()
+
+    def _row(self, p, y, w, rh, price, qty, maxq, color):
+        frac = min(1.0, qty / maxq) if maxq else 0.0
+        bar_w = int(frac * (w - 8))
+        bar = QColor(color); bar.setAlpha(50)
+        p.fillRect(w - 4 - bar_w, y + 1, bar_w, rh - 2, bar)
+        p.setFont(self._font)
+        p.setPen(color.lighter(125))
+        p.drawText(QRectF(6, y, 54, rh),
+                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), f"{price}¢")
+        p.setPen(QColor(200, 206, 214))
+        p.drawText(QRectF(w - 76, y, 70, rh),
+                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), f"{qty:,}")
+
+
 class HistoricalOddsWidget(QWidget):
     """Widget for displaying historical odds movement with point change handling"""
 
@@ -1849,6 +1939,39 @@ class HistoricalOddsWidget(QWidget):
         # Kalshi WebSocket for live odds updates
         self.kalshi_stream_client = None
         self.websocket_enabled = False  # Toggle for websocket vs polling
+
+        # --- Sub-second "Live" feed state (only active when Interval == "Live") ---
+        self.live_mode = False
+        # Maintains best bid/ask + last trade per market from trade/orderbook stream.
+        # on_gap -> resubscribe for a fresh snapshot when a seq number is skipped.
+        self.live_book = KalshiLiveBook(on_gap=self._on_live_book_gap)
+        # Coalesced repaint: buffer every tick, repaint on a fixed cadence so the
+        # GUI stays smooth during bursty markets without dropping data.
+        self._live_dirty = False
+
+        # Live overlay state / options (only meaningful while live_mode is True)
+        self.auto_follow = True
+        self.candle_mode = False
+        self.candle_bucket_s = 5        # 1 / 5 / 15 ; 0 == "Max" (one candle/tick)
+        self.show_spread_band = True
+        self.live_follow_window_s = 600  # rolling window (sec) for the line view
+        self.live_candle_visible_n = 60  # candles to keep in view when following
+        # (so candle width stays visually consistent across 1s/5s/15s buckets)
+        # Per-tick history for the live portion. Each entry:
+        #   {'t': epoch_sec, 'price': cents, 'bid': cents|None, 'ask': cents|None}
+        self.live_ticks = []
+        # Live corner-label running stats (american odds, float; tick-by-tick)
+        self._live_lbl_open = None
+        self._live_lbl_min = None
+        self._live_lbl_max = None
+        # Persistent overlay item handles (created lazily; None == not built yet)
+        self._li_line = None
+        self._li_band_lo = self._li_band_hi = self._li_band_fill = None
+        self._li_cbodies = self._li_cwicks = None
+        self.live_repaint_timer = QTimer()
+        self.live_repaint_timer.setInterval(250)  # ~4 fps repaint while live
+        self.live_repaint_timer.timeout.connect(self._flush_live_plot)
+
         self._initialize_kalshi_websocket()
 
         self.init_ui()
@@ -1896,6 +2019,9 @@ class HistoricalOddsWidget(QWidget):
         header_layout.addWidget(self.interval_label)
         self.kalshi_interval = QComboBox()  # Keep variable name for compatibility
         self.kalshi_interval.addItems([f"{M}m" for M in (1, 60, 1440)])
+        # "Live" = sub-second websocket feed (Kalshi trade + orderbook_delta).
+        # Any of the *m intervals keep the existing candlestick/polling path.
+        self.kalshi_interval.addItem("Live")
         self.kalshi_interval.setFixedWidth(60)
         self.kalshi_interval.currentIndexChanged.connect(self.on_time_range_changed)
         header_layout.addWidget(self.kalshi_interval)
@@ -1920,6 +2046,9 @@ class HistoricalOddsWidget(QWidget):
 
         # Main content area
         content_layout = QHBoxLayout()
+        # No gap/margins so the depth panel sits flush against the graph's right edge.
+        content_layout.setSpacing(0)
+        content_layout.setContentsMargins(0, 0, 0, 0)
 
         # Plot section
         self.plot_panel = QWidget()
@@ -1940,6 +2069,13 @@ class HistoricalOddsWidget(QWidget):
         # GridItem, which previously painted raw-unit ghost labels (e.g.
         # "1.7807e+09") over the plot.
         self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
+
+        # If the user pans/zooms by hand while Live "Follow" is on, drop out of
+        # follow so the view stops snapping back each tick (lets them inspect).
+        # sigRangeChangedManually fires only for user-driven changes, not our
+        # programmatic setXRange/auto-fit, so this won't self-trigger.
+        self.plot_widget.getViewBox().sigRangeChangedManually.connect(
+            self._on_user_range_change)
 
         # Team-logo watermarks: one per side (top band = positive-odds team,
         # bottom band = negative-odds team). Parented to the plot so they float
@@ -1971,17 +2107,141 @@ class HistoricalOddsWidget(QWidget):
         self.plot_layout.addWidget(self.plot_widget)
         content_layout.addWidget(self.plot_panel, 4)
 
-        # Bookmaker toggle section
+        # ============================================================
+        # Right-side expandable DEPTH / VIEW panel (Bloomberg-terminal-esque).
+        # Hosts: live controls, the bid/ask/spr/last readout, the live order-book
+        # ladder, and the (unchanged) per-bookmaker view toggles.
+        # ============================================================
+        self.right_panel = QWidget()
+        self.right_panel.setObjectName("depthPanel")
+        self.right_panel.setStyleSheet("""
+            #depthPanel { background:transparent; }
+            #depthBody { background:#0d1117; border-left:1px solid #222a35; }
+            #depthPanel QLabel { color:#cfd6df; }
+            #depthPanel QLabel#sect { color:#e0b050; font-family:monospace;
+                font-size:9px; letter-spacing:1px; }
+            #depthPanel QCheckBox { color:#cfd6df; font-family:monospace; font-size:11px; }
+            #depthPanel QComboBox { background:#161b22; color:#cfd6df; border:1px solid #2b333d;
+                font-family:monospace; font-size:11px; padding:1px 3px; }
+            #depthHandle { background:transparent; color:#5b6675; border:none;
+                font-size:13px; font-weight:bold; }
+            #depthHandle:hover { background:rgba(224,176,80,40); color:#e0b050; }
+        """)
+        self._panel_body_w = 238  # includes room for the vertical scrollbar
+        self._handle_w = 14
+        # Outer = [thin transparent handle][collapsible body], handle flush against
+        # the graph's right edge so toggling expands the body leftward over... no:
+        # the body sits to the RIGHT of the handle and pushes the graph left.
+        outer = QHBoxLayout(self.right_panel)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # Always-visible transparent toggle handle (vertical strip at graph edge)
+        self.panel_handle = QPushButton("⟨")
+        self.panel_handle.setObjectName("depthHandle")
+        self.panel_handle.setFixedWidth(self._handle_w)
+        self.panel_handle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.panel_handle.setToolTip("Show depth / view panel")
+        self.panel_handle.clicked.connect(self._toggle_right_panel)
+        outer.addWidget(self.panel_handle)
+
+        # Collapsible body (content lives inside a scroll area so expanding any
+        # section scrolls within the panel instead of growing the whole window).
+        self.panel_body = QWidget()
+        self.panel_body.setObjectName("depthBody")
+        pb = QVBoxLayout(self.panel_body)
+        pb.setContentsMargins(6, 4, 6, 6); pb.setSpacing(6)
+        # Header title
+        self.panel_title = QLabel("DEPTH / VIEW"); self.panel_title.setObjectName("sect")
+        pb.addWidget(self.panel_title)
+
+        # --- Live controls (Follow / Candles+bucket / Spread) ---
+        self.live_controls = QWidget()
+        lc = QVBoxLayout(self.live_controls)
+        lc.setContentsMargins(0, 0, 0, 0); lc.setSpacing(3)
+        row1 = QHBoxLayout(); row1.setSpacing(8)
+        self.follow_check = QCheckBox("Follow")
+        self.follow_check.setToolTip("Auto-scroll the time axis to keep the newest ticks in view")
+        self.follow_check.setChecked(True)
+        self.follow_check.stateChanged.connect(self._on_follow_toggled)
+        self.spread_check = QCheckBox("Spread")
+        self.spread_check.setToolTip("Shade the live bid/ask spread band")
+        self.spread_check.setChecked(True)
+        self.spread_check.stateChanged.connect(self._on_spread_toggled)
+        row1.addWidget(self.follow_check); row1.addWidget(self.spread_check); row1.addStretch(1)
+        lc.addLayout(row1)
+        row2 = QHBoxLayout(); row2.setSpacing(8)
+        self.candle_check = QCheckBox("Candles")
+        self.candle_check.setToolTip("Render the live feed as OHLC candlesticks")
+        self.candle_check.stateChanged.connect(self._on_candle_toggled)
+        self.candle_bucket = QComboBox()
+        self.candle_bucket.addItems(["1s", "5s", "15s", "Max"])
+        self.candle_bucket.setCurrentText("5s")
+        self.candle_bucket.setFixedWidth(64)
+        self.candle_bucket.setToolTip("Candle aggregation window (Max = one candle per tick)")
+        self.candle_bucket.currentIndexChanged.connect(self._on_candle_bucket_changed)
+        row2.addWidget(self.candle_check); row2.addWidget(self.candle_bucket); row2.addStretch(1)
+        lc.addLayout(row2)
+        pb.addWidget(self.live_controls)
+
+        # --- Order book section (live only) ---
+        self.ob_section = QWidget()
+        obl = QVBoxLayout(self.ob_section)
+        obl.setContentsMargins(0, 0, 0, 0); obl.setSpacing(2)
+        ob_title = QLabel("ORDER BOOK"); ob_title.setObjectName("sect")
+        obl.addWidget(ob_title)
+        # Best bid/ask/spr/last readout
+        self.ob_readout = QLabel("")
+        self.ob_readout.setTextFormat(Qt.TextFormat.RichText)
+        self.ob_readout.setToolTip("Live best bid / ask · spread · last trade")
+        self.ob_readout.setStyleSheet(
+            "color:#cfd6df; font-family:monospace; font-size:11px;"
+            " background:#11161d; border:1px solid #222a35;"
+            " border-radius:2px; padding:2px 5px;")
+        # Allow it to shrink to the panel width instead of forcing the body wider
+        # (which, with horizontal scroll off, caused right-edge clipping).
+        self.ob_readout.setMinimumWidth(0)
+        self.ob_readout.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        obl.addWidget(self.ob_readout)
+        # Depth ladder
+        self.ob_ladder = OrderbookLadderWidget(levels=8)
+        obl.addWidget(self.ob_ladder)
+        pb.addWidget(self.ob_section)
+
+        # --- ORDER ENTRY (live/kalshi only; collapsible) ---
+        self.order_entry_section = self._build_order_entry_section()
+        pb.addWidget(self.order_entry_section)
+
+        # --- Bookmaker view toggles (UNCHANGED logic; rehoused in a collapsible tab) ---
+        # No inner scroll — the outer panel scroll handles any overflow.
         self.bookmaker_panel = QWidget()
         self.bookmaker_layout = QVBoxLayout(self.bookmaker_panel)
         self.bookmaker_layout.setContentsMargins(0, 0, 0, 0)
         self.bookmaker_layout.setSpacing(2)
+        self.books_section = self._collapsible_section("BOOKS", self.bookmaker_panel, expanded=True)
+        pb.addWidget(self.books_section)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(self.bookmaker_panel)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFixedWidth(100)
-        content_layout.addWidget(scroll_area, 1)
+        pb.addStretch(1)
+
+        # Wrap the whole body in a scroll area so expanding a section scrolls
+        # within the (fixed-width) panel rather than enlarging the top-level window.
+        self.panel_scroll = QScrollArea()
+        self.panel_scroll.setWidget(self.panel_body)
+        self.panel_scroll.setWidgetResizable(True)
+        self.panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.panel_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.panel_scroll.setFixedWidth(self._panel_body_w)
+        self.panel_scroll.setMinimumHeight(0)
+        outer.addWidget(self.panel_scroll)
+        content_layout.addWidget(self.right_panel, 0)
+
+        # Live sections hidden until Live mode is entered
+        self.live_controls.setVisible(False)
+        self.ob_section.setVisible(False)
+        self.order_entry_section.setVisible(False)
+        # Start collapsed: just the thin transparent handle shows at the graph edge.
+        self._panel_collapsed = True
+        self.panel_scroll.setVisible(False)
+        self.panel_handle.setText("⟨")
 
         layout.addLayout(content_layout)
 
@@ -2013,6 +2273,9 @@ class HistoricalOddsWidget(QWidget):
             self.kalshi_stream_client.disconnected.connect(self._on_websocket_disconnected)
             self.kalshi_stream_client.error.connect(self._on_websocket_error)
             self.kalshi_stream_client.tick.connect(self._on_websocket_tick)
+            # Sub-second Live feed (additive; only used in "Live" interval mode)
+            self.kalshi_stream_client.trade.connect(self._on_ws_trade)
+            self.kalshi_stream_client.orderbook.connect(self._on_ws_orderbook)
 
             print("✅ Kalshi WebSocket client initialized (not started)")
         except Exception as e:
@@ -2181,8 +2444,15 @@ class HistoricalOddsWidget(QWidget):
             return
 
         try:
-            print(f"📡 Subscribing to live updates for {self.kalshi_market_ticker}")
-            self.kalshi_stream_client.subscribe_ticker([self.kalshi_market_ticker])
+            if self.live_mode:
+                print(f"📡 Subscribing to sub-second feed (trade + orderbook) for {self.kalshi_market_ticker}")
+                self.live_book.reset(self.kalshi_market_ticker)
+                self.live_ticks = []
+                self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+                self.kalshi_stream_client.subscribe_live([self.kalshi_market_ticker])
+            else:
+                print(f"📡 Subscribing to live updates for {self.kalshi_market_ticker}")
+                self.kalshi_stream_client.subscribe_ticker([self.kalshi_market_ticker])
         except Exception as e:
             print(f"Failed to subscribe to market: {e}")
 
@@ -2193,9 +2463,418 @@ class HistoricalOddsWidget(QWidget):
 
         try:
             print(f"📡 Unsubscribing from {self.kalshi_market_ticker}")
-            self.kalshi_stream_client.unsubscribe(["ticker"], [self.kalshi_market_ticker])
+            channels = ["trade", "orderbook_delta"] if self.live_mode else ["ticker"]
+            self.kalshi_stream_client.unsubscribe(channels, [self.kalshi_market_ticker])
+            # Also drop the orderbook sid explicitly so the old market's stream
+            # actually stops (channel-based unsubscribe leaves the sid running).
+            if self.live_mode:
+                old_sid = self.live_book.current_sid(self.kalshi_market_ticker)
+                if old_sid is not None:
+                    self.kalshi_stream_client.unsubscribe_sids([old_sid])
         except Exception as e:
             print(f"Failed to unsubscribe: {e}")
+
+    # ------------------------------------------------------------------
+    # Sub-second Live feed (trade + orderbook_delta) — additive to the
+    # existing `ticker` path used by _on_websocket_tick.
+    # ------------------------------------------------------------------
+    def _on_ws_trade(self, msg):
+        """Handle a Kalshi `trade` message (true per-execution tick)."""
+        if not self.live_mode:
+            return
+        try:
+            inner = msg.get('msg', {}) or {}
+            if inner.get('market_ticker') != self.kalshi_market_ticker:
+                return
+            self.live_book.apply(msg)
+            self._live_dirty = True
+        except Exception as e:
+            print(f"Error processing live trade: {e}")
+
+    def _on_ws_orderbook(self, msg):
+        """Handle a Kalshi `orderbook_snapshot`/`orderbook_delta` message."""
+        if not self.live_mode:
+            return
+        try:
+            inner = msg.get('msg', {}) or {}
+            if inner.get('market_ticker') != self.kalshi_market_ticker:
+                return
+            self.live_book.apply(msg)
+            self._live_dirty = True
+        except Exception as e:
+            print(f"Error processing live orderbook: {e}")
+
+    def _on_live_book_gap(self, ticker):
+        """Sequence gap on the orderbook stream -> resubscribe for a fresh snapshot.
+
+        Debounced: the book keeps applying deltas best-effort in the meantime, so
+        we only need an occasional resync rather than one per message."""
+        if not self.live_mode or ticker != self.kalshi_market_ticker:
+            return
+        import time
+        now = time.time()
+        last = getattr(self, '_last_gap_resub', 0)
+        if now - last < 5.0:
+            return
+        self._last_gap_resub = now
+        print(f"⚠️  Orderbook seq gap for {ticker} — resubscribing for fresh snapshot")
+        try:
+            # Drop the current sid by id (channel-based unsubscribe doesn't), then
+            # resubscribe; the fresh snapshot rebinds the book to the new sid and
+            # any straggler deltas from the old sid are ignored.
+            old_sid = self.live_book.current_sid(ticker)
+            if old_sid is not None:
+                self.kalshi_stream_client.unsubscribe_sids([old_sid])
+            self.kalshi_stream_client.subscribe(["orderbook_delta"], [ticker])
+        except Exception as e:
+            print(f"Failed to resubscribe after gap: {e}")
+
+    def _collapsible_section(self, title, content_widget, expanded=True):
+        """Wrap content in a section with a clickable ▾/▸ header that toggles it.
+        Reusable so more panel sections can be added concisely."""
+        section = QWidget()
+        v = QVBoxLayout(section)
+        v.setContentsMargins(0, 0, 0, 0); v.setSpacing(2)
+        header = QPushButton(("▾ " if expanded else "▸ ") + title)
+        header.setObjectName("sectHeader")
+        header.setStyleSheet(
+            "#sectHeader{background:transparent;border:none;color:#e0b050;"
+            "font-family:monospace;font-size:9px;letter-spacing:1px;text-align:left;padding:2px 0;}"
+            "#sectHeader:hover{color:#f0c060;}")
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        content_widget.setVisible(expanded)
+
+        def _toggle():
+            vis = not content_widget.isVisible()
+            content_widget.setVisible(vis)
+            header.setText(("▾ " if vis else "▸ ") + title)
+        header.clicked.connect(_toggle)
+        v.addWidget(header)
+        v.addWidget(content_widget)
+        return section
+
+    def _build_order_entry_section(self):
+        """Concise Kalshi order-entry + open-orders, wrapped in a collapsible
+        section. Real orders are placed only after an explicit confirmation."""
+        content = QWidget()
+        v = QVBoxLayout(content)
+        v.setContentsMargins(0, 0, 0, 0); v.setSpacing(3)
+        content.setStyleSheet(
+            "QSpinBox{background:#161b22;color:#cfd6df;border:1px solid #2b333d;"
+            "font-family:monospace;font-size:11px;padding:1px 2px;}"
+            "QPushButton#oePlace{background:#1c2530;color:#e0b050;border:1px solid #3a4452;"
+            "font-family:monospace;font-weight:bold;padding:3px;}"
+            "QPushButton#oePlace:hover{background:#27313e;}"
+            "QListWidget{background:#11161d;color:#cfd6df;border:1px solid #222a35;"
+            "font-family:monospace;font-size:10px;}")
+
+        # Side + type
+        row1 = QHBoxLayout(); row1.setSpacing(4)
+        self.oe_side = QComboBox()
+        self.oe_side.addItems(["Buy YES", "Buy NO", "Sell YES", "Sell NO"])
+        self.oe_side.currentIndexChanged.connect(self._prefill_order_price)
+        row1.addWidget(self.oe_side, 1)
+        v.addLayout(row1)
+
+        # Price + qty
+        row2 = QHBoxLayout(); row2.setSpacing(4)
+        pl = QLabel("¢"); pl.setStyleSheet("color:#8893a2;font-family:monospace;")
+        self.oe_price = QSpinBox(); self.oe_price.setRange(1, 99); self.oe_price.setValue(50)
+        self.oe_price.setToolTip("Limit price (cents)")
+        self.oe_qty = QSpinBox(); self.oe_qty.setRange(1, 1000000); self.oe_qty.setValue(1)
+        self.oe_qty.setToolTip("Contracts")
+        row2.addWidget(pl); row2.addWidget(self.oe_price, 1)
+        ql = QLabel("×"); ql.setStyleSheet("color:#8893a2;font-family:monospace;")
+        row2.addWidget(ql); row2.addWidget(self.oe_qty, 1)
+        v.addLayout(row2)
+
+        self.oe_place_btn = QPushButton("PLACE ORDER")
+        self.oe_place_btn.setObjectName("oePlace")
+        self.oe_place_btn.clicked.connect(self._on_place_order)
+        v.addWidget(self.oe_place_btn)
+
+        # Open orders
+        oo_row = QHBoxLayout(); oo_row.setSpacing(4)
+        oo_lbl = QLabel("OPEN"); oo_lbl.setObjectName("sect")
+        self.oe_refresh_btn = QPushButton("↻"); self.oe_refresh_btn.setFixedWidth(22)
+        self.oe_refresh_btn.setStyleSheet("background:transparent;border:none;color:#8893a2;")
+        self.oe_refresh_btn.clicked.connect(self._on_refresh_open_orders)
+        oo_row.addWidget(oo_lbl); oo_row.addStretch(1); oo_row.addWidget(self.oe_refresh_btn)
+        v.addLayout(oo_row)
+        self.open_orders_list = QListWidget()
+        self.open_orders_list.setFixedHeight(80)
+        self.open_orders_list.setToolTip("Resting orders — double-click to cancel")
+        self.open_orders_list.itemDoubleClicked.connect(self._on_cancel_order_item)
+        v.addWidget(self.open_orders_list)
+
+        return self._collapsible_section("ORDER ENTRY", content, expanded=True)
+
+    def _prefill_order_price(self):
+        """Seed the limit price from the live book for the chosen side."""
+        if not self.kalshi_market_ticker:
+            return
+        state = self.live_book.state(self.kalshi_market_ticker)
+        if not state:
+            return
+        text = self.oe_side.currentText()
+        # YES price for yes-side; for no-side, NO price = 100 - yes price.
+        yb, ya = state.get('best_bid'), state.get('best_ask')
+        px = None
+        if "YES" in text:
+            px = (yb if text.startswith("Buy") else ya)
+        else:  # NO side
+            if ya is not None and text.startswith("Buy"):
+                px = 100 - ya
+            elif yb is not None:
+                px = 100 - yb
+        if px is not None and 1 <= px <= 99:
+            self.oe_price.setValue(int(px))
+
+    @qasync.asyncSlot()
+    async def _on_place_order(self):
+        """Confirm + submit a Kalshi order off the GUI thread."""
+        ticker = self.kalshi_market_ticker
+        if not ticker:
+            QMessageBox.warning(self, "No market", "No Kalshi market selected.")
+            return
+        action, side = self.oe_side.currentText().lower().split(" ")  # buy/sell, yes/no
+        price = self.oe_price.value()
+        qty = self.oe_qty.value()
+        cost = price * qty  # cents of max exposure for a buy
+        confirm = QMessageBox.question(
+            self, "Confirm order",
+            f"{action.upper()} {qty} × {side.upper()} @ {price}¢\n"
+            f"Market: {ticker}\n"
+            f"Max cost ≈ ${cost/100:,.2f}\n\nPlace this REAL order?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.oe_place_btn.setEnabled(False)
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(
+                None, lambda: self.kalshi_client.kalshi_client.create_order(
+                    ticker=ticker, action=action, side=side, count=qty, price_cents=price))
+            print(f"✅ Order placed: {resp}")
+        except Exception as e:
+            QMessageBox.critical(self, "Order failed", f"{e}")
+            print(f"⚠️  Order failed: {e}")
+        finally:
+            self.oe_place_btn.setEnabled(True)
+        await self._refresh_open_orders()
+
+    @qasync.asyncSlot()
+    async def _on_refresh_open_orders(self):
+        await self._refresh_open_orders()
+
+    async def _refresh_open_orders(self):
+        ticker = self.kalshi_market_ticker
+        if not ticker:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(
+                None, lambda: self.kalshi_client.kalshi_client.get_orders(
+                    ticker=ticker, status="resting"))
+        except Exception as e:
+            print(f"⚠️  Open-orders fetch failed: {e}")
+            return
+        self.open_orders_list.clear()
+        for o in resp.get("orders", []):
+            side = o.get("side", "?")
+            action = o.get("action", "?")
+            cnt = o.get("remaining_count", o.get("count", "?"))
+            px = o.get("yes_price") if side == "yes" else o.get("no_price")
+            item = QListWidgetItem(f"{action[:1].upper()} {cnt}×{side.upper()} @ {px}¢")
+            item.setData(Qt.ItemDataRole.UserRole, o.get("order_id"))
+            self.open_orders_list.addItem(item)
+
+    @qasync.asyncSlot(QListWidgetItem)
+    async def _on_cancel_order_item(self, item):
+        order_id = item.data(Qt.ItemDataRole.UserRole)
+        if not order_id:
+            return
+        if QMessageBox.question(
+                self, "Cancel order", f"Cancel order {order_id[:8]}…?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: self.kalshi_client.kalshi_client.cancel_order(order_id))
+            print(f"🗑️  Cancelled {order_id}")
+        except Exception as e:
+            QMessageBox.critical(self, "Cancel failed", f"{e}")
+        await self._refresh_open_orders()
+
+    def _toggle_right_panel(self):
+        """Show/hide the DEPTH/VIEW body. Collapsed = just the thin transparent
+        handle at the graph's right edge; expanding pushes the graph left."""
+        self._panel_collapsed = not getattr(self, '_panel_collapsed', True)
+        if self._panel_collapsed:
+            self.panel_scroll.setVisible(False)
+            self.panel_handle.setText("⟨")
+            self.panel_handle.setToolTip("Show depth / view panel")
+        else:
+            self.panel_scroll.setVisible(True)
+            self.panel_handle.setText("⟩")
+            self.panel_handle.setToolTip("Hide depth / view panel")
+
+    # ---- Live control handlers ----
+    def _on_follow_toggled(self, state):
+        self.auto_follow = bool(state)
+        vb = self.plot_widget.getViewBox()
+        if self.auto_follow:
+            # Resume scrolling/auto-fit on the next tick.
+            if self.live_mode:
+                self._refresh_live_items()
+        else:
+            # Freeze the view exactly where it is for inspection.
+            vb.enableAutoRange(x=False, y=False)
+
+    def _on_user_range_change(self, *args):
+        """User panned/zoomed by hand -> stop following so it doesn't snap back."""
+        if self.live_mode and self.auto_follow:
+            # Uncheck the box (also sets auto_follow False via _on_follow_toggled).
+            self.follow_check.setChecked(False)
+
+    def _on_spread_toggled(self, state):
+        self.show_spread_band = bool(state)
+        if self.live_mode:
+            self._refresh_live_items()
+
+    def _on_candle_toggled(self, state):
+        self.candle_mode = bool(state)
+        self.candle_bucket.setEnabled(self.candle_mode)
+        if self.live_mode:
+            self._refresh_live_items()
+
+    def _on_candle_bucket_changed(self):
+        text = self.candle_bucket.currentText()
+        self.candle_bucket_s = 0 if text == "Max" else int(text.removesuffix('s'))
+        if self.live_mode and self.candle_mode:
+            self._refresh_live_items()
+
+    def _update_ob_readout(self, state):
+        """Refresh the discreet inline bid/ask/spread/last readout."""
+        def c(v):
+            return f"{v}¢" if v is not None else "—"
+        bid, ask, last = state.get('best_bid'), state.get('best_ask'), state.get('last_trade')
+        spread = (ask - bid) if (bid is not None and ask is not None) else None
+        stale = " <span style='color:#d08770'>·resync</span>" if state.get('stale') else ""
+        self.ob_readout.setText(
+            f"bid <span style='color:#8fbf7f'>{c(bid)}</span>  "
+            f"ask <span style='color:#cf6f6f'>{c(ask)}</span>  "
+            f"spr {c(spread)}  "
+            f"last <span style='color:#cfd6df'>{c(last)}</span>{stale}")
+
+    def _flush_live_plot(self):
+        """Coalesced per-tick repaint. Records one tick and mutates the persistent
+        Live overlay items in place (setData/setOpts) — never calls the heavy full
+        update_plot, so the GUI thread stays responsive during fast markets."""
+        if not self._live_dirty:
+            return
+        self._live_dirty = False
+
+        ticker = self.kalshi_market_ticker
+        if not ticker:
+            return
+        state = self.live_book.state(ticker)
+        if not state:
+            return
+
+        # Prefer last executed trade. Only fall back to the bid/ask MID when both
+        # sides are present — a one-sided book (only a bid or only an ask) would
+        # otherwise yield an extreme/garbage price.
+        price_cents = state.get('last_trade')
+        if price_cents is None:
+            if state.get('best_bid') is not None and state.get('best_ask') is not None:
+                price_cents = int(round(state['mid']))
+        if price_cents is None or not (0 < price_cents < 100):
+            return
+
+        # Local time to match the candlestick seed path's axis.
+        from datetime import datetime
+        now_t = datetime.now().timestamp()
+
+        # Record the live tick (price + book sides).
+        self.live_ticks.append({
+            't': now_t,
+            'price': price_cents,
+            'bid': state.get('best_bid'),
+            'ask': state.get('best_ask'),
+        })
+        # Cap memory: keep at most ~6h of 250ms ticks.
+        if len(self.live_ticks) > 90000:
+            self.live_ticks = self.live_ticks[-90000:]
+
+        self._update_ob_readout(state)
+        self._update_live_summary_label(state, now_t)
+        # Feed the depth ladder (cheap custom-painted widget).
+        lad = self.live_book.ladder(ticker, depth=self.ob_ladder._levels)
+        if lad:
+            self.ob_ladder.set_data(lad['asks'], lad['bids'],
+                                    lad.get('last_trade'), lad.get('stale', False))
+
+        # Ensure persistent items exist (first tick after entering live mode), then
+        # do the cheap in-place refresh.
+        if getattr(self, '_li_line', None) is None:
+            self._rebuild_live_items()
+        self._refresh_live_items()
+
+    @staticmethod
+    def _am_from_cents_float(cents):
+        """American odds as a FLOAT from a (possibly fractional) cent price, so the
+        live label can show sub-integer movement to one decimal place."""
+        if cents is None:
+            return None
+        p = cents / 100.0
+        if not (0.0 < p < 1.0):
+            return None
+        if p >= 0.5:
+            return -100.0 * p / (1.0 - p)
+        return 100.0 * (1.0 - p) / p
+
+    def _update_live_summary_label(self, state, now_t):
+        """Tick-by-tick update of the corner range label for the live band, with
+        the current price carried out to one decimal place."""
+        # Use the mid for smooth sub-integer movement; fall back to last trade.
+        mid = state.get('mid')
+        cents = mid if mid is not None else state.get('last_trade')
+        cur = self._am_from_cents_float(cents)
+        if cur is None:
+            return
+
+        if self._live_lbl_open is None:
+            self._live_lbl_open = cur
+            self._live_lbl_min = cur
+            self._live_lbl_max = cur
+        else:
+            self._live_lbl_min = min(self._live_lbl_min, cur)
+            self._live_lbl_max = max(self._live_lbl_max, cur)
+
+        open_v = self._live_lbl_open
+        delta = cur - open_v
+        rng = self._live_lbl_max - self._live_lbl_min
+        if delta > 0:
+            arrow, dcolor = '▲', (80, 200, 120)
+        elif delta < 0:
+            arrow, dcolor = '▼', (220, 90, 90)
+        else:
+            arrow, dcolor = '■', (170, 170, 170)
+        dhex = '#%02x%02x%02x' % dcolor
+        from datetime import datetime
+        updated = datetime.fromtimestamp(now_t).strftime('%H:%M:%S')
+        band_key = 'pos' if cur >= 0 else 'neg'
+        html = (
+            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:+.1f}&#8594;{cur:+.1f} "
+            f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span></div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>range {rng:.1f}</div>"
+            f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
+        )
+        self._set_summary_label(band_key, html)
 
     def enable_websocket_updates(self, enable: bool = True):
         """
@@ -2215,7 +2894,11 @@ class HistoricalOddsWidget(QWidget):
                     self._subscribe_to_current_market()
             # Stop polling timer
             self.refresh_timer.stop()
+            # Start coalesced repaint cadence while in sub-second Live mode
+            if self.live_mode and not self.live_repaint_timer.isActive():
+                self.live_repaint_timer.start()
         else:
+            self.live_repaint_timer.stop()
             if self.kalshi_stream_client:
                 print("🛑 Stopping Kalshi WebSocket...")
                 self.kalshi_stream_client.stop()
@@ -3783,7 +4466,10 @@ class HistoricalOddsWidget(QWidget):
         # Calculate time range
         end_time = datetime.now()
         start_time = self.calculate_start_time(end_time)
-        kalshi_interval_value = int(self.kalshi_interval.currentText().removesuffix('m'))
+        # "Live" is the sub-second websocket mode; for the seed historical pull
+        # treat it as the finest candlestick resolution (1m).
+        _interval_text = self.kalshi_interval.currentText()
+        kalshi_interval_value = 1 if _interval_text == "Live" else int(_interval_text.removesuffix('m'))
         # At 1-minute granularity the Kalshi candlestick endpoint caps results at
         # ~5000 candles. A wide range (e.g. 7d) silently truncates/errors the Kalshi
         # request while Polymarket still returns data, leaving the Kalshi line blank
@@ -3950,6 +4636,9 @@ class HistoricalOddsWidget(QWidget):
     async def load_data(self):
         """Load historical odds data and populate the graph - supports both Kalshi and Polymarket"""
 
+        # A new market load re-arms a single axis auto-fit (see update_plot).
+        self._axes_configured = False
+
         # Check if we have a unified market (new path with UnifiedMarket object)
         if hasattr(self, 'current_unified_market') and self.current_unified_market:
             return await self.load_unified_market_data()
@@ -3975,7 +4664,10 @@ class HistoricalOddsWidget(QWidget):
         # Calculate time range
         end_time = datetime.now()
         start_time = self.calculate_start_time(end_time)
-        kalshi_interval_value = int(self.kalshi_interval.currentText().removesuffix('m'))
+        # "Live" is the sub-second websocket mode; for the seed historical pull
+        # treat it as the finest candlestick resolution (1m).
+        _interval_text = self.kalshi_interval.currentText()
+        kalshi_interval_value = 1 if _interval_text == "Live" else int(_interval_text.removesuffix('m'))
         # if the interval is set to 1-minute, the start-time needs to be reduced to avoid the 5000-candlestick (API-side) limit
         if ((self.data_source == 'kalshi') and (kalshi_interval_value == 1)):
             start_time = max(start_time, (end_time - timedelta(days=2)))
@@ -4135,9 +4827,19 @@ class HistoricalOddsWidget(QWidget):
 
     @qasync.asyncSlot()
     async def on_time_range_changed(self):
-        """Handle time range dropdown changes"""
+        """Handle time range / interval dropdown changes"""
         range_text = self.time_range.currentText()
-        print(f"Time range changed to: {range_text}")
+        interval_text = self.kalshi_interval.currentText()
+        print(f"Time range changed to: {range_text} (interval: {interval_text})")
+
+        # --- Sub-second Live mode toggle (Interval == "Live") ---
+        want_live = (interval_text == "Live")
+        if want_live and not self.live_mode:
+            await self._enter_live_mode()
+            return
+        if not want_live and self.live_mode:
+            self._exit_live_mode()
+            # fall through to a normal reload below
 
         # Only update min_interval for TheOddsAPI client
         if self.data_source == 'theoddsapi' and hasattr(self.theoddsapi_client, 'min_interval'):
@@ -4151,6 +4853,67 @@ class HistoricalOddsWidget(QWidget):
         if self._load_task and not self._load_task.done():
             self._load_task.cancel()
         self._load_task = asyncio.create_task(self.load_data())
+
+    async def _enter_live_mode(self):
+        """Switch the widget into sub-second websocket Live mode (Kalshi only)."""
+        if self.kalshi_stream_client is None:
+            print("⚠️  Live mode unavailable: Kalshi WebSocket client failed to init")
+            self.kalshi_interval.setCurrentText("1m")
+            return
+        if not self.kalshi_market_ticker:
+            print("⚠️  Live mode needs a selected Kalshi market — reverting to 1m")
+            self.kalshi_interval.setCurrentText("1m")
+            return
+
+        print("🔴 Entering Live (sub-second) mode")
+        self.live_mode = True
+        self.live_ticks = []
+        self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+        self.candle_bucket.setEnabled(self.candle_mode)
+        self.live_controls.setVisible(True)
+        self.ob_section.setVisible(True)
+        self.order_entry_section.setVisible(True)
+        self.ob_ladder.clear()
+        self.open_orders_list.clear()
+        asyncio.create_task(self._refresh_open_orders())
+        # Auto-expand the panel so the live depth is visible on entry.
+        if getattr(self, '_panel_collapsed', False):
+            self._toggle_right_panel()
+        self.ws_status_label.setText("🟡")
+        self.ws_status_label.setToolTip("WebSocket: Live mode — connecting…")
+
+        # Seed the chart with recent history so it isn't empty (uses the existing
+        # candlestick path; the "Live" interval is treated as 1m for this pull).
+        if self._load_task and not self._load_task.done():
+            self._load_task.cancel()
+        await self.load_data()
+
+        # Hand off to the websocket: subscribes trade + orderbook_delta and
+        # starts the coalesced repaint cadence.
+        self.enable_websocket_updates(True)
+
+    def _exit_live_mode(self):
+        """Leave Live mode and return to the normal polling/candlestick path."""
+        print("⚪ Exiting Live mode")
+        self.live_mode = False
+        self._live_dirty = False
+        self.live_repaint_timer.stop()
+        self.live_controls.setVisible(False)
+        self.ob_section.setVisible(False)
+        self.order_entry_section.setVisible(False)
+        self.ob_readout.setText("")
+        self.ob_ladder.clear()
+        self.open_orders_list.clear()
+        self.live_ticks = []
+        self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+        # Drop persistent-item handles; the next normal load's clear() removes the
+        # items from the scene and a future live entry recreates them.
+        self._li_line = None
+        self._li_band_lo = self._li_band_hi = self._li_band_fill = None
+        self._li_cbodies = self._li_cwicks = None
+        self.enable_websocket_updates(False)
+        if self.kalshi_market_ticker:
+            self.live_book.reset(self.kalshi_market_ticker)
 
     async def update_plot(self, snapshots):
         """Enhanced plotting with point change visualization"""
@@ -4189,11 +4952,156 @@ class HistoricalOddsWidget(QWidget):
             for outcome_key, points_data in outcomes.items():
                 await self._plot_outcome_series(bookmaker, outcome_key, points_data, color)
 
-        await self.configure_plot_axes(snapshots)
+        # Auto-range the view only once per freshly loaded market, not on every
+        # refresh/tick — constantly re-fitting the axes made the chart "jump"
+        # (especially in Live mode). After the first frame the user owns the view
+        # (pan/zoom freely); a new market load re-arms a single auto-fit.
+        if not getattr(self, '_axes_configured', False):
+            await self.configure_plot_axes(snapshots)
+            self._axes_configured = True
 
         # Position team-logo watermarks for the two outcomes (moneyline only;
         # auto-hidden for Over/Under or spread markets where sides aren't teams).
         self._update_side_logos(plot_data)
+
+        # Live overlays use persistent items so the hot tick path never calls this
+        # heavy full redraw. clear() above removed them, so recreate them here on
+        # the (infrequent) full redraws — load / market change / candle toggle.
+        if getattr(self, 'live_mode', False):
+            self._rebuild_live_items()
+            self._refresh_live_items()
+
+    @staticmethod
+    def _cents_to_am(cents):
+        if cents is None or not (0 < cents < 100):
+            return None
+        return kalshi_cents_to_american_odds(cents)
+
+    def _rebuild_live_items(self):
+        """(Re)create the persistent Live overlay items and add them to the plot.
+
+        Called only on full redraws (after update_plot's clear()), not per tick.
+        Items are then mutated in place via setData/setOpts in _refresh_live_items."""
+        self._li_line = pg.PlotDataItem([], [], pen=pg.mkPen((255, 127, 14), width=2))
+        self._li_band_lo = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
+        self._li_band_hi = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
+        self._li_band_fill = pg.FillBetweenItem(
+            self._li_band_lo, self._li_band_hi, brush=pg.mkBrush(120, 140, 160, 45))
+        self._li_cwicks = pg.PlotDataItem([], [], connect='finite',
+                                          pen=pg.mkPen(170, 170, 170, 200))
+        self._li_cbodies = pg.BarGraphItem(x=[], width=[], y0=[], height=[])
+        # z-order: band (back) -> line -> candles (front)
+        for it in (self._li_band_lo, self._li_band_hi, self._li_band_fill,
+                   self._li_line, self._li_cwicks, self._li_cbodies):
+            self.plot_widget.addItem(it)
+
+    def _refresh_live_items(self):
+        """Cheap per-tick update: setData on the persistent overlay items only."""
+        if getattr(self, '_li_line', None) is None:
+            return
+        ticks = self.live_ticks
+        to_am = self._cents_to_am
+
+        # --- Line (live price extension; hidden when candles are shown) ---
+        lx, ly = [], []
+        for tk in ticks:
+            am = to_am(tk['price'])
+            if am is not None:
+                lx.append(tk['t']); ly.append(am)
+        self._li_line.setData(lx, ly)
+        self._li_line.setVisible(not self.candle_mode and len(lx) > 0)
+
+        # --- Spread band ---
+        show_band = self.show_spread_band
+        if show_band:
+            bx, b_lo, b_hi = [], [], []
+            for tk in ticks:
+                lo, hi = to_am(tk['bid']), to_am(tk['ask'])
+                if lo is None or hi is None:
+                    continue
+                bx.append(tk['t']); b_lo.append(lo); b_hi.append(hi)
+            self._li_band_lo.setData(bx, b_lo)
+            self._li_band_hi.setData(bx, b_hi)
+        for it in (self._li_band_lo, self._li_band_hi, self._li_band_fill):
+            it.setVisible(show_band)
+
+        # --- Candles ---
+        if self.candle_mode:
+            self._refresh_live_candles(ticks, to_am)
+        self._li_cbodies.setVisible(self.candle_mode)
+        self._li_cwicks.setVisible(self.candle_mode)
+
+        # --- Auto-follow: scroll X to newest ticks AND auto-fit Y to whatever is
+        # visible in that window (seed + live). setAutoVisible(y=True) makes the Y
+        # autorange consider only data inside the current X range, so the chart
+        # scrolls like a live tape. Disabled the instant the user pans by hand. ---
+        if self.auto_follow and ticks:
+            vb = self.plot_widget.getViewBox()
+            last_t = ticks[-1]['t']
+            if self.candle_mode:
+                # Keep a fixed number of candles in view so candle width reads
+                # consistently across 1s/5s/15s/Max buckets (standard charting).
+                eff = self.candle_bucket_s if self.candle_bucket_s > 0 else 0.25
+                window = max(self.live_candle_visible_n * eff, 20)
+                right_pad = eff * 2
+            else:
+                window = self.live_follow_window_s
+                right_pad = 5
+            vb.setXRange(last_t - window, last_t + right_pad, padding=0)
+            vb.setAutoVisible(y=True)
+            vb.enableAutoRange(axis='y', enable=True)
+
+    def _refresh_live_candles(self, ticks, to_am):
+        """Aggregate ticks into OHLC and push into the persistent candle items.
+
+        TODO(live-candles): this needs improvement. Candle sizing is currently a
+        heuristic — width tracks the bucket and the follow window is sized to a
+        fixed candle count (live_candle_visible_n) to keep widths visually
+        consistent across 1s/5s/15s/Max. Rough edges to revisit:
+          - candles are drawn in american-odds space, so bodies distort near 50%
+            (the +100/-100 discontinuity); a probability(¢) y-axis toggle would fix it
+          - min body height (doji) is a flat 0.5, not scaled to the visible y-range
+          - "Max" bucket assumes a ~0.25s tick cadence; real spacing varies, so
+            candles can overlap/gap in bursty/idle stretches
+          - width/visible-count are global constants, not user-tunable in the UI
+        """
+        bucket = self.candle_bucket_s
+        groups, order = {}, []
+        for tk in ticks:
+            am = to_am(tk['price'])
+            if am is None:
+                continue
+            key = tk['t'] if bucket <= 0 else int(tk['t'] // bucket) * bucket
+            if key not in groups:
+                groups[key] = []; order.append(key)
+            groups[key].append(am)
+        if not order:
+            self._li_cbodies.setOpts(x=[], width=[], y0=[], height=[])
+            self._li_cwicks.setData([], [])
+            return
+
+        # Width tracks the bucket (Max -> tick cadence ~0.25s), filling ~88% of the
+        # slot so neighbouring candles read as distinct but chunky.
+        eff_bucket = bucket if bucket > 0 else 0.25
+        width = eff_bucket * 0.88
+        centers, body_y0, body_h, brushes = [], [], [], []
+        wick_x, wick_y = [], []
+        up, down = (80, 200, 120), (220, 90, 90)
+        for key in order:
+            vals = groups[key]
+            o, c = vals[0], vals[-1]
+            hi, lo = max(vals), min(vals)
+            cx = key + (eff_bucket / 2.0 if bucket > 0 else 0)
+            centers.append(cx)
+            body_y0.append(min(o, c))
+            body_h.append(max(abs(c - o), 0.5))
+            brushes.append(pg.mkBrush(*(up if c >= o else down)))
+            wick_x += [cx, cx, float('nan')]
+            wick_y += [lo, hi, float('nan')]
+        self._li_cbodies.setOpts(x=centers, width=width, y0=body_y0,
+                                 height=body_h, brushes=brushes,
+                                 pen=pg.mkPen(0, 0, 0, 60))
+        self._li_cwicks.setData(wick_x, wick_y)
 
     def _latest_value_by_team(self, plot_data):
         """Collapse plot_data to {canonical_team: (display_name, latest_value)}.
