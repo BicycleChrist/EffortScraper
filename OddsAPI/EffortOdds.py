@@ -87,6 +87,23 @@ class ColoredTableItem(QTableWidgetItem):
 BET_LIMIT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
+# Books whose bet_limit is real order-book liquidity. Anything else returning
+# a limit (Pinnacle) is a posted/scraped max-stake figure of uncertain freshness.
+EXCHANGE_BOOK_TITLES = ("betfair", "matchbook", "smarkets", "kalshi",
+                        "polymarket", "novig", "prophet", "betopenly")
+
+
+def bet_limit_tooltip(bm_title: str, limit) -> str:
+    """Tooltip line(s) for a cell's bet limit, with provenance disclaimer."""
+    text = f"Bet limit: ${float(limit):,.0f}"
+    if any(x in bm_title.lower() for x in EXCHANGE_BOOK_TITLES):
+        text += "\nExchange — available liquidity at this price."
+    else:
+        text += ("\nNot an exchange — posted limit scraped from the public "
+                 "site; take with a grain of salt.")
+    return text
+
+
 def format_bet_limit(value) -> str:
     """Compact $ form for a bet limit: 750 -> $750, 2500 -> $2.5k, 40000 -> $40k."""
     try:
@@ -928,6 +945,27 @@ class ModernOddsWindow(QMainWindow):
         self.status_timer.timeout.connect(self._update_game_statuses)
         self.status_timer.start(600000) # 10 minutes - makes a request to fetch scores
 
+        # Keep the window from ever growing past the monitor. Child widgets whose
+        # content width changes (order-book panel, news feed when leagues change)
+        # otherwise push the window's preferred size up and Qt grows the (un-capped)
+        # top-level beyond the screen, forcing a manual resize. Cap to the current
+        # screen and re-cap when dragged to another monitor (see moveEvent).
+        self._cap_window_to_screen()
+
+    def _cap_window_to_screen(self):
+        """Clamp the window's maximum size to the available area of the screen it's
+        on, so content-driven size-hint growth can't push it past the monitor."""
+        scr = self.screen() or QApplication.primaryScreen()
+        if scr is None:
+            return
+        avail = scr.availableGeometry()
+        self.setMaximumSize(avail.width(), avail.height())
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        # Re-cap to whatever monitor the window now sits on.
+        self._cap_window_to_screen()
+
     # God speed AC
     def UpdateIcon(self):
         icon = self._icon_cache.get(self.icon_frame)
@@ -1032,6 +1070,20 @@ class ModernOddsWindow(QMainWindow):
             }
         """)
 
+        # Best Lines floating-overlay toggle (overlay lives on top of the odds table)
+        self.bestlines_toggle_button = QPushButton("Best Lines ▼")
+        self.bestlines_toggle_button.setCheckable(True)
+        self.bestlines_toggle_button.setChecked(False)
+        self.bestlines_toggle_button.clicked.connect(self.toggle_best_lines)
+        self.bestlines_toggle_button.setFixedWidth(110)
+        self.bestlines_toggle_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2C3E50; color: white; border: none;
+                padding: 4px; border-radius: 3px; font-size: 9pt;
+            }
+            QPushButton:checked { background-color: #34495E; }
+        """)
+
 
         # Create a dedicated container for the right side elements
         right_side_container = QWidget()
@@ -1045,6 +1097,7 @@ class ModernOddsWindow(QMainWindow):
         buttons_layout.addWidget(self.stream_toggle_button)
         buttons_layout.addWidget(self.news_toggle_button)
         buttons_layout.addWidget(self.history_toggle_button)  # Add historical odds toggle button
+        buttons_layout.addWidget(self.bestlines_toggle_button)  # Best Lines overlay toggle
         buttons_layout.setSpacing(4)  # Small spacing between buttons
 
 
@@ -1226,19 +1279,20 @@ class ModernOddsWindow(QMainWindow):
         # Set initial state for the news container
         self.news_container.setVisible(False)  # Hide container initially
 
-        # Create the best lines container
-        self.best_lines_container = QWidget()
-        best_lines_layout = QVBoxLayout(self.best_lines_container)
-        best_lines_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Create the best lines widget (CRT blotter; legacy BestLinesWidget
-        # remains in use by EffortOddsPropsWindow as a raw QTableWidget).
-        # Mode label, splits refresh, and the lines/splits toggle all live in
-        # the widget's own control bar — no external header row.
-        self.best_lines_widget = CRTBestLinesWidget()
+        # Best lines widget (CRT blotter; legacy BestLinesWidget remains in use by
+        # EffortOddsPropsWindow as a raw QTableWidget). Instead of a splitter child
+        # (which always claimed width and couldn't be toggled off), it's now a small
+        # FLOATING OVERLAY parented to the odds-table tab widget — toggled by the
+        # toolbar button, anchored bottom-left, scrollable internally, on top of the
+        # table. Mode label / splits refresh / lines-splits toggle live in its own
+        # control bar.
+        self.best_lines_widget = CRTBestLinesWidget(self.tab_widget)
         self.splits_refresh_button = self.best_lines_widget.refresh_button
         self.splits_refresh_button.clicked.connect(self.refresh_splits_data)
-        best_lines_layout.addWidget(self.best_lines_widget)
+        self._bestlines_overlay_size = (420, 260)   # (w, h) default of the floating panel
+        self.best_lines_widget.hide()
+        # Reposition the overlay when the odds table resizes.
+        self.tab_widget.installEventFilter(self)
 
         # Create the historical odds container
         self.historical_odds_container = QWidget()
@@ -1261,11 +1315,29 @@ class ModernOddsWindow(QMainWindow):
         # Add the news container to the left side of horizontal splitter
         self.horizontal_splitter.addWidget(self.news_container)
 
-        # Add the best lines container to the middle of horizontal splitter
-        self.horizontal_splitter.addWidget(self.best_lines_container)
-
         # Add the historical odds container to the right side of horizontal splitter
+        # (Best Lines is no longer a splitter child — it's a floating overlay.)
         self.horizontal_splitter.addWidget(self.historical_odds_container)
+
+        # Let the splitter freely squeeze these three children. Each has a large
+        # content-derived minimumSizeHint (the historical widget's non-wrapping
+        # header row, the best-lines table, the news feed). A QSplitter sums those
+        # minimums into its own minimum, which propagates to the window's minimum
+        # and beats the screen-size cap (Qt: minimum wins over maximum) — so
+        # opening the news widget alongside historical odds pushed the window past
+        # the monitor. Horizontal policy Ignored drops each child's enforced
+        # minimum to its explicit floor below, so the splitter (and window) stay
+        # bounded; the splitter still distributes space and the user can drag.
+        for _c in (self.news_container, self.historical_odds_container):
+            _sp = _c.sizePolicy()
+            _sp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            _c.setSizePolicy(_sp)
+            _c.setMinimumWidth(140)
+        self.horizontal_splitter.setChildrenCollapsible(True)
+        # Ignored policy drops size-hint-based distribution, so give explicit
+        # proportions (news : historical/order-book).
+        self.horizontal_splitter.setStretchFactor(0, 3)
+        self.horizontal_splitter.setStretchFactor(1, 5)
 
         # Create the compact liquidity widget (ProphetX order book browser)
         self.liquidity_widget = ProphetXBrowser(compact_mode=True)
@@ -1924,7 +1996,7 @@ class ModernOddsWindow(QMainWindow):
                 if link and current_value:
                     tips.append("Double-click to open betslip")
                 if limit:
-                    tips.append(f"Bet limit: ${float(limit):,.0f}")
+                    tips.append(bet_limit_tooltip(bm, limit))
                 item.setToolTip("\n".join(tips))
 
                 # Only update if value has changed
@@ -2602,7 +2674,7 @@ class ModernOddsWindow(QMainWindow):
                  if link and current_value:
                      tips.append("Double-click to open betslip")
                  if limit:
-                     tips.append(f"Bet limit: ${float(limit):,.0f}")
+                     tips.append(bet_limit_tooltip(bm, limit))
                  item.setToolTip("\n".join(tips))
 
                  # Check if this cell has changed
@@ -2786,7 +2858,49 @@ class ModernOddsWindow(QMainWindow):
         # Reposition the filter bar when its host header is resized.
         if event.type() == QEvent.Type.Resize and obj in self._wired_headers:
             self._reposition_search_bar()
+        # Keep the floating Best Lines overlay anchored when the odds table resizes.
+        if (obj is getattr(self, 'tab_widget', None)
+                and event.type() == QEvent.Type.Resize
+                and getattr(self, 'best_lines_widget', None) is not None
+                and self.best_lines_widget.isVisible()):
+            self._position_bestlines_overlay()
         return super().eventFilter(obj, event)
+
+    def _position_bestlines_overlay(self, initial=False):
+        """Place the floating Best Lines panel. initial=True sets the default
+        bottom-right spot/size; otherwise just clamp the user's current position
+        back into view (e.g. after the odds table resizes) so a dragged panel
+        isn't yanked back to the corner."""
+        w = getattr(self, 'best_lines_widget', None)
+        if w is None:
+            return
+        host = self.tab_widget
+        if initial:
+            pw, ph = self._bestlines_overlay_size
+            pw = min(pw, max(300, host.width() - 16))
+            ph = min(ph, max(150, host.height() - 16))
+            margin = 10
+            w.setGeometry(max(0, host.width() - pw - margin),
+                          max(0, host.height() - ph - margin), pw, ph)
+        else:
+            g = w.geometry()
+            nx = max(0, min(g.x(), max(0, host.width() - g.width())))
+            ny = max(0, min(g.y(), max(0, host.height() - g.height())))
+            if (nx, ny) != (g.x(), g.y()):
+                w.move(nx, ny)
+        w.raise_()
+
+    def toggle_best_lines(self):
+        """Show/hide the floating Best Lines overlay over the odds table."""
+        visible = self.bestlines_toggle_button.isChecked()
+        if visible:
+            self._position_bestlines_overlay(initial=True)
+            self.best_lines_widget.show()
+            self.best_lines_widget.raise_()
+            self.bestlines_toggle_button.setText("Best Lines ▲")
+        else:
+            self.best_lines_widget.hide()
+            self.bestlines_toggle_button.setText("Best Lines ▼")
 
     def handle_prediction_markets_error(self, error_message):
         """Handle errors from prediction markets worker"""
