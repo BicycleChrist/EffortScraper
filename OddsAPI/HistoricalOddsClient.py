@@ -5,11 +5,11 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea, QSizePolicy,
-    QSpinBox, QMessageBox, QListWidget, QListWidgetItem
+    QSpinBox, QMessageBox, QListWidget, QListWidgetItem, QFrame
 )
 from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics
 
@@ -33,6 +33,27 @@ pg.setConfigOptions(antialias=True)
 # Central team-logo asset root (shared repo dir), resolved relative to THIS
 # file so it works regardless of the host app's working directory.
 LOGO_DIR = Path(__file__).resolve().parent.parent / "TeamLogos"
+
+# Sportsbook/exchange brand logos (kalshi.png, polymarket.png, ...) used in the
+# crosshair hover readout in place of plain colored dots.
+SPORTSBOOK_LOGO_DIR = Path(__file__).resolve().parent / "sportsbooklogos"
+
+# Series line colors keyed by bookmaker. Kalshi=green, Polymarket=blue (matches
+# their brand colors). Paid-OddsAPI books fall back to the palette by index.
+BOOKMAKER_LINE_COLORS = {
+    'kalshi': (44, 160, 44),       # green
+    'polymarket': (31, 119, 180),  # blue
+}
+FALLBACK_LINE_COLORS = [
+    (255, 127, 14), (214, 39, 40), (148, 103, 189),
+    (140, 86, 75), (23, 190, 207), (188, 189, 34),
+]
+
+# Filenames under SPORTSBOOK_LOGO_DIR by bookmaker key (for the hover readout).
+BOOKMAKER_LOGO_FILE = {
+    'kalshi': 'kalshi_alt.png',  # compact "K" mark; renders cleaner at small sizes
+    'polymarket': 'polymarket.png',
+}
 
 # Canonical team name (as produced by EventMatcher.normalize_team_name) ->
 # logo filename under LOGO_DIR/<LEAGUE>/. Verified against the on-disk assets;
@@ -1261,6 +1282,40 @@ def american_odds_to_kalshi_cents(american_odds):
     # Convert to cents
     return int(round(prob * 100))
 
+
+def american_to_implied_pct(american_odds):
+    """Convert American odds to implied probability percentage (0-100, float).
+
+    The chart's primary y-axis is implied chance; American odds are shown only
+    in parentheses on labels/readouts. Returns None for unusable input.
+    """
+    if american_odds is None:
+        return None
+    try:
+        am = float(american_odds)
+    except (TypeError, ValueError):
+        return None
+    if am == 0:
+        return None
+    if am < 0:
+        return (-am) / (-am + 100.0) * 100.0
+    return 100.0 / (am + 100.0) * 100.0
+
+
+def format_pct_with_american(american_odds, pct=None):
+    """Label text: 'NN% (+150)'. Derives pct from odds when not supplied."""
+    if pct is None:
+        pct = american_to_implied_pct(american_odds)
+    if pct is None:
+        return ""
+    try:
+        am = int(round(float(american_odds)))
+        am_str = f"+{am}" if am > 0 else f"{am}"
+        return f"{pct:.0f}% ({am_str})"
+    except (TypeError, ValueError):
+        return f"{pct:.0f}%"
+
+
 class HistoricalOddsClient:
     """Client for fetching historical odds data from theOddsAPI"""
 
@@ -1891,6 +1946,21 @@ class OrderbookLadderWidget(QWidget):
 class HistoricalOddsWidget(QWidget):
     """Widget for displaying historical odds movement with point change handling"""
 
+    # Loading progress (0-100). Routed to the host's bottom status banner instead
+    # of an in-widget progress bar so the plot can extend to the widget's edge.
+    loading_progress = pyqtSignal(int)
+
+    # Combined Time+Interval presets: label -> (time_range_text, interval_text).
+    # Drives the hidden backing time_range / kalshi_interval combos. Index 0 is
+    # the default and matches their default state (1h window, 1m candles).
+    TIMEFRAME_PRESETS = [
+        ("1m · 1h",  ("1h",  "1m")),
+        ("1m · 6h",  ("6h",  "1m")),
+        ("1h · 24h", ("24h", "60m")),
+        ("1d · 7d",  ("7d",  "1440m")),
+        ("Live",     ("1h",  "Live")),
+    ]
+
     def __init__(self, api_key, interval_minutes:int, parent=None, kalshi_api_key=None):
         super().__init__(parent)
         self.sport_key = None
@@ -1979,70 +2049,88 @@ class HistoricalOddsWidget(QWidget):
     def init_ui(self):
         """Initialize the UI components"""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        # Margins zeroed top & bottom: the controls now float over the plot (no
+        # header rows) and the progress bar is gone, so the plot runs flush from
+        # the top of the widget to the host banner.
+        layout.setContentsMargins(5, 0, 5, 0)
 
-        # Header with controls
-        header_layout = QHBoxLayout()
-        self.title_label = QLabel("Historical Odds")
-        self.title_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #7bd419")
-        header_layout.addWidget(self.title_label)
-        header_layout.addStretch(1)
+        # Controls live in a translucent strip that FLOATS over the plot's top
+        # edge (parented to the plot below, after it exists) instead of consuming
+        # two header rows — so the chart takes the full widget height. A small
+        # always-visible toggle hides the strip for a fully clean chart.
+        self.control_overlay = QFrame()
+        self.control_overlay.setObjectName("controlOverlay")
+        self.control_overlay.setStyleSheet(
+            "QFrame#controlOverlay { background: rgba(13,17,23,222);"
+            " border: 1px solid #2a3340; border-radius: 4px; }"
+            " QFrame#controlOverlay QLabel { color:#7e8794; font-size:11px; }"
+            " QFrame#controlOverlay QComboBox,"
+            " QFrame#controlOverlay QPushButton { font-size:11px; }")
+        header_layout = QHBoxLayout(self.control_overlay)
+        header_layout.setContentsMargins(6, 2, 4, 2)
+        header_layout.setSpacing(5)
 
+        # Contextual market info. Only shown in TheOddsAPI (table-driven) mode,
+        # where the event/market pickers are hidden and this is the sole context;
+        # in prediction-market mode the Event dropdown already shows the matchup,
+        # so it's hidden to keep the strip as compact as possible. NO stretch —
+        # the strip hugs its content instead of spanning the graph width.
+        self.market_info = QLabel("")
+        self.market_info.setStyleSheet("color:#7e8794; font-style: italic; font-size:11px;")
+        self.market_info.hide()
+        header_layout.addWidget(self.market_info)
+
+        # No verbose "Event:/Market:/Time:/Interval:" text labels — the dropdowns
+        # are self-describing; tooltips carry the meaning and keep the strip tight.
         # Event selector - shows unified events from both sources
-        self.event_label = QLabel("Event:")
         self.event_selector = QComboBox()
-        self.event_selector.setMinimumWidth(200)
+        self.event_selector.setMinimumWidth(160)
+        self.event_selector.setToolTip("Event")
         self.event_selector.currentIndexChanged.connect(self.on_event_changed)
-        header_layout.addWidget(self.event_label)
         header_layout.addWidget(self.event_selector)
 
         # Market selector for Kalshi (populated dynamically)
-        self.market_label = QLabel("Market:")
         self.market_selector = QComboBox()
-        self.market_selector.setMinimumWidth(150)
+        self.market_selector.setMinimumWidth(120)
+        self.market_selector.setToolTip("Market")
         self.market_selector.currentIndexChanged.connect(self.on_market_changed)
-        header_layout.addWidget(self.market_label)
         header_layout.addWidget(self.market_selector)
 
-        # Time range selector (for TheOddsAPI only)
-        self.time_label = QLabel("Time:")
-        header_layout.addWidget(self.time_label)
-
-        self.time_range = QComboBox()
+        # Time range + Interval are combined into ONE compact "timeframe" preset
+        # dropdown (granularity·window). The two original combos are kept as hidden
+        # BACKING state (parented but never shown / never in the layout) so every
+        # existing reader — calculate_start_time, load_data, the Live detection,
+        # TheOddsAPI min_interval — keeps working unchanged; the preset handler
+        # keeps them in sync. This preserves full capability for the paid path.
+        self.time_range = QComboBox(self.control_overlay)
         self.time_range.addItems(["1h", "3h", "6h", "12h", "24h", "7d"])
-        self.time_range.setFixedWidth(60)
-        self.time_range.currentIndexChanged.connect(self.on_time_range_changed)
-        header_layout.addWidget(self.time_range)
-
-        # Interval selector (controls both Kalshi candlestick period and Polymarket fidelity)
-        self.interval_label = QLabel("Interval:")
-        header_layout.addWidget(self.interval_label)
-        self.kalshi_interval = QComboBox()  # Keep variable name for compatibility
+        self.time_range.hide()
+        self.kalshi_interval = QComboBox(self.control_overlay)  # name kept for compat
         self.kalshi_interval.addItems([f"{M}m" for M in (1, 60, 1440)])
-        # "Live" = sub-second websocket feed (Kalshi trade + orderbook_delta).
-        # Any of the *m intervals keep the existing candlestick/polling path.
         self.kalshi_interval.addItem("Live")
-        self.kalshi_interval.setFixedWidth(60)
-        self.kalshi_interval.currentIndexChanged.connect(self.on_time_range_changed)
-        header_layout.addWidget(self.kalshi_interval)
+        self.kalshi_interval.hide()
+
+        # Visible combined control. userData = (range_text, interval_text); the
+        # handler writes those into the hidden backing combos, then reloads.
+        self.timeframe_combo = QComboBox()
+        self.timeframe_combo.setToolTip("Window · candle granularity (Live = sub-second feed)")
+        self.timeframe_combo.setFixedWidth(82)
+        for label, (rng, itv) in self.TIMEFRAME_PRESETS:
+            self.timeframe_combo.addItem(label, userData=(rng, itv))
+        self.timeframe_combo.currentIndexChanged.connect(self._on_timeframe_changed)
+        header_layout.addWidget(self.timeframe_combo)
 
         self.refresh_button = QPushButton("↻")
-        self.refresh_button.setFixedWidth(30)
+        self.refresh_button.setFixedWidth(26)
+        self.refresh_button.setToolTip("Refresh")
         self.refresh_button.clicked.connect(self.on_refresh_clicked)
         header_layout.addWidget(self.refresh_button)
 
         # WebSocket status indicator
         self.ws_status_label = QLabel("⚪")
         self.ws_status_label.setToolTip("WebSocket: Not connected")
-        self.ws_status_label.setFixedWidth(20)
+        self.ws_status_label.setFixedWidth(18)
         header_layout.addWidget(self.ws_status_label)
-
-        layout.addLayout(header_layout)
-
-        # Market info label
-        self.market_info = QLabel("Select a market to view historical odds")
-        self.market_info.setStyleSheet("color: #6c757d; font-style: italic;")
-        layout.addWidget(self.market_info)
 
         # Main content area
         content_layout = QHBoxLayout()
@@ -2062,7 +2150,7 @@ class HistoricalOddsWidget(QWidget):
             background="#29313D",
             axisItems={'bottom': date_axis}
         )
-        self.plot_widget.setLabel('left', 'Odds')
+        self.plot_widget.setLabel('left', 'Implied %')
         self.plot_widget.setLabel('bottom', 'Time')
         #self.plot_widget.addLegend()
         # showGrid draws gridlines aligned to the real axis ticks instead of a
@@ -2103,6 +2191,38 @@ class HistoricalOddsWidget(QWidget):
                 "background: rgba(18,22,28,210); border:1px solid #39414b;"
                 " border-radius:3px; padding:3px 5px;")
             lbl.hide()
+
+        # --- Crosshair scrubber + hover readout ---------------------------------
+        # Mouse-tracking crosshair lines (added to the scene lazily in
+        # _ensure_crosshair so they survive plot_widget.clear()) plus a floating
+        # readout that reports each registered series' value at the cursor's time.
+        self._cross_v = None
+        self._cross_h = None
+        self._hover_series = []   # list of dicts: name/color/ts/pct/am
+        self.hover_label = QLabel(self.plot_widget)
+        self.hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hover_label.setTextFormat(Qt.TextFormat.RichText)
+        self.hover_label.setStyleSheet(
+            "background: rgba(13,17,23,235); border:1px solid #39414b;"
+            " border-radius:3px; padding:4px 7px; color:#dcdcdc;")
+        self.hover_label.hide()
+        self.plot_widget.scene().sigMouseMoved.connect(self._on_plot_hover)
+
+        # Reparent the control strip onto the plot so it floats over the top edge,
+        # and add the always-visible show/hide toggle. Positioned in
+        # _position_overlays; visibility tracked by _controls_visible.
+        self.control_overlay.setParent(self.plot_widget)
+        self.control_overlay.show()
+        self._controls_visible = True
+        self.controls_toggle_btn = QPushButton("▴", self.plot_widget)
+        self.controls_toggle_btn.setFixedSize(20, 18)
+        self.controls_toggle_btn.setToolTip("Hide controls")
+        self.controls_toggle_btn.setStyleSheet(
+            "QPushButton { background: rgba(13,17,23,222); color:#7e8794;"
+            " border:1px solid #2a3340; border-radius:3px; font-size:10px; }"
+            " QPushButton:hover { color:#dcdcdc; }")
+        self.controls_toggle_btn.clicked.connect(self._toggle_controls)
+        self.controls_toggle_btn.show()
 
         self.plot_layout.addWidget(self.plot_widget)
         content_layout.addWidget(self.plot_panel, 4)
@@ -2174,7 +2294,7 @@ class HistoricalOddsWidget(QWidget):
         self.candle_check.setToolTip("Render the live feed as OHLC candlesticks")
         self.candle_check.stateChanged.connect(self._on_candle_toggled)
         self.candle_bucket = QComboBox()
-        self.candle_bucket.addItems(["1s", "5s", "15s", "Max"])
+        self.candle_bucket.addItems(["1s", "5s", "15s", "30s", "1m", "5m", "Max"])
         self.candle_bucket.setCurrentText("5s")
         self.candle_bucket.setFixedWidth(64)
         self.candle_bucket.setToolTip("Candle aggregation window (Max = one candle per tick)")
@@ -2245,11 +2365,14 @@ class HistoricalOddsWidget(QWidget):
 
         layout.addLayout(content_layout)
 
-        # Progress bar
+        # Loading indicator: kept as an (unparented, never-shown) QProgressBar so
+        # all the existing self.progress_bar.setValue(...) calls still work, but
+        # NOT added to the layout — the plot now extends to the widget's bottom
+        # edge. Its value is relayed via loading_progress to the host's status
+        # banner (EffortOdds bottom strip with Last Update / API QUOTA).
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(5)
         self.progress_bar.setTextVisible(False)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.valueChanged.connect(self.loading_progress.emit)
 
         # Initial state
         self.set_enabled(False)
@@ -2752,10 +2875,19 @@ class HistoricalOddsWidget(QWidget):
             self._refresh_live_items()
 
     def _on_candle_bucket_changed(self):
-        text = self.candle_bucket.currentText()
-        self.candle_bucket_s = 0 if text == "Max" else int(text.removesuffix('s'))
+        self.candle_bucket_s = self._parse_bucket_seconds(self.candle_bucket.currentText())
         if self.live_mode and self.candle_mode:
             self._refresh_live_items()
+
+    @staticmethod
+    def _parse_bucket_seconds(text):
+        """Candle bucket label -> seconds. 'Max' == 0 (one candle/tick); supports
+        both 's' (seconds) and 'm' (minutes) suffixes."""
+        if text == "Max":
+            return 0
+        if text.endswith('m'):
+            return int(text[:-1]) * 60
+        return int(text.removesuffix('s'))
 
     def _update_ob_readout(self, state):
         """Refresh the discreet inline bid/ask/spread/last readout."""
@@ -2838,14 +2970,15 @@ class HistoricalOddsWidget(QWidget):
         return 100.0 * (1.0 - p) / p
 
     def _update_live_summary_label(self, state, now_t):
-        """Tick-by-tick update of the corner range label for the live band, with
-        the current price carried out to one decimal place."""
+        """Tick-by-tick update of the corner range label for the live band. Shows
+        implied chance (%) to one decimal with the American odds in parens."""
         # Use the mid for smooth sub-integer movement; fall back to last trade.
         mid = state.get('mid')
         cents = mid if mid is not None else state.get('last_trade')
-        cur = self._am_from_cents_float(cents)
-        if cur is None:
+        if cents is None or not (0.0 < cents < 100.0):
             return
+        cur = float(cents)  # cents == implied chance %
+        am = self._am_from_cents_float(cents)
 
         if self._live_lbl_open is None:
             self._live_lbl_open = cur
@@ -2867,11 +3000,15 @@ class HistoricalOddsWidget(QWidget):
         dhex = '#%02x%02x%02x' % dcolor
         from datetime import datetime
         updated = datetime.fromtimestamp(now_t).strftime('%H:%M:%S')
-        band_key = 'pos' if cur >= 0 else 'neg'
+        band_key = 'pos' if cur >= 50.0 else 'neg'
+        am_str = ""
+        if am is not None:
+            am_i = int(round(am))
+            am_str = f" <span style='color:#7e8794'>({'+' if am_i > 0 else ''}{am_i})</span>"
         html = (
-            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:+.1f}&#8594;{cur:+.1f} "
+            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:.1f}%&#8594;{cur:.1f}%{am_str} "
             f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span></div>"
-            f"<div style='font-size:9pt;color:#c8c8c8'>range {rng:.1f}</div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>range {rng:.1f}%</div>"
             f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
         )
         self._set_summary_label(band_key, html)
@@ -2908,8 +3045,7 @@ class HistoricalOddsWidget(QWidget):
 
     def set_enabled(self, enabled):
         """Enable or disable the widget controls"""
-        self.time_range.setEnabled(enabled)
-        self.kalshi_interval.setEnabled(enabled)
+        self.timeframe_combo.setEnabled(enabled)
         self.refresh_button.setEnabled(enabled)
         self.plot_widget.setEnabled(enabled)
         self.event_selector.setEnabled(enabled)
@@ -4246,13 +4382,14 @@ class HistoricalOddsWidget(QWidget):
         self.home_team = home_team
         self.away_team = away_team
 
-        # Show/hide appropriate controls
+        # Show/hide appropriate controls. TheOddsAPI is table-driven, so the
+        # event/market pickers are hidden (the market is fixed by the table click)
+        # and the time-range picker is shown. market_info carries the context.
         self.event_selector.setVisible(False)
-        self.event_label.setVisible(False)
         self.market_selector.setVisible(False)
-        self.market_label.setVisible(False)
-        self.time_range.setVisible(True)
-        self.time_label.setVisible(True)
+        # (time_range is a hidden backing combo now; the visible timeframe combo
+        # stays visible. Don't setVisible(True) on the backing combo or it would
+        # pop up as a stray floating widget.)
 
         # Update UI
         if home_team and away_team:
@@ -4811,7 +4948,10 @@ class HistoricalOddsWidget(QWidget):
     @qasync.asyncSlot(int)
     async def toggle_all_bookmakers(self, state):
         """Toggle all bookmaker checkboxes to the given state"""
-        checked = state == Qt.CheckState.Checked
+        # @asyncSlot(int) delivers `state` as a plain int (0/2); comparing it to
+        # the Qt.CheckState enum is always False in PyQt6, so use bool() like the
+        # other toggle handlers.
+        checked = bool(state)
         # Skip the first checkbox (which is "All") and last item (which is stretch)
         for i in range(1, self.bookmaker_layout.count() - 1):
             item = self.bookmaker_layout.itemAt(i)
@@ -4821,11 +4961,36 @@ class HistoricalOddsWidget(QWidget):
     async def on_bookmaker_toggled(self, bookmaker, state):
         """Handle bookmaker toggle checkbox changes"""
         print(f"Toggling bookmaker: {bookmaker} to {state}")
-        self.bookmaker_visible[bookmaker] = (state == Qt.CheckState.Checked)
+        # bool(state): @asyncSlot(int) gives an int; `== Qt.CheckState.Checked`
+        # is always False in PyQt6, which is why a rechecked book never returned.
+        self.bookmaker_visible[bookmaker] = bool(state)
         # Refresh the plot with current visibility settings
         await self.update_plot(self.current_snapshots)
 
     @qasync.asyncSlot()
+    async def _on_timeframe_changed(self):
+        """Combined timeframe preset picked: push (window, granularity) into the
+        hidden backing combos, then run the normal reload path. asyncSlot makes
+        this schedulable from the Qt signal; on_time_range_changed is a plain
+        coroutine, so we await it directly."""
+        data = self.timeframe_combo.currentData()
+        if not data:
+            return
+        rng, itv = data
+        # Backing combos are disconnected, so these don't recurse.
+        self.time_range.setCurrentText(rng)
+        self.kalshi_interval.setCurrentText(itv)
+        await self.on_time_range_changed()
+
+    def _set_timeframe_silent(self, label):
+        """Set the visible timeframe combo without triggering a reload (used when
+        the Live attempt reverts to a candle interval)."""
+        self.timeframe_combo.blockSignals(True)
+        i = self.timeframe_combo.findText(label)
+        if i >= 0:
+            self.timeframe_combo.setCurrentIndex(i)
+        self.timeframe_combo.blockSignals(False)
+
     async def on_time_range_changed(self):
         """Handle time range / interval dropdown changes"""
         range_text = self.time_range.currentText()
@@ -4859,10 +5024,12 @@ class HistoricalOddsWidget(QWidget):
         if self.kalshi_stream_client is None:
             print("⚠️  Live mode unavailable: Kalshi WebSocket client failed to init")
             self.kalshi_interval.setCurrentText("1m")
+            self._set_timeframe_silent("1m · 1h")
             return
         if not self.kalshi_market_ticker:
             print("⚠️  Live mode needs a selected Kalshi market — reverting to 1m")
             self.kalshi_interval.setCurrentText("1m")
+            self._set_timeframe_silent("1m · 1h")
             return
 
         print("🔴 Entering Live (sub-second) mode")
@@ -4924,6 +5091,9 @@ class HistoricalOddsWidget(QWidget):
         # annotations so the kalshi and polymarket series of the same band
         # don't double them up (reset each redraw; clear() wiped the old items).
         self._annotated_bands = set()
+        # Hover registry is rebuilt each redraw (clear() wiped the plotted series).
+        self._hover_series = []
+        self._hide_hover()
         # Corner summary overlays are widget-space (clear() doesn't touch them),
         # so hide them up front; bands that are still present re-show their own.
         self._hide_summaries()
@@ -4931,11 +5101,6 @@ class HistoricalOddsWidget(QWidget):
             self._hide_side_logos()
             await self._show_no_data_message()
             return
-
-        colors = [
-            (31, 119, 180), (255, 127, 14), (44, 160, 44),
-            (214, 39, 40), (148, 103, 189), (140, 86, 75)
-        ]
 
         # Some Legend options for graph display
         #self.plot_widget.addLegend(offset=(10, 10), labelTextSize='8pt')
@@ -4948,7 +5113,7 @@ class HistoricalOddsWidget(QWidget):
             if not self.bookmaker_visible.get(bookmaker, True):
                 continue
 
-            color = colors[bm_idx % len(colors)]
+            color = self._color_for_bookmaker(bookmaker, bm_idx)
             for outcome_key, points_data in outcomes.items():
                 await self._plot_outcome_series(bookmaker, outcome_key, points_data, color)
 
@@ -4971,18 +5136,48 @@ class HistoricalOddsWidget(QWidget):
             self._rebuild_live_items()
             self._refresh_live_items()
 
+        # Crosshair lines are scene items, so clear() removed them — re-add.
+        self._ensure_crosshair()
+
+    @staticmethod
+    def _color_for_bookmaker(bookmaker, idx):
+        """Series color by bookmaker key: kalshi=green, polymarket=blue, other
+        paid-OddsAPI books fall back to the palette by plot order."""
+        c = BOOKMAKER_LINE_COLORS.get((bookmaker or '').lower())
+        if c is not None:
+            return c
+        return FALLBACK_LINE_COLORS[idx % len(FALLBACK_LINE_COLORS)]
+
+    @staticmethod
+    def _bookmaker_logo_path(bookmaker):
+        """Absolute path to a bookmaker's brand logo, or None if we don't have one."""
+        fn = BOOKMAKER_LOGO_FILE.get((bookmaker or '').lower())
+        if not fn:
+            return None
+        p = SPORTSBOOK_LOGO_DIR / fn
+        return str(p) if p.exists() else None
+
     @staticmethod
     def _cents_to_am(cents):
         if cents is None or not (0 < cents < 100):
             return None
         return kalshi_cents_to_american_odds(cents)
 
+    @staticmethod
+    def _cents_to_pct(cents):
+        """Kalshi price in cents IS the implied chance in %, so this is a guarded
+        passthrough. Live overlays plot in implied % to match the seed series."""
+        if cents is None or not (0 < cents < 100):
+            return None
+        return float(cents)
+
     def _rebuild_live_items(self):
         """(Re)create the persistent Live overlay items and add them to the plot.
 
         Called only on full redraws (after update_plot's clear()), not per tick.
         Items are then mutated in place via setData/setOpts in _refresh_live_items."""
-        self._li_line = pg.PlotDataItem([], [], pen=pg.mkPen((255, 127, 14), width=2))
+        # Live feed is always Kalshi -> green, matching the seed-series color map.
+        self._li_line = pg.PlotDataItem([], [], pen=pg.mkPen((44, 160, 44), width=2))
         self._li_band_lo = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
         self._li_band_hi = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
         self._li_band_fill = pg.FillBetweenItem(
@@ -5000,23 +5195,23 @@ class HistoricalOddsWidget(QWidget):
         if getattr(self, '_li_line', None) is None:
             return
         ticks = self.live_ticks
-        to_am = self._cents_to_am
+        to_pct = self._cents_to_pct
 
-        # --- Line (live price extension; hidden when candles are shown) ---
+        # --- Line (live price extension in implied %; hidden when candles shown) ---
         lx, ly = [], []
         for tk in ticks:
-            am = to_am(tk['price'])
-            if am is not None:
-                lx.append(tk['t']); ly.append(am)
+            pct = to_pct(tk['price'])
+            if pct is not None:
+                lx.append(tk['t']); ly.append(pct)
         self._li_line.setData(lx, ly)
         self._li_line.setVisible(not self.candle_mode and len(lx) > 0)
 
-        # --- Spread band ---
+        # --- Spread band (bid/ask in implied %) ---
         show_band = self.show_spread_band
         if show_band:
             bx, b_lo, b_hi = [], [], []
             for tk in ticks:
-                lo, hi = to_am(tk['bid']), to_am(tk['ask'])
+                lo, hi = to_pct(tk['bid']), to_pct(tk['ask'])
                 if lo is None or hi is None:
                     continue
                 bx.append(tk['t']); b_lo.append(lo); b_hi.append(hi)
@@ -5027,7 +5222,7 @@ class HistoricalOddsWidget(QWidget):
 
         # --- Candles ---
         if self.candle_mode:
-            self._refresh_live_candles(ticks, to_am)
+            self._refresh_live_candles(ticks, to_pct)
         self._li_cbodies.setVisible(self.candle_mode)
         self._li_cwicks.setVisible(self.candle_mode)
 
@@ -5051,16 +5246,14 @@ class HistoricalOddsWidget(QWidget):
             vb.setAutoVisible(y=True)
             vb.enableAutoRange(axis='y', enable=True)
 
-    def _refresh_live_candles(self, ticks, to_am):
-        """Aggregate ticks into OHLC and push into the persistent candle items.
+    def _refresh_live_candles(self, ticks, to_pct):
+        """Aggregate ticks into OHLC (implied %) and push into the candle items.
 
-        TODO(live-candles): this needs improvement. Candle sizing is currently a
-        heuristic — width tracks the bucket and the follow window is sized to a
-        fixed candle count (live_candle_visible_n) to keep widths visually
-        consistent across 1s/5s/15s/Max. Rough edges to revisit:
-          - candles are drawn in american-odds space, so bodies distort near 50%
-            (the +100/-100 discontinuity); a probability(¢) y-axis toggle would fix it
-          - min body height (doji) is a flat 0.5, not scaled to the visible y-range
+        Candles are now drawn in implied-% space, which is linear, so bodies no
+        longer distort near 50% the way they did on the american-odds axis.
+
+        TODO(live-candles): remaining heuristics to revisit:
+          - min body height (doji) is a flat 0.5%, not scaled to the visible y-range
           - "Max" bucket assumes a ~0.25s tick cadence; real spacing varies, so
             candles can overlap/gap in bursty/idle stretches
           - width/visible-count are global constants, not user-tunable in the UI
@@ -5068,13 +5261,13 @@ class HistoricalOddsWidget(QWidget):
         bucket = self.candle_bucket_s
         groups, order = {}, []
         for tk in ticks:
-            am = to_am(tk['price'])
-            if am is None:
+            pct = to_pct(tk['price'])
+            if pct is None:
                 continue
             key = tk['t'] if bucket <= 0 else int(tk['t'] // bucket) * bucket
             if key not in groups:
                 groups[key] = []; order.append(key)
-            groups[key].append(am)
+            groups[key].append(pct)
         if not order:
             self._li_cbodies.setOpts(x=[], width=[], y0=[], height=[])
             self._li_cwicks.setData([], [])
@@ -5168,17 +5361,46 @@ class HistoricalOddsWidget(QWidget):
         label.resize(pixmap.size())
         label.show()
 
-    def _position_overlays(self):
-        """Pin logos to the corners and dock each summary just left of its logo.
+    def _toggle_controls(self):
+        """Show/hide the floating control strip for a fully clean chart."""
+        self._controls_visible = not getattr(self, '_controls_visible', True)
+        self.control_overlay.setVisible(self._controls_visible)
+        self.controls_toggle_btn.setText("▴" if self._controls_visible else "▾")
+        self.controls_toggle_btn.setToolTip(
+            "Hide controls" if self._controls_visible else "Show controls")
+        self._position_overlays()
 
-        Both are widget-space, so they stay clear of the graph lines regardless
-        of the data. Summaries fall back to the corner when a logo is hidden.
+    def _position_overlays(self):
+        """Pin the floating control strip + toggle, the corner logos, and dock
+        each summary just left of its logo. All widget-space, so they stay clear
+        of the graph lines. The top logo/summary drop below the strip when it's
+        shown so nothing stacks on the controls.
         """
         margin, gap = 10, 8
         w = self.plot_widget.width()
         h = self.plot_widget.height()
 
-        # Logos flush to the right edge; remember their left edge for the summary.
+        # --- Floating control strip + its toggle (top-LEFT, HUGGING its content
+        # so it never spans the graph width). The toggle sits just right of the
+        # strip when shown, or alone at the top-left when the strip is hidden. ---
+        btn = getattr(self, 'controls_toggle_btn', None)
+        ov = getattr(self, 'control_overlay', None)
+        if ov is not None and getattr(self, '_controls_visible', False):
+            # market_info only in TheOddsAPI mode (event picker hidden); in
+            # prediction mode the Event dropdown already shows the matchup.
+            if getattr(self, 'market_info', None) is not None:
+                self.market_info.setVisible(not self.event_selector.isVisibleTo(ov))
+            ov.adjustSize()           # shrink to fit current (mode-dependent) content
+            ov.move(6, 6)
+            ov.raise_()
+            if btn is not None:
+                btn.move(6 + ov.width() + 3, 6 + max(0, (ov.height() - btn.height()) // 2))
+                btn.raise_()
+        elif btn is not None:
+            btn.move(6, 6)
+            btn.raise_()
+
+        # Logos/summaries live top-right (strip is top-left, so no collision).
         logo_top_left = w - margin
         if self.logo_label_top.isVisible() and self.logo_label_top.pixmap():
             pm = self.logo_label_top.pixmap()
@@ -5210,7 +5432,14 @@ class HistoricalOddsWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Keep watermarks + summaries pinned when the widget (and plot) resizes.
+        # Keep the control strip, watermarks + summaries pinned when the widget
+        # (and plot) resizes.
+        self._position_overlays()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # First reveal (the widget starts hidden) may not emit a resize, so pin
+        # the floating overlays now that real geometry exists.
         self._position_overlays()
 
     async def _organize_plot_data(self, snapshots):
@@ -5308,53 +5537,45 @@ class HistoricalOddsWidget(QWidget):
 
             american_values = np.array(american_values)
 
+            # Primary y-axis is implied chance (%). American odds are carried
+            # alongside (same index) only for parenthetical label text.
+            implied_values = np.array(
+                [american_to_implied_pct(v) if v is not None else np.nan
+                 for v in american_values], dtype=float)
+
             name = f"{bookmaker} - {outcome_key[0]}"
             if outcome_key[1]:
                 name += f" ({outcome_key[1]})"
 
-            # Plot using the American odds values directly
+            # Plot the implied-% line; american odds never touch the axis.
             line = self.plot_widget.plot(
                 timestamps,
-                american_values,
+                implied_values,
                 pen=pg.mkPen(color=color, width=2),
                 name=name,
                 symbol='o',
                 symbolSize=6,
-                symbolBrush=color
+                symbolBrush=color,
+                connect='finite',
             )
 
-            # Add labels only when odds change from previous value
-            prev_american_value = None
-            for i, ts in enumerate(timestamps):
-                if i < len(american_values):
-                    current_value = american_values[i]
-                    american = american_prices[i]
+            # Register this series for the crosshair hover readout (value at the
+            # cursor's time). Skipped for the dashed points-only path below.
+            self._hover_series.append({
+                'name': outcome_key[0],
+                'bookmaker': bookmaker,
+                'color': color,
+                'ts': np.asarray(timestamps, dtype=float),
+                'pct': np.asarray(implied_values, dtype=float),
+                'am': np.asarray(american_values, dtype=float),
+            })
 
-                    # Only show label if value changed from previous point
-                    if prev_american_value is None or current_value != prev_american_value:
-                        # Format label based on whether we have point data
-                        if ('points' in points_data and
-                            points_data['points'] and
-                            i < len(points_data['points']) and
-                            points_data['points'][i] is not None):
-                            pt = points_data['points'][i]
-                            label_text = f"{self._decimal_to_american(float(american))} ({pt:.1f})"
-                        else:
-                            label_text = f"{american}"
-
-                        # Use black color for Kalshi labels, bookmaker color for others
-                        label_color = (0, 0, 0) if bookmaker == 'kalshi' else color
-                        label = pg.TextItem(label_text, anchor=(0.5, 1.5), color=label_color)
-                        self.plot_widget.addItem(label)
-                        label.setPos(ts, current_value)
-
-                    prev_american_value = current_value
-
-            # Additive overlays: peak/trough markers (noise-gated) and a
-            # net-since-open badge. Drawn once per outcome band, independent of
-            # the change-label swarm above.
+            # Labels are deliberately sparse now: the per-change swarm is gone.
+            # _draw_series_annotations places peak / trough / last labels only
+            # (in implied %, with American odds in parens), plus the corner badge.
             self._draw_series_annotations(
-                timestamps, american_values, color, outcome_key[0])
+                timestamps, implied_values, american_values, color,
+                outcome_key[0], bookmaker)
 
         # If we only have points data (no prices), plot those instead
         elif 'points' in points_data and points_data['points'] and len(points_data['points']) > 0:
@@ -5373,40 +5594,45 @@ class HistoricalOddsWidget(QWidget):
                 symbolBrush=color
             )
 
-    # Minimum swing (in American-odds points) before peak/trough markers are
-    # drawn. Below this a band is treated as flat and gets no markers, which
+    # Minimum swing (in implied-% points) before peak/trough markers + labels
+    # are drawn. Below this a band is treated as flat and gets no markers, which
     # suppresses minute-level jitter and dead-quiet markets.
-    PEAK_TROUGH_MIN_SWING = 6.0
+    PEAK_TROUGH_MIN_SWING = 3.0
 
-    def _draw_series_annotations(self, timestamps, american_values, color, outcome_name):
-        """Draw noise-gated peak/trough markers + a net-move summary badge.
+    def _draw_series_annotations(self, timestamps, implied_values, american_values,
+                                 color, outcome_name, bookmaker='kalshi'):
+        """Draw peak/trough marker triangles, a color-coded last-value tag at the
+        series end, and a fixed corner net-move summary badge — per BAND.
 
-        Additive only — at most one ScatterPlotItem (the two triangles) and one
-        summary TextItem per outcome band. Deduped per BAND so the kalshi and
-        polymarket series of the same side don't double up. Safe to no-op on
-        short/degenerate series; on flat bands it shows the badge but no markers.
+        No on-chart text except the end tag (fill = series color, 'NN% (+am)').
+        Deduped per band so kalshi/poly series of the same side don't double up.
+        Safe to no-op on short/degenerate series.
         """
         try:
             ts = np.asarray(timestamps, dtype=float)
-            vals = np.asarray(american_values, dtype=float)
+            vals = np.asarray(implied_values, dtype=float)
+            am = np.asarray(american_values, dtype=float)
         except (ValueError, TypeError):
             return
+        # Drop NaNs (unusable conversions) keeping ts/vals/am aligned.
+        finite = np.isfinite(ts) & np.isfinite(vals)
+        ts, vals, am = ts[finite], vals[finite], am[finite]
         n = vals.size
-        if n < 2 or ts.size != n:
+        if n < 2:
             return
 
-        # Dedup by BAND, not raw outcome name: kalshi/poly label the same side
-        # differently ("St. Louis" vs "St. Louis Cardinals"), so keying on the
-        # name annotated both. The two visible bands are the positive- and
-        # negative-odds clusters, so the sign is a stable per-band key.
-        band_key = 'pos' if float(vals[-1]) >= 0 else 'neg'
+        # Dedup by BAND: in implied-% space the favorite sits HIGH (>=50%) and
+        # the underdog LOW (<50%), so the side relative to 50% is the stable
+        # per-band key. 'pos' -> top corner overlay, 'neg' -> bottom.
+        cur_v = float(vals[-1])
+        band_key = 'pos' if cur_v >= 50.0 else 'neg'
         bands = getattr(self, '_annotated_bands', set())
         if band_key in bands:
             return
         bands.add(band_key)
 
         # --- Net move since open (density-agnostic: first vs last) ---
-        open_v, cur_v = float(vals[0]), float(vals[-1])
+        open_v = float(vals[0])
         delta = cur_v - open_v
         if delta > 0:
             arrow, dcolor = '▲', (80, 200, 120)
@@ -5431,8 +5657,8 @@ class HistoricalOddsWidget(QWidget):
         swing = peak_v - trough_v
 
         if swing >= self.PEAK_TROUGH_MIN_SWING:
-            # Triangles mark WHERE the extremes are (on the line, by design); the
-            # numbers live in the fixed corner overlay, never over the lines.
+            # Triangles mark WHERE the extremes are; labels sit just off the line
+            # (peak above, trough below) so they don't overlap the curve.
             markers = pg.ScatterPlotItem(
                 x=[float(ts[hi_i]), float(ts[lo_i])],
                 y=[peak_v, trough_v],
@@ -5443,14 +5669,29 @@ class HistoricalOddsWidget(QWidget):
             )
             self.plot_widget.addItem(markers)
 
-        # Summary -> fixed corner overlay (top-right for +odds band, bottom-right
-        # for -odds band). Widget-space, so it can't collide with the graph.
+        # Color-coded last-value tag pinned at the series end — the pro-chart
+        # standard, replacing the old plain-black on-chart text labels. Fill =
+        # series color; text auto-contrasts (dark on light fills, white on dark).
+        tag_txt = format_pct_with_american(am[-1] if am.size else None, cur_v)
+        if tag_txt:
+            r, g, b = int(color[0]), int(color[1]), int(color[2])
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            fg = (15, 17, 20) if luminance > 140 else (245, 245, 245)
+            tag = pg.TextItem(tag_txt, anchor=(-0.12, 0.5), color=fg,
+                              fill=pg.mkBrush(r, g, b, 235),
+                              border=pg.mkPen(r, g, b))
+            tag.setZValue(150)
+            self.plot_widget.addItem(tag)
+            tag.setPos(float(ts[-1]), cur_v)
+
+        # Summary -> fixed corner overlay (top-right for the high-% band,
+        # bottom-right for the low-% band). Widget-space, can't collide with graph.
         updated = datetime.fromtimestamp(float(ts[-1])).strftime('%H:%M:%S')
         dhex = '#%02x%02x%02x' % dcolor
         summary_html = (
-            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:+.0f}&#8594;{cur_v:+.0f} "
+            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:.0f}%&#8594;{cur_v:.0f}% "
             f"<span style='color:{dhex}'>{arrow}{abs(delta):.0f}</span></div>"
-            f"<div style='font-size:9pt;color:#c8c8c8'>range {swing:.0f}</div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>range {swing:.0f}%</div>"
             f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
         )
         self._set_summary_label(band_key, summary_html)
@@ -5461,6 +5702,151 @@ class HistoricalOddsWidget(QWidget):
         label.adjustSize()
         label.show()
         self._position_overlays()
+
+    # ---- Crosshair scrubber + hover readout --------------------------------
+    def _ensure_crosshair(self):
+        """Create the crosshair lines if needed and (re)add them to the scene.
+
+        Called at the end of update_plot, after clear() removed the old ones.
+        ignoreBounds keeps the infinite lines out of autorange calculations."""
+        if self._cross_v is None:
+            pen = pg.mkPen((150, 160, 175, 130), width=1, style=Qt.PenStyle.DashLine)
+            self._cross_v = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+            self._cross_h = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+            self._cross_v.setZValue(200)
+            self._cross_h.setZValue(200)
+        self._cross_v.hide()
+        self._cross_h.hide()
+        self.plot_widget.addItem(self._cross_v, ignoreBounds=True)
+        self.plot_widget.addItem(self._cross_h, ignoreBounds=True)
+
+    def _hide_hover(self):
+        if getattr(self, 'hover_label', None) is not None:
+            self.hover_label.hide()
+        if getattr(self, '_cross_v', None) is not None:
+            self._cross_v.hide()
+            self._cross_h.hide()
+
+    def _on_plot_hover(self, pos):
+        """Mouse-move handler: position the crosshair and report each series'
+        implied % + American odds at the cursor's time (plus the live tape /
+        candle OHLC when in Live mode) in a floating tag."""
+        if self._cross_v is None:
+            return
+        vb = self.plot_widget.getViewBox()
+        if vb is None or not vb.sceneBoundingRect().contains(pos):
+            self._hide_hover()
+            return
+        mp = vb.mapSceneToView(pos)
+        x = float(mp.x())
+
+        rows = []
+        for s in self._hover_series:
+            ts = s['ts']
+            if ts.size == 0:
+                continue
+            # Skip series whose time span doesn't cover the cursor (+~1 sample of
+            # slack). Without this, the live region (past the seed's last point)
+            # would show a stale clamped value instead of deferring to the live row.
+            pad = float(np.median(np.diff(ts))) if ts.size >= 2 else 0.0
+            if x < ts[0] - pad or x > ts[-1] + pad:
+                continue
+            i = int(np.searchsorted(ts, x))
+            if i >= ts.size:
+                i = ts.size - 1
+            elif i > 0 and abs(ts[i - 1] - x) <= abs(ts[i] - x):
+                i -= 1
+            pct = s['pct'][i]
+            if not np.isfinite(pct):
+                continue
+            am = s['am'][i]
+            c = s['color']
+            txt = format_pct_with_american(am if np.isfinite(am) else None, pct)
+            # Bookmaker brand logo in place of the old colored dot; fall back to
+            # a colored dot for books without a logo asset (paid-OddsAPI books).
+            logo = self._bookmaker_logo_path(s.get('bookmaker'))
+            if logo:
+                marker = (f"<img src='{logo}' width='15' height='15' "
+                          f"style='vertical-align:middle'>")
+            else:
+                chex = '#%02x%02x%02x' % (int(c[0]), int(c[1]), int(c[2]))
+                marker = f"<span style='color:{chex}'>&#9679;</span>"
+            rows.append(
+                f"<div style='font-size:9pt'>{marker} "
+                f"<span style='color:#aeb6c0'>{s['name']}</span>&nbsp;&nbsp;"
+                f"<span style='color:#f0f0f0'>{txt}</span></div>")
+
+        # Live tape / candle OHLC (only over the live span; defers to seed elsewhere).
+        if getattr(self, 'live_mode', False):
+            rows.extend(self._live_hover_rows(x))
+
+        if not rows:
+            self._hide_hover()
+            return
+
+        from datetime import datetime
+        tstr = datetime.fromtimestamp(x).strftime('%m/%d %H:%M:%S')
+        self.hover_label.setText(
+            f"<div style='font-size:8pt;color:#7e8794'>{tstr}</div>" + ''.join(rows))
+        self.hover_label.adjustSize()
+
+        self._cross_v.setPos(x)
+        self._cross_h.setPos(float(mp.y()))
+        self._cross_v.show()
+        self._cross_h.show()
+
+        # Position the tag next to the cursor (widget pixels), clamped to the plot.
+        vp = self.plot_widget.mapFromScene(pos)
+        w, h = self.hover_label.width(), self.hover_label.height()
+        pw, ph = self.plot_widget.width(), self.plot_widget.height()
+        lx, ly = vp.x() + 14, vp.y() + 12
+        if lx + w > pw - 4:
+            lx = vp.x() - w - 14
+        lx = max(4, min(lx, pw - w - 4))
+        ly = max(4, min(ly, ph - h - 4))
+        self.hover_label.move(int(lx), int(ly))
+        self.hover_label.show()
+        self.hover_label.raise_()
+
+    def _live_hover_rows(self, x):
+        """Hover readout row(s) for the live tape at cursor time x. In candle mode
+        it reports the hovered candle's O/H/L/C (implied %); otherwise the nearest
+        tick's price. Returns [] when the cursor isn't over the live span."""
+        lt = self.live_ticks
+        if not lt:
+            return []
+        t0, t1 = lt[0]['t'], lt[-1]['t']
+        pad = max(2.0, float(self.candle_bucket_s or 1))
+        if not (t0 - pad <= x <= t1 + pad):
+            return []
+        logo = self._bookmaker_logo_path('kalshi')
+        marker = (f"<img src='{logo}' width='15' height='15' style='vertical-align:middle'>"
+                  if logo else "<span style='color:#2ca02c'>&#9679;</span>")
+
+        if self.candle_mode:
+            bucket = self.candle_bucket_s
+            if bucket > 0:
+                key = int(x // bucket) * bucket
+                vals = [tk['price'] for tk in lt if key <= tk['t'] < key + bucket]
+            else:  # "Max" bucket == one candle per tick
+                vals = [min(lt, key=lambda tk: abs(tk['t'] - x))['price']]
+            if not vals:
+                return []
+            o, c = vals[0], vals[-1]
+            hi, lo = max(vals), min(vals)
+            ccol = '#50c878' if c >= o else '#dc5a5a'
+            ohlc = (f"<span style='color:#8a93a0'>O</span> {o}% &nbsp;"
+                    f"<span style='color:#8a93a0'>H</span> {hi}% &nbsp;"
+                    f"<span style='color:#8a93a0'>L</span> {lo}% &nbsp;"
+                    f"<span style='color:{ccol}'>C {c}%</span>")
+            body = ohlc
+        else:
+            tk = min(lt, key=lambda t: abs(t['t'] - x))
+            pct = tk['price']
+            body = (f"<span style='color:#f0f0f0'>"
+                    f"{format_pct_with_american(self._cents_to_am(pct), float(pct))}</span>")
+        return [f"<div style='font-size:9pt'>{marker} "
+                f"<span style='color:#aeb6c0'>Live</span>&nbsp;&nbsp;{body}</div>"]
 
     async def configure_plot_axes(self, snapshots):
         """Configure plot axes optimized for American odds display"""
@@ -5521,94 +5907,39 @@ class HistoricalOddsWidget(QWidget):
                             except (ValueError, TypeError):
                                 pass  # Skip invalid values
 
-        # Set Y-axis range for American odds with proper padding
-        # American odds must never be in the range (-100, +100) as this is invalid
-        if all_american_prices:
-            min_price = min(all_american_prices)
-            max_price = max(all_american_prices)
-
-            # Apply padding carefully to avoid crossing into invalid range
-            if min_price >= 100:
-                # All underdogs (positive odds)
-                min_val = max(100, min_price * 0.95)
-                max_val = max_price * 1.05
-            elif max_price <= -100:
-                # All favorites (negative odds)
-                min_val = min_price * 1.05  # Make more negative
-                max_val = min(-100, max_price * 0.95)  # Less negative but not above -100
-            else:
-                # Mixed: both favorites and underdogs
-                # Handle each side separately
-                min_val = min_price * 1.05  # Make more negative
-                max_val = max_price * 1.05  # Make more positive
-
-                # Ensure we don't cross into invalid range
-                if min_val > -100:
-                    min_val = -100
-                if max_val < 100:
-                    max_val = 100
-
-            # Ensure we don't have identical min/max which would break the axis
-            if abs(min_val - max_val) < 10:
-                if min_val >= 100:
-                    min_val = 100
-                    max_val = min_val + 50
-                elif max_val <= -100:
-                    max_val = -100
-                    min_val = max_val - 50
-                else:
-                    min_val = -200
-                    max_val = 200
+        # Y-axis is implied chance (%). Convert the collected american prices to
+        # implied % and fit a padded window, clamped to the natural [0, 100] box —
+        # no more ±9900 rail spikes blowing out the scale.
+        implied = [p for p in (american_to_implied_pct(a) for a in all_american_prices)
+                   if p is not None]
+        if implied:
+            lo, hi = min(implied), max(implied)
+            pad = max((hi - lo) * 0.10, 3.0)  # at least 3 pts of breathing room
+            min_val = max(0.0, lo - pad)
+            max_val = min(100.0, hi + pad)
+            if max_val - min_val < 5.0:  # degenerate (flat market) -> widen
+                mid = (min_val + max_val) / 2.0
+                min_val = max(0.0, mid - 5.0)
+                max_val = min(100.0, mid + 5.0)
 
             self.plot_widget.setYRange(min_val, max_val)
 
-            # Set up Y-axis label and ticks
+            # Y-axis label + ticks: implied % primary, american odds in parens.
             y_axis = self.plot_widget.getAxis('left')
-            y_axis.setLabel('American Odds')
+            y_axis.setLabel('Implied %')
 
-            # Create appropriate Y-axis ticks for American odds
-            # Must avoid the invalid range between -100 and +100
+            num_ticks = 6
+            step = (max_val - min_val) / num_ticks
             y_ticks = []
-
-            # Determine if we're crossing the ±100 boundary
-            crosses_boundary = min_val < -100 and max_val > 100
-
-            if crosses_boundary:
-                # We have both favorites and underdogs - create ticks on both sides
-                # Ticks for favorites (negative side)
-                neg_range = abs(min_val) - 100
-                neg_step = neg_range / 3  # 3 ticks on negative side
-                for i in range(4):
-                    tick_val = min_val + (i * neg_step)
-                    if tick_val <= -100:
-                        y_ticks.append((tick_val, f"{int(tick_val)}"))
-
-                # Add boundary ticks at ±100
-                y_ticks.append((-100, "-100"))
-                y_ticks.append((100, "+100"))
-
-                # Ticks for underdogs (positive side)
-                pos_range = max_val - 100
-                pos_step = pos_range / 3  # 3 ticks on positive side
-                for i in range(1, 4):
-                    tick_val = 100 + (i * pos_step)
-                    if tick_val >= 100:
-                        y_ticks.append((tick_val, f"+{int(tick_val)}"))
-            else:
-                # All on one side - create evenly spaced ticks
-                num_ticks = 5
-                step = (max_val - min_val) / num_ticks
-                current = min_val
-
-                for i in range(num_ticks + 1):
-                    # Ensure tick is in valid American odds range
-                    if current >= 100:
-                        y_ticks.append((current, f"+{int(current)}"))
-                    elif current <= -100:
-                        y_ticks.append((current, f"{int(current)}"))
-                    # Skip any ticks in invalid range (-100, +100)
-                    current += step
-
+            for i in range(num_ticks + 1):
+                p = min_val + i * step
+                am = self._am_from_cents_float(p)
+                if am is not None:
+                    am_i = int(round(am))
+                    label = f"{p:.0f}% ({'+' if am_i > 0 else ''}{am_i})"
+                else:
+                    label = f"{p:.0f}%"
+                y_ticks.append((p, label))
             y_axis.setTicks([y_ticks])
 
     async def _show_no_data_message(self, message="No historical data available"):

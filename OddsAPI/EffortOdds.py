@@ -998,7 +998,9 @@ class ModernOddsWindow(QMainWindow):
         self._outer_layout.addWidget(content_widget, 1)
         self.layout = QVBoxLayout(content_widget)
         self.layout.setSpacing(1)  # Minimize spacing between all main layout elements
-        self.layout.setContentsMargins(5, 5, 5, 5)  # Tight margins
+        # Bottom margin 0 so the bottom-most element (the vertical splitter / its
+        # historical-odds pane) extends flush to the top of the instance banner.
+        self.layout.setContentsMargins(5, 5, 5, 0)  # Tight margins
 
         # --------- TOP SECTION ---------
         # league_selector kept headless — still used by populate_leagues / handle_league_change
@@ -1559,6 +1561,15 @@ class ModernOddsWindow(QMainWindow):
         self.banner_api_label = QLabel("API QUOTA: —")
         self.banner_api_label.setToolTip("OddsAPI credits (from x-requests-remaining/used headers)")
         banner_layout.addWidget(self.banner_api_label)
+
+        # Historical-odds chart loading indicator. The HistoricalOddsWidget no
+        # longer has its own progress bar; it relays progress here so the chart
+        # can extend to its bottom edge.
+        self.hist_loading_label = QLabel("")
+        self.hist_loading_label.setToolTip("Historical odds chart loading state")
+        banner_layout.addWidget(self.hist_loading_label)
+        self.historical_odds_widget.loading_progress.connect(self._on_hist_loading)
+
         # Goes in the outer layout so it spans the full window width and sits
         # flush against the bottom edge (content layout has 5px margins).
         self._outer_layout.addWidget(self.instance_banner)
@@ -1594,6 +1605,19 @@ class ModernOddsWindow(QMainWindow):
         self.banner_state_label.setText(f"● {text}")
         self.banner_state_label.setStyleSheet(
             f"color: {color}; font-family: monospace; font-size: 9px;")
+
+    def _on_hist_loading(self, value):
+        """Reflect the historical-odds chart loading state in the bottom banner.
+
+        The widget pushes 10/50 while fetching, 100 on completion, then resets to
+        0. We show a small spinner-ish label only while actively loading."""
+        if value <= 0 or value >= 100:
+            self.hist_loading_label.setText("")
+            self.hist_loading_label.setStyleSheet("")
+        else:
+            self.hist_loading_label.setText(f"◴ chart {value}%")
+            self.hist_loading_label.setStyleSheet(
+                "color: #007bff; font-family: monospace; font-size: 9px;")
 
     def _update_banner_quota(self):
         """Pull quota numbers off the PropClient's last response headers."""
