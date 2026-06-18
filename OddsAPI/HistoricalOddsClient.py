@@ -49,6 +49,10 @@ FALLBACK_LINE_COLORS = [
     (140, 86, 75), (23, 190, 207), (188, 189, 34),
 ]
 
+# Event/game start marker line color (amber — distinct from green/blue series).
+# The x-axis "Time" label shows a matching legend swatch when the line is drawn.
+START_LINE_COLOR = (224, 168, 80)
+
 # Filenames under SPORTSBOOK_LOGO_DIR by bookmaker key (for the hover readout).
 BOOKMAKER_LOGO_FILE = {
     'kalshi': 'kalshi_alt.png',  # compact "K" mark; renders cleaner at small sizes
@@ -1853,6 +1857,59 @@ class KalshiHistoricalOddsClient:
             traceback.print_exc()
             return []
 
+    async def get_ohlc_candles(self, market_ticker, series_ticker,
+                               start_ts, end_ts, period_interval=1):
+        """Return real OHLC candles for a Kalshi market as
+        [{'t': end_period_ts, 'o','h','l','c'}] with prices in YES cents.
+
+        Unlike get_historical_candlesticks (which keeps only the close and emits
+        a TheOddsAPI-style line snapshot), this preserves open/high/low so the
+        chart can render true candlesticks. Missing legs fall back to the close.
+        """
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None,
+            lambda: self.kalshi_client.get_market_candlesticks(
+                ticker=market_ticker, series_ticker=series_ticker,
+                period_interval=period_interval,
+                start_ts=int(start_ts), end_ts=int(end_ts)))
+
+        def c(v):
+            if v is None:
+                return None
+            try:
+                return int(round(float(v) * 100))
+            except (TypeError, ValueError):
+                return None
+
+        out = []
+        for cd in data.get('candlesticks', []):
+            p = cd.get('price') or {}
+            o = c(p.get('open_dollars') or p.get('open'))
+            hi = c(p.get('high_dollars') or p.get('high'))
+            lo = c(p.get('low_dollars') or p.get('low'))
+            cl = c(p.get('close_dollars') or p.get('close')
+                   or p.get('previous_dollars') or p.get('previous'))
+            if cl is None:  # resting-order-only period: fall back to bid/ask mid
+                yb, ya = cd.get('yes_bid') or {}, cd.get('yes_ask') or {}
+                ybc = c(yb.get('close_dollars') or yb.get('close'))
+                yac = c(ya.get('close_dollars') or ya.get('close'))
+                if ybc is not None and yac is not None:
+                    cl = (ybc + yac) // 2
+                else:
+                    cl = ybc if ybc is not None else yac
+            if cl is None:
+                continue
+            o = o if o is not None else cl
+            hi = hi if hi is not None else max(o, cl)
+            lo = lo if lo is not None else min(o, cl)
+            t = cd.get('end_period_ts', 0)
+            if not t:
+                continue
+            out.append({'t': int(t), 'o': o, 'h': hi, 'l': lo, 'c': cl})
+        print(f"Fetched {len(out)} OHLC candles for {market_ticker}")
+        return out
+
 
 class OrderbookLadderWidget(QWidget):
     """Compact live depth ladder for the YES outcome, Bloomberg-terminal styling.
@@ -1958,7 +2015,7 @@ class HistoricalOddsWidget(QWidget):
         ("1m · 6h",  ("6h",  "1m")),
         ("1h · 24h", ("24h", "60m")),
         ("1d · 7d",  ("7d",  "1440m")),
-        ("Live",     ("1h",  "Live")),
+        ("Live",     ("24h", "Live")),  # seed last day of 1-min OHLC candles
     ]
 
     def __init__(self, api_key, interval_minutes:int, parent=None, kalshi_api_key=None):
@@ -2157,6 +2214,11 @@ class HistoricalOddsWidget(QWidget):
         # GridItem, which previously painted raw-unit ghost labels (e.g.
         # "1.7807e+09") over the plot.
         self.plot_widget.showGrid(x=True, y=True, alpha=0.18)
+        # Implied chance is a probability: 0% and 100% are HARD floor/ceiling.
+        # Bound the Y view so it can never pan/zoom past the valid range (no more
+        # scrolling into negative % or above 100%). minYRange keeps a sane floor
+        # on zoom-in so a flat market can't be magnified into noise.
+        self.plot_widget.getViewBox().setLimits(yMin=0, yMax=100, minYRange=2)
 
         # If the user pans/zooms by hand while Live "Follow" is on, drop out of
         # follow so the view stops snapping back each tick (lets them inspect).
@@ -2164,6 +2226,10 @@ class HistoricalOddsWidget(QWidget):
         # programmatic setXRange/auto-fit, so this won't self-trigger.
         self.plot_widget.getViewBox().sigRangeChangedManually.connect(
             self._on_user_range_change)
+        # Regenerate y-axis ticks from the visible range as the user zooms/pans,
+        # so the %-axis densifies/coarsens like the time axis (DateAxisItem) does
+        # instead of keeping the load-time tick step forever.
+        self.plot_widget.getViewBox().sigYRangeChanged.connect(self._update_y_ticks)
 
         # Team-logo watermarks: one per side (top band = positive-odds team,
         # bottom band = negative-odds team). Parented to the plot so they float
@@ -2192,12 +2258,20 @@ class HistoricalOddsWidget(QWidget):
                 " border-radius:3px; padding:3px 5px;")
             lbl.hide()
 
+        # The current value ("NN% (+am)") is shown inside the corner summary boxes
+        # (see _draw_series_annotations / _update_live_summary_label), not as a
+        # separate on-chart tag — keeps it off the lines entirely.
+
         # --- Crosshair scrubber + hover readout ---------------------------------
         # Mouse-tracking crosshair lines (added to the scene lazily in
         # _ensure_crosshair so they survive plot_widget.clear()) plus a floating
         # readout that reports each registered series' value at the cursor's time.
         self._cross_v = None
         self._cross_h = None
+        # Subtle colored vertical marker at the event/game start time (re-added per
+        # redraw in _ensure_start_line, like the crosshair, since clear() drops it).
+        # Labeled via a legend swatch on the x-axis "Time" label, not on the line.
+        self._start_line = None
         self._hover_series = []   # list of dicts: name/color/ts/pct/am
         self.hover_label = QLabel(self.plot_widget)
         self.hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -2573,6 +2647,10 @@ class HistoricalOddsWidget(QWidget):
                 self.live_ticks = []
                 self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
                 self.kalshi_stream_client.subscribe_live([self.kalshi_market_ticker])
+                # We just cleared live_ticks for the (new) market — re-seed the
+                # historical candles so the chart shows history, not just from now.
+                # No-ops outside candle mode. Runs as its own task (this is sync).
+                asyncio.ensure_future(self._apply_live_history_seed())
             else:
                 print(f"📡 Subscribing to live updates for {self.kalshi_market_ticker}")
                 self.kalshi_stream_client.subscribe_ticker([self.kalshi_market_ticker])
@@ -2753,9 +2831,15 @@ class HistoricalOddsWidget(QWidget):
         if px is not None and 1 <= px <= 99:
             self.oe_price.setValue(int(px))
 
-    @qasync.asyncSlot()
-    async def _on_place_order(self):
-        """Confirm + submit a Kalshi order off the GUI thread."""
+    def _on_place_order(self):
+        """Confirm (modal, SYNC) then submit the order on a background task.
+
+        Kept a plain slot, NOT an @asyncSlot: a modal QMessageBox spins a nested
+        Qt event loop, and under qasync the Qt loop *is* the asyncio loop — so
+        opening it inside a running task makes qasync re-enter other pending
+        tasks and raise "Cannot enter into task while another is being executed".
+        Running the confirm in sync context (no task on the stack) avoids that;
+        the actual order placement is scheduled as its own task below."""
         ticker = self.kalshi_market_ticker
         if not ticker:
             QMessageBox.warning(self, "No market", "No Kalshi market selected.")
@@ -2764,28 +2848,33 @@ class HistoricalOddsWidget(QWidget):
         price = self.oe_price.value()
         qty = self.oe_qty.value()
         cost = price * qty  # cents of max exposure for a buy
-        confirm = QMessageBox.question(
-            self, "Confirm order",
-            f"{action.upper()} {qty} × {side.upper()} @ {price}¢\n"
-            f"Market: {ticker}\n"
-            f"Max cost ≈ ${cost/100:,.2f}\n\nPlace this REAL order?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if confirm != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(
+                self, "Confirm order",
+                f"{action.upper()} {qty} × {side.upper()} @ {price}¢\n"
+                f"Market: {ticker}\n"
+                f"Max cost ≈ ${cost/100:,.2f}\n\nPlace this REAL order?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         self.oe_place_btn.setEnabled(False)
+        asyncio.ensure_future(self._submit_order(ticker, action, side, qty, price))
+
+    async def _submit_order(self, ticker, action, side, qty, price):
+        """Place the order in a worker thread, refresh the resting list, and
+        report failures via a DEFERRED dialog (QTimer.singleShot keeps the modal
+        out of this task, where a nested loop would re-enter the event loop)."""
         try:
             loop = asyncio.get_event_loop()
             resp = await loop.run_in_executor(
                 None, lambda: self.kalshi_client.kalshi_client.create_order(
                     ticker=ticker, action=action, side=side, count=qty, price_cents=price))
             print(f"✅ Order placed: {resp}")
+            await self._refresh_open_orders()
         except Exception as e:
-            QMessageBox.critical(self, "Order failed", f"{e}")
             print(f"⚠️  Order failed: {e}")
+            QTimer.singleShot(0, lambda e=e: QMessageBox.critical(self, "Order failed", f"{e}"))
         finally:
             self.oe_place_btn.setEnabled(True)
-        await self._refresh_open_orders()
 
     @qasync.asyncSlot()
     async def _on_refresh_open_orders(self):
@@ -2813,8 +2902,9 @@ class HistoricalOddsWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, o.get("order_id"))
             self.open_orders_list.addItem(item)
 
-    @qasync.asyncSlot(QListWidgetItem)
-    async def _on_cancel_order_item(self, item):
+    def _on_cancel_order_item(self, item):
+        """Confirm (modal, SYNC) then cancel on a background task — same qasync
+        re-entrancy avoidance as _on_place_order (no modal inside a running task)."""
         order_id = item.data(Qt.ItemDataRole.UserRole)
         if not order_id:
             return
@@ -2823,13 +2913,16 @@ class HistoricalOddsWidget(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
+        asyncio.ensure_future(self._submit_cancel(order_id))
+
+    async def _submit_cancel(self, order_id):
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None, lambda: self.kalshi_client.kalshi_client.cancel_order(order_id))
             print(f"🗑️  Cancelled {order_id}")
         except Exception as e:
-            QMessageBox.critical(self, "Cancel failed", f"{e}")
+            QTimer.singleShot(0, lambda e=e: QMessageBox.critical(self, "Cancel failed", f"{e}"))
         await self._refresh_open_orders()
 
     def _toggle_right_panel(self):
@@ -3004,11 +3097,13 @@ class HistoricalOddsWidget(QWidget):
         am_str = ""
         if am is not None:
             am_i = int(round(am))
-            am_str = f" <span style='color:#7e8794'>({'+' if am_i > 0 else ''}{am_i})</span>"
+            am_str = f" <span style='color:#0f7a30'>({'+' if am_i > 0 else ''}{am_i})</span>"
+        # Bold current value header (green = Kalshi live), matching the seed path.
         html = (
-            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:.1f}%&#8594;{cur:.1f}%{am_str} "
-            f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span></div>"
-            f"<div style='font-size:9pt;color:#c8c8c8'>range {rng:.1f}%</div>"
+            f"<div style='font-size:11pt;color:#2ca02c;font-weight:bold'>{cur:.1f}%{am_str}</div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>{open_v:.1f}%&#8594;{cur:.1f}% "
+            f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span> "
+            f"<span style='color:#8a93a0'>· rng {rng:.1f}%</span></div>"
             f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
         )
         self._set_summary_label(band_key, html)
@@ -5036,7 +5131,30 @@ class HistoricalOddsWidget(QWidget):
         self.live_mode = True
         self.live_ticks = []
         self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
-        self.candle_bucket.setEnabled(self.candle_mode)
+
+        # Live defaults to 1-min CANDLESTICKS over the last day (real Kalshi OHLC).
+        # Lines are reserved for TheOddsAPI; prediction-market series render as
+        # candles. Auto-check the box + set the 1m bucket (guard signals so we
+        # don't trigger a redundant refresh before the seed is in place).
+        self.candle_check.blockSignals(True)
+        self.candle_check.setChecked(True)
+        self.candle_check.blockSignals(False)
+        self.candle_mode = True
+        self.candle_bucket.blockSignals(True)
+        self.candle_bucket.setCurrentText("1m")
+        self.candle_bucket.blockSignals(False)
+        self.candle_bucket_s = 60
+        self.candle_bucket.setEnabled(True)
+        # Follow ON: show a readable RECENT window of candles (the follow logic
+        # sizes X to ~live_candle_visible_n candles) and track the live edge. The
+        # full day is still seeded — pan/zoom out to see it. Showing the entire
+        # day at once made 1-min candles ~1px wide.
+        self.auto_follow = True
+        self.follow_check.blockSignals(True)
+        self.follow_check.setChecked(True)
+        self.follow_check.blockSignals(False)
+        self._axes_configured = False
+
         self.live_controls.setVisible(True)
         self.ob_section.setVisible(True)
         self.order_entry_section.setVisible(True)
@@ -5049,15 +5167,66 @@ class HistoricalOddsWidget(QWidget):
         self.ws_status_label.setText("🟡")
         self.ws_status_label.setToolTip("WebSocket: Live mode — connecting…")
 
-        # Seed the chart with recent history so it isn't empty (uses the existing
-        # candlestick path; the "Live" interval is treated as 1m for this pull).
+        # Hand off to the websocket: subscribing (in _subscribe_to_current_market)
+        # resets live_ticks and then schedules _apply_live_history_seed, so the
+        # historical candles are (re)seeded here and on every market switch.
+        self.enable_websocket_updates(True)
+
         if self._load_task and not self._load_task.done():
             self._load_task.cancel()
         await self.load_data()
 
-        # Hand off to the websocket: subscribes trade + orderbook_delta and
-        # starts the coalesced repaint cadence.
-        self.enable_websocket_updates(True)
+    async def _apply_live_history_seed(self):
+        """Seed Live candles with the last day of real 1-min Kalshi OHLC so the
+        chart shows history up to now — not just from the moment Live was toggled.
+
+        Expands each historical candle into synthetic O→H→L→C ticks (reusing the
+        60s live aggregator) and MERGES with any live ticks newer than the seed,
+        keeping the series time-sorted. Called on live entry AND on market switch,
+        since both clear live_ticks via _subscribe_to_current_market."""
+        if not (self.live_mode and self.candle_mode):
+            return
+        seed = self._seed_ticks_from_ohlc(await self._fetch_seed_ohlc())
+        if not seed:
+            return
+        last_t = seed[-1]['t']
+        tail = [t for t in self.live_ticks if t['t'] > last_t]
+        self.live_ticks = sorted(seed + tail, key=lambda t: t['t'])
+        if getattr(self, '_li_line', None) is None:
+            self._rebuild_live_items()
+        self._refresh_live_items()
+
+    async def _fetch_seed_ohlc(self):
+        """Fetch the last day of 1-min Kalshi OHLC candles for the live market."""
+        mkt = self.kalshi_market_ticker
+        if not mkt:
+            return []
+        # Derive the series the SAME way the unified load path does
+        # (kalshi_event_ticker.split('-')[0]) instead of relying on
+        # self.kalshi_series_ticker, which isn't set in the unified-market flow.
+        series = self.kalshi_series_ticker or mkt.split('-')[0]
+        from datetime import datetime
+        end = datetime.now().timestamp()
+        try:
+            return await self.kalshi_client.get_ohlc_candles(
+                mkt, series, end - 24 * 3600, end, period_interval=1)
+        except Exception as e:
+            print(f"⚠️  seed OHLC fetch failed: {e}")
+            return []
+
+    @staticmethod
+    def _seed_ticks_from_ohlc(candles):
+        """Expand each historical 1-min OHLC candle into 4 synthetic ticks
+        (open→high→low→close, spaced within its minute) so the live 60s candle
+        aggregator reconstructs the real bar. Returns a live_ticks-shaped list."""
+        ticks = []
+        for cd in candles:
+            bs = cd['t'] - 60  # start of the 1-min period ending at end_period_ts
+            for off, price in ((1, cd['o']), (20, cd['h']), (40, cd['l']), (59, cd['c'])):
+                if price is None or not (0 < price < 100):
+                    continue
+                ticks.append({'t': bs + off, 'price': price, 'bid': None, 'ask': None})
+        return ticks
 
     def _exit_live_mode(self):
         """Leave Live mode and return to the normal polling/candlestick path."""
@@ -5113,6 +5282,12 @@ class HistoricalOddsWidget(QWidget):
             if not self.bookmaker_visible.get(bookmaker, True):
                 continue
 
+            # In candle mode the prediction markets render as candlesticks (the
+            # live overlay seeded from real OHLC), so suppress their LINES here —
+            # lines are reserved for TheOddsAPI sportsbook series.
+            if self.candle_mode and bookmaker in ('kalshi', 'polymarket'):
+                continue
+
             color = self._color_for_bookmaker(bookmaker, bm_idx)
             for outcome_key, points_data in outcomes.items():
                 await self._plot_outcome_series(bookmaker, outcome_key, points_data, color)
@@ -5136,8 +5311,10 @@ class HistoricalOddsWidget(QWidget):
             self._rebuild_live_items()
             self._refresh_live_items()
 
-        # Crosshair lines are scene items, so clear() removed them — re-add.
+        # Crosshair lines + the event-start marker are scene items, so clear()
+        # removed them — re-add.
         self._ensure_crosshair()
+        self._ensure_start_line()
 
     @staticmethod
     def _color_for_bookmaker(bookmaker, idx):
@@ -5243,8 +5420,11 @@ class HistoricalOddsWidget(QWidget):
                 window = self.live_follow_window_s
                 right_pad = 5
             vb.setXRange(last_t - window, last_t + right_pad, padding=0)
-            vb.setAutoVisible(y=True)
-            vb.enableAutoRange(axis='y', enable=True)
+            # Keep the full 0-100% probability range in view (matches the seed
+            # axis); only the X axis scrolls. No Y auto-fit so the hard floor /
+            # ceiling stay visible instead of the chart zooming into the data band.
+            vb.enableAutoRange(axis='y', enable=False)
+            vb.setYRange(0, 100, padding=0)
 
     def _refresh_live_candles(self, ticks, to_pct):
         """Aggregate ticks into OHLC (implied %) and push into the candle items.
@@ -5326,7 +5506,9 @@ class HistoricalOddsWidget(QWidget):
         return {c: (n, v) for c, (n, _t, v) in latest.items()}
 
     def _update_side_logos(self, plot_data):
-        """Show each team's logo in its odds band (top=underdog, bottom=favorite).
+        """Show each team's logo in its band: top = higher implied % (favorite),
+        bottom = lower implied % (underdog) — matching the %-axis where high sits
+        on top and the corner summary boxes (>=50% -> top).
 
         Falls back to a static top/bottom split for neutral (pick'em) markets.
         Resolution is cached, so the only per-call cost is two setPixmap/move.
@@ -5338,11 +5520,13 @@ class HistoricalOddsWidget(QWidget):
             return
 
         (ca, (na, va)), (cb, (nb, vb)) = teams.items()
-        # Clear favorite/underdog: opposite signs => the negative (favorite)
-        # team sits in the bottom band, matching its line cluster. Otherwise
-        # (same sign / near pick'em) keep a stable top/bottom split by name.
-        if (va < 0) != (vb < 0):
-            top_team, bottom_team = (na, nb) if va > vb else (nb, na)
+        # va/vb are AMERICAN odds. Compare by IMPLIED % so the higher-probability
+        # team lands on top (the line plots high in %-space). Earlier this keyed
+        # on raw american ordering, which put the underdog on top — wrong since
+        # the axis flipped from american odds to implied %.
+        pa, pb = american_to_implied_pct(va), american_to_implied_pct(vb)
+        if pa is not None and pb is not None and abs(pa - pb) > 1e-9:
+            top_team, bottom_team = (na, nb) if pa > pb else (nb, na)
         else:
             top_team, bottom_team = (na, nb) if na <= nb else (nb, na)
 
@@ -5380,9 +5564,9 @@ class HistoricalOddsWidget(QWidget):
         w = self.plot_widget.width()
         h = self.plot_widget.height()
 
-        # --- Floating control strip + its toggle (top-LEFT, HUGGING its content
+        # --- Floating control strip + its toggle (top-CENTER, HUGGING its content
         # so it never spans the graph width). The toggle sits just right of the
-        # strip when shown, or alone at the top-left when the strip is hidden. ---
+        # strip when shown, or centered alone when the strip is hidden. ---
         btn = getattr(self, 'controls_toggle_btn', None)
         ov = getattr(self, 'control_overlay', None)
         if ov is not None and getattr(self, '_controls_visible', False):
@@ -5391,16 +5575,26 @@ class HistoricalOddsWidget(QWidget):
             if getattr(self, 'market_info', None) is not None:
                 self.market_info.setVisible(not self.event_selector.isVisibleTo(ov))
             ov.adjustSize()           # shrink to fit current (mode-dependent) content
-            ov.move(6, 6)
+            sx = max(6, (w - ov.width()) // 2)
+            ov.move(sx, 6)
             ov.raise_()
             if btn is not None:
-                btn.move(6 + ov.width() + 3, 6 + max(0, (ov.height() - btn.height()) // 2))
+                btn.move(sx + ov.width() + 3, 6 + max(0, (ov.height() - btn.height()) // 2))
                 btn.raise_()
         elif btn is not None:
-            btn.move(6, 6)
+            btn.move((w - btn.width()) // 2, 6)
             btn.raise_()
 
-        # Logos/summaries live top-right (strip is top-left, so no collision).
+        # Bottom of the plotting area = above the x-axis, so the bottom logo /
+        # summary box don't sit on top of the time-axis labels.
+        axis_h = 0
+        bax = self.plot_widget.getAxis('bottom')
+        if bax is not None and bax.isVisible():
+            axis_h = bax.height()
+        # getAxis().height() is a float (GraphicsWidget) -> keep an int for moves.
+        data_bottom = int(h - axis_h)
+
+        # Top logo/summary stay top-right; bottom ones dock just ABOVE the x-axis.
         logo_top_left = w - margin
         if self.logo_label_top.isVisible() and self.logo_label_top.pixmap():
             pm = self.logo_label_top.pixmap()
@@ -5410,14 +5604,15 @@ class HistoricalOddsWidget(QWidget):
         if self.logo_label_bottom.isVisible() and self.logo_label_bottom.pixmap():
             pm = self.logo_label_bottom.pixmap()
             logo_bot_left = w - pm.width() - margin
-            self.logo_label_bottom.move(logo_bot_left, h - pm.height() - margin)
+            self.logo_label_bottom.move(logo_bot_left, data_bottom - pm.height() - margin)
 
         if self.summary_label_top.isVisible():
             s = self.summary_label_top
             s.move(logo_top_left - gap - s.width(), margin)
         if self.summary_label_bottom.isVisible():
             s = self.summary_label_bottom
-            s.move(logo_bot_left - gap - s.width(), h - s.height() - margin)
+            s.move(logo_bot_left - gap - s.width(), data_bottom - s.height() - margin)
+
 
     # Back-compat alias: older call sites used the logo-only name.
     _position_side_logos = _position_overlays
@@ -5669,29 +5864,19 @@ class HistoricalOddsWidget(QWidget):
             )
             self.plot_widget.addItem(markers)
 
-        # Color-coded last-value tag pinned at the series end — the pro-chart
-        # standard, replacing the old plain-black on-chart text labels. Fill =
-        # series color; text auto-contrasts (dark on light fills, white on dark).
-        tag_txt = format_pct_with_american(am[-1] if am.size else None, cur_v)
-        if tag_txt:
-            r, g, b = int(color[0]), int(color[1]), int(color[2])
-            luminance = 0.299 * r + 0.587 * g + 0.114 * b
-            fg = (15, 17, 20) if luminance > 140 else (245, 245, 245)
-            tag = pg.TextItem(tag_txt, anchor=(-0.12, 0.5), color=fg,
-                              fill=pg.mkBrush(r, g, b, 235),
-                              border=pg.mkPen(r, g, b))
-            tag.setZValue(150)
-            self.plot_widget.addItem(tag)
-            tag.setPos(float(ts[-1]), cur_v)
-
         # Summary -> fixed corner overlay (top-right for the high-% band,
         # bottom-right for the low-% band). Widget-space, can't collide with graph.
+        # The current value ("NN% (+am)") is the bold header line, color-coded to
+        # the series; net move / range / updated follow underneath.
+        val_txt = format_pct_with_american(am[-1] if am.size else None, cur_v) or f"{cur_v:.0f}%"
+        chex = '#%02x%02x%02x' % (int(color[0]), int(color[1]), int(color[2]))
         updated = datetime.fromtimestamp(float(ts[-1])).strftime('%H:%M:%S')
         dhex = '#%02x%02x%02x' % dcolor
         summary_html = (
-            f"<div style='font-size:9pt;color:#dcdcdc'>{open_v:.0f}%&#8594;{cur_v:.0f}% "
-            f"<span style='color:{dhex}'>{arrow}{abs(delta):.0f}</span></div>"
-            f"<div style='font-size:9pt;color:#c8c8c8'>range {swing:.0f}%</div>"
+            f"<div style='font-size:11pt;color:{chex};font-weight:bold'>{val_txt}</div>"
+            f"<div style='font-size:9pt;color:#c8c8c8'>{open_v:.0f}%&#8594;{cur_v:.0f}% "
+            f"<span style='color:{dhex}'>{arrow}{abs(delta):.0f}</span> "
+            f"<span style='color:#8a93a0'>· rng {swing:.0f}%</span></div>"
             f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
         )
         self._set_summary_label(band_key, summary_html)
@@ -5719,6 +5904,52 @@ class HistoricalOddsWidget(QWidget):
         self._cross_h.hide()
         self.plot_widget.addItem(self._cross_v, ignoreBounds=True)
         self.plot_widget.addItem(self._cross_h, ignoreBounds=True)
+
+    def _event_start_epoch(self):
+        """Epoch (UTC) of the selected event's start, from the unified event's
+        ISO start_time. None if unknown or date-only (midnight = no real time)."""
+        ev = getattr(self, 'current_unified_event', None)
+        st = getattr(ev, 'start_time', None) if ev else None
+        if not st:
+            return None
+        try:
+            s = str(st)
+            if s.endswith('Z'):
+                s = s.replace('Z', '+00:00')
+            elif '+' not in s and s.count(':') >= 2:
+                s = s + '+00:00'  # naive ISO from Polymarket is UTC
+            dt = datetime.fromisoformat(s)
+            if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                return None  # date-only (e.g. Kalshi-from-ticker) — no real start
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    def _ensure_start_line(self):
+        """Subtle colored dashed vertical marker at the event/game start time.
+        Re-added each redraw (clear() drops scene items); ignoreBounds so it
+        doesn't affect autorange. The x-axis "Time" label carries a matching
+        legend swatch ("— start"). Both hidden when the start time is unknown."""
+        if self._start_line is None:
+            self._start_line = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen(START_LINE_COLOR + (140,), width=1, style=Qt.PenStyle.DashLine))
+            self._start_line.setZValue(55)
+        epoch = self._event_start_epoch()
+        if epoch is None:
+            self._start_line.hide()
+            self.plot_widget.setLabel('bottom', 'Time')  # no legend when no marker
+            return
+        self._start_line.setPos(epoch)
+        self._start_line.show()
+        self.plot_widget.addItem(self._start_line, ignoreBounds=True)
+        # Legend swatch inline with the axis label: "Time      ── start" in the
+        # line's color (pyqtgraph axis labels render HTML).
+        hexc = '#%02x%02x%02x' % START_LINE_COLOR
+        self.plot_widget.setLabel(
+            'bottom',
+            f"Time &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            f"<span style='color:{hexc}'>&#9476;&#9476; start</span>")
 
     def _hide_hover(self):
         if getattr(self, 'hover_label', None) is not None:
@@ -5913,34 +6144,68 @@ class HistoricalOddsWidget(QWidget):
         implied = [p for p in (american_to_implied_pct(a) for a in all_american_prices)
                    if p is not None]
         if implied:
-            lo, hi = min(implied), max(implied)
-            pad = max((hi - lo) * 0.10, 3.0)  # at least 3 pts of breathing room
-            min_val = max(0.0, lo - pad)
-            max_val = min(100.0, hi + pad)
-            if max_val - min_val < 5.0:  # degenerate (flat market) -> widen
-                mid = (min_val + max_val) / 2.0
-                min_val = max(0.0, mid - 5.0)
-                max_val = min(100.0, mid + 5.0)
+            # Show the FULL probability range so the hard 0%/100% floor & ceiling
+            # are always in view (Polymarket/Kalshi style) — no more zooming into
+            # a narrow data-fit band that hides how far the market is from certain.
+            self.plot_widget.setYRange(0, 100)
 
-            self.plot_widget.setYRange(min_val, max_val)
+            # Y-axis label + ticks: implied % primary, american odds in parens,
+            # at round values with fainter minor gridlines. Ticks are (re)built
+            # from the visible range here and on every zoom/pan (sigYRangeChanged).
+            self.plot_widget.getAxis('left').setLabel('Implied %')
+            self._update_y_ticks()
 
-            # Y-axis label + ticks: implied % primary, american odds in parens.
-            y_axis = self.plot_widget.getAxis('left')
-            y_axis.setLabel('Implied %')
+    def _update_y_ticks(self):
+        """Rebuild the %-axis ticks from the current visible y-range so zoom/pan
+        densifies or coarsens them (mirrors the time axis). Cheap; safe to call
+        on every sigYRangeChanged."""
+        vb = self.plot_widget.getViewBox()
+        if vb is None:
+            return
+        lo, hi = vb.viewRange()[1]
+        if hi <= lo:
+            return
+        self.plot_widget.getAxis('left').setTicks(self._build_pct_ticks(lo, hi))
 
-            num_ticks = 6
-            step = (max_val - min_val) / num_ticks
-            y_ticks = []
-            for i in range(num_ticks + 1):
-                p = min_val + i * step
-                am = self._am_from_cents_float(p)
-                if am is not None:
-                    am_i = int(round(am))
-                    label = f"{p:.0f}% ({'+' if am_i > 0 else ''}{am_i})"
-                else:
-                    label = f"{p:.0f}%"
-                y_ticks.append((p, label))
-            y_axis.setTicks([y_ticks])
+    def _build_pct_ticks(self, lo, hi):
+        """Round, evenly-spaced %-axis ticks with a fainter minor gridline level.
+
+        Returns [major, minor] for AxisItem.setTicks: major carries 'NN.N% (+am)'
+        labels (implied % is a float, so one decimal; two when zoomed in tight) at
+        a nice step chosen for ~10 visible ticks, minor draws unlabeled gridlines
+        at half that step. Anchored to multiples of the step so lines land on round
+        probabilities (55.0%, 55.5%, …) instead of arbitrary values.
+        """
+        import math
+        span = max(hi - lo, 0.2)
+        # Aim for ~10 ticks (denser than before) and support sub-1% steps so the
+        # axis stays granular when zoomed in. Step list ascends; first that yields
+        # <=10 ticks across the span wins.
+        steps = (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 25, 50)
+        major_step = next((s for s in steps if span / s <= 10), 50)
+        minor_step = major_step / 2.0
+        dp = 2 if major_step < 0.5 else 1  # decimal places on the % label
+
+        major = []
+        v = math.ceil(lo / major_step) * major_step
+        while v <= hi + 1e-9:
+            am = self._am_from_cents_float(v)
+            if am is not None:
+                ai = int(round(am))
+                label = f"{v:.{dp}f}% ({'+' if ai > 0 else ''}{ai})"
+            else:
+                label = f"{v:.{dp}f}%"
+            major.append((v, label))
+            v += major_step
+
+        minor = []
+        v = math.ceil(lo / minor_step) * minor_step
+        while v <= hi + 1e-9:
+            # Skip positions that coincide with a major tick.
+            if abs(v / major_step - round(v / major_step)) > 1e-6:
+                minor.append((v, ''))
+            v += minor_step
+        return [major, minor]
 
     async def _show_no_data_message(self, message="No historical data available"):
         """Show a message when no data is available"""
