@@ -2202,6 +2202,10 @@ class ModernOddsWindow(QMainWindow):
             # Reset layout spacing
             self.layout.setSpacing(0)
 
+        # Keep the bottom splitter section collapsed when it has no visible content
+        # (same reclaim logic as the historical toggle).
+        self._sync_bottom_section_visibility()
+
     def toggle_historical_odds(self):
         """Toggle visibility of the historical odds widget"""
         visible = self.history_toggle_button.isChecked()
@@ -2230,10 +2234,41 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_container.setVisible(visible)
         self.historical_odds_widget.setVisible(visible)
 
+        # Reclaim/yield the bottom splitter section so hiding a maxed-out
+        # historical widget doesn't leave the odds table squeezed to nothing.
+        self._sync_bottom_section_visibility()
+
         # Force a layout update
         self.historical_odds_container.updateGeometry()
         self.historical_odds_widget.updateGeometry()
         QTimer.singleShot(10, self.update)
+
+    def _sync_bottom_section_visibility(self):
+        """Reclaim/yield the bottom splitter section (news + historical) by driving
+        the VERTICAL splitter's sizes — not by hiding the horizontal_splitter.
+
+        The bottom section is the bottom child of vertical_splitter. When the user
+        drags the divider to give it most of the height and then hides its only
+        visible child, the (still-present) horizontal_splitter keeps that big
+        allocation — squeezing the odds table to ~0 (the 'jank empty view' bug).
+        Collapsing the bottom to 0 hands all height back to the top; restoring a
+        top-heavy split brings it back. We use sizes rather than setVisible() on the
+        splitter because toggling a splitter child's visibility doesn't relayout
+        reliably (re-show left the widget stuck at 0 height). The container itself
+        is still setVisible(False)'d by the caller, so the widget is truly hidden
+        (and its live render is skipped) when collapsed."""
+        any_bottom = (self.news_container.isVisible()
+                      or self.historical_odds_container.isVisible())
+        sizes = self.vertical_splitter.sizes()
+        total = sum(sizes) or self.vertical_splitter.height()
+        if total <= 0:
+            return
+        bottom = sizes[1] if len(sizes) >= 2 else 0
+        if not any_bottom:
+            if bottom > 0:
+                self.vertical_splitter.setSizes([total, 0])
+        elif bottom < 40:  # collapsed -> restore a sane top-heavy split
+            self.vertical_splitter.setSizes([int(total * 0.6), int(total * 0.4)])
 
 
     def update_best_lines_display(self):

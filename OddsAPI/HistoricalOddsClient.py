@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics
 
 from KalshiClient import KalshiClient, KalshiStreamClient, KalshiLiveBook
-from polymarket_sports_client import PolymarketSportsClient
+from polymarketquery import PolymarketSportsClient, PolymarketStreamClient, PolymarketLiveBook
 import re
 from pathlib import Path
 from dataclasses import dataclass
@@ -61,8 +61,8 @@ BOOKMAKER_LOGO_FILE = {
 
 # Canonical team name (as produced by EventMatcher.normalize_team_name) ->
 # logo filename under LOGO_DIR/<LEAGUE>/. Verified against the on-disk assets;
-# the three teams without a dedicated PNG (Phillies, Kraken, Utah) fall back to
-# their league logo. See generation note: built from EventMatcher canonicals.
+# teams without a dedicated PNG fall back to their league logo. See generation
+# note: built from EventMatcher canonicals.
 LOGO_FILE_BY_TEAM = {
     'MLB': {
         'arizona diamondbacks': 'Diamondbacks.png', 'atlanta braves': 'Braves.png',
@@ -75,7 +75,7 @@ LOGO_FILE_BY_TEAM = {
         'miami marlins': 'Marlins.png', 'milwaukee brewers': 'Brewers.png',
         'minnesota twins': 'Twins.png', 'new york yankees': 'Yankees.png',
         'new york mets': 'Mets.png', 'oakland athletics': 'Athletics.png',
-        'philadelphia phillies': 'MLBleague.png', 'pittsburgh pirates': 'Pirates.png',
+        'philadelphia phillies': 'Phillies.png', 'pittsburgh pirates': 'Pirates.png',
         'san diego padres': 'Padres.png', 'san francisco giants': 'Giants.png',
         'seattle mariners': 'Mariners.png', 'st. louis cardinals': 'Cardinals.png',
         'tampa bay rays': 'Rays.png', 'texas rangers': 'RangersTX.png',
@@ -2072,6 +2072,15 @@ class HistoricalOddsWidget(QWidget):
         # Maintains best bid/ask + last trade per market from trade/orderbook stream.
         # on_gap -> resubscribe for a fresh snapshot when a seq number is skipped.
         self.live_book = KalshiLiveBook(on_gap=self._on_live_book_gap)
+        # Polymarket live book (CLOB market channel; full-snapshot + absolute-size
+        # deltas, no sequence numbers so no gap handling needed).
+        self.pm_live_book = PolymarketLiveBook()
+        # Which source the sub-second feed is currently streaming for the selected
+        # market: 'kalshi' or 'polymarket'. Chosen in _enter_live_mode and via the
+        # live feed-source selector when a market is available on both.
+        self.live_source = 'kalshi'
+        # Polymarket streaming client (lazily started in enable_websocket_updates).
+        self.polymarket_stream_client = None
         # Coalesced repaint: buffer every tick, repaint on a fixed cadence so the
         # GUI stays smooth during bursty markets without dropping data.
         self._live_dirty = False
@@ -2084,22 +2093,21 @@ class HistoricalOddsWidget(QWidget):
         self.live_follow_window_s = 600  # rolling window (sec) for the line view
         self.live_candle_visible_n = 60  # candles to keep in view when following
         # (so candle width stays visually consistent across 1s/5s/15s buckets)
-        # Per-tick history for the live portion. Each entry:
-        #   {'t': epoch_sec, 'price': cents, 'bid': cents|None, 'ask': cents|None}
-        self.live_ticks = []
         # Live corner-label running stats (american odds, float; tick-by-tick)
         self._live_lbl_open = None
         self._live_lbl_min = None
         self._live_lbl_max = None
-        # Persistent overlay item handles (created lazily; None == not built yet)
-        self._li_line = None
-        self._li_band_lo = self._li_band_hi = self._li_band_fill = None
-        self._li_cbodies = self._li_cwicks = None
+        # Generic live-series model (supersedes primary/secondary): one entry per
+        # (venue, outcome) being streamed/rendered. outcome_sel == 'all' shows
+        # every outcome; otherwise a single outcome label. Default single (first).
+        self.live_series = []
+        self.outcome_sel = None  # set to first outcome / 'all' on market select
         self.live_repaint_timer = QTimer()
         self.live_repaint_timer.setInterval(250)  # ~4 fps repaint while live
         self.live_repaint_timer.timeout.connect(self._flush_live_plot)
 
         self._initialize_kalshi_websocket()
+        self._initialize_polymarket_websocket()
 
         self.init_ui()
 
@@ -2108,8 +2116,10 @@ class HistoricalOddsWidget(QWidget):
         layout = QVBoxLayout(self)
         # Margins zeroed top & bottom: the controls now float over the plot (no
         # header rows) and the progress bar is gone, so the plot runs flush from
-        # the top of the widget to the host banner.
-        layout.setContentsMargins(5, 0, 5, 0)
+        # the top of the widget to the host banner. Right margin is 0 so the
+        # DEPTH/VIEW panel sits flush against the window's right edge (the old 5px
+        # left a dead dark strip beside the order book).
+        layout.setContentsMargins(5, 0, 0, 0)
 
         # Controls live in a translucent strip that FLOATS over the plot's top
         # edge (parented to the plot below, after it exists) instead of consuming
@@ -2343,7 +2353,10 @@ class HistoricalOddsWidget(QWidget):
         self.panel_body = QWidget()
         self.panel_body.setObjectName("depthBody")
         pb = QVBoxLayout(self.panel_body)
-        pb.setContentsMargins(6, 4, 6, 6); pb.setSpacing(6)
+        # No right margin: the order book / ladder run flush to the panel's right
+        # edge (which is the window's right edge) — the old 6px right margin left a
+        # dead dark band beside the numbers.
+        pb.setContentsMargins(6, 4, 0, 6); pb.setSpacing(6)
         # Header title
         self.panel_title = QLabel("DEPTH / VIEW"); self.panel_title.setObjectName("sect")
         pb.addWidget(self.panel_title)
@@ -2363,6 +2376,37 @@ class HistoricalOddsWidget(QWidget):
         self.spread_check.stateChanged.connect(self._on_spread_toggled)
         row1.addWidget(self.follow_check); row1.addWidget(self.spread_check); row1.addStretch(1)
         lc.addLayout(row1)
+        # Feed-source selector on its OWN row — keeping it off the Follow/Spread
+        # row prevents that row from overflowing the fixed-width (238px) panel and
+        # pushing it off-screen. Only shown when the market trades on BOTH Kalshi
+        # and Polymarket; otherwise the sole source is used silently.
+        self.feed_source_row = QWidget()
+        rowfeed = QHBoxLayout(self.feed_source_row)
+        rowfeed.setContentsMargins(0, 0, 0, 0); rowfeed.setSpacing(6)
+        feed_lbl = QLabel("Feed"); feed_lbl.setStyleSheet("color:#9aa4b0;")
+        self.feed_source_combo = QComboBox()
+        self.feed_source_combo.setToolTip("Live feed source for this market")
+        self.feed_source_combo.setFixedWidth(120)
+        self.feed_source_combo.currentIndexChanged.connect(self._on_feed_source_changed)
+        rowfeed.addWidget(feed_lbl); rowfeed.addWidget(self.feed_source_combo)
+        rowfeed.addStretch(1)
+        self.feed_source_row.setVisible(False)
+        lc.addWidget(self.feed_source_row)
+        # Side/outcome selector — which logical outcome the live overlay follows
+        # (per venue), or "All" to overlay every outcome at once. Lists the
+        # market's actual outcomes (teams / Over-Under / Home-Draw-Away / Yes-No).
+        self.side_row = QWidget()
+        rowside = QHBoxLayout(self.side_row)
+        rowside.setContentsMargins(0, 0, 0, 0); rowside.setSpacing(6)
+        side_lbl = QLabel("Side"); side_lbl.setStyleSheet("color:#9aa4b0;")
+        self.side_combo = QComboBox()
+        self.side_combo.setToolTip("Outcome the live feed tracks (or All to overlay every outcome)")
+        self.side_combo.setFixedWidth(120)
+        self.side_combo.currentIndexChanged.connect(self._on_side_changed)
+        rowside.addWidget(side_lbl); rowside.addWidget(self.side_combo)
+        rowside.addStretch(1)
+        self.side_row.setVisible(False)
+        lc.addWidget(self.side_row)
         row2 = QHBoxLayout(); row2.setSpacing(8)
         self.candle_check = QCheckBox("Candles")
         self.candle_check.setToolTip("Render the live feed as OHLC candlesticks")
@@ -2383,22 +2427,20 @@ class HistoricalOddsWidget(QWidget):
         obl.setContentsMargins(0, 0, 0, 0); obl.setSpacing(2)
         ob_title = QLabel("ORDER BOOK"); ob_title.setObjectName("sect")
         obl.addWidget(ob_title)
-        # Best bid/ask/spr/last readout
-        self.ob_readout = QLabel("")
-        self.ob_readout.setTextFormat(Qt.TextFormat.RichText)
-        self.ob_readout.setToolTip("Live best bid / ask · spread · last trade")
-        self.ob_readout.setStyleSheet(
-            "color:#cfd6df; font-family:monospace; font-size:11px;"
-            " background:#11161d; border:1px solid #222a35;"
-            " border-radius:2px; padding:2px 5px;")
-        # Allow it to shrink to the panel width instead of forcing the body wider
-        # (which, with horizontal scroll off, caused right-edge clipping).
-        self.ob_readout.setMinimumWidth(0)
-        self.ob_readout.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        obl.addWidget(self.ob_readout)
-        # Depth ladder
-        self.ob_ladder = OrderbookLadderWidget(levels=8)
-        obl.addWidget(self.ob_ladder)
+
+        # Readout style reused by the dynamic per-series ladder groups.
+        self._ro_style = ("color:#cfd6df; font-family:monospace; font-size:11px;"
+                          " background:#11161d; border:1px solid #222a35;"
+                          " border-radius:2px; padding:2px 5px;")
+        # One (label + bid/ask readout + depth ladder) group per active live series
+        # is built into this box by _rebuild_ob_ladders() whenever the series set
+        # changes (feed/side/market). Supports 1..N stacked books.
+        self.ob_ladders_box = QWidget()
+        self.ob_ladders_layout = QVBoxLayout(self.ob_ladders_box)
+        self.ob_ladders_layout.setContentsMargins(0, 0, 0, 0)
+        self.ob_ladders_layout.setSpacing(4)
+        obl.addWidget(self.ob_ladders_box)
+
         pb.addWidget(self.ob_section)
 
         # --- ORDER ENTRY (live/kalshi only; collapsible) ---
@@ -2478,6 +2520,350 @@ class HistoricalOddsWidget(QWidget):
         except Exception as e:
             print(f"⚠️  Failed to initialize Kalshi WebSocket: {e}")
             self.kalshi_stream_client = None
+
+    def _initialize_polymarket_websocket(self):
+        """Initialize the Polymarket CLOB market-channel stream client (public,
+        no auth). Mirrors the Kalshi init; started lazily on entering Live mode."""
+        try:
+            self.polymarket_stream_client = PolymarketStreamClient()
+            self.polymarket_stream_client.connected.connect(self._on_pm_ws_connected)
+            self.polymarket_stream_client.disconnected.connect(self._on_pm_ws_disconnected)
+            self.polymarket_stream_client.error.connect(self._on_pm_ws_error)
+            # Sub-second Live feed signals.
+            self.polymarket_stream_client.orderbook.connect(self._on_pm_orderbook)
+            self.polymarket_stream_client.trade.connect(self._on_pm_trade)
+            print("✅ Polymarket WebSocket client initialized (not started)")
+        except Exception as e:
+            print(f"⚠️  Failed to initialize Polymarket WebSocket: {e}")
+            self.polymarket_stream_client = None
+
+    # ------------------------------------------------------------------
+    # Active-source accessors: the sub-second Live render path is shared, so it
+    # reads the book/key for whichever source (`self.live_source`) is streaming.
+    # ------------------------------------------------------------------
+    def _primary_source(self):
+        """The primary feed source. In 'both' mode Kalshi is primary (it drives
+        the existing flat overlay items, readout and order entry); Polymarket is
+        the secondary overlay."""
+        return 'polymarket' if self.live_source == 'polymarket' else 'kalshi'
+
+    def _live_color(self, source=None):
+        """Series/label color (r,g,b) for a feed source (default: primary)."""
+        return BOOKMAKER_LINE_COLORS.get(source or self._primary_source(), (44, 160, 44))
+
+    def _active_sources(self):
+        """Sources currently being streamed/rendered (1 for single, 2 for 'both')."""
+        if self.live_source == 'both':
+            return ['kalshi', 'polymarket']
+        return [self.live_source]
+
+    def _pm_token_for_current_market(self):
+        """(token_id, outcome_name) of the Polymarket series we track live — the
+        first outcome's CLOB token (matches the first plotted PM series). Returns
+        (None, None) when the current market has no usable Polymarket token."""
+        um = getattr(self, 'current_unified_market', None)
+        m = getattr(um, 'polymarket_market', None) if um else None
+        if m and getattr(m, 'clob_token_ids', None):
+            outcome = m.outcomes[0] if getattr(m, 'outcomes', None) else None
+            return m.clob_token_ids[0], outcome
+        return None, None
+
+    def _build_market_sides(self):
+        """Enumerate the selected market's logical OUTCOMES and resolve each to its
+        per-venue live handle. Generic over outcome count — 2 teams, Over/Under,
+        3-way Home/Draw/Away, Yes/No props.
+
+        Returns a list of dicts (one per outcome):
+          {'label': str,                 # outcome display name
+           'pm_token': str|None,         # Polymarket CLOB token for this outcome
+           'k_ticker': str|None,         # Kalshi market ticker for this outcome
+           'k_complement': bool}         # True == track the Kalshi market's NO side
+                                         #   (single-ticker binary, second outcome)
+
+        Resolution is by OUTCOME NAME (Kalshi markets self-label via yes_sub_title),
+        not list index, since the matcher doesn't guarantee kalshi_tickers and PM
+        outcomes share an order. Falls back to index if a name match misses."""
+        um = getattr(self, 'current_unified_market', None)
+        if um is None:
+            return []
+        sport = getattr(self.current_unified_event, 'sport', None)
+        pm = getattr(um, 'polymarket_market', None)
+        pm_outcomes = list(pm.outcomes) if (pm and getattr(pm, 'outcomes', None)) else []
+        pm_tokens = list(pm.clob_token_ids) if (pm and getattr(pm, 'clob_token_ids', None)) else []
+        k_markets = um.kalshi_markets or []
+
+        # Canonical outcome labels: prefer PM outcomes (clean names, token-aligned);
+        # else derive from the Kalshi markets' yes_sub_titles.
+        if pm_outcomes:
+            labels = pm_outcomes
+        elif k_markets:
+            labels = [(km.get('yes_sub_title') or km.get('title') or f'Outcome {i+1}')
+                      for i, km in enumerate(k_markets)]
+        else:
+            return []
+
+        def _norm(s):
+            try:
+                return EventMatcher.normalize_team_name(s or '', sport)
+            except Exception:
+                return (s or '').strip().lower()
+
+        single_k = len(k_markets) == 1
+        sides = []
+        for i, label in enumerate(labels):
+            pm_token = pm_tokens[i] if i < len(pm_tokens) else None
+            k_ticker, k_complement = None, False
+            if single_k:
+                # One Kalshi binary market: outcome 0 == YES, outcome 1 == NO
+                # complement. Outcomes beyond the binary have no Kalshi handle.
+                if i < 2:
+                    k_ticker = k_markets[0].get('ticker')
+                    k_complement = (i == 1)
+            elif k_markets:
+                nl = _norm(label)
+                for km in k_markets:
+                    sub = km.get('yes_sub_title') or km.get('title') or ''
+                    if nl and (_norm(sub) == nl or nl in sub.lower()):
+                        k_ticker = km.get('ticker')
+                        break
+                if k_ticker is None and i < len(k_markets):  # index fallback
+                    k_ticker = k_markets[i].get('ticker')
+            sides.append({'label': label, 'pm_token': pm_token,
+                          'k_ticker': k_ticker, 'k_complement': k_complement})
+        return sides
+
+    def _build_live_series(self):
+        """Cross the feed axis (active venues) with the outcome axis (selected
+        outcome, or all) into the list of live series to stream + render. Each:
+          {'venue','outcome','key','k_complement','hue','dash','label','ticks','items'}
+        Venue sets the hue (Kalshi green / PM blue); outcome sets the line dash so
+        the two outcomes of a venue stay distinct (solid / dashed / dotted)."""
+        sides = self._build_market_sides()
+        if not sides:
+            return []
+        # Outcome axis.
+        if self.outcome_sel == 'all':
+            chosen = sides
+        else:
+            chosen = [s for s in sides if s['label'] == self.outcome_sel] or sides[:1]
+        # Stable dash per outcome label (shared across venues).
+        dashes = [Qt.PenStyle.SolidLine, Qt.PenStyle.DashLine,
+                  Qt.PenStyle.DotLine, Qt.PenStyle.DashDotLine]
+        label_dash = {s['label']: dashes[i % len(dashes)] for i, s in enumerate(sides)}
+        venues = self._active_sources()
+        series = []
+        for s in chosen:
+            for v in venues:
+                if v == 'polymarket':
+                    if not s['pm_token']:
+                        continue
+                    key, comp = s['pm_token'], False
+                else:
+                    if not s['k_ticker']:
+                        continue
+                    key, comp = s['k_ticker'], s['k_complement']
+                series.append({
+                    'venue': v, 'outcome': s['label'], 'key': key,
+                    'k_complement': comp,
+                    'hue': BOOKMAKER_LINE_COLORS.get(v, (44, 160, 44)),
+                    'dash': label_dash.get(s['label'], Qt.PenStyle.SolidLine),
+                    'label': f"{'K' if v == 'kalshi' else 'PM'} · {s['label']}",
+                    'ticks': [], 'items': None,
+                })
+        return series
+
+    @staticmethod
+    def _complement_state(st):
+        """YES->NO complement of a Kalshi state dict (single-ticker binary, NO side):
+        best_bid/ask swap-and-complement, last/mid -> 100-x."""
+        if not st:
+            return st
+        def c(v):
+            return None if v is None else 100 - v
+        return {'best_bid': c(st.get('best_ask')), 'best_ask': c(st.get('best_bid')),
+                'mid': c(st.get('mid')), 'last_trade': c(st.get('last_trade')),
+                'stale': st.get('stale', False)}
+
+    @staticmethod
+    def _complement_ladder(lad):
+        """YES->NO complement of a ladder dict: bids<->asks swap, price -> 100-price."""
+        if not lad:
+            return lad
+        bids = [(100 - p, q) for p, q in lad.get('asks', [])]
+        asks = [(100 - p, q) for p, q in lad.get('bids', [])]
+        last = lad.get('last_trade')
+        return {'bids': bids, 'asks': asks,
+                'best_bid': bids[0][0] if bids else None,
+                'best_ask': asks[0][0] if asks else None,
+                'last_trade': (100 - last) if last is not None else None,
+                'stale': lad.get('stale', False)}
+
+    def _series_state(self, s):
+        """Live state (cents) for one series, applying the Kalshi NO complement."""
+        if s['venue'] == 'polymarket':
+            return self.pm_live_book.state(s['key'])
+        st = self.live_book.state(s['key'])
+        return self._complement_state(st) if (st and s['k_complement']) else st
+
+    def _series_ladder(self, s, depth):
+        """Depth ladder for one series, applying the Kalshi NO complement."""
+        if s['venue'] == 'polymarket':
+            return self.pm_live_book.ladder(s['key'], depth)
+        lad = self.live_book.ladder(s['key'], depth)
+        return self._complement_ladder(lad) if (lad and s['k_complement']) else lad
+
+    def _rebuild_live_series(self):
+        """Recompute the active live-series set (feed × outcome), tearing down the
+        old overlay items and per-series ladders and rebuilding the ladder stack.
+        Overlay items are recreated lazily on the next refresh."""
+        self._remove_overlay_items()
+        self.live_series = self._build_live_series()
+        self._rebuild_ob_ladders()
+
+    def _rebuild_ob_ladders(self):
+        """Rebuild the stacked order-book ladders — one (label + readout + ladder)
+        group per active live series. Stores the widgets back on each series."""
+        if not hasattr(self, 'ob_ladders_layout'):
+            return
+        while self.ob_ladders_layout.count():
+            item = self.ob_ladders_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        for s in self.live_series:
+            r, g, b = s['hue']
+            lbl = QLabel(s['label'].upper())
+            lbl.setStyleSheet(f"color:#{r:02x}{g:02x}{b:02x};font-family:monospace;"
+                              "font-size:9px;letter-spacing:1px;")
+            ro = QLabel("")
+            ro.setTextFormat(Qt.TextFormat.RichText)
+            ro.setStyleSheet(self._ro_style)
+            ro.setMinimumWidth(0)
+            ro.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            lad = OrderbookLadderWidget(levels=8)
+            self.ob_ladders_layout.addWidget(lbl)
+            self.ob_ladders_layout.addWidget(ro)
+            self.ob_ladders_layout.addWidget(lad)
+            s['readout'], s['ladder'] = ro, lad
+
+    def _populate_side_combo(self):
+        """Fill the Side selector with the market's outcomes + 'All'. Shown only in
+        Live mode when there's >1 outcome. Keeps the current selection."""
+        sides = self._build_market_sides()
+        self.side_combo.blockSignals(True)
+        self.side_combo.clear()
+        for s in sides:
+            self.side_combo.addItem(s['label'], s['label'])
+        if len(sides) > 1:
+            self.side_combo.addItem("All", 'all')
+        idx = self.side_combo.findData(self.outcome_sel)
+        if idx >= 0:
+            self.side_combo.setCurrentIndex(idx)
+        self.side_combo.blockSignals(False)
+        self.side_row.setVisible(self.live_mode and len(sides) > 1)
+
+    @qasync.asyncSlot()
+    async def _on_side_changed(self):
+        """User picked a different outcome (or All) to follow live."""
+        if not self.live_mode:
+            return
+        sel = self.side_combo.currentData()
+        if not sel or sel == self.outcome_sel:
+            return
+        print(f"🎯 Live outcome -> {sel}")
+        # Re-subscribe in place — DON'T stop/start the stream clients (stop() does
+        # a blocking close that stalls the GUI). Unsubscribe old keys, rebuild the
+        # series, ensure the needed clients are running, subscribe the new keys.
+        self._unsubscribe_from_current_market()
+        self.outcome_sel = sel
+        self._rebuild_live_series()
+        self._populate_side_combo()
+        self._update_order_entry_visibility()
+        self._ensure_active_stream_started()
+        self._subscribe_to_current_market()
+        if self._load_task and not self._load_task.done():
+            self._load_task.cancel()
+        self._load_task = asyncio.create_task(self.load_data())
+
+    def _available_live_sources(self):
+        """Sources the currently selected market can stream a live feed from.
+
+        Kalshi is available whenever a ticker is selected (incl. the legacy
+        Kalshi-only selection path with no UnifiedMarket); Polymarket requires a
+        UnifiedMarket carrying a usable CLOB token."""
+        um = getattr(self, 'current_unified_market', None)
+        srcs = []
+        if self.kalshi_market_ticker and (um is None or um.has_kalshi()):
+            srcs.append('kalshi')
+        if um and um.has_polymarket() and self._pm_token_for_current_market()[0]:
+            srcs.append('polymarket')
+        return srcs
+
+    def _populate_feed_sources(self):
+        """Fill the feed-source selector from the current market's sources. The
+        combo is only shown when both are available; the active source is selected
+        without re-triggering a switch."""
+        sources = self._available_live_sources()
+        # Offer a "Both" option (dual orderbook + both lines) only when the market
+        # trades on both venues.
+        options = list(sources)
+        if len(sources) > 1:
+            options.append('both')
+        self.feed_source_combo.blockSignals(True)
+        self.feed_source_combo.clear()
+        labels = {'kalshi': 'Kalshi', 'polymarket': 'Polymarket', 'both': 'Both'}
+        for s in options:
+            self.feed_source_combo.addItem(labels[s], s)
+        idx = self.feed_source_combo.findData(self.live_source)
+        if idx >= 0:
+            self.feed_source_combo.setCurrentIndex(idx)
+        self.feed_source_combo.blockSignals(False)
+        self.feed_source_row.setVisible(len(sources) > 1)
+
+    def _update_order_entry_visibility(self):
+        """Live trading is Kalshi-only for now: show the Kalshi order-entry panel
+        only when a Kalshi series is being streamed, so a pure-Polymarket market
+        can't route an order to a stale Kalshi ticker. (PM trading is next phase.)"""
+        if hasattr(self, 'order_entry_section'):
+            has_kalshi = any(s['venue'] == 'kalshi' for s in self.live_series)
+            self.order_entry_section.setVisible(self.live_mode and has_kalshi)
+
+    def _ensure_active_stream_started(self):
+        """Start the active source(s) stream client(s) if not already running
+        (used when switching markets while already in Live mode)."""
+        for src in self._active_sources():
+            if src == 'polymarket':
+                if self.polymarket_stream_client and not self.polymarket_stream_client._is_running:
+                    self.polymarket_stream_client.start()
+            elif self.kalshi_stream_client and not self.kalshi_stream_client._is_running:
+                self.kalshi_stream_client.start()
+
+    @qasync.asyncSlot()
+    async def _on_feed_source_changed(self):
+        """User picked a different live feed source for the current market."""
+        if not self.live_mode:
+            return
+        sel = self.feed_source_combo.currentData()
+        if not sel or sel == self.live_source:
+            return
+        print(f"🔀 Switching live feed source -> {sel}")
+        # Re-subscribe in place (no stop/start — stop() blocks the GUI on close).
+        self._unsubscribe_from_current_market()
+        self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+        self.live_source = sel
+        if sel in ('polymarket', 'both'):
+            self.polymarket_token_id, self.polymarket_outcome_name = \
+                self._pm_token_for_current_market()
+        self._rebuild_live_series()
+        self._populate_side_combo()
+        self._update_order_entry_visibility()
+        self._ensure_active_stream_started()
+        self._subscribe_to_current_market()
+        # Full reload clears the plot and rebuilds the chart + overlay items.
+        if self._load_task and not self._load_task.done():
+            self._load_task.cancel()
+        self._load_task = asyncio.create_task(self.load_data())
 
     def _on_websocket_connected(self):
         """Handle WebSocket connection"""
@@ -2636,56 +3022,70 @@ class HistoricalOddsWidget(QWidget):
             traceback.print_exc()
 
     def _subscribe_to_current_market(self):
-        """Subscribe to live updates for the currently selected Kalshi market"""
-        if not self.kalshi_stream_client or not self.kalshi_market_ticker:
-            return
-
-        try:
-            if self.live_mode:
-                print(f"📡 Subscribing to sub-second feed (trade + orderbook) for {self.kalshi_market_ticker}")
-                self.live_book.reset(self.kalshi_market_ticker)
-                self.live_ticks = []
-                self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
-                self.kalshi_stream_client.subscribe_live([self.kalshi_market_ticker])
-                # We just cleared live_ticks for the (new) market — re-seed the
-                # historical candles so the chart shows history, not just from now.
-                # No-ops outside candle mode. Runs as its own task (this is sync).
-                asyncio.ensure_future(self._apply_live_history_seed())
-            else:
+        """Subscribe to live updates for the active source(s). In sub-second Live
+        mode each active source subscribes its trade+book feed; outside Live mode
+        only Kalshi's slow `ticker` channel applies (Polymarket has no such poll)."""
+        if not self.live_mode:
+            # Non-live ticker polling is Kalshi-only.
+            if (self.kalshi_stream_client and self.kalshi_market_ticker
+                    and self.live_source != 'polymarket'):
                 print(f"📡 Subscribing to live updates for {self.kalshi_market_ticker}")
                 self.kalshi_stream_client.subscribe_ticker([self.kalshi_market_ticker])
-        except Exception as e:
-            print(f"Failed to subscribe to market: {e}")
-
-    def _unsubscribe_from_current_market(self):
-        """Unsubscribe from the current market"""
-        if not self.kalshi_stream_client or not self.kalshi_market_ticker:
             return
 
-        try:
-            print(f"📡 Unsubscribing from {self.kalshi_market_ticker}")
-            channels = ["trade", "orderbook_delta"] if self.live_mode else ["ticker"]
-            self.kalshi_stream_client.unsubscribe(channels, [self.kalshi_market_ticker])
-            # Also drop the orderbook sid explicitly so the old market's stream
-            # actually stops (channel-based unsubscribe leaves the sid running).
-            if self.live_mode:
-                old_sid = self.live_book.current_sid(self.kalshi_market_ticker)
-                if old_sid is not None:
-                    self.kalshi_stream_client.unsubscribe_sids([old_sid])
-        except Exception as e:
-            print(f"Failed to unsubscribe: {e}")
+        # Sub-second Live: clear per-series ticks + summary, then subscribe every
+        # distinct key across the active series (N Kalshi tickers + N PM tokens).
+        for s in self.live_series:
+            s['ticks'] = []
+        self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+        k_tickers = sorted({s['key'] for s in self.live_series if s['venue'] == 'kalshi'})
+        pm_tokens = sorted({s['key'] for s in self.live_series if s['venue'] == 'polymarket'})
+        if k_tickers and self.kalshi_stream_client:
+            for t in k_tickers:
+                self.live_book.reset(t)
+            print(f"📡 Kalshi sub-second feed: {len(k_tickers)} ticker(s)")
+            self.kalshi_stream_client.subscribe_live(k_tickers)
+        if pm_tokens and self.polymarket_stream_client:
+            for t in pm_tokens:
+                self.pm_live_book.reset(t)
+            print(f"📡 Polymarket sub-second feed: {len(pm_tokens)} token(s)")
+            self.polymarket_stream_client.set_assets(pm_tokens)
+        # Re-seed historical candles for the (new) series (no-op outside candle mode).
+        asyncio.ensure_future(self._apply_live_history_seed())
+
+    def _unsubscribe_from_current_market(self):
+        """Unsubscribe every active series' key from its venue feed."""
+        k_tickers = sorted({s['key'] for s in self.live_series if s['venue'] == 'kalshi'})
+        pm_tokens = {s['key'] for s in self.live_series if s['venue'] == 'polymarket'}
+        for t in pm_tokens:
+            # PM server-side sub is replaced wholesale on the next set_assets.
+            self.pm_live_book.reset(t)
+        if self.kalshi_stream_client and k_tickers:
+            try:
+                channels = ["trade", "orderbook_delta"] if self.live_mode else ["ticker"]
+                self.kalshi_stream_client.unsubscribe(channels, k_tickers)
+                if self.live_mode:
+                    sids = [self.live_book.current_sid(t) for t in k_tickers]
+                    self.kalshi_stream_client.unsubscribe_sids([s for s in sids if s is not None])
+            except Exception as e:
+                print(f"Failed to unsubscribe Kalshi: {e}")
 
     # ------------------------------------------------------------------
     # Sub-second Live feed (trade + orderbook_delta) — additive to the
     # existing `ticker` path used by _on_websocket_tick.
     # ------------------------------------------------------------------
+    def _active_kalshi_keys(self):
+        """Tickers of the Kalshi series currently being streamed (1..N)."""
+        return {s['key'] for s in self.live_series if s['venue'] == 'kalshi'}
+
     def _on_ws_trade(self, msg):
-        """Handle a Kalshi `trade` message (true per-execution tick)."""
+        """Handle a Kalshi `trade` message (true per-execution tick). Accepts any
+        ticker among the active Kalshi series ('All' outcomes streams several)."""
         if not self.live_mode:
             return
         try:
             inner = msg.get('msg', {}) or {}
-            if inner.get('market_ticker') != self.kalshi_market_ticker:
+            if inner.get('market_ticker') not in self._active_kalshi_keys():
                 return
             self.live_book.apply(msg)
             self._live_dirty = True
@@ -2693,12 +3093,13 @@ class HistoricalOddsWidget(QWidget):
             print(f"Error processing live trade: {e}")
 
     def _on_ws_orderbook(self, msg):
-        """Handle a Kalshi `orderbook_snapshot`/`orderbook_delta` message."""
+        """Handle a Kalshi `orderbook_snapshot`/`orderbook_delta` message (any of
+        the active Kalshi series' tickers)."""
         if not self.live_mode:
             return
         try:
             inner = msg.get('msg', {}) or {}
-            if inner.get('market_ticker') != self.kalshi_market_ticker:
+            if inner.get('market_ticker') not in self._active_kalshi_keys():
                 return
             self.live_book.apply(msg)
             self._live_dirty = True
@@ -2729,6 +3130,74 @@ class HistoricalOddsWidget(QWidget):
             self.kalshi_stream_client.subscribe(["orderbook_delta"], [ticker])
         except Exception as e:
             print(f"Failed to resubscribe after gap: {e}")
+
+    # ------------------------------------------------------------------
+    # Polymarket sub-second Live feed (CLOB market channel). Symmetric to the
+    # Kalshi trade/orderbook handlers; both funnel into the shared live book +
+    # _flush_live_plot render path via the active-source accessors.
+    # ------------------------------------------------------------------
+    def _on_pm_ws_connected(self):
+        if self.live_source != 'polymarket':
+            return
+        print("🔌 Polymarket WebSocket connected")
+        self.ws_status_label.setText("🟢")
+        self.ws_status_label.setToolTip("WebSocket: Connected (Polymarket Live)")
+        self.ws_status_label.setStyleSheet("color: green")
+
+    def _on_pm_ws_disconnected(self):
+        if self.live_source != 'polymarket':
+            return
+        print("🔌 Polymarket WebSocket disconnected")
+        self.ws_status_label.setText("🔴")
+        self.ws_status_label.setToolTip("WebSocket: Disconnected")
+        self.ws_status_label.setStyleSheet("color: red")
+
+    def _on_pm_ws_error(self, error_data):
+        if self.live_source != 'polymarket':
+            return
+        print(f"⚠️  Polymarket WebSocket error: {error_data}")
+        self.ws_status_label.setText("🟠")
+        self.ws_status_label.setToolTip(
+            f"WebSocket: Error - {error_data.get('action', 'unknown') if isinstance(error_data, dict) else error_data}")
+
+    def _active_pm_keys(self):
+        """Tokens of the Polymarket series currently being streamed (1..N)."""
+        return {s['key'] for s in self.live_series if s['venue'] == 'polymarket'}
+
+    def _on_pm_orderbook(self, ev):
+        """Handle a Polymarket `book`/`price_change` event (orderbook update). The
+        book is always applied (keyed by asset_id); a repaint is flagged when the
+        event touches any active PM series token ('All' tracks several)."""
+        if not self.live_mode or self.live_source not in ('polymarket', 'both'):
+            return
+        try:
+            self.pm_live_book.apply(ev)
+            if self._pm_event_matches(ev):
+                self._live_dirty = True
+        except Exception as e:
+            print(f"Error processing Polymarket orderbook: {e}")
+
+    def _on_pm_trade(self, ev):
+        """Handle a Polymarket `last_trade_price` event (any active PM token)."""
+        if not self.live_mode or self.live_source not in ('polymarket', 'both'):
+            return
+        try:
+            self.pm_live_book.apply(ev)
+            if ev.get('asset_id') in self._active_pm_keys():
+                self._live_dirty = True
+        except Exception as e:
+            print(f"Error processing Polymarket trade: {e}")
+
+    def _pm_event_matches(self, ev):
+        """True if the event touches any active PM series token (price_change
+        bundles per-asset changes under price_changes[])."""
+        keys = self._active_pm_keys()
+        if ev.get('asset_id') in keys:
+            return True
+        for ch in ev.get('price_changes', []) or []:
+            if ch.get('asset_id') in keys:
+                return True
+        return False
 
     def _collapsible_section(self, title, content_widget, expanded=True):
         """Wrap content in a section with a clickable ▾/▸ header that toggles it.
@@ -2982,14 +3451,16 @@ class HistoricalOddsWidget(QWidget):
             return int(text[:-1]) * 60
         return int(text.removesuffix('s'))
 
-    def _update_ob_readout(self, state):
-        """Refresh the discreet inline bid/ask/spread/last readout."""
+    def _update_ob_readout(self, state, label):
+        """Refresh a per-series inline bid/ask/spread/last readout label."""
+        if label is None:
+            return
         def c(v):
             return f"{v}¢" if v is not None else "—"
         bid, ask, last = state.get('best_bid'), state.get('best_ask'), state.get('last_trade')
         spread = (ask - bid) if (bid is not None and ask is not None) else None
         stale = " <span style='color:#d08770'>·resync</span>" if state.get('stale') else ""
-        self.ob_readout.setText(
+        label.setText(
             f"bid <span style='color:#8fbf7f'>{c(bid)}</span>  "
             f"ask <span style='color:#cf6f6f'>{c(ask)}</span>  "
             f"spr {c(spread)}  "
@@ -3002,50 +3473,55 @@ class HistoricalOddsWidget(QWidget):
         if not self._live_dirty:
             return
         self._live_dirty = False
-
-        ticker = self.kalshi_market_ticker
-        if not ticker:
-            return
-        state = self.live_book.state(ticker)
-        if not state:
+        if not self.live_series:
             return
 
-        # Prefer last executed trade. Only fall back to the bid/ask MID when both
-        # sides are present — a one-sided book (only a bid or only an ask) would
-        # otherwise yield an extreme/garbage price.
-        price_cents = state.get('last_trade')
-        if price_cents is None:
-            if state.get('best_bid') is not None and state.get('best_ask') is not None:
-                price_cents = int(round(state['mid']))
-        if price_cents is None or not (0 < price_cents < 100):
-            return
-
-        # Local time to match the candlestick seed path's axis.
         from datetime import datetime
-        now_t = datetime.now().timestamp()
+        now_t = datetime.now().timestamp()  # local time matches the seed-path axis
 
-        # Record the live tick (price + book sides).
-        self.live_ticks.append({
-            't': now_t,
-            'price': price_cents,
-            'bid': state.get('best_bid'),
-            'ask': state.get('best_ask'),
-        })
-        # Cap memory: keep at most ~6h of 250ms ticks.
-        if len(self.live_ticks) > 90000:
-            self.live_ticks = self.live_ticks[-90000:]
+        # When the widget is hidden (toggled off / window minimized) keep recording
+        # ticks so the history stays continuous, but skip ALL the invisible visual
+        # work (readouts, ladders, summaries, overlay render). The chart catches up
+        # on the next live tick once it's shown again.
+        vis = self.isVisible()
 
-        self._update_ob_readout(state)
-        self._update_live_summary_label(state, now_t)
-        # Feed the depth ladder (cheap custom-painted widget).
-        lad = self.live_book.ladder(ticker, depth=self.ob_ladder._levels)
-        if lad:
-            self.ob_ladder.set_data(lad['asks'], lad['bids'],
-                                    lad.get('last_trade'), lad.get('stale', False))
+        any_ticks = False
+        for idx, s in enumerate(self.live_series):
+            st = self._series_state(s)
+            if not st:
+                any_ticks = any_ticks or bool(s['ticks'])
+                continue
+            # Prefer last executed trade; fall back to the bid/ask MID only when
+            # both sides are present (a one-sided book yields a garbage price).
+            px = st.get('last_trade')
+            if px is None and st.get('best_bid') is not None and st.get('best_ask') is not None:
+                px = st['mid']
+            if px is not None and 0 < px < 100:
+                s['ticks'].append({'t': now_t, 'price': px,
+                                   'bid': st.get('best_bid'), 'ask': st.get('best_ask')})
+                if len(s['ticks']) > 90000:  # cap ~6h of 250ms ticks
+                    s['ticks'] = s['ticks'][-90000:]
+            any_ticks = any_ticks or bool(s['ticks'])
+            # Per-series readout + depth ladder (skip when hidden — invisible).
+            if vis and s.get('readout') is not None:
+                self._update_ob_readout(st, s['readout'])
+            if vis and s.get('ladder') is not None:
+                lad = self._series_ladder(s, s['ladder']._levels)
+                if lad:
+                    s['ladder'].set_data(lad['asks'], lad['bids'],
+                                         lad.get('last_trade'), lad.get('stale', False))
 
-        # Ensure persistent items exist (first tick after entering live mode), then
+        if not vis:
+            return
+        # Corner summaries: one box per band (pos >=50% / neg <50%), each showing
+        # every venue's price for that band side by side.
+        self._update_live_summaries(now_t)
+
+        if not any_ticks:
+            return
+        # Ensure persistent items exist (first tick after a series-set change), then
         # do the cheap in-place refresh.
-        if getattr(self, '_li_line', None) is None:
+        if not self._overlays_built():
             self._rebuild_live_items()
         self._refresh_live_items()
 
@@ -3062,51 +3538,70 @@ class HistoricalOddsWidget(QWidget):
             return -100.0 * p / (1.0 - p)
         return 100.0 * (1.0 - p) / p
 
-    def _update_live_summary_label(self, state, now_t):
-        """Tick-by-tick update of the corner range label for the live band. Shows
-        implied chance (%) to one decimal with the American odds in parens."""
-        # Use the mid for smooth sub-integer movement; fall back to last trade.
-        mid = state.get('mid')
-        cents = mid if mid is not None else state.get('last_trade')
-        if cents is None or not (0.0 < cents < 100.0):
-            return
-        cur = float(cents)  # cents == implied chance %
-        am = self._am_from_cents_float(cents)
+    def _update_live_summaries(self, now_t):
+        """Update the corner range boxes — one per band (pos >=50% / neg <50%).
 
-        if self._live_lbl_open is None:
-            self._live_lbl_open = cur
-            self._live_lbl_min = cur
-            self._live_lbl_max = cur
-        else:
-            self._live_lbl_min = min(self._live_lbl_min, cur)
-            self._live_lbl_max = max(self._live_lbl_max, cur)
-
-        open_v = self._live_lbl_open
-        delta = cur - open_v
-        rng = self._live_lbl_max - self._live_lbl_min
-        if delta > 0:
-            arrow, dcolor = '▲', (80, 200, 120)
-        elif delta < 0:
-            arrow, dcolor = '▼', (220, 90, 90)
-        else:
-            arrow, dcolor = '■', (170, 170, 170)
-        dhex = '#%02x%02x%02x' % dcolor
+        Each box shows EVERY active venue's current price for that band side by
+        side (venue-coloured, e.g. Kalshi 71.5% green next to Poly 71.5% blue), plus
+        the open->cur move / range / updated-time for the band's first series.
+        With Side='All' both bands are populated (favourite + underdog)."""
         from datetime import datetime
         updated = datetime.fromtimestamp(now_t).strftime('%H:%M:%S')
-        band_key = 'pos' if cur >= 50.0 else 'neg'
-        am_str = ""
-        if am is not None:
-            am_i = int(round(am))
-            am_str = f" <span style='color:#0f7a30'>({'+' if am_i > 0 else ''}{am_i})</span>"
-        # Bold current value header (green = Kalshi live), matching the seed path.
-        html = (
-            f"<div style='font-size:11pt;color:#2ca02c;font-weight:bold'>{cur:.1f}%{am_str}</div>"
-            f"<div style='font-size:9pt;color:#c8c8c8'>{open_v:.1f}%&#8594;{cur:.1f}% "
-            f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span> "
-            f"<span style='color:#8a93a0'>· rng {rng:.1f}%</span></div>"
-            f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
-        )
-        self._set_summary_label(band_key, html)
+
+        bands = {'pos': [], 'neg': []}
+        for s in self.live_series:
+            st = self._series_state(s)
+            if not st:
+                continue
+            mid = st.get('mid')
+            cents = mid if mid is not None else st.get('last_trade')
+            if cents is None or not (0.0 < cents < 100.0):
+                continue
+            cents = float(cents)
+            # Per-series running open/min/max (reset whenever the series is rebuilt
+            # since _build_live_series makes fresh dicts without these keys).
+            if s.get('_lbl_open') is None:
+                s['_lbl_open'] = s['_lbl_min'] = s['_lbl_max'] = cents
+            else:
+                s['_lbl_min'] = min(s['_lbl_min'], cents)
+                s['_lbl_max'] = max(s['_lbl_max'], cents)
+            bands['pos' if cents >= 50.0 else 'neg'].append((s, cents))
+
+        for band in ('pos', 'neg'):
+            label = self.summary_label_top if band == 'pos' else self.summary_label_bottom
+            items = bands[band]
+            if not items:
+                label.hide()
+                continue
+            # Big line: each venue's % adjacent (no spacing), coloured by venue.
+            spans = []
+            for s, cents in items:
+                r, g, b = s['hue']
+                spans.append(f"<span style='color:#{r:02x}{g:02x}{b:02x};"
+                             f"font-weight:bold'>{cents:.1f}%</span>")
+            # Space the venue prices apart so they read as distinct values rather
+            # than being slammed together.
+            big = "&nbsp;&nbsp;&nbsp;".join(spans)
+            # Move/range line tracks the band's first series.
+            s0, c0 = items[0]
+            open_v = s0['_lbl_open']
+            delta = c0 - open_v
+            rng = s0['_lbl_max'] - s0['_lbl_min']
+            if delta > 0:
+                arrow, dcolor = '▲', (80, 200, 120)
+            elif delta < 0:
+                arrow, dcolor = '▼', (220, 90, 90)
+            else:
+                arrow, dcolor = '■', (170, 170, 170)
+            dhex = '#%02x%02x%02x' % dcolor
+            html = (
+                f"<div style='font-size:11pt'>{big}</div>"
+                f"<div style='font-size:9pt;color:#c8c8c8'>{open_v:.1f}%&#8594;{c0:.1f}% "
+                f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span> "
+                f"<span style='color:#8a93a0'>· rng {rng:.1f}%</span></div>"
+                f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>"
+            )
+            self._set_summary_label(band, html)
 
     def enable_websocket_updates(self, enable: bool = True):
         """
@@ -3118,12 +3613,17 @@ class HistoricalOddsWidget(QWidget):
         self.websocket_enabled = enable
 
         if enable:
-            if self.kalshi_stream_client and not self.kalshi_stream_client._is_running:
-                print("🚀 Starting Kalshi WebSocket...")
-                self.kalshi_stream_client.start()
-                # Subscribe to current market if any
-                if self.kalshi_market_ticker:
-                    self._subscribe_to_current_market()
+            # Start every active source's stream client (one for single, both for
+            # 'both' mode), then subscribe the current market on each.
+            for src in self._active_sources():
+                if src == 'polymarket':
+                    if self.polymarket_stream_client and not self.polymarket_stream_client._is_running:
+                        print("🚀 Starting Polymarket WebSocket...")
+                        self.polymarket_stream_client.start()
+                elif self.kalshi_stream_client and not self.kalshi_stream_client._is_running:
+                    print("🚀 Starting Kalshi WebSocket...")
+                    self.kalshi_stream_client.start()
+            self._subscribe_to_current_market()
             # Stop polling timer
             self.refresh_timer.stop()
             # Start coalesced repaint cadence while in sub-second Live mode
@@ -3131,9 +3631,13 @@ class HistoricalOddsWidget(QWidget):
                 self.live_repaint_timer.start()
         else:
             self.live_repaint_timer.stop()
-            if self.kalshi_stream_client:
+            # Stop whichever stream clients are running (source may have changed).
+            if self.kalshi_stream_client and self.kalshi_stream_client._is_running:
                 print("🛑 Stopping Kalshi WebSocket...")
                 self.kalshi_stream_client.stop()
+            if self.polymarket_stream_client and self.polymarket_stream_client._is_running:
+                print("🛑 Stopping Polymarket WebSocket...")
+                self.polymarket_stream_client.stop()
             # Resume polling if enabled
             if self.auto_refresh_enabled and self.data_source == 'kalshi':
                 self.refresh_timer.start(self.refresh_interval_ms)
@@ -4565,23 +5069,53 @@ class HistoricalOddsWidget(QWidget):
         # Check if this is a UnifiedMarket object
         if isinstance(market_data, UnifiedMarket):
             unified_market = market_data
+
+            # Unsubscribe from the OLD market's live feed BEFORE retargeting the
+            # tracked tickers/tokens (uses the current live_source + keys).
+            if self.websocket_enabled:
+                self._unsubscribe_from_current_market()
+
             self.current_unified_market = unified_market
 
-            # Show what sources are available
+            # Retarget per-source keys for the new market.
             source_info = []
             if unified_market.has_kalshi():
                 source_info.append("Kalshi")
-                # Store first ticker for legacy compatibility (some code may still use it)
                 self.kalshi_market_ticker = unified_market.kalshi_tickers[0] if unified_market.kalshi_tickers else None
+            else:
+                self.kalshi_market_ticker = None
             if unified_market.has_polymarket():
                 source_info.append("Polymarket")
+                self.polymarket_token_id, self.polymarket_outcome_name = \
+                    self._pm_token_for_current_market()
+            else:
+                self.polymarket_token_id = self.polymarket_outcome_name = None
 
             print(f"Market changed to: [{' + '.join(source_info)}] {unified_market.display_name}")
 
-            # Handle WebSocket subscription for Kalshi markets
-            if self.websocket_enabled and unified_market.has_kalshi():
-                self._unsubscribe_from_current_market()
-                # Market ticker is already set above, now subscribe
+            # Re-target the live feed for the new market.
+            if self.live_mode and self.websocket_enabled:
+                avail = self._available_live_sources()
+                if avail:
+                    # Keep 'both' if both venues are still available; otherwise if
+                    # the current single source is gone, fall back to what's there.
+                    if self.live_source == 'both':
+                        if len(avail) < 2:
+                            self.live_source = avail[0]
+                    elif self.live_source not in avail:
+                        self.live_source = avail[0]
+                    # Reset the outcome selection to the new market's first outcome
+                    # (the previous label likely doesn't exist here).
+                    _sides = self._build_market_sides()
+                    self.outcome_sel = _sides[0]['label'] if _sides else None
+                    self._rebuild_live_series()
+                    self._populate_feed_sources()
+                    self._populate_side_combo()
+                    self._update_order_entry_visibility()
+                    self._ensure_active_stream_started()
+                    self._subscribe_to_current_market()
+            elif self.websocket_enabled and unified_market.has_kalshi():
+                # Non-live ticker-polling path (Kalshi only) — existing behavior.
                 self._subscribe_to_current_market()
 
             # Reload data for new market
@@ -5115,22 +5649,41 @@ class HistoricalOddsWidget(QWidget):
         self._load_task = asyncio.create_task(self.load_data())
 
     async def _enter_live_mode(self):
-        """Switch the widget into sub-second websocket Live mode (Kalshi only)."""
-        if self.kalshi_stream_client is None:
-            print("⚠️  Live mode unavailable: Kalshi WebSocket client failed to init")
+        """Switch the widget into sub-second websocket Live mode (Kalshi or
+        Polymarket). The source is chosen from what the selected market offers;
+        when it trades on both, Kalshi is the default (its OHLC seed + order entry
+        are fully wired) and the feed selector lets the user switch to Polymarket."""
+        def _revert():
             self.kalshi_interval.setCurrentText("1m")
             self._set_timeframe_silent("1m · 1h")
-            return
-        if not self.kalshi_market_ticker:
-            print("⚠️  Live mode needs a selected Kalshi market — reverting to 1m")
-            self.kalshi_interval.setCurrentText("1m")
-            self._set_timeframe_silent("1m · 1h")
+
+        sources = self._available_live_sources()
+        if not sources:
+            print("⚠️  Live mode needs a selected Kalshi or Polymarket market — reverting to 1m")
+            _revert()
             return
 
-        print("🔴 Entering Live (sub-second) mode")
+        self.live_source = 'kalshi' if 'kalshi' in sources else 'polymarket'
+        if self.live_source == 'polymarket':
+            if self.polymarket_stream_client is None:
+                print("⚠️  Live mode unavailable: Polymarket WebSocket failed to init")
+                _revert()
+                return
+            self.polymarket_token_id, self.polymarket_outcome_name = \
+                self._pm_token_for_current_market()
+        else:
+            if self.kalshi_stream_client is None:
+                print("⚠️  Live mode unavailable: Kalshi WebSocket client failed to init")
+                _revert()
+                return
+
+        print(f"🔴 Entering Live (sub-second) mode [{self.live_source}]")
         self.live_mode = True
-        self.live_ticks = []
         self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
+        # Default to following the first outcome (single series) — matches prior
+        # behavior; the Side selector lets the user pick another or "All".
+        _sides = self._build_market_sides()
+        self.outcome_sel = _sides[0]['label'] if _sides else None
 
         # Live defaults to 1-min CANDLESTICKS over the last day (real Kalshi OHLC).
         # Lines are reserved for TheOddsAPI; prediction-market series render as
@@ -5157,10 +5710,15 @@ class HistoricalOddsWidget(QWidget):
 
         self.live_controls.setVisible(True)
         self.ob_section.setVisible(True)
-        self.order_entry_section.setVisible(True)
-        self.ob_ladder.clear()
+        # Build the active series (feed × outcome) + the ladder stack, then the
+        # selectors reflect the current choice.
+        self._rebuild_live_series()
+        self._populate_feed_sources()
+        self._populate_side_combo()
+        self._update_order_entry_visibility()  # Kalshi-only order entry for now
         self.open_orders_list.clear()
-        asyncio.create_task(self._refresh_open_orders())
+        if any(s['venue'] == 'kalshi' for s in self.live_series):
+            asyncio.create_task(self._refresh_open_orders())
         # Auto-expand the panel so the live depth is visible on entry.
         if getattr(self, '_panel_collapsed', False):
             self._toggle_right_panel()
@@ -5177,34 +5735,41 @@ class HistoricalOddsWidget(QWidget):
         await self.load_data()
 
     async def _apply_live_history_seed(self):
-        """Seed Live candles with the last day of real 1-min Kalshi OHLC so the
-        chart shows history up to now — not just from the moment Live was toggled.
-
-        Expands each historical candle into synthetic O→H→L→C ticks (reusing the
-        60s live aggregator) and MERGES with any live ticks newer than the seed,
-        keeping the series time-sorted. Called on live entry AND on market switch,
-        since both clear live_ticks via _subscribe_to_current_market."""
+        """Seed each live series' candles with the last day of history so the chart
+        shows history up to now — Kalshi from real 1-min OHLC, Polymarket from CLOB
+        prices-history (both -> 4 ticks/min via the shared aggregator). Merges with
+        any live ticks newer than the seed, time-sorted. Called on live entry and on
+        every feed/side/market change (which clear per-series ticks)."""
         if not (self.live_mode and self.candle_mode):
             return
-        seed = self._seed_ticks_from_ohlc(await self._fetch_seed_ohlc())
-        if not seed:
+        for s in self.live_series:
+            if s['venue'] == 'polymarket':
+                seed = await self._fetch_pm_seed_ticks(s['key'])
+            else:
+                seed = self._seed_ticks_from_ohlc(await self._fetch_seed_ohlc(s['key']))
+                if seed and s['k_complement']:
+                    seed = [{**t, 'price': 100 - t['price']} for t in seed]
+            if seed:
+                last_t = seed[-1]['t']
+                tail = [t for t in s['ticks'] if t['t'] > last_t]
+                s['ticks'] = sorted(seed + tail, key=lambda t: t['t'])
+
+        if not any(s['ticks'] for s in self.live_series):
             return
-        last_t = seed[-1]['t']
-        tail = [t for t in self.live_ticks if t['t'] > last_t]
-        self.live_ticks = sorted(seed + tail, key=lambda t: t['t'])
-        if getattr(self, '_li_line', None) is None:
+        if not self._overlays_built():
             self._rebuild_live_items()
         self._refresh_live_items()
 
-    async def _fetch_seed_ohlc(self):
-        """Fetch the last day of 1-min Kalshi OHLC candles for the live market."""
-        mkt = self.kalshi_market_ticker
+    async def _fetch_seed_ohlc(self, ticker=None):
+        """Fetch the last day of 1-min Kalshi OHLC candles for `ticker` (default
+        the primary Kalshi market)."""
+        mkt = ticker or self.kalshi_market_ticker
         if not mkt:
             return []
         # Derive the series the SAME way the unified load path does
-        # (kalshi_event_ticker.split('-')[0]) instead of relying on
-        # self.kalshi_series_ticker, which isn't set in the unified-market flow.
-        series = self.kalshi_series_ticker or mkt.split('-')[0]
+        # (event_ticker prefix) instead of relying on self.kalshi_series_ticker,
+        # which isn't set in the unified-market flow.
+        series = (self.kalshi_series_ticker if not ticker else None) or mkt.split('-')[0]
         from datetime import datetime
         end = datetime.now().timestamp()
         try:
@@ -5212,6 +5777,70 @@ class HistoricalOddsWidget(QWidget):
                 mkt, series, end - 24 * 3600, end, period_interval=1)
         except Exception as e:
             print(f"⚠️  seed OHLC fetch failed: {e}")
+            return []
+
+    async def _fetch_pm_seed_ticks(self, token=None):
+        """Seed Live candles with the last day of Polymarket price history for the
+        tracked token.
+
+        Unlike Kalshi (real OHLC bars), CLOB prices-history gives ONE price per
+        minute. Emitting one tick per point would make every seeded candle a flat
+        doji. Instead we candle-ize the series the standard way: each minute's
+        candle OPENS at the previous minute's price and CLOSES at this minute's
+        price, so the seeded bars show real directional bodies. The open/close are
+        placed at +1s/+59s within the minute, matching _seed_ticks_from_ohlc's
+        1-minute-bucket convention (live entry forces the 1m bucket)."""
+        token = token or self.polymarket_token_id
+        if not token:
+            return []
+        from datetime import datetime
+        end = datetime.now().timestamp()
+        try:
+            import aiohttp
+            url = "https://clob.polymarket.com/prices-history"
+            params = {'market': token, 'startTs': int(end - 24 * 3600),
+                      'endTs': int(end), 'fidelity': 1}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=15) as resp:
+                    if resp.status != 200:
+                        print(f"⚠️  PM seed history HTTP {resp.status}")
+                        return []
+                    data = await resp.json()
+            pts = []
+            for pt in data.get('history', []):
+                t, p = pt.get('t'), pt.get('p')
+                if t is None or p is None:
+                    continue
+                pf = float(p)
+                cents = pf * 100.0 if pf <= 1.0 else pf
+                if 0 < cents < 100:
+                    pts.append((float(t), round(cents, 1)))
+            if not pts:
+                return []
+            # Resample onto a CONTINUOUS 1-minute grid (carry the last known price
+            # across minutes that prices-history skips), then emit 4 ticks/min at
+            # the SAME offsets as the Kalshi OHLC seed (_seed_ticks_from_ohlc). This
+            # makes PM seeded candles continuous + identically spaced to Kalshi
+            # instead of gapped/sparse where PM's history has no point for a minute.
+            pts.sort(key=lambda x: x[0])
+            start_m = (int(pts[0][0]) // 60) * 60
+            end_m = (int(pts[-1][0]) // 60) * 60
+            grid, j, last_price = {}, 0, pts[0][1]
+            for m in range(start_m, end_m + 60, 60):
+                while j < len(pts) and (int(pts[j][0]) // 60) * 60 <= m:
+                    last_price = pts[j][1]; j += 1
+                grid[m] = last_price
+            ticks, prev = [], None
+            for m in sorted(grid):
+                c = grid[m]
+                o = prev if prev is not None else c
+                hi, lo = max(o, c), min(o, c)
+                for off, price in ((1, o), (20, hi), (40, lo), (59, c)):
+                    ticks.append({'t': m + off, 'price': price, 'bid': None, 'ask': None})
+                prev = c
+            return ticks
+        except Exception as e:
+            print(f"⚠️  PM seed history fetch failed: {e}")
             return []
 
     @staticmethod
@@ -5237,19 +5866,19 @@ class HistoricalOddsWidget(QWidget):
         self.live_controls.setVisible(False)
         self.ob_section.setVisible(False)
         self.order_entry_section.setVisible(False)
-        self.ob_readout.setText("")
-        self.ob_ladder.clear()
         self.open_orders_list.clear()
-        self.live_ticks = []
+        # Drop overlay items + the per-series ladders; the next live entry rebuilds.
+        self._remove_overlay_items()
+        self.live_series = []
+        self._rebuild_ob_ladders()  # clears the ladder stack
         self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
-        # Drop persistent-item handles; the next normal load's clear() removes the
-        # items from the scene and a future live entry recreates them.
-        self._li_line = None
-        self._li_band_lo = self._li_band_hi = self._li_band_fill = None
-        self._li_cbodies = self._li_cwicks = None
         self.enable_websocket_updates(False)
-        if self.kalshi_market_ticker:
-            self.live_book.reset(self.kalshi_market_ticker)
+        self.live_book.reset()
+        self.pm_live_book.reset()
+        self.feed_source_row.setVisible(False)
+        self.side_row.setVisible(False)
+        self.live_source = 'kalshi'  # default for the next live entry
+        self.outcome_sel = None
 
     async def update_plot(self, snapshots):
         """Enhanced plotting with point change visualization"""
@@ -5348,85 +5977,139 @@ class HistoricalOddsWidget(QWidget):
             return None
         return float(cents)
 
-    def _rebuild_live_items(self):
-        """(Re)create the persistent Live overlay items and add them to the plot.
-
-        Called only on full redraws (after update_plot's clear()), not per tick.
-        Items are then mutated in place via setData/setOpts in _refresh_live_items."""
-        # Live feed is always Kalshi -> green, matching the seed-series color map.
-        self._li_line = pg.PlotDataItem([], [], pen=pg.mkPen((44, 160, 44), width=2))
-        self._li_band_lo = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
-        self._li_band_hi = pg.PlotDataItem([], [], pen=pg.mkPen((120, 140, 160, 90), width=1))
-        self._li_band_fill = pg.FillBetweenItem(
-            self._li_band_lo, self._li_band_hi, brush=pg.mkBrush(120, 140, 160, 45))
-        self._li_cwicks = pg.PlotDataItem([], [], connect='finite',
-                                          pen=pg.mkPen(170, 170, 170, 200))
-        self._li_cbodies = pg.BarGraphItem(x=[], width=[], y0=[], height=[])
+    def _make_overlay_set(self, line_color, dash=None):
+        """Create one series' persistent overlay items (line + spread band + candle
+        bodies/wicks), add them to the plot, and return them as a dict. `dash` (a
+        Qt.PenStyle) distinguishes outcomes within a venue's hue; the candle wick
+        carries the venue hue so overlapping candle series stay identifiable."""
+        r, g, b = line_color
+        pen = pg.mkPen(line_color, width=2)
+        if dash is not None:
+            pen.setStyle(dash)
+        line = pg.PlotDataItem([], [], pen=pen)
+        band_lo = pg.PlotDataItem([], [], pen=pg.mkPen((r, g, b, 90), width=1))
+        band_hi = pg.PlotDataItem([], [], pen=pg.mkPen((r, g, b, 90), width=1))
+        band_fill = pg.FillBetweenItem(band_lo, band_hi, brush=pg.mkBrush(r, g, b, 40))
+        cwicks = pg.PlotDataItem([], [], connect='finite',
+                                 pen=pg.mkPen(r, g, b, 220))
+        cbodies = pg.BarGraphItem(x=[], width=[], y0=[], height=[])
         # z-order: band (back) -> line -> candles (front)
-        for it in (self._li_band_lo, self._li_band_hi, self._li_band_fill,
-                   self._li_line, self._li_cwicks, self._li_cbodies):
+        for it in (band_lo, band_hi, band_fill, line, cwicks, cbodies):
             self.plot_widget.addItem(it)
+        return {'line': line, 'band_lo': band_lo, 'band_hi': band_hi,
+                'band_fill': band_fill, 'cwicks': cwicks, 'cbodies': cbodies}
 
-    def _refresh_live_items(self):
-        """Cheap per-tick update: setData on the persistent overlay items only."""
-        if getattr(self, '_li_line', None) is None:
-            return
-        ticks = self.live_ticks
+    def _overlays_built(self):
+        """True once every active live series has its overlay items created."""
+        return bool(self.live_series) and all(s.get('items') for s in self.live_series)
+
+    def _remove_overlay_items(self):
+        """Remove all series overlay items from the plot (used before a rebuild)."""
+        for s in self.live_series:
+            it = s.get('items')
+            if not it:
+                continue
+            for obj in it.values():
+                try:
+                    self.plot_widget.removeItem(obj)
+                except Exception:
+                    pass
+            s['items'] = None
+
+    def _rebuild_live_items(self):
+        """(Re)create the persistent overlay items for every active live series and
+        add them to the plot. Called on full redraws (after update_plot's clear())
+        and on the first tick after the series set changes; mutated in place per
+        tick via setData/setOpts in _refresh_live_items."""
+        for s in self.live_series:
+            s['items'] = self._make_overlay_set(s['hue'], s['dash'])
+
+    def _render_overlay_set(self, ticks, items, xmin=None, xmax=None):
+        """Update one series' overlay items (line, spread band, candles) from its
+        ticks, CLIPPED to the visible [xmin, xmax] window so the per-frame cost is
+        bounded by what's on screen rather than the full (seed + live) history.
+        Ticks are time-sorted, so the window is found by bisection."""
         to_pct = self._cents_to_pct
+        if xmin is not None and ticks:
+            import bisect
+            i0 = bisect.bisect_left(ticks, xmin, key=lambda tk: tk['t'])
+            i1 = bisect.bisect_right(ticks, xmax, key=lambda tk: tk['t'])
+            sub = ticks[i0:i1]
+        else:
+            sub = ticks
 
-        # --- Line (live price extension in implied %; hidden when candles shown) ---
-        lx, ly = [], []
-        for tk in ticks:
-            pct = to_pct(tk['price'])
-            if pct is not None:
-                lx.append(tk['t']); ly.append(pct)
-        self._li_line.setData(lx, ly)
-        self._li_line.setVisible(not self.candle_mode and len(lx) > 0)
+        # --- Line (hidden in candle mode -> skip building its array entirely) ---
+        if not self.candle_mode:
+            lx, ly = [], []
+            for tk in sub:
+                pct = to_pct(tk['price'])
+                if pct is not None:
+                    lx.append(tk['t']); ly.append(pct)
+            items['line'].setData(lx, ly)
+            items['line'].setVisible(len(lx) > 0)
+        else:
+            items['line'].setVisible(False)
 
         # --- Spread band (bid/ask in implied %) ---
         show_band = self.show_spread_band
         if show_band:
             bx, b_lo, b_hi = [], [], []
-            for tk in ticks:
+            for tk in sub:
                 lo, hi = to_pct(tk['bid']), to_pct(tk['ask'])
                 if lo is None or hi is None:
                     continue
                 bx.append(tk['t']); b_lo.append(lo); b_hi.append(hi)
-            self._li_band_lo.setData(bx, b_lo)
-            self._li_band_hi.setData(bx, b_hi)
-        for it in (self._li_band_lo, self._li_band_hi, self._li_band_fill):
-            it.setVisible(show_band)
+            items['band_lo'].setData(bx, b_lo)
+            items['band_hi'].setData(bx, b_hi)
+        for k in ('band_lo', 'band_hi', 'band_fill'):
+            items[k].setVisible(show_band)
 
         # --- Candles ---
         if self.candle_mode:
-            self._refresh_live_candles(ticks, to_pct)
-        self._li_cbodies.setVisible(self.candle_mode)
-        self._li_cwicks.setVisible(self.candle_mode)
+            self._refresh_live_candles(sub, to_pct, items['cbodies'], items['cwicks'])
+        items['cbodies'].setVisible(self.candle_mode)
+        items['cwicks'].setVisible(self.candle_mode)
 
-        # --- Auto-follow: scroll X to newest ticks AND auto-fit Y to whatever is
-        # visible in that window (seed + live). setAutoVisible(y=True) makes the Y
-        # autorange consider only data inside the current X range, so the chart
-        # scrolls like a live tape. Disabled the instant the user pans by hand. ---
-        if self.auto_follow and ticks:
-            vb = self.plot_widget.getViewBox()
-            last_t = ticks[-1]['t']
+    def _live_render_window(self):
+        """The x-range to render: the follow window when following, else the current
+        view range. Returns (xmin, xmax, follow_target_or_None)."""
+        last_t = None
+        for s in self.live_series:
+            if s['ticks'] and (last_t is None or s['ticks'][-1]['t'] > last_t):
+                last_t = s['ticks'][-1]['t']
+        if self.auto_follow and last_t is not None:
             if self.candle_mode:
-                # Keep a fixed number of candles in view so candle width reads
-                # consistently across 1s/5s/15s/Max buckets (standard charting).
                 eff = self.candle_bucket_s if self.candle_bucket_s > 0 else 0.25
                 window = max(self.live_candle_visible_n * eff, 20)
                 right_pad = eff * 2
             else:
                 window = self.live_follow_window_s
                 right_pad = 5
-            vb.setXRange(last_t - window, last_t + right_pad, padding=0)
-            # Keep the full 0-100% probability range in view (matches the seed
-            # axis); only the X axis scrolls. No Y auto-fit so the hard floor /
-            # ceiling stay visible instead of the chart zooming into the data band.
+            return last_t - window, last_t + right_pad, (last_t, right_pad)
+        (vxmin, vxmax), _ = self.plot_widget.getViewBox().viewRange()
+        return vxmin, vxmax, None
+
+    def _refresh_live_items(self):
+        """Cheap per-tick update: setData on every series' overlay items (clipped to
+        the visible window), then apply auto-follow once."""
+        if not self._overlays_built():
+            return
+        xmin, xmax, follow = self._live_render_window()
+        # Render a bit beyond the visible edges so a small pan still shows data.
+        span = max(xmax - xmin, 1.0)
+        rxmin, rxmax = xmin - span * 0.25, xmax + span * 0.25
+        for s in self.live_series:
+            self._render_overlay_set(s['ticks'], s['items'], rxmin, rxmax)
+
+        # --- Auto-follow: scroll X to newest ticks; keep full 0-100% in view. ---
+        if follow is not None:
+            last_t, right_pad = follow
+            vb = self.plot_widget.getViewBox()
+            vb.setXRange(xmin, xmax, padding=0)
             vb.enableAutoRange(axis='y', enable=False)
             vb.setYRange(0, 100, padding=0)
 
-    def _refresh_live_candles(self, ticks, to_pct):
+    def _refresh_live_candles(self, ticks, to_pct, cbodies, cwicks):
         """Aggregate ticks into OHLC (implied %) and push into the candle items.
 
         Candles are now drawn in implied-% space, which is linear, so bodies no
@@ -5449,8 +6132,8 @@ class HistoricalOddsWidget(QWidget):
                 groups[key] = []; order.append(key)
             groups[key].append(pct)
         if not order:
-            self._li_cbodies.setOpts(x=[], width=[], y0=[], height=[])
-            self._li_cwicks.setData([], [])
+            cbodies.setOpts(x=[], width=[], y0=[], height=[])
+            cwicks.setData([], [])
             return
 
         # Width tracks the bucket (Max -> tick cadence ~0.25s), filling ~88% of the
@@ -5460,10 +6143,19 @@ class HistoricalOddsWidget(QWidget):
         centers, body_y0, body_h, brushes = [], [], [], []
         wick_x, wick_y = [], []
         up, down = (80, 200, 120), (220, 90, 90)
+        # Open each candle at the PREVIOUS candle's close (continuous candles), so
+        # the body color reflects the bar-to-bar directional move. With true
+        # intra-bar opens, these markets often sit flat within a minute
+        # (open==close -> all green) even while the series steps DOWN between bars;
+        # prev-close opens make declines render red as expected. The wick still
+        # spans the intra-bar high/low (extended to include the open).
+        prev_close = None
         for key in order:
             vals = groups[key]
-            o, c = vals[0], vals[-1]
-            hi, lo = max(vals), min(vals)
+            c = vals[-1]
+            o = prev_close if prev_close is not None else vals[0]
+            hi = max(max(vals), o)
+            lo = min(min(vals), o)
             cx = key + (eff_bucket / 2.0 if bucket > 0 else 0)
             centers.append(cx)
             body_y0.append(min(o, c))
@@ -5471,10 +6163,11 @@ class HistoricalOddsWidget(QWidget):
             brushes.append(pg.mkBrush(*(up if c >= o else down)))
             wick_x += [cx, cx, float('nan')]
             wick_y += [lo, hi, float('nan')]
-        self._li_cbodies.setOpts(x=centers, width=width, y0=body_y0,
-                                 height=body_h, brushes=brushes,
-                                 pen=pg.mkPen(0, 0, 0, 60))
-        self._li_cwicks.setData(wick_x, wick_y)
+            prev_close = c
+        cbodies.setOpts(x=centers, width=width, y0=body_y0,
+                        height=body_h, brushes=brushes,
+                        pen=pg.mkPen(0, 0, 0, 60))
+        cwicks.setData(wick_x, wick_y)
 
     def _latest_value_by_team(self, plot_data):
         """Collapse plot_data to {canonical_team: (display_name, latest_value)}.
@@ -5636,6 +6329,13 @@ class HistoricalOddsWidget(QWidget):
         # First reveal (the widget starts hidden) may not emit a resize, so pin
         # the floating overlays now that real geometry exists.
         self._position_overlays()
+        # Live render is skipped while hidden (ticks still accumulate); on re-show,
+        # render immediately so the chart reflects everything that arrived rather
+        # than waiting for the next live tick.
+        if getattr(self, 'live_mode', False) and self.live_series:
+            if not self._overlays_built():
+                self._rebuild_live_items()
+            self._refresh_live_items()
 
     async def _organize_plot_data(self, snapshots):
         """Organize snapshot data using American odds directly"""
@@ -6039,45 +6739,58 @@ class HistoricalOddsWidget(QWidget):
         self.hover_label.show()
         self.hover_label.raise_()
 
-    def _live_hover_rows(self, x):
-        """Hover readout row(s) for the live tape at cursor time x. In candle mode
-        it reports the hovered candle's O/H/L/C (implied %); otherwise the nearest
-        tick's price. Returns [] when the cursor isn't over the live span."""
-        lt = self.live_ticks
-        if not lt:
-            return []
-        t0, t1 = lt[0]['t'], lt[-1]['t']
+    def _hover_row(self, source, ticks, x, label):
+        """Build one live hover row for a feed source at cursor time x, branded with
+        that venue's logo. Returns None when the cursor isn't over this feed's span
+        or it has no ticks."""
+        if not ticks:
+            return None
+        t0, t1 = ticks[0]['t'], ticks[-1]['t']
         pad = max(2.0, float(self.candle_bucket_s or 1))
         if not (t0 - pad <= x <= t1 + pad):
-            return []
-        logo = self._bookmaker_logo_path('kalshi')
+            return None
+        logo = self._bookmaker_logo_path(source)
+        r, g, b = self._live_color(source)
         marker = (f"<img src='{logo}' width='15' height='15' style='vertical-align:middle'>"
-                  if logo else "<span style='color:#2ca02c'>&#9679;</span>")
-
+                  if logo else f"<span style='color:#{r:02x}{g:02x}{b:02x}'>&#9679;</span>")
         if self.candle_mode:
             bucket = self.candle_bucket_s
             if bucket > 0:
                 key = int(x // bucket) * bucket
-                vals = [tk['price'] for tk in lt if key <= tk['t'] < key + bucket]
+                vals = [tk['price'] for tk in ticks if key <= tk['t'] < key + bucket]
             else:  # "Max" bucket == one candle per tick
-                vals = [min(lt, key=lambda tk: abs(tk['t'] - x))['price']]
+                vals = [min(ticks, key=lambda tk: abs(tk['t'] - x))['price']]
             if not vals:
-                return []
+                return None
             o, c = vals[0], vals[-1]
             hi, lo = max(vals), min(vals)
             ccol = '#50c878' if c >= o else '#dc5a5a'
-            ohlc = (f"<span style='color:#8a93a0'>O</span> {o}% &nbsp;"
+            body = (f"<span style='color:#8a93a0'>O</span> {o}% &nbsp;"
                     f"<span style='color:#8a93a0'>H</span> {hi}% &nbsp;"
                     f"<span style='color:#8a93a0'>L</span> {lo}% &nbsp;"
                     f"<span style='color:{ccol}'>C {c}%</span>")
-            body = ohlc
         else:
-            tk = min(lt, key=lambda t: abs(t['t'] - x))
+            tk = min(ticks, key=lambda t: abs(t['t'] - x))
             pct = tk['price']
             body = (f"<span style='color:#f0f0f0'>"
                     f"{format_pct_with_american(self._cents_to_am(pct), float(pct))}</span>")
-        return [f"<div style='font-size:9pt'>{marker} "
-                f"<span style='color:#aeb6c0'>Live</span>&nbsp;&nbsp;{body}</div>"]
+        lcol = '#%02x%02x%02x' % (r, g, b)
+        return (f"<div style='font-size:9pt'>{marker} "
+                f"<span style='color:{lcol}'>{label}</span>&nbsp;&nbsp;{body}</div>")
+
+    def _live_hover_rows(self, x):
+        """Hover readout row(s) for the live tape at cursor time x — one row per
+        active live series (branded with its venue logo + outcome label). In candle
+        mode each reports its hovered candle's O/H/L/C; otherwise its nearest tick."""
+        rows = []
+        for s in self.live_series:
+            # Full venue name in the tooltip (the compact "K ·"/"PM ·" form is
+            # kept for the narrow order-book headers).
+            vlabel = 'Kalshi' if s['venue'] == 'kalshi' else 'Poly'
+            row = self._hover_row(s['venue'], s['ticks'], x, f"{vlabel} · {s['outcome']}")
+            if row:
+                rows.append(row)
+        return rows
 
     async def configure_plot_axes(self, snapshots):
         """Configure plot axes optimized for American odds display"""
