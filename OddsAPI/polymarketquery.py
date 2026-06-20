@@ -1,13 +1,15 @@
 import csv
 import json
 import time
+import threading
 import orjson
 from py_clob_client.client import ClobClient
 from mmKEY import pmkey
 import pathlib
 import requests
 from datetime import datetime, timezone
-from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Any, Callable, Iterable
+from dataclasses import dataclass
 
 def is_cache_fresh(cache_file="markets_cache.json", cache_hours=24):
     """Check if markets cache is still fresh"""
@@ -54,6 +56,26 @@ def save_markets_cache(markets_list, cache_file="markets_cache.json", cache_hour
     except Exception as e:
         print(f"Error saving markets cache: {e}")
 
+# Shared keep-alive session for the gamma-api volume fetches. The old bare
+# requests.get() opened a NEW connection per token — DNS lookup + full TLS
+# handshake, thousands of times per refresh. The handshake/connection setup is
+# the most GIL-expensive part of a request (pure-Python ssl/urllib3 glue), and
+# with 8 workers grinding them concurrently the stall watchdog showed this
+# herd starving the UI loop. Keep-alive reuses a handful of connections; the
+# urllib3 pool underneath Session is thread-safe.
+_GAMMA_SESSION = None
+
+
+def _gamma_session():
+    global _GAMMA_SESSION
+    if _GAMMA_SESSION is None:
+        s = requests.Session()
+        s.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8))
+        _GAMMA_SESSION = s
+    return _GAMMA_SESSION
+
+
 def get_market_volume_single(token_id):
     """Fetch volume data for a single token_id from Gamma API with optimized rate limiting"""
     import time
@@ -71,7 +93,7 @@ def get_market_volume_single(token_id):
                 print(f"Rate limited, waiting {delay}s before retry {attempt}")
                 time.sleep(delay)
             
-            response = requests.get(url, timeout=8)
+            response = _gamma_session().get(url, timeout=8)
             
             if response.status_code == 429:
                 print(f"Rate limited (429) for token {token_id[-8:]}..., attempt {attempt + 1}")
@@ -125,11 +147,16 @@ def get_market_volume_batch(token_ids, cancellation_flag=None):
     volume_map = {}
     
     print(f"\n🚀 Fetching volume data for {len(token_ids)} tokens...")
-    print("Rate limiting strategy: 8 workers, burst then throttle, adaptive pacing")
+    print("Rate limiting strategy: 3 workers, keep-alive session, burst then throttle")
     
     # Adaptive strategy: burst for first 100, then throttle
     # API allows ~100 requests burst, then heavily rate limits
-    max_workers = 8  # Moderate concurrency to handle burst + throttle
+    # Capped at 3: this runs inside the EffortOdds process, and 8 workers'
+    # worth of concurrent request glue (urllib3/http.client framing, json)
+    # was enough GIL pressure to starve the UI loop (watchdog-confirmed).
+    # With the keep-alive _gamma_session the per-request cost is far lower
+    # anyway, so 3 workers sustain a similar request rate.
+    max_workers = 3
     request_delay = 0.1  # 100ms between batches initially
     
     start_time = time.time()
@@ -207,111 +234,9 @@ def get_market_volume_batch(token_ids, cancellation_flag=None):
     
     return volume_map
 
-def scrape_breaking_markets():
-    """
-    Scrape breaking markets from Polymarket's breaking page.
-    Returns list of market question strings found on the page.
-    """
-    url = "https://polymarket.com/breaking"
-    print(f"🌐 Scraping breaking markets from {url}...")
-
-    try:
-        # Use a browser-like user agent to avoid blocks
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-
-        # Parse HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Find all market title paragraphs with the specific class structure
-        # Target: <p class="text-[15px] font-medium mb-0.5 text-pretty line-clamp-3 hover:underline underline-offset-2">
-        market_titles = []
-
-        # Look for p tags with these specific classes
-        for p_tag in soup.find_all('p', class_='text-[15px]'):
-            # Check if it has the other required classes
-            classes = p_tag.get('class', [])
-            if ('font-medium' in classes and
-                'mb-0.5' in classes and
-                'text-pretty' in classes and
-                'line-clamp-3' in classes):
-
-                title_text = p_tag.get_text(strip=True)
-                if title_text and len(title_text) > 10:  # Sanity check
-                    market_titles.append(title_text)
-
-        print(f"✅ Found {len(market_titles)} breaking markets")
-        for i, title in enumerate(market_titles[:5], 1):
-            print(f"  {i}. {title[:60]}{'...' if len(title) > 60 else ''}")
-
-        if len(market_titles) > 5:
-            print(f"  ... and {len(market_titles) - 5} more")
-
-        return market_titles
-
-    except requests.RequestException as e:
-        print(f"❌ Error fetching breaking markets page: {e}")
-        return []
-    except Exception as e:
-        print(f"❌ Error parsing breaking markets: {e}")
-        return []
-
-
-def match_breaking_markets_to_tokens(breaking_titles, cached_markets):
-    """
-    Match breaking market titles to cached market data and extract token IDs.
-
-    Args:
-        breaking_titles: List of market question strings from breaking page
-        cached_markets: List of market dicts from cache
-
-    Returns:
-        List of matched market dicts with token_ids
-    """
-    print(f"\n🔍 Matching {len(breaking_titles)} breaking markets against {len(cached_markets)} cached markets...")
-
-    matched_markets = []
-    unmatched_titles = []
-
-    for breaking_title in breaking_titles:
-        # Try exact match first
-        found = False
-        for market in cached_markets:
-            if market.get('question', '') == breaking_title:
-                matched_markets.append(market)
-                found = True
-                print(f"  ✓ Exact match: {breaking_title[:50]}...")
-                break
-
-        if not found:
-            # Try fuzzy match (case-insensitive, strip whitespace)
-            breaking_normalized = breaking_title.lower().strip()
-            for market in cached_markets:
-                market_question = market.get('question', '').lower().strip()
-                if market_question == breaking_normalized:
-                    matched_markets.append(market)
-                    found = True
-                    print(f"  ✓ Fuzzy match: {breaking_title[:50]}...")
-                    break
-
-        if not found:
-            unmatched_titles.append(breaking_title)
-            print(f"  ✗ No match: {breaking_title[:50]}...")
-
-    print(f"\n📊 Matching results:")
-    print(f"  ✓ Matched: {len(matched_markets)} markets")
-    print(f"  ✗ Unmatched: {len(unmatched_titles)} markets")
-
-    if unmatched_titles:
-        print(f"\n⚠️  Unmatched markets (may need to refresh cache):")
-        for title in unmatched_titles[:3]:
-            print(f"    - {title[:60]}{'...' if len(title) > 60 else ''}")
-
-    return matched_markets
+# NOTE: the polymarket.com/breaking scrape + title-matching path was removed —
+# that page is now client-side JS rendered, so a plain GET returned 0 markets and
+# always fell through to the gamma-API approach below.
 
 
 def GetRecentCursor():
@@ -452,67 +377,28 @@ def process_markets_metadata(markets) -> list[dict]:
 
     return filtered_data
 
-def add_volume_data_to_markets(markets, volume_limit=200, cancellation_flag=None) -> list[dict]:
-    """Add fresh volume data to markets (supports both old and new breaking markets flow)"""
-    all_token_ids = []
-    for i, market in enumerate(markets):
-        if i < volume_limit:
-            all_token_ids.extend(market["token_ids"])
+def add_volume_data_to_markets(markets, token_limit=50, cancellation_flag=None) -> list[dict]:
+    """Attach fresh volume data, fetching at most `token_limit` tokens.
 
-    print(f"Fetching volume data for {len(all_token_ids)} tokens from first {min(len(markets), volume_limit)} markets...")
-    volume_map = get_market_volume_batch(all_token_ids, cancellation_flag=cancellation_flag)
-
-    for i, market in enumerate(markets):
-        volume_data = []
-        total_volume = 0
-        total_volume_24hr = 0
-        total_liquidity = 0
-
-        if i < volume_limit:
-            for token_id in market["token_ids"]:
-                vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
-                volume_data.append(vol_data)
-                total_volume += float(vol_data['volume']) if vol_data['volume'] else 0
-                total_volume_24hr += float(vol_data['volume_24hr']) if vol_data['volume_24hr'] else 0
-                total_liquidity += float(vol_data['liquidity']) if vol_data['liquidity'] else 0
-        else:
-            volume_data = [{'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0} for _ in market["token_ids"]]
-
-        market["volume_data"] = volume_data
-        market["total_volume"] = total_volume
-        market["total_volume_24hr"] = total_volume_24hr
-        market["total_liquidity"] = total_liquidity
-
-    # Sort by volume
-    markets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
-    print(f"Sorted {len(markets)} markets by volume (highest to lowest)")
-
-    return markets
-
-
-def add_volume_data_to_breaking_markets(markets, cancellation_flag=None) -> list[dict]:
+    Tokens are taken in market order until the cap is hit (was 400 tokens / 200
+    markets — way more than the ticker needs). Markets beyond the cap get zeros
+    and naturally sink to the bottom of the volume sort.
     """
-    Optimized version: Add volume data ONLY to matched breaking markets.
-    No volume_limit needed since we're only processing ~15-20 markets.
-    """
-    # Collect ALL token IDs from the breaking markets
     all_token_ids = []
     for market in markets:
-        all_token_ids.extend(market["token_ids"])
+        for tid in market["token_ids"]:
+            if len(all_token_ids) >= token_limit:
+                break
+            all_token_ids.append(tid)
+        if len(all_token_ids) >= token_limit:
+            break
 
-    print(f"💰 Fetching volume data for {len(all_token_ids)} tokens from {len(markets)} breaking markets...")
-    print(f"   (Previously would fetch 400+ tokens - now fetching {len(all_token_ids)}!)")
-
-    # Fetch volume data for all tokens
+    print(f"Fetching volume data for {len(all_token_ids)} tokens (cap {token_limit})...")
     volume_map = get_market_volume_batch(all_token_ids, cancellation_flag=cancellation_flag)
 
-    # Add volume data to each market
     for market in markets:
         volume_data = []
-        total_volume = 0
-        total_volume_24hr = 0
-        total_liquidity = 0
-
+        total_volume = total_volume_24hr = total_liquidity = 0
         for token_id in market["token_ids"]:
             vol_data = volume_map.get(token_id, {'volume': 0, 'volume_24hr': 0, 'liquidity': 0, 'volume_formatted': 0})
             volume_data.append(vol_data)
@@ -525,11 +411,12 @@ def add_volume_data_to_breaking_markets(markets, cancellation_flag=None) -> list
         market["total_volume_24hr"] = total_volume_24hr
         market["total_liquidity"] = total_liquidity
 
-    # Sort by volume (highest first)
+    # Sort by volume
     markets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
-    print(f"✅ Sorted {len(markets)} breaking markets by volume")
+    print(f"Sorted {len(markets)} markets by volume (highest to lowest)")
 
     return markets
+
 
 def FilterData(markets) -> list[dict]:
     """Legacy function for backward compatibility"""
@@ -594,82 +481,36 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
-def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False, use_breaking=True):
+def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False, use_breaking=None):
     """
-    Optimized version using breaking markets from polymarket.com/breaking page.
+    Fetch recent market metadata (gamma API), attach fresh volume for the top
+    `token_limit` tokens, and sort by volume.
 
     Args:
-        recent_only: Whether to fetch only recent markets (used as fallback if breaking scrape fails)
+        recent_only: Whether to fetch only recent markets
         cancellation_flag: Dict with 'should_stop' key for cancellation
         save_full_dump: If True, saves PMdump.json (for manual runs)
-                       If False, skips file writes (for ticker worker to avoid blocking)
-        use_breaking: If True, scrapes breaking markets page (default, much faster)
-                     If False, uses old behavior (fallback)
+        use_breaking: Deprecated/ignored — the polymarket.com/breaking scrape was
+                      removed (that page is now JS-rendered).
     """
     # Get FILTERED markets from cache (metadata only, no volume yet)
     processed_markets = get_cached_or_fresh_markets(recent_only=recent_only, cancellation_flag=cancellation_flag)
 
-    # Check for cancellation
     if cancellation_flag and cancellation_flag.get('should_stop', False):
         print("🚫 Market fetch cancelled before volume data")
         return []
 
-    # NEW APPROACH: Use breaking markets page to identify which markets to fetch
-    if use_breaking:
-        print("\n🚀 Using BREAKING MARKETS approach (optimized)...")
+    print("\n💰 Fetching fresh volume data (top tokens)...")
+    final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
 
-        # Scrape breaking markets page
-        breaking_titles = scrape_breaking_markets()
+    if cancellation_flag and cancellation_flag.get('should_stop', False):
+        print("🚫 Market fetch cancelled before saving")
+        return []
 
-        if not breaking_titles:
-            print("⚠️  No breaking markets found, falling back to old approach...")
-            use_breaking = False  # Fall through to old approach
-        else:
-            # Match breaking market titles to cached markets
-            matched_markets = match_breaking_markets_to_tokens(breaking_titles, processed_markets)
+    if save_full_dump:
+        WriteJsonDump(final_data)
 
-            if not matched_markets:
-                print("⚠️  No matches found, falling back to old approach...")
-                use_breaking = False  # Fall through to old approach
-            else:
-                # Check for cancellation
-                if cancellation_flag and cancellation_flag.get('should_stop', False):
-                    print("🚫 Market fetch cancelled after matching")
-                    return []
-
-                # Fetch volume data ONLY for matched breaking markets (much faster!)
-                print(f"\n💰 Fetching volume for {len(matched_markets)} breaking markets only...")
-                print(f"   📉 Token reduction: ~400+ → {sum(len(m['token_ids']) for m in matched_markets)}")
-                final_data = add_volume_data_to_breaking_markets(matched_markets, cancellation_flag=cancellation_flag)
-
-                # Check for cancellation before saving
-                if cancellation_flag and cancellation_flag.get('should_stop', False):
-                    print("🚫 Market fetch cancelled before saving")
-                    return []
-
-                # Only save dumps if explicitly requested
-                if save_full_dump:
-                    WriteJsonDump(final_data)
-
-                return final_data
-
-    # FALLBACK: Old approach if breaking scrape failed
-    if not use_breaking:
-        print("\n📦 Using OLD approach (fallback - slower)...")
-        print("💰 Fetching fresh volume data for first 200 markets...")
-        final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
-
-        # Check for cancellation before saving
-        if cancellation_flag and cancellation_flag.get('should_stop', False):
-            print("🚫 Market fetch cancelled before saving")
-            return []
-
-        # Only save dumps if explicitly requested
-        if save_full_dump:
-            WriteJsonDump(final_data)
-            print("Skipping PMdump_all.json write (not needed for ticker)")
-
-        return final_data
+    return final_data
 
 def fetch_and_process_markets_legacy(recent_only=True):
     """Original version without caching - kept for fallback"""
@@ -680,6 +521,794 @@ def fetch_and_process_markets_legacy(recent_only=True):
     return filtered_data
 
 
+
+
+# ============================================================================
+# Polymarket Sports Client (merged from the former polymarket_sports_client.py)
+#
+# Sports-event listing + orderbook/trade fetching via the modern Gamma /events
+# and CLOB /book + Data /trades endpoints. Distinct from the tickertape path
+# above (authenticated CLOB pagination + per-token Gamma volume): this is the
+# sports-specific client consumed by HistoricalOddsClient. Only the surface
+# actually used downstream is kept here; the old demo/export helpers and the
+# unused get_historical_prices/get_all_sports_markets/get_game_by_teams methods
+# were dropped during the merge.
+# ============================================================================
+
+
+@dataclass
+class Order:
+    """Represents a single orderbook order"""
+    price: float
+    size: float
+    timestamp: Optional[str] = None
+
+
+@dataclass
+class Trade:
+    """Represents a single trade"""
+    timestamp: int
+    side: str
+    price: float
+    size: float
+    wallet: str
+    transaction_hash: Optional[str] = None
+
+
+@dataclass
+class Market:
+    """Represents a single market within a game"""
+    id: str
+    question: str
+    slug: str
+    outcomes: List[str]
+    outcome_prices: List[float]
+    volume: float
+    volume_24hr: float
+    liquidity: float
+    clob_token_ids: List[str]
+    active: bool
+    closed: bool
+    end_date: str
+
+    # Orderbook data
+    bids: List[Order]
+    asks: List[Order]
+
+    # Trade data
+    recent_trades: List[Trade]
+    largest_trades: List[Trade]
+
+
+@dataclass
+class Game:
+    """Represents a single game/event"""
+    id: str
+    title: str
+    slug: str
+    description: str
+    sport: str
+    start_time: str
+    end_time: str
+    volume: float
+    volume_24hr: float
+    liquidity: float
+    active: bool
+    closed: bool
+
+    # Nested markets
+    markets: List[Market]
+
+
+class PolymarketSportsClient:
+    """Client for fetching Polymarket sports data"""
+
+    # API endpoints
+    GAMMA_API = "https://gamma-api.polymarket.com"
+    CLOB_API = "https://clob.polymarket.com"
+    DATA_API = "https://data-api.polymarket.com"
+
+    # Sports series IDs
+    SPORTS_SERIES = {
+        "NFL": 10187,
+        "NBA": 10345,
+        "NHL": 10346,
+        "MLB": 3,
+        "CFB": 10210,
+        "NCAAB": 39
+    }
+
+    def __init__(self, rate_limit_delay: float = 0.01, max_workers: int = 20):
+        """
+        Initialize the client (optimized for maximum speed)
+
+        Default settings: 20 workers, 0.01s delay (~30-50 markets/sec)
+        Includes automatic retry on rate limit errors
+        """
+        self.rate_limit_delay = rate_limit_delay
+        self.max_workers = max_workers
+        self.session = requests.Session()
+
+        # Rate limits (based on Polymarket docs):
+        # - Gamma /events: 10 req/s
+        # - Gamma /markets: 12.5 req/s
+        # - CLOB /book: 20 req/s
+        # - Data API /trades: 15 req/s
+        # Using max_workers=10 with 0.05s delay = ~10 req/s average
+
+    def _rate_limit(self):
+        """Simple rate limiting"""
+        time.sleep(self.rate_limit_delay)
+
+    def _parse_json_field(self, value: Any) -> Any:
+        """Parse JSON string fields"""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except:
+                return value
+        return value
+
+    def get_sport_markets(self, sport: str, limit: int = 50,
+                         include_orderbook: bool = True,
+                         include_trades: bool = True,
+                         max_trades: int = 100,
+                         days_ahead: Optional[int] = None) -> List[Game]:
+        """
+        Get all active games for a specific sport with full market data
+
+        Args:
+            sport: Sport name (NFL, NBA, NHL, MLB, CFB, NCAAB)
+            limit: Maximum number of games to fetch
+            include_orderbook: Whether to fetch orderbook data
+            include_trades: Whether to fetch trade history
+            max_trades: Maximum number of trades to fetch per market
+            days_ahead: When set, restrict the listing to events whose
+                gamma endDate falls within now + N days. The unfiltered
+                series listing is ordered by listing-creation time, so a
+                bare `limit` cap returns months-out games (created early)
+                while dropping games 2-3 days from now — which then show
+                as Kalshi-only in the unified event list.
+
+        Returns:
+            List of Game objects with nested Market data
+        """
+        series_id = self.SPORTS_SERIES.get(sport)
+        if not series_id:
+            raise ValueError(f"Unknown sport: {sport}. Available: {list(self.SPORTS_SERIES.keys())}")
+
+        # Fetch events
+        url = f"{self.GAMMA_API}/events"
+        params = {
+            "series_id": series_id,
+            "closed": False,
+            "limit": limit
+        }
+        if days_ahead is not None:
+            from datetime import timedelta
+            cutoff = datetime.now(timezone.utc) + timedelta(days=days_ahead)
+            params["end_date_max"] = cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        print(f"📡 Fetching {sport} games (Series ID: {series_id})...")
+        response = self.session.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        events = response.json()
+
+        print(f"✅ Found {len(events)} {sport} games")
+
+        # Process each game
+        games = []
+        for idx, event in enumerate(events, 1):
+            print(f"📊 Processing game {idx}/{len(events)}: {event['title']}")
+            game = self._process_game(event, sport, include_orderbook, include_trades, max_trades)
+            games.append(game)
+            self._rate_limit()
+
+        return games
+
+    def _process_game(self, event: Dict, sport: str,
+                     include_orderbook: bool,
+                     include_trades: bool,
+                     max_trades: int) -> Game:
+        """Process a single game event with parallel market processing"""
+        import concurrent.futures
+
+        # Extract markets from event
+        markets_data = event.get('markets', [])
+        markets = []
+
+        print(f"   Processing {len(markets_data)} markets in parallel...")
+
+        # Process markets in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all market processing tasks
+            future_to_market = {
+                executor.submit(
+                    self._process_market,
+                    market_data,
+                    include_orderbook,
+                    include_trades,
+                    max_trades
+                ): market_data
+                for market_data in markets_data
+            }
+
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_market):
+                try:
+                    market = future.result()
+                    markets.append(market)
+                except Exception as e:
+                    market_data = future_to_market[future]
+                    print(f"   ⚠️  Error processing market {market_data.get('question', 'Unknown')[:30]}: {e}")
+
+        print(f"   ✅ Processed {len(markets)}/{len(markets_data)} markets")
+
+        # Create Game object
+        game = Game(
+            id=str(event.get('id', '')),
+            title=event.get('title', ''),
+            slug=event.get('slug', ''),
+            description=event.get('description', ''),
+            sport=sport,
+            start_time=event.get('startTime', ''),  # Actual game start time (UTC)
+            end_time=event.get('endDate', ''),
+            volume=float(event.get('volume', 0)),
+            volume_24hr=float(event.get('volume24hr', 0)),
+            liquidity=float(event.get('liquidity', 0)),
+            active=event.get('active', False),
+            closed=event.get('closed', False),
+            markets=markets
+        )
+
+        return game
+
+    def _process_market(self, market_data: Dict,
+                       include_orderbook: bool,
+                       include_trades: bool,
+                       max_trades: int) -> Market:
+        """Process a single market"""
+
+        # Parse JSON fields
+        outcomes = self._parse_json_field(market_data.get('outcomes', '[]'))
+        outcome_prices = self._parse_json_field(market_data.get('outcomePrices', '[]'))
+        outcome_prices = [float(p) for p in outcome_prices] if outcome_prices else []
+        clob_token_ids = self._parse_json_field(market_data.get('clobTokenIds', '[]'))
+
+        # Initialize orderbook and trades
+        bids = []
+        asks = []
+        recent_trades = []
+        largest_trades = []
+
+        # Fetch orderbook if requested
+        if include_orderbook and clob_token_ids:
+            token_id = clob_token_ids[0]
+            bids, asks = self._fetch_orderbook(token_id)
+
+        # Fetch trades if requested
+        if include_trades and clob_token_ids:
+            token_id = clob_token_ids[0]
+            recent_trades, largest_trades = self._fetch_trades(token_id, max_trades)
+
+        market = Market(
+            id=str(market_data.get('id', '')),
+            question=market_data.get('question', ''),
+            slug=market_data.get('slug', ''),
+            outcomes=outcomes,
+            outcome_prices=outcome_prices,
+            volume=float(market_data.get('volumeNum', market_data.get('volume', 0))),
+            volume_24hr=float(market_data.get('volume24hr', 0)),
+            liquidity=float(market_data.get('liquidityNum', market_data.get('liquidity', 0))),
+            clob_token_ids=clob_token_ids,
+            active=market_data.get('active', False),
+            closed=market_data.get('closed', False),
+            end_date=market_data.get('endDate', ''),
+            bids=bids,
+            asks=asks,
+            recent_trades=recent_trades,
+            largest_trades=largest_trades
+        )
+
+        return market
+
+    def _fetch_orderbook(self, token_id: str) -> tuple[List[Order], List[Order]]:
+        """
+        Fetch orderbook for a token with retry on rate limit
+
+        Returns:
+            Tuple of (bids, asks)
+        """
+        import time as time_module
+
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                url = f"{self.CLOB_API}/book"
+                response = self.session.get(url, params={"token_id": token_id}, timeout=10)
+
+                # Handle rate limiting with retry
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = 0.5 * (attempt + 1)  # 0.5s, 1.0s
+                        time_module.sleep(wait_time)
+                        continue
+                    else:
+                        return [], []  # Give up after retries
+
+                response.raise_for_status()
+                orderbook = response.json()
+
+                bids = [Order(price=float(b.get('price', 0)),
+                             size=float(b.get('size', 0)))
+                       for b in orderbook.get('bids', [])]
+
+                asks = [Order(price=float(a.get('price', 0)),
+                             size=float(a.get('size', 0)))
+                       for a in orderbook.get('asks', [])]
+
+                return bids, asks
+
+            except Exception as e:
+                if attempt < max_retries - 1 and "429" in str(e):
+                    time_module.sleep(0.5)
+                    continue
+                else:
+                    print(f"      ⚠️  Error fetching orderbook: {e}")
+                    return [], []
+
+    def _fetch_trades(self, token_id: str, limit: int) -> tuple[List[Trade], List[Trade]]:
+        """
+        Fetch trade history for a token with retry on rate limit
+
+        Returns:
+            Tuple of (recent_trades, largest_trades)
+        """
+        import time as time_module
+
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                url = f"{self.DATA_API}/trades"
+                response = self.session.get(url, params={
+                    "asset_id": token_id,
+                    "limit": limit
+                }, timeout=10)
+
+                # Handle rate limiting with retry
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = 0.5 * (attempt + 1)  # 0.5s, 1.0s
+                        time_module.sleep(wait_time)
+                        continue
+                    else:
+                        return [], []  # Give up after retries
+
+                response.raise_for_status()
+                trades_data = response.json()
+                break  # Success
+
+            except Exception as e:
+                if attempt < max_retries - 1 and "429" in str(e):
+                    time_module.sleep(0.5)
+                    continue
+                else:
+                    return [], []
+
+        try:
+
+            # Process trades
+            trades = []
+            for trade_data in trades_data:
+                wallet = trade_data.get('proxyWallet', 'N/A')
+
+                trade = Trade(
+                    timestamp=trade_data.get('timestamp', 0),
+                    side=trade_data.get('side', 'N/A'),
+                    price=float(trade_data.get('price', 0)),
+                    size=float(trade_data.get('size', 0)),
+                    wallet=wallet,
+                    transaction_hash=trade_data.get('transactionHash')
+                )
+                trades.append(trade)
+
+            # Get recent trades (already in chronological order)
+            recent_trades = trades[:20]
+
+            # Get largest trades (sort by size)
+            largest_trades = sorted(trades, key=lambda t: t.size, reverse=True)[:5]
+
+            return recent_trades, largest_trades
+
+        except Exception as e:
+            print(f"      ⚠️  Error fetching trades: {e}")
+            return [], []
+
+
+# ============================================================================
+# Polymarket live WebSocket feed (sub-second market channel)
+#
+# Mirrors KalshiStreamClient / KalshiLiveBook (KalshiClient.py) so the historical
+# odds widget's live render path can be reused for Polymarket. The CLOB market
+# channel is PUBLIC (no auth) and far simpler than Kalshi's: prices arrive as
+# 0-1 dollar strings (×100 == implied-chance cents, the same space the widget
+# renders in), the YES token's book gives bids/asks directly (no NO inversion),
+# and there are NO sequence numbers — `book` is a full snapshot and `price_change`
+# carries the NEW ABSOLUTE size at each level. Connection keepalive is an
+# application-level "PING" string every <10s (the server replies "PONG").
+#
+# Docs: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+# ============================================================================
+
+import websocket  # websocket-client (same dep KalshiClient uses)
+from PyQt6.QtCore import QObject, pyqtSignal
+
+
+POLYMARKET_WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+class PolymarketStreamClient(QObject):
+    """WebSocket streaming client for the Polymarket CLOB market channel.
+
+    Emits typed Qt signals so the widget can consume them on the main thread:
+      - orderbook(dict): a `book` (full snapshot) or `price_change` (level updates)
+      - trade(dict):     a `last_trade_price` execution
+      - best_quote(dict):a `best_bid_ask` update (only with custom_feature_enabled)
+      - connected / disconnected / error
+
+    Subscriptions are keyed by CLOB token id (asset_id). The desired set is
+    resent on every (re)connect; switching markets replaces the set and bounces
+    the socket so the server stops streaming the old asset. Messages for assets
+    we no longer care about are also filtered downstream by asset_id.
+    """
+
+    connected = pyqtSignal()
+    disconnected = pyqtSignal()
+    error = pyqtSignal(object)
+    raw_message = pyqtSignal(object)
+    orderbook = pyqtSignal(object)
+    trade = pyqtSignal(object)
+    best_quote = pyqtSignal(object)
+
+    def __init__(
+        self,
+        url: str = POLYMARKET_WS_MARKET,
+        reconnect: bool = True,
+        reconnect_backoff_max: int = 60,
+        ping_interval: int = 8,
+        custom_feature_enabled: bool = True,
+    ):
+        super().__init__()
+        self.url = url
+        self.reconnect = reconnect
+        self.reconnect_backoff_max = reconnect_backoff_max
+        self.ping_interval = ping_interval  # app-level PING cadence (<10s)
+        self.custom_feature_enabled = custom_feature_enabled
+
+        self._ws_app: Optional[websocket.WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ping_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._assets = set()           # desired CLOB token ids
+        self._assets_lock = threading.Lock()
+        self._is_running = False
+        self._running_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
+    def start(self):
+        with self._running_lock:
+            if self._is_running:
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run_forever, name="PolymarketWS", daemon=True)
+            self._thread.start()
+            self._is_running = True
+
+    def stop(self):
+        self._stop_event.set()
+        self.reconnect = False
+        # Close the UNDERLYING socket directly instead of WebSocketApp.close():
+        # close() performs a close handshake (blocking recv_frame on the caller),
+        # which stalls the Qt main loop ~100-200ms when stop() is called from the
+        # GUI thread. Closing the raw socket unblocks run_forever's recv at once
+        # and is non-blocking.
+        ws = self._ws_app
+        if ws is not None:
+            try:
+                ws.keep_running = False
+            except Exception:
+                pass
+            sock = getattr(ws, "sock", None)
+            raw = getattr(sock, "sock", None) if sock is not None else None
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+        if self._thread:
+            self._thread.join(timeout=2)
+        with self._running_lock:
+            self._is_running = False
+
+    def send(self, message: str):
+        if (self._ws_app and getattr(self._ws_app, "sock", None)
+                and self._ws_app.sock.connected):
+            try:
+                self._ws_app.send(message)
+            except Exception as e:
+                self.error.emit({"action": "send_failed", "exception": e})
+        else:
+            self.error.emit({"action": "not_connected"})
+
+    def set_assets(self, asset_ids: Iterable[str]):
+        """Replace the desired asset set and (re)send the subscription in place.
+
+        Does NOT close/reconnect — WebSocketApp.close() blocks the caller on the
+        close handshake (a GUI stall when called from the main thread). Sending a
+        fresh subscribe for the new set is non-blocking; any still-streaming old
+        assets are harmless (filtered downstream by active-key) and are dropped on
+        the next natural reconnect, which re-subscribes only the current set."""
+        with self._assets_lock:
+            self._assets = {a for a in asset_ids if a}
+        self._send_subscribe()
+
+    def subscribe(self, asset_ids: Iterable[str]):
+        """Add assets to the desired set and (re)send the subscription."""
+        with self._assets_lock:
+            self._assets.update(a for a in asset_ids if a)
+        self._send_subscribe()
+
+    # ------------------------------------------------------------------
+    # SUBSCRIPTION
+    # ------------------------------------------------------------------
+    def _build_subscribe(self) -> Optional[str]:
+        with self._assets_lock:
+            assets = sorted(self._assets)
+        if not assets:
+            return None
+        return json.dumps({
+            "assets_ids": assets,
+            "type": "market",
+            "custom_feature_enabled": self.custom_feature_enabled,
+        })
+
+    def _send_subscribe(self):
+        payload = self._build_subscribe()
+        if payload:
+            self.send(payload)
+
+    # ------------------------------------------------------------------
+    # INTERNAL THREAD LOOP
+    # ------------------------------------------------------------------
+    def _run_forever(self):
+        backoff = 1.0
+        while not self._stop_event.is_set():
+            try:
+                self._ws_app = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws_app.run_forever()
+            except Exception as ex:
+                self.error.emit({"action": "run_exception", "exception": ex})
+
+            if self._stop_event.is_set() or not self.reconnect:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, self.reconnect_backoff_max)
+
+        self._ws_app = None
+        self._is_running = False
+
+    def _ping_loop(self):
+        """Application-level keepalive: Polymarket wants a literal 'PING' string
+        roughly every 10s (it replies 'PONG'); WS-protocol pings aren't enough."""
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(self.ping_interval):
+                break
+            if (self._ws_app and getattr(self._ws_app, "sock", None)
+                    and self._ws_app.sock.connected):
+                try:
+                    self._ws_app.send("PING")
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # CALLBACKS
+    # ------------------------------------------------------------------
+    def _on_open(self, ws):
+        self.connected.emit()
+        self._send_subscribe()
+        # One ping thread for the client's lifetime (idempotent guard).
+        if self._ping_thread is None or not self._ping_thread.is_alive():
+            self._ping_thread = threading.Thread(
+                target=self._ping_loop, name="PolymarketWS-ping", daemon=True)
+            self._ping_thread.start()
+
+    def _on_message(self, ws, message):
+        # Keepalive ack and other bare strings: ignore.
+        if message in ("PONG", "PING"):
+            return
+        try:
+            msg = json.loads(message)
+        except Exception:
+            return
+
+        self.raw_message.emit(msg)
+
+        # The market channel may deliver a single event object OR an array of
+        # them (the initial book burst arrives as a list). Normalize to a list.
+        events = msg if isinstance(msg, list) else [msg]
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            et = ev.get("event_type")
+            if et in ("book", "price_change"):
+                self.orderbook.emit(ev)
+            elif et == "last_trade_price":
+                self.trade.emit(ev)
+            elif et == "best_bid_ask":
+                self.best_quote.emit(ev)
+            # tick_size_change / new_market / market_resolved: no live-render
+            # action needed today; raw_message already exposed them.
+
+    def _on_error(self, ws, error):
+        self.error.emit({"action": "ws_error", "error": error})
+
+    def _on_close(self, ws, code, reason):
+        self.disconnected.emit()
+
+
+class PolymarketLiveBook:
+    """Maintains a live orderbook + last trade per Polymarket CLOB token (asset_id)
+    from the market-channel `book` / `price_change` / `last_trade_price` stream.
+
+    All prices are normalized to CENTS (0-100, == implied chance %) to match the
+    widget's shared live render path. Unlike Kalshi there is no NO-side: a token's
+    own bids/asks are the YES-equivalent book directly. No sequence numbers exist,
+    so there is no gap handling — `book` is authoritative and `price_change` sets
+    each level's new absolute size.
+
+    Level dicts are keyed by price-in-cents rounded to 1 decimal (PM tick size can
+    be 0.001 dollars = 0.1¢); sizes are share counts (float).
+    """
+
+    def __init__(self):
+        # asset_id -> {"bids": {cents: size}, "asks": {cents: size},
+        #              "last_trade": cents|None}
+        self._books: Dict[str, Dict] = {}
+
+    def _blank(self):
+        return {"bids": {}, "asks": {}, "last_trade": None}
+
+    @staticmethod
+    def _to_cents(price):
+        """Dollar price (string/float, 0-1) -> cents float rounded to 0.1¢."""
+        try:
+            return round(float(price) * 100.0, 1)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_size(size):
+        try:
+            return float(size)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def apply(self, ev: dict) -> Optional[str]:
+        """Apply one market-channel event. Returns the affected asset_id, or None
+        if the event was ignored / had no asset."""
+        if not isinstance(ev, dict):
+            return None
+        et = ev.get("event_type")
+
+        if et == "book":
+            asset_id = ev.get("asset_id")
+            if not asset_id:
+                return None
+            book = self._books.get(asset_id)
+            last = book.get("last_trade") if book else None
+            book = self._blank()
+            book["last_trade"] = last  # preserve across snapshots
+            for b in ev.get("bids", []) or []:
+                c = self._to_cents(b.get("price"))
+                if c is not None:
+                    book["bids"][c] = self._to_size(b.get("size"))
+            for a in ev.get("asks", []) or []:
+                c = self._to_cents(a.get("price"))
+                if c is not None:
+                    book["asks"][c] = self._to_size(a.get("size"))
+            self._books[asset_id] = book
+            return asset_id
+
+        if et == "price_change":
+            # Each change carries its own asset_id; a message can touch several.
+            touched = None
+            for ch in ev.get("price_changes", []) or []:
+                asset_id = ch.get("asset_id")
+                if not asset_id:
+                    continue
+                book = self._books.setdefault(asset_id, self._blank())
+                side = (ch.get("side") or "").upper()
+                levels = book["bids"] if side == "BUY" else \
+                    book["asks"] if side == "SELL" else None
+                if levels is None:
+                    continue
+                c = self._to_cents(ch.get("price"))
+                if c is None:
+                    continue
+                size = self._to_size(ch.get("size"))  # NEW absolute size
+                if size <= 1e-9:
+                    levels.pop(c, None)
+                else:
+                    levels[c] = size
+                touched = asset_id
+            return touched
+
+        if et == "last_trade_price":
+            asset_id = ev.get("asset_id")
+            if not asset_id:
+                return None
+            book = self._books.setdefault(asset_id, self._blank())
+            c = self._to_cents(ev.get("price"))
+            if c is not None:
+                book["last_trade"] = c
+            return asset_id
+
+        return None
+
+    def state(self, asset_id: str) -> Optional[dict]:
+        """Normalized state in cents: best bid/ask, mid, last trade."""
+        book = self._books.get(asset_id)
+        if not book:
+            return None
+        best_bid = max(book["bids"]) if book["bids"] else None
+        best_ask = min(book["asks"]) if book["asks"] else None
+        mid = None
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2.0
+        elif best_bid is not None:
+            mid = best_bid
+        elif best_ask is not None:
+            mid = best_ask
+        return {
+            "asset_id": asset_id,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "last_trade": book["last_trade"],
+            "stale": False,  # no seq stream to fall behind
+        }
+
+    def ladder(self, asset_id: str, depth: int = 10) -> Optional[dict]:
+        """Depth ladder in cents: bids best (highest) first, asks best (lowest)
+        first. Same shape as KalshiLiveBook.ladder for the shared ladder widget."""
+        book = self._books.get(asset_id)
+        if not book:
+            return None
+        bids = sorted(book["bids"].items(), key=lambda x: -x[0])[:depth]
+        asks = sorted(book["asks"].items(), key=lambda x: x[0])[:depth]
+        return {
+            "bids": [(round(p, 1), int(round(q))) for p, q in bids],
+            "asks": [(round(p, 1), int(round(q))) for p, q in asks],
+            "best_bid": round(bids[0][0], 1) if bids else None,
+            "best_ask": round(asks[0][0], 1) if asks else None,
+            "last_trade": book["last_trade"],
+            "stale": False,
+        }
+
+    def reset(self, asset_id: str = None):
+        if asset_id is None:
+            self._books.clear()
+        else:
+            self._books.pop(asset_id, None)
 
 
 if __name__ == "__main__":
