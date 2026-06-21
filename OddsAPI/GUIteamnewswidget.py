@@ -13,13 +13,13 @@ import webbrowser
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QObject, QThread,
-    QAbstractListModel, QModelIndex, QSize, QRect, QEvent
+    QAbstractListModel, QModelIndex, QSize, QRect, QRectF, QPointF, QEvent
 )
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QAction
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QFrame, QSizePolicy, QToolButton, QSpinBox, QCheckBox,
-    QLineEdit, QListView, QStyledItemDelegate, QStyle
+    QLineEdit, QListView, QStyledItemDelegate, QStyle, QMenu
 )
 import GUIMLBlineups
 
@@ -815,6 +815,41 @@ def _rel_age(dt):
     return f"{int(secs // 86400)}d"
 
 
+class WireIcon(QWidget):
+    """Hand-painted brand mark for the feed header: a transmission node with
+    three broadcast arcs radiating up-and-right — a 'news wire' on the air.
+    Replaces the old NEWSWIRE text label (no emoji, scales crisply)."""
+
+    def __init__(self, parent=None, size=18):
+        super().__init__(parent)
+        self._sz = size
+        self.setFixedSize(size, size)
+        self.setToolTip("NEWSWIRE")
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self._sz
+        ox, oy = s * 0.24, s * 0.76          # emitter near bottom-left
+        # transmission node
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(ACCENT_BRIGHT))
+        node_r = s * 0.11
+        p.drawEllipse(QPointF(ox, oy), node_r, node_r)
+        # broadcast arcs (upper-right quadrant), fading outward
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i, frac in enumerate((0.34, 0.55, 0.76)):
+            col = QColor(ACCENT)
+            col.setAlpha(255 - i * 60)
+            pen = QPen(col)
+            pen.setWidthF(max(1.3, s * 0.085))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            rr = s * frac
+            p.drawArc(QRectF(ox - rr, oy - rr, 2 * rr, 2 * rr), 0, 90 * 16)
+        p.end()
+
+
 NEWS_TERMINAL_QSS = """
 QWidget#newsTerminal { background: #0b0f14; }
 QWidget#newsHeader, QWidget#newsToolbar {
@@ -851,6 +886,31 @@ QPushButton#leagueChip:checked {
     color: """ + ACCENT_BRIGHT + """;
     border-color: """ + ACCENT + """;
 }
+QToolButton#chipOverflow {
+    background: #131a24;
+    color: #7d8590;
+    border: 1px solid #232c3a;
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: bold;
+}
+QToolButton#chipOverflow:hover { border-color: #3a4656; color: """ + ACCENT_BRIGHT + """; }
+QToolButton#chipOverflow[active="true"] {
+    color: """ + ACCENT_BRIGHT + """;
+    border-color: """ + ACCENT + """;
+}
+QToolButton#chipOverflow::menu-indicator { image: none; width: 0; }
+QMenu#chipMenu {
+    background: #0e141c;
+    color: #aab4c0;
+    border: 1px solid #232c3a;
+    font-family: monospace;
+    font-size: 11px;
+}
+QMenu#chipMenu::item { padding: 4px 22px 4px 22px; }
+QMenu#chipMenu::item:selected { background: #1c2734; color: """ + ACCENT_BRIGHT + """; }
 QPushButton#sortChip:checked {
     background: #16202e;
     color: #58a6ff;
@@ -1152,7 +1212,6 @@ class TeamNewsWidget(QWidget):
         self.refresh_disabled = False
         self.current_league = None
         self.current_team = None
-        self.show_injuries_only = False
         self.all_news_items = []
         self.expanded_row = -1
         self.active_league_chip = "all"
@@ -1191,17 +1250,20 @@ class TeamNewsWidget(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(0)
 
-        # -- Row 1: title, league chips, category chips, sort, status
+        # -- Row 1: brand mark, league chips, category chips, sort, status
+        #
+        # Both chip groups overflow responsively: any chip that doesn't fit
+        # the current width folds into a "⋯" dropdown (see _relayout_chips),
+        # so the bar stays legible from full-screen down to a narrow embed.
         header = QWidget()
         header.setObjectName("newsHeader")
         h = QHBoxLayout(header)
         h.setContentsMargins(8, 4, 8, 4)
         h.setSpacing(4)
 
-        title_label = QLabel("NEWSWIRE")
-        title_label.setObjectName("newsTitle")
-        h.addWidget(title_label)
-        h.addSpacing(10)
+        self.wire_icon = WireIcon(header)
+        h.addWidget(self.wire_icon)
+        h.addSpacing(8)
 
         self.league_chips = {}
         for key, label in LEAGUE_CHIPS:
@@ -1213,6 +1275,8 @@ class TeamNewsWidget(QWidget):
             self.league_chips[key] = chip
             h.addWidget(chip)
         self.league_chips["all"].setChecked(True)
+        self.league_overflow = self._make_overflow_button("More leagues")
+        h.addWidget(self.league_overflow)
         h.addSpacing(12)
 
         self.category_chips = {}
@@ -1226,6 +1290,8 @@ class TeamNewsWidget(QWidget):
             chip.toggled.connect(self.apply_filters)
             self.category_chips[cat] = chip
             h.addWidget(chip)
+        self.cat_overflow = self._make_overflow_button("More categories")
+        h.addWidget(self.cat_overflow)
         h.addSpacing(12)
 
         # Default order is relevance-ranked (fluff sinks); CHRONO flips to
@@ -1244,6 +1310,11 @@ class TeamNewsWidget(QWidget):
         h.addWidget(self.status_label)
         self.layout.addWidget(header)
 
+        # Pin each chip to its natural width so the visible set never squishes;
+        # _relayout_chips guarantees the visible set fits, overflow goes to "⋯".
+        for chip in list(self.league_chips.values()) + list(self.category_chips.values()):
+            chip.setMinimumWidth(chip.sizeHint().width())
+
         # -- Row 2: search, team, injuries-only, refresh controls
         toolbar = QWidget()
         toolbar.setObjectName("newsToolbar")
@@ -1257,10 +1328,6 @@ class TeamNewsWidget(QWidget):
         self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self.apply_filters)
         t.addWidget(self.search_box, 1)
-
-        self.injury_filter = QCheckBox("INJ ONLY")
-        self.injury_filter.toggled.connect(self.toggle_injury_filter)
-        t.addWidget(self.injury_filter)
 
         team_label = QLabel("TEAM")
         team_label.setObjectName("newsToolbarLabel")
@@ -1308,6 +1375,135 @@ class TeamNewsWidget(QWidget):
 
         self.status_label.setText("LOADING…")
 
+    # ----------------------------------------------------- responsive chips
+
+    def _make_overflow_button(self, tooltip):
+        """A '⋯' QToolButton whose popup menu holds the chips that don't fit
+        the current width. Hidden until _relayout_chips finds an overflow."""
+        btn = QToolButton()
+        btn.setObjectName("chipOverflow")
+        btn.setText("⋯")
+        btn.setToolTip(tooltip)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+        menu.setObjectName("chipMenu")
+        btn.setMenu(menu)
+        btn.hide()
+        return btn
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_chips()
+
+    def _relayout_chips(self):
+        """Decide which league/category chips stay in the bar and which fold
+        into their '⋯' overflow menus, sized to the current header width.
+
+        Allocation order: the league group is guaranteed at least ALL + the
+        active league, then the (few, high-value) category chips fill the
+        middle, then leagues claim whatever is left. The active league and any
+        checked categories are always pinned into the visible set so the
+        current selection is never hidden behind the menu."""
+        if not hasattr(self, "league_overflow"):
+            return
+        header = self.wire_icon.parentWidget()
+        if header is None or header.width() <= 1:
+            return
+
+        spacing = 4                      # QHBoxLayout spacing
+        def w(widget):                   # natural width incl. style padding
+            return widget.sizeHint().width()
+
+        # Fixed, non-chip costs left of the right-aligned status label.
+        fixed = (8 + 8                                   # margins
+                 + w(self.wire_icon) + 8                 # brand mark + gap
+                 + 12 + 12                               # the two group gaps
+                 + w(self.chrono_sort)
+                 + max(60, w(self.status_label)) + spacing * 6)
+        avail = max(0, header.width() - fixed)
+
+        league_items = [self.league_chips[k] for k, _ in LEAGUE_CHIPS]
+        cat_items = list(self.category_chips.values())
+        ob = w(self.league_overflow)     # overflow-button width (same QSS)
+
+        # Reserve a league minimum (ALL + active) before handing space to cats.
+        pinned_leagues = [self.league_chips["all"]]
+        active_chip = self.league_chips.get(self.active_league_chip)
+        if active_chip is not None and active_chip not in pinned_leagues:
+            pinned_leagues.append(active_chip)
+        league_min = sum(w(c) + spacing for c in pinned_leagues) + ob
+
+        # Categories fill the middle (pinned: any checked chip).
+        cat_pinned = [c for c in cat_items if c.isChecked()]
+        cat_vis, cat_over = self._fit(cat_items, max(0, avail - league_min),
+                                      ob, spacing, cat_pinned)
+        cat_used = sum(w(c) + spacing for c in cat_vis) + (ob if cat_over else 0)
+
+        # Leagues take the remainder (always keep ALL + active visible).
+        league_vis, league_over = self._fit(league_items, max(0, avail - cat_used),
+                                             ob, spacing, pinned_leagues)
+
+        self._apply_overflow(league_items, league_vis, self.league_overflow,
+                             league_over, "league")
+        self._apply_overflow(cat_items, cat_vis, self.cat_overflow,
+                             cat_over, "category")
+
+    def _fit(self, chips, budget, overflow_w, spacing, pinned):
+        """Greedy fit: returns (visible_set, overflow_list). Pinned chips are
+        always visible; the rest are added in natural order until the budget
+        (minus the overflow button, if anything spills) runs out."""
+        full = sum(c.sizeHint().width() + spacing for c in chips)
+        if full <= budget:
+            return set(chips), []
+        budget -= overflow_w
+        visible, used = [], 0
+        for c in pinned:                 # pin selection in first
+            used += c.sizeHint().width() + spacing
+            visible.append(c)
+        for c in chips:
+            if c in visible:
+                continue
+            cw = c.sizeHint().width() + spacing
+            if used + cw <= budget:
+                used += cw
+                visible.append(c)
+        vis_set = set(visible)
+        return vis_set, [c for c in chips if c not in vis_set]
+
+    def _apply_overflow(self, chips, visible, overflow_btn, overflow, kind):
+        """Show the visible chips inline; rebuild the '⋯' menu for the rest."""
+        for c in chips:
+            c.setVisible(c in visible)
+        menu = overflow_btn.menu()
+        menu.clear()
+        if not overflow:
+            overflow_btn.hide()
+            return
+        for c in overflow:
+            act = QAction(c.text(), menu)
+            act.setCheckable(True)
+            act.setChecked(c.isChecked())
+            if kind == "league":
+                key = next(k for k, btn in self.league_chips.items() if btn is c)
+                act.triggered.connect(lambda _=False, k=key: self._overflow_pick_league(k))
+            else:
+                act.triggered.connect(lambda checked, btn=c: self._overflow_toggle_cat(btn, checked))
+            menu.addAction(act)
+        overflow_btn.show()
+        # Light the "⋯" up when a hidden chip is the active/checked one.
+        any_active = any(c.isChecked() for c in overflow)
+        overflow_btn.setProperty("active", "true" if any_active else "false")
+        overflow_btn.style().unpolish(overflow_btn)
+        overflow_btn.style().polish(overflow_btn)
+
+    def _overflow_pick_league(self, key):
+        self.on_league_chip(key)         # re-pins + relayouts via apply path
+
+    def _overflow_toggle_cat(self, chip, checked):
+        chip.setChecked(checked)         # fires toggled → apply_filters
+        self._relayout_chips()
+
     def setup_worker(self):
         """Set up the background worker for fetching news"""
         self.worker = NewsWorker()
@@ -1328,10 +1524,7 @@ class TeamNewsWidget(QWidget):
             chip.setChecked(k == key)
         self.update_team_dropdown(key)
         self.apply_filters()
-
-    def toggle_injury_filter(self, checked):
-        self.show_injuries_only = checked
-        self.apply_filters()
+        self._relayout_chips()           # keep the now-active league pinned visible
 
     def on_team_changed(self, team_name):
         if team_name == "All Teams":
@@ -1355,9 +1548,6 @@ class TeamNewsWidget(QWidget):
         active_cats = [c for c, chip in self.category_chips.items() if chip.isChecked()]
         if active_cats:
             items = [i for i in items if i.get('category') in active_cats]
-
-        if self.show_injuries_only:
-            items = [i for i in items if i.get('is_injury_news', False)]
 
         if self.current_team:
             team = self.current_team.lower()
