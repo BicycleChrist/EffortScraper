@@ -49,7 +49,7 @@ DEFAULT_DB_PATH = "./nhl_analytics.db"
 MODEL_PARAMS_PATH = "advanced_model_params_v6.npz"
 STATS_PATH = "advanced_standardize_stats_v6.npz"
 CALIBRATION_PATH = "model_calibration_v6.npz"
-RANDOM_SEED = 4237426529  # Best performer from random seed testing (val loss -0.4517)
+RANDOM_SEED = None   # Best performer from random seed testing (4237426529, val loss -0.4517)
 
 DEFAULT_EPOCHS = 1000
 DEFAULT_BATCH = 64
@@ -62,6 +62,24 @@ DEFAULT_N_SIMS = 5000
 # Historical values: 3.0, 2.17
 EMPTY_NET_MULTIPLIER_FOR = 3.0
 EMPTY_NET_MULTIPLIER_AGAINST = 2.17
+
+# --- Simulation realism constants (calibrated to nhl_analytics.db, 2021-2026) ---
+# Home/away goals are NOT independent: empirical within-game count correlation is
+# ≈ -0.118 (score effects — the trailing team pushes, the leading team sits back).
+# We inject this via a Gaussian copula on regulation scores; the Gaussian rho is
+# calibrated through the FULL sim (the OT/SO +1-to-one-side mechanic adds its own
+# negative correlation on top of the copula) so the resulting final-score COUNT
+# correlation lands on the -0.118 target. rho_gauss=-0.088 -> final corr ≈ -0.118.
+# NOTE: a linear copula matches the correlation but cannot reproduce the empirical
+# *excess* of one-goal/tied games (~22% reach OT vs ~18% under independence) — that
+# underdispersion is a score-effect phenomenon and is left for a future score-effect
+# refinement of the regulation simulation.
+HOME_AWAY_RHO_GAUSS = -0.088
+# Overtime/shootout: every NHL game has a winner, so tied regulation games must be
+# resolved. Empirically home teams win ~53% of games that reach OT (54% of
+# OT-decided, ~even in the shootout), tilted by relative team strength (lh-la).
+OT_HOME_WIN_BASE = 0.53
+OT_STRENGTH_TILT = 0.10
 
 # ---------------------------
 # Global Helpers
@@ -1664,6 +1682,24 @@ def prepare_training_data(db_path, use_complete_games_filter=True):
     """
     df = get_base_team_stats(db_path, use_complete_games_filter=use_complete_games_filter)
 
+    # TARGET GUARD: drop games with a degenerate / missing-data target so they can
+    # never train the model, regardless of the complete-games filter.
+    #  - An NHL game can never end 0-0 (every game has a winner), so a 0-0 final is
+    #    the signature of missing MoneyPuck goals COALESCE'd to 0.
+    #  - Every real game has expected goals > 0; xgf <= 0 on either side means the
+    #    MoneyPuck team row was absent and goals_for was zero-filled.
+    n_before = len(df)
+    bad_target = (
+        ((df['goals_home'] == 0) & (df['goals_away'] == 0)) |
+        (df.get('home_xgf', 1.0) <= 0) |
+        (df.get('away_xgf', 1.0) <= 0)
+    )
+    n_bad = int(bad_target.sum())
+    if n_bad:
+        print(f"⚠  Target guard: dropping {n_bad} game(s) with degenerate/missing targets "
+              f"(0-0 finals or missing MoneyPuck data) out of {n_before}.")
+        df = df[~bad_target].reset_index(drop=True)
+
     # Validate data quality
     is_valid = validate_training_data(df, verbose=True)
 
@@ -1812,11 +1848,11 @@ def update_step(p, x, y, lr, rng_key, dropout_rate, w=None):
 update_step = jax.jit(update_step, static_argnums=(5,))  # static_argnums for dropout_rate
 
 
-def update_step_adam(params, adam_state, x, y, lr, rng_key, dropout_rate, beta1=0.9, beta2=0.999):
-    """Single training step with Adam optimizer."""
+def update_step_adam(params, adam_state, x, y, lr, rng_key, dropout_rate, w=None, beta1=0.9, beta2=0.999):
+    """Single training step with Adam optimizer and optional sample weights."""
     # Compute loss and gradients with dropout enabled
     loss_and_grad = jax.value_and_grad(
-        lambda p: loss_fn(p, x, y, training=True, rng_key=rng_key, dropout_rate=dropout_rate)
+        lambda p: loss_fn(p, x, y, training=True, rng_key=rng_key, dropout_rate=dropout_rate, weights=w)
     )
     loss, grads = loss_and_grad(params)
 
@@ -2008,12 +2044,258 @@ def get_features_pruned(df):
 
 
 # ---------------------------
+# Odds Backtesting
+# ---------------------------
+def load_odds_data():
+    """Load all moneypuck_odds CSV files and return a DataFrame keyed by traditional_game_id."""
+    import glob as glob_mod
+    csv_files = glob_mod.glob('moneypuck_odds_*.csv')
+    csv_files = [f for f in csv_files if not f.endswith('_all_playoffs.csv')]
+
+    if not csv_files:
+        return pd.DataFrame()
+
+    dfs = []
+    for f in csv_files:
+        try:
+            dfs.append(pd.read_csv(f))
+        except Exception as e:
+            print(f"  Warning: Could not load {f}: {e}")
+
+    if not dfs:
+        return pd.DataFrame()
+
+    odds_df = pd.concat(dfs, ignore_index=True)
+    odds_df['traditional_game_id'] = odds_df['traditional_game_id'].astype(str)
+    return odds_df
+
+
+def odds_backtest(val_game_ids, val_pred_home, val_pred_away, val_actual_home, val_actual_away, label=""):
+    """
+    Backtest model predictions against sportsbook closing lines.
+    Uses Pinnacle as primary (sharpest line), FanDuel as fallback.
+    Simulates flat $100 bets where model disagrees with market.
+    """
+    tag = f" ({label})" if label else ""
+    print(f"\n{'=' * 60}")
+    print(f"ODDS BACKTESTING: Model vs Market{tag}")
+    print('=' * 60)
+
+    odds_df = load_odds_data()
+    if odds_df.empty:
+        print("  No odds CSV files found. Skipping backtest.")
+        print('=' * 60)
+        return
+
+    # Match val games to odds data
+    val_ids_str = [str(gid) for gid in val_game_ids]
+    matched = odds_df[odds_df['traditional_game_id'].isin(val_ids_str)].copy()
+
+    if matched.empty:
+        print("  No val games matched to odds data. Skipping backtest.")
+        print('=' * 60)
+        return
+
+    # Deduplicate (keep first occurrence per game)
+    matched = matched.drop_duplicates('traditional_game_id', keep='first')
+
+    # Pick best available closing odds: Pinnacle > FanDuel > DraftKings
+    def get_closing_odds(row):
+        for book in ['pinnacle', 'fanduel', 'draftkings']:
+            away_col = f'{book}_closing_away_odds'
+            home_col = f'{book}_closing_home_odds'
+            if away_col in row.index and home_col in row.index:
+                a, h = row[away_col], row[home_col]
+                try:
+                    a, h = float(a), float(h)
+                    if not (np.isnan(a) or np.isnan(h)):
+                        return pd.Series({'close_away': a, 'close_home': h, 'book': book})
+                except (ValueError, TypeError):
+                    continue
+        return pd.Series({'close_away': np.nan, 'close_home': np.nan, 'book': None})
+
+    closing = matched.apply(get_closing_odds, axis=1)
+    matched = pd.concat([matched, closing], axis=1)
+    matched = matched.dropna(subset=['close_away', 'close_home'])
+
+    if matched.empty:
+        print("  No valid closing odds found for val games. Skipping.")
+        print('=' * 60)
+        return
+
+    # Build lookup: game_id -> index in val arrays
+    id_to_idx = {str(gid): i for i, gid in enumerate(val_game_ids)}
+    matched['val_idx'] = matched['traditional_game_id'].map(id_to_idx)
+    matched = matched.dropna(subset=['val_idx'])
+    matched['val_idx'] = matched['val_idx'].astype(int)
+
+    n_matched = len(matched)
+    book_counts = matched['book'].value_counts()
+    print(f"  Matched {n_matched}/{len(val_game_ids)} val games to closing odds")
+    for book, count in book_counts.items():
+        print(f"    {book}: {count} games")
+
+    # Convert American odds to implied probability (no-vig)
+    def american_to_implied(odds):
+        if odds > 0:
+            return 100.0 / (odds + 100.0)
+        else:
+            return abs(odds) / (abs(odds) + 100.0)
+
+    # American odds to decimal (for payout calculation)
+    def american_to_decimal(odds):
+        if odds > 0:
+            return 1.0 + odds / 100.0
+        else:
+            return 1.0 + 100.0 / abs(odds)
+
+    matched['market_home_prob'] = matched['close_home'].apply(american_to_implied)
+    matched['market_away_prob'] = matched['close_away'].apply(american_to_implied)
+    # Remove vig: normalize to sum to 1
+    total_prob = matched['market_home_prob'] + matched['market_away_prob']
+    matched['market_home_prob'] /= total_prob
+    matched['market_away_prob'] /= total_prob
+
+    matched['decimal_home'] = matched['close_home'].apply(american_to_decimal)
+    matched['decimal_away'] = matched['close_away'].apply(american_to_decimal)
+
+    # Model implied win probabilities from Poisson rates
+    # P(home wins) approx from lambda comparison (simple: higher lambda = higher win prob)
+    idxs = matched['val_idx'].values
+    m_home = val_pred_home[idxs]
+    m_away = val_pred_away[idxs]
+    act_home = val_actual_home[idxs]
+    act_away = val_actual_away[idxs]
+
+    # Poisson win probability: P(X>Y) where X~Pois(lh), Y~Pois(la)
+    from scipy.stats import poisson
+    max_goals = 12
+    model_home_win_prob = np.zeros(n_matched)
+    model_away_win_prob = np.zeros(n_matched)
+    for i in range(n_matched):
+        lh, la = m_home[i], m_away[i]
+        h_pmf = poisson.pmf(np.arange(max_goals), lh)
+        a_pmf = poisson.pmf(np.arange(max_goals), la)
+        # Joint probability grid
+        grid = np.outer(h_pmf, a_pmf)
+        p_home_win = np.sum(np.tril(grid, -1))  # below diagonal = home > away
+        p_away_win = np.sum(np.triu(grid, 1))   # above diagonal = away > home
+        # Normalize (exclude ties for moneyline)
+        total = p_home_win + p_away_win
+        model_home_win_prob[i] = p_home_win / total if total > 0 else 0.5
+        model_away_win_prob[i] = p_away_win / total if total > 0 else 0.5
+
+    matched['model_home_prob'] = model_home_win_prob
+    matched['model_away_prob'] = model_away_win_prob
+
+    # Actual outcomes
+    actual_home_won = act_home > act_away
+    actual_away_won = act_away > act_home
+    actual_tie = act_home == act_away  # regulation tie
+
+    # --- Model pick accuracy (on games with odds) ---
+    model_picks_home = model_home_win_prob > 0.5
+    decided = ~actual_tie
+    if decided.sum() > 0:
+        correct = (model_picks_home[decided] == actual_home_won[decided]).sum()
+        print(f"\n  Model pick accuracy (odds-matched games): {correct}/{decided.sum()} = {correct/decided.sum()*100:.1f}%")
+
+    # --- Market pick accuracy ---
+    market_picks_home = matched['market_home_prob'].values > 0.5
+    if decided.sum() > 0:
+        mkt_correct = (market_picks_home[decided] == actual_home_won[decided]).sum()
+        print(f"  Market pick accuracy (odds-matched games): {mkt_correct}/{decided.sum()} = {mkt_correct/decided.sum()*100:.1f}%")
+
+    # --- MoneyPuck pick accuracy ---
+    mp_home_prob = matched['mp_home_win_prob'].apply(lambda x: float(str(x).replace('%', '')) / 100.0 if pd.notna(x) else np.nan)
+    mp_valid = mp_home_prob.notna().values & decided
+    if mp_valid.sum() > 0:
+        mp_picks_home = mp_home_prob.values[mp_valid] > 0.5
+        mp_correct = (mp_picks_home == actual_home_won[mp_valid]).sum()
+        print(f"  MoneyPuck pick accuracy (odds-matched games): {mp_correct}/{mp_valid.sum()} = {mp_correct/mp_valid.sum()*100:.1f}%")
+
+    # --- Flat bet simulation: bet $100 on model's pick at closing line ---
+    STAKE = 100.0
+    total_profit = 0.0
+    n_bets = 0
+    wins = 0
+    losses = 0
+
+    # Edge-filtered bets: only bet when model edge > threshold
+    EDGE_THRESHOLD = 0.03  # 3% edge over market
+    edge_profit = 0.0
+    edge_bets = 0
+    edge_wins = 0
+
+    for i in range(n_matched):
+        if actual_tie[i]:
+            continue  # Skip ties (push)
+
+        home_won = actual_home_won[i]
+        m_prob_home = model_home_win_prob[i]
+        mkt_prob_home = matched['market_home_prob'].iloc[i]
+        dec_home = matched['decimal_home'].iloc[i]
+        dec_away = matched['decimal_away'].iloc[i]
+
+        # Model picks home
+        if m_prob_home > 0.5:
+            bet_won = home_won
+            payout = STAKE * dec_home if bet_won else 0.0
+        else:
+            bet_won = not home_won
+            payout = STAKE * dec_away if bet_won else 0.0
+
+        profit = payout - STAKE
+        total_profit += profit
+        n_bets += 1
+        if bet_won:
+            wins += 1
+        else:
+            losses += 1
+
+        # Edge-filtered bet
+        edge_home = m_prob_home - mkt_prob_home
+        edge_away = (1.0 - m_prob_home) - (1.0 - mkt_prob_home)
+        max_edge = max(edge_home, edge_away)
+
+        if max_edge >= EDGE_THRESHOLD:
+            edge_bets += 1
+            # Bet on side with edge
+            if edge_home > edge_away:
+                e_won = home_won
+                e_payout = STAKE * dec_home if e_won else 0.0
+            else:
+                e_won = not home_won
+                e_payout = STAKE * dec_away if e_won else 0.0
+            edge_profit += e_payout - STAKE
+            if e_won:
+                edge_wins += 1
+
+    print(f"\n  --- Flat Bet Simulation ($100/game on model's pick) ---")
+    if n_bets > 0:
+        roi = total_profit / (n_bets * STAKE) * 100
+        print(f"  Total bets: {n_bets} | W-L: {wins}-{losses} ({wins/n_bets*100:.1f}%)")
+        print(f"  Total profit: ${total_profit:+.2f} | ROI: {roi:+.2f}%")
+
+    print(f"\n  --- Edge-Filtered Bets (>{EDGE_THRESHOLD*100:.0f}% edge over market) ---")
+    if edge_bets > 0:
+        e_roi = edge_profit / (edge_bets * STAKE) * 100
+        print(f"  Total bets: {edge_bets} | W: {edge_wins} ({edge_wins/edge_bets*100:.1f}%)")
+        print(f"  Total profit: ${edge_profit:+.2f} | ROI: {e_roi:+.2f}%")
+    else:
+        print(f"  No bets met the {EDGE_THRESHOLD*100:.0f}% edge threshold.")
+
+    print('=' * 60)
+
+
+# ---------------------------
 # Train & Forecast
 # ---------------------------
-def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, use_pruned_features=False):
+def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, use_pruned_features=False, use_adam=False):
     print("preparing training data...")
     print(f"game filtering: {'ENABLED' if use_complete_games_filter else 'DISABLED'}")
-    print(f"feature set: {'PRUNED (~40)' if use_pruned_features else 'FULL (~124)'}\n")
+    print(f"feature set: {'PRUNED (~40)' if use_pruned_features else 'FULL (~124)'}")
+    print(f"optimizer: {'ADAM' if use_adam else 'SGD'}\n")
     df = prepare_training_data(db, use_complete_games_filter=use_complete_games_filter)
     if df.empty:
         print("No data!")
@@ -2029,7 +2311,7 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
     # Temporal Validation Split: train on older games, validate on most recent
     # Sort by date so split is chronological (no future leakage)
     df = df.sort_values('mp_game_date').reset_index(drop=True)
-    val_size = int(len(df) * 0.15)
+    val_size = int(len(df) * 0.08)
     train_size = len(df) - val_size
 
     split_date = df.iloc[train_size]['mp_game_date']
@@ -2068,6 +2350,13 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
 
     params = init_params(key, len(feats), hidden)
 
+    # Adam optimizer state (only used when use_adam=True)
+    adam_state = {
+        'm': {k: jnp.zeros_like(v) for k, v in params.items()},
+        'v': {k: jnp.zeros_like(v) for k, v in params.items()},
+        't': 0,
+    }
+
     best_val_loss = float('inf')
     best_params = None
     patience_counter = 0
@@ -2081,20 +2370,26 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
 
         # Generate new random key for this epoch
         key, subkey = jax.random.split(key)
+        # Permute INDICES each epoch and gather batches from the original arrays.
+        # Do NOT mutate X/Y/W_train: in-place shuffling accumulates across epochs,
+        # which (a) desyncs the time weights from X/Y after the first epoch and
+        # (b) leaves post-training train_predictions misaligned with train_game_ids.
         perm = jax.random.permutation(subkey, len(X))
-        X, Y = X[perm], Y[perm]
-        W_shuffled = W_train[perm]
         loss_sum = 0.0
 
         # Train Loop
         for i in range(steps):
-            xb = X[i * batch:(i + 1) * batch]
-            yb = Y[i * batch:(i + 1) * batch]
-            wb = W_shuffled[i * batch:(i + 1) * batch]
+            idx = perm[i * batch:(i + 1) * batch]
+            xb = X[idx]
+            yb = Y[idx]
+            wb = W_train[idx]
 
             # Generate unique random key for dropout in this batch
             key, dropout_key = jax.random.split(key)
-            params, l = update_step(params, xb, yb, current_lr, dropout_key, dropout_rate, wb)
+            if use_adam:
+                params, adam_state, l = update_step_adam(params, adam_state, xb, yb, current_lr, dropout_key, dropout_rate, wb)
+            else:
+                params, l = update_step(params, xb, yb, current_lr, dropout_key, dropout_rate, wb)
             loss_sum += l
 
         # Validation & Logging
@@ -2102,7 +2397,7 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
             # Full validation pass WITHOUT dropout (training=False)
             val_loss = loss_fn(params, X_val, Y_val, training=False, rng_key=None, dropout_rate=0.0)
             train_loss = loss_sum / steps
-            
+
             improved = ""
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -2243,6 +2538,15 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
 
     print('=' * 60)
 
+    # --- ODDS BACKTESTING: Model vs Market ---
+    train_game_ids = df.iloc[:train_size]['game_id'].values
+    train_pred_home = np.array(train_predictions[:, 0])
+    train_pred_away = np.array(train_predictions[:, 1])
+    train_actual_home = np.array(Y[:, 0])
+    train_actual_away = np.array(Y[:, 1])
+    odds_backtest(train_game_ids, train_pred_home, train_pred_away, train_actual_home, train_actual_away, label="TRAIN")
+    odds_backtest(val_game_ids, val_pred_home, val_pred_away, val_actual_home, val_actual_away, label="VAL")
+
     # Save calibration factors
     np.savez(CALIBRATION_PATH,
              calibration_factor_home=calibration_factor_home,
@@ -2315,7 +2619,7 @@ def lookup_player_id(player_name: str, db_conn, is_goalie: bool = True) -> str:
         if len(exact) == 1:
             player_id = exact['player_id'].iloc[0]
             print(f"  Exact match: {exact['player_name'].iloc[0]}")
-            return f"{player_id} [G]" if is_goalie else player_id
+            return f"{str(player_id).replace(' [G]', '').strip()} [G]" if is_goalie else player_id
 
         # Multiple matches - need disambiguation
         print(f"ERROR: Multiple {'goalies' if is_goalie else 'players'} match '{player_name}':")
@@ -2326,7 +2630,7 @@ def lookup_player_id(player_name: str, db_conn, is_goalie: bool = True) -> str:
 
     player_id = result['player_id'].iloc[0]
     print(f"  Found: {result['player_name'].iloc[0]} ({player_id})")
-    return f"{player_id} [G]" if is_goalie else player_id
+    return f"{str(player_id).replace(' [G]', '').strip()} [G]" if is_goalie else player_id
 
 def get_latest_stats_for_manual(db_path):
     """
@@ -2437,6 +2741,52 @@ def get_latest_stats_for_manual(db_path):
     return latest
 
 
+def _resolve_goalie_features(goalie_features_df, goalie_id, team_id, primary_goalie_id, side_label):
+    """Return the latest per-goalie feature row for a forecast.
+
+    Falls back to the team's primary starter (never league averages / zeros) when
+    the requested goalie is missing or belongs to a different team. Returns an
+    empty DataFrame only if even the primary starter cannot be resolved.
+    """
+    def clean(gid):
+        return str(gid).replace(' [G]', '').strip() if gid is not None else None
+
+    def latest_row_for(gid, restrict_team=None):
+        gid = clean(gid)
+        if not gid:
+            return pd.DataFrame()
+        rows = goalie_features_df[goalie_features_df['player_id'] == gid]
+        if restrict_team is not None:
+            rows = rows[rows['team_id'] == int(restrict_team)]
+        rows = rows.sort_values('game_id')
+        return rows.tail(1) if not rows.empty else pd.DataFrame()
+
+    primary_id = clean(primary_goalie_id)
+
+    # 1. Requested goalie, validated against the requested team.
+    row = latest_row_for(goalie_id)
+    if not row.empty:
+        row_team = int(row['team_id'].iloc[0])
+        if int(team_id) == row_team:
+            return row
+        print(f"⚠  {side_label}: goalie {clean(goalie_id)} last played for team {row_team}, "
+              f"not the requested team {int(team_id)} (likely a typo/swapped or traded goalie). "
+              f"Falling back to primary starter {primary_id}.")
+    elif clean(goalie_id):
+        print(f"⚠  {side_label}: no data for requested goalie {clean(goalie_id)}. "
+              f"Falling back to primary starter {primary_id}.")
+
+    # 2. Team primary starter (restricted to their games for this team).
+    if primary_id and primary_id != clean(goalie_id):
+        prow = latest_row_for(primary_id, restrict_team=team_id)
+        if not prow.empty:
+            return prow
+
+    print(f"⚠  {side_label}: could not resolve any goalie features "
+          f"(requested={clean(goalie_id)}, primary={primary_id}); features will default to 0.")
+    return pd.DataFrame()
+
+
 def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a_odd, n_sims, home_goalie_id=None, away_goalie_id=None, use_calibration=True):
     if not os.path.exists(MODEL_PARAMS_PATH):
         print("No model – train first.")
@@ -2502,29 +2852,22 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     goalie_features_df = process_goalie_metrics(con)
     con.close()
 
-    # Get latest features for home goalie
-    home_goalie_features = pd.DataFrame()
-    if home_goalie_id:
-        hg_data = goalie_features_df[
-            (goalie_features_df['player_id'] == home_goalie_id) &
-            (goalie_features_df['team_id'] == h_row['team_id'])
-        ].sort_values('game_id')
-        if not hg_data.empty:
-            home_goalie_features = hg_data.tail(1)
-        else:
-            print(f"Warning: No data found for home goalie {home_goalie_id}")
-
-    # Get latest features for away goalie
-    away_goalie_features = pd.DataFrame()
-    if away_goalie_id:
-        ag_data = goalie_features_df[
-            (goalie_features_df['player_id'] == away_goalie_id) &
-            (goalie_features_df['team_id'] == a_row['team_id'])
-        ].sort_values('game_id')
-        if not ag_data.empty:
-            away_goalie_features = ag_data.tail(1)
-        else:
-            print(f"Warning: No data found for away goalie {away_goalie_id}")
+    # Resolve goalie features with a primary-starter fallback.
+    # We have full per-goalie data, so we NEVER fall back to league averages /
+    # zeros. Resolution order:
+    #   1. The requested goalie, IF their latest game was for the requested team
+    #      (validates team membership: catches typos / swapped home-away goalies /
+    #       a goalie who has since been traded away).
+    #   2. The team's primary starter (most-started goalie in recent games).
+    # team_id is intentionally NOT used to filter the row set (a mid-season-traded
+    # goalie's latest row already carries the correct current team) — it is only
+    # used to validate membership after selecting the goalie's latest row.
+    home_goalie_features = _resolve_goalie_features(
+        goalie_features_df, home_goalie_id, h_row['team_id'],
+        h_row.get('primary_goalie_id', None), f"{h_norm} (home)")
+    away_goalie_features = _resolve_goalie_features(
+        goalie_features_df, away_goalie_id, a_row['team_id'],
+        a_row.get('primary_goalie_id', None), f"{a_norm} (away)")
 
     matchup = {}
     for f in feats:
@@ -2684,21 +3027,22 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
 
     print(f"Period weights (empirical): P1={p1_wt:.3f}  P2={p2_wt:.3f}  P3={p3_wt:.3f}  EN base={EN_BASE_SHARE:.3f}  (periods={p1_wt+p2_wt+p3_wt:.3f})")
 
-    # Simulate each period independently
-    h_p1 = np.random.poisson(lh * p1_wt, n_sims)
-    a_p1 = np.random.poisson(la * p1_wt, n_sims)
-    h_p2 = np.random.poisson(lh * p2_wt, n_sims)
-    a_p2 = np.random.poisson(la * p2_wt, n_sims)
-    h_p3 = np.random.poisson(lh * p3_wt, n_sims)
-    a_p3 = np.random.poisson(la * p3_wt, n_sims)
+    from scipy.stats import norm as _norm, poisson as _poisson
 
-    # Score entering EN window (final ~2 min of P3)
-    cur_h = h_p1 + h_p2 + h_p3
-    cur_a = a_p1 + a_p2 + a_p3
+    # --- Correlated regulation scoring (Gaussian copula) ---
+    # Draw the two teams' 58-min regulation goal totals with the empirical NEGATIVE
+    # correlation (score effects) baked in, while preserving exact Poisson marginals.
+    lam_h_reg = lh * REGULATION_SHARE
+    lam_a_reg = la * REGULATION_SHARE
+    cov = [[1.0, HOME_AWAY_RHO_GAUSS], [HOME_AWAY_RHO_GAUSS, 1.0]]
+    z = np.random.multivariate_normal([0.0, 0.0], cov, n_sims)
+    u = _norm.cdf(z)
+    cur_h = _poisson.ppf(u[:, 0], lam_h_reg).astype(np.int64)
+    cur_a = _poisson.ppf(u[:, 1], lam_a_reg).astype(np.int64)
     diff = cur_h - cur_a
 
-    # Empty net phase: final ~2 minutes of regulation
-    # Base rate = normal 2-min scoring rate; multipliers model goalie-pull effect
+    # --- Empty net phase: final ~2 minutes of regulation ---
+    # Base rate = normal 2-min scoring rate; multipliers model goalie-pull effect.
     rh = np.full(n_sims, lh * EN_BASE_SHARE)
     ra = np.full(n_sims, la * EN_BASE_SHARE)
 
@@ -2713,18 +3057,35 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     en_h = np.random.poisson(rh)
     en_a = np.random.poisson(ra)
 
-    final_h = cur_h + en_h
-    final_a = cur_a + en_a
+    # End-of-regulation score
+    reg_h = cur_h + en_h
+    reg_a = cur_a + en_a
+
+    # --- Overtime / shootout resolution ---
+    # NHL games cannot tie. Tied regulation games go to OT/SO; the winner gets +1
+    # (a real sudden-death OT goal or the NHL-convention shootout goal). Home win
+    # prob anchored at the empirical ~53% and tilted by relative team strength.
+    tied = reg_h == reg_a
+    p_home_ot = float(np.clip(OT_HOME_WIN_BASE + OT_STRENGTH_TILT * (lh - la), 0.30, 0.70))
+    home_wins_ot = np.random.random(n_sims) < p_home_ot
+
+    final_h = reg_h.copy()
+    final_a = reg_a.copy()
+    final_h[tied & home_wins_ot] += 1
+    final_a[tied & ~home_wins_ot] += 1
     total = final_h + final_a
+
+    ot_rate = float(np.mean(tied))
 
     # --- SIMULATION OVERVIEW ---
     print(f"{h_row['team_abbr']} {np.mean(final_h):.2f} – {a_row['team_abbr']} {np.mean(final_a):.2f}  |  Total {np.mean(total):.2f}")
+    print(f"Home/away goal corr (sim): {np.corrcoef(final_h, final_a)[0, 1]:+.3f}  (target ≈ -0.118)  |  Reach OT/SO: {100 * ot_rate:.1f}%")
 
+    # Moneyline now sums to 100% (every game has a winner, incl. OT/SO)
     win_h = np.mean(final_h > final_a)
     win_a = np.mean(final_a > final_h)
-    ties = np.mean(final_h == final_a)
 
-    print(f"Win Probability → {h_row['team_abbr']}: {100 * win_h:.1f}%   |   {a_row['team_abbr']}: {100 * win_a:.1f}%  |  ties: {100 * ties:.1f}%")
+    print(f"Win Probability → {h_row['team_abbr']}: {100 * win_h:.1f}%   |   {a_row['team_abbr']}: {100 * win_a:.1f}%  (incl. OT/SO)")
     print(f"Puckline (-1.5) → {h_row['team_abbr']}: {100 * np.mean(final_h - final_a >= 2):.1f}%   |   {a_row['team_abbr']}: {100 * np.mean(final_a - final_h >= 2):.1f}%")
     print(f"Over 6.5: {100 * np.mean(total > 6.5):.1f}%   |   Under 6.5: {100 * np.mean(total <= 6.5):.1f}%")
 
@@ -2737,10 +3098,15 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     for _, row in top_scores.iterrows():
         print(f"  {h_row['team_abbr']} {int(row['h'])} - {int(row['a'])} {a_row['team_abbr']}  ({row['prob']*100:.1f}%)")
 
-    # 2. Projected Period Scoring (from actual simulation arrays)
-    sp1_h, sp1_a = np.mean(h_p1), np.mean(a_p1)
-    sp2_h, sp2_a = np.mean(h_p2), np.mean(a_p2)
-    sp3_h, sp3_a = np.mean(h_p3) + np.mean(en_h), np.mean(a_p3) + np.mean(en_a)
+    # 2. Projected Period Scoring (regulation mean split by empirical period weights;
+    #    P3 adds the EN phase). Periods are a display approximation of the simulated
+    #    regulation totals (cur_h/cur_a), which is what the EN/OT logic runs on.
+    pw = np.array([p1_wt, p2_wt, p3_wt])
+    pw = pw / pw.sum()
+    mh, ma = float(np.mean(cur_h)), float(np.mean(cur_a))
+    sp1_h, sp1_a = mh * pw[0], ma * pw[0]
+    sp2_h, sp2_a = mh * pw[1], ma * pw[1]
+    sp3_h, sp3_a = mh * pw[2] + np.mean(en_h), ma * pw[2] + np.mean(en_a)
 
     print(f"\nProjected Scoring by Period:")
     print(f"  P1: {h_row['team_abbr']} {sp1_h:.2f} - {sp1_a:.2f} {a_row['team_abbr']}")
@@ -2811,6 +3177,10 @@ Examples:
     p.add_argument("--pruned", dest='use_pruned', action='store_true',
                    help="Use pruned feature set (~40 high-signal features instead of ~124)")
 
+    # Optimizer toggle
+    p.add_argument("--optimizer", choices=['sgd', 'adam'], default='sgd',
+                   help="Training optimizer (default: sgd)")
+
     rest_days_args = p.add_mutually_exclusive_group()
     rest_days_args.add_argument("--date", type=str, help="calculate rest-days from Game date YYYY-MM-DD (manual mode)")
     rest_days_args.add_argument("--today", dest="date", action="store_const", const=str(datetime.datetime.now().date()), help="use today's date for rest-diff calculations")
@@ -2833,10 +3203,10 @@ Examples:
         print(f"Database: {a.db}")
         print(f"Complete games filter: {'ENABLED' if a.use_filter else 'DISABLED'}")
         print(f"Feature set: {'PRUNED (~40)' if a.use_pruned else 'FULL (~124)'}")
-        print(f"Epochs: {a.epochs} | Batch: {a.batch} | LR: {a.lr} | Hidden: {a.hidden}")
+        print(f"Epochs: {a.epochs} | Batch: {a.batch} | LR: {a.lr} | Hidden: {a.hidden} | Optimizer: {a.optimizer.upper()}")
         print("=" * 70 + "\n")
 
-        train(a.db, a.epochs, a.batch, a.lr, a.hidden, RANDOM_SEED, use_complete_games_filter=a.use_filter, use_pruned_features=a.use_pruned)
+        train(a.db, a.epochs, a.batch, a.lr, a.hidden, RANDOM_SEED, use_complete_games_filter=a.use_filter, use_pruned_features=a.use_pruned, use_adam=(a.optimizer == 'adam'))
     elif a.mode == 'manual':
         manual_forecast(a.db, a.home, a.away, a.date, a.rest[0], a.rest[1],
                        a.h_odds, a.a_odds, a.n_sims,
