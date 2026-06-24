@@ -8,6 +8,9 @@ Supports fetching events, markets, and historical candlestick data.
 import requests
 import hashlib
 import json
+import orjson
+import os
+import concurrent.futures as cf
 import threading
 import traceback
 import time
@@ -29,6 +32,10 @@ class KalshiClient:
     """Client for Kalshi API interactions."""
 
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+    # Authenticated TRADING endpoints (orders) live on the dedicated external host.
+    # The legacy /portfolio/orders* endpoints on the elections host now return HTTP
+    # 410 (Gone); orders moved to the V2 event-order endpoints under this host.
+    TRADE_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 
     # Sports-related series prefixes
     SPORTS_SERIES = ['NFL', 'NBA', 'MLB', 'NHL', 'SOCCER', 'FOOTBALL', 'BASKETBALL',
@@ -135,21 +142,32 @@ class KalshiClient:
         # Note: For now making unauthenticated requests to public endpoints
         # Full authentication requires RSA signing with private key
 
-        try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                json=data
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error making request to {url}: {e}")
-            if hasattr(e.response, 'text'):
-                print(f"Response: {e.response.text}")
-            raise
+        # Retry on 429 with exponential backoff. Loading many sports series at once
+        # bursts past Kalshi's public rate limit; without this a 429 silently drops
+        # a whole league from the event menu (MLB/KBO/etc. randomly vanishing).
+        last_exc = None
+        for attempt in range(4):
+            try:
+                response = self.session.request(
+                    method=method, url=url, headers=headers,
+                    params=params, json=data,
+                    timeout=15  # never hang the event loader on a stalled connection
+                )
+                if response.status_code == 429:
+                    time.sleep(0.4 * (2 ** attempt))  # 0.4s, 0.8s, 1.6s, 3.2s
+                    last_exc = requests.exceptions.HTTPError("429 Too Many Requests")
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                if getattr(e, 'response', None) is not None and e.response.status_code == 429:
+                    time.sleep(0.4 * (2 ** attempt))
+                    continue
+                print(f"Error making request to {url}: {e}")
+                raise
+        print(f"Error making request to {url}: rate-limited after retries")
+        raise last_exc
 
     # ------------------------------------------------------------------
     # AUTHENTICATED REST (RSA-PSS signed) — required for portfolio/orders
@@ -161,10 +179,15 @@ class KalshiClient:
         return self._priv_key
 
     def _signed_request(self, method: str, endpoint: str,
-                        params: Dict = None, data: Dict = None) -> Dict:
+                        params: Dict = None, data: Dict = None,
+                        base_url: str = None) -> Dict:
         """Authenticated request signed per Kalshi's scheme:
-        sign `timestamp + METHOD + /trade-api/v2<endpoint-path>` with RSA-PSS/SHA256."""
-        url = f"{self.BASE_URL}{endpoint}"
+        sign `timestamp + METHOD + /trade-api/v2<endpoint-path>` with RSA-PSS/SHA256.
+
+        `base_url` overrides the host (e.g. TRADE_BASE_URL for order endpoints); the
+        signed path is `/trade-api/v2<endpoint>` and is host-independent, so the same
+        RSA key works across hosts."""
+        url = f"{base_url or self.BASE_URL}{endpoint}"
         ts = str(int(time.time() * 1000))
         path = "/trade-api/v2" + endpoint.split("?")[0]
         signature = self._get_private_key().sign(
@@ -180,25 +203,60 @@ class KalshiClient:
         }
         resp = self.session.request(method, url, headers=headers,
                                     params=params, json=data)
-        resp.raise_for_status()
+        if not resp.ok:
+            # Surface the API's error body (field name / reason) — far more useful
+            # than a bare status code when refining an order payload.
+            raise RuntimeError(
+                f"Kalshi {method} {endpoint} -> {resp.status_code}: {resp.text[:600]}")
         return resp.json() if resp.content else {}
+
+    @staticmethod
+    def legacy_to_v2_order(action: str, side: str, price_cents: int):
+        """Map the legacy order shape (action buy/sell + side yes/no + price in
+        CENTS) to the V2 single-YES-book shape (side bid/ask + price in DOLLARS).
+
+        The V2 book is the YES book: bid = buy YES, ask = sell YES. A NO order is the
+        economic inverse of a YES order at the complementary price:
+            buy  NO @ p  ==  sell YES @ (100 - p)  -> ask
+            sell NO @ p  ==  buy  YES @ (100 - p)  -> bid
+        Returns (v2_side, yes_price_cents, price_dollars_str).
+        """
+        p = int(price_cents)
+        if side == "yes":
+            v2_side = "bid" if action == "buy" else "ask"
+            yes_cents = p
+        else:  # no
+            v2_side = "ask" if action == "buy" else "bid"
+            yes_cents = 100 - p
+        return v2_side, yes_cents, f"{yes_cents / 100:.2f}"
 
     def create_order(self, ticker: str, action: str, side: str, count: int,
                      price_cents: int = None, order_type: str = "limit",
-                     client_order_id: str = None) -> Dict:
-        """Place an order. action='buy'|'sell', side='yes'|'no', price in cents."""
+                     client_order_id: str = None,
+                     time_in_force: str = "good_till_canceled",
+                     self_trade_prevention_type: str = "taker_at_cross",
+                     post_only: bool = False) -> Dict:
+        """Place a limit order via the V2 event-order endpoint
+        (POST /portfolio/events/orders on TRADE_BASE_URL). action='buy'|'sell',
+        side='yes'|'no', price in cents — translated to the V2 bid/ask + dollar
+        shape. The legacy /portfolio/orders endpoint now returns 410."""
         import uuid
+        if price_cents is None:
+            raise ValueError("create_order requires price_cents (limit order)")
+        v2_side, _yc, price_dollars = self.legacy_to_v2_order(action, side, price_cents)
         body = {
             "ticker": ticker,
-            "action": action,
-            "side": side,
-            "count": int(count),
-            "type": order_type,
+            "side": v2_side,
+            "count": str(int(count)),
+            "price": price_dollars,
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": self_trade_prevention_type,
             "client_order_id": client_order_id or str(uuid.uuid4()),
         }
-        if order_type == "limit" and price_cents is not None:
-            body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-        return self._signed_request("POST", "/portfolio/orders", data=body)
+        if post_only:
+            body["post_only"] = True
+        return self._signed_request("POST", "/portfolio/events/orders",
+                                    data=body, base_url=self.TRADE_BASE_URL)
 
     def get_orders(self, ticker: str = None, status: str = "resting") -> Dict:
         params = {}
@@ -206,10 +264,162 @@ class KalshiClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        return self._signed_request("GET", "/portfolio/orders", params=params)
+        return self._signed_request("GET", "/portfolio/events/orders",
+                                    params=params, base_url=self.TRADE_BASE_URL)
 
     def cancel_order(self, order_id: str) -> Dict:
-        return self._signed_request("DELETE", f"/portfolio/orders/{order_id}")
+        return self._signed_request("DELETE", f"/portfolio/events/orders/{order_id}",
+                                    base_url=self.TRADE_BASE_URL)
+
+    # ------------------------------------------------------------------
+    # SPORTS DISCOVERY — classify event vs future, find active leagues,
+    # rank by volume. Kalshi exposes ~2200 sports series; this distills them
+    # to the head-to-head GAME leagues with open events, ordered by traded
+    # volume, so the widget menu is data-driven instead of a hardcoded big-4.
+    # ------------------------------------------------------------------
+    # A few series end in GAME/MATCH but are season/event PROPS, not a matchup.
+    # Narrow title denylist — must NOT include league words (cup/champion/winner),
+    # which appear in legit head-to-head series ("UEFA Champions League Game").
+    _PROP_TITLE_DENY = ("in every game", "teams in game", "home game opponent",
+                        "exact match", "goal in every")
+    # Companion market-type series sharing a GAME series' league prefix.
+    _COMPANION_SUFFIXES = ("SPREAD", "TOTAL", "TEAMTOTAL")
+    _SERIES_CACHE_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "kalshi_event_series_cache.json")
+
+    @staticmethod
+    def classify_market(ticker: str, title: str = "") -> str:
+        """Distinguish a sports series as 'event' (head-to-head GAME/MATCH),
+        'event_alt' (the same matchup's SPREAD/TOTAL lines), or 'future'
+        (outright/season/award/prop). The ticker suffix is the reliable signal;
+        the title only feeds a narrow prop denylist on GAME/MATCH series."""
+        tk = (ticker or "").upper()
+        tl = (title or "").lower().strip()
+        if tk.endswith(("SPREAD", "TOTAL")):
+            return "event_alt"
+        if tk.endswith(("GAME", "MATCH")):
+            return "future" if any(p in tl for p in KalshiClient._PROP_TITLE_DENY) else "event"
+        return "future"
+
+    def get_sports_series(self) -> List[Dict]:
+        """All series under the Sports category (paginated)."""
+        out, cursor = [], None
+        while True:
+            p = {"category": "Sports", "limit": 200}
+            if cursor:
+                p["cursor"] = cursor
+            r = self.session.get(f"{self.BASE_URL}/series", params=p, timeout=20)
+            if not r.ok:
+                break
+            d = r.json()
+            out += d.get("series", [])
+            cursor = d.get("cursor")
+            if not cursor:
+                break
+        return out
+
+    def _open_event_count(self, ticker: str, retries: int = 4) -> int:
+        for attempt in range(retries):
+            try:
+                r = self.session.get(f"{self.BASE_URL}/events", params={
+                    "series_ticker": ticker, "status": "open", "limit": 200}, timeout=15)
+                if r.status_code == 429:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return len(r.json().get("events", [])) if r.ok else 0
+            except Exception:
+                time.sleep(0.3)
+        return 0
+
+    def _series_volume(self, ticker: str, retries: int = 4):
+        """(volume, open_interest) summed over a series' open markets (V2 _fp)."""
+        vol = oi = 0.0
+        cursor = None
+        for _ in range(8):
+            for attempt in range(retries):
+                r = self.session.get(f"{self.BASE_URL}/markets", params={
+                    "series_ticker": ticker, "status": "open", "limit": 1000,
+                    **({"cursor": cursor} if cursor else {})}, timeout=20)
+                if r.status_code == 429:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                break
+            if not r.ok:
+                break
+            d = r.json()
+            for m in d.get("markets", []):
+                try:
+                    vol += float(m.get("volume_fp") or 0)
+                    oi += float(m.get("open_interest_fp") or 0)
+                except (TypeError, ValueError):
+                    pass
+            cursor = d.get("cursor")
+            if not cursor:
+                break
+        return vol, oi
+
+    def discover_event_series_ranked(self, workers: int = 4) -> List[Dict]:
+        """Active head-to-head GAME series, each enriched with companion market
+        series + volume, sorted by VOLUME desc. Row:
+            {game, tag, title, open_events, volume, open_interest, market_series:[...]}
+        Live scan (slow + rate-limited) — callers should use load_ranked_event_series."""
+        all_series = self.get_sports_series()
+        have = {s.get("ticker", "") for s in all_series}
+        games = [s for s in all_series
+                 if s.get("ticker", "").endswith("GAME")
+                 and self.classify_market(s["ticker"], s.get("title", "")) == "event"]
+
+        def build(s):
+            tk = s["ticker"]
+            n = self._open_event_count(tk)
+            if n == 0:
+                return None
+            base = tk[:-4]
+            companions = [tk] + [base + suf for suf in self._COMPANION_SUFFIXES
+                                 if (base + suf) in have]
+            vol, oi = self._series_volume(tk)
+            return {"game": tk, "tag": (s.get("tags") or ["(none)"])[0],
+                    "title": s.get("title", ""), "open_events": n,
+                    "volume": vol, "open_interest": oi, "market_series": companions}
+
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            rows = [r for r in ex.map(build, games) if r]
+        rows.sort(key=lambda r: -r["volume"])
+        return rows
+
+    def read_cached_event_series(self) -> List[Dict]:
+        """Pure cache read (never scans) — for instant startup. [] if no cache."""
+        if os.path.exists(self._SERIES_CACHE_PATH):
+            try:
+                with open(self._SERIES_CACHE_PATH) as f:
+                    return json.load(f).get("series", [])
+            except Exception:
+                return []
+        return []
+
+    def load_ranked_event_series(self, max_age_s: int = 6 * 3600,
+                                 refresh: bool = False) -> List[Dict]:
+        """Volume-ranked event-series config from a disk cache, rescanning when
+        older than max_age_s (the scan is slow, so we don't run it every launch).
+        Returns the cached list immediately if a refresh fails. refresh=True forces."""
+        cached = None
+        if os.path.exists(self._SERIES_CACHE_PATH):
+            try:
+                with open(self._SERIES_CACHE_PATH) as f:
+                    cached = json.load(f)
+            except Exception:
+                cached = None
+        fresh = cached and (time.time() - cached.get("ts", 0) < max_age_s)
+        if cached and fresh and not refresh:
+            return cached["series"]
+        try:
+            series = self.discover_event_series_ranked()
+            with open(self._SERIES_CACHE_PATH, "w") as f:
+                json.dump({"ts": time.time(), "series": series}, f)
+            return series
+        except Exception as e:
+            print(f"[kalshi-discovery] refresh failed ({e}); using cached")
+            return cached["series"] if cached else []
 
     def get_events(
         self,
@@ -740,6 +950,7 @@ class KalshiStreamClient(QObject):
     # initial orderbook_snapshot and subsequent orderbook_delta messages.
     trade = pyqtSignal(object)
     orderbook = pyqtSignal(object)
+    raw_frame = pyqtSignal(str)   # original frame string, for native (C++) parsing
 
     def __init__(
         self,
@@ -973,7 +1184,7 @@ class KalshiStreamClient(QObject):
 
     def _on_message(self, ws, message: str):
         try:
-            msg = json.loads(message)
+            msg = orjson.loads(message)  # ~1.5x faster decode on the sub-second path
         except Exception:
             msg = message
 
@@ -993,8 +1204,21 @@ class KalshiStreamClient(QObject):
                 self.tick.emit(msg)
             elif mtype == "trade":
                 self.trade.emit(msg)
+                self._emit_raw_frame(message)
             elif mtype in ("orderbook_snapshot", "orderbook_delta"):
                 self.orderbook.emit(msg)
+                self._emit_raw_frame(message)
+
+    def _emit_raw_frame(self, message):
+        """Expose the untouched frame string (book-relevant types only) so a native
+        (C++) book can parse it directly, skipping json.loads + the dict build."""
+        if isinstance(message, (bytes, bytearray)):
+            message = message.decode("utf-8", "replace")
+        if isinstance(message, str):
+            try:
+                self.raw_frame.emit(message)
+            except Exception:
+                pass
 
     def _on_error(self, ws, error):
         self.error.emit({"action": "ws_error", "error": error})
@@ -1031,6 +1255,12 @@ class KalshiLiveBook:
         # market_ticker -> {"yes": {price:int qty:int}, "no": {...}, "sid": int,
         #                   "seq": int, "last_trade": int|None, "stale": bool}
         self._books: Dict[str, Dict] = {}
+        # Kalshi's `seq` is per-SID, not per market_ticker. A single subscription can
+        # carry several markets (Kalshi only serves one active orderbook_delta sub per
+        # connection), and their deltas interleave on one shared seq counter. Validate
+        # seq at the SID level so an interleaved multi-market stream isn't mistaken for
+        # per-market gaps. sid -> last seq seen on that subscription.
+        self._sid_seq: Dict[int, int] = {}
         self._on_gap = on_gap
 
     def _blank(self):
@@ -1103,6 +1333,10 @@ class KalshiLiveBook:
             book["no"] = self._parse_levels(inner, "no")
             book["sid"] = msg.get("sid")
             book["seq"] = msg.get("seq")
+            # Baseline the SID-level seq from this snapshot (the snapshot's seq is part
+            # of the subscription's single sequence stream shared by all its markets).
+            if book["sid"] is not None and book["seq"] is not None:
+                self._sid_seq[book["sid"]] = book["seq"]
             self._books[ticker] = book
             return self.state(ticker)
 
@@ -1121,14 +1355,18 @@ class KalshiLiveBook:
             # cascade when multiple orderbook subscriptions exist for one market.
             if book.get("sid") is not None and sid is not None and sid != book["sid"]:
                 return None
-            # Real sequence gap within the bound sid -> notify (debounced upstream)
-            # and realign best-effort so we don't storm.
-            prev_seq = book.get("seq")
+            # Sequence gap is evaluated at the SID level: one subscription's seq counter
+            # is shared across every market it carries, so consecutive deltas for the
+            # SAME market are NOT consecutive in seq (a sibling market's deltas fall in
+            # between). Checking per-market would flag those interleavings as gaps and
+            # freeze the book. Only a break in the SID's own monotonic sequence is real.
+            prev_seq = self._sid_seq.get(sid) if sid is not None else book.get("seq")
             if prev_seq is not None and seq is not None and seq != prev_seq + 1:
                 book["stale"] = True
                 if self._on_gap:
                     self._on_gap(ticker)
-                book["seq"] = seq
+            if sid is not None and seq is not None:
+                self._sid_seq[sid] = seq
             side = inner.get("side")
             price = self._to_cents(
                 inner.get("price") if inner.get("price") is not None
@@ -1209,8 +1447,14 @@ class KalshiLiveBook:
     def reset(self, ticker: str = None):
         if ticker is None:
             self._books.clear()
+            self._sid_seq.clear()
         else:
-            self._books.pop(ticker, None)
+            book = self._books.pop(ticker, None)
+            # Drop the per-sid seq baseline only if no other book still rides this sid.
+            sid = book.get("sid") if book else None
+            if sid is not None and not any(b.get("sid") == sid
+                                           for b in self._books.values()):
+                self._sid_seq.pop(sid, None)
 
 
 def main():
