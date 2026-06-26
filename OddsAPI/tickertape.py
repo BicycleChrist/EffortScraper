@@ -17,10 +17,19 @@ class TickerTape(QWidget):
         self.news_widget = news_widget
         self.loading_attempted = False
 
-        # Smooth scrolling properties - keep it simple!
-        self._scroll_position = -0.5
-        self.scroll_speed = 2.0
+        # Dwell-based crossfade display (replaces continuous scroll).
+        # Each item is shown fully static for `dwell_ms`, then crossfades to the
+        # next over `crossfade_ms`. No per-frame scroll => repaints happen only
+        # during the brief fade, so a UI-thread block almost never coincides with
+        # a paint, and when it does an opacity jump is imperceptible.
+        self.dwell_ms = 8000          # how long each item stays fully readable
+        self.crossfade_ms = 150       # fade duration between items
+        self._text_opacity = 1.0      # 0..1 fade-in of the current item
+        self._prev_text = ""          # outgoing text, drawn during the fade
+        self._ticker_running = False
         self.is_paused = False
+        # kept only so legacy reset_scroll_position()/resizeEvent() stay safe
+        self._scroll_position = 0.0
 
         # Transition style: "flip_card" or "split_reveal"
         self.transition_style = transition_style
@@ -89,11 +98,19 @@ class TickerTape(QWidget):
         self.sport_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         self.game_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
 
-        # Animation timer - don't start until data is loaded
-        self.animation_timer = QTimer()
-        self.animation_timer.timeout.connect(self.advance_animation)
+        # Dwell timer: single-shot, fires when the current item's read time is up
+        self.dwell_timer = QTimer()
+        self.dwell_timer.setSingleShot(True)
+        self.dwell_timer.timeout.connect(self._begin_text_transition)
 
-        # Transition animation
+        # Crossfade animation drives text_opacity 0 -> 1 for the incoming item
+        self.text_fade_anim = QPropertyAnimation(self, b"text_opacity")
+        self.text_fade_anim.setDuration(self.crossfade_ms)
+        self.text_fade_anim.setStartValue(0.0)
+        self.text_fade_anim.setEndValue(1.0)
+        self.text_fade_anim.finished.connect(self._on_text_fade_done)
+
+        # Transition animation (left league badge flip — independent of text)
         self.transition_animation = QPropertyAnimation(self, b"transition_progress")
         self.transition_animation.setDuration(300)  # 300ms transition
         self.transition_animation.finished.connect(self.on_transition_finished)
@@ -104,11 +121,10 @@ class TickerTape(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
 
-        # Initialize content and start position
+        # Initialize content
         self.update_current_text()
-        self._scroll_position = self.width() if self.width() > 0 else 800
 
-        # Cache text width to avoid recalculating every frame
+        # Cache text width (retained for legacy callers)
         self.cached_text_width = 0
         self.update_text_width()
 
@@ -143,6 +159,15 @@ class TickerTape(QWidget):
     @transition_progress.setter
     def transition_progress(self, value):
         self._transition_progress = value
+        self.update()
+
+    @pyqtProperty(float)
+    def text_opacity(self):
+        return self._text_opacity
+
+    @text_opacity.setter
+    def text_opacity(self, value):
+        self._text_opacity = value
         self.update()
 
     def reset_scroll_position(self):
@@ -226,17 +251,51 @@ class TickerTape(QWidget):
         self._transition_progress = 0.0
         self.update_current_text()
 
-    def advance_animation(self):
-        """Scroll and rotate content when text disappears under sport segment"""
-        if not self.is_paused and self.current_text:
-            self._scroll_position -= self.scroll_speed
+    def start_ticker(self):
+        """Begin the dwell/crossfade cycle (idempotent — safe to call repeatedly
+        from the various data loaders)."""
+        if self._ticker_running:
+            return
+        self._ticker_running = True
+        self._text_opacity = 1.0
+        self.dwell_timer.start(self.dwell_ms)
 
-            # When text disappears under sport segment, rotate to next content
-            if self._scroll_position < -(self.cached_text_width + self.segment_width + 20):
-                self.rotate_content()  # Move to next content
-                self._scroll_position = self.width()  # Reset position
+    def _begin_text_transition(self):
+        """Dwell elapsed: advance to the next item and crossfade it in."""
+        if self.is_paused or not self.current_text:
+            # paused or nothing to show — re-arm and try again later
+            self.dwell_timer.start(self.dwell_ms)
+            return
 
-            self.update()
+        self._prev_text = self.current_text
+        self.rotate_content()           # advance sport/game index
+        self.update_current_text()      # ensure current_text is fresh now
+                                        # (rotate_content defers it on sport change)
+        self.text_fade_anim.stop()
+        self.text_fade_anim.setDuration(self.crossfade_ms)
+        self._text_opacity = 0.0
+        self.text_fade_anim.start()
+
+    def _on_text_fade_done(self):
+        """Crossfade finished: settle on the new item and re-arm the dwell."""
+        self._text_opacity = 1.0
+        self._prev_text = ""
+        self.update()
+        if not self.is_paused:
+            self.dwell_timer.start(self.dwell_ms)
+
+    def enterEvent(self, event):
+        """Pause cycling while hovered so a long item can be read in full."""
+        self.is_paused = True
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Resume cycling when the cursor leaves."""
+        self.is_paused = False
+        if self._ticker_running and not self.dwell_timer.isActive() \
+                and self.text_fade_anim.state() != QPropertyAnimation.State.Running:
+            self.dwell_timer.start(self.dwell_ms)
+        super().leaveEvent(event)
 
     def get_current_sport_info(self):
         """Get current sport color information"""
@@ -466,19 +525,53 @@ class TickerTape(QWidget):
         painter.restore()
 
     def draw_scrolling_content(self, painter, rect, sport_info):
-        """Simple scrolling text - no complications"""
-        painter.setFont(self.game_font)
+        """Draw the current item statically, crossfading from the previous one.
+        Text is left-aligned in the content area (right of the badge) and
+        auto-shrunk to fit, so nothing has to move to be fully readable."""
+        content_left = self.segment_width + 15
+        content_rect = QRectF(content_left, 0,
+                              max(0, rect.width() - content_left - 15), rect.height())
 
-        # Just draw the text at the current scroll position
-        y_baseline = rect.height() / 2 + 4
+        painter.save()
+        painter.setClipRect(content_rect)
 
-        # Draw text shadow
-        painter.setPen(QColor("#000000"))
-        painter.drawText(QPointF(self._scroll_position + 1, y_baseline + 1), self.current_text)
+        op = max(0.0, min(1.0, self._text_opacity))
+        if op < 1.0 and self._prev_text:
+            self._draw_centered_text(painter, content_rect, self._prev_text, 1.0 - op)
+        self._draw_centered_text(painter, content_rect, self.current_text, op)
 
-        # Draw main text
-        painter.setPen(QColor("#FFFFFF"))
-        painter.drawText(QPointF(self._scroll_position, y_baseline), self.current_text)
+        painter.restore()
+
+    def _fit_game_font(self, text, avail_w):
+        """Shrink the game font until `text` fits within `avail_w` (down to 9pt)."""
+        base = self.game_font.pointSize()
+        if base <= 0:
+            base = 15
+        f = QFont(self.game_font)
+        size = base
+        while size > 9:
+            f.setPointSize(size)
+            if QFontMetrics(f).horizontalAdvance(text) <= avail_w:
+                break
+            size -= 1
+        return f
+
+    def _draw_centered_text(self, painter, rect, text, alpha):
+        """Draw `text` vertically centered, left-aligned, at the given 0..1 alpha."""
+        if not text or alpha <= 0.0:
+            return
+        a = int(255 * max(0.0, min(1.0, alpha)))
+        painter.setFont(self._fit_game_font(text, rect.width()))
+
+        flags = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        # shadow
+        painter.setPen(QColor(0, 0, 0, int(a * 0.6)))
+        painter.drawText(rect.translated(1, 1), flags, text)
+
+        # main text
+        painter.setPen(QColor(255, 255, 255, a))
+        painter.drawText(rect, flags, text)
 
     def draw_accent_effects(self, painter, rect, sport_info):
         """Draw accent lines using cached gradients"""
@@ -861,8 +954,7 @@ class TickerTape(QWidget):
 
             # Stop loading animation and start ticker
             self.stop_loading_animation()
-            if not self.animation_timer.isActive():
-                self.animation_timer.start(16)
+            self.start_ticker()
             self.data_loaded = True
 
             self.update_current_text()
@@ -886,8 +978,7 @@ class TickerTape(QWidget):
         self.stop_loading_animation()
 
         # Start animation timer
-        if not self.animation_timer.isActive():
-            self.animation_timer.start(16)
+        self.start_ticker()
 
         self.data_loaded = True
 
@@ -1195,8 +1286,7 @@ class TickerTape(QWidget):
             self.update_current_text()
 
             # Start animation timer if not already running
-            if not self.animation_timer.isActive():
-                self.animation_timer.start(16)  # 60fps smooth scrolling
+            self.start_ticker()
 
             total_headlines = sum(len(headlines) for headlines in categorized_headlines.values())
             print(f"✓ Headlines merged - {total_headlines} headlines across {len(new_sports_data)} leagues")
@@ -1232,8 +1322,7 @@ class TickerTape(QWidget):
         self.update_current_text()
 
         # Start animation timer if not already running
-        if not self.animation_timer.isActive():
-            self.animation_timer.start(16)  # 60fps smooth scrolling
+        self.start_ticker()
 
         print(f"✓ Prediction markets added - PRED section with {len(prediction_markets)} markets")
         print(f"Updated sports order: {list(self.sports_data.keys())}")
