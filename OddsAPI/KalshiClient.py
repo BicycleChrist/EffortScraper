@@ -951,13 +951,19 @@ class KalshiStreamClient(QObject):
     trade = pyqtSignal(object)
     orderbook = pyqtSignal(object)
     raw_frame = pyqtSignal(str)   # original frame string, for native (C++) parsing
+    # True round-trip latency (ms) from a protocol-level ping/pong exchange. Kalshi
+    # has no app-level ping message; this rides the RFC6455 control frames that the
+    # websocket-client library already sends on `ping_interval`. Clock-skew-free:
+    # both timestamps are local, so no NTP dependency (unlike a server-stamp diff).
+    latency = pyqtSignal(float)
 
     def __init__(
         self,
         url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2",
         reconnect: bool = True,
         reconnect_backoff_max: int = 60,
-        ping_interval: int = 30,
+        ping_interval: int = 15,
+        ping_timeout: int = 10,
         on_message_callback: Optional[Callable[[dict], None]] = None,
     ):
         """
@@ -980,6 +986,9 @@ class KalshiStreamClient(QObject):
         self.reconnect = reconnect
         self.reconnect_backoff_max = reconnect_backoff_max
         self.ping_interval = ping_interval
+        # Must stay < ping_interval (websocket-client enforces this) and is the
+        # window we wait for the pong before declaring the connection dead.
+        self.ping_timeout = ping_timeout
         self._on_message_callback = on_message_callback
 
         self._ws_app: Optional[websocket.WebSocketApp] = None
@@ -989,6 +998,7 @@ class KalshiStreamClient(QObject):
         self._is_running = False
         self._running_lock = threading.Lock()
         self._message_id = 1
+        self._last_rtt_ms = None   # most recent ping/pong round-trip (ms)
 
     # -------------------------------------------------------------------
     # PUBLIC API
@@ -1118,6 +1128,31 @@ class KalshiStreamClient(QObject):
             "params": {"sids": list(sids)},
         }))
 
+    def get_snapshot(self, tickers, sids=None):
+        """Request a fresh `orderbook_snapshot` for `tickers` WITHOUT touching the
+        subscription. This is Kalshi's intended orderbook-resync path: per the docs
+        it "sends an orderbook_snapshot response for the requested markets without
+        adding them to the subscription or affecting the existing delta stream", so
+        the deltas keep flowing and only the local book re-baselines from the fresh
+        snapshot. Far less fragile than unsubscribe+resubscribe when several markets
+        interleave on one shared sid (both-sides YES, multi-contract fields), where a
+        teardown can starve siblings or land them on a new sid mid-stream.
+
+        `sids` (optional) scopes the request to specific subscriptions; the array
+        `market_tickers` form is the only one the server accepts."""
+        tickers = [t for t in (tickers or []) if t]
+        if not tickers:
+            return
+        params = {"market_tickers": list(tickers)}
+        sids = [s for s in (sids or []) if s is not None]
+        if sids:
+            params["sids"] = list(sids)
+        self.send(json.dumps({
+            "id": self._msg_id(),
+            "cmd": "get_snapshot",
+            "params": params,
+        }))
+
     # Convenience helpers
     def subscribe_ticker(self, tickers):
         self.subscribe(["ticker"], tickers)
@@ -1151,11 +1186,12 @@ class KalshiStreamClient(QObject):
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
-                    on_close=self._on_close
+                    on_close=self._on_close,
+                    on_pong=self._on_pong
                 )
 
                 self._ws_app.run_forever(
-                    ping_interval=self.ping_interval, ping_timeout=10
+                    ping_interval=self.ping_interval, ping_timeout=self.ping_timeout
                 )
 
             except Exception as ex:
@@ -1219,6 +1255,21 @@ class KalshiStreamClient(QObject):
                 self.raw_frame.emit(message)
             except Exception:
                 pass
+
+    def _on_pong(self, ws, message):
+        """Protocol-level pong to one of OUR pings (the library sends a ping every
+        `ping_interval` and records the send time as `ws.last_ping_tm`). The gap to
+        now is the genuine round-trip time — no clock-sync dependency, both stamps
+        local. Pongs the library auto-sends in reply to the SERVER's pings don't
+        reach here, so this only times round trips we initiated."""
+        try:
+            sent = getattr(ws, "last_ping_tm", 0.0)
+            if sent:
+                rtt_ms = max(0.0, (time.time() - sent) * 1000.0)
+                self._last_rtt_ms = rtt_ms
+                self.latency.emit(rtt_ms)
+        except Exception:
+            pass
 
     def _on_error(self, ws, error):
         self.error.emit({"action": "ws_error", "error": error})

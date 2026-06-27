@@ -1,10 +1,11 @@
+import os
 import csv
 import json
 import time
 import threading
 import orjson
 from py_clob_client.client import ClobClient
-from mmKEY import pmkey
+from Creds import pmkey
 import pathlib
 import requests
 from datetime import datetime, timezone
@@ -265,6 +266,55 @@ def get_client():
     return _client
 
 
+# --- CLOB order placement (authenticated) -----------------------------------
+# Distinct from get_client() (read-only): the trading client carries L2 API creds
+# plus the proxy funder + signature_type so orders sign against the wallet that
+# holds the USDC. See Creds.POLY_* — the wallet combo is UNVERIFIED until a live
+# funded test is run.
+_trading_client = None
+
+
+def get_trading_client():
+    """Lazily build + cache a ClobClient configured for ORDER PLACEMENT."""
+    global _trading_client
+    if _trading_client is None:
+        from Creds import POLY_SIGNER_KEY, POLY_SIGNATURE_TYPE, POLY_PROXY_ADDRESS
+        c = ClobClient(host, key=POLY_SIGNER_KEY, chain_id=chain_id,
+                       signature_type=POLY_SIGNATURE_TYPE, funder=POLY_PROXY_ADDRESS)
+        c.set_api_creds(c.create_or_derive_api_creds())
+        _trading_client = c
+    return _trading_client
+
+
+def place_pm_order(token_id: str, price: float, size: float, side: str):
+    """Place a GTC limit order on a Polymarket CLOB token.
+
+      token_id : CLOB asset/token id of the outcome to trade
+      price    : dollars in [0, 1] (e.g. 0.56)
+      size     : number of shares/contracts
+      side     : 'buy' | 'sell'
+    Returns the CLOB response dict (signs + posts in one call)."""
+    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.order_builder.constants import BUY, SELL
+    client = get_trading_client()
+    args = OrderArgs(token_id=token_id, price=float(price), size=float(size),
+                     side=(BUY if side.lower() == "buy" else SELL))
+    return client.create_and_post_order(args)
+
+
+def get_pm_open_orders(token_id: str = None):
+    """Resting orders for the account, optionally filtered to one token."""
+    from py_clob_client.clob_types import OpenOrderParams
+    client = get_trading_client()
+    params = OpenOrderParams(asset_id=token_id) if token_id else None
+    return client.get_orders(params)
+
+
+def cancel_pm_order(order_id: str):
+    """Cancel a single resting order by id."""
+    return get_trading_client().cancel_orders([order_id])
+
+
 def FetchMarkets(next_cursor=None, recent_only=True, cancellation_flag=None):
     """Fetch markets from Polymarket CLOB API"""
     markets_list = []
@@ -481,35 +531,98 @@ def SaveToCSV(marketsdata, filename):
     except IOError as e:
         print(f"Error writing to CSV: {e}")
 
+def fetch_top_markets_modern(limit=300, cancellation_flag=None):
+    """Modern PM market fetch: ONE gamma /markets query returns the top active
+    markets already ranked by 24h volume, with outcome prices, volume and tags
+    pre-attached. Replaces the legacy CLOB cursor pagination (page-through-
+    everything) + per-token volume fetch. Emits the SAME processed-dict shape the
+    tickertape consumes: {question, description, condition_id, question_id, tags,
+    lines, token_ids, total_volume, total_volume_24hr, total_liquidity}."""
+    session = _gamma_session()
+    out, offset, page = [], 0, 100
+    while len(out) < limit:
+        if cancellation_flag and cancellation_flag.get('should_stop', False):
+            break
+        try:
+            r = session.get("https://gamma-api.polymarket.com/markets", params={
+                "closed": "false", "active": "true", "order": "volume24hr",
+                "ascending": "false", "limit": min(page, limit - len(out)),
+                "offset": offset, "include_tag": "true"}, timeout=15)
+        except Exception as e:
+            print(f"Modern PM market fetch error: {e}")
+            break
+        if not r.ok:
+            break
+        batch = r.json()
+        if not batch:
+            break
+        for m in batch:
+            try:
+                outcomes = json.loads(m.get("outcomes") or "[]")
+                prices = json.loads(m.get("outcomePrices") or "[]")
+            except Exception:
+                outcomes, prices = [], []
+            lines = []
+            for o, p in zip(outcomes, prices):
+                try:
+                    lines.append(f"{o}: {float(p) * 100:.2f}%")
+                except (ValueError, TypeError):
+                    pass
+            try:
+                token_ids = json.loads(m.get("clobTokenIds") or "[]")
+            except Exception:
+                token_ids = []
+            tags = [(t.get("slug") or t.get("label")) for t in (m.get("tags") or [])
+                    if isinstance(t, dict)]
+            out.append({
+                "question": m.get("question", ""),
+                "description": m.get("description", ""),
+                "condition_id": m.get("conditionId"),
+                "question_id": m.get("id"),
+                "tags": tags,
+                "lines": lines,
+                "token_ids": token_ids,
+                "total_volume": float(m.get("volume") or 0),
+                "total_volume_24hr": float(m.get("volume24hr") or 0),
+                "total_liquidity": float(m.get("liquidity") or 0),
+            })
+        offset += len(batch)
+        if len(batch) < page:
+            break
+    print(f"✅ Modern PM fetch: {len(out)} top markets by 24h volume (1 gamma query)")
+    return out
+
+
 def fetch_and_process_markets(recent_only=True, cancellation_flag=None, save_full_dump=False, use_breaking=None):
-    """
-    Fetch recent market metadata (gamma API), attach fresh volume for the top
-    `token_limit` tokens, and sort by volume.
+    """MODERN PM market fetch (gamma top-by-volume). Drop-in for the tickertape:
+    same processed-dict shape, but skips the legacy full-CLOB cursor pagination +
+    per-token volume fetch entirely. The old path is kept as
+    fetch_and_process_markets_paginated() for fallback."""
+    final_data = fetch_top_markets_modern(cancellation_flag=cancellation_flag)
+    if cancellation_flag and cancellation_flag.get('should_stop', False):
+        return []
+    if save_full_dump:
+        WriteJsonDump(final_data)
+    return final_data
 
-    Args:
-        recent_only: Whether to fetch only recent markets
-        cancellation_flag: Dict with 'should_stop' key for cancellation
-        save_full_dump: If True, saves PMdump.json (for manual runs)
-        use_breaking: Deprecated/ignored — the polymarket.com/breaking scrape was
-                      removed (that page is now JS-rendered).
-    """
-    # Get FILTERED markets from cache (metadata only, no volume yet)
+
+def fetch_and_process_markets_paginated(recent_only=True, cancellation_flag=None,
+                                        save_full_dump=False, use_breaking=None):
+    """LEGACY (back-burner): full CLOB cursor pagination (get_markets next_cursor
+    loop) + per-token gamma volume fetch. Slow — written when PM's API lacked the
+    server-side volume ordering the modern path now uses. Kept for fallback /
+    full-corpus dumps."""
     processed_markets = get_cached_or_fresh_markets(recent_only=recent_only, cancellation_flag=cancellation_flag)
-
     if cancellation_flag and cancellation_flag.get('should_stop', False):
         print("🚫 Market fetch cancelled before volume data")
         return []
-
     print("\n💰 Fetching fresh volume data (top tokens)...")
     final_data = add_volume_data_to_markets(processed_markets, cancellation_flag=cancellation_flag)
-
     if cancellation_flag and cancellation_flag.get('should_stop', False):
         print("🚫 Market fetch cancelled before saving")
         return []
-
     if save_full_dump:
         WriteJsonDump(final_data)
-
     return final_data
 
 def fetch_and_process_markets_legacy(recent_only=True):
@@ -608,7 +721,8 @@ class PolymarketSportsClient:
     CLOB_API = "https://clob.polymarket.com"
     DATA_API = "https://data-api.polymarket.com"
 
-    # Sports series IDs
+    # Sports series IDs (static fallback; discover_sports_series() supersedes this
+    # dynamically from the gamma /sports endpoint).
     SPORTS_SERIES = {
         "NFL": 10187,
         "NBA": 10345,
@@ -617,6 +731,100 @@ class PolymarketSportsClient:
         "CFB": 10210,
         "NCAAB": 39
     }
+    _SERIES_CACHE_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "pm_event_series_cache.json")
+
+    @staticmethod
+    def classify_pm_event(title: str) -> str:
+        """Distinguish a Polymarket sports event: 'event' = head-to-head game
+        ('A vs. B' / 'A @ B', 2-3 markets), 'future' = outright/award/prop
+        (Winner, Golden Boot, advance, group, MVP, …) with many outcomes. Mirrors
+        KalshiClient.classify_market."""
+        t = (title or "").lower()
+        return "event" if (" vs " in t or " vs. " in t or " @ " in t) else "future"
+
+    def discover_sports_series(self) -> Dict[str, int]:
+        """Dynamic sport-slug -> gamma series_id map from /sports (supersedes the
+        hardcoded SPORTS_SERIES). Falls back to SPORTS_SERIES on failure."""
+        try:
+            r = self.session.get(f"{self.GAMMA_API}/sports", timeout=20)
+            out = {}
+            if r.ok:
+                for s in r.json():
+                    slug, sid = s.get("sport"), s.get("series")
+                    if slug and sid:
+                        try:
+                            out[slug] = int(str(sid).split(",")[0])
+                        except (ValueError, TypeError):
+                            pass
+            return out or dict(self.SPORTS_SERIES)
+        except Exception:
+            return dict(self.SPORTS_SERIES)
+
+    def discover_event_series_ranked(self, max_age_s: int = 6 * 3600,
+                                     refresh: bool = False) -> List[Dict]:
+        """Active sports event-series ranked by volume (cached on disk). For each
+        active game ('A vs B') event, attribute its volume to the parent series;
+        return [{series_id, ticker, title, game_events, volume, liquidity}] sorted
+        by volume desc. Mirrors KalshiClient.load_ranked_event_series."""
+        cached = None
+        if os.path.exists(self._SERIES_CACHE_PATH):
+            try:
+                with open(self._SERIES_CACHE_PATH) as f:
+                    cached = json.load(f)
+            except Exception:
+                cached = None
+        if cached and (time.time() - cached.get("ts", 0) < max_age_s) and not refresh:
+            return cached["series"]
+        try:
+            agg = {}
+            offset = 0
+            # Page active events ordered by volume; keep only head-to-head games
+            # that belong to a sports series, aggregate volume per series.
+            for _ in range(10):
+                r = self.session.get(f"{self.GAMMA_API}/events", params={
+                    "closed": "false", "active": "true", "limit": 500,
+                    "offset": offset, "order": "volume", "ascending": "false"}, timeout=25)
+                if not r.ok:
+                    break
+                evs = r.json()
+                if not evs:
+                    break
+                for e in evs:
+                    if self.classify_pm_event(e.get("title", "")) != "event":
+                        continue
+                    ser = (e.get("series") or [{}])[0]
+                    sid = ser.get("id")
+                    if not sid:
+                        continue
+                    a = agg.setdefault(sid, {
+                        "series_id": int(sid), "ticker": ser.get("ticker", ""),
+                        "title": ser.get("title", ""), "game_events": 0,
+                        "volume": 0.0, "liquidity": 0.0})
+                    a["game_events"] += 1
+                    try:
+                        a["volume"] += float(e.get("volume") or 0)
+                        a["liquidity"] += float(e.get("liquidity") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                offset += len(evs)
+            series = sorted(agg.values(), key=lambda x: -x["volume"])
+            with open(self._SERIES_CACHE_PATH, "w") as f:
+                json.dump({"ts": time.time(), "series": series}, f)
+            return series
+        except Exception as e:
+            print(f"[pm-discovery] refresh failed ({e}); using cached")
+            return cached["series"] if cached else []
+
+    def read_cached_event_series(self) -> List[Dict]:
+        """Pure cache read (never scans) — for instant startup. [] if no cache."""
+        if os.path.exists(self._SERIES_CACHE_PATH):
+            try:
+                with open(self._SERIES_CACHE_PATH) as f:
+                    return json.load(f).get("series", [])
+            except Exception:
+                return []
+        return []
 
     def __init__(self, rate_limit_delay: float = 0.01, max_workers: int = 20):
         """
@@ -649,11 +857,12 @@ class PolymarketSportsClient:
                 return value
         return value
 
-    def get_sport_markets(self, sport: str, limit: int = 50,
+    def get_sport_markets(self, sport: str = None, limit: int = 50,
                          include_orderbook: bool = True,
                          include_trades: bool = True,
                          max_trades: int = 100,
-                         days_ahead: Optional[int] = None) -> List[Game]:
+                         days_ahead: Optional[int] = None,
+                         series_id: int = None) -> List[Game]:
         """
         Get all active games for a specific sport with full market data
 
@@ -673,7 +882,10 @@ class PolymarketSportsClient:
         Returns:
             List of Game objects with nested Market data
         """
-        series_id = self.SPORTS_SERIES.get(sport)
+        # Accept an explicit series_id (for discovered non-big-4 leagues like the
+        # World Cup) or resolve one from the sport name.
+        if series_id is None:
+            series_id = self.SPORTS_SERIES.get(sport)
         if not series_id:
             raise ValueError(f"Unknown sport: {sport}. Available: {list(self.SPORTS_SERIES.keys())}")
 
@@ -966,9 +1178,14 @@ class PolymarketStreamClient(QObject):
     disconnected = pyqtSignal()
     error = pyqtSignal(object)
     raw_message = pyqtSignal(object)
+    raw_frame = pyqtSignal(str)   # original frame string, for native (C++) parsing
     orderbook = pyqtSignal(object)
     trade = pyqtSignal(object)
     best_quote = pyqtSignal(object)
+    # True round-trip latency (ms): the app-level 'PING' send is timestamped and
+    # the matching 'PONG' reply closes the loop. Both stamps local -> no clock-sync
+    # dependency (unlike diffing a server timestamp against the local clock).
+    latency = pyqtSignal(float)
 
     def __init__(
         self,
@@ -993,6 +1210,8 @@ class PolymarketStreamClient(QObject):
         self._assets_lock = threading.Lock()
         self._is_running = False
         self._running_lock = threading.Lock()
+        self._ping_sent_tm = 0.0   # monotonic send time of the last 'PING'
+        self._last_rtt_ms = None   # most recent PING/PONG round-trip (ms)
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -1044,27 +1263,48 @@ class PolymarketStreamClient(QObject):
             self.error.emit({"action": "not_connected"})
 
     def set_assets(self, asset_ids: Iterable[str]):
-        """Replace the desired asset set and (re)send the subscription in place.
+        """Replace the desired asset set IN PLACE using PM's dynamic subscription
+        operations (no close/reconnect — WebSocketApp.close() blocks the caller on
+        the close handshake, a GUI stall from the main thread).
 
-        Does NOT close/reconnect — WebSocketApp.close() blocks the caller on the
-        close handshake (a GUI stall when called from the main thread). Sending a
-        fresh subscribe for the new set is non-blocking; any still-streaming old
-        assets are harmless (filtered downstream by active-key) and are dropped on
-        the next natural reconnect, which re-subscribes only the current set."""
+        PM market-channel subscriptions are CUMULATIVE: per the WSS docs the bare
+        `{assets_ids, type, custom_feature_enabled}` payload is the INITIAL subscribe
+        only, and later changes on an established connection must use
+        `{assets_ids, operation: "subscribe"|"unsubscribe"}`. Re-sending the bare
+        initial payload neither replaces the old set nor reliably registers the new
+        tokens, which left a switched-to event with a (REST-seeded) but FROZEN book
+        while the old event's tokens kept streaming in the background. So we diff
+        against the current set and send add/remove ops. On a reconnect _on_open
+        re-sends the full set as a fresh initial subscribe (server has no subs then)."""
+        new = {a for a in asset_ids if a}
         with self._assets_lock:
-            self._assets = {a for a in asset_ids if a}
-        self._send_subscribe()
+            old = set(self._assets)
+            self._assets = set(new)
+        self._send_assets_op(old - new, "unsubscribe")
+        self._send_assets_op(new - old, "subscribe")
 
     def subscribe(self, asset_ids: Iterable[str]):
-        """Add assets to the desired set and (re)send the subscription."""
+        """Add assets to the desired set (dynamic subscribe op, no full re-send)."""
+        new = {a for a in asset_ids if a}
         with self._assets_lock:
-            self._assets.update(a for a in asset_ids if a)
-        self._send_subscribe()
+            added = new - self._assets
+            self._assets.update(new)
+        self._send_assets_op(added, "subscribe")
+
+    def unsubscribe(self, asset_ids: Iterable[str]):
+        """Remove assets from the desired set (dynamic unsubscribe op)."""
+        drop = {a for a in asset_ids if a}
+        with self._assets_lock:
+            removed = drop & self._assets
+            self._assets -= drop
+        self._send_assets_op(removed, "unsubscribe")
 
     # ------------------------------------------------------------------
     # SUBSCRIPTION
     # ------------------------------------------------------------------
     def _build_subscribe(self) -> Optional[str]:
+        """The INITIAL full-set subscription payload (sent on (re)connect by
+        _on_open). Later in-session changes go through _send_assets_op instead."""
         with self._assets_lock:
             assets = sorted(self._assets)
         if not assets:
@@ -1079,6 +1319,19 @@ class PolymarketStreamClient(QObject):
         payload = self._build_subscribe()
         if payload:
             self.send(payload)
+
+    def _send_assets_op(self, asset_ids, operation: str):
+        """Send a dynamic subscription change for `asset_ids`. `operation` is
+        'subscribe' or 'unsubscribe'; the `type` field is omitted (docs: only the
+        initial subscribe carries it). custom_feature_enabled rides the subscribe op
+        so added assets also emit best_bid_ask/new_market/market_resolved events."""
+        ids = sorted({a for a in (asset_ids or []) if a})
+        if not ids:
+            return
+        payload = {"assets_ids": ids, "operation": operation}
+        if operation == "subscribe":
+            payload["custom_feature_enabled"] = self.custom_feature_enabled
+        self.send(json.dumps(payload))
 
     # ------------------------------------------------------------------
     # INTERNAL THREAD LOOP
@@ -1116,6 +1369,7 @@ class PolymarketStreamClient(QObject):
                     and self._ws_app.sock.connected):
                 try:
                     self._ws_app.send("PING")
+                    self._ping_sent_tm = time.monotonic()
                 except Exception:
                     pass
 
@@ -1132,11 +1386,27 @@ class PolymarketStreamClient(QObject):
             self._ping_thread.start()
 
     def _on_message(self, ws, message):
-        # Keepalive ack and other bare strings: ignore.
-        if message in ("PONG", "PING"):
+        # Keepalive ack: a 'PONG' closes the round trip we opened with 'PING'.
+        if message == "PONG":
+            if self._ping_sent_tm:
+                rtt_ms = max(0.0, (time.monotonic() - self._ping_sent_tm) * 1000.0)
+                self._last_rtt_ms = rtt_ms
+                self.latency.emit(rtt_ms)
             return
+        if message == "PING":
+            return
+        # Normalize binary frames to str so downstream (native parser, orjson) is
+        # uniform. PM normally sends text JSON, but guard anyway.
+        if isinstance(message, (bytes, bytearray)):
+            message = message.decode("utf-8", "replace")
+        # Expose the untouched frame string so a native (C++) book can parse it
+        # directly, skipping Python's json.loads + the per-event dict build.
         try:
-            msg = json.loads(message)
+            self.raw_frame.emit(message)
+        except Exception:
+            pass
+        try:
+            msg = orjson.loads(message)  # ~1.5x faster than stdlib on the hot path
         except Exception:
             return
 
