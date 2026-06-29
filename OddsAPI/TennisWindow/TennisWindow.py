@@ -7,12 +7,13 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect, QPoint
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QPen, QBrush
 )
 from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsData
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
+import tennis_sim
 
 #TODO: Display Serve data,fix I-Hard surface dissappearing in career surface widget display
 
@@ -24,7 +25,7 @@ class TennisTheme:
     PRIMARY = "#00D4AA"
     SECONDARY = "#FFD700"
     ACCENT = "#FF6B6B"
-    
+
     # Surface Colors
     HARD_COURT = "#1976D2"  # Blue for hard courts
     CLAY_COURT = "#D84315"
@@ -47,7 +48,7 @@ class SurfaceStats:
     grass_total: int = 0
     indoor_wins: int = 0
     indoor_total: int = 0
-    
+
     def get_percentage(self, surface: str) -> float:
         """Get win percentage for a surface"""
         if surface.lower() == 'hard':
@@ -62,7 +63,7 @@ class SurfaceStats:
 
 class CompactSurfaceWidget(QWidget):
     """Compact surface performance visualization - FRESH IMPLEMENTATION"""
-    
+
     def __init__(self):
         super().__init__()
         self.surface_stats = SurfaceStats()
@@ -70,23 +71,23 @@ class CompactSurfaceWidget(QWidget):
         self.setToolTip("Surface Performance")
         self.is_populated = False
         print(f"NEW CompactSurfaceWidget initialized - Size: 180x85")
-        
+
     def update_stats_from_yearly_data(self, yearly_stats: dict):
         """Update surface statistics from H2H yearly stats - SINGLE UPDATE ONLY"""
         if self.is_populated:
             print("WARNING: CompactSurfaceWidget already populated, ignoring update")
             return
-            
+
         print(f"CompactSurfaceWidget.update_stats_from_yearly_data called")
         print(f"Available years: {list(yearly_stats.keys())}")
-        
+
         # Get last 3 years of data, or use career totals if insufficient
         current_year = 2025
         last_3_years = [str(current_year), str(current_year-1), str(current_year-2)]
-        
+
         available_years = [year for year in last_3_years if year in yearly_stats]
         print(f"Available years in last 3: {available_years}")
-        
+
         if len(available_years) >= 3:
             # Use last 3 years data
             print("Using last 3 years of data")
@@ -101,28 +102,28 @@ class CompactSurfaceWidget(QWidget):
             else:
                 print("ERROR: No career totals available")
                 return
-                
+
         # Aggregate surface stats from selected years
         stats = SurfaceStats()
-        
+
         for year in years_to_use:
             year_data = yearly_stats[year]
             print(f"Processing year {year}: {year_data}")
-            
+
             for surface_key, record in year_data.items():
                 if not record or record == "--" or record == "0-0":
                     continue
-                    
+
                 if '-' not in record:
                     continue
-                    
+
                 try:
                     wins_str, losses_str = record.split('-')
                     wins = int(wins_str.strip())
                     losses = int(losses_str.strip())
-                    
+
                     surface_lower = surface_key.lower()
-                    
+
                     if surface_lower == 'hard':
                         stats.hard_wins += wins
                         stats.hard_total += (wins + losses)
@@ -139,35 +140,35 @@ class CompactSurfaceWidget(QWidget):
                         stats.indoor_wins += wins
                         stats.indoor_total += (wins + losses)
                         print(f"  I.HARD: +{wins}/{wins+losses} -> Total: {stats.indoor_wins}/{stats.indoor_total}")
-                        
+
                 except (ValueError, AttributeError) as e:
                     print(f"  ERROR parsing {surface_key}: {record} - {e}")
                     continue
-                    
+
         print(f"FINAL STATS ({data_source}):")
         print(f"  Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
         print(f"  Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
         print(f"  Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
         print(f"  Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
-        
+
         self.surface_stats = stats
         self.is_populated = True
         print("CompactSurfaceWidget populated and locked")
         self.update()
-        
+
     def paintEvent(self, event):
         """Custom paint for surface performance"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.SURFACE))
-        
+
         # Career label at the top
         painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         painter.setFont(QFont("Arial", 7))
         painter.drawText(2, 2, 156, 10, Qt.AlignmentFlag.AlignCenter, "Trailing 3y Surface W%")
-        
+
         # Surface data - ALL 4 SURFACES ALWAYS
         surfaces = [
             ('Hard', TennisTheme.HARD_COURT, self.surface_stats.get_percentage('hard')),
@@ -175,39 +176,39 @@ class CompactSurfaceWidget(QWidget):
             ('Grass', TennisTheme.GRASS_COURT, self.surface_stats.get_percentage('grass')),
             ('Indoor', TennisTheme.INDOOR_COURT, self.surface_stats.get_percentage('indoor'))
         ]
-        
+
         print(f"PAINTING 4 surfaces:")
         for i, (name, color, percentage) in enumerate(surfaces):
             print(f"  {i}: {name} = {percentage:.1f}%")
-        
+
         # Draw compact bars
         bar_width = 28
         bar_height = 45
         spacing = 3
         start_x = 8
         start_y = 25
-        
+
         for i, (name, color, percentage) in enumerate(surfaces):
             x = start_x + i * (bar_width + spacing)
             print(f"  Drawing {name} at x={x} (width={bar_width})")
-            
+
             # Background bar
             painter.setPen(QPen(QColor("#2A3441"), 1))
             painter.setBrush(QBrush(QColor("#2A3441")))
             painter.drawRect(x, start_y, bar_width, bar_height)
-            
+
             # Performance bar
             fill_height = max(1, int((percentage / 100) * bar_height)) if percentage > 0 else 0
             if fill_height > 0:
                 painter.setBrush(QBrush(QColor(color)))
                 painter.drawRect(x, start_y + bar_height - fill_height, bar_width, fill_height)
-            
+
             # Surface label
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
             painter.setFont(QFont("Arial", 7))
             label = "I.Hard" if name == "Indoor" else name[:1]
             painter.drawText(x, start_y - 5, bar_width, 12, Qt.AlignmentFlag.AlignCenter, label)
-            
+
             # Percentage
             painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
             painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
@@ -216,7 +217,7 @@ class CompactSurfaceWidget(QWidget):
 
 class HistoricalSurfaceTableWidget(QWidget):
     """Historical surface performance table widget matching Tennis Tonic style"""
-    
+
     def __init__(self):
         super().__init__()
         self.player1_yearly_stats = {}
@@ -231,7 +232,7 @@ class HistoricalSurfaceTableWidget(QWidget):
                 border-radius: 8px;
             }}
         """)
-        
+
     def update_player_stats(self, player_name: str, yearly_stats: dict, player_num: int):
         """Update yearly surface statistics for a specific player"""
         if player_num == 1:
@@ -241,79 +242,79 @@ class HistoricalSurfaceTableWidget(QWidget):
             self.player2_yearly_stats = yearly_stats
             self.player2_name = player_name
         self.update()
-        
+
     def paintEvent(self, event):
         """Custom paint for historical surface table"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
-        
+
         # Draw two side-by-side tables with no spacing
         self.draw_player_table(painter, self.player1_name, self.player1_yearly_stats, 0, 0, 300, TennisTheme.PRIMARY)
         self.draw_player_table(painter, self.player2_name, self.player2_yearly_stats, 300, 0, 300, TennisTheme.ACCENT)
-        
+
     def draw_player_table(self, painter, player_name, yearly_stats, x_offset, y_offset, width, accent_color):
         """Draw historical surface table for one player"""
         # Header background
-        header_color = QColor("#2A3441") 
+        header_color = QColor("#2A3441")
         painter.fillRect(x_offset, y_offset, width, 30, header_color)
-        
+
         # Player name in header
         painter.setPen(QColor(accent_color))
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         painter.drawText(x_offset + 10, y_offset + 20, player_name if player_name else "Select Player")
-        
+
         # Table headers
         y = y_offset + 30
         header_height = 25
         painter.fillRect(x_offset, y, width, header_height, QColor("#1A1F2E"))
-        
+
         painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-        
+
         # Column headers
         headers = ["Year", "Sum", "Hard", "Clay", "I.hard", "Grass"]
         col_widths = [45, 50, 50, 45, 50, 50]
         x_pos = x_offset + 5
-        
+
         for header, col_width in zip(headers, col_widths):
             painter.drawText(x_pos, y + 17, header)
             x_pos += col_width
-            
+
         # Draw data rows
         if yearly_stats:
             # Sort years in descending order
             sorted_years = sorted([year for year in yearly_stats.keys() if year != "Year Total"], reverse=True)
-            
+
             row_y = y + header_height
             row_height = 20  # Slightly reduced for better space utilization
-            
+
             # Data rows - show more years with increased height
             for i, year in enumerate(sorted_years[:10]):  # Show last 10 years
                 if i % 2 == 0:
                     painter.fillRect(x_offset, row_y, width, row_height, QColor("#252B3A"))
                 else:
                     painter.fillRect(x_offset, row_y, width, row_height, QColor("#1E242F"))
-                
+
                 year_data = yearly_stats[year]
-                
+
                 painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
                 painter.setFont(QFont("Arial", 9))
-                
+
                 # Year
                 painter.drawText(x_offset + 5, row_y + 14, year)
-                
+
                 # Data columns
                 data_values = [
                     year_data.get('Sum.', '0-0'),
-                    year_data.get('Hard', '0-0'),  
+                    year_data.get('Hard', '0-0'),
                     year_data.get('Clay', '0-0'),
                     year_data.get('I.hard', '0-0'),
                     year_data.get('Grass', '0-0')
                 ]
-                
+
                 x_pos = x_offset + 50
                 for value, col_width in zip(data_values, col_widths[1:]):
                     # Color code based on performance
@@ -331,37 +332,37 @@ class HistoricalSurfaceTableWidget(QWidget):
                             painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
                     else:
                         painter.setPen(QColor(TennisTheme.TEXT_MUTED))
-                    
+
                     painter.drawText(x_pos, row_y + 14, value)
                     x_pos += col_width
-                
+
                 row_y += row_height
-            
+
             # Total row (if available)
             if "Year Total" in yearly_stats:
                 # Separator line
                 painter.setPen(QColor(accent_color))
                 painter.drawLine(x_offset, row_y, x_offset + width, row_y)
                 row_y += 2
-                
+
                 # Total row background
                 painter.fillRect(x_offset, row_y, width, row_height, QColor("#2A3441"))
-                
+
                 total_data = yearly_stats["Year Total"]
-                
+
                 painter.setPen(QColor(accent_color))
                 painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
                 painter.drawText(x_offset + 5, row_y + 15, "Total")
-                
+
                 # Total data
                 total_values = [
                     total_data.get('Sum.', '0-0'),
                     total_data.get('Hard', '0-0'),
-                    total_data.get('Clay', '0-0'), 
+                    total_data.get('Clay', '0-0'),
                     total_data.get('I.hard', '0-0'),
                     total_data.get('Grass', '0-0')
                 ]
-                
+
                 x_pos = x_offset + 50
                 for value, col_width in zip(total_values, col_widths[1:]):
                     painter.drawText(x_pos, row_y + 14, value)
@@ -369,7 +370,7 @@ class HistoricalSurfaceTableWidget(QWidget):
 
 class CompactRankingChart(QWidget):
     """Compact ranking evolution chart with dual player overlay"""
-    
+
     def __init__(self, db_path: str = "tennis_rankings.db"):
         super().__init__()
         self.db_path = db_path
@@ -389,120 +390,120 @@ class CompactRankingChart(QWidget):
                 border-radius: 12px;
             }}
         """)
-        
+
     def add_player(self, player_name: str, player_num: int):
         """Add player ranking data to chart"""
         ranking_data = self.load_player_rankings(player_name)
-        
+
         if player_num == 1:
             self.player1_data = ranking_data
             self.player1_name = player_name
         else:
             self.player2_data = ranking_data
             self.player2_name = player_name
-            
+
         self.update()
-        
+
     def load_player_rankings(self, player_name: str) -> List[Tuple[str, int, int, int]]:
         """Load last 52 weeks of ranking data for player with points and rank changes"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             # First, get the most recent date in the database
             cursor.execute('SELECT MAX(ranking_date) FROM rankings')
             latest_date = cursor.fetchone()[0]
-            
+
             if not latest_date:
                 conn.close()
                 return []
-            
+
             # Convert to datetime to calculate 52 weeks back
             from datetime import datetime, timedelta
             latest_datetime = datetime.strptime(latest_date, '%Y-%m-%d')
             earliest_datetime = latest_datetime - timedelta(weeks=52)
             earliest_date = earliest_datetime.strftime('%Y-%m-%d')
-            
+
             # Get ranking data with points and rank changes for the player within the last 52 weeks
             cursor.execute('''
                 SELECT ranking_date, rank, points, rank_change
-                FROM rankings 
-                WHERE player_name = ? 
+                FROM rankings
+                WHERE player_name = ?
                 AND ranking_date >= ?
                 AND ranking_date <= ?
                 ORDER BY ranking_date ASC
             ''', (player_name, earliest_date, latest_date))
-            
+
             data = cursor.fetchall()
             conn.close()
-            
+
             return data
-            
+
         except Exception as e:
             print(f"Error loading rankings for {player_name}: {e}")
             return []
-    
+
     def paintEvent(self, event):
         """Custom paint for ranking chart"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Fill background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
-        
+
         # Draw legend at the top first
         self._draw_legend(painter)
-        
+
         # Chart area - adjusted margins for legend at top and X-axis labels at bottom
         left_margin = 35  # More space for Y-axis labels
         top_margin = 40   # Space for legend at top
         bottom_margin = 35  # Space for X-axis date labels
         right_margin = 20
         chart_rect = self.rect().adjusted(left_margin, top_margin, -right_margin, -bottom_margin)
-        
+
         if not self.player1_data and not self.player2_data:
             # No data message
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 10))
             painter.drawText(chart_rect, Qt.AlignmentFlag.AlignCenter, "Select players to view rankings")
             return
-        
+
         # Calculate scale
         all_ranks = []
         if self.player1_data:
             all_ranks.extend([rank for _, rank, _, _ in self.player1_data])
         if self.player2_data:
             all_ranks.extend([rank for _, rank, _, _ in self.player2_data])
-            
+
         if not all_ranks:
             return
-            
+
         min_rank = min(all_ranks)
         max_rank = max(all_ranks)
         rank_range = max_rank - min_rank
-        
+
         # Add padding to range
         padding = max(1, rank_range * 0.1)
         min_rank = max(1, min_rank - padding)
         max_rank = max_rank + padding
-        
+
         # Draw grid lines
         painter.setPen(QPen(QColor("#2A3441"), 1))
         grid_lines = 4
         for i in range(grid_lines + 1):
             y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
             painter.drawLine(chart_rect.left(), int(y), chart_rect.right(), int(y))
-        
+
         # Draw Player 1
         if self.player1_data:
-            self._draw_player_line(painter, self.player1_data, chart_rect, min_rank, max_rank, 
+            self._draw_player_line(painter, self.player1_data, chart_rect, min_rank, max_rank,
                                  TennisTheme.PRIMARY, self.player1_name)
-        
-        # Draw Player 2  
+
+        # Draw Player 2
         if self.player2_data:
             self._draw_player_line(painter, self.player2_data, chart_rect, min_rank, max_rank,
                                  TennisTheme.ACCENT, self.player2_name)
-        
+
         # Draw Y-axis labels (rankings) - better positioning
         painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         painter.setFont(QFont("Arial", 10))
@@ -510,23 +511,23 @@ class CompactRankingChart(QWidget):
             rank = min_rank + (max_rank - min_rank) * (i / grid_lines)
             y = chart_rect.top() + (chart_rect.height() * i / grid_lines)
             painter.drawText(5, int(y - 7), 30, 14, Qt.AlignmentFlag.AlignCenter, f"#{int(rank)}")
-        
+
         # Draw X-axis date labels
         self._draw_x_axis_dates(painter, chart_rect)
-        
+
         # Draw tooltip if hovering over a point
         self._draw_tooltip(painter)
-        
+
     def _draw_player_line(self, painter, data, chart_rect, min_rank, max_rank, color, player_name):
         """Draw ranking line for a player with data points"""
         if len(data) < 2:
             return
-            
+
         painter.setPen(QPen(QColor(color), 3))
-        
+
         points = []
         point_data = []  # Store data for hover detection
-        
+
         for i, (date, rank, points_val, rank_change) in enumerate(data):
             x = chart_rect.left() + (chart_rect.width() * i / max(len(data) - 1, 1))
             # Correct Y axis: better rank (#1) at top, worse rank (#100) at bottom
@@ -535,54 +536,54 @@ class CompactRankingChart(QWidget):
             point = QPointF(x, y)
             points.append(point)
             point_data.append((date, rank, points_val, rank_change, point))
-        
+
         # Store points for hover detection
         if player_name == self.player1_name:
             self.player1_points = point_data
         else:
             self.player2_points = point_data
-        
+
         # Draw line with glow effect
         painter.setPen(QPen(QColor(color + "80"), 6))  # Semi-transparent thicker line
         for i in range(len(points) - 1):
             painter.drawLine(points[i], points[i + 1])
-            
+
         painter.setPen(QPen(QColor(color), 3))  # Main line
         for i in range(len(points) - 1):
             painter.drawLine(points[i], points[i + 1])
-        
+
         # Draw data point dots
         painter.setBrush(QBrush(QColor(color)))
         painter.setPen(QPen(QColor(color), 2))
         for point in points:
             painter.drawEllipse(int(point.x() - 3), int(point.y() - 3), 6, 6)
-        
+
         # Highlight current rank point with larger dot
         if points:
             painter.setBrush(QBrush(QColor(color)))
             painter.setPen(QPen(QColor(color), 2))
             last_point = points[-1]
             painter.drawEllipse(int(last_point.x() - 4), int(last_point.y() - 4), 8, 8)
-    
+
     def _draw_legend(self, painter):
         """Draw compact legend at the top"""
         if not self.player1_name and not self.player2_name:
             return
-            
+
         legend_y = 20  # Position at top
         x_pos = 35
-        
+
         painter.setFont(QFont("Arial", 9))
-        
+
         if self.player1_name:
             # Player 1 legend
             painter.setPen(QPen(QColor(TennisTheme.PRIMARY), 3))
             painter.drawLine(x_pos, legend_y, x_pos + 15, legend_y)
             painter.setPen(QColor(TennisTheme.PRIMARY))
-            painter.drawText(x_pos + 20, legend_y - 6, 100, 12, Qt.AlignmentFlag.AlignLeft, 
+            painter.drawText(x_pos + 20, legend_y - 6, 100, 12, Qt.AlignmentFlag.AlignLeft,
                            self.player1_name[:12] + ("..." if len(self.player1_name) > 12 else ""))
             x_pos += 140
-            
+
         if self.player2_name:
             # Player 2 legend
             painter.setPen(QPen(QColor(TennisTheme.ACCENT), 3))
@@ -590,27 +591,27 @@ class CompactRankingChart(QWidget):
             painter.setPen(QColor(TennisTheme.ACCENT))
             painter.drawText(x_pos + 20, legend_y - 6, 100, 12, Qt.AlignmentFlag.AlignLeft,
                            self.player2_name[:12] + ("..." if len(self.player2_name) > 12 else ""))
-    
+
     def _draw_x_axis_dates(self, painter, chart_rect):
         """Draw X-axis date labels"""
         # Use the longer dataset to determine date positions
         data_to_use = self.player1_data if len(self.player1_data) >= len(self.player2_data) else self.player2_data
-        
+
         if not data_to_use:
             return
-            
+
         painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         painter.setFont(QFont("Arial", 8))
-        
+
         # Show dates at regular intervals
         num_labels = min(6, len(data_to_use))  # Show max 6 date labels
         step = max(1, len(data_to_use) // num_labels)
-        
+
         for i in range(0, len(data_to_use), step):
             if i < len(data_to_use):
                 date, _, _, _ = data_to_use[i]
                 x = chart_rect.left() + (chart_rect.width() * i / max(len(data_to_use) - 1, 1))
-                
+
                 # Format date (show month/year)
                 try:
                     from datetime import datetime
@@ -618,21 +619,21 @@ class CompactRankingChart(QWidget):
                     formatted_date = date_obj.strftime('%m/%y')
                 except:
                     formatted_date = date[-5:]  # Fallback to last 5 chars
-                
-                painter.drawText(int(x - 15), chart_rect.bottom() + 20, 30, 12, 
+
+                painter.drawText(int(x - 15), chart_rect.bottom() + 20, 30, 12,
                                Qt.AlignmentFlag.AlignCenter, formatted_date)
-    
+
     def mouseMoveEvent(self, event):
         """Handle mouse movement for hover tooltips"""
         mouse_pos = event.pos()
         hover_found = False
-        
+
         # Check player 1 points
         for date, rank, points_val, rank_change, point in self.player1_points:
             if self._is_point_hovered(mouse_pos, point):
                 self.hover_point = {
                     'date': date,
-                    'rank': rank, 
+                    'rank': rank,
                     'points': points_val,
                     'rank_change': rank_change,
                     'player': self.player1_name,
@@ -641,7 +642,7 @@ class CompactRankingChart(QWidget):
                 }
                 hover_found = True
                 break
-        
+
         # Check player 2 points if no player 1 hover found
         if not hover_found:
             for date, rank, points_val, rank_change, point in self.player2_points:
@@ -649,7 +650,7 @@ class CompactRankingChart(QWidget):
                     self.hover_point = {
                         'date': date,
                         'rank': rank,
-                        'points': points_val, 
+                        'points': points_val,
                         'rank_change': rank_change,
                         'player': self.player2_name,
                         'color': TennisTheme.ACCENT,
@@ -657,25 +658,25 @@ class CompactRankingChart(QWidget):
                     }
                     hover_found = True
                     break
-        
+
         if not hover_found:
             self.hover_point = None
-            
+
         self.update()  # Trigger repaint to show/hide tooltip
-    
+
     def _is_point_hovered(self, mouse_pos, point):
         """Check if mouse is hovering over a data point"""
         hover_radius = 8  # Hover detection radius
         distance = ((mouse_pos.x() - point.x()) ** 2 + (mouse_pos.y() - point.y()) ** 2) ** 0.5
         return distance <= hover_radius
-    
-    
-    
+
+
+
     def _draw_tooltip(self, painter):
         """Draw hover tooltip for data points"""
         if not self.hover_point:
             return
-            
+
         # Tooltip content
         date = self.hover_point['date']
         rank = self.hover_point['rank']
@@ -684,7 +685,7 @@ class CompactRankingChart(QWidget):
         player = self.hover_point['player']
         color = self.hover_point['color']
         pos = self.hover_point['pos']
-        
+
         # Format date
         try:
             from datetime import datetime
@@ -692,7 +693,7 @@ class CompactRankingChart(QWidget):
             formatted_date = date_obj.strftime('%B %d, %Y')
         except:
             formatted_date = date
-        
+
         # Format rank change (handle None values)
         if rank_change is None:
             change_text = "━ N/A"
@@ -706,7 +707,7 @@ class CompactRankingChart(QWidget):
         else:
             change_text = "━ 0"
             change_color = TennisTheme.TEXT_SECONDARY
-        
+
         # Tooltip text
         points_text = f"{points:,}" if points is not None else "N/A"
         tooltip_lines = [
@@ -716,7 +717,7 @@ class CompactRankingChart(QWidget):
             f"Points: {points_text}",
             f"Change: {change_text}"
         ]
-        
+
         # Calculate tooltip size
         painter.setFont(QFont("Arial", 9))
         max_width = 0
@@ -725,31 +726,31 @@ class CompactRankingChart(QWidget):
             metrics = painter.fontMetrics()
             text_width = metrics.horizontalAdvance(line)
             max_width = max(max_width, text_width)
-        
+
         tooltip_width = max_width + 20
         tooltip_height = len(tooltip_lines) * line_height + 10
-        
+
         # Position tooltip near the point but within widget bounds
         tooltip_x = int(pos.x() + 15)
         tooltip_y = int(pos.y() - tooltip_height - 10)
-        
+
         # Adjust if tooltip goes off-screen
         if tooltip_x + tooltip_width > self.width():
             tooltip_x = int(pos.x() - tooltip_width - 15)
         if tooltip_y < 0:
             tooltip_y = int(pos.y() + 15)
-        
+
         # Draw tooltip background
         tooltip_rect = QRect(tooltip_x, tooltip_y, tooltip_width, tooltip_height)
         painter.setPen(QPen(QColor(color), 2))
         painter.setBrush(QBrush(QColor("#2A3441")))
         painter.drawRoundedRect(tooltip_rect, 5, 5)
-        
+
         # Draw tooltip text
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
         painter.drawText(tooltip_x + 10, tooltip_y + 15, tooltip_lines[0])  # Player name
-        
+
         painter.setFont(QFont("Arial", 9))
         for i, line in enumerate(tooltip_lines[1:], 1):
             y_pos = tooltip_y + 15 + (i * line_height)
@@ -785,7 +786,7 @@ class CompactPlayerSearchWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)  # Compact margins
         layout.setSpacing(2)  # Tighter spacing
-        
+
         # Set minimum size for the widget but allow it to expand
         self.setMinimumHeight(70)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
@@ -901,8 +902,11 @@ class CompactPlayerSearchWidget(QWidget):
         self.results2_frame.hide()
 
         layout.addWidget(search_frame)
-        layout.addWidget(self.results1_frame)
-        layout.addWidget(self.results2_frame)
+        # NOTE: the results frames are deliberately NOT added to the layout.
+        # They float as overlay children of the top-level window (positioned in
+        # _position_overlay) so showing suggestions never resizes/pushes the
+        # surrounding widgets. They are reparented to the window on first show.
+        self._overlay_reparented = False
 
     def load_players(self):
         """Load players from database"""
@@ -914,7 +918,7 @@ class CompactPlayerSearchWidget(QWidget):
                 FROM rankings r1
                 INNER JOIN (
                     SELECT player_name, MAX(ranking_date) as latest_date
-                    FROM rankings 
+                    FROM rankings
                     GROUP BY player_name
                 ) r2 ON r1.player_name = r2.player_name AND r1.ranking_date = r2.latest_date
                 ORDER BY r1.rank
@@ -937,7 +941,7 @@ class CompactPlayerSearchWidget(QWidget):
                 self.current_suggestions_p2 = []
             return
 
-        filtered = [(name, rank) for name, rank in self.players 
+        filtered = [(name, rank) for name, rank in self.players
                    if text.lower() in name.lower()][:8]
 
         # Store current suggestions and reset selection
@@ -956,10 +960,12 @@ class CompactPlayerSearchWidget(QWidget):
             frame = self.results1_frame
             layout = self.results1_layout
             button_list = self.suggestion_buttons_p1
+            input_widget = self.player1_input
         else:
             frame = self.results2_frame
             layout = self.results2_layout
             button_list = self.suggestion_buttons_p2
+            input_widget = self.player2_input
 
         # Clear previous
         for i in reversed(range(layout.count())):
@@ -973,12 +979,31 @@ class CompactPlayerSearchWidget(QWidget):
         for i, (name, rank) in enumerate(filtered_players):
             btn = QPushButton(f"#{rank} {name}")
             btn.clicked.connect(lambda checked, n=name, p=player_num: self.select_player(n, p))
-            btn.setFixedHeight(38)  # Even larger height for better visibility
+            btn.setFixedHeight(38)  # larger height for better visibility
             btn.setMinimumWidth(320)  # Ensure minimum width for full names
             btn.setStyleSheet(self.get_button_style(False))  # Normal style initially
             layout.addWidget(btn)
             button_list.append(btn)
 
+        self._position_overlay(frame, input_widget)
+
+    def _position_overlay(self, frame, input_widget):
+        """Float the results frame over the window, just under its input box.
+
+        The frame is a child of the top-level window (not in any layout), so it
+        overlays the dashboard instead of expanding the search widget and
+        pushing the other panels down.
+        """
+        win = self.window()
+        if frame.parentWidget() is not win:
+            frame.setParent(win)
+        # Top-left corner just below the input box, in window coordinates.
+        pt = input_widget.mapTo(win, QPoint(0, input_widget.height() + 2))
+        frame.adjustSize()
+        width = max(input_widget.width(), frame.sizeHint().width())
+        height = min(frame.sizeHint().height(), 320)
+        frame.setGeometry(pt.x(), pt.y(), width, height)
+        frame.raise_()
         frame.show()
 
     def get_button_style(self, is_selected):
@@ -1034,7 +1059,7 @@ class CompactPlayerSearchWidget(QWidget):
     def handle_key_press(self, event, player_num):
         """Handle arrow key navigation and Enter key selection"""
         key = event.key()
-        
+
         if player_num == 1:
             suggestions = self.current_suggestions_p1
             selected_index = self.selected_index_p1
@@ -1045,12 +1070,12 @@ class CompactPlayerSearchWidget(QWidget):
             selected_index = self.selected_index_p2
             button_list = self.suggestion_buttons_p2
             frame = self.results2_frame
-        
+
         if not suggestions or not frame.isVisible():
             # Let the line edit handle normal text input
             QLineEdit.keyPressEvent(self.player1_input if player_num == 1 else self.player2_input, event)
             return
-        
+
         if key == Qt.Key.Key_Down:
             # Move selection down
             new_index = min(selected_index + 1, len(suggestions) - 1)
@@ -1089,7 +1114,7 @@ class CompactPlayerSearchWidget(QWidget):
             old_index = self.selected_index_p2
             self.selected_index_p2 = new_index
             button_list = self.suggestion_buttons_p2
-        
+
         # Update button styles
         for i, btn in enumerate(button_list):
             if i == new_index:
@@ -1102,43 +1127,43 @@ class CompactPlayerSearchWidget(QWidget):
 
 class RankingGraphWidget(QWidget):
     """Compact ranking visualization with current and peak"""
-    
+
     def __init__(self):
         super().__init__()
         self.current_rank = None
         self.peak_rank = None
         self.elo_rating = None
         self.setFixedSize(100, 80)
-        
+
     def update_ranking(self, current_rank: Optional[int], peak_rank: Optional[int], elo_rating: Optional[int] = None):
         """Update ranking information"""
         self.current_rank = current_rank
         self.peak_rank = peak_rank
         self.elo_rating = elo_rating
         self.update()
-        
+
     def paintEvent(self, event):
         """Custom paint for ranking display"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.SURFACE))
-        
+
         # Current rank (main display)
         if self.current_rank:
             painter.setPen(QColor(TennisTheme.PRIMARY))
             painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
             rank_text = f"#{self.current_rank}"
             painter.drawText(5, 5, 90, 35, Qt.AlignmentFlag.AlignCenter, rank_text)
-            
+
             # Peak rank (smaller)
             if self.peak_rank:
                 painter.setPen(QColor(TennisTheme.SECONDARY))
                 painter.setFont(QFont("Arial", 10))
                 peak_text = f"Peak: #{self.peak_rank}"
                 painter.drawText(5, 40, 90, 15, Qt.AlignmentFlag.AlignCenter, peak_text)
-                
+
             # ELO rating (bottom)
             if self.elo_rating:
                 painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
@@ -1157,7 +1182,7 @@ class RankingGraphWidget(QWidget):
 
 class PlayerProfileWidget(QWidget):
     """Compact player profile container widget"""
-    
+
     # Signals
     dataUpdated = pyqtSignal(str)  # player_name
     surfaceStatsLoaded = pyqtSignal(str, object, int)  # player_name, SurfaceStats, player_num
@@ -1165,7 +1190,7 @@ class PlayerProfileWidget(QWidget):
     rawPlayerDataLoaded = pyqtSignal(str, object, int)  # player_name, raw_player_data, player_num
     recentResultsLoaded = pyqtSignal(str, list, int)  # player_name, recent_results_list, player_num
     historicalMatchesLoaded = pyqtSignal(str, list, int)  # player_name, historical_matches_list, player_num
-    
+
     def __init__(self, player_color: str = TennisTheme.PRIMARY, player_num: int = 1):
         super().__init__()
         self.player_color = player_color
@@ -1174,39 +1199,39 @@ class PlayerProfileWidget(QWidget):
         self.player_bio: Optional[PlayerBio] = None
         self.current_ranking: Optional[PlayerRanking] = None
         self.surface_stats = SurfaceStats()
-        
+
         # Scrapers
         self.h2h_scraper = TennisScraper()
-        
+
         # Database path for rankings
         self.db_path = "tennis_rankings.db"
-        
+
         self.setup_ui()
-        
+
     def get_player_rankings_from_db(self, player_name: str) -> Tuple[Optional[int], Optional[int], bool]:
         """Get current and peak rankings from the database, and whether current rank is recent"""
         try:
             from datetime import datetime, timedelta
-            
+
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             # Get current ranking (most recent entry) with date
             cursor.execute("""
-                SELECT rank, ranking_date FROM rankings 
-                WHERE player_name = ? 
-                ORDER BY ranking_date DESC 
+                SELECT rank, ranking_date FROM rankings
+                WHERE player_name = ?
+                ORDER BY ranking_date DESC
                 LIMIT 1
             """, (player_name,))
             current_result = cursor.fetchone()
-            
+
             current_rank = None
             is_current = False
-            
+
             if current_result:
                 current_rank = current_result[0]
                 ranking_date_str = current_result[1]
-                
+
                 # Check if ranking is recent (within last 3 months)
                 try:
                     ranking_date = datetime.strptime(ranking_date_str, '%Y-%m-%d')
@@ -1215,22 +1240,22 @@ class PlayerProfileWidget(QWidget):
                 except:
                     # If date parsing fails, consider it not current
                     is_current = False
-            
+
             # Get peak ranking (minimum rank value)
             cursor.execute("""
-                SELECT MIN(rank) FROM rankings 
+                SELECT MIN(rank) FROM rankings
                 WHERE player_name = ?
             """, (player_name,))
             peak_result = cursor.fetchone()
             peak_rank = peak_result[0] if peak_result else None
-            
+
             conn.close()
             return current_rank, peak_rank, is_current
-            
+
         except Exception as e:
             print(f"Error getting rankings from database for {player_name}: {e}")
             return None, None, False
-        
+
     def setup_ui(self):
         """Setup the compact player profile UI"""
         self.setFixedSize(420, 200)  # Even wider to prevent bio text from pushing widgets
@@ -1241,103 +1266,103 @@ class PlayerProfileWidget(QWidget):
                 border-radius: 12px;
             }}
         """)
-        
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 4)  # Reduced bottom margin to decrease spacing
         layout.setSpacing(8)
-        
+
         # Header with player name and recent form
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(10)
-        
+
         self.name_label = QLabel("Select Player")
         self.name_label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
         self.name_label.setStyleSheet(f"color: {self.player_color}; margin-bottom: 4px;")
-        
+
         # Recent form display (moved from bottom)
-        self.form_display = QLabel("🔴🔴🔴🔴🔴")
+        self.form_display = QLabel("")
         self.form_display.setFont(QFont("Arial", 12))
         self.form_display.setAlignment(Qt.AlignmentFlag.AlignRight)
-        
+
         header_layout.addWidget(self.name_label)
         header_layout.addStretch()
-        header_layout.addWidget(self.form_display)
-        
+        # header_layout.addWidget(self.form_display)
+
         header_widget = QWidget()
         header_widget.setLayout(header_layout)
-        
+
         # Main content area
         content_widget = QWidget()
         content_layout = QHBoxLayout(content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(12)
-        
+
         # Left side: Bio information
         bio_widget = QWidget()
         bio_layout = QVBoxLayout(bio_widget)
         bio_layout.setContentsMargins(0, 0, 0, 0)
         bio_layout.setSpacing(4)
-        
+
         # Bio labels
         self.country_label = QLabel("Country: --")
         self.age_label = QLabel("Age: --")
         self.plays_label = QLabel("Plays: --")
         self.elo_label = QLabel("ELO: --")
-        
+
         for label in [self.country_label, self.age_label, self.plays_label, self.elo_label]:
             label.setFont(QFont("Arial", 10))
             label.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY};")
             bio_layout.addWidget(label)
-            
+
         bio_layout.addStretch()
-        
+
         # Center: Ranking display aligned with Country label
         center_layout = QVBoxLayout()
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(4)
-        
+
         self.ranking_widget = RankingGraphWidget()
         center_layout.addWidget(self.ranking_widget)
         center_layout.addStretch()  # Push ranking widget to top
-        
+
         center_widget = QWidget()
         center_widget.setLayout(center_layout)
-        
+
         # Right side: Surface performance aligned with Country label
         right_side_layout = QVBoxLayout()
         right_side_layout.setContentsMargins(0, 0, 0, 0)
         right_side_layout.setSpacing(4)
-        
+
         # Surface performance widget positioned at top to align with Country label
         self.surface_widget = CompactSurfaceWidget()
         right_side_layout.addWidget(self.surface_widget)
         right_side_layout.addStretch()  # Push surface widget to top
-        
+
         right_side_widget = QWidget()
         right_side_widget.setLayout(right_side_layout)
-        
+
         # Assemble content
         content_layout.addWidget(bio_widget, 1)
         content_layout.addWidget(center_widget, 0)
         content_layout.addWidget(right_side_widget, 0)
-        
+
         # Assemble main layout
         layout.addWidget(header_widget)
         layout.addWidget(content_widget, 1)
-        
+
     def set_player(self, player_name: str):
         """Set the player and load their data"""
         if player_name == self.player_name:
             return
-            
+
         self.player_name = player_name
         self.name_label.setText(player_name)
-        
+
         # Load data asynchronously
         self.load_player_data()
-         
-        
+
+
     def load_player_data(self):
         """Load player data from multiple sources"""
         def background_load():
@@ -1345,7 +1370,7 @@ class PlayerProfileWidget(QWidget):
                 # Load Tennis Abstract data - create new scraper instance for each use
                 formatted_name = self.player_name.replace(' ', '')
                 url = f"https://www.tennisabstract.com/cgi-bin/player.cgi?p={formatted_name}"
-                
+
                 abstract_scraper = TennisAbstractScraper(headless=True)
                 try:
                     player_data = abstract_scraper._scrape_player_page(url)
@@ -1353,30 +1378,30 @@ class PlayerProfileWidget(QWidget):
                     # Always close the scraper after use
                     abstract_scraper.close()
                     print(f"Closed scraper for {self.player_name}")
-                
+
                 if player_data and player_data.player_bio:
                     self.player_bio = player_data.player_bio
-                    
+
                     # Update bio info
                     self.country_label.setText(f"Country: {player_data.player_bio.country}")
                     self.age_label.setText(f"Age: {player_data.player_bio.age}")
-                    
+
                     # Parse and abbreviate plays info
                     plays_text = player_data.player_bio.plays
                     abbreviated_plays = self.abbreviate_plays(plays_text)
                     self.plays_label.setText(f"Plays: {abbreviated_plays}")
-                    
+
                     # Parse ELO rating
                     try:
                         elo_rating = int(player_data.player_bio.elo_rating) if player_data.player_bio.elo_rating else None
                         self.elo_label.setText(f"ELO: {elo_rating}" if elo_rating else "ELO: --")
                     except:
                         self.elo_label.setText("ELO: --")
-                    
+
                     # Get rankings from database with recency check
                     try:
                         current_rank_db, peak_rank_db, is_current = self.get_player_rankings_from_db(self.player_name)
-                        
+
                         # Use database current ranking only if it's recent (within 3 months)
                         # Otherwise fallback to Tennis Abstract scraped ranking
                         if is_current and current_rank_db is not None:
@@ -1384,16 +1409,16 @@ class PlayerProfileWidget(QWidget):
                         else:
                             # Use Tennis Abstract current_rank as fallback for stale DB data
                             current_rank = int(player_data.player_bio.current_rank) if player_data.player_bio.current_rank.isdigit() else None
-                        
+
                         # Always use database peak rank if available (historical data is always valid)
                         peak_rank = peak_rank_db if peak_rank_db is not None else (int(player_data.player_bio.peak_rank) if player_data.player_bio.peak_rank.isdigit() else None)
-                        
+
                         self.ranking_widget.update_ranking(current_rank, peak_rank, elo_rating)
                     except:
                         pass
-                    
-                        
-                    
+
+
+
                     # Emit raw player data for stats widget
                     if hasattr(player_data, '__dict__'):
                         # Convert dataclass to dict properly, including nested lists
@@ -1404,15 +1429,15 @@ class PlayerProfileWidget(QWidget):
                             print(f"Error converting player data to dict: {e}")
                             # Fallback to __dict__ if asdict fails
                             self.rawPlayerDataLoaded.emit(self.player_name, player_data.__dict__, self.player_num)
-                    
+
                     # Emit recent results for form/momentum widget
                     if hasattr(player_data, 'recent_results') and player_data.recent_results:
                         self.recentResultsLoaded.emit(self.player_name, player_data.recent_results, self.player_num)
-                    
+
                     # Emit historical matches for enhanced momentum analysis
                     if hasattr(player_data, 'historical_matches') and player_data.historical_matches:
                         self.historicalMatchesLoaded.emit(self.player_name, player_data.historical_matches, self.player_num)
-                
+
                 # Get rankings from database for cases where Abstract data wasn't available
                 if not self.player_bio:
                     try:
@@ -1422,30 +1447,30 @@ class PlayerProfileWidget(QWidget):
                             self.ranking_widget.update_ranking(current_rank_db, peak_rank_db)
                     except:
                         pass
-                
+
                 # Get recent form and surface data from H2H scraper by doing a dummy comparison
                 try:
                     # Create a dummy comparison to get player stats with recent form and surface data
                     dummy_player = "Carlos Alcaraz"  # Use a common player as dummy
                     if self.player_name.lower() == dummy_player.lower():
                         dummy_player = "Jannik Sinner"  # Use different dummy if same player
-                    
+
                     h2h_data = self.h2h_scraper.scrape_h2h_comprehensive_sync(self.player_name, dummy_player)
                     if h2h_data:
                         # Check which player matches our target player by name similarity
                         target_player_data = None
-                        
+
                         # Check if player1 name matches our target player
-                        if (h2h_data.player1.name and 
+                        if (h2h_data.player1.name and
                             self.player_name.lower() in h2h_data.player1.name.lower() or
                             h2h_data.player1.name.lower() in self.player_name.lower()):
                             target_player_data = h2h_data.player1
-                        # Check if player2 name matches our target player  
-                        elif (h2h_data.player2.name and 
+                        # Check if player2 name matches our target player
+                        elif (h2h_data.player2.name and
                               self.player_name.lower() in h2h_data.player2.name.lower() or
                               h2h_data.player2.name.lower() in self.player_name.lower()):
                             target_player_data = h2h_data.player2
-                        
+
                         # Use the recent form from the correct player
                         if target_player_data and target_player_data.recent_form:
                             self.update_form(target_player_data.recent_form)
@@ -1455,41 +1480,41 @@ class PlayerProfileWidget(QWidget):
                                 self.update_form(h2h_data.player1.recent_form)
                             elif h2h_data.player2.recent_form:
                                 self.update_form(h2h_data.player2.recent_form)
-                                
+
                         # Update surface widget with yearly stats data - SINGLE UPDATE ONLY
                         if target_player_data and target_player_data.yearly_stats:
                             self.surface_widget.update_stats_from_yearly_data(target_player_data.yearly_stats)
-                            
+
                             # Also emit yearly stats for historical table
                             self.yearlyStatsLoaded.emit(self.player_name, target_player_data.yearly_stats, self.player_num)
-                            
+
                 except Exception as e:
                     print(f"Error getting H2H data for {self.player_name}: {e}")
                     # Fallback to placeholder if H2H scraper fails
                     self.update_form(['L', 'L', 'L', 'L', 'L'])
-                        
+
                 # Emit signal that data is updated
                 self.dataUpdated.emit(self.player_name)
-                
+
             except Exception as e:
                 print(f"Error loading player data for {self.player_name}: {e}")
                 self.country_label.setText("Country: Error")
                 self.age_label.setText("Age: Error")
                 self.plays_label.setText("Plays: Error")
                 self.elo_label.setText("ELO: Error")
-                
+
         # Run in background thread
         thread = threading.Thread(target=background_load, daemon=True)
         thread.start()
-        
+
     def abbreviate_plays(self, plays_text: str) -> str:
         """Abbreviate plays information to standard tennis format"""
         if not plays_text:
             return "--"
-            
+
         # Convert to lowercase for easier matching
         plays_lower = plays_text.lower()
-        
+
         # Determine handedness
         if "right" in plays_lower:
             handedness = "RH"
@@ -1497,7 +1522,7 @@ class PlayerProfileWidget(QWidget):
             handedness = "LH"
         else:
             handedness = "?"
-            
+
         # Determine backhand style
         if "two" in plays_lower or "2" in plays_lower:
             backhand = "2HBH"
@@ -1505,26 +1530,26 @@ class PlayerProfileWidget(QWidget):
             backhand = "1HBH"
         else:
             backhand = "?"
-            
+
         return f"{handedness}/{backhand}"
-        
+
     def extract_surface_stats(self, career_splits: List) -> SurfaceStats:
         """Extract surface statistics from career splits data"""
         stats = SurfaceStats()
-        
+
         # Debug: Print what splits we're getting
         print(f"DEBUG: Extracting surface stats from {len(career_splits)} splits:")
         for split in career_splits:
             print(f"  Split: '{split.split}' - Wins: {split.wins}, Matches: {split.matches}")
-        
+
         for split in career_splits:
             split_name = split.split.lower()
-            
+
             # Parse wins-losses from matches
             try:
                 wins = int(split.wins) if split.wins.isdigit() else 0
                 total = int(split.matches) if split.matches.isdigit() else 0
-                
+
                 if 'hard' in split_name or 'outdoor hard' in split_name:
                     stats.hard_wins += wins
                     stats.hard_total += total
@@ -1543,45 +1568,45 @@ class PlayerProfileWidget(QWidget):
                     print(f"  -> Added to INDOOR: {wins}/{total}")
                 else:
                     print(f"  -> UNMATCHED: '{split_name}'")
-                    
+
             except (ValueError, AttributeError):
                 continue
-                
+
         print(f"Final stats: Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
         print(f"             Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
         print(f"             Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
         print(f"             Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
-        
+
         return stats
-    
+
     def extract_surface_stats_from_h2h(self, yearly_stats: Dict[str, Dict[str, str]]) -> SurfaceStats:
         """Extract surface statistics from H2H scraper yearly stats data"""
         stats = SurfaceStats()
-        
+
         # Debug: Print what yearly stats we're getting
         print(f"DEBUG: Extracting surface stats from H2H yearly stats:")
         for year, surfaces in yearly_stats.items():
             print(f"  Year {year}: {surfaces}")
-        
+
         # Use the most recent year (2025)
         current_year = "2025"
         if current_year in yearly_stats:
             surfaces = yearly_stats[current_year]
-            
+
             for surface_name, record in surfaces.items():
                 if not record or record == "--":
                     continue
-                    
-                # Parse records like "7-0", "11-2", "0-0" 
+
+                # Parse records like "7-0", "11-2", "0-0"
                 try:
                     if '-' in record:
                         wins_str, losses_str = record.split('-')
                         wins = int(wins_str.strip())
                         losses = int(losses_str.strip())
                         total = wins + losses
-                        
+
                         surface_lower = surface_name.lower()
-                        
+
                         # Handle I.hard/indoor specifically first to prevent it from matching 'hard'
                         if surface_lower == 'i.hard' or 'indoor' in surface_lower:
                             stats.indoor_wins += wins
@@ -1601,38 +1626,38 @@ class PlayerProfileWidget(QWidget):
                             print(f"  -> Added to GRASS: {wins}/{total} from '{surface_name}: {record}'")
                         else:
                             print(f"  -> UNMATCHED: '{surface_name}: {record}'")
-                            
+
                 except (ValueError, AttributeError) as e:
                     print(f"  -> ERROR parsing '{surface_name}: {record}': {e}")
                     continue
         else:
             print(f"  -> No data found for current year {current_year}")
-            
+
         print(f"H2H Final stats: Hard: {stats.hard_wins}/{stats.hard_total} ({stats.get_percentage('hard'):.1f}%)")
         print(f"                 Clay: {stats.clay_wins}/{stats.clay_total} ({stats.get_percentage('clay'):.1f}%)")
         print(f"                 Grass: {stats.grass_wins}/{stats.grass_total} ({stats.get_percentage('grass'):.1f}%)")
         print(f"                 Indoor: {stats.indoor_wins}/{stats.indoor_total} ({stats.get_percentage('indoor'):.1f}%)")
-        
+
         return stats
-    
+
     def is_winning_score(self, score: str) -> bool:
         """Analyze tennis score to determine if it's a win from player's perspective"""
         try:
             # Handle common score formats from Tennis Abstract
             if not score or score == "--":
                 return False
-                
+
             # Remove common suffixes
             score = score.replace(" (ret.)", "").replace(" (wo)", "").strip()
-            
+
             # Split by spaces to get sets
             sets = score.split()
             if not sets:
                 return False
-                
+
             player_sets = 0
             opponent_sets = 0
-            
+
             for set_score in sets:
                 if '-' in set_score:
                     try:
@@ -1642,39 +1667,39 @@ class PlayerProfileWidget(QWidget):
                             # Remove tiebreak info like "(3)"
                             player_games = int(parts[0].split('(')[0])
                             opponent_games = int(parts[1].split('(')[0])
-                            
+
                             if player_games > opponent_games:
                                 player_sets += 1
                             elif opponent_games > player_games:
                                 opponent_sets += 1
                     except ValueError:
                         continue
-                        
+
             # Player wins if they won more sets
             return player_sets > opponent_sets
-            
+
         except Exception:
             return False
-        
+
     def update_form(self, recent_form: List[str]):
         """Update recent form display"""
         if not recent_form:
-            self.form_display.setText("No data")
+            self.form_display.setText("")
             return
-            
+
         # Take the first 5 matches from TennisTonic (they display in chronological order)
         # The rightmost position shows the most recent match
         first_5_matches = recent_form[:5] if len(recent_form) >= 5 else recent_form
-        
+
         form_display = ""
         for result in first_5_matches:
             if result.upper() == 'W':
-                form_display += "🟢"
+                form_display += ""
             elif result.upper() == 'L':
-                form_display += "🔴"
+                form_display += ""
             else:
-                form_display += "⚫"  # Unknown/no data
-                
+                form_display += ""  # Unknown/no data
+
         self.form_display.setText(form_display)
 
 
@@ -1685,7 +1710,7 @@ class PlayerProfileWidget(QWidget):
 
 class CompactStatsWidget(QWidget):
     """Compact stats widget showing Tour-Level vs Challenger stats with individual toggles"""
-    
+
     def __init__(self):
         super().__init__()
         self.player1_data = {}
@@ -1705,10 +1730,10 @@ class CompactStatsWidget(QWidget):
                 border-radius: 8px;
             }}
         """)
-        
+
         # Create toggle buttons for each player
         self.setup_toggle_buttons()
-        
+
     def setup_toggle_buttons(self):
         """Create individual toggle buttons for each player"""
         # Mode toggle button (cycles through current_year, career, last52) - left side
@@ -1730,7 +1755,7 @@ class CompactStatsWidget(QWidget):
         self.mode_toggle.clicked.connect(self.toggle_stats_mode)
         self.mode_toggle.setParent(self)
         self.mode_toggle.move(85, 25)  # Left side of center
-        
+
         # Split type toggle button (only active for career/last52 modes) - right side
         self.split_toggle = QPushButton("Hard")
         self.split_toggle.setFixedSize(70, 20)
@@ -1755,7 +1780,7 @@ class CompactStatsWidget(QWidget):
         self.split_toggle.setParent(self)
         self.split_toggle.move(150, 25)  # Right side of center
         self.split_toggle.setEnabled(False)  # Initially disabled
-        
+
         # Player 1 toggle button - positioned inline with player 1 name
         self.player1_toggle = QPushButton("Tour")
         self.player1_toggle.setFixedSize(35, 14)
@@ -1779,7 +1804,7 @@ class CompactStatsWidget(QWidget):
         self.player1_toggle.clicked.connect(lambda: self.toggle_player_stats(1))
         self.player1_toggle.setParent(self)
         self.player1_toggle.move(100, 65)  # Inline with player 1 name (adjusted for new y position)
-        
+
         # Player 2 toggle button - positioned inline with player 2 name
         self.player2_toggle = QPushButton("Tour")
         self.player2_toggle.setFixedSize(35, 14)
@@ -1803,7 +1828,7 @@ class CompactStatsWidget(QWidget):
         self.player2_toggle.clicked.connect(lambda: self.toggle_player_stats(2))
         self.player2_toggle.setParent(self)
         self.player2_toggle.move(240, 65)  # Inline with player 2 name (adjusted for new y position)
-        
+
     def toggle_player_stats(self, player_num: int):
         """Toggle between Tour-Level and Challenger for specific player"""
         if player_num == 1:
@@ -1812,10 +1837,10 @@ class CompactStatsWidget(QWidget):
         else:
             self.player2_show_tour = not self.player2_show_tour
             self.player2_toggle.setText("Tour" if self.player2_show_tour else "Chall")
-        
+
         # Trigger repaint to show updated data
         self.update()
-        
+
     def toggle_stats_mode(self):
         """Toggle between current year, career, and last 52 week stats"""
         if self.stats_mode == "current_year":
@@ -1839,16 +1864,16 @@ class CompactStatsWidget(QWidget):
             self.player1_toggle.setEnabled(True)  # Enable tour/challenger for season stats
             self.player2_toggle.setEnabled(True)
         self.update()
-        
+
     def toggle_split_type(self):
         """Toggle between different split types for career/last52 modes"""
         if not self.available_splits:
             return
-            
+
         current_index = self.available_splits.index(self.current_split_type) if self.current_split_type in self.available_splits else 0
         next_index = (current_index + 1) % len(self.available_splits)
         self.current_split_type = self.available_splits[next_index]
-        
+
         # Update button text (abbreviate long names)
         button_text = self.current_split_type
         if len(button_text) > 8:
@@ -1865,19 +1890,19 @@ class CompactStatsWidget(QWidget):
                 "vs Top 10": "vsT10"
             }
             button_text = abbreviations.get(button_text, button_text[:8])
-        
+
         self.split_toggle.setText(button_text)
         self.update()
-        
+
     def update_available_splits(self):
         """Update available splits based on current data"""
         # Get splits from all players, combining both tour and challenger data
         tour_key = "career_splits" if self.stats_mode == "career" else "last52_splits"
         chall_key = "career_splits_chall" if self.stats_mode == "career" else "last52_splits_chall"
-        
+
         # Gather all unique splits from both players and both levels
         all_splits = set()
-        
+
         for player_data in [self.player1_data, self.player2_data]:
             if player_data:
                 # Check tour-level splits (if available)
@@ -1885,22 +1910,22 @@ class CompactStatsWidget(QWidget):
                     for split_data in player_data[tour_key]:
                         if isinstance(split_data, dict) and 'split' in split_data:
                             all_splits.add(split_data['split'])
-                
+
                 # Check challenger-level splits (if available)
                 if chall_key in player_data and player_data[chall_key]:
                     for split_data in player_data[chall_key]:
                         if isinstance(split_data, dict) and 'split' in split_data:
                             all_splits.add(split_data['split'])
-        
+
         # Convert to sorted list, prioritizing common splits
         priority_splits = ["Hard", "Clay", "Grass", "Grand Slams", "Masters", "vs Lefties", "vs Top 10"]
         self.available_splits = [s for s in priority_splits if s in all_splits]
         self.available_splits.extend(sorted([s for s in all_splits if s not in priority_splits]))
-        
+
         # Set default split type if current one is not available
         if self.current_split_type not in self.available_splits and self.available_splits:
             self.current_split_type = self.available_splits[0]
-            
+
         # Update button text and enable/disable based on available data
         if self.available_splits:
             button_text = self.current_split_type
@@ -1919,13 +1944,13 @@ class CompactStatsWidget(QWidget):
                 }
                 button_text = abbreviations.get(button_text, button_text[:8])
             self.split_toggle.setText(button_text)
-            
+
             # Enable button if we have multiple split types to cycle through
             if self.stats_mode in ["career", "last52"]:
                 self.split_toggle.setEnabled(len(self.available_splits) > 1)
         else:
             self.split_toggle.setEnabled(False)
-        
+
     def update_player_data(self, player_name: str, player_data: dict, player_num: int):
         """Update player data from tennis abstract"""
         if player_num == 1:
@@ -1934,121 +1959,121 @@ class CompactStatsWidget(QWidget):
         else:
             self.player2_data = player_data
             self.player2_name = player_name
-        
+
         # Update available splits when new data is loaded
         if self.stats_mode in ["career", "last52"]:
             self.update_available_splits()
-        
+
         self.update()
-        
+
     def paintEvent(self, event):
         """Custom paint for stats display"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
-        
+
         # Title based on current mode
         mode_titles = {
             "current_year": "2025 Stats",
-            "career": "Career Stats", 
+            "career": "Career Stats",
             "last52": "Last 52 Weeks"
         }
         title = mode_titles.get(self.stats_mode, "Stats")
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         painter.drawText(5, 5, 270, 20, Qt.AlignmentFlag.AlignCenter, title)
-        
+
         # Draw player stats tables with individual toggles (5px spacing from top toggles)
         self.draw_player_stats(painter, self.player1_name, self.player1_data, 0, 50, 140, TennisTheme.PRIMARY, self.player1_show_tour)
         self.draw_player_stats(painter, self.player2_name, self.player2_data, 140, 50, 140, TennisTheme.ACCENT, self.player2_show_tour)
-        
+
     def draw_player_stats(self, painter, player_name, player_data, x_offset, y_offset, width, accent_color, show_tour_level):
         """Draw stats for one player"""
-        # Player name header  
+        # Player name header
         painter.setPen(QColor(accent_color))
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(x_offset + 5, y_offset + 15, player_name[:15] + ("..." if len(player_name) > 15 else ""))
-        
+
         # Get data based on current mode
         if not player_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
             painter.drawText(x_offset + 5, y_offset + 40, "No data")
             return
-            
+
         current_data = None
-        
+
         if self.stats_mode == "current_year":
             # Get current year stats - only use the requested level (no fallback)
             current_year = "2025"
             stats_key = "tour_seasons" if show_tour_level else "challenger_seasons"
-            
+
             if stats_key not in player_data or not player_data[stats_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
                 painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} data")
                 return
-                
+
             # Find current year data
             for season in player_data[stats_key]:
                 if isinstance(season, dict) and season.get('year') == current_year:
                     current_data = season
                     break
-                    
+
         elif self.stats_mode == "career":
             # Get career splits data - only use the requested level (no fallback)
             splits_key = "career_splits" if show_tour_level else "career_splits_chall"
-            
+
             if splits_key not in player_data or not player_data[splits_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
                 painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} career data")
                 return
-                
+
             # Find the specific split type
             for split_data in player_data[splits_key]:
                 if isinstance(split_data, dict) and split_data.get('split') == self.current_split_type:
                     current_data = split_data
                     break
-                    
+
         elif self.stats_mode == "last52":
             # Get last 52 weeks splits data - only use the requested level (no fallback)
             splits_key = "last52_splits" if show_tour_level else "last52_splits_chall"
-            
+
             if splits_key not in player_data or not player_data[splits_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
                 painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} last52 data")
                 return
-                
+
             # Find the specific split type
             for split_data in player_data[splits_key]:
                 if isinstance(split_data, dict) and split_data.get('split') == self.current_split_type:
                     current_data = split_data
                     break
-                    
+
         if not current_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
             painter.drawText(x_offset + 5, y_offset + 40, "No data")
             return
-            
+
         # Draw stats
         stats_y = y_offset + 35
         painter.setFont(QFont("Arial", 10))
-        
+
         # Stats to display - handle both dict and object data
         def get_stat_value(data, key, default="0%"):
             if isinstance(data, dict):
                 return data.get(key, default)
             else:
                 return getattr(data, key, default)
-        
+
         stats_items = [
             ("Set%", get_stat_value(current_data, "set_percentage", "0%")),
             ("Game%", get_stat_value(current_data, "game_percentage", "0%")),
@@ -2061,15 +2086,15 @@ class CompactStatsWidget(QWidget):
             ("RPW%", get_stat_value(current_data, "return_points_won", "0%")),
             ("DR", get_stat_value(current_data, "dominance_ratio", "0.0"))
         ]
-        
+
         for i, (label, value) in enumerate(stats_items):
             y_pos = stats_y + (i * 20)
-            
+
             # Label
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
             painter.drawText(x_offset + 5, y_pos, 45, 20, Qt.AlignmentFlag.AlignLeft, label)
-            
-            # Value with color coding 
+
+            # Value with color coding
             if label == "DR":
                 # Color code dominance ratio
                 try:
@@ -2105,7 +2130,7 @@ class CompactStatsWidget(QWidget):
                         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
                 except:
                     painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
-            
+
             painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             painter.drawText(x_offset + 55, y_pos, 80, 20, Qt.AlignmentFlag.AlignRight, value)
             painter.setFont(QFont("Arial", 10))
@@ -2113,7 +2138,7 @@ class CompactStatsWidget(QWidget):
 
 class RecentFormMomentumWidget(QWidget):
     """Recent form and momentum widget with rolling averages graph"""
-    
+
     def __init__(self):
         super().__init__()
         self.player1_recent_results = []
@@ -2133,18 +2158,18 @@ class RecentFormMomentumWidget(QWidget):
                 border-radius: 12px;
             }}
         """)
-        
+
         # Create dropdown controls
         self.create_controls()
-        
+
     def create_controls(self):
         """Create metric and surface filter dropdown controls"""
         from PyQt6.QtWidgets import QComboBox, QLabel
-        
+
         # Metric selector
         self.metric_combo = QComboBox(self)
         self.metric_combo.addItems([
-            "1st Serve %", "Dominance Ratio", "Ace %", "Double Fault %", 
+            "1st Serve %", "Dominance Ratio", "Ace %", "Double Fault %",
             "1st Serve Won %", "2nd Serve Won %", "Break Points Saved %"
         ])
         self.metric_combo.setStyleSheet(f"""
@@ -2158,7 +2183,7 @@ class RecentFormMomentumWidget(QWidget):
         """)
         self.metric_combo.currentTextChanged.connect(self.on_metric_changed)
         self.metric_combo.setGeometry(80, 45, 130, 25)
-        
+
         # Surface filter
         self.surface_combo = QComboBox(self)
         self.surface_combo.addItems(["All", "Hard", "Clay", "Grass", "Carpet"])
@@ -2173,7 +2198,7 @@ class RecentFormMomentumWidget(QWidget):
         """)
         self.surface_combo.currentTextChanged.connect(self.on_surface_changed)
         self.surface_combo.setGeometry(280, 45, 90, 25)
-        
+
         # Match count selection dropdown
         self.match_count_combo = QComboBox(self)
         self.match_count_combo.addItems(["10", "25", "50", "All Career"])
@@ -2188,12 +2213,12 @@ class RecentFormMomentumWidget(QWidget):
         """)
         self.match_count_combo.currentTextChanged.connect(self.on_match_count_changed)
         self.match_count_combo.setGeometry(380, 45, 90, 25)
-        
+
     def on_metric_changed(self, text):
         """Handle metric selection change"""
         metric_mapping = {
             "1st Serve %": "first_serve_in",
-            "Dominance Ratio": "dominance_ratio", 
+            "Dominance Ratio": "dominance_ratio",
             "Ace %": "ace_rate",
             "Double Fault %": "double_fault_rate",
             "1st Serve Won %": "first_serve_won",
@@ -2202,12 +2227,12 @@ class RecentFormMomentumWidget(QWidget):
         }
         self.current_metric = metric_mapping.get(text, "first_serve_in")
         self.update()
-        
+
     def on_surface_changed(self, text):
         """Handle surface filter change"""
         self.current_surface = text
         self.update()
-    
+
     def on_match_count_changed(self, text):
         """Handle match count selection change"""
         if text == "All Career":
@@ -2215,18 +2240,18 @@ class RecentFormMomentumWidget(QWidget):
         else:
             self.current_match_count = int(text)
         self.update()
-        
+
     def filter_by_surface(self, recent_results):
         """Filter results by selected surface"""
         if self.current_surface == "All":
             return recent_results
         return [result for result in recent_results if result.surface == self.current_surface]
-        
+
     def update_player_results(self, player_name: str, recent_results: list, player_num: int):
         """Update recent results for a player"""
         # Filter out matches with no underlying data
         filtered_results = self.filter_valid_matches(recent_results)
-        
+
         if player_num == 1:
             self.player1_recent_results = filtered_results[:15]  # Last 15 valid matches
             self.player1_name = player_name
@@ -2234,7 +2259,7 @@ class RecentFormMomentumWidget(QWidget):
             self.player2_recent_results = filtered_results[:15]  # Last 15 valid matches
             self.player2_name = player_name
         self.update()
-    
+
     def update_player_historical_data(self, player_name: str, historical_matches: list, player_num: int):
         """Update historical matches for enhanced analysis"""
         # Convert HistoricalMatchData to MatchResult format for compatibility
@@ -2260,50 +2285,50 @@ class RecentFormMomentumWidget(QWidget):
                     'match_time': getattr(match, 'match_time', '')
                 })()
                 converted_matches.append(converted_match)
-        
+
         # Use historical data if recent results are insufficient
         if player_num == 1:
             self.player1_historical_data = converted_matches[:50]  # Last 50 matches
             if len(self.player1_recent_results) < 10:
                 self.player1_recent_results = converted_matches[:15]
         else:
-            self.player2_historical_data = converted_matches[:50]  # Last 50 matches  
+            self.player2_historical_data = converted_matches[:50]  # Last 50 matches
             if len(self.player2_recent_results) < 10:
                 self.player2_recent_results = converted_matches[:15]
         self.update()
-        
+
     def filter_valid_matches(self, recent_results: list) -> list:
         """Filter out matches that have no underlying statistical data"""
         valid_matches = []
-        
+
         for match in recent_results:
             # Check if match has meaningful data
             if self.has_valid_match_data(match):
                 valid_matches.append(match)
-                
+
         return valid_matches
-        
+
     def has_valid_match_data(self, match_result) -> bool:
         """Check if a match result has valid underlying data"""
         # Check for presence of key statistical fields
         required_fields = ['opponent', 'score']
         optional_stats = ['first_serve_in', 'ace_rate', 'double_fault_rate', 'dominance_ratio']
-        
+
         # Must have basic match info
         for field in required_fields:
             if not hasattr(match_result, field) or not getattr(match_result, field):
                 return False
-                
+
         # Check if score is meaningful (not empty or placeholder)
         score = getattr(match_result, 'score', '')
         if not score or score.strip() == '' or score.strip() == '--':
             return False
-            
+
         # Check if opponent field has meaningful data
         opponent = getattr(match_result, 'opponent', '')
         if not opponent or opponent.strip() == '' or opponent.strip() == '--':
             return False
-            
+
         # At least one statistical field should have data
         has_stats = False
         for stat in optional_stats:
@@ -2312,45 +2337,45 @@ class RecentFormMomentumWidget(QWidget):
                 if value and value.strip() != '' and value.strip() != '--':
                     has_stats = True
                     break
-                    
+
         return has_stats
-        
+
     def paintEvent(self, event):
         """Custom paint for recent form and momentum display"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
-        
+
         # Title
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         title_rect = QRect(0, 10, self.width(), 30)
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, "Recent Form & Momentum")
-        
+
         # Draw labels for controls
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(15, 60, "Metric:")
         painter.drawText(220, 60, "Surface:")
         painter.drawText(380, 60, "Matches:")
-        
+
         # Account for controls at top (70px height for controls)
         controls_height = 75
         content_y = controls_height
         content_height = self.height() - controls_height - 10
-        
+
         # Split into two main areas: Form summary (left) and Rolling averages graph (right)
         form_area_width = 300
         graph_area_width = self.width() - form_area_width - 20
-        
+
         # Draw form summary area
         self.draw_form_summary(painter, 10, content_y, form_area_width, content_height)
-        
+
         # Draw rolling averages graph area
         self.draw_rolling_averages_graph(painter, form_area_width + 20, content_y, graph_area_width, content_height)
-        
+
     def draw_form_summary(self, painter, x, y, width, height):
         """Draw recent form summary for both players"""
         # Player 1 section
@@ -2358,23 +2383,23 @@ class RecentFormMomentumWidget(QWidget):
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         player1_rect = QRect(x, y, width, 25)
         painter.drawText(player1_rect, Qt.AlignmentFlag.AlignLeft, self.player1_name or "Player 1")
-        
+
         # Player 1 form indicators
         self.draw_player_form(painter, x, y + 30, width, 150, self.player1_recent_results, TennisTheme.PRIMARY, self.player1_name)
-        
+
         # Separator line
         painter.setPen(QColor(TennisTheme.SURFACE))
         painter.drawLine(x, y + 200, x + width, y + 200)
-        
+
         # Player 2 section
         painter.setPen(QColor(TennisTheme.ACCENT))
         painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         player2_rect = QRect(x, y + 220, width, 25)
         painter.drawText(player2_rect, Qt.AlignmentFlag.AlignLeft, self.player2_name or "Player 2")
-        
+
         # Player 2 form indicators
         self.draw_player_form(painter, x, y + 250, width, 150, self.player2_recent_results, TennisTheme.ACCENT, self.player2_name)
-        
+
     def draw_player_form(self, painter, x, y, width, height, recent_results, color, player_name):
         """Draw form indicators for one player"""
         if not recent_results:
@@ -2382,22 +2407,22 @@ class RecentFormMomentumWidget(QWidget):
             painter.setFont(QFont("Arial", 10))
             painter.drawText(x, y + 20, "No recent results available")
             return
-            
+
         # Win/Loss streak visualization
         form_y = y + 10
         circle_size = 18
         circle_spacing = 22
-        
+
         painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
-        
+
         # Show last 10 results as colored circles
         results_to_show = recent_results[:10]
         for i, result in enumerate(results_to_show):
             circle_x = x + (i * circle_spacing)
-            
+
             # Determine if win or loss from score - pass player name
             is_win = self.is_match_win(result, player_name)
-            
+
             # Draw circle
             if is_win:
                 painter.setBrush(QBrush(QColor("#31596F")))  # Green for wins
@@ -2405,38 +2430,38 @@ class RecentFormMomentumWidget(QWidget):
             else:
                 painter.setBrush(QBrush(QColor("#6b3562")))  # Red for losses
                 painter.setPen(QColor("#6b3562"))
-                
+
             painter.drawEllipse(circle_x, form_y, circle_size, circle_size)
-            
+
             # Draw W/L in circle
             painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
             text_rect = QRect(circle_x, form_y, circle_size, circle_size)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "W" if is_win else "L")
-        
+
         # Recent stats summary
         stats_y = form_y + 35
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 9))
-        
+
         # Calculate recent form stats - pass player name
         wins = sum(1 for result in results_to_show if self.is_match_win(result, player_name))
         total = len(results_to_show)
         win_pct = (wins / total * 100) if total > 0 else 0
-        
+
         # Stats display
         stats_text = f"Last {total}: {wins}W-{total-wins}L ({win_pct:.1f}%)"
         painter.drawText(x, stats_y, stats_text)
-        
+
         # Comprehensive stats display (averaged from recent matches)
         if recent_results and hasattr(recent_results[0], 'first_serve_in') and recent_results[0].first_serve_in:
             filtered_results = self.filter_by_surface(results_to_show)
             if filtered_results:
                 all_stats = self.calculate_comprehensive_stats(filtered_results)
                 stats_y_start = stats_y + 20
-                
+
                 painter.setFont(QFont("Arial", 8))
                 row_height = 12
-                
+
                 # First column of stats
                 col1_stats = [
                     f"DR: {all_stats.get('dominance_ratio', 0):.2f}",
@@ -2444,31 +2469,31 @@ class RecentFormMomentumWidget(QWidget):
                     f"Aces: {all_stats.get('ace_rate', 0):.1f}%",
                     f"DF: {all_stats.get('double_fault_rate', 0):.1f}%"
                 ]
-                
+
                 for i, stat_text in enumerate(col1_stats):
                     painter.drawText(x, stats_y_start + (i * row_height), stat_text)
-                
+
                 # Second column of stats
                 col2_x = x + 140
                 col2_stats = [
                     f"1st Won: {all_stats.get('first_serve_won', 0):.1f}%",
-                    f"2nd Won: {all_stats.get('second_serve_won', 0):.1f}%", 
+                    f"2nd Won: {all_stats.get('second_serve_won', 0):.1f}%",
                     f"BP Saved: {all_stats.get('break_points_saved', 0):.1f}%",
                     f"Surface: {self.current_surface} ({len(filtered_results)})"
                 ]
-                
+
                 for i, stat_text in enumerate(col2_stats):
                     painter.drawText(col2_x, stats_y_start + (i * row_height), stat_text)
-            
+
     def draw_rolling_averages_graph(self, painter, x, y, width, height):
         """Draw rolling averages graph for serve statistics"""
         # Graph background - use card background to avoid green tint
         painter.fillRect(x, y, width, height, QColor(TennisTheme.CARD_BACKGROUND))
-        
+
         # Graph border
         painter.setPen(QColor(TennisTheme.TEXT_MUTED))
         painter.drawRect(x, y, width, height)
-        
+
         # Title
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 11, QFont.Weight.Bold))
@@ -2476,7 +2501,7 @@ class RecentFormMomentumWidget(QWidget):
         # Dynamic title based on selected metric
         metric_titles = {
             "first_serve_in": "1st Serve %",
-            "dominance_ratio": "Dominance Ratio", 
+            "dominance_ratio": "Dominance Ratio",
             "ace_rate": "Ace %",
             "double_fault_rate": "Double Fault %",
             "first_serve_won": "1st Serve Won %",
@@ -2487,25 +2512,25 @@ class RecentFormMomentumWidget(QWidget):
         surface_text = f" ({self.current_surface})" if self.current_surface != "All" else ""
         title_text = f"{metric_title} - Rolling Averages{surface_text}"
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, title_text)
-        
+
         # Graph area
         graph_x = x + 40
         graph_y = y + 40
         graph_width = width - 80
         graph_height = height - 80
-        
+
         # Draw axes
         painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
         painter.drawLine(graph_x, graph_y + graph_height, graph_x + graph_width, graph_y + graph_height)  # X-axis
         painter.drawLine(graph_x, graph_y, graph_x, graph_y + graph_height)  # Y-axis
-        
+
         # Get filtered results for axis calculations - use historical data when available
         p1_data = self.player1_historical_data if len(self.player1_historical_data) > len(self.player1_recent_results) else self.player1_recent_results
         p2_data = self.player2_historical_data if len(self.player2_historical_data) > len(self.player2_recent_results) else self.player2_recent_results
-        
+
         filtered_p1_results = self.filter_by_surface(p1_data)
         filtered_p2_results = self.filter_by_surface(p2_data)
-        
+
         # Dynamic Y-axis based on metric type and data range
         if self.current_metric == "dominance_ratio":
             # For DR, use a different scale (typically 0.5 to 2.0)
@@ -2515,7 +2540,7 @@ class RecentFormMomentumWidget(QWidget):
             # For percentages, calculate dynamic range based on actual data
             min_val, max_val, step = self.calculate_percentage_axis_range(filtered_p1_results, filtered_p2_results)
             y_format = "{:.0f}%"
-        
+
         # Y-axis labels with dynamic range
         painter.setFont(QFont("Arial", 8))
         num_labels = int((max_val - min_val) / step) + 1
@@ -2523,86 +2548,86 @@ class RecentFormMomentumWidget(QWidget):
             value = min_val + (i * step)
             normalized_pos = (value - min_val) / (max_val - min_val) if max_val > min_val else 0
             label_y = int(graph_y + graph_height - (normalized_pos * graph_height))
-            
+
             painter.drawText(graph_x - 35, label_y + 3, y_format.format(value))
             # Grid lines
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.drawLine(graph_x, int(label_y), graph_x + graph_width, int(label_y))
             painter.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-        
+
         # Plot rolling averages for both players with current metric and surface filter
-        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
+        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height,
                                  filtered_p1_results, TennisTheme.PRIMARY, self.current_metric, min_val, max_val)
-        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height, 
+        self.plot_rolling_average(painter, graph_x, graph_y, graph_width, graph_height,
                                  filtered_p2_results, TennisTheme.ACCENT, self.current_metric, min_val, max_val)
-        
+
         # Legend and current values
         legend_y = y + height - 25
         painter.setFont(QFont("Arial", 9))
-        
+
         # Calculate current rolling averages for display
         p1_current = self.get_current_rolling_average(filtered_p1_results, self.current_metric)
         p2_current = self.get_current_rolling_average(filtered_p2_results, self.current_metric)
-        
+
         # Player 1 legend with current value box
         painter.setPen(QColor(TennisTheme.PRIMARY))
         painter.drawLine(x + 20, legend_y, x + 35, legend_y)
         painter.drawText(x + 40, legend_y + 4, self.player1_name or "Player 1")
-        
+
         # Player 1 current value box
         if p1_current is not None:
             box_x = x + graph_width - 180
             box_y = y + 30
             self.draw_value_box(painter, box_x, box_y, p1_current, self.current_metric, TennisTheme.PRIMARY)
-        
+
         # Player 2 legend with current value box
         painter.setPen(QColor(TennisTheme.ACCENT))
         painter.drawLine(x + 150, legend_y, x + 165, legend_y)
         painter.drawText(x + 170, legend_y + 4, self.player2_name or "Player 2")
-        
+
         # Player 2 current value box
         if p2_current is not None:
             box_x = x + graph_width - 180
             box_y = y + 80
             self.draw_value_box(painter, box_x, box_y, p2_current, self.current_metric, TennisTheme.ACCENT)
-        
-    def plot_rolling_average(self, painter, graph_x, graph_y, graph_width, graph_height, 
+
+    def plot_rolling_average(self, painter, graph_x, graph_y, graph_width, graph_height,
                            recent_results, color, stat_key, min_val, max_val):
         """Plot individual match statistics as connected line for trend analysis"""
         if len(recent_results) < 2:
             return
-            
+
         painter.setPen(QColor(color))
-        
+
         # Get individual match values (not rolling averages)
         match_values = []
         matches_to_show = recent_results[:self.current_match_count] if self.current_match_count > 0 else recent_results
-        
+
         for match in matches_to_show:
             value = self.get_match_stat_value(match, stat_key)
             if value is not None:
                 match_values.append(value)
-        
+
         if len(match_values) < 2:
             return
-            
+
         # Plot individual match data points connected by lines
         points_count = len(match_values)
         value_range = max_val - min_val if max_val > min_val else 1
-        
+
         for i in range(points_count):
             x_pos = int(graph_x + (i * graph_width / max(1, points_count - 1)))
-            
+
             # Use dynamic scaling with boundary clamping
             normalized_value = max(0.0, min(1.0, (match_values[i] - min_val) / value_range))
             y_pos = int(graph_y + graph_height - (normalized_value * graph_height))
-            
+
             # Ensure coordinates stay within graph bounds
             y_pos = max(graph_y, min(graph_y + graph_height, y_pos))
-            
+
             # Draw point
             painter.drawEllipse(x_pos - 2, y_pos - 2, 4, 4)
-            
+
             # Draw line to next point
             if i < points_count - 1:
                 next_x = int(graph_x + ((i + 1) * graph_width / max(1, points_count - 1)))
@@ -2610,7 +2635,7 @@ class RecentFormMomentumWidget(QWidget):
                 next_y = int(graph_y + graph_height - (next_normalized * graph_height))
                 next_y = max(graph_y, min(graph_y + graph_height, next_y))
                 painter.drawLine(x_pos, y_pos, next_x, next_y)
-    
+
     def get_match_stat_value(self, match, stat_key):
         """Get individual match statistic value"""
         try:
@@ -2641,30 +2666,30 @@ class RecentFormMomentumWidget(QWidget):
         except (ValueError, AttributeError, ZeroDivisionError):
             pass
         return None
-                
+
     def is_match_win(self, match_result, player_name=None):
         """Determine if match result is a win based on opponent column data"""
         if not hasattr(match_result, 'opponent') or not match_result.opponent:
             return True  # Default assumption if no data
-        
+
         opponent_str = match_result.opponent.strip()
-        
+
         # Skip incomplete matches (using "vs" instead of "d.")
         if ' vs ' in opponent_str:
             return True  # Default for incomplete matches
-        
+
         # Tennis Abstract format: "Winner d. Loser"
         # Current player appears with name like "(1)PlayerName", "(14)PlayerName", etc.
         # Examples from actual data:
         # WINS: "(1)Rublev d. Emilio Nava [USA]", "(14)Rublev d. Lloyd Harris [RSA]"
         # LOSSES: "(7)Aleksandar Kovacevic [USA] d. (1)Rublev", "(2)Carlos Alcaraz [ESP] d. (14)Rublev"
-        
+
         if ' d. ' in opponent_str:
             parts = opponent_str.split(' d. ')
             if len(parts) == 2:
                 winner_part = parts[0].strip()
                 loser_part = parts[1].strip()
-                
+
                 # Extract last name from full player name (e.g., "Andrey Rublev" -> "Rublev")
                 if player_name:
                     # Get the last name from full name
@@ -2679,15 +2704,15 @@ class RecentFormMomentumWidget(QWidget):
                     else:
                         # Fallback: check if winner starts with ranking
                         return winner_part.startswith('(')
-                
+
                 # Look specifically for the current player's last name with ranking prefix
                 import re
                 current_player_pattern = rf'\([^)]+\){re.escape(last_name)}'
-                
+
                 # Check if current player appears in winner or loser part
                 winner_has_current_player = bool(re.search(current_player_pattern, winner_part))
                 loser_has_current_player = bool(re.search(current_player_pattern, loser_part))
-                
+
                 if winner_has_current_player and not loser_has_current_player:
                     return True  # Current player won (appears in winner position)
                 elif loser_has_current_player and not winner_has_current_player:
@@ -2695,11 +2720,11 @@ class RecentFormMomentumWidget(QWidget):
                 else:
                     # Fallback: check if winner part starts with ranking
                     return winner_part.startswith('(')
-        
-        # No ' d. ' separator found - unclear format  
+
+        # No ' d. ' separator found - unclear format
         return True  # Default assumption
-        
-        
+
+
     def calculate_comprehensive_stats(self, recent_results):
         """Calculate comprehensive averaged statistics from recent results"""
         stats = {
@@ -2711,24 +2736,24 @@ class RecentFormMomentumWidget(QWidget):
             'second_serve_won': 0.0,
             'break_points_saved': 0.0
         }
-        
+
         # Counters for each stat type
         counts = {key: 0 for key in stats.keys()}
         totals = {key: 0.0 for key in stats.keys()}
-        
+
         for result in recent_results:
             try:
                 # Process each stat if available
                 stat_fields = {
                     'dominance_ratio': 'dominance_ratio',
-                    'first_serve_in': 'first_serve_in', 
+                    'first_serve_in': 'first_serve_in',
                     'ace_rate': 'ace_rate',
                     'double_fault_rate': 'double_fault_rate',
                     'first_serve_won': 'first_serve_won',
                     'second_serve_won': 'second_serve_won',
                     'break_points_saved': 'break_points_saved'
                 }
-                
+
                 for stat_key, field_name in stat_fields.items():
                     if hasattr(result, field_name):
                         field_value = getattr(result, field_name)
@@ -2739,24 +2764,24 @@ class RecentFormMomentumWidget(QWidget):
                             else:
                                 # Handle percentage values
                                 value = float(field_value.replace('%', ''))
-                            
+
                             totals[stat_key] += value
                             counts[stat_key] += 1
-                            
+
             except (ValueError, AttributeError):
                 continue
-                
+
         # Calculate averages only for stats with valid data
         for stat_key in stats.keys():
             if counts[stat_key] > 0:
                 stats[stat_key] = totals[stat_key] / counts[stat_key]
-            
+
         return stats
-        
+
     def calculate_dr_axis_range(self, p1_results, p2_results):
         """Calculate appropriate axis range for Dominance Ratio based on individual match values"""
         all_values = []
-        
+
         # Collect individual DR values from both players
         for results in [p1_results, p2_results]:
             matches_to_show = results[:self.current_match_count] if self.current_match_count > 0 else results
@@ -2764,29 +2789,29 @@ class RecentFormMomentumWidget(QWidget):
                 value = self.get_match_stat_value(match, "dominance_ratio")
                 if value is not None:
                     all_values.append(value)
-        
+
         if not all_values:
             return 0.5, 2.0, 0.25  # Default DR range
-            
+
         # Add padding to ensure all data points are visible
         data_min = min(all_values)
         data_max = max(all_values)
         range_padding = (data_max - data_min) * 0.1  # 10% padding
-        
+
         min_val = max(0.1, data_min - max(0.1, range_padding))
         max_val = min(5.0, data_max + max(0.1, range_padding))
-        
+
         # Round to nice values
         min_val = round(min_val * 4) / 4  # Round to nearest 0.25
         max_val = round(max_val * 4) / 4
-        
+
         step = 0.25
         return min_val, max_val, step
-        
+
     def calculate_percentage_axis_range(self, p1_results, p2_results):
         """Calculate appropriate axis range for percentage metrics based on individual match values"""
         all_values = []
-        
+
         # Collect individual match values from both players
         for results in [p1_results, p2_results]:
             matches_to_show = results[:self.current_match_count] if self.current_match_count > 0 else results
@@ -2794,74 +2819,74 @@ class RecentFormMomentumWidget(QWidget):
                 value = self.get_match_stat_value(match, self.current_metric)
                 if value is not None:
                     all_values.append(value)
-        
+
         if not all_values:
             return 0, 100, 25  # Default percentage range
-            
+
         # Add padding to ensure all data points are visible
         data_min = min(all_values)
         data_max = max(all_values)
         range_padding = (data_max - data_min) * 0.1  # 10% padding
-        
+
         min_val = max(0, data_min - max(5, range_padding))
         max_val = min(100, data_max + max(5, range_padding))
-        
+
         # Round to nice values
         min_val = round(min_val / 10) * 10
         max_val = round(max_val / 10) * 10
-        
+
         # Ensure reasonable range
         if max_val - min_val < 20:
             center = (min_val + max_val) / 2
             min_val = max(0, center - 15)
             max_val = min(100, center + 15)
-        
+
         step = 10 if max_val - min_val > 40 else 5
         return min_val, max_val, step
-    
+
     def get_current_rolling_average(self, recent_results, stat_key):
         """Get the most recent rolling average for display"""
         if not recent_results:
             return None
-            
+
         window_size = self.current_match_count if self.current_match_count > 0 else len(recent_results)
         if len(recent_results) < window_size:
             window_size = len(recent_results)
-            
+
         # Get the most recent window
         recent_window = recent_results[:window_size]
         return self.calculate_stat_average(recent_window, stat_key)
-    
+
     def draw_value_box(self, painter, x, y, value, metric_key, color):
         """Draw a value display box in the graph"""
         box_width = 120
         box_height = 35
-        
+
         # Draw box background with slight transparency effect
         painter.fillRect(x, y, box_width, box_height, QColor(color).darker(150))
         painter.setPen(QColor(color))
         painter.drawRect(x, y, box_width, box_height)
-        
+
         # Format value based on metric type
         if metric_key == "dominance_ratio":
             value_text = f"{value:.2f}"
         else:
             value_text = f"{value:.1f}%"
-        
+
         # Draw metric label and value
         painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
         painter.setFont(QFont("Arial", 8))
         metric_display = self.get_metric_display_name(metric_key)
         painter.drawText(x + 5, y + 12, metric_display)
-        
+
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(x + 5, y + 28, value_text)
-    
+
     def get_metric_display_name(self, metric_key):
         """Get display name for metric"""
         display_names = {
             "first_serve_in": "1st Serve %",
-            "dominance_ratio": "Dom Ratio", 
+            "dominance_ratio": "Dom Ratio",
             "ace_rate": "Ace %",
             "double_fault_rate": "DF %",
             "first_serve_won": "1st Won %",
@@ -2869,7 +2894,7 @@ class RecentFormMomentumWidget(QWidget):
             "break_points_saved": "BP Saved %"
         }
         return display_names.get(metric_key, metric_key)
-        
+
     def calculate_stat_average(self, match_window, stat_key):
         """Calculate average for a specific stat over a window of matches"""
         values = []
@@ -2900,20 +2925,726 @@ class RecentFormMomentumWidget(QWidget):
                         else:
                             # Standard percentage values
                             value = float(value_str.replace('%', ''))
-                        
+
                         # Sanity check for percentage values (not DR)
                         if stat_key != "dominance_ratio" and 0 <= value <= 100:
                             values.append(value)
-                            
+
             except (ValueError, AttributeError, ZeroDivisionError):
                 continue
-                
+
         return sum(values) / len(values) if values else None
+
+
+# ----------------------------------------------------------------------------- #
+# Matchup analysis panel (Match Sim / Head-to-Head / Serve & Return)
+# ----------------------------------------------------------------------------- #
+def _to_float(value):
+    """Parse a possibly-'%'-suffixed string to a float, else None."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace('%', '').replace('\xa0', '').strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_fraction(value):
+    """Parse a percentage string ('66.4%') to a 0-1 fraction, else None."""
+    f = _to_float(value)
+    return f / 100.0 if f is not None else None
+
+
+def _avg_pct(records, key):
+    """Average a percentage-valued field across a list of dataclass-dicts."""
+    vals = [_to_float(r.get(key)) for r in records]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _avg_num(records, key):
+    vals = [_to_float(r.get(key)) for r in records]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def parse_player_payload(data_dict: dict) -> dict:
+    """Distil the raw scraped player dict into the fields the panel needs."""
+    bio = data_dict.get('player_bio', {}) or {}
+    elo = {
+        'Overall': _to_float(bio.get('elo_rating')),
+        'Hard': _to_float(bio.get('hard_elo')),
+        'Clay': _to_float(bio.get('clay_elo')),
+        'Grass': _to_float(bio.get('grass_elo')),
+    }
+
+    surf = {}
+    for sp in data_dict.get('career_splits', []) or []:
+        name = sp.get('split', '')
+        if name in ('Hard', 'Clay', 'Grass'):
+            surf[name] = {
+                'spw': _to_fraction(sp.get('service_points_won')),
+                'rpw': _to_fraction(sp.get('return_points_won')),
+                'hold': _to_float(sp.get('hold_percentage')),
+                'brk': _to_float(sp.get('break_percentage')),
+                'dr': _to_float(sp.get('dominance_ratio')),
+                'm': _to_float(sp.get('matches')) or 0,
+            }
+
+    tac = data_dict.get('tactics', []) or []
+    we = data_dict.get('winners_errors', []) or []
+    style = {
+        'net_freq': _avg_pct(tac, 'net_freq'),
+        'net_w': _avg_pct(tac, 'net_w_pct'),
+        'snv_freq': _avg_pct(tac, 'snv_freq'),
+        'drop_freq': _avg_pct(tac, 'drop_freq'),
+        'fh_wnr': _avg_pct(tac, 'fh_wnr_pct'),
+        'bh_wnr': _avg_pct(tac, 'bh_wnr_pct'),
+        'wufe': _avg_num(we, 'ratio'),
+    }
+
+    # Latest season serve detail (numeric year row with the largest year).
+    latest, best_year = {}, -1
+    for s in data_dict.get('tour_seasons', []) or []:
+        try:
+            y = int(str(s.get('year')).strip())
+        except (ValueError, TypeError):
+            continue
+        if y > best_year:
+            best_year, latest = y, s
+    serve = {
+        'year': str(best_year) if best_year > 0 else '',
+        'matches': _to_float(latest.get('matches')),
+        '1st_in': _to_float(latest.get('first_serve_in')),
+        '1st_won': _to_float(latest.get('first_serve_won')),
+        '2nd_won': _to_float(latest.get('second_serve_won')),
+        'ace': _to_float(latest.get('ace_rate')),
+        'df': _to_float(latest.get('double_fault_rate')),
+    }
+    # Charted-match sample size behind the playing-style averages.
+    style['n'] = len(data_dict.get('tactics', []) or [])
+    return {'elo': elo, 'surf': surf, 'style': style, 'serve': serve}
+
+
+# Below this many matches a surface/season split is treated as a small,
+# noise-prone sample and flagged in the UI.
+LOW_SAMPLE_MATCHES = 20
+
+
+def surface_rates(parsed: dict, surface: str):
+    """(spw, rpw) for a surface, falling back to match-weighted avg / tour avg."""
+    s = parsed.get('surf', {}).get(surface)
+    if s and s.get('spw') and s.get('rpw'):
+        return s['spw'], s['rpw']
+    rows = [v for v in parsed.get('surf', {}).values() if v.get('spw') and v.get('rpw')]
+    if rows:
+        wsum = sum((r['m'] or 1) for r in rows)
+        spw = sum(r['spw'] * (r['m'] or 1) for r in rows) / wsum
+        rpw = sum(r['rpw'] * (r['m'] or 1) for r in rows) / wsum
+        return spw, rpw
+    return tennis_sim.ATP_SERVE_AVG, tennis_sim.ATP_RETURN_AVG
+
+
+
+
+class WinProbBar(QWidget):
+    """Two-sided win-probability bar with names and percentages."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(46)
+        self.setMinimumWidth(300)
+        self.p1_name = "Player 1"
+        self.p2_name = "Player 2"
+        self.p1_color = QColor(TennisTheme.PRIMARY)
+        self.p2_color = QColor(TennisTheme.ACCENT)
+        self.p1_prob = 0.5
+        self.subtitle = ""
+
+    def set_values(self, p1_name, p2_name, p1_prob, subtitle=""):
+        self.p1_name = p1_name or "Player 1"
+        self.p2_name = p2_name or "Player 2"
+        self.p1_prob = max(0.0, min(1.0, p1_prob))
+        self.subtitle = subtitle
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bar_h = 26
+        y = 2
+        split = int(w * self.p1_prob)
+
+        # Bars
+        p.setPen(Qt.PenStyle.NoPen)
+        c1 = QColor(self.p1_color); c1.setAlpha(210)
+        c2 = QColor(self.p2_color); c2.setAlpha(210)
+        p.setBrush(c1)
+        p.drawRoundedRect(QRect(0, y, split, bar_h), 4, 4)
+        p.setBrush(c2)
+        p.drawRoundedRect(QRect(split, y, w - split, bar_h), 4, 4)
+
+        # Percent labels inside bars
+        p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(QRect(6, y, split - 8, bar_h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   f"{self.p1_prob*100:.0f}%")
+        p.drawText(QRect(split + 4, y, w - split - 10, bar_h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                   f"{(1-self.p1_prob)*100:.0f}%")
+
+        # Names / subtitle below
+        p.setFont(QFont("Arial", 8))
+        p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        label = self.subtitle or f"{self.p1_name}   vs   {self.p2_name}"
+        p.drawText(QRect(0, y + bar_h, w, h - bar_h - y),
+                   Qt.AlignmentFlag.AlignCenter, label)
+        p.end()
+
+
+class MatchSimTab(QWidget):
+    """Surface-adjusted win probability + Monte Carlo scoreline texture."""
+
+    mcReady = pyqtSignal(object, float, int)
+
+    def __init__(self):
+        super().__init__()
+        from PyQt6.QtWidgets import QComboBox, QGridLayout as _QGrid
+        self.p1_name = self.p2_name = ""
+        self.p1 = self.p2 = None
+        self._req = 0
+
+        # Elo blend weight on the *surface* rating (remainder -> overall Elo).
+        # 50/50 is the FiveThirtyEight / Tennis Abstract tested default.
+        self._blend_w = {
+            "50/50 Elo blend": 0.5,
+            "Surface Elo": 1.0,
+            "75% surface": 0.75,
+            "Overall Elo": 0.0,
+        }
+        # Headline model: how to combine Elo and the serve/return Monte Carlo.
+        self._models = ("Blend (Elo+Sim)", "Elo only", "Sim only")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(6)
+
+        lbl_style = f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;"
+        combo_style = f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 2px; min-width: 64px;
+            }}
+        """
+
+        def mk_combo(items, width=64):
+            c = QComboBox()
+            c.addItems(items)
+            c.setStyleSheet(combo_style)
+            c.setMinimumWidth(width)
+            c.currentTextChanged.connect(lambda *_: self.recompute())
+            return c
+
+        def mk_lbl(text):
+            la = QLabel(text); la.setStyleSheet(lbl_style)
+            return la
+
+        # Two compact control rows.
+        ctrl = _QGrid()
+        ctrl.setHorizontalSpacing(6)
+        ctrl.setVerticalSpacing(4)
+        self.surface_combo = mk_combo(["Hard", "Clay", "Grass"])
+        self.bo_combo = mk_combo(["3", "5"], width=46)
+        self.blend_combo = mk_combo(list(self._blend_w.keys()), width=120)
+        self.model_combo = mk_combo(list(self._models), width=120)
+        ctrl.addWidget(mk_lbl("Surface:"), 0, 0)
+        ctrl.addWidget(self.surface_combo, 0, 1)
+        ctrl.addWidget(mk_lbl("Best of:"), 0, 2)
+        ctrl.addWidget(self.bo_combo, 0, 3)
+        ctrl.addWidget(mk_lbl("Elo:"), 1, 0)
+        ctrl.addWidget(self.blend_combo, 1, 1)
+        ctrl.addWidget(mk_lbl("Model:"), 1, 2)
+        ctrl.addWidget(self.model_combo, 1, 3)
+        ctrl.setColumnStretch(4, 1)
+        layout.addLayout(ctrl)
+
+        self.bar = WinProbBar()
+        layout.addWidget(self.bar)
+
+        # Detail labels
+        self.elo_label = QLabel("")
+        self.mc_label = QLabel("")
+        self.score_label = QLabel("")
+        for w_ in (self.elo_label, self.mc_label, self.score_label):
+            w_.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
+            w_.setWordWrap(True)
+            layout.addWidget(w_)
+        layout.addStretch()
+
+        self.placeholder = QLabel("Select two players to simulate the matchup.")
+        self.placeholder.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 12px;")
+        layout.addWidget(self.placeholder)
+
+        self.mcReady.connect(self._on_mc)
+
+    def set_players(self, p1_name, p2_name, p1, p2):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        self.p1, self.p2 = p1, p2
+        self.recompute()
+
+    def recompute(self):
+        if not (self.p1 and self.p2):
+            return
+        self.placeholder.hide()
+        surface = self.surface_combo.currentText()
+        best_of = int(self.bo_combo.currentText())
+        w_surf = self._blend_w.get(self.blend_combo.currentText(), 0.5)
+
+        e1 = tennis_sim.blend_elo(self.p1['elo'].get('Overall'),
+                                  self.p1['elo'].get(surface), w_surf)
+        e2 = tennis_sim.blend_elo(self.p2['elo'].get('Overall'),
+                                  self.p2['elo'].get(surface), w_surf)
+        elo_p = tennis_sim.elo_win_prob(e1, e2) if (e1 and e2) else 0.5
+
+        blend_name = self.blend_combo.currentText()
+        self.elo_label.setText(
+            f"Elo · {blend_name} ({surface}):  {self.p1_name} {e1:.0f}  vs  "
+            f"{e2:.0f} {self.p2_name}   →  {elo_p*100:.0f}% / {(1-elo_p)*100:.0f}%"
+            if (e1 and e2) else "Elo: unavailable"
+        )
+        self.bar.set_values(self.p1_name, self.p2_name, elo_p, subtitle="simulating…")
+        self.mc_label.setText("Running Monte Carlo…")
+        self.score_label.setText("")
+
+        spw1, rpw1 = surface_rates(self.p1, surface)
+        spw2, rpw2 = surface_rates(self.p2, surface)
+        self._req += 1
+        req = self._req
+
+        def worker():
+            try:
+                res = tennis_sim.simulate_match(spw1, rpw1, spw2, rpw2,
+                                                best_of=best_of, n=10000)
+                self.mcReady.emit(res, elo_p, req)
+            except Exception as e:
+                print(f"Match sim error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mc(self, res, elo_p, req):
+        if req != self._req:
+            return  # stale result
+        model = self.model_combo.currentText()
+        if model == "Elo only":
+            headline = elo_p
+            sub = "Elo model"
+        elif model == "Sim only":
+            headline = res.p_a
+            sub = "Serve/return sim"
+        else:
+            headline = tennis_sim.blended_win_prob(elo_p, res.p_a) or 0.5
+            sub = "Blended (Elo + sim)"
+        odds1 = tennis_sim.prob_to_american(headline)
+        odds2 = tennis_sim.prob_to_american(1 - headline)
+        self.bar.set_values(self.p1_name, self.p2_name, headline,
+                            subtitle=f"{sub}   {odds1} / {odds2}")
+        self.mc_label.setText(
+            f"Monte Carlo:  {self.p1_name} {res.p_a*100:.0f}% / "
+            f"{res.p_b*100:.0f}% {self.p2_name}   ·   "
+            f"avg {res.avg_games:.0f} games   ·   "
+            f"straights {res.p_straights_winner*100:.0f}%   ·   "
+            f"decider {res.p_decider*100:.0f}%")
+        top = list(res.set_scores.items())[:3]
+        self.score_label.setText(
+            "Likely set scores:  " +
+            "   ".join(f"{k} {v*100:.0f}%" for k, v in top))
+
+
+class HeadToHeadTab(QWidget):
+    """Career head-to-head record and the list of prior meetings."""
+
+    def __init__(self):
+        super().__init__()
+        from PyQt6.QtWidgets import QScrollArea
+        self.p1_name = self.p2_name = ""
+        self.p1_color = TennisTheme.PRIMARY
+        self.p2_color = TennisTheme.ACCENT
+        self._record = None
+        self._matches = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        self.header = QLabel("Select two players to load their head-to-head.")
+        self.header.setStyleSheet(
+            f"color: {TennisTheme.TEXT_PRIMARY}; font-size: 14px; font-weight: bold;")
+        self.header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        self.rows_container = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_container)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(3)
+        self.rows_layout.addStretch()
+        scroll.setWidget(self.rows_container)
+        layout.addWidget(scroll)
+
+    def set_players(self, p1_name, p2_name):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        # Names can arrive after the H2H data; re-render once we have them.
+        if self._record is not None or self._matches is not None:
+            self._render()
+
+    @staticmethod
+    def _surname(name):
+        parts = (name or "").lower().split()
+        return parts[-1] if parts else ""
+
+    def _clear_rows(self):
+        while self.rows_layout.count() > 1:  # keep trailing stretch
+            item = self.rows_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def set_h2h(self, record, h2h_matches):
+        """record: 'p1wins-p2wins' string; h2h_matches: list of H2HMatch."""
+        self._record = record
+        self._matches = h2h_matches or []
+        self._render()
+
+    def _render(self):
+        self._clear_rows()
+        record = self._record
+        h2h_matches = self._matches or []
+        sn1, sn2 = self._surname(self.p1_name), self._surname(self.p2_name)
+
+        p1w = p2w = 0
+        if sn1 and sn2:
+            for m in h2h_matches:
+                winner = (m.winner or "").lower()
+                if sn1 in winner:
+                    p1w += 1
+                elif sn2 in winner:
+                    p2w += 1
+        if (p1w + p2w) == 0 and record and '-' in str(record).replace(':', '-'):
+            try:
+                a, b = str(record).replace(':', '-').split('-')[:2]
+                p1w, p2w = int(a), int(b)
+            except (ValueError, IndexError):
+                pass
+
+        name1 = self.p1_name or "Player 1"
+        name2 = self.p2_name or "Player 2"
+        if p1w == p2w:
+            self.header.setText(f"Head-to-Head:  {name1} {p1w} – {p2w} {name2}")
+        else:
+            self.header.setText(
+                f"Head-to-Head:  {name1} {p1w} – {p2w} {name2}")
+
+        if not h2h_matches:
+            lbl = QLabel("No prior meetings on record.")
+            lbl.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 12px;")
+            self.rows_layout.insertWidget(0, lbl)
+            return
+
+        for m in h2h_matches:
+            won_by_p1 = bool(sn1) and sn1 in (m.winner or "").lower()
+            color = self.p1_color if won_by_p1 else self.p2_color
+            row = QFrame()
+            row.setStyleSheet(f"background: {TennisTheme.CARD_BACKGROUND}; border-radius: 3px;")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(8, 3, 8, 3)
+            rl.setSpacing(8)
+
+            def cell(text, w, col=TennisTheme.TEXT_SECONDARY, bold=False):
+                lab = QLabel(str(text))
+                lab.setFixedWidth(w)
+                weight = "bold" if bold else "normal"
+                lab.setStyleSheet(f"color: {col}; font-size: 11px; font-weight: {weight}; background: transparent;")
+                return lab
+
+            rl.addWidget(cell(m.date or "", 70))
+            rl.addWidget(cell(m.tournament or "", 130, TennisTheme.TEXT_PRIMARY))
+            rl.addWidget(cell(m.surface or "", 50))
+            rl.addWidget(cell(m.round or "", 45))
+            rl.addWidget(cell((m.winner or "").split()[-1] if m.winner else "", 80, color, True))
+            rl.addWidget(cell(m.score or "", 120))
+            rl.addStretch()
+            self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+
+
+class ServeReturnTab(QWidget):
+    """Surface serve/return efficiency plus charted playing-style metrics."""
+
+    def __init__(self):
+        super().__init__()
+        from PyQt6.QtWidgets import QComboBox, QGridLayout as _QGrid
+        self.p1_name = self.p2_name = ""
+        self.p1 = self.p2 = None
+        self.p1_color = TennisTheme.PRIMARY
+        self.p2_color = TennisTheme.ACCENT
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        controls = QHBoxLayout()
+        lbl = QLabel("Surface:")
+        lbl.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
+        self.surface_combo = QComboBox()
+        self.surface_combo.addItems(["Hard", "Clay", "Grass"])
+        self.surface_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 3px; min-width: 70px;
+            }}
+        """)
+        self.surface_combo.currentTextChanged.connect(lambda *_: self.refresh())
+        controls.addWidget(lbl)
+        controls.addWidget(self.surface_combo)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.grid = _QGrid()
+        self.grid.setHorizontalSpacing(10)
+        self.grid.setVerticalSpacing(3)
+        layout.addLayout(self.grid)
+        layout.addStretch()
+
+        self.placeholder = QLabel("Select two players to compare serve & return.")
+        self.placeholder.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 12px;")
+        layout.addWidget(self.placeholder)
+
+    def set_players(self, p1_name, p2_name, p1, p2):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        self.p1, self.p2 = p1, p2
+        self.refresh()
+
+    def _clear_grid(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    # --- small grid builders that track the current row ---------------- #
+    def _hdr(self, text, col, color):
+        la = QLabel(text)
+        la.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold;")
+        if col > 0:
+            la.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.grid.addWidget(la, self._r, col)
+
+    def _section(self, text):
+        sec = QLabel(text)
+        sec.setStyleSheet(f"color: {TennisTheme.SECONDARY}; font-size: 10px; font-weight: bold;")
+        self.grid.addWidget(sec, self._r, 0, 1, 3)
+        self._r += 1
+
+    def _note(self, text):
+        n = QLabel(text)
+        n.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 10px; font-style: italic;")
+        self.grid.addWidget(n, self._r, 0, 1, 3)
+        self._r += 1
+
+    def _metric(self, label, v1, v2, better=None, reliable=True):
+        name = QLabel(label)
+        name.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
+        c1 = c2 = TennisTheme.TEXT_PRIMARY
+        # Only highlight a 'winner' when the comparison is trustworthy.
+        if reliable and better and better[0] is not None and better[1] is not None:
+            if better[0] > better[1]:
+                c1 = self.p1_color
+            elif better[1] > better[0]:
+                c2 = self.p2_color
+        l1 = QLabel(v1); l1.setAlignment(Qt.AlignmentFlag.AlignRight)
+        l1.setStyleSheet(f"color: {c1}; font-size: 11px; font-weight: bold;")
+        l2 = QLabel(v2); l2.setAlignment(Qt.AlignmentFlag.AlignRight)
+        l2.setStyleSheet(f"color: {c2}; font-size: 11px; font-weight: bold;")
+        self.grid.addWidget(name, self._r, 0)
+        self.grid.addWidget(l1, self._r, 1)
+        self.grid.addWidget(l2, self._r, 2)
+        self._r += 1
+
+    def _sample_row(self, label, m1, m2):
+        """Render a match-count row, flagging low/zero samples."""
+        def cell(m):
+            if not m:
+                return "none", TennisTheme.TEXT_MUTED
+            if m < LOW_SAMPLE_MATCHES:
+                return f"{m:.0f}*", TennisTheme.SECONDARY  # amber: small sample
+            return f"{m:.0f}", TennisTheme.TEXT_SECONDARY
+        t1, col1 = cell(m1)
+        t2, col2 = cell(m2)
+        name = QLabel(label)
+        name.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 10px;")
+        l1 = QLabel(t1); l1.setAlignment(Qt.AlignmentFlag.AlignRight)
+        l1.setStyleSheet(f"color: {col1}; font-size: 10px;")
+        l2 = QLabel(t2); l2.setAlignment(Qt.AlignmentFlag.AlignRight)
+        l2.setStyleSheet(f"color: {col2}; font-size: 10px;")
+        self.grid.addWidget(name, self._r, 0)
+        self.grid.addWidget(l1, self._r, 1)
+        self.grid.addWidget(l2, self._r, 2)
+        self._r += 1
+
+    def refresh(self):
+        if not (self.p1 and self.p2):
+            return
+        self.placeholder.hide()
+        self._clear_grid()
+        surface = self.surface_combo.currentText()
+
+        def g(parsed, *path):
+            cur = parsed
+            for k in path:
+                cur = (cur or {}).get(k) if isinstance(cur, dict) else None
+            return cur
+
+        s1 = self.p1.get('surf', {}).get(surface, {}) or {}
+        s2 = self.p2.get('surf', {}).get(surface, {}) or {}
+        m1, m2 = s1.get('m'), s2.get('m')
+
+        def fmt(v, suffix="%"):
+            return f"{v:.1f}{suffix}" if isinstance(v, (int, float)) else "—"
+        def fmt_frac(v):
+            return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "—"
+
+        def reliable(*counts):
+            return all((c is not None and c >= LOW_SAMPLE_MATCHES) for c in counts)
+
+        # Header
+        self._r = 0
+        self._hdr("Metric", 0, TennisTheme.TEXT_MUTED)
+        self._hdr(self.p1_name.split()[-1] if self.p1_name else "P1", 1, self.p1_color)
+        self._hdr(self.p2_name.split()[-1] if self.p2_name else "P2", 2, self.p2_color)
+        self._r = 1
+
+        # --- Surface serve / return -----------------------------------
+        self._section(f"Serve / Return ({surface})")
+        self._sample_row("Surface matches", m1, m2)
+        if not s1 and not s2:
+            self._note(f"Neither player has tour-level {surface}-court data.")
+        elif not s1 or not s2:
+            who = self.p2_name if not s1 else self.p1_name
+            self._note(f"{who.split()[-1] if who else 'One player'} has no {surface} data.")
+        surf_rel = reliable(m1, m2)
+        self._metric("Service pts won", fmt_frac(s1.get('spw')), fmt_frac(s2.get('spw')),
+                     (s1.get('spw'), s2.get('spw')), surf_rel)
+        self._metric("Return pts won", fmt_frac(s1.get('rpw')), fmt_frac(s2.get('rpw')),
+                     (s1.get('rpw'), s2.get('rpw')), surf_rel)
+        self._metric("Hold %", fmt(s1.get('hold')), fmt(s2.get('hold')),
+                     (s1.get('hold'), s2.get('hold')), surf_rel)
+        self._metric("Break %", fmt(s1.get('brk')), fmt(s2.get('brk')),
+                     (s1.get('brk'), s2.get('brk')), surf_rel)
+        self._metric("Dominance ratio", fmt(s1.get('dr'), ""), fmt(s2.get('dr'), ""),
+                     (s1.get('dr'), s2.get('dr')), surf_rel)
+
+        # --- Serve detail (latest season) -----------------------------
+        sv1, sv2 = self.p1.get('serve', {}), self.p2.get('serve', {})
+        y1, y2 = sv1.get('year') or '—', sv2.get('year') or '—'
+        yr_lbl = y1 if y1 == y2 else f"{y1}/{y2}"
+        self._section(f"Serve detail ({yr_lbl})")
+        self._sample_row("Season matches", sv1.get('matches'), sv2.get('matches'))
+        serve_rel = reliable(sv1.get('matches'), sv2.get('matches'))
+        self._metric("1st serve in", fmt(sv1.get('1st_in')), fmt(sv2.get('1st_in')),
+                     (sv1.get('1st_in'), sv2.get('1st_in')), serve_rel)
+        self._metric("1st serve won", fmt(sv1.get('1st_won')), fmt(sv2.get('1st_won')),
+                     (sv1.get('1st_won'), sv2.get('1st_won')), serve_rel)
+        self._metric("2nd serve won", fmt(sv1.get('2nd_won')), fmt(sv2.get('2nd_won')),
+                     (sv1.get('2nd_won'), sv2.get('2nd_won')), serve_rel)
+        self._metric("Ace %", fmt(sv1.get('ace')), fmt(sv2.get('ace')),
+                     (sv1.get('ace'), sv2.get('ace')), serve_rel)
+        self._metric("Double fault %", fmt(sv1.get('df')), fmt(sv2.get('df')),
+                     (sv2.get('df'), sv1.get('df')), serve_rel)  # lower is better
+
+        # --- Playing style (charted) ----------------------------------
+        st1, st2 = self.p1.get('style', {}), self.p2.get('style', {})
+        self._section("Playing style (charted)")
+        self._sample_row("Charted matches", st1.get('n'), st2.get('n'))
+        style_rel = reliable(st1.get('n'), st2.get('n'))
+        self._metric("Net freq", fmt(st1.get('net_freq')), fmt(st2.get('net_freq')))
+        self._metric("Net win %", fmt(st1.get('net_w')), fmt(st2.get('net_w')),
+                     (st1.get('net_w'), st2.get('net_w')), style_rel)
+        self._metric("Drop-shot freq", fmt(st1.get('drop_freq')), fmt(st2.get('drop_freq')))
+        self._metric("FH winner %", fmt(st1.get('fh_wnr')), fmt(st2.get('fh_wnr')))
+        self._metric("BH winner %", fmt(st1.get('bh_wnr')), fmt(st2.get('bh_wnr')))
+        self._metric("Winner/UFE ratio", fmt(st1.get('wufe'), ""), fmt(st2.get('wufe'), ""),
+                     (st1.get('wufe'), st2.get('wufe')), style_rel)
+
+
+class MatchupAnalysisPanel(QWidget):
+    """Tabbed bottom-right panel: Match Sim / Head-to-Head / Serve & Return."""
+
+    def __init__(self):
+        super().__init__()
+        from PyQt6.QtWidgets import QTabWidget
+        self.p1_name = self.p2_name = ""
+        self.p1 = self.p2 = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {TennisTheme.CARD_BACKGROUND};
+                background: {TennisTheme.SURFACE};
+            }}
+            QTabBar::tab {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                color: {TennisTheme.TEXT_SECONDARY};
+                padding: 6px 14px; margin-right: 2px;
+                font-size: 11px;
+            }}
+            QTabBar::tab:selected {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.PRIMARY};
+                border-bottom: 2px solid {TennisTheme.PRIMARY};
+            }}
+        """)
+        self.match_sim_tab = MatchSimTab()
+        self.h2h_tab = HeadToHeadTab()
+        self.serve_return_tab = ServeReturnTab()
+        self.tabs.addTab(self.match_sim_tab, "Match Sim")
+        self.tabs.addTab(self.h2h_tab, "Head-to-Head")
+        self.tabs.addTab(self.serve_return_tab, "Serve / Return")
+        layout.addWidget(self.tabs)
+
+        self.setStyleSheet(f"background: {TennisTheme.SURFACE};")
+
+    def update_player(self, player_name: str, data_dict: dict, player_num: int):
+        parsed = parse_player_payload(data_dict)
+        if player_num == 1:
+            self.p1_name, self.p1 = player_name, parsed
+        else:
+            self.p2_name, self.p2 = player_name, parsed
+        self._push()
+
+    def _push(self):
+        self.match_sim_tab.set_players(self.p1_name, self.p2_name, self.p1, self.p2)
+        self.serve_return_tab.set_players(self.p1_name, self.p2_name, self.p1, self.p2)
+        self.h2h_tab.set_players(self.p1_name, self.p2_name)
+
+    def set_h2h(self, record, h2h_matches):
+        self.h2h_tab.set_h2h(record, h2h_matches)
 
 
 class CompactTennisComparisonWidget(QWidget):
     """Main container combining search and player profile widgets"""
-    
+
+    h2hReady = pyqtSignal(object, object)  # record_str, list[H2HMatch]
+
     def __init__(self):
         super().__init__()
         self.h2h_scraper = TennisScraper()
@@ -2921,19 +3652,20 @@ class CompactTennisComparisonWidget(QWidget):
         self.current_player2 = ""
         self.setup_ui()
         self.setup_connections()
-        
+        self.h2hReady.connect(self._on_h2h_ready)
+
     def setup_ui(self):
         """Setup the complete comparison interface"""
         self.setWindowTitle("Effort H2H Tennis Analyzer")
         self.setGeometry(100, 100, 1900, 800)  # Optimized size for stacked tables
         self.setMinimumSize(1400, 600)  # Set minimum size for proper functionality
         self.setStyleSheet(f"background: {TennisTheme.BACKGROUND};")
-        
+
         # Main layout: Grid layout for better organization
         main_layout = QGridLayout(self)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(12)
-        
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
         # Top-left area: Player comparison widgets
         top_left_widget = QWidget()
         top_left_widget.setFixedWidth(900)  # Wider to accommodate both 420px player widgets
@@ -2941,79 +3673,89 @@ class CompactTennisComparisonWidget(QWidget):
         top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
         top_left_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Search widget
         self.search_widget = CompactPlayerSearchWidget()
-        
+
         # Player profile widgets
         profiles_layout = QHBoxLayout()
-        profiles_layout.setSpacing(15)
-        
+        profiles_layout.setSpacing(8)
+
         self.player1_widget = PlayerProfileWidget(TennisTheme.PRIMARY, player_num=1)
         self.player2_widget = PlayerProfileWidget(TennisTheme.ACCENT, player_num=2)
-        
+
         profiles_layout.addWidget(self.player1_widget)
         profiles_layout.addWidget(self.player2_widget)
-        
+
         # Rankings chart widget (compact size)
         self.ranking_chart = CompactRankingChart()
         self.ranking_chart.setFixedSize(900, 220)  # Fixed size matching surface table
-        
+
         # Historical surface performance table
         self.surface_table_widget = HistoricalSurfaceTableWidget()
-        
+
         # Create horizontal layout for surface table and stats widget
         surface_stats_layout = QHBoxLayout()
-        surface_stats_layout.setSpacing(20)  # Spacing between surface table and stats widget
+        surface_stats_layout.setSpacing(10)  # Spacing between surface table and stats widget
         surface_stats_layout.addWidget(self.surface_table_widget)
-        
+
         # Compact stats widget
         self.stats_widget = CompactStatsWidget()
         surface_stats_layout.addWidget(self.stats_widget)
-        
+
         # Add widgets to top-left layout
         top_left_layout.addWidget(self.search_widget)
         top_left_layout.addLayout(profiles_layout)
         top_left_layout.addLayout(surface_stats_layout)
         top_left_layout.addStretch()  # Push everything to top
-        
+
         # Place top-left widget in grid position (0, 0)
         main_layout.addWidget(top_left_widget, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        
-        # Top-right area: Recent Form & Momentum Widget
-        self.form_momentum_widget = RecentFormMomentumWidget()
-        main_layout.addWidget(self.form_momentum_widget, 0, 1, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        
-        # Bottom area: Rankings chart
-        main_layout.addWidget(self.ranking_chart, 1, 0, 1, 2, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        
+        # Bottom-left: Rankings chart
+        main_layout.addWidget(self.ranking_chart, 1, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        # Right column: Momentum stacked directly above the analysis panel so
+        # they pack together instead of leaving a row-driven gap between them.
+        self.form_momentum_widget = RecentFormMomentumWidget()
+        self.analysis_panel = MatchupAnalysisPanel()
+        self.analysis_panel.setMinimumSize(560, 240)
+
+        right_column = QWidget()
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(self.form_momentum_widget, 0, Qt.AlignmentFlag.AlignTop)
+        right_layout.addWidget(self.analysis_panel, 1)
+        main_layout.addWidget(right_column, 0, 1, 2, 1)
+
+
     def setup_connections(self):
         """Connect search signals to player widgets"""
         self.search_widget.player1Selected.connect(self.on_player1_selected)
         self.search_widget.player2Selected.connect(self.on_player2_selected)
-        
-        
+
+
         # Connect surface stats signals
         self.player1_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
         self.player2_widget.surfaceStatsLoaded.connect(self.on_surface_stats_loaded)
-        
+
         # Connect yearly stats signals for historical table
         self.player1_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
         self.player2_widget.yearlyStatsLoaded.connect(self.on_yearly_stats_loaded)
-        
+
         # Connect raw player data signals for stats widget
         self.player1_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
         self.player2_widget.rawPlayerDataLoaded.connect(self.on_raw_player_data_loaded)
-        
+
         # Connect recent results signals for form momentum widget
         self.player1_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
         self.player2_widget.recentResultsLoaded.connect(self.on_recent_results_loaded)
-        
+
         # Connect historical matches signals for enhanced momentum analysis
         self.player1_widget.historicalMatchesLoaded.connect(self.on_historical_matches_loaded)
         self.player2_widget.historicalMatchesLoaded.connect(self.on_historical_matches_loaded)
-        
+
     def on_player1_selected(self, player_name: str):
         """Handle player 1 selection"""
         self.current_player1 = player_name
@@ -3021,7 +3763,7 @@ class CompactTennisComparisonWidget(QWidget):
         self.ranking_chart.add_player(player_name, 1)
         self.update_status()
         self.check_and_load_h2h()
-        
+
     def on_player2_selected(self, player_name: str):
         """Handle player 2 selection"""
         self.current_player2 = player_name
@@ -3029,29 +3771,36 @@ class CompactTennisComparisonWidget(QWidget):
         self.ranking_chart.add_player(player_name, 2)
         self.update_status()
         self.check_and_load_h2h()
-        
-        
+
+
     def on_surface_stats_loaded(self, player_name: str, surface_stats, player_num: int):
         """Handle surface statistics loaded for either player"""
         # This is kept for compatibility but the historical table uses yearly stats instead
         pass
-        
+
     def on_yearly_stats_loaded(self, player_name: str, yearly_stats: dict, player_num: int):
         """Handle yearly surface statistics loaded for either player"""
         self.surface_table_widget.update_player_stats(player_name, yearly_stats, player_num)
-        
+
     def on_raw_player_data_loaded(self, player_name: str, player_data: dict, player_num: int):
         """Handle raw player data loaded for stats widget"""
         self.stats_widget.update_player_data(player_name, player_data, player_num)
-        
+        self.analysis_panel.update_player(player_name, player_data, player_num)
+
     def on_recent_results_loaded(self, player_name: str, recent_results: list, player_num: int):
         """Handle recent results loaded for form momentum widget"""
         self.form_momentum_widget.update_player_results(player_name, recent_results, player_num)
-    
+
     def on_historical_matches_loaded(self, player_name: str, historical_matches: list, player_num: int):
         """Handle historical matches loaded for enhanced momentum analysis"""
         self.form_momentum_widget.update_player_historical_data(player_name, historical_matches, player_num)
-        
+
+    def _on_h2h_ready(self, record, h2h_matches):
+        """Deliver head-to-head data to the analysis panel (main thread)."""
+        # Seed names from the search selection in case raw player data is still loading.
+        self.analysis_panel.h2h_tab.set_players(self.current_player1, self.current_player2)
+        self.analysis_panel.set_h2h(record, h2h_matches)
+
     def update_status(self):
         """Update status label"""
         if self.current_player1 and self.current_player2:
@@ -3062,7 +3811,7 @@ class CompactTennisComparisonWidget(QWidget):
             pass  # Individual status if needed
         else:
             pass  # Default status if needed
-            
+
     def check_and_load_h2h(self):
         """Load H2H data if both players are selected"""
         if self.current_player1 and self.current_player2:
@@ -3072,11 +3821,12 @@ class CompactTennisComparisonWidget(QWidget):
                     h2h_data = self.h2h_scraper.scrape_h2h_comprehensive_sync(
                         self.current_player1, self.current_player2
                     )
-                    # Could add H2H display here in the future
+                    if h2h_data:
+                        self.h2hReady.emit(h2h_data.head_to_head, h2h_data.h2h_history)
                     print(f"H2H data loaded for {self.current_player1} vs {self.current_player2}")
                 except Exception as e:
                     print(f"Error loading comparison data: {e}")
-            
+
             # Run in background thread
             import threading
             thread = threading.Thread(target=load_h2h, daemon=True)
@@ -3084,27 +3834,27 @@ class CompactTennisComparisonWidget(QWidget):
         else:
             # No action needed when not both players selected
             pass
-    
+
     def closeEvent(self, event):
         """Cleanup scrapers when window is closed"""
         try:
             # Close H2H scraper
             if hasattr(self.h2h_scraper, 'close'):
                 self.h2h_scraper.close()
-            
+
             print("Scrapers cleaned up successfully")
         except Exception as e:
             print(f"Error during cleanup: {e}")
         finally:
             event.accept()
-        
+
 
 # Test application
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
+
     # Create main comparison widget
     window = CompactTennisComparisonWidget()
     window.show()
-    
+
     sys.exit(app.exec())
