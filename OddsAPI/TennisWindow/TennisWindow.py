@@ -1,4 +1,5 @@
 import sys
+import re
 import threading
 import sqlite3
 from typing import Optional, Dict, List, Tuple
@@ -1302,7 +1303,7 @@ class PlayerProfileWidget(QWidget):
 
     def setup_ui(self):
         """Setup the compact player profile UI"""
-        self.setFixedSize(420, 200)  # Even wider to prevent bio text from pushing widgets
+        self.setFixedSize(420, 152)  # Trimmed height: content only needs ~135px
         self.setStyleSheet(f"""
             PlayerProfileWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -2404,14 +2405,14 @@ class RecentFormMomentumWidget(QWidget):
                 })()
                 converted_matches.append(converted_match)
 
-        # Keep a deep window so the "All Career" / large match-count options are
-        # representative; the dropdown limits how much is actually used.
+        # Store the full career log (bounded for safety) so "All Career" really
+        # spans the whole career; the dropdown limits how much is actually used.
         if player_num == 1:
-            self.player1_historical_data = converted_matches[:200]
+            self.player1_historical_data = converted_matches[:1500]
             if len(self.player1_recent_results) < 10:
                 self.player1_recent_results = converted_matches[:15]
         else:
-            self.player2_historical_data = converted_matches[:200]
+            self.player2_historical_data = converted_matches[:1500]
             if len(self.player2_recent_results) < 10:
                 self.player2_recent_results = converted_matches[:15]
         self._tag_recent_levels(player_num)
@@ -2798,15 +2799,17 @@ class RecentFormMomentumWidget(QWidget):
                   for i in range(n)]
 
         # Faint raw match dots (win = filled, loss = hollow) in player colour.
+        # Skip them for very large windows so a full-career view stays clean.
         from PyQt6.QtGui import QPen
-        dot = QColor(color); dot.setAlpha(120)
-        for i, p in enumerate(pts):
-            xp, yp = int(X(i)), Y(raw[i])
-            if p['win']:
-                painter.setPen(QPen(dot, 1)); painter.setBrush(dot)
-            else:
-                painter.setPen(QPen(dot, 1)); painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(xp - 2, yp - 2, 5, 5)
+        if n <= 60:
+            dot = QColor(color); dot.setAlpha(120)
+            for i, p in enumerate(pts):
+                xp, yp = int(X(i)), Y(raw[i])
+                if p['win']:
+                    painter.setPen(QPen(dot, 1)); painter.setBrush(dot)
+                else:
+                    painter.setPen(QPen(dot, 1)); painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(xp - 2, yp - 2, 5, 5)
 
         # Bold rolling-average trend line.
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -3168,6 +3171,45 @@ def _avg_num(records, key):
     return sum(vals) / len(vals) if vals else None
 
 
+# --- aggregation over the generic {'headers','rows'} Match-Charting tables ----- #
+def _col_vals(tbl, idx):
+    """Raw cell strings for column `idx` across all rows of a generic table."""
+    rows = (tbl or {}).get('rows', [])
+    return [r[idx] for r in rows if idx < len(r)]
+
+
+def _agg_mean(tbl, idx):
+    """Mean of a numeric / '%'-suffixed column, else None."""
+    vals = [_to_float(v) for v in _col_vals(tbl, idx)]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _agg_max(tbl, idx):
+    vals = [_to_float(v) for v in _col_vals(tbl, idx)]
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+_FRAC_RE = re.compile(r'\((\d+)\s*/\s*(\d+)\)')
+_BARE_FRAC_RE = re.compile(r'^(\d+)\s*/\s*(\d+)$')
+
+
+def _agg_rate(tbl, idx):
+    """Aggregate an 'x/y' or 'pp% (x/y)' column into a true rate % by summing
+    numerators and denominators across matches. Returns (pct, made, total)."""
+    made = total = 0
+    for v in _col_vals(tbl, idx):
+        v = (v or '').strip()
+        m = _FRAC_RE.search(v) or _BARE_FRAC_RE.match(v)
+        if m:
+            made += int(m.group(1))
+            total += int(m.group(2))
+    if total == 0:
+        return None, 0, 0
+    return made / total * 100.0, made, total
+
+
 def parse_player_payload(data_dict: dict) -> dict:
     """Distil the raw scraped player dict into the fields the panel needs."""
     bio = data_dict.get('player_bio', {}) or {}
@@ -3223,7 +3265,70 @@ def parse_player_payload(data_dict: dict) -> dict:
     }
     # Charted-match sample size behind the playing-style averages.
     style['n'] = len(data_dict.get('tactics', []) or [])
-    return {'elo': elo, 'surf': surf, 'style': style, 'serve': serve}
+
+    mcp = _aggregate_charting(data_dict)
+    return {'elo': elo, 'surf': surf, 'style': style, 'serve': serve, 'mcp': mcp}
+
+
+def _aggregate_charting(data_dict: dict) -> dict:
+    """Aggregate the Match-Charting / point-by-point tables into a flat dict of
+    averaged metrics for the comparison tabs. All keys -> float or None."""
+    ss = data_dict.get('serve_speed_detail', {}) or {}
+    sv = data_dict.get('mcp_serve', {}) or {}
+    rt = data_dict.get('mcp_return', {}) or {}
+    ra = data_dict.get('mcp_rally', {}) or {}
+    pp = data_dict.get('pbp_points', {}) or {}
+    pg = data_dict.get('pbp_games', {}) or {}
+    ps = data_dict.get('pbp_stats', {}) or {}
+
+    def rate(tbl, idx):
+        return _agg_rate(tbl, idx)[0]
+
+    m = {
+        'charted_n': len(sv.get('rows', []) or ra.get('rows', []) or []),
+        # --- serve speed (mph) ---
+        'spd_1st': _agg_mean(ss, 3),       # 1st Avg
+        'spd_1st_t': _agg_mean(ss, 5),     # 1st T Avg
+        'spd_1st_wide': _agg_mean(ss, 6),  # 1st Wide Avg
+        'spd_1st_max': _agg_max(ss, 7),    # Max 1st
+        'spd_1st_sd': _agg_mean(ss, 4),    # 1st StDev (consistency)
+        'spd_2nd': _agg_mean(ss, 9),       # 2nd Avg
+        # --- serve effectiveness (mcp-serve) ---
+        'srv_unret': _agg_mean(sv, 2),     # Unreturned %
+        'srv_le3': _agg_mean(sv, 3),       # pts won <=3 shots %
+        'srv_rip_w': _agg_mean(sv, 4),     # rally-in-play won %
+        'srv_impact': _agg_mean(sv, 5),    # serve impact
+        'srv_1st_unret': _agg_mean(sv, 6),
+        'srv_2nd_unret': _agg_mean(sv, 13),
+        # --- return (mcp-return) ---
+        'ret_rip': _agg_mean(rt, 2),       # return in play %
+        'ret_rip_w': _agg_mean(rt, 3),     # return pts won %
+        'ret_wnr': _agg_mean(rt, 4),       # return winner %
+        'ret_depth': _agg_mean(rt, 6),     # RDI (return depth index)
+        'ret_slice': _agg_mean(rt, 7),     # slice %
+        # --- rally (mcp-rally) ---
+        'rally_len': _agg_mean(ra, 2),
+        'rally_1_3': _agg_mean(ra, 5),     # win% rallies 1-3 shots
+        'rally_4_6': _agg_mean(ra, 6),
+        'rally_7_9': _agg_mean(ra, 7),
+        'rally_10p': _agg_mean(ra, 8),     # win% rallies 10+ shots
+        'rally_fh_share': _agg_mean(ra, 9),
+        # --- clutch (pbp) ---
+        'bp_conv': rate(pp, 3),            # break points converted
+        'bp_saved': rate(pp, 6),           # break points saved
+        'tb_spw': _agg_mean(pp, 9),        # tiebreak serve pts won
+        'tb_rpw': _agg_mean(pp, 10),       # tiebreak return pts won
+        'breakback': rate(pg, 4),          # break back %
+        'hold_bpf': rate(pg, 6),           # hold when facing BP
+        'consolidate': rate(pg, 7),        # consolidate a break %
+        'serve_for_set': rate(pg, 8),      # held serving for the set
+        'serve_for_match': rate(pg, 10),   # held serving for the match
+        'deuce_spw': _agg_mean(ps, 7),
+        'ad_spw': _agg_mean(ps, 9),
+        'deuce_rpw': _agg_mean(ps, 10),
+        'ad_rpw': _agg_mean(ps, 11),
+    }
+    return m
 
 
 # Below this many matches a surface/season split is treated as a small,
@@ -4164,6 +4269,175 @@ class ServeReturnTab(QWidget):
                      (st1.get('wufe'), st2.get('wufe')), style_rel)
 
 
+class StatComparisonTab(QWidget):
+    """Spec-driven two-player comparison grid over the Match-Charting aggregates.
+
+    Spec entries:
+      ('sec', title)
+      ('stat', label, key, fmt, higher_better)   fmt in {pct, mph, num, ratio}
+    Values come from each player's parsed['mcp'] dict.
+    """
+
+    def __init__(self, spec, scroll=False):
+        super().__init__()
+        from PyQt6.QtWidgets import QGridLayout as _QGrid, QScrollArea
+        self.spec = spec
+        self.p1_name = self.p2_name = ""
+        self.m1 = self.m2 = None
+        self.n1 = self.n2 = 0
+        self.p1_color = TennisTheme.PRIMARY
+        self.p2_color = TennisTheme.ACCENT
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(4)
+
+        self.grid = _QGrid()
+        self.grid.setHorizontalSpacing(12)
+        self.grid.setVerticalSpacing(3)
+
+        if scroll:
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setStyleSheet("QScrollArea{border:none;}")
+            holder = QWidget()
+            hl = QVBoxLayout(holder)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addLayout(self.grid)
+            hl.addStretch()
+            area.setWidget(holder)
+            outer.addWidget(area)
+        else:
+            outer.addLayout(self.grid)
+            outer.addStretch()
+
+        self.placeholder = QLabel("Select two players to compare.")
+        self.placeholder.setStyleSheet(f"color: {TennisTheme.TEXT_MUTED}; font-size: 12px;")
+        outer.addWidget(self.placeholder)
+
+    def set_data(self, p1_name, p2_name, p1_parsed, p2_parsed):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        self.m1 = (p1_parsed or {}).get('mcp', {})
+        self.m2 = (p2_parsed or {}).get('mcp', {})
+        self.refresh()
+
+    def _clear(self):
+        while self.grid.count():
+            it = self.grid.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+    @staticmethod
+    def _fmt(v, kind):
+        if not isinstance(v, (int, float)):
+            return "—"
+        if kind == 'pct':
+            return f"{v:.1f}%"
+        if kind == 'mph':
+            return f"{v:.0f}"
+        if kind == 'ratio':
+            return f"{v:.2f}"
+        return f"{v:.1f}"
+
+    def refresh(self):
+        if not (self.m1 is not None and self.m2 is not None):
+            return
+        self.placeholder.hide()
+        self._clear()
+        r = 0
+
+        def lbl(text, color, bold=False, size=11, align=None):
+            la = QLabel(text)
+            la.setStyleSheet(f"color: {color}; font-size: {size}px; "
+                             f"font-weight: {'bold' if bold else 'normal'};")
+            if align:
+                la.setAlignment(align)
+            return la
+
+        sn1 = self.p1_name.split()[-1] if self.p1_name else "P1"
+        sn2 = self.p2_name.split()[-1] if self.p2_name else "P2"
+        self.grid.addWidget(lbl("Metric", TennisTheme.TEXT_MUTED, True, 10), r, 0)
+        self.grid.addWidget(lbl(sn1, self.p1_color, True, 11, Qt.AlignmentFlag.AlignRight), r, 1)
+        self.grid.addWidget(lbl(sn2, self.p2_color, True, 11, Qt.AlignmentFlag.AlignRight), r, 2)
+        r += 1
+
+        n1, n2 = self.m1.get('charted_n', 0), self.m2.get('charted_n', 0)
+        self.grid.addWidget(lbl("Charted matches", TennisTheme.TEXT_MUTED, False, 10), r, 0)
+        for col, n in ((1, n1), (2, n2)):
+            c = TennisTheme.TEXT_MUTED if n else TennisTheme.TEXT_MUTED
+            self.grid.addWidget(lbl(str(n) if n else "none", c, False, 10,
+                                    Qt.AlignmentFlag.AlignRight), r, col)
+        r += 1
+
+        for entry in self.spec:
+            if entry[0] == 'sec':
+                self.grid.addWidget(lbl(entry[1], TennisTheme.SECONDARY, True, 10), r, 0, 1, 3)
+                r += 1
+                continue
+            _, label, key, kind, better = entry
+            v1, v2 = self.m1.get(key), self.m2.get(key)
+            c1 = c2 = TennisTheme.TEXT_PRIMARY
+            if better is not None and isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+                hi = v1 > v2 if better else v1 < v2
+                lo = v1 < v2 if better else v1 > v2
+                if hi:
+                    c1 = self.p1_color
+                elif lo:
+                    c2 = self.p2_color
+            self.grid.addWidget(lbl(label, TennisTheme.TEXT_SECONDARY, False, 11), r, 0)
+            self.grid.addWidget(lbl(self._fmt(v1, kind), c1, True, 11, Qt.AlignmentFlag.AlignRight), r, 1)
+            self.grid.addWidget(lbl(self._fmt(v2, kind), c2, True, 11, Qt.AlignmentFlag.AlignRight), r, 2)
+            r += 1
+
+
+# Spec tables for the Match-Charting comparison tabs.
+SERVE_SPEC = [
+    ('sec', 'Serve speed (mph · charted)'),
+    ('stat', '1st serve avg', 'spd_1st', 'mph', True),
+    ('stat', '   down the T', 'spd_1st_t', 'mph', True),
+    ('stat', '   out wide', 'spd_1st_wide', 'mph', True),
+    ('stat', 'Fastest serve', 'spd_1st_max', 'mph', True),
+    ('stat', 'Consistency (StDev↓)', 'spd_1st_sd', 'num', False),
+    ('stat', '2nd serve avg', 'spd_2nd', 'mph', True),
+    ('sec', 'Serve effectiveness'),
+    ('stat', 'Unreturned %', 'srv_unret', 'pct', True),
+    ('stat', 'Points won ≤3 shots', 'srv_le3', 'pct', True),
+    ('stat', 'Rally (in-play) won %', 'srv_rip_w', 'pct', True),
+    ('stat', 'Serve impact', 'srv_impact', 'pct', True),
+    ('sec', 'Serving under pressure'),
+    ('stat', 'Break points saved', 'bp_saved', 'pct', True),
+    ('stat', 'Hold facing BP', 'hold_bpf', 'pct', True),
+    ('stat', 'Held serving for set', 'serve_for_set', 'pct', True),
+    ('stat', 'Held serving for match', 'serve_for_match', 'pct', True),
+    ('stat', 'Deuce-court SPW', 'deuce_spw', 'pct', True),
+    ('stat', 'Ad-court SPW', 'ad_spw', 'pct', True),
+    ('stat', 'Tiebreak SPW', 'tb_spw', 'pct', True),
+]
+
+RETURN_RALLY_SPEC = [
+    ('sec', 'Return game'),
+    ('stat', 'Return in play %', 'ret_rip', 'pct', True),
+    ('stat', 'Return pts won %', 'ret_rip_w', 'pct', True),
+    ('stat', 'Return winner %', 'ret_wnr', 'pct', True),
+    ('stat', 'Return depth (RDI)', 'ret_depth', 'num', True),
+    ('stat', 'Slice return %', 'ret_slice', 'pct', None),
+    ('sec', 'Returning under pressure'),
+    ('stat', 'Break points converted', 'bp_conv', 'pct', True),
+    ('stat', 'Break back %', 'breakback', 'pct', True),
+    ('stat', 'Deuce-court RPW', 'deuce_rpw', 'pct', True),
+    ('stat', 'Ad-court RPW', 'ad_rpw', 'pct', True),
+    ('stat', 'Tiebreak RPW', 'tb_rpw', 'pct', True),
+    ('sec', 'Rally profile'),
+    ('stat', 'Avg rally length', 'rally_len', 'num', None),
+    ('stat', 'Win% rallies 1-3', 'rally_1_3', 'pct', True),
+    ('stat', 'Win% rallies 4-6', 'rally_4_6', 'pct', True),
+    ('stat', 'Win% rallies 7-9', 'rally_7_9', 'pct', True),
+    ('stat', 'Win% rallies 10+', 'rally_10p', 'pct', True),
+    ('stat', 'Forehand share', 'rally_fh_share', 'pct', None),
+]
+
+
 class MatchupAnalysisPanel(QWidget):
     """Tabbed bottom-right panel: Match Sim / Head-to-Head / Serve & Return."""
 
@@ -4199,9 +4473,13 @@ class MatchupAnalysisPanel(QWidget):
         self.match_sim_tab = MatchSimTab()
         self.h2h_tab = HeadToHeadTab()
         self.serve_return_tab = ServeReturnTab()
+        self.serve_tab = StatComparisonTab(SERVE_SPEC, scroll=True)
+        self.return_rally_tab = StatComparisonTab(RETURN_RALLY_SPEC, scroll=True)
         self.tabs.addTab(self.match_sim_tab, "Match Sim")
         self.tabs.addTab(self.h2h_tab, "Head-to-Head")
-        self.tabs.addTab(self.serve_return_tab, "Serve / Return")
+        self.tabs.addTab(self.serve_return_tab, "Surface")
+        self.tabs.addTab(self.serve_tab, "Serve")
+        self.tabs.addTab(self.return_rally_tab, "Return & Rally")
         layout.addWidget(self.tabs)
 
         self.setStyleSheet(f"background: {TennisTheme.SURFACE};")
@@ -4218,6 +4496,8 @@ class MatchupAnalysisPanel(QWidget):
     def _push(self):
         self.match_sim_tab.set_players(self.p1_name, self.p2_name, self.p1, self.p2)
         self.serve_return_tab.set_players(self.p1_name, self.p2_name, self.p1, self.p2)
+        self.serve_tab.set_data(self.p1_name, self.p2_name, self.p1, self.p2)
+        self.return_rally_tab.set_data(self.p1_name, self.p2_name, self.p1, self.p2)
         self.h2h_tab.set_players(self.p1_name, self.p2_name)
         self.h2h_tab.set_historical(self.p1_hist, self.p2_hist)
 
@@ -4258,6 +4538,7 @@ class CompactTennisComparisonWidget(QWidget):
         top_left_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         top_left_layout = QVBoxLayout(top_left_widget)
         top_left_layout.setContentsMargins(0, 0, 0, 0)
+        top_left_layout.setSpacing(6)
 
         # Search widget
         self.search_widget = CompactPlayerSearchWidget()
