@@ -15,20 +15,35 @@ Run standalone:
     python3 live_scores_widget.py
 """
 
+import os
+import re
 import sys
 import threading
+import unicodedata
 from datetime import datetime
+from html import escape as _html_escape
 
-from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QBrush, QFont
+import requests
+
+from PyQt6 import sip
+from PyQt6.QtCore import Qt, QObject, QTimer, QSize, pyqtSignal
+from PyQt6.QtGui import QColor, QBrush, QFont, QPixmap, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
     QComboBox, QSpinBox, QCheckBox, QPushButton, QLabel, QSplitter, QHeaderView,
+    QLineEdit, QButtonGroup, QFrame,
 )
 
 from flashscore_client import (
     FlashscoreClient, SPORT_IDS, Event, format_progress, format_to_par,
 )
+from OddsPortalClient import (
+    OddsPortalClient, DroppingOdd, EventOdds, format_odd,
+)
+
+# Odds display format (OddsPortal feeds are always decimal; we convert). Maps
+# the format-selector combo labels to format_odd() codes.
+ODDS_FORMATS = [("American", "us"), ("Decimal", "dec"), ("Fractional", "frac")]
 
 # Cap on how many live rows we fetch granular progress for per refresh, to
 # bound request volume (the LIVE-all view can have hundreds of live events).
@@ -72,6 +87,63 @@ PARTICIPANT_SPECS = {
 PRIORITY_SPORTS = ["baseball", "football", "basketball", "tennis", "hockey"]
 DEFAULT_SPORT = "baseball"
 LIVE_NODE = "__live_all__"
+
+# Bridge from Flashscore sport keys (SPORT_IDS, underscored) to the OddsPortal
+# sport url-name used by the dropping-odds feed. Only sports OddsPortal carries
+# an odds feed for are listed; a sport absent here simply gets no odds overlay.
+SPORT_BRIDGE = {
+    "football": "football", "tennis": "tennis", "basketball": "basketball",
+    "hockey": "hockey", "american_football": "american-football",
+    "baseball": "baseball", "handball": "handball", "rugby_union": "rugby-union",
+    "floorball": "floorball", "futsal": "futsal", "volleyball": "volleyball",
+    "cricket": "cricket", "darts": "darts", "snooker": "snooker",
+    "boxing": "boxing", "aussie_rules": "aussie-rules",
+    "rugby_league": "rugby-league", "badminton": "badminton",
+    "table_tennis": "table-tennis", "esports": "esports",
+}
+
+# Dropping-odds fetch knobs (period: 2=last 12h; bs: 1=min 10% of books moved).
+DROPPING_PERIOD = 2
+DROPPING_BS = 1
+DROPPING_MAX_PAGES = 10
+
+# Flashscore image CDN — team logos / player headshots (Event.home_logo etc.).
+LOGO_BASE = "https://static.flashscore.com/res/image/data/"
+LOGO_PX = 18  # rendered icon size
+
+_PUNCT_RE = re.compile(r"[^a-z0-9 ]")
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm_name(name):
+    """Normalize a team/player name for cross-source matching: strip accents,
+    lowercase, drop punctuation (so 'Tüfekci C. E.' == 'tufekci c e'). Both
+    Flashscore and OddsPortal use the same 'Surname X.' convention, so a
+    normalized exact match is reliable for head-to-head events."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", str(name))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = _PUNCT_RE.sub(" ", s.lower())
+    return _WS_RE.sub(" ", s).strip()
+
+
+def _oddsportal_locations():
+    """Build the {label: proxy} map for multi-geo odds aggregation from the
+    ODDSPORTAL_PROXIES env var (comma-separated 'label=proxy' or bare proxy
+    URLs). OddsPortal geo-filters its bookmaker set by egress IP, so each extra
+    geo surfaces books (Pinnacle, Asian books, exchanges) hidden from the rest;
+    the per-event odds fetch hits them all concurrently and merges. Always
+    includes the direct (no-proxy) location."""
+    locs = {"direct": None}
+    raw = os.environ.get("ODDSPORTAL_PROXIES", "")
+    for i, spec in enumerate(s.strip() for s in raw.split(",") if s.strip()):
+        if "=" in spec:
+            label, proxy = spec.split("=", 1)
+        else:
+            label, proxy = f"geo{i + 1}", spec
+        locs[label.strip()] = proxy.strip()
+    return locs
 
 # colors
 C_BG = "#14181d"
@@ -149,6 +221,89 @@ class ScheduleWorker(QObject):
         threading.Thread(target=run, daemon=True).start()
 
 
+class OddsWorker(QObject):
+    """Runs blocking OddsPortalClient calls on daemon threads and emits results.
+
+    Mirrors ScheduleWorker's token-guard pattern so stale results are dropped.
+    """
+
+    droppingReady = pyqtSignal(int, str, list)  # token, sport_urlname, [DroppingOdd]
+    searchReady = pyqtSignal(int, str, list)    # token, query, [participant dict]
+    eventOddsReady = pyqtSignal(int, str, object)  # token, event_url, EventOdds
+    failed = pyqtSignal(int, str)               # token, message
+
+    def __init__(self, client: OddsPortalClient):
+        super().__init__()
+        self.client = client
+
+    def fetch_dropping(self, token: int, sport_urlname: str):
+        def run():
+            try:
+                drops = self.client.dropping_odds_pages(
+                    sport_urlname, DROPPING_PERIOD, DROPPING_BS,
+                    max_pages=DROPPING_MAX_PAGES)
+                self.droppingReady.emit(token, sport_urlname, drops)
+            except Exception as e:
+                self.failed.emit(token, str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def fetch_search(self, token: int, query: str):
+        def run():
+            try:
+                parts = self.client.search_participants(query)
+                self.searchReady.emit(token, query, parts)
+            except Exception as e:
+                self.failed.emit(token, str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def fetch_event_odds(self, token: int, event_url: str, locations: dict):
+        """Full per-bookmaker odds for one event. Aggregates across geos
+        concurrently when >1 location is configured (more books); falls back to
+        a single direct fetch otherwise."""
+        def run():
+            try:
+                if locations and len(locations) > 1:
+                    eo = OddsPortalClient.get_event_odds_multi(
+                        event_url, locations, client_kwargs={"verbose": False})
+                else:
+                    eo = self.client.get_event_odds(event_url)
+                self.eventOddsReady.emit(token, event_url, eo)
+            except Exception as e:
+                self.failed.emit(token, str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+
+class ImageLoader(QObject):
+    """Downloads Flashscore logos/headshots on daemon threads and emits the raw
+    bytes back to the GUI thread (QPixmap must be built on the GUI thread). One
+    in-flight request per URL; the widget owns the decoded-pixmap cache."""
+
+    loaded = pyqtSignal(str, bytes)  # url, raw bytes (empty on failure)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._inflight = set()
+        self._sess = requests.Session()
+        self._sess.headers["User-Agent"] = "Mozilla/5.0"
+
+    def request(self, url: str):
+        if url in self._inflight:
+            return
+        self._inflight.add(url)
+
+        def run():
+            data = b""
+            try:
+                r = self._sess.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.content
+            except Exception:
+                data = b""
+            self._inflight.discard(url)
+            self.loaded.emit(url, data)
+        threading.Thread(target=run, daemon=True).start()
+
+
 class LiveScoresWidget(QWidget):
     def __init__(self, client: FlashscoreClient = None, parent=None):
         super().__init__(parent)
@@ -160,6 +315,35 @@ class LiveScoresWidget(QWidget):
         self.worker.golfReady.connect(self._on_golf)
         self.worker.participantsReady.connect(self._on_participants)
         self.worker.failed.connect(self._on_failed)
+
+        # OddsPortal: odds movement (dropping feed) + participant search.
+        self.odds_client = OddsPortalClient(verbose=False)
+        self.odds_worker = OddsWorker(self.odds_client)
+        self.odds_worker.droppingReady.connect(self._on_dropping)
+        self.odds_worker.searchReady.connect(self._on_search)
+        self.odds_worker.eventOddsReady.connect(self._on_event_odds)
+        self.odds_worker.failed.connect(self._on_odds_failed)
+        self._odds_locations = _oddsportal_locations()  # multi-geo book set
+
+        # logo/headshot loading: bytes fetched off-thread, pixmaps built + cached
+        # here on the GUI thread. _pending_icons maps a not-yet-loaded url to the
+        # (render_gen, item, col) sites awaiting it; the gen guard drops sites
+        # whose row was rebuilt by a newer render before the image arrived.
+        self.image_loader = ImageLoader(self)
+        self.image_loader.loaded.connect(self._on_image_loaded)
+        self._pixmaps = {}              # url -> QPixmap (null pixmap = failed)
+        self._pending_icons = {}        # url -> [(render_gen, item, col), ...]
+        self._render_gen = 0
+
+        self._mode = "scores"           # "scores" | "dropping" | "search"
+        self._odds_fmt = "us"           # display format: us | dec | frac
+        self._odds_token = 0            # request sequence guard for odds calls
+        self._detail_token = 0          # guards stale per-event odds fetches
+        self._detail_drop = None        # DroppingOdd backing the open detail panel
+        self._drop_index = {}           # (norm_home, norm_away) -> DroppingOdd
+        self._drops = []                # last dropping feed for current sport
+        self._row_items = {}            # event_id -> QTreeWidgetItem (all H2H rows)
+        self._search_results = []       # last participant search results
 
         self._token = 0                 # request sequence guard
         self._current_sport = None      # None => LIVE-all view
@@ -207,7 +391,15 @@ class LiveScoresWidget(QWidget):
             QPushButton {{ background-color: {C_HEADER}; border: 1px solid #3a444f;
                            padding: 4px 12px; border-radius: 3px; }}
             QPushButton:hover {{ background-color: {C_ACCENT}; color: #0b0e12; }}
+            QPushButton#modeBtn {{ padding: 4px 14px; border-radius: 0;
+                                   border-left: none; }}
+            QPushButton#modeBtn:checked {{ background-color: {C_ACCENT};
+                                           color: #0b0e12; font-weight: 600; }}
+            QLineEdit {{ background-color: {C_PANEL}; border: 1px solid #2a323c;
+                         padding: 4px 8px; border-radius: 3px; }}
             QLabel#title {{ font-size: 16px; font-weight: 600; }}
+            QLabel#detail {{ background-color: {C_PANEL}; border: 1px solid #2a323c;
+                             border-radius: 3px; padding: 8px; }}
         """)
 
         # left nav
@@ -220,6 +412,38 @@ class LiveScoresWidget(QWidget):
         # right header controls
         self.title = QLabel("Live Scores")
         self.title.setObjectName("title")
+
+        # mode segmented control: Scores | Dropping Odds | Search
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self._mode_btns = {}
+        mode_bar = QHBoxLayout()
+        mode_bar.setSpacing(0)
+        for key, label in (("scores", "Scores"),
+                           ("dropping", "Dropping Odds"),
+                           ("search", "Search")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setObjectName("modeBtn")
+            b.clicked.connect(lambda _c, k=key: self._set_mode(k))
+            self.mode_group.addButton(b)
+            self._mode_btns[key] = b
+            mode_bar.addWidget(b)
+        self._mode_btns["scores"].setChecked(True)
+
+        # search box (visible only in search mode)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search player / team…")
+        self.search_edit.returnPressed.connect(self._run_search)
+        self.search_edit.setVisible(False)
+        self.search_edit.setMinimumWidth(220)
+
+        # odds-format selector (we convert client-side; the feeds are decimal)
+        self.fmt_combo = QComboBox()
+        for label, _code in ODDS_FORMATS:
+            self.fmt_combo.addItem(label)
+        self.fmt_combo.setToolTip("Odds display format")
+        self.fmt_combo.currentIndexChanged.connect(self._on_format_changed)
 
         self.days_spin = QSpinBox()
         self.days_spin.setRange(0, 14)
@@ -248,7 +472,12 @@ class LiveScoresWidget(QWidget):
 
         controls = QHBoxLayout()
         controls.addWidget(self.title)
+        controls.addSpacing(12)
+        controls.addLayout(mode_bar)
+        controls.addWidget(self.search_edit)
         controls.addStretch(1)
+        controls.addWidget(QLabel("Odds:"))
+        controls.addWidget(self.fmt_combo)
         controls.addWidget(QLabel("Window:"))
         controls.addWidget(self.days_spin)
         controls.addWidget(self.auto_chk)
@@ -260,6 +489,7 @@ class LiveScoresWidget(QWidget):
         self.results.setColumnCount(4)
         self.results.setHeaderLabels(["When", "Home", "Score", "Away"])
         self.results.setRootIsDecorated(True)
+        self.results.setIconSize(QSize(LOGO_PX, LOGO_PX))
         # align the Home/Score/Away headers with their (right/center/left) cells
         hitem = self.results.headerItem()
         hitem.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -270,11 +500,22 @@ class LiveScoresWidget(QWidget):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.results.itemClicked.connect(self._on_result_clicked)
+
+        # detail panel: full odds + open->current movement for the clicked event
+        # (populated from the matched DroppingOdd). Hidden until a row is clicked.
+        self.detail_lbl = QLabel("")
+        self.detail_lbl.setObjectName("detail")
+        self.detail_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.detail_lbl.setWordWrap(True)
+        self.detail_lbl.setVisible(False)
+
         right = QWidget()
         rlay = QVBoxLayout(right)
         rlay.setContentsMargins(8, 8, 8, 8)
         rlay.addLayout(controls)
         rlay.addWidget(self.results)
+        rlay.addWidget(self.detail_lbl)
         rlay.addWidget(self.status_lbl)
 
         splitter = QSplitter()
@@ -314,7 +555,9 @@ class LiveScoresWidget(QWidget):
             self._render_participants(self._participant_events, self._current_sport)
         elif key and key.startswith("league::"):
             self._league_filter = key.split("::", 1)[1]
-            if self._current_sport == "golf":
+            if self._mode == "dropping":
+                self._render_dropping(self._drops)  # filter in place
+            elif self._current_sport == "golf":
                 self._render_golf(self._golf_boards)
             elif self._current_sport in PARTICIPANT_SPECS:
                 self._render_participants(self._participant_events, self._current_sport)
@@ -356,13 +599,78 @@ class LiveScoresWidget(QWidget):
         finally:
             self._suppress_progress = False
 
+    # -- cross-source matching ---------------------------------------------
+    def _oddsportal_sport(self):
+        """OddsPortal url-name for the current sport, or None if unsupported."""
+        if self._current_sport is None:
+            return None
+        return SPORT_BRIDGE.get(self._current_sport)
+
+    def _build_drop_index(self, drops):
+        """Index dropping odds by normalized (home, away) for row decoration."""
+        idx = {}
+        for d in drops:
+            idx[(_norm_name(d.home), _norm_name(d.away))] = d
+        self._drop_index = idx
+
+    def _match_drop(self, e):
+        """Find the DroppingOdd for a Flashscore Event (orientation-agnostic)."""
+        if not self._drop_index or not e.home or not e.away:
+            return None
+        return (self._drop_index.get((_norm_name(e.home), _norm_name(e.away)))
+                or self._drop_index.get((_norm_name(e.away), _norm_name(e.home))))
+
+    def _score_index(self):
+        """Index the current sport's cached schedule events by normalized
+        (home, away), for annotating dropping-odds rows with live scores."""
+        cached = self._cache.get(self._current_sport)
+        events = cached[1] if cached and cached[0] == "sched" else []
+        idx = {}
+        for e in events:
+            if e.home and e.away:
+                idx[(_norm_name(e.home), _norm_name(e.away))] = e
+        return idx
+
+    # -- mode switching -----------------------------------------------------
+    def _set_mode(self, mode):
+        if mode == self._mode:
+            return
+        self._mode = mode
+        btn = self._mode_btns.get(mode)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)  # keep the segmented control in sync
+        self.search_edit.setVisible(mode == "search")
+        self.detail_lbl.setVisible(False)
+        # window/auto-refresh controls are irrelevant in search mode
+        for w in (self.days_spin, self.auto_chk, self.interval_spin):
+            w.setEnabled(mode != "search")
+        if mode == "search":
+            self.search_edit.setFocus()
+        self._apply_autorefresh()  # pauses the timer in search mode
+        self.refresh()
+
+    def _sport_label(self):
+        return (self._current_sport or "all sports").replace("_", " ").title()
+
     def refresh(self):
+        """Dispatch a refresh for the active mode. The shared left sport-nav
+        selection (self._current_sport) drives every mode."""
+        if self._mode == "dropping":
+            self._refresh_dropping()
+        elif self._mode == "search":
+            self._refresh_search()
+        else:
+            self._refresh_scores()
+
+    def _refresh_scores(self):
         self._token += 1
         cached = self._cache.get(self._cache_key())
         if cached is not None:
             self._render_from_cache(cached)  # instant; fresh data replaces it below
         else:
             self.status_lbl.setText("loading…")
+        # kick the matching dropping-odds feed so score rows get movement badges
+        self._refresh_drop_overlay()
         if self._current_sport is None:
             self.title.setText("🔴  LIVE — All Sports")
             self.worker.fetch_live_all(self._token)
@@ -377,6 +685,54 @@ class LiveScoresWidget(QWidget):
             label = self._current_sport.replace("_", " ").title()
             self.title.setText(label)
             self.worker.fetch_schedule(self._token, self._current_sport, self.days_spin.value())
+
+    def _refresh_drop_overlay(self):
+        """Fetch the dropping feed for the current sport to overlay movement
+        badges on score rows. No-op for LIVE-all and unsupported sports."""
+        op_sport = self._oddsportal_sport()
+        if op_sport is None:
+            self._drop_index = {}
+            return
+        self._odds_token += 1
+        self.odds_worker.fetch_dropping(self._odds_token, op_sport)
+
+    def _refresh_dropping(self):
+        op_sport = self._oddsportal_sport()
+        self.title.setText(f"📉 Dropping Odds — {self._sport_label()}")
+        if op_sport is None:
+            self.results.clear()
+            self.status_lbl.setText(
+                "Dropping odds: pick a sport OddsPortal carries (e.g. tennis, "
+                "football, basketball).")
+            return
+        self._odds_token += 1
+        self.status_lbl.setText("loading dropping odds…")
+        # also ensure the sport's schedule is cached so we can annotate scores
+        if self._cache.get(self._current_sport) is None:
+            self._token += 1
+            self.worker.fetch_schedule(self._token, self._current_sport,
+                                       self.days_spin.value())
+        self.odds_worker.fetch_dropping(self._odds_token, op_sport)
+
+    def _refresh_search(self):
+        self.title.setText("🔎 Search — Historical Odds")
+        q = self.search_edit.text().strip()
+        if not q:
+            self.results.clear()
+            self.status_lbl.setText("Type a player or team name and press Enter.")
+            return
+        self._run_search()
+
+    def _run_search(self):
+        q = self.search_edit.text().strip()
+        if not q:
+            return
+        self._mode = "search"
+        self._mode_btns["search"].setChecked(True)
+        self.search_edit.setVisible(True)
+        self._odds_token += 1
+        self.status_lbl.setText(f"searching “{q}”…")
+        self.odds_worker.fetch_search(self._odds_token, q)
 
     def _on_days_changed(self, _value):
         # cached data is for the old window; drop it and re-warm the priority set
@@ -398,6 +754,14 @@ class LiveScoresWidget(QWidget):
     def _on_schedule(self, token, sport, events):
         self._cache[sport] = ("sched", events)  # cache even prefetched results
         if token != self._token or sport != self._current_sport:
+            return
+        if self._mode == "dropping":
+            # schedule was fetched only to warm the score index; re-render the
+            # dropping view so newly-available live scores get annotated.
+            self._refill_league_children(sport, events)
+            self._render_dropping(self._drops)
+            return
+        if self._mode != "scores":
             return
         self._events = events
         self._refill_league_children(sport, events)
@@ -458,6 +822,27 @@ class LiveScoresWidget(QWidget):
     def _on_failed(self, token, msg):
         if token in (self._token, self._progress_token):
             self.status_lbl.setText(f"error: {msg}")
+
+    # -- OddsPortal handlers ------------------------------------------------
+    def _on_dropping(self, token, sport_urlname, drops):
+        if token != self._odds_token:
+            return  # stale (newer odds request superseded this)
+        self._drops = drops
+        self._build_drop_index(drops)
+        if self._mode == "dropping":
+            self._render_dropping(drops)
+        else:  # scores mode: overlay movement badges on the existing rows
+            self._decorate_score_rows()
+
+    def _on_search(self, token, query, participants):
+        if token != self._odds_token or self._mode != "search":
+            return
+        self._search_results = participants
+        self._render_search(query, participants)
+
+    def _on_odds_failed(self, token, msg):
+        if token == self._odds_token and self._mode in ("dropping", "search"):
+            self.status_lbl.setText(f"odds error: {msg}")
 
     # -- per-row live progress ---------------------------------------------
     def _fetch_live_progress(self):
@@ -532,7 +917,8 @@ class LiveScoresWidget(QWidget):
         else:
             self._configure_columns([
                 ("When", "c", False), ("Home", "r", True),
-                ("Score", "c", False), ("Away", "l", True)])
+                ("Score", "c", False), ("Away", "l", True),
+                ("Move", "c", False, 96)])  # OddsPortal dropping-odds overlay
 
     def _render_golf(self, boards):
         self.results.clear()
@@ -661,8 +1047,11 @@ class LiveScoresWidget(QWidget):
 
     def _render(self):
         self.results.clear()
+        self._render_gen += 1
+        self._pending_icons.clear()
         self._set_headers(golf=False)
         self._live_items = {}
+        self._row_items = {}
         events = self._events
         self._event_map = {e.event_id: e for e in events}
         if self._league_filter:
@@ -728,13 +1117,14 @@ class LiveScoresWidget(QWidget):
             score = f"{e.home_score} - {e.away_score}"
         else:
             score = "vs" if not e.is_live else "-"
-        item = QTreeWidgetItem([when, e.home or "", score, e.away or ""])
+        item = QTreeWidgetItem([when, e.home or "", score, e.away or "", ""])
         # Home hugs the right, Away hugs the left, so the score sits centered
         # between the two team names rather than drifting to the far right.
         vc = Qt.AlignmentFlag.AlignVCenter
         item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | vc)
         item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(3, Qt.AlignmentFlag.AlignLeft | vc)
+        item.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter | vc)
         if e.note:
             item.setToolTip(0, e.note)  # e.g. series score / aggregate
         if e.is_live:
@@ -746,11 +1136,321 @@ class LiveScoresWidget(QWidget):
         item.setData(0, Qt.ItemDataRole.UserRole, e.event_id)
         if e.is_live:
             self._live_items[e.event_id] = item  # progress fills col 0 later
+        self._row_items[e.event_id] = item       # for async odds-badge overlay
+        self._apply_drop_badge(item, e)
+        self._attach_logos(item, e)
         return item
+
+    # -- odds overlay (dropping-odds movement on score rows) ----------------
+    # -- odds-format display (client-side; feeds are always decimal) --------
+    def _oddval(self, v):
+        """Format one decimal odd in the user's chosen display format."""
+        return format_odd(v, self._odds_fmt)
+
+    def _drop_odds_str(self, d: DroppingOdd) -> str:
+        """DroppingOdd.odds_str but in the active display format (the dropped
+        outcome's open→now first, then the rest)."""
+        moved = d.dropped_outcome
+        parts = []
+        if moved:
+            parts.append(f"{moved['name']}: {self._oddval(moved['prev_odd'])}"
+                         f"→{self._oddval(moved['odd'])}")
+        for o in d.outcomes:
+            if o is moved or o.get("odd") is None:
+                continue
+            parts.append(f"{o['name']} {self._oddval(o['odd'])}")
+        return "  |  ".join(parts)
+
+    def _on_format_changed(self, idx):
+        self._odds_fmt = ODDS_FORMATS[idx][1]
+        # re-render the current view from cached data (no refetch needed)
+        if self._mode == "dropping":
+            self._render_dropping(self._drops)
+        elif self._mode == "scores":
+            self._render()
+        if self._detail_drop is not None:
+            self._show_drop_detail(self._detail_drop)
+
+    def _apply_drop_badge(self, item, e):
+        """Stamp the Move column of a score row with the matched dropping-odds
+        movement (e.g. '▼27%'), red, full price move in the tooltip."""
+        d = self._match_drop(e)
+        if d is None:
+            return
+        pct = d.drop_pct
+        arrow = "▼" if pct < 0 else "▲"
+        item.setText(4, f"{arrow}{abs(pct):.0f}%")
+        item.setForeground(4, QBrush(QColor(C_LIVE if pct < 0 else C_ACCENT)))
+        f = item.font(4); f.setBold(True); item.setFont(4, f)
+        item.setToolTip(4, f"{d.betting_type}: {self._drop_odds_str(d)}  "
+                           f"({d.bookies} books)")
+
+    def _decorate_score_rows(self):
+        """Re-apply odds badges to all current score rows (after a fresh
+        dropping feed arrives asynchronously)."""
+        for eid, item in self._row_items.items():
+            e = self._event_map.get(eid)
+            if e is not None:
+                self._apply_drop_badge(item, e)
+
+    # -- logos / headshots --------------------------------------------------
+    def _attach_logos(self, item, ev):
+        """Put the home/away team logo (or player headshot) on a row's Home/Away
+        columns. Served from cache instantly; otherwise fetched async and filled
+        in when the bytes arrive."""
+        if ev is None:
+            return
+        self._attach_one_logo(item, 1, getattr(ev, "home_logo", None))
+        self._attach_one_logo(item, 3, getattr(ev, "away_logo", None))
+
+    def _attach_one_logo(self, item, col, logo):
+        if not logo:
+            return
+        url = LOGO_BASE + logo
+        pm = self._pixmaps.get(url)
+        if pm is not None:
+            if not pm.isNull():
+                item.setIcon(col, QIcon(pm))
+            return
+        self._pending_icons.setdefault(url, []).append((self._render_gen, item, col))
+        self.image_loader.request(url)
+
+    def _on_image_loaded(self, url, data):
+        pm = QPixmap()
+        if data:
+            pm.loadFromData(data)
+        if not pm.isNull():
+            pm = pm.scaled(LOGO_PX, LOGO_PX, Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        self._pixmaps[url] = pm  # cache even a null result (don't refetch failures)
+        for gen, item, col in self._pending_icons.pop(url, []):
+            # gen guard skips rows from a superseded render; sip.isdeleted guards
+            # against the C++ QTreeWidgetItem already being freed by results.clear()
+            # (setIcon on a freed item segfaults — not a catchable RuntimeError).
+            if gen != self._render_gen or pm.isNull() or sip.isdeleted(item):
+                continue
+            item.setIcon(col, QIcon(pm))
+
+    # -- dropping-odds mode (market-first, score-annotated) -----------------
+    def _render_dropping(self, drops):
+        """Render the sport's dropping-odds feed grouped Tournament → Event →
+        Market. Each event collapses its many dropping markets (1X2, AH, O/U,
+        DNB, HT/FT…) under one row showing the live score + the worst move; the
+        child rows name the market and show its open→now odds."""
+        self.results.clear()
+        self._render_gen += 1
+        self._pending_icons.clear()
+        self._live_items = {}
+        self._row_items = {}
+        self._configure_columns([
+            ("When / Market", "l", False, 230), ("Home", "r", True),
+            ("Score", "c", False), ("Away", "l", True),
+            ("Move", "c", False, 70), ("Odds (open→now)", "l", True)])
+        score_idx = self._score_index()
+
+        if self._league_filter:
+            drops = [d for d in drops if d.tournament == self._league_filter]
+        # tournament -> event(home,away) -> [markets]
+        from collections import OrderedDict
+        tours = OrderedDict()
+        for d in drops:
+            tours.setdefault(d.tournament or "—", OrderedDict()) \
+                 .setdefault((d.home or "", d.away or ""), []).append(d)
+
+        def evt_worst(markets):
+            return min(x.drop_pct for x in markets)
+
+        def tour_worst(events):
+            return min(evt_worst(m) for m in events.values())
+
+        ordered = sorted(tours.items(), key=lambda kv: tour_worst(kv[1]))
+        n_matched = n_events = 0
+        for tname, events in ordered:
+            thead = QTreeWidgetItem([f"{tname}  ({len(events)})"])
+            tf = thead.font(0); tf.setBold(True); thead.setFont(0, tf)
+            thead.setForeground(0, QBrush(QColor(C_DIM)))
+            thead.setFirstColumnSpanned(True)
+            self.results.addTopLevelItem(thead)
+            for (home, away), markets in sorted(
+                    events.items(), key=lambda kv: evt_worst(kv[1])):
+                markets.sort(key=lambda d: d.drop_pct)
+                ev = (score_idx.get((_norm_name(home), _norm_name(away)))
+                      or score_idx.get((_norm_name(away), _norm_name(home))))
+                thead.addChild(self._dropping_event_item(markets, ev))
+                n_events += 1
+                if ev is not None:
+                    n_matched += 1
+            thead.setExpanded(True)
+
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.status_lbl.setText(
+            f"{n_events} events · {len(drops)} dropping markets · "
+            f"{n_matched} matched to live data · updated {stamp}")
+
+    def _dropping_event_item(self, markets, ev=None):
+        """One event row carrying its dropping markets as children."""
+        d0 = markets[0]
+        worst = min(markets, key=lambda d: d.drop_pct)
+        when = d0.time or "—"
+        if ev is not None and ev.is_live:
+            when = "● LIVE"
+        if ev is not None and ev.home_score not in (None, "") \
+                and ev.away_score not in (None, ""):
+            score = f"{ev.home_score} - {ev.away_score}"
+        else:
+            score = "—"
+        pct = worst.drop_pct
+        arrow = "▼" if pct < 0 else "▲"
+        n = len(markets)
+        item = QTreeWidgetItem([
+            when, d0.home or "", score, d0.away or "",
+            f"{arrow}{abs(pct):.0f}%",
+            f"{n} market{'s' if n != 1 else ''} dropping"])
+        vc = Qt.AlignmentFlag.AlignVCenter
+        item.setTextAlignment(0, Qt.AlignmentFlag.AlignLeft | vc)
+        item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | vc)
+        item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter | vc)
+        item.setTextAlignment(3, Qt.AlignmentFlag.AlignLeft | vc)
+        item.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter | vc)
+        ef = item.font(1); ef.setBold(True)
+        item.setFont(1, ef); item.setFont(3, ef)
+        item.setForeground(4, QBrush(QColor(C_LIVE if pct < 0 else C_ACCENT)))
+        mf = item.font(4); mf.setBold(True); item.setFont(4, mf)
+        item.setForeground(5, QBrush(QColor(C_DIM)))
+        if ev is not None and ev.is_live:
+            item.setForeground(0, QBrush(QColor(C_LIVE)))
+            item.setForeground(2, QBrush(QColor(C_LIVE)))
+            sf = item.font(2); sf.setBold(True); item.setFont(2, sf)
+        # event row drills into full odds via the worst-moving market's url
+        item.setData(0, Qt.ItemDataRole.UserRole, ("drop", worst))
+        self._attach_logos(item, ev)
+        for d in markets:
+            item.addChild(self._market_item(d))
+        return item
+
+    def _market_item(self, d: DroppingOdd):
+        """A single dropping market under an event: name + drop% + odds move."""
+        pct = d.drop_pct
+        arrow = "▼" if pct < 0 else "▲"
+        item = QTreeWidgetItem([f"    {d.betting_type or '—'}", "", "", "",
+                                f"{arrow}{abs(pct):.0f}%", self._drop_odds_str(d)])
+        vc = Qt.AlignmentFlag.AlignVCenter
+        item.setTextAlignment(0, Qt.AlignmentFlag.AlignLeft | vc)
+        item.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter | vc)
+        item.setForeground(0, QBrush(QColor(C_TEXT)))
+        item.setForeground(4, QBrush(QColor(C_LIVE if pct < 0 else C_ACCENT)))
+        item.setForeground(5, QBrush(QColor(C_TEXT)))
+        item.setToolTip(5, f"{d.betting_type}  ·  {d.bookies} books  ·  "
+                           f"max {self._oddval(d.max_odds)} ({d.max_provider or '—'})")
+        item.setData(0, Qt.ItemDataRole.UserRole, ("drop", d))
+        return item
+
+    # -- search mode (participant resolution) -------------------------------
+    def _render_search(self, query, participants):
+        self.results.clear()
+        self._live_items = {}
+        self._row_items = {}
+        self._configure_columns([
+            ("Sport", "l", False), ("Name", "l", True),
+            ("Country", "l", False), ("Events", "c", False)])
+        for p in participants:
+            item = QTreeWidgetItem([
+                (p.get("sport") or "").replace("-", " ").title(),
+                p.get("name", ""), p.get("country", ""),
+                str(len(p.get("event_ids") or []))])
+            item.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
+            item.setData(0, Qt.ItemDataRole.UserRole, ("participant", p))
+            self.results.addTopLevelItem(item)
+        stamp = datetime.now().strftime("%H:%M:%S")
+        note = "" if participants else "  (no matches)"
+        self.status_lbl.setText(
+            f"“{query}”: {len(participants)} participants{note} · {stamp}  ·  "
+            f"full per-book odds available by clicking events in Scores/Dropping; "
+            f"participant→match listing still JS-gated")
+
+    # -- detail panel (full per-bookmaker odds for the clicked event) -------
+    def _on_result_clicked(self, item, _col):
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        d = None
+        if isinstance(payload, tuple) and payload[0] == "drop":
+            d = payload[1]
+        elif isinstance(payload, str):  # score row -> event_id
+            e = self._event_map.get(payload)
+            if e is not None:
+                d = self._match_drop(e)
+        if d is None:
+            self.detail_lbl.setVisible(False)
+            self._detail_drop = None
+            return
+        self._detail_drop = d
+        self._show_drop_detail(d)
+        # then pull the full per-bookmaker odds (multi-geo) for this event
+        if d.event_url:
+            self._detail_token += 1
+            n = len(self._odds_locations)
+            note = (f"loading odds across {n} geos…" if n > 1 else "loading odds…")
+            self.detail_lbl.setText(
+                self.detail_lbl.text()
+                + f"<br><span style='color:{C_DIM}'>{note}</span>")
+            self.odds_worker.fetch_event_odds(
+                self._detail_token, d.event_url, self._odds_locations)
+
+    def _on_event_odds(self, token, event_url, eo):
+        if token != self._detail_token or eo is None:
+            return
+        self._render_event_odds(eo)
+
+    def _render_event_odds(self, eo: EventOdds):
+        """Full per-bookmaker odds: best/avg/opening + drift + every book's
+        price, best first. Books are unioned across the configured geos."""
+        sub = eo.tournament or eo.sport.replace("-", " ").title()
+        lines = [f"<b>{_html_escape(eo.home)}</b> v <b>{_html_escape(eo.away)}</b>"
+                 f"  —  <span style='color:{C_DIM}'>{_html_escape(sub)}</span>"]
+        for o in eo.outcomes:
+            drift = o.drift
+            dtxt = ""
+            if drift is not None and abs(drift) >= 0.005:
+                col = C_LIVE if drift < 0 else C_ACCENT
+                ar = "▼" if drift < 0 else "▲"
+                dtxt = f"  <span style='color:{col}'>{ar}{abs(drift) * 100:.0f}%</span>"
+            lines.append(
+                f"<b>{_html_escape(o.name)}</b>:  max <b>{self._oddval(o.max_odds)}</b> "
+                f"<span style='color:{C_DIM}'>({_html_escape(o.max_book or '—')})</span>"
+                f"  ·  avg {self._oddval(o.avg_odds)}  ·  open {self._oddval(o.opening_avg)}{dtxt}"
+                f"  ·  <span style='color:{C_DIM}'>{o.n_books} books</span>")
+            books = sorted(o.books.items(), key=lambda kv: kv[1], reverse=True)
+            bstr = "   ".join(f"{_html_escape(b)} {self._oddval(v)}" for b, v in books)
+            if bstr:
+                lines.append(f"<span style='color:{C_DIM}'>&nbsp;&nbsp;{bstr}</span>")
+        self.detail_lbl.setText("<br>".join(lines))
+        self.detail_lbl.setVisible(True)
+
+    def _show_drop_detail(self, d: DroppingOdd):
+        """Show the full odds breakdown + open→current movement for an event."""
+        moved = d.dropped_outcome
+        lines = [f"<b>{_html_escape(d.home)}</b> v <b>{_html_escape(d.away)}</b>"
+                 f"  —  <span style='color:{C_DIM}'>{_html_escape(d.tournament)}</span>"]
+        lines.append(f"<span style='color:{C_DIM}'>{_html_escape(d.betting_type)} · "
+                     f"{d.bookies} books · max {self._oddval(d.max_odds)} "
+                     f"({_html_escape(d.max_provider or '—')})</span>")
+        cells = []
+        for o in d.outcomes:
+            name = _html_escape(str(o.get("name")))
+            cur = o.get("odd")
+            if o is moved and o.get("prev_odd") is not None:
+                col = C_LIVE if d.drop_pct < 0 else C_ACCENT
+                cells.append(f"<b>{name}</b>: <span style='color:{C_DIM}'>"
+                             f"{self._oddval(o['prev_odd'])}</span> → <span style='color:{col}'>"
+                             f"<b>{self._oddval(cur)}</b></span>  ({d.drop})")
+            elif cur is not None:
+                cells.append(f"{name}: <b>{self._oddval(cur)}</b>")
+        lines.append("  &nbsp;|&nbsp;  ".join(cells))
+        self.detail_lbl.setText("<br>".join(lines))
+        self.detail_lbl.setVisible(True)
 
     # -- auto-refresh -------------------------------------------------------
     def _apply_autorefresh(self):
-        if self.auto_chk.isChecked():
+        if self.auto_chk.isChecked() and self._mode != "search":
             self.refresh_timer.start(self.interval_spin.value() * 1000)
         else:
             self.refresh_timer.stop()

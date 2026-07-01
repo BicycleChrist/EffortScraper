@@ -271,6 +271,8 @@ class Event:
     is_live: bool
     note: Optional[str]
     tournament_url: Optional[str]
+    home_logo: Optional[str] = None   # OA — image filename on the Flashscore CDN
+    away_logo: Optional[str] = None   # OB
     raw: Dict[str, str] = field(default_factory=dict)
 
 
@@ -525,6 +527,8 @@ class FlashscoreClient:
                         is_live=(d.get("AB") == "2"),
                         note=d.get("AM"),
                         tournament_url=cur_url,
+                        home_logo=d.get("OA"),
+                        away_logo=d.get("OB"),
                         raw=d,
                     )
                 )

@@ -2,21 +2,26 @@ import sys
 import re
 import threading
 import sqlite3
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton
+    QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton,
+    QComboBox, QCheckBox, QScrollArea, QTabWidget
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect, QPoint
 from PyQt6.QtGui import (
-    QFont, QColor, QPainter, QPen, QBrush
+    QFont, QColor, QPainter, QPen, QBrush, QIntValidator
 )
 from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsData
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
 import tennis_sim
+import tennis_context
 
-#TODO: Display Serve data,fix I-Hard surface dissappearing in career surface widget display
+#TODO: Reduce vertical padding between context adjustments and total game dist in Match Sim Panel to fix total games dist and labels clipping.
+#TODO: Adjust placement of Top level selectors(ELO, Custom ELO, Model) in Match Sim panel so as they no longer clip upon intial window load. Also reduce spacing of selectors for more compact look
+#TODO: Fix some metrics (DR, BP saved) not being plotted in the Form and Momentum panel. Implement logic for discerning what matchs results being plotted were tour, challenger, itf, etc
 
 class TennisTheme:
     """Tennis theme colors"""
@@ -420,7 +425,6 @@ class CompactRankingChart(QWidget):
                 return []
 
             # Convert to datetime to calculate 52 weeks back
-            from datetime import datetime, timedelta
             latest_datetime = datetime.strptime(latest_date, '%Y-%m-%d')
             earliest_datetime = latest_datetime - timedelta(weeks=52)
             earliest_date = earliest_datetime.strftime('%Y-%m-%d')
@@ -615,7 +619,6 @@ class CompactRankingChart(QWidget):
 
                 # Format date (show month/year)
                 try:
-                    from datetime import datetime
                     date_obj = datetime.strptime(date, '%Y-%m-%d')
                     formatted_date = date_obj.strftime('%m/%y')
                 except:
@@ -689,7 +692,6 @@ class CompactRankingChart(QWidget):
 
         # Format date
         try:
-            from datetime import datetime
             date_obj = datetime.strptime(date, '%Y-%m-%d')
             formatted_date = date_obj.strftime('%B %d, %Y')
         except:
@@ -1231,7 +1233,6 @@ class PlayerProfileWidget(QWidget):
     def get_player_rankings_from_db(self, player_name: str) -> Tuple[Optional[int], Optional[int], bool]:
         """Get current and peak rankings from the database, and whether current rank is recent"""
         try:
-            from datetime import datetime, timedelta
 
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -1281,7 +1282,6 @@ class PlayerProfileWidget(QWidget):
         if not peak_rank:
             return None
         try:
-            from datetime import datetime as _dt
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute("""
@@ -1292,7 +1292,7 @@ class PlayerProfileWidget(QWidget):
             conn.close()
             if row and row[0]:
                 try:
-                    return _dt.strptime(row[0], '%Y-%m-%d').strftime("%b %Y")
+                    return datetime.strptime(row[0], '%Y-%m-%d').strftime("%b %Y")
                 except ValueError:
                     return row[0]
             return None
@@ -2215,8 +2215,6 @@ class RecentFormMomentumWidget(QWidget):
 
     def create_controls(self):
         """Create metric and surface filter dropdown controls"""
-        from PyQt6.QtWidgets import QComboBox, QLabel
-
         # Metric selector
         self.metric_combo = QComboBox(self)
         self.metric_combo.addItems([
@@ -2631,13 +2629,12 @@ class RecentFormMomentumWidget(QWidget):
     @staticmethod
     def _match_date(match):
         """Parse a match date from the several formats in play -> datetime/None."""
-        from datetime import datetime as _dt
         d = str(getattr(match, 'date', '') or '').strip()
         if not d:
             return None
         for fmt in ("%d-%b-%Y", "%Y%m%d", "%Y-%m-%d"):
             try:
-                return _dt.strptime(d, fmt)
+                return datetime.strptime(d, fmt)
             except ValueError:
                 continue
         return None
@@ -2800,7 +2797,6 @@ class RecentFormMomentumWidget(QWidget):
 
         # Faint raw match dots (win = filled, loss = hollow) in player colour.
         # Skip them for very large windows so a full-career view stays clean.
-        from PyQt6.QtGui import QPen
         if n <= 60:
             dot = QColor(color); dot.setAlpha(120)
             for i, p in enumerate(pts):
@@ -2895,7 +2891,6 @@ class RecentFormMomentumWidget(QWidget):
                 else:
                     # Try to extract player name from the context (fallback)
                     # Look for pattern like "(ranking)Name" and extract the name
-                    import re
                     match = re.search(r'\([^)]+\)([A-Za-z]+)', opponent_str)
                     if match:
                         last_name = match.group(1)
@@ -2904,7 +2899,6 @@ class RecentFormMomentumWidget(QWidget):
                         return winner_part.startswith('(')
 
                 # Look specifically for the current player's last name with ranking prefix
-                import re
                 current_player_pattern = rf'\([^)]+\){re.escape(last_name)}'
 
                 # Check if current player appears in winner or loser part
@@ -3220,18 +3214,23 @@ def parse_player_payload(data_dict: dict) -> dict:
         'Grass': _to_float(bio.get('grass_elo')),
     }
 
-    surf = {}
-    for sp in data_dict.get('career_splits', []) or []:
-        name = sp.get('split', '')
-        if name in ('Hard', 'Clay', 'Grass'):
-            surf[name] = {
-                'spw': _to_fraction(sp.get('service_points_won')),
-                'rpw': _to_fraction(sp.get('return_points_won')),
-                'hold': _to_float(sp.get('hold_percentage')),
-                'brk': _to_float(sp.get('break_percentage')),
-                'dr': _to_float(sp.get('dominance_ratio')),
-                'm': _to_float(sp.get('matches')) or 0,
-            }
+    def _splits(key):
+        out = {}
+        for sp in data_dict.get(key, []) or []:
+            name = sp.get('split', '')
+            if name in ('Hard', 'Clay', 'Grass', 'Total'):
+                out[name] = {
+                    'spw': _to_fraction(sp.get('service_points_won')),
+                    'rpw': _to_fraction(sp.get('return_points_won')),
+                    'hold': _to_float(sp.get('hold_percentage')),
+                    'brk': _to_float(sp.get('break_percentage')),
+                    'dr': _to_float(sp.get('dominance_ratio')),
+                    'm': _to_float(sp.get('matches')) or 0,
+                }
+        return out
+
+    surf = _splits('career_splits')
+    surf52 = _splits('last52_splits')   # trailing-52-week form (recent vs career)
 
     tac = data_dict.get('tactics', []) or []
     we = data_dict.get('winners_errors', []) or []
@@ -3267,7 +3266,9 @@ def parse_player_payload(data_dict: dict) -> dict:
     style['n'] = len(data_dict.get('tactics', []) or [])
 
     mcp = _aggregate_charting(data_dict)
-    return {'elo': elo, 'surf': surf, 'style': style, 'serve': serve, 'mcp': mcp}
+    return {'elo': elo, 'surf': surf, 'surf52': surf52, 'style': style,
+            'serve': serve, 'mcp': mcp,
+            'historical': data_dict.get('historical_matches', []) or []}
 
 
 def _aggregate_charting(data_dict: dict) -> dict:
@@ -3336,18 +3337,31 @@ def _aggregate_charting(data_dict: dict) -> dict:
 LOW_SAMPLE_MATCHES = 20
 
 
-def surface_rates(parsed: dict, surface: str):
-    """(spw, rpw) for a surface, falling back to match-weighted avg / tour avg."""
-    s = parsed.get('surf', {}).get(surface)
-    if s and s.get('spw') and s.get('rpw'):
-        return s['spw'], s['rpw']
-    rows = [v for v in parsed.get('surf', {}).values() if v.get('spw') and v.get('rpw')]
+def _player_overall_rates(parsed: dict):
+    """Match-weighted serve/return rates across all surfaces (the player's own
+    baseline), else tour average. Used as the shrinkage prior for a surface."""
+    rows = [v for v in parsed.get('surf', {}).values()
+            if v.get('spw') and v.get('rpw') and (v.get('m') or 0) > 0]
     if rows:
-        wsum = sum((r['m'] or 1) for r in rows)
-        spw = sum(r['spw'] * (r['m'] or 1) for r in rows) / wsum
-        rpw = sum(r['rpw'] * (r['m'] or 1) for r in rows) / wsum
+        wsum = sum(r['m'] for r in rows)
+        spw = sum(r['spw'] * r['m'] for r in rows) / wsum
+        rpw = sum(r['rpw'] * r['m'] for r in rows) / wsum
         return spw, rpw
     return tennis_sim.ATP_SERVE_AVG, tennis_sim.ATP_RETURN_AVG
+
+
+def surface_rates(parsed: dict, surface: str):
+    """(spw, rpw) for a surface, shrunk toward the player's own all-surface
+    baseline by sample size so a thin surface split (e.g. a 9-match grass line)
+    can't dominate the Monte Carlo. Falls back to the baseline / tour average."""
+    base_spw, base_rpw = _player_overall_rates(parsed)
+    s = parsed.get('surf', {}).get(surface)
+    if s and s.get('spw') and s.get('rpw'):
+        n = s.get('m') or 0
+        spw = tennis_sim.shrink_rate(s['spw'], n, base_spw)
+        rpw = tennis_sim.shrink_rate(s['rpw'], n, base_rpw)
+        return spw, rpw
+    return base_spw, base_rpw
 
 
 
@@ -3520,16 +3534,96 @@ class DistributionView(QWidget):
                        f"{prob*100:.0f}%")
 
 
-class MatchSimTab(QWidget):
-    """Surface-adjusted win probability + Monte Carlo scoreline texture."""
+class ContextView(QWidget):
+    """Situational-adjustment breakdown: the per-factor Elo deltas that bridge
+    the static rating and the anchored sim, shown side by side for both players.
 
-    mcReady = pyqtSignal(object, float, int)
+    This is what turns 'the sim and the market disagree' into an explanation —
+    rest/rust, fatigue, surface adaptation and serve form each carry a signed
+    Elo nudge, and the header line reconciles base Elo -> context -> headline."""
 
     def __init__(self):
         super().__init__()
-        from PyQt6.QtWidgets import (QComboBox, QGridLayout as _QGrid,
-                                     QCheckBox, QLineEdit)
-        from PyQt6.QtGui import QIntValidator
+        self.setMinimumHeight(150)
+        self.p1_name = self.p2_name = ""
+        self.ctx1 = self.ctx2 = None
+        self.base_prob = None      # pre-context Elo win prob for P1
+        self.final_prob = None     # anchored headline for P1
+        self.applied = True        # whether context deltas fed the anchor
+        self.p1_color = QColor(TennisTheme.PRIMARY)
+        self.p2_color = QColor(TennisTheme.ACCENT)
+
+    def set_data(self, p1_name, p2_name, ctx1, ctx2, base_prob, final_prob, applied):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        self.ctx1, self.ctx2 = ctx1, ctx2
+        self.base_prob, self.final_prob = base_prob, final_prob
+        self.applied = applied
+        self.update()
+
+    def paintEvent(self, event):
+        if not (self.ctx1 and self.ctx2):
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        # Header: reconciliation line.
+        p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        p.setPen(QColor(TennisTheme.SECONDARY))
+        p.drawText(0, 12, "Context adjustments" + ("" if self.applied else "  (info only — not applied)"))
+        if self.base_prob is not None and self.final_prob is not None:
+            sn1 = self.p1_name.split()[-1] if self.p1_name else "P1"
+            p.setFont(QFont("Arial", 8))
+            p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            txt = (f"{sn1}:  Elo {self.base_prob*100:.0f}%  →  "
+                   f"anchored {self.final_prob*100:.0f}%")
+            p.drawText(QRect(0, 2, w, 12), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, txt)
+
+        col_w = (w - 12) // 2
+        self._draw_col(p, QRect(0, 20, col_w, self.height() - 20),
+                       self.p1_name, self.ctx1, self.p1_color)
+        self._draw_col(p, QRect(col_w + 12, 20, col_w, self.height() - 20),
+                       self.p2_name, self.ctx2, self.p2_color)
+        p.end()
+
+    def _draw_col(self, p, rect, name, ctx, color):
+        x, y = rect.x(), rect.y()
+        sn = name.split()[-1] if name else "—"
+        p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        p.setPen(QColor(color))
+        net_txt = f"{ctx.net:+.0f}"
+        p.drawText(x, y + 11, f"{sn}   net {net_txt} Elo")
+        p.setFont(QFont("Arial", 8))
+        row_h = 15
+        for i, f in enumerate(ctx.factors):
+            ry = y + 24 + i * row_h
+            # delta chip colour: green positive, red negative, muted zero
+            if abs(f.delta) < 0.5:
+                dc = TennisTheme.TEXT_MUTED
+            else:
+                dc = "#4CAF50" if f.delta > 0 else "#FF6B6B"
+            p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            p.drawText(QRect(x, ry, 82, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f.label)
+            dtxt = f"{f.delta:+.0f}" if abs(f.delta) >= 0.5 else "0"
+            p.setPen(QColor(dc))
+            p.drawText(QRect(x + 82, ry, 34, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                       dtxt)
+            p.setPen(QColor(TennisTheme.TEXT_MUTED))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(QRect(x + 120, ry, rect.width() - 120, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f.detail)
+            p.setFont(QFont("Arial", 8))
+
+
+class MatchSimTab(QWidget):
+    """Surface-adjusted win probability + Monte Carlo scoreline texture."""
+
+    mcReady = pyqtSignal(object, object, int)
+
+    def __init__(self):
+        super().__init__()
         self.p1_name = self.p2_name = ""
         self.p1 = self.p2 = None
         self._req = 0
@@ -3542,20 +3636,41 @@ class MatchSimTab(QWidget):
             "75% surface": 0.75,
             "Overall Elo": 0.0,
         }
-        # Headline model: how to combine Elo and the serve/return Monte Carlo.
-        self._models = ("Blend (Elo+Sim)", "Elo only", "Sim only")
+        # Headline model. The Monte Carlo is always run for scoreline/games
+        # texture; these choose what its win probability is *anchored* to:
+        #   Elo + Context - context-adjusted surface Elo (default, recommended)
+        #   Elo only      - plain surface-blended Elo, context shown but not applied
+        #   Raw sim       - unanchored serve/return rates (diagnostic; the old,
+        #                   un-opponent-adjusted behaviour that over-favours big
+        #                   servers on thin samples)
+        self._models = ("Elo + Context", "Elo only", "Raw sim")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(6)
 
         lbl_style = f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;"
+        # Pin a font-size so the combo's metrics (used by AdjustToContents) match
+        # what is actually painted, and give the drop-down arrow its own box with
+        # right padding so the selected text never renders under it.
         combo_style = f"""
             QComboBox {{
                 background: {TennisTheme.SURFACE};
                 color: {TennisTheme.TEXT_PRIMARY};
                 border: 1px solid {TennisTheme.TEXT_MUTED};
-                padding: 2px; min-width: 64px;
+                font-size: 11px;
+                padding: 2px 24px 2px 6px;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {TennisTheme.TEXT_MUTED};
+            }}
+            QComboBox QAbstractItemView {{
+                background: {TennisTheme.SURFACE};
+                color: {TennisTheme.TEXT_PRIMARY};
+                selection-background-color: {TennisTheme.PRIMARY};
             }}
         """
 
@@ -3563,6 +3678,14 @@ class MatchSimTab(QWidget):
             c = QComboBox()
             c.addItems(items)
             c.setStyleSheet(combo_style)
+            # Let Qt size the combo from its *polished* contents (real font +
+            # QSS padding + arrow) so nothing clips regardless of the system
+            # font. Fixed policy + a floor keeps a small combo from ballooning
+            # into a wider shared grid column.
+            c.setSizePolicy(QSizePolicy.Policy.MinimumExpanding,
+                QSizePolicy.Policy.Fixed)
+            c.setMinimumWidth(width)
+            c.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             c.setMinimumWidth(width)
             c.currentTextChanged.connect(lambda *_: self.recompute())
             return c
@@ -3572,13 +3695,16 @@ class MatchSimTab(QWidget):
             return la
 
         # Two compact control rows.
-        ctrl = _QGrid()
+        ctrl = QGridLayout()
         ctrl.setHorizontalSpacing(6)
         ctrl.setVerticalSpacing(4)
         self.surface_combo = mk_combo(["Hard", "Clay", "Grass"])
         self.bo_combo = mk_combo(["3", "5"], width=46)
         self.blend_combo = mk_combo(list(self._blend_w.keys()), width=120)
         self.model_combo = mk_combo(list(self._models), width=120)
+        print(self.surface_combo.sizeHint().width())
+        print(self.surface_combo.minimumSizeHint().width())
+        print(self.surface_combo.width()) # Debug print delete later
         ctrl.addWidget(mk_lbl("Surface:"), 0, 0)
         ctrl.addWidget(self.surface_combo, 0, 1)
         ctrl.addWidget(mk_lbl("Best of:"), 0, 2)
@@ -3630,6 +3756,9 @@ class MatchSimTab(QWidget):
             w_.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
             w_.setWordWrap(True)
             layout.addWidget(w_)
+
+        self.context_view = ContextView()
+        layout.addWidget(self.context_view)
 
         self.dist_view = DistributionView()
         layout.addWidget(self.dist_view)
@@ -3683,12 +3812,33 @@ class MatchSimTab(QWidget):
 
         elo_p = tennis_sim.elo_win_prob(e1, e2) if (e1 and e2) else 0.5
 
+        # Situational context (rest/rust, fatigue, surface adaptation, serve
+        # form). Computed for display in every mode; only *applied* to the anchor
+        # target in "Elo + Context". Cheap enough to do on the UI thread.
+        model = self.model_combo.currentText()
+        ctx1 = tennis_context.compute_context(self.p1, surface)
+        ctx2 = tennis_context.compute_context(self.p2, surface)
+        if model == "Elo + Context" and e1 and e2:
+            adj_p, ea, eb = tennis_context.adjusted_win_prob(e1, e2, ctx1, ctx2)
+        else:
+            adj_p, ea, eb = elo_p, e1, e2
+
+        # What the Monte Carlo is anchored to (None => raw, unanchored sim).
+        if model == "Raw sim":
+            anchor = None
+        elif model == "Elo only":
+            anchor = elo_p
+        else:
+            anchor = adj_p
+
         self.elo_label.setText(
             f"Elo · {elo_src}:  {self.p1_name} {e1:.0f}  vs  "
             f"{e2:.0f} {self.p2_name}   →  {elo_p*100:.0f}% / {(1-elo_p)*100:.0f}%"
             if (e1 and e2) else "Elo: unavailable"
         )
-        self.bar.set_values(self.p1_name, self.p2_name, elo_p, subtitle="simulating…")
+        self.bar.set_values(self.p1_name, self.p2_name,
+                            anchor if anchor is not None else adj_p,
+                            subtitle="simulating…")
         self.mc_label.setText("Running Monte Carlo…")
         self.score_label.setText("")
 
@@ -3696,30 +3846,33 @@ class MatchSimTab(QWidget):
         spw2, rpw2 = surface_rates(self.p2, surface)
         self._req += 1
         req = self._req
+        meta = {'elo_p': elo_p, 'base_prob': elo_p, 'anchor': anchor,
+                'applied': model == "Elo + Context",
+                'ctx1': ctx1, 'ctx2': ctx2, 'model': model}
 
         def worker():
             try:
                 res = tennis_sim.simulate_match(spw1, rpw1, spw2, rpw2,
-                                                best_of=best_of, n=10000)
-                self.mcReady.emit(res, elo_p, req)
+                                                best_of=best_of, n=10000,
+                                                anchor_p=anchor)
+                self.mcReady.emit(res, meta, req)
             except Exception as e:
                 print(f"Match sim error: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_mc(self, res, elo_p, req):
+    def _on_mc(self, res, meta, req):
         if req != self._req:
             return  # stale result
-        model = self.model_combo.currentText()
-        if model == "Elo only":
-            headline = elo_p
-            sub = "Elo model"
-        elif model == "Sim only":
-            headline = res.p_a
-            sub = "Serve/return sim"
-        else:
-            headline = tennis_sim.blended_win_prob(elo_p, res.p_a) or 0.5
-            sub = "Blended (Elo + sim)"
+        model = meta['model']
+        # With anchoring the headline IS the simulated win prob (which now tracks
+        # the target). Only "Raw sim" lets the serve/return rates speak alone.
+        headline = res.p_a
+        sub = {"Elo + Context": "Elo + context (anchored)",
+               "Elo only": "Elo-anchored",
+               "Raw sim": "Raw serve/return sim"}.get(model, "sim")
+        if res.anchor_delta:
+            sub += f"   ·  Δ{res.anchor_delta:+.2f}"
         odds1 = tennis_sim.prob_to_american(headline)
         odds2 = tennis_sim.prob_to_american(1 - headline)
         self.bar.set_values(self.p1_name, self.p2_name, headline,
@@ -3736,6 +3889,9 @@ class MatchSimTab(QWidget):
             f"Total games:  median {res.games_quantile(0.5)}  ·  "
             f"O/U {line:g}  {o*100:.0f}% / {u*100:.0f}%")
         self.dist_view.set_data(res, self.p1_name, self.p2_name)
+        self.context_view.set_data(self.p1_name, self.p2_name,
+                                   meta['ctx1'], meta['ctx2'],
+                                   meta['base_prob'], headline, meta['applied'])
 
 
 class HeadToHeadTab(QWidget):
@@ -3743,7 +3899,6 @@ class HeadToHeadTab(QWidget):
 
     def __init__(self):
         super().__init__()
-        from PyQt6.QtWidgets import QScrollArea
         self.p1_name = self.p2_name = ""
         self.p1_color = TennisTheme.PRIMARY
         self.p2_color = TennisTheme.ACCENT
@@ -4005,7 +4160,6 @@ class HeadToHeadTab(QWidget):
                          total_min, n_timed, longest):
         frame = QFrame()
         frame.setStyleSheet(f"background: {TennisTheme.CARD_BACKGROUND}; border-radius: 4px;")
-        from PyQt6.QtWidgets import QGridLayout
         g = QGridLayout(frame)
         g.setContentsMargins(10, 6, 10, 6)
         g.setHorizontalSpacing(14)
@@ -4073,7 +4227,6 @@ class ServeReturnTab(QWidget):
 
     def __init__(self):
         super().__init__()
-        from PyQt6.QtWidgets import QComboBox, QGridLayout as _QGrid
         self.p1_name = self.p2_name = ""
         self.p1 = self.p2 = None
         self.p1_color = TennisTheme.PRIMARY
@@ -4102,7 +4255,7 @@ class ServeReturnTab(QWidget):
         controls.addStretch()
         layout.addLayout(controls)
 
-        self.grid = _QGrid()
+        self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(10)
         self.grid.setVerticalSpacing(3)
         layout.addLayout(self.grid)
@@ -4280,7 +4433,6 @@ class StatComparisonTab(QWidget):
 
     def __init__(self, spec, scroll=False):
         super().__init__()
-        from PyQt6.QtWidgets import QGridLayout as _QGrid, QScrollArea
         self.spec = spec
         self.p1_name = self.p2_name = ""
         self.m1 = self.m2 = None
@@ -4292,7 +4444,7 @@ class StatComparisonTab(QWidget):
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(4)
 
-        self.grid = _QGrid()
+        self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
         self.grid.setVerticalSpacing(3)
 
@@ -4443,7 +4595,6 @@ class MatchupAnalysisPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        from PyQt6.QtWidgets import QTabWidget
         self.p1_name = self.p2_name = ""
         self.p1 = self.p2 = None
         self.p1_hist = []
@@ -4697,7 +4848,6 @@ class CompactTennisComparisonWidget(QWidget):
                     print(f"Error loading comparison data: {e}")
 
             # Run in background thread
-            import threading
             thread = threading.Thread(target=load_h2h, daemon=True)
             thread.start()
         else:
@@ -4725,5 +4875,6 @@ if __name__ == "__main__":
     # Create main comparison widget
     window = CompactTennisComparisonWidget()
     window.show()
+
 
     sys.exit(app.exec())
