@@ -85,7 +85,7 @@ class CompactSurfaceWidget(QWidget):
         print(f"Available years: {list(yearly_stats.keys())}")
 
         # Get last 3 years of data, or use career totals if insufficient
-        current_year = 2025
+        current_year = datetime.now().year
         last_3_years = [str(current_year), str(current_year-1), str(current_year-2)]
 
         available_years = [year for year in last_3_years if year in yearly_stats]
@@ -914,7 +914,7 @@ class CompactPlayerSearchWidget(QWidget):
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT r1.player_name, r1.rank
+                SELECT r1.player_name, r1.rank, r1.tour
                 FROM rankings r1
                 INNER JOIN (
                     SELECT player_name, MAX(ranking_date) as latest_date
@@ -923,8 +923,25 @@ class CompactPlayerSearchWidget(QWidget):
                 ) r2 ON r1.player_name = r2.player_name AND r1.ranking_date = r2.latest_date
                 ORDER BY r1.rank
             ''')
-            self.players = [(name, rank) for name, rank in cursor.fetchall()]
+            self.players = [(name, rank, tour) for name, rank, tour in cursor.fetchall()]
             conn.close()
+        except sqlite3.OperationalError:
+            # Pre-migration DB without a tour column (fresh ATP-only setup).
+            try:
+                cursor.execute('''
+                    SELECT r1.player_name, r1.rank
+                    FROM rankings r1
+                    INNER JOIN (
+                        SELECT player_name, MAX(ranking_date) as latest_date
+                        FROM rankings
+                        GROUP BY player_name
+                    ) r2 ON r1.player_name = r2.player_name AND r1.ranking_date = r2.latest_date
+                    ORDER BY r1.rank
+                ''')
+                self.players = [(name, rank, "ATP") for name, rank in cursor.fetchall()]
+                conn.close()
+            except Exception as e:
+                print(f"Error loading players: {e}")
         except Exception as e:
             print(f"Error loading players: {e}")
 
@@ -941,7 +958,7 @@ class CompactPlayerSearchWidget(QWidget):
                 self.current_suggestions_p2 = []
             return
 
-        filtered = [(name, rank) for name, rank in self.players
+        filtered = [(name, rank, tour) for name, rank, tour in self.players
                    if text.lower() in name.lower()][:8]
 
         # Store current suggestions and reset selection
@@ -976,8 +993,9 @@ class CompactPlayerSearchWidget(QWidget):
             frame.hide()
             return
 
-        for i, (name, rank) in enumerate(filtered_players):
-            btn = QPushButton(f"#{rank} {name}")
+        for i, (name, rank, tour) in enumerate(filtered_players):
+            tag = "  ·  WTA" if tour == "WTA" else ""
+            btn = QPushButton(f"#{rank} {name}{tag}")
             btn.clicked.connect(lambda checked, n=name, p=player_num: self.select_player(n, p))
             btn.setFixedHeight(38)  # larger height for better visibility
             btn.setMinimumWidth(320)  # Ensure minimum width for full names
@@ -1098,7 +1116,7 @@ class CompactPlayerSearchWidget(QWidget):
         elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
             # Select current highlighted item
             if 0 <= selected_index < len(suggestions):
-                name, rank = suggestions[selected_index]
+                name = suggestions[selected_index][0]
                 self.select_player(name, player_num)
             event.accept()
         elif key == Qt.Key.Key_Escape:
@@ -1632,8 +1650,10 @@ class PlayerProfileWidget(QWidget):
         for year, surfaces in yearly_stats.items():
             print(f"  Year {year}: {surfaces}")
 
-        # Use the most recent year (2025)
-        current_year = "2025"
+        # Use the most recent season present in the data (falling back to the
+        # calendar year if the keys are non-numeric).
+        numeric_years = [y for y in yearly_stats if str(y).isdigit() and len(str(y)) == 4]
+        current_year = max(numeric_years) if numeric_years else str(datetime.now().year)
         if current_year in yearly_stats:
             surfaces = yearly_stats[current_year]
 
@@ -1766,7 +1786,9 @@ class CompactStatsWidget(QWidget):
         self.stats_mode = "current_year"  # current_year, career, last52
         self.current_split_type = "Hard"  # Current split type for career/last52 modes
         self.available_splits = []  # Will be populated when data is loaded
-        self.setFixedSize(280, 280)  # Taller for additional toggle button
+        self.selected_year = str(datetime.now().year)  # Year shown in season mode
+        self.available_years = []  # Populated from loaded player season data
+        self.setFixedSize(280, 288)  # Taller for the pill row above player names
         self.setStyleSheet(f"""
             CompactStatsWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -1781,7 +1803,7 @@ class CompactStatsWidget(QWidget):
     def setup_toggle_buttons(self):
         """Create individual toggle buttons for each player"""
         # Mode toggle button (cycles through current_year, career, last52) - left side
-        self.mode_toggle = QPushButton("2025")
+        self.mode_toggle = QPushButton("Season")
         self.mode_toggle.setFixedSize(60, 20)
         self.mode_toggle.setStyleSheet(f"""
             QPushButton {{
@@ -1800,8 +1822,9 @@ class CompactStatsWidget(QWidget):
         self.mode_toggle.setParent(self)
         self.mode_toggle.move(85, 25)  # Left side of center
 
-        # Split type toggle button (only active for career/last52 modes) - right side
-        self.split_toggle = QPushButton("Hard")
+        # Split/year toggle button - right side. In season mode it cycles the
+        # displayed year; in career/last52 modes it cycles the split type.
+        self.split_toggle = QPushButton(self.selected_year)
         self.split_toggle.setFixedSize(70, 20)
         self.split_toggle.setStyleSheet(f"""
             QPushButton {{
@@ -1847,7 +1870,7 @@ class CompactStatsWidget(QWidget):
         """)
         self.player1_toggle.clicked.connect(lambda: self.toggle_player_stats(1))
         self.player1_toggle.setParent(self)
-        self.player1_toggle.move(100, 65)  # Inline with player 1 name (adjusted for new y position)
+        self.player1_toggle.move(5, 46)  # Above player 1's name, left-aligned
 
         # Player 2 toggle button - positioned inline with player 2 name
         self.player2_toggle = QPushButton("Tour")
@@ -1871,7 +1894,7 @@ class CompactStatsWidget(QWidget):
         """)
         self.player2_toggle.clicked.connect(lambda: self.toggle_player_stats(2))
         self.player2_toggle.setParent(self)
-        self.player2_toggle.move(240, 65)  # Inline with player 2 name (adjusted for new y position)
+        self.player2_toggle.move(240, 46)  # Above player 2's name, right-aligned
 
     def toggle_player_stats(self, player_num: int):
         """Toggle between Tour-Level and Challenger for specific player"""
@@ -1903,14 +1926,27 @@ class CompactStatsWidget(QWidget):
             self.update_available_splits()
         else:
             self.stats_mode = "current_year"
-            self.mode_toggle.setText("2025")
-            self.split_toggle.setEnabled(False)  # Disable split toggle for current year mode
+            self.mode_toggle.setText("Season")
+            # In season mode the right-hand button cycles the displayed year.
+            self.split_toggle.setText(self.selected_year)
+            self.split_toggle.setEnabled(len(self.available_years) > 1)
             self.player1_toggle.setEnabled(True)  # Enable tour/challenger for season stats
             self.player2_toggle.setEnabled(True)
         self.update()
 
     def toggle_split_type(self):
-        """Toggle between different split types for career/last52 modes"""
+        """Cycle the season year (season mode) or split type (career/last52)."""
+        if self.stats_mode == "current_year":
+            if len(self.available_years) < 2:
+                return
+            try:
+                idx = self.available_years.index(self.selected_year)
+            except ValueError:
+                idx = -1
+            self.selected_year = self.available_years[(idx + 1) % len(self.available_years)]
+            self.split_toggle.setText(self.selected_year)
+            self.update()
+            return
         if not self.available_splits:
             return
 
@@ -1995,6 +2031,27 @@ class CompactStatsWidget(QWidget):
         else:
             self.split_toggle.setEnabled(False)
 
+    def update_available_years(self):
+        """Collect the season years present in either player's loaded data."""
+        years = set()
+        for player_data in [self.player1_data, self.player2_data]:
+            if not player_data:
+                continue
+            for key in ("tour_seasons", "challenger_seasons"):
+                for season in player_data.get(key) or []:
+                    if isinstance(season, dict):
+                        y = str(season.get('year', ''))
+                        if y.isdigit() and len(y) == 4:
+                            years.add(y)
+        self.available_years = sorted(years, reverse=True)
+        # Default to the most recent season with data if the selected year
+        # (initially the calendar year) has none.
+        if self.available_years and self.selected_year not in self.available_years:
+            self.selected_year = self.available_years[0]
+        if self.stats_mode == "current_year":
+            self.split_toggle.setText(self.selected_year)
+            self.split_toggle.setEnabled(len(self.available_years) > 1)
+
     def update_player_data(self, player_name: str, player_data: dict, player_num: int):
         """Update player data from tennis abstract"""
         if player_num == 1:
@@ -2007,6 +2064,7 @@ class CompactStatsWidget(QWidget):
         # Update available splits when new data is loaded
         if self.stats_mode in ["career", "last52"]:
             self.update_available_splits()
+        self.update_available_years()
 
         self.update()
 
@@ -2020,7 +2078,7 @@ class CompactStatsWidget(QWidget):
 
         # Title based on current mode
         mode_titles = {
-            "current_year": "2025 Stats",
+            "current_year": f"{self.selected_year} Stats",
             "career": "Career Stats",
             "last52": "Last 52 Weeks"
         }
@@ -2035,30 +2093,30 @@ class CompactStatsWidget(QWidget):
 
     def draw_player_stats(self, painter, player_name, player_data, x_offset, y_offset, width, accent_color, show_tour_level):
         """Draw stats for one player"""
-        # Player name header
+        # Player name header (drawn below the Tour/Chall pill row at y=46-60)
         painter.setPen(QColor(accent_color))
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        painter.drawText(x_offset + 5, y_offset + 15, player_name[:15] + ("..." if len(player_name) > 15 else ""))
+        painter.drawText(x_offset + 5, y_offset + 23, player_name[:15] + ("..." if len(player_name) > 15 else ""))
 
         # Get data based on current mode
         if not player_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
-            painter.drawText(x_offset + 5, y_offset + 40, "No data")
+            painter.drawText(x_offset + 5, y_offset + 48,"No data")
             return
 
         current_data = None
 
         if self.stats_mode == "current_year":
-            # Get current year stats - only use the requested level (no fallback)
-            current_year = "2025"
+            # Get selected-year stats - only use the requested level (no fallback)
+            current_year = self.selected_year
             stats_key = "tour_seasons" if show_tour_level else "challenger_seasons"
 
             if stats_key not in player_data or not player_data[stats_key]:
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
-                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} data")
+                painter.drawText(x_offset + 5, y_offset + 48,f"No {level_text} data")
                 return
 
             # Find current year data
@@ -2075,7 +2133,7 @@ class CompactStatsWidget(QWidget):
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
-                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} career data")
+                painter.drawText(x_offset + 5, y_offset + 48,f"No {level_text} career data")
                 return
 
             # Find the specific split type
@@ -2092,7 +2150,7 @@ class CompactStatsWidget(QWidget):
                 painter.setPen(QColor(TennisTheme.TEXT_MUTED))
                 painter.setFont(QFont("Arial", 9))
                 level_text = "tour" if show_tour_level else "challenger"
-                painter.drawText(x_offset + 5, y_offset + 40, f"No {level_text} last52 data")
+                painter.drawText(x_offset + 5, y_offset + 48,f"No {level_text} last52 data")
                 return
 
             # Find the specific split type
@@ -2104,11 +2162,11 @@ class CompactStatsWidget(QWidget):
         if not current_data:
             painter.setPen(QColor(TennisTheme.TEXT_MUTED))
             painter.setFont(QFont("Arial", 9))
-            painter.drawText(x_offset + 5, y_offset + 40, "No data")
+            painter.drawText(x_offset + 5, y_offset + 48,"No data")
             return
 
         # Draw stats
-        stats_y = y_offset + 35
+        stats_y = y_offset + 43
         painter.setFont(QFont("Arial", 10))
 
         # Stats to display - handle both dict and object data
@@ -3247,6 +3305,7 @@ def parse_player_payload(data_dict: dict) -> dict:
     mcp = _aggregate_charting(data_dict)
     return {'elo': elo, 'surf': surf, 'surf52': surf52, 'style': style,
             'serve': serve, 'mcp': mcp,
+            'tour': (bio.get('tour') or 'ATP'),
             'historical': data_dict.get('historical_matches', []) or []}
 
 
@@ -3326,21 +3385,49 @@ def _player_overall_rates(parsed: dict):
         spw = sum(r['spw'] * r['m'] for r in rows) / wsum
         rpw = sum(r['rpw'] * r['m'] for r in rows) / wsum
         return spw, rpw
-    return tennis_sim.ATP_SERVE_AVG, tennis_sim.ATP_RETURN_AVG
+    avg = tennis_sim.tour_serve_avg(parsed.get('tour', 'ATP'))
+    return avg, 1.0 - avg
 
 
 def surface_rates(parsed: dict, surface: str):
-    """(spw, rpw) for a surface, shrunk toward the player's own all-surface
-    baseline by sample size so a thin surface split (e.g. a 9-match grass line)
-    can't dominate the Monte Carlo. Falls back to the baseline / tour average."""
+    """(spw, rpw) for a surface: career surface split shrunk toward a
+    surface-offset prior, then blended toward the trailing-52-week split.
+
+    Two refinements over plain own-baseline shrinkage (both standard in the
+    point-based literature — Barnett/Clarke priors, Ingram's player x surface
+    partial pooling and random-walk skill drift):
+
+    * The shrinkage prior is the player's all-surface baseline PLUS the tour's
+      surface offset (e.g. grass serve ~ +2.1pp over the all-tour average), so
+      a player with little grass data is presumed to serve better on grass the
+      way the whole tour does, instead of being dragged to his hard-court level.
+    * The trailing-52-week surface split (if present) is shrunk toward the
+      career estimate with a lighter pseudo-count and used as the final rate,
+      weighting current form over career history (Kovalchik: ~1y windows beat
+      career-to-date for established players).
+    """
     base_spw, base_rpw = _player_overall_rates(parsed)
+    # Tour-level surface offset applied to the player's own baseline.
+    tour = parsed.get('tour', 'ATP')
+    off = (tennis_sim.surface_serve_avg(surface, tour)
+           - tennis_sim.tour_serve_avg(tour))
+    prior_spw = base_spw + off
+    prior_rpw = base_rpw - off
+
     s = parsed.get('surf', {}).get(surface)
     if s and s.get('spw') and s.get('rpw'):
         n = s.get('m') or 0
-        spw = tennis_sim.shrink_rate(s['spw'], n, base_spw)
-        rpw = tennis_sim.shrink_rate(s['rpw'], n, base_rpw)
-        return spw, rpw
-    return base_spw, base_rpw
+        spw = tennis_sim.shrink_rate(s['spw'], n, prior_spw)
+        rpw = tennis_sim.shrink_rate(s['rpw'], n, prior_rpw)
+    else:
+        spw, rpw = prior_spw, prior_rpw
+
+    s52 = parsed.get('surf52', {}).get(surface)
+    if s52 and s52.get('spw') and s52.get('rpw'):
+        n52 = s52.get('m') or 0
+        spw = tennis_sim.shrink_rate(s52['spw'], n52, spw, pseudo=12.0)
+        rpw = tennis_sim.shrink_rate(s52['rpw'], n52, rpw, pseudo=12.0)
+    return spw, rpw
 
 
 
@@ -3665,13 +3752,13 @@ class MatchSimTab(QWidget):
             c = QComboBox()
             c.addItems(items)
             c.setStyleSheet(combo_style)
-            # Fixed policy + a width floor keeps a small combo from ballooning
-            # into a wider shared grid column. A fixed HEIGHT is the important
-            # bit: without it, a short panel lets the surrounding QVBoxLayout
-            # compress the whole control grid, clipping the selector text on
-            # initial (small) window loads.
+            # Fixed size in BOTH axes. The width comes from the combo's own
+            # sizeHint, which (with the stylesheet already applied) includes
+            # the QSS padding + drop-down arrow that a bare minimum width
+            # ignored — the old Fixed-policy floor left "Hard" / "50/50 Elo
+            # blend" clipped behind the arrow box until a manual resize.
             c.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            c.setMinimumWidth(width)
+            c.setFixedWidth(max(width, c.sizeHint().width() + 4))
             c.setFixedHeight(24)
             c.currentTextChanged.connect(lambda *_: self.recompute())
             return c
@@ -3834,11 +3921,19 @@ class MatchSimTab(QWidget):
                 'applied': model == "Elo + Context",
                 'ctx1': ctx1, 'ctx2': ctx2, 'model': model}
 
+        # Tour from the players' payloads (WTA if either matched the WTA Elo
+        # report) — drives the serve baselines the sim prices holds against.
+        tours = {self.p1.get('tour', 'ATP'), self.p2.get('tour', 'ATP')}
+        tour = 'WTA' if 'WTA' in tours else 'ATP'
+        serve_avg = tennis_sim.surface_serve_avg(surface, tour)
+
         def worker():
             try:
                 res = tennis_sim.simulate_match(spw1, rpw1, spw2, rpw2,
                                                 best_of=best_of, n=10000,
-                                                anchor_p=anchor)
+                                                anchor_p=anchor,
+                                                serve_avg=serve_avg,
+                                                form_sigma=tennis_sim.tour_form_sigma(tour))
                 self.mcReady.emit(res, meta, req)
             except Exception as e:
                 print(f"Match sim error: {e}")
@@ -3869,9 +3964,18 @@ class MatchSimTab(QWidget):
             f"decider {res.p_decider*100:.0f}%")
         o, u = res.games_line_probs(round(res.avg_games) + 0.5)
         line = round(res.avg_games) + 0.5
+        # Fair games handicap for whoever the sim favours, book-style sign.
+        sline, scover = res.fair_spread()
+        sn1 = self.p1_name.split()[-1] if self.p1_name else "P1"
+        sn2 = self.p2_name.split()[-1] if self.p2_name else "P2"
+        if sline <= -0.5:
+            spread_txt = f"{sn1} {sline:+g} ({scover*100:.0f}%)"
+        else:
+            spread_txt = f"{sn2} {-sline:+g} ({(1-scover)*100:.0f}%)"
         self.score_label.setText(
             f"Total games:  median {res.games_quantile(0.5)}  ·  "
-            f"O/U {line:g}  {o*100:.0f}% / {u*100:.0f}%")
+            f"O/U {line:g}  {o*100:.0f}% / {u*100:.0f}%   ·   "
+            f"Fair spread:  {spread_txt}")
         self.dist_view.set_data(res, self.p1_name, self.p2_name)
         self.context_view.set_data(self.p1_name, self.p2_name,
                                    meta['ctx1'], meta['ctx2'],
@@ -4610,7 +4714,15 @@ class MatchupAnalysisPanel(QWidget):
         self.serve_return_tab = ServeReturnTab()
         self.serve_tab = StatComparisonTab(SERVE_SPEC, scroll=True)
         self.return_rally_tab = StatComparisonTab(RETURN_RALLY_SPEC, scroll=True)
-        self.tabs.addTab(self.match_sim_tab, "Match Sim")
+        # Scroll-wrap the sim tab: its full content (controls + prob bar +
+        # context + distributions) needs ~500px; on the initial 800px-tall
+        # window the panel gets far less, and without a scroll area the
+        # QVBoxLayout squeezed the control grid into overlapping/clipped rows.
+        sim_scroll = QScrollArea()
+        sim_scroll.setWidgetResizable(True)
+        sim_scroll.setStyleSheet("QScrollArea { border: none; }")
+        sim_scroll.setWidget(self.match_sim_tab)
+        self.tabs.addTab(sim_scroll, "Match Sim")
         self.tabs.addTab(self.h2h_tab, "Head-to-Head")
         self.tabs.addTab(self.serve_return_tab, "Surface")
         self.tabs.addTab(self.serve_tab, "Serve")
@@ -4640,10 +4752,229 @@ class MatchupAnalysisPanel(QWidget):
         self.h2h_tab.set_h2h(record, h2h_matches)
 
 
+class MarketLedgerWidget(QWidget):
+    """Bottom-left panel: each selected player's recent matches with closing
+    odds from the td_matches corpus (tennis-data.co.uk), plus a market summary
+    line — record as favourite / underdog and the ROI of blindly backing the
+    player at the closing average price. Data no other panel shows: how the
+    market has priced these players lately, and whether it was right."""
+
+    N_ROWS = 11          # recent matches listed per player
+    N_SUMMARY = 50       # matches the summary line aggregates over
+
+    def __init__(self, db_path: Optional[str] = None):
+        super().__init__()
+        import pathlib
+        self.db_path = db_path or str(pathlib.Path(__file__).parent / "tennis_rankings.db")
+        self.setFixedSize(900, 236)
+        self.setStyleSheet(f"""
+            MarketLedgerWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 2px solid {TennisTheme.SURFACE};
+                border-radius: 8px;
+            }}
+        """)
+        self.p1_name = self.p2_name = ""
+        self.p1_rows, self.p2_rows = [], []
+        self.p1_summary = self.p2_summary = ""
+
+    def set_player(self, player_name: str, player_num: int):
+        rows, summary = self._load(player_name)
+        if player_num == 1:
+            self.p1_name, self.p1_rows, self.p1_summary = player_name, rows, summary
+        else:
+            self.p2_name, self.p2_rows, self.p2_summary = player_name, rows, summary
+        self.update()
+
+    def merge_ta_matches(self, player_name: str, historical_matches, player_num: int):
+        """Prepend matches Tennis Abstract already has but the odds corpus
+        doesn't (tennis-data lags a few days and posts slams late). These rows
+        carry no closing price — shown with an em-dash — but keep the recent
+        form current (e.g. this week's Wimbledon rounds)."""
+        rows = self.p1_rows if player_num == 1 else self.p2_rows
+        name = self.p1_name if player_num == 1 else self.p2_name
+        if player_name != name:
+            return
+        newest_td = rows[0][0] if rows else "1970-01-01"
+        fresh = []
+        for m in historical_matches or []:
+            d = str(m.get('date', '') if isinstance(m, dict) else getattr(m, 'date', ''))
+            if len(d) != 8 or not d.isdigit():
+                continue
+            iso = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            if iso <= newest_td:
+                break                      # TA log is newest-first
+            get = (m.get if isinstance(m, dict) else lambda k, d="": getattr(m, k, d))
+            won = get('result') == 'Win'
+            # TA scores are winner-first; count sets for a compact "2-1" readout.
+            sw = sl = 0
+            for st in str(get('score', '')).split():
+                mm = re.match(r'(\d+)-(\d+)', st)
+                if mm and mm.group(1) != mm.group(2):
+                    if int(mm.group(1)) > int(mm.group(2)):
+                        sw += 1
+                    else:
+                        sl += 1
+            score = f"{sw}-{sl}" if won else f"{sl}-{sw}"
+            fresh.append((iso, get('tournament', ''), get('round', ''),
+                          get('surface', ''), get('opponent', ''), won, 0.0, score))
+        if not fresh:
+            return
+        merged = (fresh + rows)[:self.N_ROWS]
+        if player_num == 1:
+            self.p1_rows = merged
+        else:
+            self.p2_rows = merged
+        self.update()
+
+    def _load(self, player_name: str):
+        """Recent matches (opponent, result, closing odds) + market summary."""
+        try:
+            from tennis_data_ingest import td_name_key
+            key = td_name_key(player_name)
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute("""
+                SELECT date, tournament, round, surface, winner, loser,
+                       winner_key, avgw, avgl, wsets, lsets, comment
+                FROM td_matches
+                WHERE winner_key = ? OR loser_key = ?
+                ORDER BY date DESC, id DESC LIMIT ?
+            """, (key, key, self.N_SUMMARY))
+            raw = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"MarketLedger load error for {player_name}: {e}")
+            return [], ""
+
+        rows = []
+        wins = losses = 0
+        fav = [0, 0]        # [wins, n] as market favourite
+        dog = [0, 0]
+        units = 0.0
+        priced = 0
+        for (date, tourney, rnd, surf, w, l, wkey, avgw, avgl, ws, ls, comment) in raw:
+            won = (wkey == key)
+            opp = l if won else w
+            my_odds = (avgw if won else avgl) or 0.0
+            opp_odds = (avgl if won else avgw) or 0.0
+            if won:
+                wins += 1
+            else:
+                losses += 1
+            if my_odds and opp_odds:
+                priced += 1
+                is_fav = my_odds < opp_odds
+                side = fav if is_fav else dog
+                side[0] += won
+                side[1] += 1
+                units += (my_odds - 1.0) if won else -1.0
+            if len(rows) < self.N_ROWS:
+                score = (f"{ws:.0f}-{ls:.0f}" if won else f"{ls:.0f}-{ws:.0f}") \
+                    if ws is not None and ls is not None else ""
+                if comment and str(comment).strip().lower() != "completed":
+                    score += " ret"
+                rows.append((date or "", tourney or "", rnd or "", surf or "",
+                             opp, won, my_odds, score))
+        summary = ""
+        if raw:
+            summary = f"{wins}-{losses} last {len(raw)}"
+            if priced:
+                summary += (f"   ·   fav {fav[0]}-{fav[1]-fav[0]}  dog {dog[0]}-{dog[1]-dog[0]}"
+                            f"   ·   blind-back ROI {units/priced*100:+.1f}%")
+        return rows, summary
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+
+        painter.setPen(QColor(TennisTheme.TEXT_PRIMARY))
+        painter.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        painter.drawText(QRect(0, 4, self.width(), 18),
+                         Qt.AlignmentFlag.AlignCenter, "Market Ledger")
+        if not (self.p1_rows or self.p2_rows):
+            painter.setPen(QColor(TennisTheme.TEXT_MUTED))
+            painter.setFont(QFont("Arial", 9))
+            painter.drawText(QRect(0, 0, self.width(), self.height()),
+                             Qt.AlignmentFlag.AlignCenter,
+                             "Select players to view recent matches & closing prices")
+            return
+        half = self.width() // 2
+        self._draw_side(painter, QRect(8, 24, half - 14, self.height() - 30),
+                        self.p1_name, self.p1_rows, self.p1_summary,
+                        QColor(TennisTheme.PRIMARY))
+        self._draw_side(painter, QRect(half + 6, 24, half - 14, self.height() - 30),
+                        self.p2_name, self.p2_rows, self.p2_summary,
+                        QColor(TennisTheme.ACCENT))
+
+    def _draw_side(self, p, rect, name, rows, summary, color):
+        if not name:
+            return
+        x, y = rect.x(), rect.y()
+        p.setPen(color)
+        p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        p.drawText(x, y + 11, name)
+        p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        p.setFont(QFont("Arial", 8))
+        p.drawText(QRect(x + 130, y, rect.width() - 130, 14),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, summary)
+        if not rows:
+            p.setPen(QColor(TennisTheme.TEXT_MUTED))
+            p.drawText(x, y + 32, "No matches in odds corpus")
+            return
+
+        row_h = 16
+        top = y + 18
+        # columns: date, tournament, opp, W/L score, odds
+        cw = {"date": 42, "tour": 108, "opp": 132, "res": 74, "odds": 44}
+        p.setFont(QFont("Arial", 7))
+        p.setPen(QColor(TennisTheme.TEXT_MUTED))
+        cx = x
+        for label, wdt in (("DATE", cw["date"]), ("EVENT", cw["tour"]),
+                           ("OPPONENT", cw["opp"]), ("RESULT", cw["res"]),
+                           ("CLOSE", cw["odds"])):
+            p.drawText(QRect(cx, top, wdt, 12),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+            cx += wdt + 6
+        p.setFont(QFont("Arial", 8))
+        for i, (date, tourney, rnd, surf, opp, won, odds, score) in enumerate(rows):
+            ry = top + 13 + i * row_h
+            if ry + row_h > rect.bottom():
+                break
+            cx = x
+            p.setPen(QColor(TennisTheme.TEXT_MUTED))
+            p.drawText(QRect(cx, ry, cw["date"], row_h),
+                       Qt.AlignmentFlag.AlignVCenter, date[5:] if len(date) >= 10 else date)
+            cx += cw["date"] + 6
+            p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            p.drawText(QRect(cx, ry, cw["tour"], row_h), Qt.AlignmentFlag.AlignVCenter,
+                       (tourney[:17] + "…") if len(tourney) > 18 else tourney)
+            cx += cw["tour"] + 6
+            p.drawText(QRect(cx, ry, cw["opp"], row_h), Qt.AlignmentFlag.AlignVCenter,
+                       (opp[:19] + "…") if len(opp) > 20 else opp)
+            cx += cw["opp"] + 6
+            p.setPen(QColor("#4CAF50") if won else QColor("#FF6B6B"))
+            p.drawText(QRect(cx, ry, cw["res"], row_h), Qt.AlignmentFlag.AlignVCenter,
+                       f"{'W' if won else 'L'} {score}")
+            cx += cw["res"] + 6
+            if odds:
+                # colour the closing price by fav/dog status
+                p.setPen(QColor(TennisTheme.SECONDARY) if odds < 2.0
+                         else QColor(TennisTheme.TEXT_PRIMARY))
+                p.drawText(QRect(cx, ry, cw["odds"], row_h),
+                           Qt.AlignmentFlag.AlignVCenter, f"{odds:.2f}")
+            else:
+                # fresh TA row — no closing price in the corpus yet
+                p.setPen(QColor(TennisTheme.TEXT_MUTED))
+                p.drawText(QRect(cx, ry, cw["odds"], row_h),
+                           Qt.AlignmentFlag.AlignVCenter, "—")
+
+
 class CompactTennisComparisonWidget(QWidget):
     """Main container combining search and player profile widgets"""
 
     h2hReady = pyqtSignal(object, object)  # record_str, list[H2HMatch]
+    tdRefreshed = pyqtSignal()             # odds corpus current-season refresh done
 
     def __init__(self):
         super().__init__()
@@ -4653,6 +4984,43 @@ class CompactTennisComparisonWidget(QWidget):
         self.setup_ui()
         self.setup_connections()
         self.h2hReady.connect(self._on_h2h_ready)
+        self.tdRefreshed.connect(self._on_td_refreshed)
+        self._refresh_td_corpus()
+
+    def _refresh_td_corpus(self):
+        """Refresh the current tennis-data season in the background (both
+        tours, ~450KB total) if the cached files are stale, so the Market
+        Ledger is as current as the source allows (site lags ~3 days,
+        slams sometimes post late)."""
+        def worker():
+            try:
+                import time as _time
+                from datetime import date as _date
+                from tennis_data_ingest import download, ingest_season, CACHE_DIR
+                year = _date.today().year
+                probe = CACHE_DIR / f"{year}.xlsx"
+                if probe.exists() and (_time.time() - probe.stat().st_mtime) < 6 * 3600:
+                    return
+                import sqlite3 as _sqlite3
+                import pathlib as _pathlib
+                con = _sqlite3.connect(str(_pathlib.Path(__file__).parent / "tennis_rankings.db"))
+                for tour in ("ATP", "WTA"):
+                    path = download(tour, year, force=True)
+                    if path:
+                        ingest_season(con, tour, year, path)
+                con.close()
+                self.tdRefreshed.emit()
+            except Exception as e:
+                print(f"td corpus refresh skipped: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_td_refreshed(self):
+        """Re-pull ledger rows for any already-selected players (main thread)."""
+        if self.current_player1:
+            self.market_ledger.set_player(self.current_player1, 1)
+        if self.current_player2:
+            self.market_ledger.set_player(self.current_player2, 2)
 
     def setup_ui(self):
         """Setup the complete comparison interface"""
@@ -4713,8 +5081,10 @@ class CompactTennisComparisonWidget(QWidget):
         # Place top-left widget in grid position (0, 0)
         main_layout.addWidget(top_left_widget, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        # Bottom-left: Rankings chart
+        # Bottom-left: Rankings chart, then the market ledger below it.
         main_layout.addWidget(self.ranking_chart, 1, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.market_ledger = MarketLedgerWidget()
+        main_layout.addWidget(self.market_ledger, 2, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         # Right column: Momentum stacked directly above the analysis panel so
         # they pack together instead of leaving a row-driven gap between them.
@@ -4728,7 +5098,7 @@ class CompactTennisComparisonWidget(QWidget):
         right_layout.setSpacing(8)
         right_layout.addWidget(self.form_momentum_widget, 0)
         right_layout.addWidget(self.analysis_panel, 1)
-        main_layout.addWidget(right_column, 0, 1, 2, 1)
+        main_layout.addWidget(right_column, 0, 1, 3, 1)
         # Left column is fixed-width; let the right column absorb the extra width.
         main_layout.setColumnStretch(0, 0)
         main_layout.setColumnStretch(1, 1)
@@ -4765,6 +5135,7 @@ class CompactTennisComparisonWidget(QWidget):
         self.current_player1 = player_name
         self.player1_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 1)
+        self.market_ledger.set_player(player_name, 1)
         self.update_status()
         self.check_and_load_h2h()
 
@@ -4773,6 +5144,7 @@ class CompactTennisComparisonWidget(QWidget):
         self.current_player2 = player_name
         self.player2_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 2)
+        self.market_ledger.set_player(player_name, 2)
         self.update_status()
         self.check_and_load_h2h()
 
@@ -4798,6 +5170,7 @@ class CompactTennisComparisonWidget(QWidget):
     def on_historical_matches_loaded(self, player_name: str, historical_matches: list, player_num: int):
         """Handle historical matches loaded for enhanced momentum analysis"""
         self.form_momentum_widget.update_player_historical_data(player_name, historical_matches, player_num)
+        self.market_ledger.merge_ta_matches(player_name, historical_matches, player_num)
 
     def _on_h2h_ready(self, record, h2h_matches):
         """Deliver head-to-head data to the analysis panel (main thread)."""

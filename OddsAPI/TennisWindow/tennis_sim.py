@@ -25,6 +25,41 @@ from typing import Dict, Optional, Tuple
 ATP_SERVE_AVG = 0.642
 ATP_RETURN_AVG = 1.0 - ATP_SERVE_AVG
 
+# Surface-specific tour averages, computed from Sackmann-schema ATP match data
+# (2024+2025 seasons, ~925k service points): serve dominance differs enough by
+# surface to change hold rates (grass 84.0%, hard 80.8%, clay 76.6%), which is
+# what drives set length, tiebreak frequency and therefore games totals/spreads.
+# Using one flat baseline made grass sets too break-heavy and clay too clean.
+SURFACE_SERVE_AVG = {
+    "Hard": 0.6453,
+    "Clay": 0.6204,
+    "Grass": 0.6630,
+}
+
+# WTA equivalents (same Sackmann-schema computation, 2024+2025, ~750k service
+# points). Serve dominance is far lower on the women's tour — holds are 66.1%
+# hard / 61.9% clay / 70.0% grass vs ATP's 80.8/76.6/84.0 — so running a WTA
+# match on ATP baselines badly overprices holds, totals and tiebreak rates.
+WTA_SERVE_AVG = 0.5660          # svpt-weighted mean of the three surfaces
+WTA_SURFACE_SERVE_AVG = {
+    "Hard": 0.5691,
+    "Clay": 0.5499,
+    "Grass": 0.5857,
+}
+
+
+def surface_serve_avg(surface: Optional[str], tour: str = "ATP") -> float:
+    """Tour-average SPW for a surface, falling back to the tour's overall
+    average. `tour` is "ATP" (default) or "WTA"."""
+    if str(tour).upper() == "WTA":
+        return WTA_SURFACE_SERVE_AVG.get(surface or "", WTA_SERVE_AVG)
+    return SURFACE_SERVE_AVG.get(surface or "", ATP_SERVE_AVG)
+
+
+def tour_serve_avg(tour: str = "ATP") -> float:
+    """Overall tour-average SPW."""
+    return WTA_SERVE_AVG if str(tour).upper() == "WTA" else ATP_SERVE_AVG
+
 
 # --------------------------------------------------------------------------- #
 # Elo
@@ -67,14 +102,17 @@ def prob_to_american(p: float) -> str:
 # --------------------------------------------------------------------------- #
 # Serve/return point model
 # --------------------------------------------------------------------------- #
-def serve_point_prob(spw_server: float, rpw_returner: float) -> float:
+def serve_point_prob(spw_server: float, rpw_returner: float,
+                     serve_avg: float = ATP_SERVE_AVG) -> float:
     """P(server wins a point) given server SPW% and returner RPW% (0-1 each).
 
     Deviation-from-tour-average blend (O'Malley / Barnett style):
         p = SERVE_AVG + (SPW - SERVE_AVG) - (RPW - RETURN_AVG)
-    Clamped to a sane range.
+    with SERVE_AVG the tour average for the surface being played (see
+    SURFACE_SERVE_AVG) so two tour-average players hold at the surface's true
+    rate. Clamped to a sane range.
     """
-    p = ATP_SERVE_AVG + (spw_server - ATP_SERVE_AVG) - (rpw_returner - ATP_RETURN_AVG)
+    p = serve_avg + (spw_server - serve_avg) - (rpw_returner - (1.0 - serve_avg))
     return min(0.92, max(0.30, p))
 
 
@@ -177,18 +215,72 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+# Per-match latent "relative form" spread, in logit(point-on-serve) space.
+# i.i.d. sets systematically understate straight-set finishes: a 75% Bo5
+# favourite can NEVER have 3-0 more likely than 3-1 under i.i.d. sets (that
+# needs set-win > 2/3, i.e. match win > ~79%), yet books price 3-0 as the
+# modal scoreline for such favourites. Real matches have day-to-day form: the
+# player who is better *today* tends to be better in every set. A single
+# zero-mean gaussian shift drawn once per simulated match (A up, B down)
+# induces exactly that inter-set correlation and fattens both 3-0 tails.
+# 0.15 calibrated against 983 completed Bo5 matches (Sackmann ATP data,
+# 2024-25): empirical set-count distribution is 43% / 34% / 22.5% for 3/4/5
+# sets, which a favourite-strength mixture around 65-80% reproduces at sigma
+# ~0.12-0.15 (0.20 overshot to ~50%+ three-setters, shorting games totals by
+# ~2). Conditional games-per-set-count validate the within-set model (sim
+# 3-setters avg ~29 games vs 28.7 empirical; 5-setters ~51 vs 50.3), so the
+# latent-form draw only has to fix the set-count mixture. Market set-betting
+# boards for a ~75-80% Bo5 favourite (3-0 ≈ 39% devigged) agree independently.
+# Full-corpus backtest (backtest_model.py, td_matches 2017-26, ~24k graded
+# matches/tour bucketed by market favourite prob) confirmed 0.15 for ATP
+# (Bo5 straight-set/games/margin all within ~1pp) and showed WTA runs
+# streakier: empirical straight-set shares sit between the 0.15 and 0.20
+# columns in every bucket, best fit ~0.17.
+MATCH_FORM_SIGMA = 0.15
+WTA_MATCH_FORM_SIGMA = 0.17
+
+
+def tour_form_sigma(tour: str = "ATP") -> float:
+    return WTA_MATCH_FORM_SIGMA if str(tour).upper() == "WTA" else MATCH_FORM_SIGMA
+
+# 7-point Gauss-Hermite rule (physicists'), for averaging the analytic match
+# win probability over the latent-form gaussian when solving the anchor.
+_GH_NODES = (
+    (0.0, 0.8102646175568073),
+    (0.8162878828589647, 0.4256072526101278),
+    (-0.8162878828589647, 0.4256072526101278),
+    (1.6735516287674714, 0.05451558281912703),
+    (-1.6735516287674714, 0.05451558281912703),
+    (2.6519613568352334, 0.0009717812450995192),
+    (-2.6519613568352334, 0.0009717812450995192),
+)
+_GH_NORM = math.sqrt(math.pi)
+
+
 def solve_anchor_delta(pa: float, pb: float, target: float,
-                       best_of: int = 3) -> float:
+                       best_of: int = 3,
+                       form_sigma: float = 0.0) -> float:
     """Find the symmetric logit shift delta such that, with the two serve
     point probs shifted (pa up, pb down by delta in logit space), the analytic
-    match win probability for A equals `target`. Bisection; delta may be <0."""
+    match win probability for A equals `target`. Bisection; delta may be <0.
+
+    If `form_sigma` > 0 the Monte Carlo will additionally jitter the logits by
+    a per-match N(0, sigma) draw, which pulls the *expected* win prob toward
+    0.5; the solve averages the analytic probability over that gaussian
+    (Gauss-Hermite) so the anchored headline still lands on `target`."""
     target = min(0.999, max(0.001, target))
     la, lb = _logit(pa), _logit(pb)
 
-    def wp(delta: float) -> float:
-        na = min(0.92, max(0.30, _sigmoid(la + delta)))
-        nb = min(0.92, max(0.30, _sigmoid(lb - delta)))
+    def wp_at(delta: float, eps: float) -> float:
+        na = min(0.92, max(0.30, _sigmoid(la + delta + eps)))
+        nb = min(0.92, max(0.30, _sigmoid(lb - delta - eps)))
         return match_win_prob(na, nb, best_of)
+
+    def wp(delta: float) -> float:
+        if form_sigma <= 0.0:
+            return wp_at(delta, 0.0)
+        scale = form_sigma * math.sqrt(2.0)
+        return sum(w * wp_at(delta, scale * t) for t, w in _GH_NODES) / _GH_NORM
 
     lo, hi = -2.5, 2.5
     # Ensure the target is bracketed (clamps handle extreme asks gracefully).
@@ -279,6 +371,7 @@ class MatchSimResult:
     set_scores: Dict[str, float] = field(default_factory=dict)  # "2-1" -> prob
     set_scores_oriented: Dict[str, float] = field(default_factory=dict)  # "A 2-1" -> prob
     games_hist: Dict[int, float] = field(default_factory=dict)  # total games -> prob
+    margin_hist: Dict[int, float] = field(default_factory=dict)  # A games - B games -> prob
     pa_serve: float = 0.0           # derived A point-on-serve prob (post-anchor)
     pb_serve: float = 0.0
     anchor_delta: float = 0.0       # logit shift applied to hit the anchor (0 = none)
@@ -298,11 +391,40 @@ class MatchSimResult:
                 return g
         return max(self.games_hist) if self.games_hist else 0
 
+    def spread_probs(self, line: float):
+        """P(A covers a games handicap of `line`) and P(B covers).
+
+        `line` is A's handicap in the usual book convention: -4.5 means A must
+        win by 5+ games; +2.5 means A covers unless beaten by 3+. Half-point
+        lines only (no push mass)."""
+        cover = sum(p for m, p in self.margin_hist.items() if m + line > 0)
+        return cover, 1.0 - cover
+
+    def fair_spread(self):
+        """Half-point games handicap for A closest to a 50/50 cover split."""
+        if not self.margin_hist:
+            return 0.0, 0.5
+        best_line, best_gap, best_cover = 0.5, 1.0, 0.5
+        # A covers `line` iff margin > -line, so candidate lines span the
+        # negated margin support.
+        lo = -max(self.margin_hist) - 0.5
+        hi = -min(self.margin_hist) + 0.5
+        line = lo
+        while line <= hi:
+            cover, _ = self.spread_probs(line)
+            gap = abs(cover - 0.5)
+            if gap < best_gap:
+                best_line, best_gap, best_cover = line, gap, cover
+            line += 1.0
+        return best_line, best_cover
+
 
 def simulate_match(spw_a: float, rpw_a: float, spw_b: float, rpw_b: float,
                    best_of: int = 3, n: int = 20000,
                    seed: Optional[int] = None,
-                   anchor_p: Optional[float] = None) -> MatchSimResult:
+                   anchor_p: Optional[float] = None,
+                   form_sigma: float = MATCH_FORM_SIGMA,
+                   serve_avg: float = ATP_SERVE_AVG) -> MatchSimResult:
     """Monte Carlo a match from surface service/return rates (all 0-1).
 
     If `anchor_p` is given, the two players' per-point serve probabilities are
@@ -311,19 +433,26 @@ def simulate_match(spw_a: float, rpw_a: float, spw_b: float, rpw_b: float,
     scoreline/games *texture* while pinning the headline probability to a
     calibrated target (e.g. surface Elo, optionally context-adjusted). Raw,
     un-opponent-adjusted point rates otherwise let a big-serving small-sample
-    player run away with a match the ratings say they should lose."""
+    player run away with a match the ratings say they should lose.
+
+    `form_sigma` adds a per-match latent form draw (see MATCH_FORM_SIGMA):
+    sets within one simulated match share the same form shift, giving the
+    inter-set correlation that i.i.d. sets lack. The anchor solve integrates
+    over the same gaussian, so the headline win prob still hits `anchor_p`."""
     rng = random.Random(seed)
-    pa = serve_point_prob(spw_a, rpw_b)
-    pb = serve_point_prob(spw_b, rpw_a)
+    pa = serve_point_prob(spw_a, rpw_b, serve_avg)
+    pb = serve_point_prob(spw_b, rpw_a, serve_avg)
     sets_to_win = 3 if best_of == 5 else 2
     anchor_delta = 0.0
     if anchor_p is not None:
         # Deterministic analytic solve (exact game/set/tiebreak model). Matches
         # the sampled headline to within Monte Carlo noise, with no probe-stream
         # jitter of its own.
-        anchor_delta = solve_anchor_delta(pa, pb, anchor_p, best_of)
+        anchor_delta = solve_anchor_delta(pa, pb, anchor_p, best_of,
+                                          form_sigma=form_sigma)
         pa = min(0.92, max(0.30, _sigmoid(_logit(pa) + anchor_delta)))
         pb = min(0.92, max(0.30, _sigmoid(_logit(pb) - anchor_delta)))
+    la, lb = _logit(pa), _logit(pb)
 
     a_wins = 0
     total_games = 0
@@ -332,14 +461,24 @@ def simulate_match(spw_a: float, rpw_a: float, spw_b: float, rpw_b: float,
     scores: Dict[str, int] = {}
     oriented: Dict[str, int] = {}
     games_hist: Dict[int, int] = {}
+    margin_hist: Dict[int, int] = {}
 
     for _ in range(n):
+        if form_sigma > 0.0:
+            eps = rng.gauss(0.0, form_sigma)
+            pa_m = min(0.92, max(0.30, _sigmoid(la + eps)))
+            pb_m = min(0.92, max(0.30, _sigmoid(lb - eps)))
+        else:
+            pa_m, pb_m = pa, pb
         sa = sb = 0
         a_first = True
         games = 0
+        a_games = b_games = 0
         while sa < sets_to_win and sb < sets_to_win:
-            w, ga, gb, _nxt = _sim_set(pa, pb, a_first, rng)
+            w, ga, gb, _nxt = _sim_set(pa_m, pb_m, a_first, rng)
             games += ga + gb
+            a_games += ga
+            b_games += gb
             if w == "A":
                 sa += 1
             else:
@@ -347,6 +486,8 @@ def simulate_match(spw_a: float, rpw_a: float, spw_b: float, rpw_b: float,
             a_first = not a_first
         total_games += games
         games_hist[games] = games_hist.get(games, 0) + 1
+        margin = a_games - b_games
+        margin_hist[margin] = margin_hist.get(margin, 0) + 1
         if sa > sb:
             a_wins += 1
         hi, lo = (sa, sb) if sa > sb else (sb, sa)
@@ -371,6 +512,7 @@ def simulate_match(spw_a: float, rpw_a: float, spw_b: float, rpw_b: float,
         set_scores_oriented={k: v / n for k, v in sorted(oriented.items(),
                                                          key=lambda kv: -kv[1])},
         games_hist={k: v / n for k, v in sorted(games_hist.items())},
+        margin_hist={k: v / n for k, v in sorted(margin_hist.items())},
         pa_serve=pa,
         pb_serve=pb,
         anchor_delta=anchor_delta,
