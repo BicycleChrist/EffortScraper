@@ -19,10 +19,12 @@ import concurrent.futures
 import json
 import pathlib
 import re
+import threading
+import time
 import html as _html
 import requests
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, date
 
 try:
@@ -232,6 +234,7 @@ class HistoricalMatchData:
     second_serve_won: str
     break_points_saved: str
     match_time: str
+    level: str = ""  # TA level code: G/M/A/F/D/O=tour, C=challenger, S/15/25=ITF
 
 @dataclass
 class PlayerBio:
@@ -276,6 +279,18 @@ class PlayerData:
     historical_matches: List[HistoricalMatchData]
     scrape_timestamp: str
     source_url: str
+    # Rich Match-Charting-Project / point-by-point tables, stored generically as
+    # {'headers': [...], 'rows': [[cell, ...], ...]} since columns are numerous
+    # and we aggregate them. New fields with defaults keep positional construction
+    # valid for any existing callers.
+    mcp_serve: Dict = field(default_factory=dict)
+    mcp_return: Dict = field(default_factory=dict)
+    mcp_rally: Dict = field(default_factory=dict)
+    pbp_stats: Dict = field(default_factory=dict)
+    pbp_games: Dict = field(default_factory=dict)
+    pbp_points: Dict = field(default_factory=dict)
+    serve_speed_detail: Dict = field(default_factory=dict)
+    head_to_heads: Dict = field(default_factory=dict)
 
 
 def _norm_name_key(name: str) -> str:
@@ -290,6 +305,10 @@ class TennisAbstractScraper:
     # per tour per process). Maps normalised name -> dict of elo fields.
     _elo_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
 
+    # The cgi-bin endpoints (player.cgi / player-classic.cgi) rate-limit hard.
+    # Serialise them process-wide so two concurrent player loads don't 429.
+    _cgi_lock = threading.Lock()
+
     def __init__(self, headless: bool = True, timeout: int = 10,
                  max_workers: int = 4, reuse_driver: bool = True):
         # headless / reuse_driver kept only for call-site compatibility.
@@ -302,9 +321,46 @@ class TennisAbstractScraper:
     # ------------------------------------------------------------------ #
     # HTTP helpers
     # ------------------------------------------------------------------ #
-    def _fetch(self, url: str, retries: int = 3) -> str:
-        """GET a URL, backing off on 429 (the cgi-bin endpoints rate-limit)."""
-        import time
+    # Disk cache for fetched responses: a successfully-loaded player persists
+    # across loads/restarts, so we stop re-hitting the rate-limited cgi-bin.
+    CACHE_TTL_SECONDS = 6 * 3600
+
+    def _cache_path(self, url: str):
+        import hashlib
+        key = hashlib.md5(url.encode("utf-8")).hexdigest()
+        d = pathlib.Path(__file__).parent / "ta_cache"
+        try:
+            d.mkdir(exist_ok=True)
+        except OSError:
+            return None
+        return d / f"{key}.txt"
+
+    def _fetch(self, url: str, retries: int = 4) -> str:
+        """GET a URL with a disk cache (TTL) + 429 backoff. cgi-bin requests are
+        serialised behind a process-wide lock (they 429 under concurrent load)."""
+        cp = self._cache_path(url)
+        if cp is not None and cp.exists():
+            if (time.time() - cp.stat().st_mtime) < self.CACHE_TTL_SECONDS:
+                try:
+                    return cp.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+
+        if "cgi-bin" in url:
+            with TennisAbstractScraper._cgi_lock:
+                text = self._fetch_with_backoff(url, retries)
+                time.sleep(0.4)   # be polite between serialised cgi-bin hits
+        else:
+            text = self._fetch_with_backoff(url, retries)
+
+        if cp is not None:
+            try:
+                cp.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
+        return text
+
+    def _fetch_with_backoff(self, url: str, retries: int) -> str:
         delay = 1.0
         for attempt in range(retries):
             resp = self.session.get(url, timeout=self.timeout)
@@ -507,8 +563,40 @@ class TennisAbstractScraper:
         data["serve-speed"] = tbl("serve-speed")
         data["mcp-tactics"] = tbl("mcp-tactics")
 
+        # Rich Match-Charting / point-by-point tables (headers+rows, aggregated
+        # downstream). These carry duplicate column names per serve/return split
+        # so a header-keyed dict would collide -> keep headers + raw rows.
+        for tid in ("mcp-serve", "mcp-return", "mcp-rally",
+                    "pbp-stats", "pbp-games", "pbp-points",
+                    "serve-speed", "head-to-heads"):
+            data[f"generic:{tid}"] = self._scrape_generic_table(soup, tid)
+
         self._element_cache[slug] = data
         return data
+
+    def _scrape_generic_table(self, soup, table_id) -> Dict:
+        """Return {'headers': [...], 'rows': [[cell, ...], ...]} for a table,
+        preserving column order (duplicate header names are common)."""
+        if not soup:
+            return {"headers": [], "rows": []}
+        t = soup.find(id=table_id)
+        if not t:
+            return {"headers": [], "rows": []}
+        trs = t.find_all("tr")
+        if len(trs) < 2:
+            return {"headers": [], "rows": []}
+
+        def cells(tr):
+            return [c.get_text(strip=True).replace("\xa0", " ")
+                    for c in tr.find_all(["th", "td"])]
+
+        headers = cells(trs[0])
+        rows = []
+        for tr in trs[1:]:
+            c = cells(tr)
+            if c and any(v for v in c):
+                rows.append(c)
+        return {"headers": headers, "rows": rows}
 
     def _scrape_table_from_soup(self, table_element, table_type):
         """Generic table scraper that works with BeautifulSoup elements"""
@@ -692,10 +780,15 @@ class TennisAbstractScraper:
     # ------------------------------------------------------------------ #
     # Historical matches (from matchmx data array on player-classic page)
     # ------------------------------------------------------------------ #
-    # matchmx column indices (player serve block 0..26 is reliably aligned):
+    # matchmx column indices. Derived from Tennis Abstract's own `matchhead`
+    # array on the player-classic page, so the OPPONENT serve block (needed for
+    # dominance ratio) and the break-point columns are reliably positioned too:
+    #   ...games(27) saved(28) chances(29) oaces(30) odfs(31) opts(32)
+    #   ofirsts(33) ofwon(34) oswon(35) ogames(36) ...
     _MX = dict(date=0, tourn=1, surf=2, level=3, wl=4, rank=5, round=8, score=9,
                opp=11, orank=12, time=20, aces=21, dfs=22, pts=23,
-               firsts=24, fwon=25, swon=26)
+               firsts=24, fwon=25, swon=26, saved=28, chances=29,
+               opts=32, ofwon=34, oswon=35)
 
     def _scrape_historical_matches(self, slug: str) -> List[HistoricalMatchData]:
         try:
@@ -726,7 +819,7 @@ class TennisAbstractScraper:
             if not (date_str and opp):
                 continue
 
-            ace = df = f_in = f_won = s_won = ""
+            ace = df = f_in = f_won = s_won = dr = ""
             try:
                 pts = float(r[c["pts"]] or 0)
                 firsts = float(r[c["firsts"]] or 0)
@@ -739,8 +832,25 @@ class TennisAbstractScraper:
                     seconds = pts - firsts
                     if seconds > 0:
                         s_won = f"{float(r[c['swon']] or 0) / seconds * 100:.0f}%"
+                    # Dominance ratio = (return points won) / (serve points lost),
+                    # matching TA's own formula: rpw/spl. Needs the opponent
+                    # serve block, which the matchhead map now gives us.
+                    opts = float(r[c["opts"]] or 0) if len(r) > c["opts"] else 0
+                    if opts > 0 and len(r) > c["oswon"]:
+                        spl = 1 - (float(r[c["fwon"]] or 0) + float(r[c["swon"]] or 0)) / pts
+                        rpw = 1 - (float(r[c["ofwon"]] or 0) + float(r[c["oswon"]] or 0)) / opts
+                        if spl > 0:
+                            dr = f"{rpw / spl:.2f}"
             except (ValueError, TypeError):
                 pass
+
+            # Break points saved, kept as a "saved/faced" fraction (the widget
+            # parses either a fraction or a percentage).
+            bps = ""
+            if len(r) > c["chances"]:
+                saved, chances = r[c["saved"]], r[c["chances"]]
+                if str(chances).strip() not in ("", "0"):
+                    bps = f"{saved}/{chances}"
 
             out.append(HistoricalMatchData(
                 date=date_str,
@@ -753,16 +863,14 @@ class TennisAbstractScraper:
                 result="Win" if wl == "W" else "Loss",
                 score=r[c["score"]],
                 charting_link="",
-                # DR and break-points need the opponent serve block, which is
-                # not reliably positioned in matchmx; left blank (the primary
-                # recent-results table carries these for recent matches).
-                dominance_ratio="",
+                level=r[c["level"]] if len(r) > c["level"] else "",
+                dominance_ratio=dr,
                 ace_rate=ace,
                 double_fault_rate=df,
                 first_serve_in=f_in,
                 first_serve_won=f_won,
                 second_serve_won=s_won,
-                break_points_saved="",
+                break_points_saved=bps,
                 match_time=r[c["time"]],
             ))
         return out
@@ -800,6 +908,14 @@ class TennisAbstractScraper:
                 historical_matches=historical_matches,
                 scrape_timestamp=datetime.now().isoformat(),
                 source_url=f"{BASE}/cgi-bin/player.cgi?p={slug}",
+                mcp_serve=main.get("generic:mcp-serve", {}),
+                mcp_return=main.get("generic:mcp-return", {}),
+                mcp_rally=main.get("generic:mcp-rally", {}),
+                pbp_stats=main.get("generic:pbp-stats", {}),
+                pbp_games=main.get("generic:pbp-games", {}),
+                pbp_points=main.get("generic:pbp-points", {}),
+                serve_speed_detail=main.get("generic:serve-speed", {}),
+                head_to_heads=main.get("generic:head-to-heads", {}),
             )
 
             print(f"Successfully scraped {player_name}: "

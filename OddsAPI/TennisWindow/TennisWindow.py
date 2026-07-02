@@ -19,9 +19,6 @@ from tennis_h2h_scraper import TennisScraper, PlayerRanking
 import tennis_sim
 import tennis_context
 
-#TODO: Reduce vertical padding between context adjustments and total game dist in Match Sim Panel to fix total games dist and labels clipping.
-#TODO: Adjust placement of Top level selectors(ELO, Custom ELO, Model) in Match Sim panel so as they no longer clip upon intial window load. Also reduce spacing of selectors for more compact look
-#TODO: Fix some metrics (DR, BP saved) not being plotted in the Form and Momentum panel. Implement logic for discerning what matchs results being plotted were tour, challenger, itf, etc
 
 class TennisTheme:
     """Tennis theme colors"""
@@ -2263,9 +2260,9 @@ class RecentFormMomentumWidget(QWidget):
         self.match_count_combo.currentTextChanged.connect(self.on_match_count_changed)
         self.match_count_combo.setGeometry(382, 45, 78, 25)
 
-        # Competition-level filter (tour vs challenger/ITF)
+        # Competition-level filter (tour vs challenger vs ITF)
         self.level_combo = QComboBox(self)
-        self.level_combo.addItems(["All levels", "Tour", "Ch/ITF"])
+        self.level_combo.addItems(["All levels", "Tour", "Challenger", "ITF"])
         self.level_combo.setStyleSheet(f"""
             QComboBox {{
                 background: {TennisTheme.SURFACE};
@@ -2312,8 +2309,18 @@ class RecentFormMomentumWidget(QWidget):
 
     @staticmethod
     def _level_class(code):
-        """Classify a Tennis Abstract level code as 'Tour' or 'Ch/ITF'."""
-        return 'Tour' if (code or '').strip() in ('G', 'M', 'A', 'F', 'D', 'O', 'P') else 'Ch/ITF'
+        """Classify a Tennis Abstract level code as 'Tour', 'Challenger' or 'ITF'.
+
+        TA level codes: G=Grand Slam, M=Masters/1000, A=ATP tour, F=Tour Finals,
+        D=Davis Cup, O=Olympics, P=team event -> Tour; C=Challenger; everything
+        else (S=Satellite/futures, 15/25=ITF $15k/$25k) -> ITF.
+        """
+        c = (code or '').strip()
+        if c in ('G', 'M', 'A', 'F', 'D', 'O', 'P'):
+            return 'Tour'
+        if c == 'C':
+            return 'Challenger'
+        return 'ITF'
 
     def filter_by_level(self, matches):
         """Filter a match list by the current competition-level selection."""
@@ -2918,58 +2925,30 @@ class RecentFormMomentumWidget(QWidget):
 
 
     def calculate_comprehensive_stats(self, recent_results):
-        """Calculate comprehensive averaged statistics from recent results"""
-        stats = {
-            'dominance_ratio': 0.0,
-            'first_serve_in': 0.0,
-            'ace_rate': 0.0,
-            'double_fault_rate': 0.0,
-            'first_serve_won': 0.0,
-            'second_serve_won': 0.0,
-            'break_points_saved': 0.0
-        }
+        """Calculate comprehensive averaged statistics from recent results.
 
-        # Counters for each stat type
-        counts = {key: 0 for key in stats.keys()}
-        totals = {key: 0.0 for key in stats.keys()}
+        Delegates per-match parsing to get_match_stat_value so every stat is read
+        the same way it is for the graph — crucially, break_points_saved arrives
+        as a "saved/faced" fraction ("4/6"), NOT a percentage, and dominance
+        ratio is a bare number. Parsing those inline as percentages silently
+        dropped them (ValueError), which is why DR / BP Saved showed "—"."""
+        keys = ['dominance_ratio', 'first_serve_in', 'ace_rate',
+                'double_fault_rate', 'first_serve_won', 'second_serve_won',
+                'break_points_saved']
+        counts = {key: 0 for key in keys}
+        totals = {key: 0.0 for key in keys}
 
         for result in recent_results:
-            try:
-                # Process each stat if available
-                stat_fields = {
-                    'dominance_ratio': 'dominance_ratio',
-                    'first_serve_in': 'first_serve_in',
-                    'ace_rate': 'ace_rate',
-                    'double_fault_rate': 'double_fault_rate',
-                    'first_serve_won': 'first_serve_won',
-                    'second_serve_won': 'second_serve_won',
-                    'break_points_saved': 'break_points_saved'
-                }
-
-                for stat_key, field_name in stat_fields.items():
-                    if hasattr(result, field_name):
-                        field_value = getattr(result, field_name)
-                        if field_value and field_value.strip() not in ['', '--']:
-                            # Handle dominance ratio (no % symbol)
-                            if stat_key == 'dominance_ratio':
-                                value = float(field_value)
-                            else:
-                                # Handle percentage values
-                                value = float(field_value.replace('%', ''))
-
-                            totals[stat_key] += value
-                            counts[stat_key] += 1
-
-            except (ValueError, AttributeError):
-                continue
+            for stat_key in keys:
+                value = self.get_match_stat_value(result, stat_key)
+                if value is not None:
+                    totals[stat_key] += value
+                    counts[stat_key] += 1
 
         # Average only stats that had data; mark the rest as unavailable (None)
         # so the UI shows "—" instead of a misleading 0.00.
-        for stat_key in stats.keys():
-            stats[stat_key] = (totals[stat_key] / counts[stat_key]
-                               if counts[stat_key] > 0 else None)
-
-        return stats
+        return {key: (totals[key] / counts[key] if counts[key] > 0 else None)
+                for key in keys}
 
     def calculate_dr_axis_range(self, p1_results, p2_results):
         """Calculate appropriate axis range for Dominance Ratio based on individual match values"""
@@ -3464,7 +3443,10 @@ class DistributionView(QWidget):
         ncols = gmax - gmin + 1
         maxp = max(gh.values()) or 1.0
         top = rect.y() + 22
-        bottom = rect.bottom() - 26
+        # Leave room below the bars for TWO label rows (axis min/max + the
+        # median/IQR caption); -26 clipped the caption on the widget's bottom
+        # edge whenever the panel sat at its minimum height.
+        bottom = rect.bottom() - 30
         plot_h = bottom - top
         bw = max(2.0, (rect.width() - 10) / ncols)
         med = self.res.games_quantile(0.5)
@@ -3491,10 +3473,10 @@ class DistributionView(QWidget):
         # axis labels
         p.setFont(QFont("Arial", 8))
         p.setPen(QColor(TennisTheme.TEXT_MUTED))
-        p.drawText(rect.x() + 5, bottom + 12, str(gmin))
-        p.drawText(rect.right() - 18, bottom + 12, str(gmax))
+        p.drawText(rect.x() + 5, bottom + 11, str(gmin))
+        p.drawText(rect.right() - 18, bottom + 11, str(gmax))
         p.setPen(QColor(TennisTheme.SECONDARY))
-        p.drawText(QRect(rect.x(), bottom + 13, rect.width(), 14),
+        p.drawText(QRect(rect.x(), bottom + 15, rect.width(), 13),
                    Qt.AlignmentFlag.AlignCenter,
                    f"median {med}  ·  IQR {q1}-{q3}")
 
@@ -3544,7 +3526,12 @@ class ContextView(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(150)
+        # Header (20px) + up to ~5 factor rows (24 + 5*15 = 99) ≈ 120px of real
+        # content; reserving 150 left a dead band above the games histogram.
+        # Cap it too so the panel packs tightly and the distribution below is
+        # not shoved off the bottom on shorter windows.
+        self.setMinimumHeight(126)
+        self.setMaximumHeight(140)
         self.p1_name = self.p2_name = ""
         self.ctx1 = self.ctx2 = None
         self.base_prob = None      # pre-context Elo win prob for P1
@@ -3678,15 +3665,14 @@ class MatchSimTab(QWidget):
             c = QComboBox()
             c.addItems(items)
             c.setStyleSheet(combo_style)
-            # Let Qt size the combo from its *polished* contents (real font +
-            # QSS padding + arrow) so nothing clips regardless of the system
-            # font. Fixed policy + a floor keeps a small combo from ballooning
-            # into a wider shared grid column.
-            c.setSizePolicy(QSizePolicy.Policy.MinimumExpanding,
-                QSizePolicy.Policy.Fixed)
-            c.setMinimumWidth(width)
+            # Fixed policy + a width floor keeps a small combo from ballooning
+            # into a wider shared grid column. A fixed HEIGHT is the important
+            # bit: without it, a short panel lets the surrounding QVBoxLayout
+            # compress the whole control grid, clipping the selector text on
+            # initial (small) window loads.
             c.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             c.setMinimumWidth(width)
+            c.setFixedHeight(24)
             c.currentTextChanged.connect(lambda *_: self.recompute())
             return c
 
@@ -3696,15 +3682,13 @@ class MatchSimTab(QWidget):
 
         # Two compact control rows.
         ctrl = QGridLayout()
+        ctrl.setContentsMargins(0, 0, 0, 0)
         ctrl.setHorizontalSpacing(6)
-        ctrl.setVerticalSpacing(4)
+        ctrl.setVerticalSpacing(3)
         self.surface_combo = mk_combo(["Hard", "Clay", "Grass"])
         self.bo_combo = mk_combo(["3", "5"], width=46)
         self.blend_combo = mk_combo(list(self._blend_w.keys()), width=120)
         self.model_combo = mk_combo(list(self._models), width=120)
-        print(self.surface_combo.sizeHint().width())
-        print(self.surface_combo.minimumSizeHint().width())
-        print(self.surface_combo.width()) # Debug print delete later
         ctrl.addWidget(mk_lbl("Surface:"), 0, 0)
         ctrl.addWidget(self.surface_combo, 0, 1)
         ctrl.addWidget(mk_lbl("Best of:"), 0, 2)
