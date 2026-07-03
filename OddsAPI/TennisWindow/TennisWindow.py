@@ -8,7 +8,7 @@ from dataclasses import dataclass, asdict
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton,
-    QComboBox, QCheckBox, QScrollArea, QTabWidget
+    QComboBox, QCheckBox, QScrollArea, QTabWidget, QStackedLayout
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect, QPoint
 from PyQt6.QtGui import (
@@ -1511,11 +1511,18 @@ class PlayerProfileWidget(QWidget):
                         pass
 
                 # Get recent form and surface data from H2H scraper by doing a dummy comparison
+                yearly_emitted = False
                 try:
-                    # Create a dummy comparison to get player stats with recent form and surface data
-                    dummy_player = "Carlos Alcaraz"  # Use a common player as dummy
-                    if self.player_name.lower() == dummy_player.lower():
-                        dummy_player = "Jannik Sinner"  # Use different dummy if same player
+                    # Dummy opponent must be same-tour or tennistonic has no page.
+                    tour = getattr(getattr(player_data, 'player_bio', None), 'tour', '') or 'ATP'
+                    if tour == 'WTA':
+                        dummy_player = "Aryna Sabalenka"
+                        if self.player_name.lower() == dummy_player.lower():
+                            dummy_player = "Iga Swiatek"
+                    else:
+                        dummy_player = "Carlos Alcaraz"
+                        if self.player_name.lower() == dummy_player.lower():
+                            dummy_player = "Jannik Sinner"
 
                     h2h_data = self.h2h_scraper.scrape_h2h_comprehensive_sync(self.player_name, dummy_player)
                     if h2h_data:
@@ -1549,11 +1556,23 @@ class PlayerProfileWidget(QWidget):
 
                             # Also emit yearly stats for historical table
                             self.yearlyStatsLoaded.emit(self.player_name, target_player_data.yearly_stats, self.player_num)
+                            yearly_emitted = True
 
                 except Exception as e:
                     print(f"Error getting H2H data for {self.player_name}: {e}")
-                    # Fallback to placeholder if H2H scraper fails
-                    self.update_form(['L', 'L', 'L', 'L', 'L'])
+
+                # Tennistonic miss (common for WTA / blocked pages): derive the
+                # yearly surface table and recent form from the TA match log we
+                # already scraped, so both tours populate identically.
+                if not yearly_emitted and player_data and player_data.historical_matches:
+                    ys = yearly_stats_from_history(player_data.historical_matches)
+                    if ys:
+                        self.surface_widget.update_stats_from_yearly_data(ys)
+                        self.yearlyStatsLoaded.emit(self.player_name, ys, self.player_num)
+                    form = ['W' if getattr(m, 'result', '') == 'Win' else 'L'
+                            for m in player_data.historical_matches[:5]]
+                    if form:
+                        self.update_form(form)
 
                 # Emit signal that data is updated
                 self.dataUpdated.emit(self.player_name)
@@ -1770,6 +1789,460 @@ class PlayerProfileWidget(QWidget):
 
 
 
+
+
+class TournamentBracketWidget(QWidget):
+    """Live tournament bracket built from Tennis Abstract's draw-forecast
+    pages (tennisabstract.com/current/...Forecast.html — slams, tour events
+    and challengers). The page lists players in DRAW ORDER with per-round
+    survival probabilities, so slot j of round k is the contiguous block of
+    2^(k+1) rows and its occupant is the block's most probable survivor —
+    decided slots show the actual player (~100%), undecided ones the
+    favourite with their % to arrive. Shares the rankings-chart slot via a
+    toggle; the two selected players are highlighted in their colours."""
+
+    bracketReady = pyqtSignal(object)
+    bracketFailed = pyqtSignal(str)
+    eventsReady = pyqtSignal(object)
+
+    HOME = "https://www.tennisabstract.com"
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(900, 220)
+        self.setStyleSheet(f"background: {TennisTheme.CARD_BACKGROUND}; border-radius: 8px;")
+        self._data = None          # {'title', 'labels', 'players', 'probs'}
+        self._status = "Pick a tournament"
+        self._highlight = {}       # surname -> highlight colour
+        self._loaded_once = False
+
+        self.event_combo = QComboBox(self)
+        self.event_combo.setGeometry(8, 6, 250, 22)
+        self.event_combo.setStyleSheet(f"""
+            QComboBox {{ background: {TennisTheme.SURFACE}; color: {TennisTheme.TEXT_PRIMARY};
+                         border: 1px solid {TennisTheme.TEXT_MUTED}; font-size: 10px;
+                         padding: 1px 18px 1px 6px; }}
+            QComboBox QAbstractItemView {{ background: {TennisTheme.SURFACE};
+                         color: {TennisTheme.TEXT_PRIMARY};
+                         selection-background-color: {TennisTheme.PRIMARY}; }}
+        """)
+        self.event_combo.currentIndexChanged.connect(self._on_event_changed)
+        self.bracketReady.connect(self._on_bracket)
+        self.bracketFailed.connect(self._on_failed)
+        self.eventsReady.connect(self._on_events)
+
+    # -- data loading -------------------------------------------------------
+    def ensure_loaded(self):
+        """Discover current events on first show."""
+        if self._loaded_once:
+            return
+        self._loaded_once = True
+        self._status = "Finding current events…"
+
+        def worker():
+            try:
+                import requests as _rq
+                html = _rq.get(f"{self.HOME}/", timeout=20,
+                               headers={"User-Agent": "Mozilla/5.0"}).text
+                links = re.findall(r'href="(https?://[^"]*/current/([^"]+)\.html)"', html)
+                year = str(datetime.now().year)
+                seen, events = set(), []
+                for url, name in links:
+                    # the homepage links a few stale past-year pages — skip them
+                    if name in seen or not name.startswith(year):
+                        continue
+                    seen.add(name)
+                    label = re.sub(r'(?<!^)(?=[A-Z0-9][a-z])', ' ', name).strip()
+                    events.append((label, url))
+                # slam/tour forecasts first, then challengers alphabetically
+                events.sort(key=lambda e: (0 if 'Forecast' in e[1] else 1, e[0]))
+                self.eventsReady.emit(events)
+            except Exception as e:
+                self.bracketFailed.emit(f"event discovery failed: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_events(self, events):
+        self.event_combo.blockSignals(True)
+        self.event_combo.clear()
+        for label, url in events:
+            self.event_combo.addItem(label, url)
+        self.event_combo.blockSignals(False)
+        if events:
+            self._on_event_changed(0)
+        else:
+            self._status = "No current events found"
+            self.update()
+
+    def _on_event_changed(self, _idx):
+        url = self.event_combo.currentData()
+        if not url:
+            return
+        self._status = "Loading draw…"
+        self._data = None
+        self.update()
+
+        def worker():
+            try:
+                import requests as _rq
+                html = _rq.get(url, timeout=20,
+                               headers={"User-Agent": "Mozilla/5.0"}).text
+                data = self._parse_forecast(html)
+                if data:
+                    try:
+                        self._add_own_forecast(data)
+                    except Exception as e:
+                        print(f"own bracket forecast failed: {e}")
+                    self.bracketReady.emit(data)
+                else:
+                    self.bracketFailed.emit("no forecast table on page")
+            except Exception as e:
+                self.bracketFailed.emit(str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- our own Elo forecast of the same draw ------------------------------
+    _elo_tables = {}          # tour -> (overall, surface, n) walk-forward Elo
+    _elo_lock = threading.Lock()
+
+    @classmethod
+    def _corpus_elo(cls, tour: str):
+        """Current walk-forward Elo (overall + per-surface) from td_matches —
+        the same rating structure the backtest validated, built locally in
+        ~1s and cached for the session. Keys are td_name_key form."""
+        with cls._elo_lock:
+            if tour in cls._elo_tables:
+                return cls._elo_tables[tour]
+            from backtest_model import WalkForwardElo
+            import pathlib
+            elo = WalkForwardElo()
+            con = sqlite3.connect(str(pathlib.Path(__file__).parent / "tennis_rankings.db"))
+            for _d, s, wk, lk in con.execute(
+                    """SELECT date, surface, winner_key, loser_key FROM td_matches
+                       WHERE tour=? AND surface IN ('Hard','Clay','Grass')
+                       ORDER BY date, id""", (tour,)):
+                elo.update(wk, lk, s)
+            con.close()
+            cls._elo_tables[tour] = elo
+            return elo
+
+    def _add_own_forecast(self, data):
+        """Exact bracket DP: P(each player reaches each remaining round) from
+        our corpus Elo, conditioned on eliminations already in TA's numbers
+        (an eliminated player's row is all zeros; a bye/decided pairing passes
+        the survivor through at probability 1)."""
+        from tennis_data_ingest import td_name_key
+        players = data['players']
+        probs = data['probs']
+        n = len(players)
+        keys = [td_name_key(p) for p in players]
+
+        # tour = whichever rating table knows more of these players
+        cands = {}
+        for tour in ("ATP", "WTA"):
+            elo = self._corpus_elo(tour)
+            cands[tour] = (sum(1 for k in keys if elo.n.get(k, 0) >= 5), elo)
+        tour = max(cands, key=lambda t: cands[t][0])
+        elo = cands[tour][1]
+
+        # surface from the corpus (most common for this tournament name)
+        surface = "Hard"
+        try:
+            import pathlib
+            con = sqlite3.connect(str(pathlib.Path(__file__).parent / "tennis_rankings.db"))
+            toks = [t for t in re.findall(r'[A-Za-z]+', data.get('title', ''))
+                    if len(t) > 3 and t.lower() not in
+                    ('draw', 'forecast', 'men', 'women')]
+            for t in toks:
+                row = con.execute(
+                    """SELECT surface, COUNT(*) c FROM td_matches
+                       WHERE tournament LIKE ? GROUP BY surface
+                       ORDER BY c DESC LIMIT 1""", (f"%{t}%",)).fetchone()
+                if row:
+                    surface = row[0]
+                    break
+            con.close()
+        except Exception:
+            pass
+
+        def rating(i):
+            k = keys[i]
+            if elo.n.get(k, 0) < 3:
+                return 1420.0            # qualifier / unknown
+            return 0.5 * elo.surface[(k, surface)] + 0.5 * elo.overall[k]
+
+        rat = [rating(i) for i in range(n)]
+        alive = [1.0 if any(v > 0 for v in probs[i]) else 0.0 for i in range(n)]
+
+        ours = [[0.0] * len(data['labels']) for _ in range(n)]
+        cur = alive[:]
+        for k in range(len(data['labels'])):
+            seg = 2 ** (k + 1)
+            nxt = [0.0] * n
+            for b0 in range(0, n, seg):
+                half = seg // 2
+                A = range(b0, b0 + half)
+                B = range(b0 + half, b0 + seg)
+                sa, sb = sum(cur[i] for i in A), sum(cur[j] for j in B)
+                for i in A:
+                    if cur[i] <= 0:
+                        continue
+                    nxt[i] = cur[i] if sb <= 1e-9 else cur[i] * sum(
+                        cur[j] * tennis_sim.elo_win_prob(rat[i], rat[j]) for j in B)
+                for j in B:
+                    if cur[j] <= 0:
+                        continue
+                    nxt[j] = cur[j] if sa <= 1e-9 else cur[j] * sum(
+                        cur[i] * tennis_sim.elo_win_prob(rat[j], rat[i]) for i in A)
+            for i in range(n):
+                ours[i][k] = nxt[i] * 100.0
+            cur = nxt
+        data['ours'] = ours
+        data['ratings'] = rat
+        data['surface'] = surface
+        data['tour'] = tour
+
+    @staticmethod
+    def _parse_forecast(html: str):
+        """Parse a TA forecast page into draw-ordered players + prob matrix."""
+        title_m = re.search(r'<h2[^>]*>([^<]+)</h2>', html)
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+        labels: List[str] = []
+        players: List[str] = []
+        probs: List[List[float]] = []
+        for tr in rows:
+            cells = [re.sub(r'<[^>]+>', '', c).replace('&nbsp;', ' ').strip()
+                     for c in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.DOTALL)]
+            if not cells:
+                continue
+            # Header row (repeats per draw section). The very first one has the
+            # page title glued into the Player cell, so match by containment.
+            if any(c.endswith('Player') for c in cells):
+                if not labels:
+                    labels = [c for c in cells if re.fullmatch(r'R\d+|QF|SF|F|W', c)]
+                continue
+            # player rows: a name cell followed by percentage cells
+            pcts = [c for c in cells if c.endswith('%')]
+            if not pcts or not labels:
+                continue
+            # Name arrives as one combined cell like '(1)Jannik Sinner (ITA)'
+            # or 'Miomir Kecmanovic (SRB)' — strip seed/entry prefix + country.
+            name = ""
+            for c in cells:
+                c2 = c.strip()
+                if not c2 or c2.endswith('%'):
+                    continue
+                c2 = re.sub(r'^(\((?:\d+|WC|Q|LL|SE|PR|Alt)\)\s*)+', '', c2)
+                c2 = re.sub(r'\s*\([A-Z]{3}\)\s*$', '', c2).strip()
+                if c2 and any(ch.isalpha() for ch in c2):
+                    name = c2
+                    break
+            if not name:
+                # keep draw order intact even for unparsed slots (byes/quals)
+                name = '—'
+            vals = []
+            for c in pcts[:len(labels)]:
+                try:
+                    vals.append(float(c.rstrip('%')))
+                except ValueError:
+                    vals.append(0.0)
+            while len(vals) < len(labels):
+                vals.append(0.0)
+            players.append(name)
+            probs.append(vals)
+        # draws are powers of two; trim stray rows (e.g. byes footnotes)
+        n = 1
+        while n * 2 <= len(players):
+            n *= 2
+        if n < 2:
+            return None
+        players, probs = players[:n], probs[:n]
+        return {'title': title_m.group(1).strip() if title_m else '',
+                'labels': labels, 'players': players, 'probs': probs}
+
+    def _on_bracket(self, data):
+        self._data = data
+        self._status = ""
+        self.update()
+
+    def _on_failed(self, msg):
+        self._status = f"Bracket unavailable: {msg}"
+        self.update()
+
+    def set_highlight(self, names):
+        """Highlight players in their panel colours (P1 teal, P2 red)."""
+        colors = (TennisTheme.PRIMARY, TennisTheme.ACCENT)
+        self._highlight = {n.split()[-1].lower(): colors[min(i, 1)]
+                           for i, n in enumerate(names) if n}
+        self.update()
+
+    # -- painting -----------------------------------------------------------
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        if not self._data:
+            p.setPen(QColor(TennisTheme.TEXT_MUTED))
+            p.setFont(QFont("Arial", 9))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status)
+            return
+        d = self._data
+        n = len(d['players'])
+        labels = d['labels']
+        # show at most the last 5 rounds (16 slots max in the first column)
+        n_rounds = len(labels)
+        first_i = max(0, n_rounds - 5)
+        show = list(range(first_i, n_rounds))
+        # header band (combo + title) is y 0-30; round labels get their own
+        # row below it so nothing collides.
+        path = self._player_path()
+        top = 46
+        bottom = self.height() - (22 if path else 4)
+        col_w = (self.width() - 16) / len(show)
+
+        p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+        p.drawText(QRect(266, 6, self.width() - 274, 20),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   d['title'])
+        # Legend for the per-slot dual percentages, right of the title.
+        if d.get('ours'):
+            p.setFont(QFont("Arial", 8))
+            p.setPen(QColor(TennisTheme.SECONDARY))
+            p.drawText(QRect(0, 6, self.width() - 44, 20),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                       "%:  TA forecast / our Elo sim")
+
+        for ci, ri in enumerate(show):
+            seg = 2 ** (ri + 1)                     # rows per slot at this round
+            slots = max(1, n // seg)
+            x = 8 + ci * col_w
+            p.setPen(QColor(TennisTheme.SECONDARY))
+            p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+            p.drawText(QRect(int(x), top - 12, int(col_w), 10),
+                       Qt.AlignmentFlag.AlignCenter, labels[ri])
+            slot_h = (bottom - top) / slots
+            p.setFont(QFont("Arial", 7))
+            for j in range(slots):
+                lo, hi = j * seg, (j + 1) * seg
+                best, bp = None, -1.0
+                for k in range(lo, min(hi, n)):
+                    v = d['probs'][k][ri]
+                    if v > bp:
+                        best, bp = d['players'][k], v
+                y = top + j * slot_h
+                cy = int(y + slot_h / 2)
+                # connector stub
+                p.setPen(QColor(TennisTheme.SURFACE))
+                p.drawLine(int(x), cy, int(x + col_w - 6), cy)
+                if not best or bp <= 0:
+                    continue
+                surname = best.split()[-1].lower()
+                if surname in self._highlight:
+                    color = QColor(self._highlight[surname])
+                elif bp >= 99.5:
+                    color = QColor(TennisTheme.TEXT_PRIMARY)
+                else:
+                    color = QColor(TennisTheme.TEXT_SECONDARY)
+                # show TA% / our corpus-Elo % side by side
+                op_val = None
+                if d.get('ours'):
+                    ki = d['players'].index(best) if best in d['players'] else -1
+                    if ki >= 0:
+                        op_val = d['ours'][ki][ri]
+                if bp >= 99.5 and (op_val is None or op_val >= 99.5):
+                    txt = best
+                elif op_val is None:
+                    txt = f"{best} {bp:.0f}%"
+                else:
+                    txt = f"{best} {bp:.0f}/{op_val:.0f}"
+                p.setPen(color)
+                p.drawText(QRect(int(x) + 2, int(y), int(col_w) - 6, int(slot_h)),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           txt[:28])
+
+        if path:
+            p.setPen(QColor(TennisTheme.SECONDARY))
+            p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+            p.drawText(QRect(8, self.height() - 18, 46, 14),
+                       Qt.AlignmentFlag.AlignVCenter, "PATH")
+            p.setFont(QFont("Arial", 8))
+            p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            p.drawText(QRect(52, self.height() - 18, self.width() - 60, 14),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       path)
+        p.end()
+
+    def _player_path(self) -> str:
+        """Highlighted player's projected route: for each remaining round, the
+        most likely opponent (by TA reach prob) and OUR Elo win% against them."""
+        d = self._data
+        if not (d and d.get('ours') and self._highlight):
+            return ""
+        players, probs, rat = d['players'], d['probs'], d['ratings']
+        n = len(players)
+        # Prefer P1's path (highlight dict preserves selection order).
+        idx = None
+        for sn in self._highlight:
+            idx = next((i for i, nm in enumerate(players)
+                        if nm.split()[-1].lower() == sn), None)
+            if idx is not None and any(v > 0 for v in probs[idx]):
+                break
+            idx = None
+        if idx is None:
+            return ""
+        parts = [players[idx].split()[-1] + ":"]
+        for k, lab in enumerate(d['labels']):
+            if probs[idx][k] >= 99.5:
+                continue                      # round already reached
+            seg = 2 ** (k + 1)
+            b0 = (idx // seg) * seg
+            half = seg // 2
+            sib = range(b0 + half, b0 + seg) if idx < b0 + half else range(b0, b0 + half)
+            opp, best = None, -1.0
+            for j in sib:
+                v = max(probs[j][k - 1] if k else probs[j][0], probs[j][k])
+                if v > best and j != idx:
+                    opp, best = j, v
+            if opp is None or best <= 0:
+                continue
+            wp = tennis_sim.elo_win_prob(rat[idx], rat[opp]) * 100
+            parts.append(f"{lab} {players[opp].split()[-1]} ({wp:.0f}%)")
+        return "   ·  ".join(parts) if len(parts) > 1 else ""
+
+
+def yearly_stats_from_history(matches) -> dict:
+    """Build the tennistonic-shaped yearly surface table ({year: {'Sum.',
+    'Hard', 'Clay', 'I.hard', 'Grass': 'W-L'}} + 'Year Total') from the Tennis
+    Abstract match log. Used when the tennistonic dummy-H2H yields nothing
+    (WTA players, blocked pages) — TA can't split indoor hard, so I.hard
+    stays '0-0' and indoor matches count under Hard."""
+    counts: Dict[str, Dict[str, List[int]]] = {}
+
+    def bump(year, surf, won):
+        yd = counts.setdefault(year, {})
+        for k in (surf, 'Sum.'):
+            wl = yd.setdefault(k, [0, 0])
+            wl[0 if won else 1] += 1
+
+    for m in matches or []:
+        get = m.get if isinstance(m, dict) else lambda k, d="": getattr(m, k, d)
+        res = get('result')
+        d = str(get('date') or '')
+        if res not in ('Win', 'Loss') or len(d) < 4 or not d[:4].isdigit():
+            continue
+        surf = str(get('surface') or '').strip().title()
+        if surf not in ('Hard', 'Clay', 'Grass'):
+            surf = 'Hard' if surf == 'Carpet' else (surf or 'Hard')
+        bump(d[:4], surf, res == 'Win')
+        bump('Year Total', surf, res == 'Win')
+
+    out = {}
+    for year, yd in counts.items():
+        out[year] = {k: f"{w}-{l}" for k, (w, l) in yd.items()}
+        for k in ('Hard', 'Clay', 'I.hard', 'Grass'):
+            out[year].setdefault(k, '0-0')
+    return out
 
 
 class CompactStatsWidget(QWidget):
@@ -3581,17 +4054,24 @@ class DistributionView(QWidget):
         maxp = max((v for _, v in items), default=1.0) or 1.0
         row_h = 20
         top = rect.y() + 24
-        bar_x = rect.x() + 86
+        p.setFont(QFont("Arial", 9))
+        # Size the label column to the longest actual label ("Alexandrova 2-0"
+        # overflows a fixed 84px column), capped so the bars keep some room.
+        fm = p.fontMetrics()
+        label_w = max((fm.horizontalAdvance(f"{sn1 if k.startswith('A') else sn2} "
+                                            f"{k.split(' ')[1]}")
+                       for k, _v in items), default=84) + 6
+        label_w = min(label_w, int(rect.width() * 0.45))
+        bar_x = rect.x() + label_w + 2
         bar_max = rect.right() - bar_x - 42
 
-        p.setFont(QFont("Arial", 9))
         for i, (key, prob) in enumerate(items):
             side, sc = key.split(" ")
             who = sn1 if side == "A" else sn2
             color = self.p1_color if side == "A" else self.p2_color
             y = top + i * row_h
             p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
-            p.drawText(QRect(rect.x(), y, 84, row_h),
+            p.drawText(QRect(rect.x(), y, label_w, row_h),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        f"{who} {sc}")
             bw = (prob / maxp) * bar_max
@@ -3980,6 +4460,40 @@ class MatchSimTab(QWidget):
         self.context_view.set_data(self.p1_name, self.p2_name,
                                    meta['ctx1'], meta['ctx2'],
                                    meta['base_prob'], headline, meta['applied'])
+        self._log_price(res, model)
+
+    def _log_price(self, res, model):
+        """Snapshot the model's prices so they can later be graded against
+        closing lines/outcomes in td_matches (clv_report.py). One row per
+        matchup+config per 6h; failures never disturb the UI."""
+        try:
+            import pathlib
+            db = str(pathlib.Path(__file__).parent / "tennis_rankings.db")
+            con = sqlite3.connect(db)
+            con.execute("""CREATE TABLE IF NOT EXISTS model_price_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT DEFAULT (datetime('now')),
+                p1 TEXT, p2 TEXT, surface TEXT, best_of INTEGER, model TEXT,
+                p_model REAL, elo_p REAL, anchor_delta REAL,
+                fair_spread REAL, med_games INTEGER, avg_games REAL)""")
+            dupe = con.execute(
+                """SELECT 1 FROM model_price_log WHERE p1=? AND p2=? AND surface=?
+                   AND best_of=? AND model=? AND ts > datetime('now','-6 hours')""",
+                (self.p1_name, self.p2_name, self.surface_combo.currentText(),
+                 int(self.bo_combo.currentText()), model)).fetchone()
+            if not dupe:
+                sline, _ = res.fair_spread()
+                con.execute(
+                    """INSERT INTO model_price_log (p1, p2, surface, best_of, model,
+                       p_model, elo_p, anchor_delta, fair_spread, med_games, avg_games)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (self.p1_name, self.p2_name, self.surface_combo.currentText(),
+                     int(self.bo_combo.currentText()), model, res.p_a, None,
+                     res.anchor_delta, sline, res.games_quantile(0.5), res.avg_games))
+                con.commit()
+            con.close()
+        except Exception as e:
+            print(f"price log skipped: {e}")
 
 
 class HeadToHeadTab(QWidget):
@@ -4753,20 +5267,33 @@ class MatchupAnalysisPanel(QWidget):
 
 
 class MarketLedgerWidget(QWidget):
-    """Bottom-left panel: each selected player's recent matches with closing
-    odds from the td_matches corpus (tennis-data.co.uk), plus a market summary
-    line — record as favourite / underdog and the ROI of blindly backing the
-    player at the closing average price. Data no other panel shows: how the
-    market has priced these players lately, and whether it was right."""
+    """Bottom-left panel: each selected player's recent matches with market
+    prices, plus a summary line — record as favourite / underdog and the ROI
+    of blindly backing the player at the closing average price.
 
-    N_ROWS = 11          # recent matches listed per player
+    Two data layers: the td_matches corpus (tennis-data.co.uk closing odds)
+    renders instantly and powers the 50-match summary; OddsPortal is then
+    fetched on a background thread and, when it answers, replaces the match
+    list — it is days fresher, includes any UPCOMING fixture with the live
+    current price, and its finished rows carry closing averages."""
+
+    N_ROWS = 26          # recent matches kept per player (paint clips to height)
     N_SUMMARY = 50       # matches the summary line aggregates over
+
+    opReady = pyqtSignal(int, int, object)   # player_num, generation, rows
+
+    _op_client = None            # shared OddsPortalClient (lazy, class-level)
+    _op_lock = threading.Lock()
 
     def __init__(self, db_path: Optional[str] = None):
         super().__init__()
         import pathlib
         self.db_path = db_path or str(pathlib.Path(__file__).parent / "tennis_rankings.db")
-        self.setFixedSize(900, 236)
+        # Fixed width to match the left column; height grows with the window
+        # (the grid gives this row the leftover stretch).
+        self.setFixedWidth(900)
+        self.setMinimumHeight(236)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"""
             MarketLedgerWidget {{
                 background: {TennisTheme.CARD_BACKGROUND};
@@ -4777,13 +5304,100 @@ class MarketLedgerWidget(QWidget):
         self.p1_name = self.p2_name = ""
         self.p1_rows, self.p2_rows = [], []
         self.p1_summary = self.p2_summary = ""
+        self._gen = {1: 0, 2: 0}         # drops stale async results
+        self._op_live = {1: False, 2: False}   # OP rows currently displayed?
+        self.opReady.connect(self._on_op_ready)
+
+    @classmethod
+    def _client(cls):
+        with cls._op_lock:
+            if cls._op_client is None:
+                import sys as _sys
+                import pathlib as _pathlib
+                parent = str(_pathlib.Path(__file__).parent.parent)
+                if parent not in _sys.path:
+                    _sys.path.insert(0, parent)
+                from OddsPortalClient import OddsPortalClient
+                cls._op_client = OddsPortalClient()
+            return cls._op_client
 
     def set_player(self, player_name: str, player_num: int):
         rows, summary = self._load(player_name)
+        self._gen[player_num] += 1
+        self._op_live[player_num] = False
         if player_num == 1:
             self.p1_name, self.p1_rows, self.p1_summary = player_name, rows, summary
         else:
             self.p2_name, self.p2_rows, self.p2_summary = player_name, rows, summary
+        self.update()
+        self._fetch_oddsportal(player_name, player_num, self._gen[player_num])
+
+    # ------------------------------------------------------------------ #
+    # OddsPortal layer
+    # ------------------------------------------------------------------ #
+    def _fetch_oddsportal(self, player_name: str, player_num: int, gen: int):
+        def worker():
+            try:
+                from tennis_data_ingest import td_name_key
+                from urllib.parse import quote
+                key = td_name_key(player_name)
+                surname = " ".join(player_name.split()[1:]) or player_name
+                c = self._client()
+                q = quote(surname)
+                fin = c.search_matches(q, results=True, pages=2, sport="tennis")
+                upc = c.search_matches(q, results=False, pages=1, sport="tennis")
+
+                def mine(m):
+                    return td_name_key(m.home) == key or td_name_key(m.away) == key
+
+                rows = []
+                for m in [x for x in upc if mine(x)][:2]:
+                    rows.append(self._op_row(m, key, upcoming=True))
+                for m in [x for x in fin if mine(x)]:
+                    if len(rows) >= self.N_ROWS:
+                        break
+                    rows.append(self._op_row(m, key, upcoming=False))
+                if any(r for r in rows):
+                    self.opReady.emit(player_num, gen, rows)
+            except Exception as e:
+                print(f"MarketLedger OddsPortal fetch failed for {player_name}: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _op_row(m, key, upcoming: bool):
+        """SearchMatch -> ledger row tuple (player-perspective)."""
+        from tennis_data_ingest import td_name_key
+        from datetime import datetime as _dt
+        is_home = td_name_key(m.home) == key
+        opp = m.away if is_home else m.home
+        date = _dt.fromtimestamp(m.start_ts).strftime("%Y-%m-%d") if m.start_ts else ""
+        # tournament strings look like "ATP Wimbledon (grass)"
+        tourney = re.sub(r"\s*\((hard|clay|grass|indoor)\)\s*$", "", m.tournament,
+                         flags=re.I)
+        my_odds = 0.0
+        if len(m.odds) >= 2:
+            o = m.odds[0] if is_home else m.odds[1]
+            my_odds = o.avg_odds or o.max_odds or 0.0
+        if upcoming:
+            return (date, tourney, "", "", opp, None, my_odds, "", "up", m.url or "")
+        hs, _, as_ = (m.result or "").partition(":")
+        try:
+            mine_s, opp_s = (int(hs), int(as_)) if is_home else (int(as_), int(hs))
+            won = mine_s > opp_s
+            score = f"{mine_s}-{opp_s}"
+        except ValueError:
+            won, score = None, m.result or ""
+        return (date, tourney, "", "", opp, won, my_odds, score, "op", m.url or "")
+
+    def _on_op_ready(self, player_num: int, gen: int, rows):
+        if gen != self._gen[player_num]:
+            return
+        self._op_live[player_num] = True
+        if player_num == 1:
+            self.p1_rows = rows
+        else:
+            self.p2_rows = rows
         self.update()
 
     def merge_ta_matches(self, player_name: str, historical_matches, player_num: int):
@@ -4793,8 +5407,8 @@ class MarketLedgerWidget(QWidget):
         form current (e.g. this week's Wimbledon rounds)."""
         rows = self.p1_rows if player_num == 1 else self.p2_rows
         name = self.p1_name if player_num == 1 else self.p2_name
-        if player_name != name:
-            return
+        if player_name != name or self._op_live.get(player_num):
+            return      # OddsPortal rows already cover the fresh matches
         newest_td = rows[0][0] if rows else "1970-01-01"
         fresh = []
         for m in historical_matches or []:
@@ -4817,7 +5431,8 @@ class MarketLedgerWidget(QWidget):
                         sl += 1
             score = f"{sw}-{sl}" if won else f"{sl}-{sw}"
             fresh.append((iso, get('tournament', ''), get('round', ''),
-                          get('surface', ''), get('opponent', ''), won, 0.0, score))
+                          get('surface', ''), get('opponent', ''), won, 0.0,
+                          score, "ta", ""))
         if not fresh:
             return
         merged = (fresh + rows)[:self.N_ROWS]
@@ -4874,7 +5489,7 @@ class MarketLedgerWidget(QWidget):
                 if comment and str(comment).strip().lower() != "completed":
                     score += " ret"
                 rows.append((date or "", tourney or "", rnd or "", surf or "",
-                             opp, won, my_odds, score))
+                             opp, won, my_odds, score, "td", ""))
         summary = ""
         if raw:
             summary = f"{wins}-{losses} last {len(raw)}"
@@ -4926,23 +5541,25 @@ class MarketLedgerWidget(QWidget):
         row_h = 16
         top = y + 18
         # columns: date, tournament, opp, W/L score, odds
-        cw = {"date": 42, "tour": 108, "opp": 132, "res": 74, "odds": 44}
+        cw = {"date": 42, "tour": 100, "opp": 126, "res": 74, "odds": 70}
         p.setFont(QFont("Arial", 7))
         p.setPen(QColor(TennisTheme.TEXT_MUTED))
         cx = x
         for label, wdt in (("DATE", cw["date"]), ("EVENT", cw["tour"]),
                            ("OPPONENT", cw["opp"]), ("RESULT", cw["res"]),
-                           ("CLOSE", cw["odds"])):
+                           ("ODDS/CLOSING", cw["odds"])):
             p.drawText(QRect(cx, top, wdt, 12),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
             cx += wdt + 6
         p.setFont(QFont("Arial", 8))
-        for i, (date, tourney, rnd, surf, opp, won, odds, score) in enumerate(rows):
+        for i, (date, tourney, rnd, surf, opp, won, odds, score, kind, url) in enumerate(rows):
             ry = top + 13 + i * row_h
             if ry + row_h > rect.bottom():
                 break
+            upcoming = kind == "up"
             cx = x
-            p.setPen(QColor(TennisTheme.TEXT_MUTED))
+            p.setPen(QColor(TennisTheme.SECONDARY) if upcoming
+                     else QColor(TennisTheme.TEXT_MUTED))
             p.drawText(QRect(cx, ry, cw["date"], row_h),
                        Qt.AlignmentFlag.AlignVCenter, date[5:] if len(date) >= 10 else date)
             cx += cw["date"] + 6
@@ -4953,18 +5570,37 @@ class MarketLedgerWidget(QWidget):
             p.drawText(QRect(cx, ry, cw["opp"], row_h), Qt.AlignmentFlag.AlignVCenter,
                        (opp[:19] + "…") if len(opp) > 20 else opp)
             cx += cw["opp"] + 6
-            p.setPen(QColor("#4CAF50") if won else QColor("#FF6B6B"))
-            p.drawText(QRect(cx, ry, cw["res"], row_h), Qt.AlignmentFlag.AlignVCenter,
-                       f"{'W' if won else 'L'} {score}")
+            if upcoming:
+                p.setPen(QColor(TennisTheme.SECONDARY))
+                p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                p.drawText(QRect(cx, ry, cw["res"], row_h),
+                           Qt.AlignmentFlag.AlignVCenter, "UPCOMING")
+                p.setFont(QFont("Arial", 8))
+            elif won is None:
+                p.setPen(QColor(TennisTheme.TEXT_MUTED))
+                p.drawText(QRect(cx, ry, cw["res"], row_h),
+                           Qt.AlignmentFlag.AlignVCenter, score)
+            else:
+                p.setPen(QColor("#4CAF50") if won else QColor("#FF6B6B"))
+                p.drawText(QRect(cx, ry, cw["res"], row_h),
+                           Qt.AlignmentFlag.AlignVCenter, f"{'W' if won else 'L'} {score}")
             cx += cw["res"] + 6
             if odds:
-                # colour the closing price by fav/dog status
-                p.setPen(QColor(TennisTheme.SECONDARY) if odds < 2.0
-                         else QColor(TennisTheme.TEXT_PRIMARY))
-                p.drawText(QRect(cx, ry, cw["odds"], row_h),
-                           Qt.AlignmentFlag.AlignVCenter, f"{odds:.2f}")
+                if upcoming:
+                    # the live current price, not a close — make it pop
+                    p.setPen(QColor(TennisTheme.SECONDARY))
+                    p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                    p.drawText(QRect(cx, ry, cw["odds"], row_h),
+                               Qt.AlignmentFlag.AlignVCenter, f"{odds:.2f}")
+                    p.setFont(QFont("Arial", 8))
+                else:
+                    # colour the closing price by fav/dog status
+                    p.setPen(QColor(TennisTheme.SECONDARY) if odds < 2.0
+                             else QColor(TennisTheme.TEXT_PRIMARY))
+                    p.drawText(QRect(cx, ry, cw["odds"], row_h),
+                               Qt.AlignmentFlag.AlignVCenter, f"{odds:.2f}")
             else:
-                # fresh TA row — no closing price in the corpus yet
+                # no price available (fresh TA row / unpriced OP row)
                 p.setPen(QColor(TennisTheme.TEXT_MUTED))
                 p.drawText(QRect(cx, ry, cw["odds"], row_h),
                            Qt.AlignmentFlag.AlignVCenter, "—")
@@ -5056,9 +5692,29 @@ class CompactTennisComparisonWidget(QWidget):
         profiles_layout.addWidget(self.player1_widget)
         profiles_layout.addWidget(self.player2_widget)
 
-        # Rankings chart widget (compact size)
+        # Rankings chart widget (compact size), stacked with the tournament
+        # bracket view — a corner icon toggles between the two.
         self.ranking_chart = CompactRankingChart()
         self.ranking_chart.setFixedSize(900, 220)  # Fixed size matching surface table
+        self.bracket_view = TournamentBracketWidget()
+        self.chart_stack_widget = QWidget()
+        self.chart_stack_widget.setFixedSize(900, 220)
+        self.chart_stack = QStackedLayout(self.chart_stack_widget)
+        self.chart_stack.addWidget(self.ranking_chart)
+        self.chart_stack.addWidget(self.bracket_view)
+        self.bracket_toggle = QPushButton("▦", self.chart_stack_widget)
+        self.bracket_toggle.setGeometry(872, 4, 24, 22)
+        self.bracket_toggle.setToolTip("Toggle rankings chart / tournament bracket")
+        self.bracket_toggle.setStyleSheet(f"""
+            QPushButton {{
+                background: {TennisTheme.SURFACE}; color: {TennisTheme.TEXT_SECONDARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED}; border-radius: 4px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {TennisTheme.SECONDARY}; color: #000; }}
+        """)
+        self.bracket_toggle.clicked.connect(self._toggle_bracket)
+        self.bracket_toggle.raise_()
 
         # Historical surface performance table
         self.surface_table_widget = HistoricalSurfaceTableWidget()
@@ -5081,10 +5737,16 @@ class CompactTennisComparisonWidget(QWidget):
         # Place top-left widget in grid position (0, 0)
         main_layout.addWidget(top_left_widget, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        # Bottom-left: Rankings chart, then the market ledger below it.
-        main_layout.addWidget(self.ranking_chart, 1, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # Bottom-left: Rankings chart, then the market ledger below it. The
+        # ledger row takes the column's leftover stretch (no alignment flag,
+        # expanding size policy) so it fills to the window bottom instead of
+        # leaving dead bands above and below.
+        main_layout.addWidget(self.chart_stack_widget, 1, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.market_ledger = MarketLedgerWidget()
-        main_layout.addWidget(self.market_ledger, 2, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        main_layout.addWidget(self.market_ledger, 2, 0)
+        main_layout.setRowStretch(0, 0)
+        main_layout.setRowStretch(1, 0)
+        main_layout.setRowStretch(2, 1)
 
         # Right column: Momentum stacked directly above the analysis panel so
         # they pack together instead of leaving a row-driven gap between them.
@@ -5103,6 +5765,17 @@ class CompactTennisComparisonWidget(QWidget):
         main_layout.setColumnStretch(0, 0)
         main_layout.setColumnStretch(1, 1)
 
+
+    def _toggle_bracket(self):
+        """Flip between the rankings chart and the tournament bracket."""
+        to_bracket = self.chart_stack.currentIndex() == 0
+        self.chart_stack.setCurrentIndex(1 if to_bracket else 0)
+        self.bracket_toggle.setText("📈" if to_bracket else "▦")
+        self.bracket_toggle.raise_()
+        if to_bracket:
+            self.bracket_view.ensure_loaded()
+            self.bracket_view.set_highlight(
+                [self.current_player1, self.current_player2])
 
     def setup_connections(self):
         """Connect search signals to player widgets"""
@@ -5136,6 +5809,7 @@ class CompactTennisComparisonWidget(QWidget):
         self.player1_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 1)
         self.market_ledger.set_player(player_name, 1)
+        self.bracket_view.set_highlight([self.current_player1, self.current_player2])
         self.update_status()
         self.check_and_load_h2h()
 
@@ -5145,6 +5819,7 @@ class CompactTennisComparisonWidget(QWidget):
         self.player2_widget.set_player(player_name)
         self.ranking_chart.add_player(player_name, 2)
         self.market_ledger.set_player(player_name, 2)
+        self.bracket_view.set_highlight([self.current_player1, self.current_player2])
         self.update_status()
         self.check_and_load_h2h()
 
