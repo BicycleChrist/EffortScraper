@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem,
     QStyledItemDelegate, QDoubleSpinBox, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread, QSize, QObject, QThreadPool, QRunnable
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath, QFontMetrics
 import asyncio
 import json
@@ -521,8 +521,13 @@ class MatchMapWorker(QThread):
                 self.map_ready.emit([])
                 return
 
+            # populate_markets=False on BOTH sides: event-level pairing only
+            # reads identity fields, and the eager PX market/order normalize
+            # here was a ~100ms+ pure-Python GIL burn starving the UI loop.
+            # hydrate_event_pair_markets fills both sides in for the one
+            # event the user actually opens.
             px_events = emk.load_prophetx_normalized_events(
-                px_data, league_filter=None)
+                px_data, league_filter=None, populate_markets=False)
             nv_events = emk.load_novig_normalized_events(
                 nv_data, league_filter=None, currency="CASH")
             # populate_markets=False: nv_events have no markets (index is
@@ -1692,25 +1697,35 @@ class SGPScannerPanel(QWidget):
             self.tree.setEnabled(True)
 
     async def _scanEvent(self, ev: dict, idx: int, total: int) -> list:
-        """Run the PX and NV scanners for one event concurrently. Returns
-        a list of (source, row) tuples. A failure on one exchange is
-        logged and does not abort the other."""
-        px_rows, nv_rows = await asyncio.gather(
+        """Run the per-event scanner(s). Returns a list of (source, row)
+        tuples. A failure on one exchange is logged and does not abort
+        the others.
+
+        NV (Novig) disabled 2026-06-27: Novig killed parlay pricing — the
+        /parlay/request pricer now 400s "Cannot price parlay" for every
+        2-leg combo (verified live on priced pregame legs), so the SGP
+        implication scan can never surface a row. PX still works, so only
+        PX is dispatched. To revive if Novig restores parlays, restore the
+        gather over _scanNV below. See memory: project_novig_parlay_pricer_400.
+        """
+        px_rows = await asyncio.gather(
             self._scanPX(ev),
-            self._scanNV(ev, idx, total),
             return_exceptions=True,
         )
+        px_rows = px_rows[0]
         out = []
         if isinstance(px_rows, Exception):
             print(f"[sgp-panel] PX scan failed for {ev['name']}: "
                   f"{px_rows!r}")
         else:
             out += [("PX", r) for r in px_rows]
-        if isinstance(nv_rows, Exception):
-            print(f"[sgp-panel] NV scan failed for {ev['name']}: "
-                  f"{nv_rows!r}")
-        else:
-            out += [("NV", r) for r in nv_rows]
+        # --- NV scan disabled (see docstring) ---
+        # nv_rows = await self._scanNV(ev, idx, total)
+        # if isinstance(nv_rows, Exception):
+        #     print(f"[sgp-panel] NV scan failed for {ev['name']}: "
+        #           f"{nv_rows!r}")
+        # else:
+        #     out += [("NV", r) for r in nv_rows]
         return out
 
     async def _scanPX(self, ev: dict) -> list:
@@ -2090,6 +2105,29 @@ class OddsBarDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _SectionBuildSignals(QObject):
+    """Carries the cross-thread signal from the section-build worker back to
+    OrderBookWidget._onSectionsReady on the main thread."""
+    ready = pyqtSignal(int, object)   # (generation, result_dict)
+
+
+class _SectionBuildRunnable(QRunnable):
+    """Runs the pure-Python section-building off the main thread."""
+    def __init__(self, gen: int, build_fn, signals: "_SectionBuildSignals"):
+        super().__init__()
+        self._gen = gen
+        self._build_fn = build_fn
+        self._signals = signals
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            result = self._build_fn()
+            self._signals.ready.emit(self._gen, result)
+        except Exception:
+            pass  # superseded render just doesn't paint
+
+
 class OrderBookWidget(QWidget):
     """
     Professional order book display widget for ProphetX markets.
@@ -2223,9 +2261,15 @@ class OrderBookWidget(QWidget):
         self.orderbook_table.verticalHeader().setVisible(False)
         self.orderbook_table.horizontalHeader().setStretchLastSection(True)
 
-        # Set column widths
+        # Set column widths. SIDE (col 0) is sized manually: full rebuilds in
+        # _emitOrderbookRows run with the model's signals blocked, so a
+        # ResizeToContents header never re-measures after the new content
+        # lands — the column stayed at its stale width (truncated "AR…"
+        # sides) until something else (e.g. the alt-lines toggle) forced a
+        # re-layout. _fitSideColumn measures the real texts every render.
         header = self.orderbook_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.orderbook_table.setColumnWidth(0, 90)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         if not self.compact_mode:
@@ -2336,6 +2380,9 @@ class OrderBookWidget(QWidget):
         self._alts_collapsed: bool = True
         self._alt_header_row: Optional[int] = None
         self._last_render = None  # ("dual", px, nv) | ("single", nm)
+        self._render_gen = 0
+        self._render_signals = _SectionBuildSignals(self)
+        self._render_signals.ready.connect(self._onSectionsReady)
 
     def createHeader(self):
         """Create header widget showing current market name"""
@@ -2715,21 +2762,17 @@ class OrderBookWidget(QWidget):
         return sections, main
 
     def renderNormalizedOrderBook(self, nm) -> None:
-        """Walk Lines -> Sides -> Orders and emit one row per Order using
-        the existing renderOrderRow / separator helpers."""
-        self.orderbook_table.setUpdatesEnabled(False)
-        try:
-            self._renderNormalizedOrderBookImpl(nm)
-        finally:
-            self.orderbook_table.setUpdatesEnabled(True)
+        """Submit a background section build; result delivered to _onSectionsReady."""
+        self._render_gen += 1
+        gen = self._render_gen
+        alts_collapsed = self._alts_collapsed
+        def _build():
+            return self._buildSingleSections(nm, alts_collapsed)
+        QThreadPool.globalInstance().start(
+            _SectionBuildRunnable(gen, _build, self._render_signals))
 
-    def _renderNormalizedOrderBookImpl(self, nm) -> None:
-        # Bring SIDE_* enums into local scope without forcing import-time
-        # coupling at the top of the file.
+    def _buildSingleSections(self, nm, alts_collapsed: bool) -> dict:
         import exchange_market_keys as _emk
-        if hasattr(self, "_orderbook_row_payloads"):
-            self._orderbook_row_payloads.clear()
-        self._alt_header_row = None
 
         # Collect rows grouped by display section. For Over/Under markets,
         # produce two sections (OVER, UNDER); for team markets, produce
@@ -2750,7 +2793,7 @@ class OrderBookWidget(QWidget):
             per_strike, strike_liq = self._gridFromLines(
                 [(None, nm)], is_over_under)
             sections, _main = self._composeMultiStrikeSections(
-                per_strike, strike_liq, is_over_under, self._alts_collapsed)
+                per_strike, strike_liq, is_over_under, alts_collapsed)
             lead_header = True
         elif is_over_under:
             # Build the Over half: lines in strike-DESC order (already
@@ -2819,8 +2862,8 @@ class OrderBookWidget(QWidget):
                         sections.append((label, rows))
 
         sections = self._finalizeSections(sections, is_over_under, lead_header)
-        self._emitOrderbookRows(sections, lead_header, dual=False,
-                                market_name=nm.market_name)
+        return {"sections": sections, "lead_header": lead_header,
+                "dual": False, "market_name": nm.market_name}
 
     # ------------------------------------------------------------------
     # Dual-source render path
@@ -2883,21 +2926,17 @@ class OrderBookWidget(QWidget):
         self._renderDualOrderBook(px_norm, nv_norm)
 
     def _renderDualOrderBook(self, px_norm, nv_norm) -> None:
-        """Build rows by merging PX + NV per strike and side, sorted
-        American-desc within strike, then dispatch to the existing
-        renderOrderRow / separator helpers. Each rendered row gets a
-        background tint based on its source."""
-        self.orderbook_table.setUpdatesEnabled(False)
-        try:
-            self._renderDualOrderBookImpl(px_norm, nv_norm)
-        finally:
-            self.orderbook_table.setUpdatesEnabled(True)
+        """Submit a background section build; result delivered to _onSectionsReady."""
+        self._render_gen += 1
+        gen = self._render_gen
+        alts_collapsed = self._alts_collapsed
+        def _build():
+            return self._buildDualSections(px_norm, nv_norm, alts_collapsed)
+        QThreadPool.globalInstance().start(
+            _SectionBuildRunnable(gen, _build, self._render_signals))
 
-    def _renderDualOrderBookImpl(self, px_norm, nv_norm) -> None:
+    def _buildDualSections(self, px_norm, nv_norm, alts_collapsed: bool) -> dict:
         import exchange_market_keys as _emk
-        if hasattr(self, "_orderbook_row_payloads"):
-            self._orderbook_row_payloads.clear()
-        self._alt_header_row = None
 
         # Combine lines by strike. Either source may have lines the
         # other lacks; we keep all of them. Strike None (moneyline)
@@ -2960,7 +2999,7 @@ class OrderBookWidget(QWidget):
             per_strike, strike_liq = self._gridFromLines(
                 [("px", px_norm), ("nv", nv_norm)], is_over_under)
             sections, _main = self._composeMultiStrikeSections(
-                per_strike, strike_liq, is_over_under, self._alts_collapsed)
+                per_strike, strike_liq, is_over_under, alts_collapsed)
             lead_header = True
         elif is_over_under:
             # Over half: lines in descending strike order
@@ -3093,7 +3132,8 @@ class OrderBookWidget(QWidget):
                     sections.append((display, rows))
 
         sections = self._finalizeSections(sections, is_over_under, lead_header)
-        self._emitOrderbookRows(sections, lead_header, dual=True)
+        return {"sections": sections, "lead_header": lead_header,
+                "dual": True, "market_name": None}
 
     def _finalizeSections(self, sections, is_over_under: bool,
                           lead_header: bool):
@@ -3230,6 +3270,10 @@ class OrderBookWidget(QWidget):
 
         self._last_plan_sig = sig
 
+        # Size the SIDE column from the rendered texts (see initUI for why
+        # ResizeToContents can't be trusted here). ~40 string measurements.
+        self._fitSideColumn(plan)
+
         if self._row_anim and not self._anim_timer.isActive():
             self._anim_timer.start()
 
@@ -3250,6 +3294,24 @@ class OrderBookWidget(QWidget):
                     f"Best Ask: {worst_o.get('displayOdds', 'N/A')} • "
                     f"Spread: {len(sections)} sides • "
                     f"Total Liquidity: ${total_liquidity:,.2f}")
+
+    def _onSectionsReady(self, gen: int, result: object) -> None:
+        """Main-thread slot: receive finished section data from the background
+        builder and update the table. Drops stale results when the user has
+        moved to a different market since the build was submitted."""
+        if gen != self._render_gen:
+            return
+        if hasattr(self, "_orderbook_row_payloads"):
+            self._orderbook_row_payloads.clear()
+        self._alt_header_row = None
+        tbl = self.orderbook_table
+        tbl.setUpdatesEnabled(False)
+        try:
+            self._emitOrderbookRows(
+                result["sections"], result["lead_header"],
+                dual=result["dual"], market_name=result.get("market_name"))
+        finally:
+            tbl.setUpdatesEnabled(True)
 
     def _applyDualRowTint(self, row: int, source: Optional[str]) -> None:
         """Source differentiation for the dual path: brand-color the SIDE
@@ -3438,6 +3500,31 @@ class OrderBookWidget(QWidget):
             self._row_anim.pop(row, None)
         if not self._row_anim:
             self._anim_timer.stop()
+
+    def _fitSideColumn(self, plan: list) -> None:
+        """Set the SIDE column width from the actual rendered texts.
+
+        Column 0 is on Fixed resize mode because the full-rebuild path blocks
+        the model's signals while it writes items, which starves a
+        ResizeToContents header of the dataChanged notifications it needs to
+        re-measure — leaving the column at whatever width the previous
+        content produced (the truncated-until-alt-toggle bug). Separator rows
+        are ignored: they span the full table and must not widen the column."""
+        tbl = self.orderbook_table
+        fm = None
+        widest = 0
+        for row, p in enumerate(plan):
+            if p["kind"] != "order":
+                continue
+            item = tbl.item(row, 0)
+            if item is None:
+                continue
+            if fm is None:
+                fm = QFontMetrics(item.font())
+            widest = max(widest, fm.horizontalAdvance(item.text()))
+        if widest:
+            pad = 14 if self.compact_mode else 24
+            tbl.setColumnWidth(0, widest + pad)
 
     def renderSideSeparatorRow(self, row: int, label: str):
         """Render a separator row between the two market sides"""
@@ -4320,6 +4407,8 @@ class ProphetXBrowser(QWidget):
         initial build) repopulate normally."""
         self.all_events = all_markets
         self._px_data_ready = True
+        # Fresh dump in hand — release the pending-fetch hold on the gate.
+        self._pending_fresh_fetch = False
         # Rebuild the match map against the fresh PX set + re-evaluate NV dump
         # staleness (a newly-listed PX event may be unmatched -> re-scrape).
         self.onProphetxDataRefreshed()
@@ -4375,6 +4464,24 @@ class ProphetXBrowser(QWidget):
         # Quiet failure — widget stays PX-only, user can retry by
         # restarting EffortOdds or running the scraper manually.
         print(f"[LiquidityWidget] Novig dump refresh failed: {err}")
+        # Token expiry used to fail SILENTLY here: the scrape errored, the
+        # widget kept serving the last good (stale) dump, and daily slates
+        # like MLB vanished while multi-day events still matched — looking
+        # like a matching bug rather than dead auth. Detect that case and say
+        # so loudly, with the one-time fix.
+        try:
+            from NovigClient import novig_token_status
+            st = novig_token_status()
+            if st["expired"] or not st["has_token"]:
+                print("[LiquidityWidget] >>> Novig access token is EXPIRED "
+                      f"(since {st['exp_iso']}). Novig data is STALE. Fix: "
+                      "paste a fresh access token into NOVIG_AUTH_TOKEN in "
+                      "Creds.py (novig.com -> DevTools -> Network filter "
+                      "'token' -> the auth.novig.us/oauth/token response -> "
+                      "copy access_token). There is no browserless auto-"
+                      "refresh — Auth0 enforces MFA. See NovigClient.py.")
+        except Exception:
+            pass
         # Don't wedge the initial-populate gate on a failed scrape: release
         # it with whatever data we already have (the stale-index match map
         # from the first build is still in place).
@@ -4493,14 +4600,21 @@ class ProphetXBrowser(QWidget):
             # the coordinator below will build it once with correct badges.
             # After it, restamp in place (a periodic dump refresh rebuilt the
             # map) without a full repopulate.
+            # Both follow-ups are deferred one loop pass each (singleShot(0)
+            # fires FIFO, so badges still precede the re-render): running
+            # restamp + full market re-render synchronously here made this
+            # one slot routinely blow the ~120ms frame budget. Each callback
+            # re-reads live state at fire time, so the deferral can't render
+            # stale data.
             if self._initial_events_populated:
-                self._refreshEventSourceBadges()
-            # The map may now contain a match for the market the user is
-            # already looking at (it commonly renders PX-only on the very
-            # first event because this map is built async, after the first
-            # market is auto-selected). Re-render so the dual-source view
-            # engages without a manual event re-selection.
-            self._rerenderCurrentMarketForMatchMap()
+                QTimer.singleShot(0, self._refreshEventSourceBadges)
+                # A rebuilt map may now match the market the user is already
+                # looking at — re-render so the dual-source view engages
+                # without a manual re-selection. On the FIRST build this is
+                # unnecessary (and, deferred, would double-render): the gated
+                # initial populate below auto-opens the top event with the
+                # map already in place, so its render is already dual-source.
+                QTimer.singleShot(0, self._rerenderCurrentMarketForMatchMap)
         # else: empty result — keep any existing map, stay PX-only.
 
         # Match map is in (even when empty): release the initial-populate
@@ -4812,6 +4926,14 @@ class ProphetXBrowser(QWidget):
         guards at each hook)."""
         if self._initial_events_populated:
             return
+        # _pending_fresh_fetch: the stale-JSON fallback sets _px_data_ready
+        # immediately, which used to open the gate with stale data — the book
+        # painted, then the deferred fresh scrape re-covered it with the
+        # loading overlay and repainted everything (the visible populate ->
+        # loading -> repopulate cycle). Hold the gate until the fresh dump
+        # lands (or the watchdog gives up on it).
+        if self._pending_fresh_fetch:
+            return
         if not (self._px_data_ready and self._nv_data_ready
                 and self._match_map_ready and self._dump_ready):
             return
@@ -4870,7 +4992,10 @@ class ProphetXBrowser(QWidget):
         self._force_populate_attempts += 1
         scraping = (self._novig_dump_worker is not None
                     and self._novig_dump_worker.isRunning())
-        if ((not self._px_data_ready or scraping)
+        # An in-flight fresh PX fetch holds the gate on purpose (see
+        # _maybePopulateInitialEvents) — wait it out like a running scrape.
+        if ((not self._px_data_ready or scraping
+                or self._pending_fresh_fetch)
                 and self._force_populate_attempts <= 6):
             QTimer.singleShot(4000, self._forceInitialPopulate)
             return
@@ -4880,6 +5005,7 @@ class ProphetXBrowser(QWidget):
         self._nv_data_ready = True
         self._match_map_ready = True
         self._dump_ready = True
+        self._pending_fresh_fetch = False
         self._maybePopulateInitialEvents()
 
     def _loadStaleDataAsFallback(self):
@@ -5056,6 +5182,7 @@ class ProphetXBrowser(QWidget):
         combo = getattr(self, "event_combo", None)
         if combo is not None and combo.count():
             combo.blockSignals(True)
+            combo.setUpdatesEnabled(False)
             try:
                 for i in range(combo.count()):
                     data = combo.itemData(i)
@@ -5063,9 +5190,17 @@ class ProphetXBrowser(QWidget):
                     if eid is None:
                         continue
                     source = self._event_source_for(eid)
+                    # Badge + role depend only on the source; skip the Qt
+                    # model writes (each fires dataChanged) for the vast
+                    # majority of rows whose source didn't change. This
+                    # restamp runs on every map rebuild and was a ~130ms
+                    # slice when it rewrote every row unconditionally.
+                    if combo.itemData(i, _EVENT_SOURCE_ROLE) == source:
+                        continue
                     combo.setItemText(i, _swap(combo.itemText(i), source))
                     combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
             finally:
+                combo.setUpdatesEnabled(True)
                 combo.blockSignals(False)
 
         # Full list path.
@@ -5078,6 +5213,11 @@ class ProphetXBrowser(QWidget):
                 if eid is None:
                     continue
                 source = self._event_source_for(eid)
+                # Same skip as the combo path: text/role/tint all derive
+                # from the source, so an unchanged source means nothing
+                # to rewrite.
+                if item.data(_EVENT_SOURCE_ROLE) == source:
+                    continue
                 item.setText(_swap(item.text(), source))
                 item.setData(_EVENT_SOURCE_ROLE, source)
                 if source == "PX":
@@ -5140,21 +5280,15 @@ class ProphetXBrowser(QWidget):
         combo's popup view so the delegate's custom text painting
         wins over the combo's stylesheet (which would otherwise
         force all rows white)."""
-        # Block signals to prevent auto-selection when populating with stale data
-        self.event_combo.blockSignals(True)
-        self.event_combo.clear()
-
-        # Install delegate idempotently. setItemDelegate on the combo
-        # forwards to its view; we also set it on the view explicitly
-        # because some Qt builds need both for the closed-state
-        # display + popup-state list to agree.
-        view = self.event_combo.view()
-        if not isinstance(view.itemDelegate(),
-                          _EventSourceDelegate):
-            delegate = _EventSourceDelegate(view)
-            view.setItemDelegate(delegate)
-            self.event_combo.setItemDelegate(delegate)
-
+        combo = self.event_combo
+        # Build the desired rows first. A refresh tick usually changes only
+        # the stake figures, so when the row STRUCTURE (event ids + separator
+        # position) is unchanged we update texts/data in place instead of
+        # clear()+addItem() — no model reset / item churn (the full rebuild
+        # of hundreds of rows was a ~140-180ms main-loop stall per refresh-
+        # all), and the user's current selection survives untouched. Same
+        # pattern as _refreshMarketSelector.
+        rows = []  # (key, display, source, event_dict_or_None_for_separator)
         futures_separator_added = False
         for event in self.filtered_events:
             metadata = event['metadata']
@@ -5162,30 +5296,81 @@ class ProphetXBrowser(QWidget):
             # Boundary header between games and futures (see refreshEventList).
             # A disabled item so it can't be selected; onCompactEventSelected
             # already no-ops on items whose data is None.
-            if (is_future and not futures_separator_added
-                    and self.event_combo.count() > 0):
-                self.event_combo.addItem("──────  FUTURES  ──────", None)
-                sep_i = self.event_combo.count() - 1
-                sep_model_item = self.event_combo.model().item(sep_i)
-                if sep_model_item is not None:
-                    sep_model_item.setEnabled(False)
-                    sep_model_item.setForeground(QColor(140, 140, 150))
+            if is_future and not futures_separator_added and rows:
+                rows.append(("__SEP__", "──────  FUTURES  ──────", None, None))
                 futures_separator_added = True
 
             event_name = metadata.get('name', 'Unknown Event')
             stake = metadata.get('stake', 0)
             source = event.get('source', 'PX')
             badge = _SOURCE_BADGES.get(source, "")
-
             display = f"{badge}{event_name} (${stake:,.0f})"
-            self.event_combo.addItem(display, event)
-            i = self.event_combo.count() - 1
-            # Stash the source on the same role the delegate reads.
-            self.event_combo.setItemData(i, source,
-                                         _EVENT_SOURCE_ROLE)
+            rows.append((str(event['id']), display, source, event))
 
-        # Re-enable signals - don't auto-select, wait for fresh data
-        self.event_combo.blockSignals(False)
+        # Block signals to prevent auto-selection when populating with stale data
+        combo.blockSignals(True)
+        combo.setUpdatesEnabled(False)
+        try:
+            # Install delegate idempotently. setItemDelegate on the combo
+            # forwards to its view; we also set it on the view explicitly
+            # because some Qt builds need both for the closed-state
+            # display + popup-state list to agree.
+            view = combo.view()
+            if not isinstance(view.itemDelegate(),
+                              _EventSourceDelegate):
+                delegate = _EventSourceDelegate(view)
+                view.setItemDelegate(delegate)
+                combo.setItemDelegate(delegate)
+
+            same_structure = combo.count() == len(rows)
+            if same_structure:
+                for i, (key, _d, _s, _e) in enumerate(rows):
+                    data = combo.itemData(i)
+                    cur_key = (str(data['id']) if isinstance(data, dict)
+                               else "__SEP__")
+                    if cur_key != key:
+                        same_structure = False
+                        break
+
+            if same_structure:
+                for i, (key, display, source, event) in enumerate(rows):
+                    if event is None:
+                        continue  # separator text/style never changes
+                    if combo.itemText(i) != display:
+                        combo.setItemText(i, display)
+                    # Always refresh the stored dict — it carries the fresh
+                    # 'data' payload onCompactEventSelected renders from.
+                    combo.setItemData(i, event)
+                    combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
+            else:
+                combo.clear()
+                for key, display, source, event in rows:
+                    combo.addItem(display, event)
+                    i = combo.count() - 1
+                    if event is None:
+                        sep_model_item = combo.model().item(i)
+                        if sep_model_item is not None:
+                            sep_model_item.setEnabled(False)
+                            sep_model_item.setForeground(QColor(140, 140, 150))
+                    else:
+                        # Stash the source on the same role the delegate reads.
+                        combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
+                # clear() wiped the selection; point the closed-state display
+                # back at the event the user is viewing when it's still
+                # listed (signals are blocked — no re-render fires). Falls
+                # back to item 0, as before, when it's gone.
+                if self.current_event_id is not None:
+                    for i in range(combo.count()):
+                        data = combo.itemData(i)
+                        if (isinstance(data, dict)
+                                and str(data.get('id'))
+                                    == str(self.current_event_id)):
+                            combo.setCurrentIndex(i)
+                            break
+        finally:
+            combo.setUpdatesEnabled(True)
+            # Re-enable signals - don't auto-select, wait for fresh data
+            combo.blockSignals(False)
 
     def onCompactEventSelected(self, index: int):
         """Handle event selection in compact mode"""
@@ -5427,7 +5612,7 @@ class ProphetXBrowser(QWidget):
             if mp is not None:
                 w = self._novig_book_worker
                 if w is None or not w.isRunning():
-                    self._launchNovigBookRefresh(mp)
+                    self._scheduleNovigBookRefresh(mp)
             return
         self._last_selected_market_sig = new_sig
 
@@ -5588,9 +5773,10 @@ class ProphetXBrowser(QWidget):
 
         # Refresh in the background: pull /book/batch for each Novig
         # line under this market, and re-render when results arrive.
-        # Cancel any previous worker first so stale results don't
-        # overwrite the fresh display.
-        self._launchNovigBookRefresh(market_pair)
+        # Deferred one loop pass so this slot ends at the render — the
+        # worker launch (and its first-time NovigClient import) gets its
+        # own slice instead of extending an already-long selection slot.
+        self._scheduleNovigBookRefresh(market_pair)
 
     def _lookupCurrentMarketPair(self, prophetx_market: Dict):
         """Return the MarketPair for the given raw PX market dict, or
@@ -5627,15 +5813,27 @@ class ProphetXBrowser(QWidget):
         if not eid or eid in self._hydrated_event_ids:
             return
         self._hydrated_event_ids.add(eid)
-        if self._novig_full_dump_cache is None:
-            try:
-                from NovigClient import NovigQueries
-                self._novig_full_dump_cache = (
-                    NovigQueries.load_latest_dump() or {})
-            except Exception as e:
-                print(f"[LiquidityWidget] full dump load failed: {e!r}")
-                self._novig_full_dump_cache = {}
-        entry = self._novig_full_dump_cache.get(eid)
+        # Sidecar first: one ~100KB file per event (<1ms) instead of the
+        # ~38MB full-dump parse that stalled the main loop ~175ms on the
+        # first paired-event open. ([PERF-DIAG])
+        entry = None
+        try:
+            from NovigClient import NovigQueries
+            entry = NovigQueries.load_event_entry(eid)
+        except Exception:
+            entry = None
+        if entry is None:
+            # Fallback: dump predates sidecars — parse the full dump once
+            # (cached for the lifetime of this match map).
+            if self._novig_full_dump_cache is None:
+                try:
+                    from NovigClient import NovigQueries
+                    self._novig_full_dump_cache = (
+                        NovigQueries.load_latest_dump() or {})
+                except Exception as e:
+                    print(f"[LiquidityWidget] full dump load failed: {e!r}")
+                    self._novig_full_dump_cache = {}
+            entry = self._novig_full_dump_cache.get(eid)
         if not entry:
             return
         try:
@@ -5643,6 +5841,21 @@ class ProphetXBrowser(QWidget):
             emk.hydrate_event_pair_markets(ep, entry, currency="CASH")
         except Exception as e:
             print(f"[LiquidityWidget] market hydration failed for {eid}: {e!r}")
+
+    def _scheduleNovigBookRefresh(self, market_pair) -> None:
+        """Queue _launchNovigBookRefresh on the next event-loop pass.
+
+        The launch used to run synchronously at the tail of
+        onMarketSelected / the 20s refresh tick — the watchdog kept
+        catching ~120-250ms stalls with the stack parked on it because it
+        extended a slot that had already spent its frame budget on the
+        render. One pass later the loop has painted; the guard drops the
+        launch if the user selected a different market in between."""
+        def _fire(mp=market_pair):
+            if self._current_market_pair is not mp:
+                return
+            self._launchNovigBookRefresh(mp)
+        QTimer.singleShot(0, _fire)
 
     def _launchNovigBookRefresh(self, market_pair) -> None:
         """Fire a NovigMarketBookWorker for the lines on the matched NV
@@ -5812,6 +6025,7 @@ class ProphetXBrowser(QWidget):
                 # Gate the first build on NV + match map + dump; afterwards
                 # this is a normal (already-combined) refresh.
                 self._px_data_ready = True
+                self._pending_fresh_fetch = False
                 if self._initial_events_populated:
                     self._populateEventListOnly()
                     self.hideLoading()
@@ -5898,6 +6112,7 @@ class ProphetXBrowser(QWidget):
             if all_markets:
                 self.all_events = all_markets
                 self._px_data_ready = True
+                self._pending_fresh_fetch = False
                 if self._initial_events_populated:
                     self.populateEventList()
                 else:

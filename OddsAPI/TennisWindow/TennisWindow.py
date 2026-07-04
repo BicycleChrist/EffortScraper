@@ -8,7 +8,9 @@ from dataclasses import dataclass, asdict
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton,
-    QComboBox, QCheckBox, QScrollArea, QTabWidget, QStackedLayout
+    QComboBox, QCheckBox, QScrollArea, QTabWidget, QStackedLayout,
+    QListWidget, QListWidgetItem, QSplitter, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect, QPoint
 from PyQt6.QtGui import (
@@ -18,6 +20,7 @@ from tennis_abstract_scraper import TennisAbstractScraper, PlayerBio, TacticsDat
 from tennis_h2h_scraper import TennisScraper, PlayerRanking
 import tennis_sim
 import tennis_context
+import flashscore_matches
 
 
 class TennisTheme:
@@ -5192,6 +5195,403 @@ RETURN_RALLY_SPEC = [
 ]
 
 
+class MatchStatsTab(QWidget):
+    """Browse either player's recent completed matches and inspect the full
+    per-match statistics (match + per-set), point-by-point and set summary,
+    sourced from Flashscore and cached to the DB via FlashscoreMatchStore."""
+
+    matchesReady = pyqtSignal(int, object, int)      # player_num, matches, req
+    detailReady = pyqtSignal(object, object, int)    # detail, match_meta, req
+
+    def __init__(self, db_path: str = "tennis_rankings.db"):
+        super().__init__()
+        self.store = flashscore_matches.FlashscoreMatchStore(db_path)
+        self.p1_name = self.p2_name = ""
+        self.gender1 = self.gender2 = None
+        self._matches = {1: [], 2: []}
+        self._which = 1                # whose matches are listed (1 or 2)
+        self._h2h_only = False
+        self._match_req = 0
+        self._detail_req = 0
+        self._cur_stats = {}           # scope -> {category -> [(stat,home,away)]}
+        self._cur_meta = None
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
+        # ---- left: player toggle + H2H filter + match list ----
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(6)
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(4)
+        self.p1_btn = QPushButton("Player 1")
+        self.p2_btn = QPushButton("Player 2")
+        for b in (self.p1_btn, self.p2_btn):
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.p1_btn.setChecked(True)
+        self.p1_btn.clicked.connect(lambda: self._set_which(1))
+        self.p2_btn.clicked.connect(lambda: self._set_which(2))
+        self.h2h_chk = QCheckBox("H2H only")
+        self.h2h_chk.setStyleSheet(
+            f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
+        self.h2h_chk.toggled.connect(self._on_h2h_toggle)
+        ctrl.addWidget(self.p1_btn)
+        ctrl.addWidget(self.p2_btn)
+        ctrl.addWidget(self.h2h_chk)
+        ctrl.addStretch()
+        lv.addLayout(ctrl)
+
+        self.match_list = QListWidget()
+        self.match_list.setStyleSheet(f"""
+            QListWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 1px solid {TennisTheme.SURFACE};
+                border-radius: 6px; outline: none;
+            }}
+            QListWidget::item {{ padding: 5px 6px; border-bottom: 1px solid {TennisTheme.SURFACE}; }}
+            QListWidget::item:selected {{ background: {TennisTheme.SURFACE}; }}
+        """)
+        self.match_list.itemClicked.connect(self._on_match_clicked)
+        lv.addWidget(self.match_list, 1)
+        self.list_note = QLabel("Select two players to load recent matches.")
+        self.list_note.setStyleSheet(
+            f"color: {TennisTheme.TEXT_MUTED}; font-size: 11px;")
+        self.list_note.setWordWrap(True)
+        lv.addWidget(self.list_note)
+        splitter.addWidget(left)
+
+        # ---- right: header + scope selector + stats table + pbp ----
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+        self.detail_header = QLabel("")
+        self.detail_header.setStyleSheet(
+            f"color: {TennisTheme.TEXT_PRIMARY}; font-size: 12px; font-weight: bold;")
+        self.detail_header.setWordWrap(True)
+        rv.addWidget(self.detail_header)
+
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(6)
+        sl = QLabel("Scope:")
+        sl.setStyleSheet(f"color: {TennisTheme.TEXT_SECONDARY}; font-size: 11px;")
+        self.scope_combo = QComboBox()
+        self.scope_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {TennisTheme.SURFACE}; color: {TennisTheme.TEXT_PRIMARY};
+                border: 1px solid {TennisTheme.TEXT_MUTED};
+                padding: 2px 24px 2px 6px; font-size: 11px;
+            }}
+            QComboBox::drop-down {{ width: 20px; }}
+        """)
+        self.scope_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.scope_combo.currentTextChanged.connect(self._render_scope)
+        scope_row.addWidget(sl)
+        scope_row.addWidget(self.scope_combo)
+        scope_row.addStretch()
+        rv.addLayout(scope_row)
+
+        self.stats_table = QTableWidget(0, 3)
+        self.stats_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.stats_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.stats_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.stats_table.verticalHeader().setVisible(False)
+        self.stats_table.setShowGrid(False)
+        self.stats_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 1px solid {TennisTheme.SURFACE}; border-radius: 6px;
+                color: {TennisTheme.TEXT_PRIMARY}; font-size: 11px; gridline-color: transparent;
+            }}
+            QHeaderView::section {{
+                background: {TennisTheme.SURFACE}; color: {TennisTheme.TEXT_SECONDARY};
+                border: none; padding: 4px; font-size: 11px; font-weight: bold;
+            }}
+        """)
+        rv.addWidget(self.stats_table, 3)
+
+        pbp_lbl = QLabel("Point by point")
+        pbp_lbl.setStyleSheet(
+            f"color: {TennisTheme.SECONDARY}; font-size: 11px; font-weight: bold;")
+        rv.addWidget(pbp_lbl)
+        self.pbp_view = QPlainTextEdit()
+        self.pbp_view.setReadOnly(True)
+        self.pbp_view.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {TennisTheme.CARD_BACKGROUND};
+                border: 1px solid {TennisTheme.SURFACE}; border-radius: 6px;
+                color: {TennisTheme.TEXT_SECONDARY}; font-family: monospace; font-size: 11px;
+            }}
+        """)
+        rv.addWidget(self.pbp_view, 2)
+        splitter.addWidget(right)
+        splitter.setSizes([250, 620])
+
+        self._btn_style()
+        self.matchesReady.connect(self._on_matches)
+        self.detailReady.connect(self._on_detail)
+
+    # -- styling helpers ----------------------------------------------------
+    def _btn_style(self):
+        for b, on, col in ((self.p1_btn, self._which == 1, TennisTheme.PRIMARY),
+                           (self.p2_btn, self._which == 2, TennisTheme.ACCENT)):
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: {col if on else TennisTheme.SURFACE};
+                    color: {TennisTheme.BACKGROUND if on else TennisTheme.TEXT_SECONDARY};
+                    border: 1px solid {col}; border-radius: 4px;
+                    padding: 3px 8px; font-size: 11px; font-weight: bold;
+                }}
+            """)
+
+    # -- inputs -------------------------------------------------------------
+    def set_players(self, p1_name, p2_name, gender1=None, gender2=None):
+        self.p1_name, self.p2_name = p1_name, p2_name
+        self.gender1, self.gender2 = gender1, gender2
+        self.p1_btn.setText(p1_name.split()[-1] if p1_name else "Player 1")
+        self.p2_btn.setText(p2_name.split()[-1] if p2_name else "Player 2")
+        self._btn_style()
+        self._matches = {1: [], 2: []}
+        self.match_list.clear()
+        self._clear_detail()
+        if p1_name:
+            self._load_matches(1, p1_name, gender1)
+        if p2_name:
+            self._load_matches(2, p2_name, gender2)
+        self.list_note.setText("Loading recent matches…")
+
+    def _set_which(self, which):
+        self._which = which
+        self.p1_btn.setChecked(which == 1)
+        self.p2_btn.setChecked(which == 2)
+        self._btn_style()
+        self._populate_list()
+
+    def _on_h2h_toggle(self, on):
+        self._h2h_only = on
+        self._populate_list()
+
+    # -- match-list loading (threaded) --------------------------------------
+    def _load_matches(self, player_num, name, gender):
+        self._match_req += 1
+        req = self._match_req
+
+        def worker():
+            try:
+                ms = self.store.get_recent_matches(name, months=6,
+                                                   gender_hint=gender)
+                self.matchesReady.emit(player_num, ms, req)
+            except Exception as e:
+                print(f"Match-stats load error ({name}): {e}")
+                self.matchesReady.emit(player_num, [], req)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_matches(self, player_num, matches, req):
+        self._matches[player_num] = matches or []
+        self._populate_list()
+
+    def _populate_list(self):
+        self.match_list.clear()
+        matches = self._matches.get(self._which, [])
+        other = self.p2_name if self._which == 1 else self.p1_name
+        other_key = flashscore_matches._name_key(other) if other else ""
+        shown = 0
+        for m in matches:
+            if self._h2h_only and other_key:
+                opp_key = flashscore_matches._name_key(m.get("opponent", ""))
+                # opponent names are "Surname X." — require surname overlap
+                if not (set(opp_key.split()) & set(other_key.split())):
+                    continue
+            self.match_list.addItem(self._make_item(m))
+            shown += 1
+        if not matches:
+            self.list_note.setText("No recent matches found (or player not on "
+                                   "Flashscore).")
+        elif shown == 0:
+            self.list_note.setText("No head-to-head meetings in the last 6 months.")
+        else:
+            self.list_note.setText(f"{shown} match{'es' if shown != 1 else ''} "
+                                   f"· last 6 months")
+
+    def _make_item(self, m):
+        from datetime import datetime as _dt, timezone as _tz
+        ts = m.get("start_ts")
+        dstr = (_dt.fromtimestamp(ts, _tz.utc).strftime("%d %b %y")
+                if ts else "")
+        won = m.get("won")
+        # orient score to the listed player
+        ph = m.get("player_is_home")
+        ps = m.get("home_sets") if ph else m.get("away_sets")
+        os_ = m.get("away_sets") if ph else m.get("home_sets")
+        wl = "W" if won else ("L" if won is False else "·")
+        surf = (m.get("surface") or "").title()[:5]
+        text = (f"{dstr}   {wl}  {ps}-{os_}   vs {m.get('opponent','?')}\n"
+                f"       {m.get('tournament','')[:26]} · {surf}")
+        it = QListWidgetItem(text)
+        it.setForeground(QColor(TennisTheme.PRIMARY if won else
+                                (TennisTheme.ACCENT if won is False else
+                                 TennisTheme.TEXT_SECONDARY)))
+        it.setData(Qt.ItemDataRole.UserRole, m)
+        return it
+
+    # -- detail loading (threaded) ------------------------------------------
+    def _on_match_clicked(self, item):
+        m = item.data(Qt.ItemDataRole.UserRole)
+        if not m:
+            return
+        self.detail_header.setText("Loading match detail…")
+        self.scope_combo.clear()
+        self.stats_table.setRowCount(0)
+        self.pbp_view.setPlainText("")
+        self._detail_req += 1
+        req = self._detail_req
+        eid = m.get("event_id")
+
+        def worker():
+            try:
+                det = self.store.get_match_detail(eid, finished=bool(m.get("finished")))
+                self.detailReady.emit(det, m, req)
+            except Exception as e:
+                print(f"Match detail error ({eid}): {e}")
+                self.detailReady.emit({"stats": {}, "pbp": [], "set_summary": []},
+                                      m, req)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_detail(self, detail, meta, req):
+        if req != self._detail_req:
+            return
+        self._cur_stats = detail.get("stats", {}) or {}
+        self._cur_meta = meta
+        # header
+        from datetime import datetime as _dt, timezone as _tz
+        ts = meta.get("start_ts")
+        dstr = _dt.fromtimestamp(ts, _tz.utc).strftime("%d %b %Y") if ts else ""
+        setsum = detail.get("set_summary", []) or []
+        sets, total_time = self._parse_set_summary(setsum)
+        ph = meta.get("player_is_home")
+        pname = (self.p1_name if self._which == 1 else self.p2_name).split()[-1]
+        if not ph:                          # orient set scores to the player
+            sets = ["-".join(reversed(s.split("-"))) for s in sets]
+        score = " ".join(sets)
+        head = (f"{pname} vs {meta.get('opponent','?')}   ·   "
+                f"{meta.get('tournament','')}   ·   {meta.get('surface','').title()}"
+                f"   ·   {dstr}")
+        if score:
+            head += f"   ·   {score}"
+        if total_time:
+            head += f"   ·   {total_time}"
+        self.detail_header.setText(head)
+
+        # scope selector
+        self.scope_combo.blockSignals(True)
+        self.scope_combo.clear()
+        scopes = list(self._cur_stats.keys())
+        self.scope_combo.addItems(scopes)
+        self.scope_combo.blockSignals(False)
+        if scopes:
+            self._render_scope(scopes[0])
+        else:
+            self.stats_table.setRowCount(1)
+            self.stats_table.setSpan(0, 0, 1, 3)
+            self.stats_table.setItem(0, 0, QTableWidgetItem(
+                "No detailed statistics available for this match."))
+
+        self.pbp_view.setPlainText(self._format_pbp(detail.get("pbp", []) or [], meta))
+
+    @staticmethod
+    def _parse_set_summary(setsum):
+        """Return (['6-1','6-4',...], total_time_str) from a df_su feed."""
+        sets = []
+        total = ""
+        for r in setsum:
+            for hk, ak in (("BA", "BB"), ("BC", "BD"), ("BE", "BF"),
+                           ("BG", "BH"), ("BI", "BJ")):
+                if r.get(hk) is not None and r.get(ak) is not None:
+                    sets.append(f"{r[hk]}-{r[ak]}")
+            if r.get("RB"):
+                total = r["RB"]
+        return sets, total
+
+    # -- rendering ----------------------------------------------------------
+    def _render_scope(self, scope):
+        cats = self._cur_stats.get(scope, {})
+        ph = self._cur_meta.get("player_is_home") if self._cur_meta else True
+        pname = (self.p1_name if self._which == 1 else self.p2_name).split()[-1] or "Player"
+        oname = (self._cur_meta or {}).get("opponent", "Opp")
+        self.stats_table.setColumnCount(3)
+        self.stats_table.setHorizontalHeaderLabels([pname, "", oname])
+        hdr = self.stats_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
+        rows = []
+        for cat, stats in cats.items():
+            rows.append(("cat", cat, "", ""))
+            for stat, home, away in stats:
+                # orient to the listed player
+                pv, ov = (home, away) if ph else (away, home)
+                rows.append(("stat", stat, pv, ov))
+
+        self.stats_table.setRowCount(len(rows))
+        for i, (kind, a, b, c) in enumerate(rows):
+            if kind == "cat":
+                self.stats_table.setSpan(i, 0, 1, 3)
+                it = QTableWidgetItem(a)
+                it.setForeground(QColor(TennisTheme.SECONDARY))
+                f = QFont(); f.setBold(True); it.setFont(f)
+                self.stats_table.setItem(i, 0, it)
+                self.stats_table.setItem(i, 1, QTableWidgetItem(""))
+                self.stats_table.setItem(i, 2, QTableWidgetItem(""))
+            else:
+                pv = QTableWidgetItem(str(b))
+                pv.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                pv.setForeground(QColor(TennisTheme.PRIMARY if self._which == 1
+                                        else TennisTheme.ACCENT))
+                name = QTableWidgetItem(a)
+                name.setForeground(QColor(TennisTheme.TEXT_SECONDARY))
+                name.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ov = QTableWidgetItem(str(c))
+                ov.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ov.setForeground(QColor(TennisTheme.TEXT_PRIMARY))
+                self.stats_table.setItem(i, 0, pv)
+                self.stats_table.setItem(i, 1, name)
+                self.stats_table.setItem(i, 2, ov)
+        self.stats_table.resizeRowsToContents()
+
+    @staticmethod
+    def _format_pbp(pbp, meta):
+        home = (meta.get("home_name") or "Home")
+        away = (meta.get("away_name") or "Away")
+        lines = []
+        for r in pbp:
+            if "HA" in r:                       # set header
+                lines.append(f"\n{r['HA']}")
+            elif "HL" in r:
+                gh, ga = r.get("HC", ""), r.get("HE", "")
+                server = home if r.get("HG") == "1" else away
+                seq = r.get("HL", "")
+                lines.append(f"  {gh}-{ga}  {server[:14]:<14}  {seq}")
+        return "\n".join(lines).strip() or "No point-by-point available."
+
+    # -- reset --------------------------------------------------------------
+    def _clear_detail(self):
+        self.detail_header.setText("")
+        self.scope_combo.clear()
+        self.stats_table.setRowCount(0)
+        self.pbp_view.setPlainText("")
+        self._cur_stats, self._cur_meta = {}, None
+
+
 class MatchupAnalysisPanel(QWidget):
     """Tabbed bottom-right panel: Match Sim / Head-to-Head / Serve & Return."""
 
@@ -5201,6 +5601,7 @@ class MatchupAnalysisPanel(QWidget):
         self.p1 = self.p2 = None
         self.p1_hist = []
         self.p2_hist = []
+        self.g1 = self.g2 = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -5228,6 +5629,7 @@ class MatchupAnalysisPanel(QWidget):
         self.serve_return_tab = ServeReturnTab()
         self.serve_tab = StatComparisonTab(SERVE_SPEC, scroll=True)
         self.return_rally_tab = StatComparisonTab(RETURN_RALLY_SPEC, scroll=True)
+        self.match_stats_tab = MatchStatsTab()
         # Scroll-wrap the sim tab: its full content (controls + prob bar +
         # context + distributions) needs ~500px; on the initial 800px-tall
         # window the panel gets far less, and without a scroll area the
@@ -5241,6 +5643,7 @@ class MatchupAnalysisPanel(QWidget):
         self.tabs.addTab(self.serve_return_tab, "Surface")
         self.tabs.addTab(self.serve_tab, "Serve")
         self.tabs.addTab(self.return_rally_tab, "Return & Rally")
+        self.tabs.addTab(self.match_stats_tab, "Match Stats")
         layout.addWidget(self.tabs)
 
         self.setStyleSheet(f"background: {TennisTheme.SURFACE};")
@@ -5248,10 +5651,14 @@ class MatchupAnalysisPanel(QWidget):
     def update_player(self, player_name: str, data_dict: dict, player_num: int):
         parsed = parse_player_payload(data_dict)
         hist = data_dict.get('historical_matches', []) or []
+        bio = data_dict.get('player_bio', {}) or {}
+        tour = (bio.get('tour') if isinstance(bio, dict)
+                else getattr(bio, 'tour', '')) or ''
+        gender = 'Women' if str(tour).upper() == 'WTA' else 'Men'
         if player_num == 1:
-            self.p1_name, self.p1, self.p1_hist = player_name, parsed, hist
+            self.p1_name, self.p1, self.p1_hist, self.g1 = player_name, parsed, hist, gender
         else:
-            self.p2_name, self.p2, self.p2_hist = player_name, parsed, hist
+            self.p2_name, self.p2, self.p2_hist, self.g2 = player_name, parsed, hist, gender
         self._push()
 
     def _push(self):
@@ -5261,6 +5668,8 @@ class MatchupAnalysisPanel(QWidget):
         self.return_rally_tab.set_data(self.p1_name, self.p2_name, self.p1, self.p2)
         self.h2h_tab.set_players(self.p1_name, self.p2_name)
         self.h2h_tab.set_historical(self.p1_hist, self.p2_hist)
+        self.match_stats_tab.set_players(self.p1_name, self.p2_name,
+                                         self.g1, self.g2)
 
     def set_h2h(self, record, h2h_matches):
         self.h2h_tab.set_h2h(record, h2h_matches)
