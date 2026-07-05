@@ -1,5 +1,7 @@
 import sys
+import os
 import re
+import html
 import threading
 import sqlite3
 from datetime import datetime, timedelta
@@ -9,8 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QGridLayout, QSizePolicy, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QScrollArea, QTabWidget, QStackedLayout,
-    QListWidget, QListWidgetItem, QSplitter, QTableWidget,
-    QTableWidgetItem, QHeaderView, QAbstractItemView, QPlainTextEdit
+    QListWidget, QListWidgetItem, QSplitter, QAbstractItemView, QTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRect, QPoint
 from PyQt6.QtGui import (
@@ -1033,8 +1034,11 @@ class CompactPlayerSearchWidget(QWidget):
 
         pt = input_widget.mapTo(win, QPoint(0, input_widget.height() + 2))
         frame.setGeometry(pt.x(), pt.y(), input_widget.width(), height)
-        frame.raise_()
+        # Show BEFORE raising: on some X11 window managers show() re-inserts the
+        # widget into the sibling stack, so a raise_() issued first doesn't stick
+        # and the overlay renders behind the dashboard.
         frame.show()
+        frame.raise_()
 
     def get_button_style(self, is_selected):
         """Get button style based on selection state"""
@@ -5195,6 +5199,110 @@ RETURN_RALLY_SPEC = [
 ]
 
 
+def _stat_num(s):
+    """Parse a comparable number out of a stat value string.
+
+    '73% (56/77)' -> 73, '2/5' -> 0.4, '185 km/h' -> 185, '12' -> 12.
+    Both cells of a row share a format, so the pair is always comparable.
+    """
+    s = str(s or "").strip()
+    if re.fullmatch(r"\d+/\d+", s):                 # e.g. break points '2/5'
+        a, b = s.split("/")
+        return float(a) / float(b) if float(b) else 0.0
+    m = re.search(r"-?\d+\.?\d*", s)
+    return float(m.group()) if m else None
+
+
+class _StatCompareView(QWidget):
+    """Dense head-to-head stat comparison: per stat a left/right value with a
+    diverging bar showing each player's share, grouped by category. Fills the
+    width and makes 'who's ahead' scannable at a glance."""
+
+    HDR_H = 22
+    CAT_H = 18
+    ROW_H = 27
+
+    def __init__(self):
+        super().__init__()
+        self._rows = []            # ('cat', name) | ('stat', name, a, b, af)
+        self.left_name = self.right_name = ""
+        self.left_color = QColor(TennisTheme.PRIMARY)
+        self.right_color = QColor(TennisTheme.ACCENT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_data(self, rows, left_name, right_name, left_color, right_color):
+        self.left_name, self.right_name = left_name, right_name
+        self.left_color = QColor(left_color)
+        self.right_color = QColor(right_color)
+        self._rows = rows
+        h = self.HDR_H
+        for r in rows:
+            h += self.CAT_H if r[0] == "cat" else self.ROW_H
+        self.setMinimumHeight(h + 6)
+        self.updateGeometry()
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(TennisTheme.CARD_BACKGROUND))
+        w = self.width()
+        pad = 10
+        y = 0
+
+        # sticky-ish player name header
+        p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        p.setPen(self.left_color)
+        p.drawText(QRect(pad, y, w - 2 * pad, self.HDR_H),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.left_name)
+        p.setPen(self.right_color)
+        p.drawText(QRect(pad, y, w - 2 * pad, self.HDR_H),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                   self.right_name)
+        y += self.HDR_H
+
+        for r in self._rows:
+            if r[0] == "cat":
+                p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+                p.setPen(QColor(TennisTheme.SECONDARY))
+                p.drawText(QRect(pad, y, w - 2 * pad, self.CAT_H),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           r[1].upper())
+                y += self.CAT_H
+                continue
+            _, name, a, b, af = r
+            # values
+            p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            p.setPen(self.left_color)
+            p.drawText(QRect(pad, y + 2, 150, 15),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, a)
+            p.setPen(self.right_color)
+            p.drawText(QRect(w - pad - 150, y + 2, 150, 15),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, b)
+            p.setFont(QFont("Arial", 9))
+            p.setPen(QColor(TennisTheme.TEXT_SECONDARY))
+            p.drawText(QRect(pad, y + 2, w - 2 * pad, 15),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, name)
+            # diverging share bar
+            bx, bw, bh = pad, w - 2 * pad, 4
+            by = y + 19
+            p.setPen(Qt.PenStyle.NoPen)
+            track = QColor(TennisTheme.SURFACE)
+            p.setBrush(track)
+            p.drawRoundedRect(bx, by, bw, bh, 2, 2)
+            if af is not None:
+                lw = int(bw * max(0.0, min(1.0, af)))
+                lc = QColor(self.left_color); lc.setAlpha(230)
+                rc = QColor(self.right_color); rc.setAlpha(230)
+                p.setBrush(lc)
+                p.drawRoundedRect(bx, by, max(0, lw), bh, 2, 2)
+                p.setBrush(rc)
+                p.drawRoundedRect(bx + lw, by, max(0, bw - lw), bh, 2, 2)
+            y += self.ROW_H
+        p.end()
+
+
 class MatchStatsTab(QWidget):
     """Browse either player's recent completed matches and inspect the full
     per-match statistics (match + per-set), point-by-point and set summary,
@@ -5298,36 +5406,33 @@ class MatchStatsTab(QWidget):
         scope_row.addStretch()
         rv.addLayout(scope_row)
 
-        self.stats_table = QTableWidget(0, 3)
-        self.stats_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.stats_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.stats_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.stats_table.verticalHeader().setVisible(False)
-        self.stats_table.setShowGrid(False)
-        self.stats_table.setStyleSheet(f"""
-            QTableWidget {{
+        self.stats_view = _StatCompareView()
+        self.stats_scroll = QScrollArea()
+        self.stats_scroll.setWidgetResizable(True)
+        self.stats_scroll.setWidget(self.stats_view)
+        self.stats_scroll.setStyleSheet(f"""
+            QScrollArea {{
                 background: {TennisTheme.CARD_BACKGROUND};
                 border: 1px solid {TennisTheme.SURFACE}; border-radius: 6px;
-                color: {TennisTheme.TEXT_PRIMARY}; font-size: 11px; gridline-color: transparent;
-            }}
-            QHeaderView::section {{
-                background: {TennisTheme.SURFACE}; color: {TennisTheme.TEXT_SECONDARY};
-                border: none; padding: 4px; font-size: 11px; font-weight: bold;
             }}
         """)
-        rv.addWidget(self.stats_table, 3)
+        self.stats_msg = QLabel("")
+        self.stats_msg.setStyleSheet(
+            f"color: {TennisTheme.TEXT_MUTED}; font-size: 11px;")
+        rv.addWidget(self.stats_scroll, 3)
+        rv.addWidget(self.stats_msg)
 
         pbp_lbl = QLabel("Point by point")
         pbp_lbl.setStyleSheet(
             f"color: {TennisTheme.SECONDARY}; font-size: 11px; font-weight: bold;")
         rv.addWidget(pbp_lbl)
-        self.pbp_view = QPlainTextEdit()
+        self.pbp_view = QTextEdit()
         self.pbp_view.setReadOnly(True)
         self.pbp_view.setStyleSheet(f"""
-            QPlainTextEdit {{
+            QTextEdit {{
                 background: {TennisTheme.CARD_BACKGROUND};
                 border: 1px solid {TennisTheme.SURFACE}; border-radius: 6px;
-                color: {TennisTheme.TEXT_SECONDARY}; font-family: monospace; font-size: 11px;
+                color: {TennisTheme.TEXT_SECONDARY};
             }}
         """)
         rv.addWidget(self.pbp_view, 2)
@@ -5449,7 +5554,8 @@ class MatchStatsTab(QWidget):
             return
         self.detail_header.setText("Loading match detail…")
         self.scope_combo.clear()
-        self.stats_table.setRowCount(0)
+        self.stats_view.set_data([], "", "", TennisTheme.PRIMARY, TennisTheme.ACCENT)
+        self.stats_msg.setText("")
         self.pbp_view.setPlainText("")
         self._detail_req += 1
         req = self._detail_req
@@ -5500,12 +5606,13 @@ class MatchStatsTab(QWidget):
         if scopes:
             self._render_scope(scopes[0])
         else:
-            self.stats_table.setRowCount(1)
-            self.stats_table.setSpan(0, 0, 1, 3)
-            self.stats_table.setItem(0, 0, QTableWidgetItem(
-                "No detailed statistics available for this match."))
+            self.stats_view.set_data([], "", "", TennisTheme.PRIMARY, TennisTheme.ACCENT)
+            self.stats_msg.setText("No detailed statistics available for this match.")
 
-        self.pbp_view.setPlainText(self._format_pbp(detail.get("pbp", []) or [], meta))
+        left_color = TennisTheme.PRIMARY if self._which == 1 else TennisTheme.ACCENT
+        right_color = TennisTheme.ACCENT if self._which == 1 else TennisTheme.PRIMARY
+        self.pbp_view.setHtml(self._format_pbp(detail.get("pbp", []) or [], meta,
+                                               left_color, right_color))
 
     @staticmethod
     def _parse_set_summary(setsum):
@@ -5527,67 +5634,73 @@ class MatchStatsTab(QWidget):
         ph = self._cur_meta.get("player_is_home") if self._cur_meta else True
         pname = (self.p1_name if self._which == 1 else self.p2_name).split()[-1] or "Player"
         oname = (self._cur_meta or {}).get("opponent", "Opp")
-        self.stats_table.setColumnCount(3)
-        self.stats_table.setHorizontalHeaderLabels([pname, "", oname])
-        hdr = self.stats_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        left_color = TennisTheme.PRIMARY if self._which == 1 else TennisTheme.ACCENT
+        right_color = TennisTheme.ACCENT if self._which == 1 else TennisTheme.PRIMARY
 
         rows = []
         for cat, stats in cats.items():
-            rows.append(("cat", cat, "", ""))
+            rows.append(("cat", cat))
             for stat, home, away in stats:
-                # orient to the listed player
-                pv, ov = (home, away) if ph else (away, home)
-                rows.append(("stat", stat, pv, ov))
-
-        self.stats_table.setRowCount(len(rows))
-        for i, (kind, a, b, c) in enumerate(rows):
-            if kind == "cat":
-                self.stats_table.setSpan(i, 0, 1, 3)
-                it = QTableWidgetItem(a)
-                it.setForeground(QColor(TennisTheme.SECONDARY))
-                f = QFont(); f.setBold(True); it.setFont(f)
-                self.stats_table.setItem(i, 0, it)
-                self.stats_table.setItem(i, 1, QTableWidgetItem(""))
-                self.stats_table.setItem(i, 2, QTableWidgetItem(""))
-            else:
-                pv = QTableWidgetItem(str(b))
-                pv.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                pv.setForeground(QColor(TennisTheme.PRIMARY if self._which == 1
-                                        else TennisTheme.ACCENT))
-                name = QTableWidgetItem(a)
-                name.setForeground(QColor(TennisTheme.TEXT_SECONDARY))
-                name.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                ov = QTableWidgetItem(str(c))
-                ov.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                ov.setForeground(QColor(TennisTheme.TEXT_PRIMARY))
-                self.stats_table.setItem(i, 0, pv)
-                self.stats_table.setItem(i, 1, name)
-                self.stats_table.setItem(i, 2, ov)
-        self.stats_table.resizeRowsToContents()
+                pv, ov = (home, away) if ph else (away, home)   # orient to player
+                na, nb = _stat_num(pv), _stat_num(ov)
+                af = None
+                if na is not None and nb is not None and (na + nb) > 0:
+                    af = na / (na + nb)
+                rows.append(("stat", stat, pv, ov, af))
+        self.stats_view.set_data(rows, pname, oname, left_color, right_color)
+        self.stats_msg.setText("")
 
     @staticmethod
-    def _format_pbp(pbp, meta):
-        home = (meta.get("home_name") or "Home")
-        away = (meta.get("away_name") or "Away")
-        lines = []
+    def _format_pbp(pbp, meta, left_color, right_color):
+        """Colored, column-aligned HTML: game score · server (player-coloured) ·
+        point sequence, with break points highlighted. Serving player's games
+        are tinted so holds/breaks read at a glance."""
+        home = meta.get("home_name") or "Home"
+        away = meta.get("away_name") or "Away"
+        ph = meta.get("player_is_home")
+        home_col = left_color if ph else right_color
+        away_col = right_color if ph else left_color
+        muted = TennisTheme.TEXT_MUTED
+        sec = TennisTheme.SECONDARY
+        txt = TennisTheme.TEXT_SECONDARY
+
+        def hl_bp(seq):                       # highlight |Bn| break-point marks
+            return re.sub(r"\|B\d+\|",
+                          lambda m: f'<b style="color:{sec}">{m.group()}</b>',
+                          html.escape(seq))
+
+        parts = ['<div style="font-family:monospace;font-size:11px">']
+        rows = []
         for r in pbp:
-            if "HA" in r:                       # set header
-                lines.append(f"\n{r['HA']}")
+            if "HA" in r:
+                if rows:
+                    parts.append('<table cellspacing="0" cellpadding="0">'
+                                 + "".join(rows) + "</table>")
+                    rows = []
+                parts.append(f'<div style="color:{sec};font-weight:bold;'
+                             f'margin:6px 0 2px">{html.escape(r["HA"])}</div>')
             elif "HL" in r:
                 gh, ga = r.get("HC", ""), r.get("HE", "")
-                server = home if r.get("HG") == "1" else away
-                seq = r.get("HL", "")
-                lines.append(f"  {gh}-{ga}  {server[:14]:<14}  {seq}")
-        return "\n".join(lines).strip() or "No point-by-point available."
+                is_home = r.get("HG") == "1"
+                server = (home if is_home else away).split()[0]
+                scol = home_col if is_home else away_col
+                rows.append(
+                    f'<tr><td style="color:{muted};padding-right:12px">{gh}-{ga}</td>'
+                    f'<td style="color:{scol};padding-right:14px">{html.escape(server)}</td>'
+                    f'<td style="color:{txt}">{hl_bp(r.get("HL",""))}</td></tr>')
+        if rows:
+            parts.append('<table cellspacing="0" cellpadding="0">'
+                         + "".join(rows) + "</table>")
+        parts.append("</div>")
+        body = "".join(parts)
+        return body if pbp else "No point-by-point available."
 
     # -- reset --------------------------------------------------------------
     def _clear_detail(self):
         self.detail_header.setText("")
         self.scope_combo.clear()
-        self.stats_table.setRowCount(0)
+        self.stats_view.set_data([], "", "", TennisTheme.PRIMARY, TennisTheme.ACCENT)
+        self.stats_msg.setText("")
         self.pbp_view.setPlainText("")
         self._cur_stats, self._cur_meta = {}, None
 
@@ -6311,6 +6424,13 @@ class CompactTennisComparisonWidget(QWidget):
 
 # Test application
 if __name__ == "__main__":
+    # Anchor the working directory to this script's folder so the app's relative
+    # paths (tennis_rankings.db, ta_cache/, ...) resolve correctly no matter
+    # where it is launched from. Launching from another directory otherwise makes
+    # the scraper create a fresh EMPTY tennis_rankings.db in that cwd -> no
+    # rankings load -> no search suggestions and blank panels.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
     app = QApplication(sys.argv)
 
     # Create main comparison widget
