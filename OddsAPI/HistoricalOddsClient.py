@@ -13,7 +13,15 @@ from PyQt6.QtWidgets import (
     QSpinBox, QMessageBox, QListWidget, QListWidgetItem, QFrame,
     QLineEdit, QStyle, QStyleOptionComboBox, QStylePainter, QAbstractItemView
 )
-from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics
+from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics, QAction
+from PyQt6.QtWidgets import QApplication as _QApplication
+
+# The volume heat map's QWebEngineView (imported lazily on demand) requires
+# AA_ShareOpenGLContexts to be set BEFORE the QApplication is created. This module
+# is imported before the app exists (EffortOdds.py imports it at top-level, ahead
+# of QApplication([])), so set it here. Guarded: no-op if an app already exists.
+if _QApplication.instance() is None:
+    _QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
 from KalshiClient import KalshiClient, KalshiStreamClient, KalshiLiveBook
 from polymarketquery import (PolymarketSportsClient, PolymarketStreamClient,
@@ -21,7 +29,7 @@ from polymarketquery import (PolymarketSportsClient, PolymarketStreamClient,
                              cancel_pm_order)
 import re
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
 
@@ -64,12 +72,13 @@ SPORTSBOOK_LOGO_DIR = Path(__file__).resolve().parent / "sportsbooklogos"
 # Series line colors keyed by bookmaker. Kalshi=green, Polymarket=blue (matches
 # their brand colors). Paid-OddsAPI books fall back to the palette by index.
 BOOKMAKER_LINE_COLORS = {
-    # Venue identity hues are deliberately kept OFF green/red — the candle bodies
-    # own those (bull/bear). Venues read as CRT phosphor accents instead: Kalshi a
-    # cyan/teal, Polymarket a violet. Both pop on the near-black terminal screen
-    # and stay distinguishable from the green/red bars and from each other.
-    'kalshi': (72, 197, 190),       # teal
-    'polymarket': (176, 138, 240),  # violet
+    # Venue identity hues match each exchange's BRAND colour (sampled from their
+    # logos) so a glance at a line/percentage reads as the right venue: Kalshi the
+    # mint green of its mark, Polymarket its royal blue. Both pop on the near-black
+    # terminal screen. The candle bodies use a softer bull green / bear red, so the
+    # saturated Kalshi mint stays distinct from a green candle.
+    'kalshi': (0, 211, 151),        # Kalshi brand mint-green
+    'polymarket': (46, 92, 255),    # Polymarket brand blue
 }
 FALLBACK_LINE_COLORS = [
     (255, 127, 14), (214, 39, 40), (148, 103, 189),
@@ -2056,6 +2065,311 @@ class KalshiHistoricalOddsClient:
         return out
 
 
+# ---------------------------------------------------------------------------
+# Combined Kalshi × Polymarket volume heat map — DATA LAYER ONLY
+# ---------------------------------------------------------------------------
+# Rolls per-market USD-notional volume up Sport -> League -> Event -> Market off
+# the already-built UnifiedEvents. The existing EventMatcher/MarketMatcher mapping
+# is the source of truth: this neither re-matches nor re-fetches events, it only
+# aggregates volume over what load_all_sports already produced. Rendering is
+# intentionally absent — to_records()/to_nested() feed a px.treemap / go.Treemap
+# (or ECharts/D3 later) without any plotting import leaking into the data layer.
+#
+# Volume unit = trailing-window USD notional on BOTH platforms (apples-to-apples):
+#   * Polymarket: Market.volume_24hr (native USDC notional, already fetched bulk)
+#   * Kalshi:    SUM(candle.volume_fp * candle.price.mean_dollars) via the batch
+#                candlesticks endpoint — price-weighted, reuses
+#                KalshiClient.candle_dollar_volume. Falls back to bulk contract
+#                `volume` * last_price only when candles are unavailable, and flags
+#                that node approximate (HeatmapNode.approx).
+@dataclass
+class HeatmapNode:
+    id: str
+    parent: str          # "" for sport-level roots
+    label: str
+    level: str           # 'sport' | 'league' | 'event' | 'market'
+    value: float = 0.0           # rolled-up USD notional (Kalshi + Polymarket)
+    kalshi_value: float = 0.0
+    poly_value: float = 0.0
+    approx: bool = False         # any contributing Kalshi leg used the fallback
+    meta: dict = field(default_factory=dict)
+
+
+class VolumeHeatmap:
+    """Aggregates UnifiedEvents into a Sport->League->Event->Market volume tree.
+
+    Usage:
+        hm = await VolumeHeatmap(kalshi_client).compute(unified_events,
+                                                        sport_by_league)
+        records = hm.to_records()   # flat rows for Plotly treemap
+        tree    = hm.to_nested()    # nested dict for custom renderers
+    """
+
+    # League -> sport category for common leagues. Non-big-4 leagues fall back to
+    # the league label as its own sport bucket unless sport_by_league overrides.
+    SPORT_CATEGORY = {
+        'NFL': 'Football', 'NCAAF': 'Football',
+        'NBA': 'Basketball', 'NCAAB': 'Basketball',
+        'MLB': 'Baseball',
+        'NHL': 'Hockey',
+        'EPL': 'Soccer', 'UCL': 'Soccer', 'MLS': 'Soccer', 'LA_LIGA': 'Soccer',
+        'BUNDESLIGA': 'Soccer', 'SERIE_A': 'Soccer', 'LIGUE_1': 'Soccer',
+    }
+
+    # Event lifecycle: a game is 'live' for this many hours after its start, then
+    # 'final'. Generous enough to cover the longest games (extra innings / OT).
+    LIVE_WINDOW_HOURS = 4.0
+    STATUS_ICON = {'live': '🔴 ', 'final': '✓ ', 'future': '🏆 '}
+
+    @staticmethod
+    def _event_status(start_time) -> str:
+        """live / upcoming / final / unknown from an ISO start_time. Date-only
+        (midnight-UTC, from a Kalshi ticker with no time) -> 'unknown' since the
+        intraday clock can't be inferred."""
+        if not start_time:
+            return 'unknown'
+        from datetime import datetime, timezone
+        try:
+            s = start_time.replace('Z', '+00:00')
+            if '+' not in s and 'T' in s and s.count(':') >= 2:
+                s += '+00:00'
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return 'unknown'
+        # Midnight-exact == date-only Kalshi parse; can't tell live vs final.
+        if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            return 'unknown'
+        hrs = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+        if hrs < 0:
+            return 'upcoming'
+        return 'live' if hrs <= VolumeHeatmap.LIVE_WINDOW_HOURS else 'final'
+
+    def __init__(self, kalshi_client=None, window_hours: int = 24,
+                 period_interval: int = 60):
+        self.kalshi_client = kalshi_client      # KalshiClient (batch candles)
+        self.window_hours = window_hours
+        self.period_interval = period_interval
+        self.nodes: dict = {}                    # id -> HeatmapNode
+
+    async def compute(self, unified_events, sport_by_league: dict = None):
+        """Fetch Kalshi candle dollars (batched, off-thread) then build the tree.
+        sport_by_league: optional {league_label: sport_category}, e.g. from the
+        ranked-series tags. Returns self."""
+        kalshi_vwaps = await self._kalshi_vwaps(unified_events)
+        self._build(unified_events, kalshi_vwaps, sport_by_league or {})
+        return self
+
+    # -- Kalshi price (VWAP) from batched candlesticks ---------------------
+    async def _kalshi_vwaps(self, unified_events) -> dict:
+        """{market_ticker: vwap_in_dollars} from the 24h candles — the volume-
+        weighted average traded price. We dollarize the AUTHORITATIVE 24h contract
+        count (volume_24h_fp on the bulk market dict) by this VWAP rather than
+        summing raw candle volume, because candle volume can materially under-report
+        a busy market's true 24h total (observed ~50% on a 2.3M-contract market),
+        whereas the VWAP is a ratio and stays accurate. Empty dict -> callers fall
+        back to the book mid. No client / no tickers -> empty."""
+        if not self.kalshi_client:
+            return {}
+        tickers = []
+        for ev in unified_events:
+            for m in (ev.kalshi_markets or []):
+                if isinstance(m, dict) and m.get('ticker'):
+                    tickers.append(m['ticker'])
+        tickers = list(dict.fromkeys(tickers))   # de-dupe, preserve order
+        if not tickers:
+            return {}
+        end_ts = int(_time.time())
+        start_ts = end_ts - self.window_hours * 3600
+        loop = asyncio.get_event_loop()
+        try:
+            candle_map = await loop.run_in_executor(
+                None,
+                lambda: self.kalshi_client.get_markets_candlesticks_batch(
+                    tickers, start_ts, end_ts, self.period_interval))
+        except Exception as e:
+            print(f"[heatmap] kalshi candle batch failed: {e}")
+            return {}
+        out = {}
+        for tk, c in candle_map.items():
+            contracts = 0.0
+            for cd in (c or []):
+                try:
+                    contracts += float(cd.get('volume_fp', cd.get('volume', 0)) or 0)
+                except (TypeError, ValueError):
+                    pass
+            if contracts > 0:                       # VWAP = $ / contracts
+                out[tk] = KalshiClient.candle_dollar_volume(c) / contracts
+        return out
+
+    # -- per-market helpers ------------------------------------------------
+    @staticmethod
+    def _kalshi_24h_contracts(m: dict) -> float:
+        """Authoritative trailing-24h contract count from the bulk market dict."""
+        try:
+            return float(m.get('volume_24h_fp', m.get('volume_fp', 0)) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _market_mid_dollars(m: dict) -> float:
+        """Fallback price (dollars) when no candle VWAP: last/previous trade, else
+        bid/ask mid. Kalshi market dicts carry *_dollars price fields."""
+        for k in ('last_price_dollars', 'previous_price_dollars'):
+            v = m.get(k)
+            if v not in (None, ''):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        yb, ya = m.get('yes_bid_dollars'), m.get('yes_ask_dollars')
+        try:
+            if yb not in (None, '') and ya not in (None, ''):
+                return (float(yb) + float(ya)) / 2.0
+        except (TypeError, ValueError):
+            pass
+        lp = m.get('last_price')                    # legacy cents field
+        try:
+            return float(lp) / 100.0 if lp not in (None, '') else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _poly_market_usd(m) -> float:
+        """Polymarket 24h USDC notional (native). Matches the 24h Kalshi window."""
+        v = getattr(m, 'volume_24hr', None)
+        if v is None and isinstance(m, dict):
+            v = m.get('volume_24hr', m.get('volume24hr'))
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # -- tree assembly ------------------------------------------------------
+    def _build(self, unified_events, kalshi_vwaps: dict, sport_by_league: dict):
+        self.nodes = {}
+        for ev in unified_events:
+            league = ev.sport or 'Other'
+            sport = (sport_by_league.get(league)
+                     or self.SPORT_CATEGORY.get(league, league))
+            sport_id = f"S::{sport}"
+            league_id = f"L::{sport}::{league}"
+            ev_key = (ev.kalshi_event_ticker or ev.polymarket_game_id
+                      or ev.future_label or ev.get_display_title())
+            event_id = f"E::{league_id}::{ev_key}"
+            self._ensure(sport_id, '', sport, 'sport')
+            self._ensure(league_id, sport_id, league, 'league')
+            ev_name = (ev.future_label if ev.is_future
+                       else f"{ev.away_team} @ {ev.home_team}".strip(' @')) or ev_key
+            # Lifecycle status (sports markets, unlike stocks, have a game clock):
+            # tag live/upcoming/final so finished-game tiles are honest, and the
+            # view can offer a 'live & upcoming only' toggle.
+            status = 'future' if ev.is_future else self._event_status(ev.start_time)
+            ev_label = f"{self.STATUS_ICON.get(status, '')}{ev_name}".strip()
+            self._ensure(event_id, league_id, ev_label, 'event', meta={
+                'kalshi_event_ticker': ev.kalshi_event_ticker,
+                'polymarket_game_id': ev.polymarket_game_id,
+                'start_time': ev.start_time, 'is_future': ev.is_future,
+                'status': status})
+
+            for m in (ev.kalshi_markets or []):
+                if not isinstance(m, dict):
+                    continue
+                tk = m.get('ticker')
+                # USD = authoritative 24h contracts * VWAP (candle-derived). When
+                # no candle VWAP, fall back to the book mid and flag approximate.
+                contracts = self._kalshi_24h_contracts(m)
+                vwap = kalshi_vwaps.get(tk)
+                approx = vwap is None
+                if approx:
+                    vwap = self._market_mid_dollars(m)
+                usd = contracts * vwap
+                label = (m.get('yes_sub_title') or m.get('subtitle')
+                         or m.get('title') or tk or 'market')
+                self._add_market(f"M::{event_id}::K::{tk or label}", event_id,
+                                 label, usd, kalshi=usd, poly=0.0, approx=approx,
+                                 meta={'platform': 'kalshi', 'ticker': tk})
+
+            for m in (ev.polymarket_markets or []):
+                usd = self._poly_market_usd(m)
+                q = getattr(m, 'question', None)
+                if q is None and isinstance(m, dict):
+                    q = m.get('question')
+                pid = getattr(m, 'id', None) or (
+                    m.get('id') if isinstance(m, dict) else None)
+                self._add_market(f"M::{event_id}::P::{pid or q}", event_id,
+                                 q or 'market', usd, kalshi=0.0, poly=usd,
+                                 approx=False,
+                                 meta={'platform': 'polymarket', 'id': pid})
+        return self
+
+    def _ensure(self, node_id, parent, label, level, meta=None):
+        n = self.nodes.get(node_id)
+        if n is None:
+            n = HeatmapNode(id=node_id, parent=parent, label=label,
+                            level=level, meta=meta or {})
+            self.nodes[node_id] = n
+        return n
+
+    def _add_market(self, node_id, parent, label, value, kalshi, poly,
+                    approx, meta):
+        n = self.nodes.get(node_id)
+        if n is None:
+            n = HeatmapNode(id=node_id, parent=parent, label=label,
+                            level='market', meta=meta or {})
+            self.nodes[node_id] = n
+        n.value += value
+        n.kalshi_value += kalshi
+        n.poly_value += poly
+        n.approx = n.approx or approx
+        self._rollup(parent, value, kalshi, poly, approx)
+
+    def _rollup(self, node_id, value, kalshi, poly, approx):
+        while node_id:
+            n = self.nodes.get(node_id)
+            if n is None:
+                break
+            n.value += value
+            n.kalshi_value += kalshi
+            n.poly_value += poly
+            n.approx = n.approx or approx
+            node_id = n.parent
+
+    # -- outputs (rendering-agnostic) --------------------------------------
+    def to_records(self) -> list:
+        """Flat rows for px.treemap / go.Treemap (branchvalues='total'): parents
+        equal the sum of their children because every leaf is rolled up exactly
+        once. Carries the K/P split + approx flag for color modes."""
+        return [{
+            'id': n.id, 'parent': n.parent, 'label': n.label, 'level': n.level,
+            'value': round(n.value, 2),
+            'kalshi_value': round(n.kalshi_value, 2),
+            'poly_value': round(n.poly_value, 2),
+            'approx': n.approx,
+            **{f'meta_{k}': v for k, v in n.meta.items()},
+        } for n in self.nodes.values()]
+
+    def to_nested(self) -> list:
+        """Nested [{...,'children':[...]}] from the sport roots down, volume-sorted."""
+        kids = {}
+        for n in self.nodes.values():
+            kids.setdefault(n.parent, []).append(n)
+
+        def build(node):
+            return {
+                'id': node.id, 'label': node.label, 'level': node.level,
+                'value': round(node.value, 2),
+                'kalshi_value': round(node.kalshi_value, 2),
+                'poly_value': round(node.poly_value, 2),
+                'approx': node.approx, 'meta': node.meta,
+                'children': [build(c) for c in sorted(
+                    kids.get(node.id, []), key=lambda x: -x.value)],
+            }
+        return [build(r) for r in sorted(kids.get('', []),
+                                         key=lambda x: -x.value)]
+
+
 class OrderbookLadderWidget(QWidget):
     """Compact live depth ladder for the YES outcome
 
@@ -2556,6 +2870,14 @@ class HistoricalOddsWidget(QWidget):
         self.ws_status_label.setFixedWidth(18)
         header_layout.addWidget(self.ws_status_label)
 
+        # Volume Heat Map launcher — opens the Kalshi × Polymarket treemap in its
+        # own resizeable window. Additive: does not touch the chart/live path.
+        self.volume_map_button = QPushButton("▦")
+        self.volume_map_button.setFixedWidth(26)
+        self.volume_map_button.setToolTip("Volume Heat Map (Kalshi × Polymarket)")
+        self.volume_map_button.clicked.connect(self.open_volume_map)
+        header_layout.addWidget(self.volume_map_button)
+
         # Main content area
         content_layout = QHBoxLayout()
         # No gap/margins so the depth panel sits flush against the graph's right edge.
@@ -2603,6 +2925,16 @@ class HistoricalOddsWidget(QWidget):
         # scrolling into negative % or above 100%). minYRange keeps a sane floor
         # on zoom-in so a flat market can't be magnified into noise.
         self.plot_widget.getViewBox().setLimits(yMin=0, yMax=100, minYRange=2)
+        # Zoom/pan act on the TIME (x) axis only; the %-axis (y) auto-fits to whatever
+        # data is visible in the current x-window. This makes the view a deterministic
+        # function of the x-range: zooming out and back to the same span reproduces the
+        # SAME view (candles keep a readable height) instead of leaving y stuck at some
+        # wheel-zoomed range. minYRange=2 (above) keeps a flat market from collapsing to
+        # a hairline. See _on_user_range_change, which re-asserts this after each drag.
+        _vb0 = self.plot_widget.getViewBox()
+        _vb0.setMouseEnabled(x=True, y=False)
+        _vb0.setAutoVisible(y=True)
+        _vb0.enableAutoRange(axis='y', enable=True)
 
         # If the user pans/zooms by hand while Live "Follow" is on, drop out of
         # follow so the view stops snapping back each tick (lets them inspect).
@@ -2610,6 +2942,18 @@ class HistoricalOddsWidget(QWidget):
         # programmatic setXRange/auto-fit, so this won't self-trigger.
         self.plot_widget.getViewBox().sigRangeChangedManually.connect(
             self._on_user_range_change)
+        # Manual "Follow live edge" toggle in the plot's right-click context menu
+        # (mirrors the DEPTH/VIEW checkbox). Both drive _on_follow_toggled; the
+        # action's checked state is kept in sync from there so the menu always shows
+        # the true follow state (incl. when a pan auto-released it).
+        self._follow_action = QAction("Follow live edge", self)
+        self._follow_action.setCheckable(True)
+        self._follow_action.setChecked(self.auto_follow)
+        self._follow_action.toggled.connect(
+            lambda on: self.follow_check.setChecked(on))
+        _vb_menu = self.plot_widget.getViewBox().menu
+        _vb_menu.addSeparator()
+        _vb_menu.addAction(self._follow_action)
         # Regenerate y-axis ticks from the visible range as the user zooms/pans,
         # so the %-axis densifies/coarsens like the time axis (DateAxisItem) does
         # instead of keeping the load-time tick step forever.
@@ -2639,7 +2983,8 @@ class HistoricalOddsWidget(QWidget):
             lbl.setTextFormat(Qt.TextFormat.RichText)
             lbl.setStyleSheet(
                 "background: rgba(18,22,28,210); border:1px solid #39414b;"
-                " border-radius:3px; padding:3px 5px;")
+                " border-radius:3px; padding:4px 8px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.hide()
 
         # The current value ("NN% (+am)") is shown inside the corner summary boxes
@@ -3829,7 +4174,8 @@ class HistoricalOddsWidget(QWidget):
             # the ladder populates immediately instead of waiting on a WS snapshot
             # that may not come until the next reconnect.
             asyncio.ensure_future(self._seed_pm_books_rest(pm_tokens))
-        # Re-seed historical candles for the (new) series (no-op outside candle mode).
+        # Re-seed the (new) series' history so the overlay line/candles span the
+        # market life, not just live ticks (runs in both line and candle mode).
         asyncio.ensure_future(self._apply_live_history_seed())
 
     def _unsubscribe_from_current_market(self):
@@ -4471,30 +4817,52 @@ class HistoricalOddsWidget(QWidget):
     # ---- Live control handlers ----
     def _on_follow_toggled(self, state):
         self.auto_follow = bool(state)
+        # Keep the right-click menu action in lockstep with the checkbox (and with
+        # auto-releases from a pan). blockSignals avoids the toggle bouncing back.
+        act = getattr(self, '_follow_action', None)
+        if act is not None and act.isChecked() != self.auto_follow:
+            act.blockSignals(True)
+            act.setChecked(self.auto_follow)
+            act.blockSignals(False)
         vb = self.plot_widget.getViewBox()
         if self.auto_follow:
             # Resume scrolling/auto-fit on the next tick.
             if self.live_mode:
                 self._refresh_live_items()
         else:
-            # Freeze the view exactly where it is for inspection.
-            vb.enableAutoRange(x=False, y=False)
+            # Freeze the TIME axis where it is for inspection; the %-axis keeps
+            # auto-fitting to the visible data (mouse can't touch y).
+            vb.enableAutoRange(x=False)
+            vb.enableAutoRange(axis='y', enable=True)
 
     def _on_user_range_change(self, *args):
-        """User panned/zoomed by hand -> stop following, and re-render the overlay
-        for the NEW window (debounced). Overlays are clipped to the visible range,
-        so without this the candles outside the old window stay blank until the
-        next live flush — the zoom-out lag."""
-        if self.live_mode and self.auto_follow:
-            # Uncheck the box (also sets auto_follow False via _on_follow_toggled).
+        """User panned/zoomed by hand -> switch to MANUAL view control.
+
+        Follow (auto-scroll to the live edge) is nothing more than an auto-scroll
+        MODE; the instant the user drives the view themselves it turns off, so the
+        view stops snapping back and zoom/pan behave as plain, native pyqtgraph —
+        IDENTICALLY whether Follow was on or off, and anywhere on the chart (incl.
+        empty space past the last tick). Re-enable auto-scroll via the DEPTH/VIEW
+        checkbox or the right-click menu.
+
+        The overlay is also re-rendered for the new window (debounced): the overlays
+        are clipped to the visible range, so without this the candles outside the old
+        window stay blank until the next live flush (the zoom-out lag)."""
+        if not self.live_mode:
+            return
+        if self.auto_follow:
+            # Taking manual control of the TIME axis -> stop auto-scroll.
             self.follow_check.setChecked(False)
-        if self.live_mode:
-            if not hasattr(self, '_zoom_render_timer'):
-                self._zoom_render_timer = QTimer(self)
-                self._zoom_render_timer.setSingleShot(True)
-                self._zoom_render_timer.timeout.connect(
-                    lambda: self.live_mode and self._refresh_live_items())
-            self._zoom_render_timer.start(40)  # coalesce a drag into one re-render
+        # Keep the %-axis auto-fitting to the visible data after the x-zoom/pan (a
+        # manual range change can drop y off autorange; re-assert it so the view stays
+        # a pure function of the x-window and remains reversible).
+        self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
+        if not hasattr(self, '_zoom_render_timer'):
+            self._zoom_render_timer = QTimer(self)
+            self._zoom_render_timer.setSingleShot(True)
+            self._zoom_render_timer.timeout.connect(
+                lambda: self.live_mode and self._refresh_live_items())
+        self._zoom_render_timer.start(40)  # coalesce a drag into one re-render
 
     def _on_spread_toggled(self, state):
         self.show_spread_band = bool(state)
@@ -4505,10 +4873,13 @@ class HistoricalOddsWidget(QWidget):
         self.candle_mode = bool(state)
         self.candle_bucket.setEnabled(self.candle_mode)
         if self.live_mode:
-            # Turning candles ON: re-seed history. The seed (_apply_live_history_seed)
-            # no-ops while candle_mode is False, so a book subscribed with candles off
-            # has only live ticks — without this the candles would start blank and only
-            # fill from "now" forward. Re-fit the axis so the candle window is readable.
+            # The overlay already carries seeded history in BOTH modes (the seed runs
+            # on every subscribe now, not just in candle mode), and update_plot never
+            # draws the K/PM lines while live — so toggling is a pure in-place visibility
+            # flip (line <-> candles) on the SAME overlay items, no stale static layer to
+            # collide with. Re-fit the axis when turning candles ON so the 1-min candle
+            # window is readable; a defensive re-seed covers a series that somehow has no
+            # history yet (idempotent — merges by timestamp).
             if self.candle_mode:
                 self._axes_configured = False
                 asyncio.ensure_future(self._apply_live_history_seed())
@@ -4737,8 +5108,9 @@ class HistoricalOddsWidget(QWidget):
                     continue
                 s, cents = scored[idx]
                 r, g, b = s['hue']
-                lead = (f"<span style='color:#{r:02x}{g:02x}{b:02x};font-weight:bold'>"
-                        f"{s['outcome']} {cents:.1f}%</span>")
+                mark = self._venue_marker(s.get('venue'), s['hue'])
+                lead = (f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
+                        f"font-weight:bold'>{s['outcome']} {cents:.1f}%</span>")
                 self._set_summary_label(band, _move_html(s, cents, lead))
             return
 
@@ -4755,13 +5127,15 @@ class HistoricalOddsWidget(QWidget):
             if not items:
                 label.hide()
                 continue
-            # Big line: each venue's % adjacent, coloured by venue, spaced apart.
+            # Big line: each venue's % tagged with its brand logo + coloured by
+            # venue, so which price is Kalshi vs Polymarket reads at a glance.
             spans = []
             for s, cents in items:
                 r, g, b = s['hue']
-                spans.append(f"<span style='color:#{r:02x}{g:02x}{b:02x};"
+                mark = self._venue_marker(s.get('venue'), s['hue'])
+                spans.append(f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
                              f"font-weight:bold'>{cents:.1f}%</span>")
-            big = "&nbsp;&nbsp;&nbsp;".join(spans)
+            big = "&nbsp;&nbsp;&nbsp;&nbsp;".join(spans)
             # Move/range line tracks the band's first series.
             s0, c0 = items[0]
             self._set_summary_label(band, _move_html(s0, c0, big))
@@ -4814,7 +5188,30 @@ class HistoricalOddsWidget(QWidget):
         self.market_selector.setEnabled(enabled)
 
     async def load_all_sports(self):
-        """Load events from all 4 major sports (NFL, NBA, MLB, NHL)"""
+        """Gather the cross-platform event list and populate the event selector."""
+        all_unified_events = await self.gather_unified_events()
+        # Cache the loaded events so the volume heat map can reuse them instead of
+        # re-running the (heavy, rate-limited) full gather — see _refresh_volume_map.
+        self._last_unified_events = all_unified_events
+        # Populate event selector with all events
+        self.event_selector.blockSignals(True)
+        self.event_selector.clear()
+        for event in all_unified_events:
+            self.event_selector.addItem(event.get_display_title(), userData=event)
+        self.event_selector.blockSignals(False)
+
+        # Enable controls + update the no-data message (original tail of this method).
+        self.set_enabled(True)
+        if all_unified_events:
+            self.no_data_text.setText("Select an event to view historical odds")
+        else:
+            self.no_data_text.setText("No events available")
+
+    async def gather_unified_events(self):
+        """Build the cross-platform UnifiedEvent list (NO UI side effects) and
+        return it past-filtered. Also stashes self.last_sport_by_league
+        ({league_label: sport_category}) so the volume heat map can group leagues
+        under their sport. Shared by load_all_sports and the heat map controller."""
         print(f"\n{'='*80}")
         print(f"Loading all sports events...")
         print(f"{'='*80}\n")
@@ -4851,7 +5248,21 @@ class HistoricalOddsWidget(QWidget):
         # Auto-map non-big-4 Kalshi leagues -> PM gamma series_id (World Cup, etc.)
         # so they merge cross-platform via the generic matcher.
         pm_series_map = self._build_kalshi_pm_series_map(ranked)
-        sem = asyncio.Semaphore(3)  # bound concurrent Kalshi paging (429 rate limits)
+        # League -> sport-category map (from the ranked-series tags) so the volume
+        # heat map can put each league under its sport. Built here where the big-4
+        # labels (PM_SPORT_BY_GAME) and non-big-4 series labels are both known.
+        self.last_sport_by_league = {}
+        for _r in ranked:
+            _gt = _r.get('game')
+            _label = PM_SPORT_BY_GAME.get(_gt) or self._series_label(_r)
+            if _label and _r.get('tag'):
+                self.last_sport_by_league[_label] = _r['tag']
+        # Kalshi Basic tier = ~20 read req/s (200 tokens/s ÷ 10 per request); PM
+        # Gamma /events = 50 req/s. Each series fires ~1-2 Kalshi requests (~0.3s),
+        # so 8 concurrent ≈ 20-26 req/s peak — at the Kalshi ceiling, with
+        # _make_request's exponential backoff absorbing transient 429s. Kalshi is
+        # the binding constraint (PM has 2.5x more headroom).
+        sem = asyncio.Semaphore(8)
 
         async def _load_one(r):
             async with sem:
@@ -4938,30 +5349,166 @@ class HistoricalOddsWidget(QWidget):
                 print(f"🗑️  Filtered out {filtered_count} past events (older than {PAST_EVENT_CUTOFF_HOURS} hours)")
             print(f"📊 Showing {len(all_unified_events)} events")
 
-        _post_t1 = _tp_post.perf_counter()
-        # Populate event selector with all events
-        self.event_selector.blockSignals(True)
-        self.event_selector.clear()
-
-        for event in all_unified_events:
-            display_title = event.get_display_title()
-            self.event_selector.addItem(display_title, userData=event)
-
-        self.event_selector.blockSignals(False)
-        _post_t2 = _tp_post.perf_counter()
         if PERF_DIAG:
-            print(f"[post-probe] filter={(_post_t1-_post_t0)*1000:.0f}ms "
-                  f"populate_selector={(_post_t2-_post_t1)*1000:.0f}ms "
+            print(f"[post-probe] filter={(_tp_post.perf_counter()-_post_t0)*1000:.0f}ms "
                   f"(n={len(all_unified_events)})", file=_sp_post.stderr)
+        return all_unified_events
 
-        # Enable controls
-        self.set_enabled(True)
+    # ----- Volume heat map (Kalshi × Polymarket treemap) ----------------------
+    # Additive feature in its OWN window: aggregates trailing-24h USD notional
+    # across both platforms and rolls it up Sport->League->Event->Market. Reuses
+    # gather_unified_events() (existing cross-platform mapping) for data + the
+    # VolumeHeatmap data layer for the roll-up. NOTE: distinct _volmap_* namespace
+    # — unrelated to the liquidity-ribbon _heat*/heatmap_mode state.
+    def open_volume_map(self):
+        """Open (or re-show) the volume heat map window and start live refresh."""
+        if getattr(self, '_volmap_view', None) is None:
+            from volume_heatmap_view import VolumeHeatmapView
+            self._volmap_view = VolumeHeatmapView()
+            self._volmap_view.refresh_requested.connect(self._kick_volume_map_refresh)
+            self._volmap_view.closed.connect(self._on_volume_map_closed)
+            self._volmap_timer = QTimer(self)
+            self._volmap_timer.setInterval(90_000)   # 90s REST snapshot cadence
+            self._volmap_timer.timeout.connect(self._kick_volume_map_refresh)
+        self._volmap_view.show()
+        self._volmap_view.raise_()
+        self._volmap_view.activateWindow()
+        self._volmap_timer.start()
+        self._kick_volume_map_refresh()
 
-        # Update the no data message
-        if all_unified_events:
-            self.no_data_text.setText("Select an event to view historical odds")
-        else:
-            self.no_data_text.setText("No events available")
+    def _on_volume_map_closed(self):
+        if getattr(self, '_volmap_timer', None) is not None:
+            self._volmap_timer.stop()
+
+    def _kick_volume_map_refresh(self):
+        """Schedule the async refresh; guarded so ticks can't overlap a slow fetch."""
+        if getattr(self, '_volmap_view', None) is None:
+            return
+        if getattr(self, '_volmap_busy', False):
+            return
+        asyncio.ensure_future(self._refresh_volume_map())
+
+    async def _refresh_volume_map(self):
+        self._volmap_busy = True
+        try:
+            self._volmap_view.set_status("loading…")
+            # Reuse the events the widget already loaded for the selector — do NOT
+            # re-run the full multi-league gather here (that doubled Kalshi calls and
+            # could starve the main event load with 429s). Only fall back to a gather
+            # if nothing has loaded yet. The Kalshi candle $ (the live-moving part) is
+            # still re-fetched fresh inside VolumeHeatmap.compute below.
+            events = getattr(self, '_last_unified_events', None)
+            if not events:
+                events = await self.gather_unified_events()
+                self._last_unified_events = events
+            # Recover finished games' Kalshi side (settled markets drop out of the
+            # 'open' fetch, leaving finals reading 100% Polymarket). Best-effort;
+            # operates on COPIES so the shared event list / dropdown is untouched.
+            events = await self._enrich_settled_kalshi(events)
+            kalshi = self.kalshi_client.kalshi_client   # underlying KalshiClient
+            hm = await VolumeHeatmap(kalshi).compute(
+                events, getattr(self, 'last_sport_by_league', None))
+            self._volmap_view.set_records(hm.to_records())
+            from datetime import datetime as _dt
+            self._volmap_view.set_status(
+                f"updated {_dt.now():%H:%M:%S} · {len(events)} events")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            if getattr(self, '_volmap_view', None) is not None:
+                self._volmap_view.set_status(f"refresh failed: {e}")
+        finally:
+            self._volmap_busy = False
+
+    # Big-4 league -> Kalshi GAME series (for settled-event recovery).
+    _SETTLED_RECOVERY_SERIES = {'NFL': 'KXNFLGAME', 'NBA': 'KXNBAGAME',
+                                'MLB': 'KXMLBGAME', 'NHL': 'KXNHLGAME'}
+
+    async def _enrich_settled_kalshi(self, events):
+        """Heatmap-only: a finished game drops out of the Kalshi 'open' fetch, so it
+        reaches us PM-only and reads 100% Polymarket. Pull recently-CLOSED/SETTLED
+        Kalshi events (bounded by min_close_ts) for the big-4 leagues that have such
+        PM-only games, match them with the EXISTING EventMatcher, and attach the
+        Kalshi markets to COPIES of those events — the shared list / dropdown is left
+        untouched. Best-effort: any failure returns events unchanged.
+
+        Caveat: dollarization uses volume_24h_fp, which decays to 0 once a game closed
+        >24h ago; this recovers today's finished slate, not yesterday's."""
+        from dataclasses import replace
+        pm_only = [e for e in events
+                   if getattr(e, 'polymarket_game_id', None)
+                   and not getattr(e, 'kalshi_event_ticker', None)
+                   and e.sport in self._SETTLED_RECOVERY_SERIES]
+        if not pm_only:
+            return events
+        pm_only_ids = {id(e) for e in pm_only}
+        leagues = sorted({e.sport for e in pm_only})
+        min_close = int(_time.time()) - 36 * 3600   # match the 36h past-event window
+        kc = self.kalshi_client.kalshi_client
+        loop = asyncio.get_event_loop()
+
+        def fetch_closed(series):
+            out, seen = [], set()
+            for st in ('closed', 'settled'):
+                cursor = None
+                for _ in range(4):
+                    try:
+                        r = kc.get_events(series_ticker=series, status=st,
+                                          with_nested_markets=True,
+                                          min_close_ts=min_close, limit=200,
+                                          cursor=cursor)
+                    except Exception:
+                        break
+                    for ev in r.get('events', []):
+                        et = ev.get('event_ticker', '')
+                        if et and et not in seen:
+                            seen.add(et)
+                            out.append(ev)
+                    cursor = r.get('cursor')
+                    if not cursor:
+                        break
+            return out
+
+        try:
+            results = await asyncio.gather(*[
+                loop.run_in_executor(None, fetch_closed,
+                                     self._SETTLED_RECOVERY_SERIES[lg])
+                for lg in leagues], return_exceptions=True)
+        except Exception as e:
+            print(f"[heatmap] settled-event fetch failed: {e}")
+            return events
+        closed_by_league = {
+            lg: (res if not isinstance(res, Exception) else [])
+            for lg, res in zip(leagues, results)}
+
+        enriched, used = [], set()
+        for e in events:
+            if id(e) not in pm_only_ids:
+                enriched.append(e)
+                continue
+            p1, p2 = EventMatcher.parse_polymarket_title(e.polymarket_title or '')
+            match = None
+            for ke in closed_by_league.get(e.sport, []):
+                ket = ke.get('event_ticker', '')
+                if ket in used:
+                    continue
+                ka, kh = EventMatcher.parse_kalshi_title(ke.get('title', ''))
+                if (EventMatcher.events_match(ka, kh, p1, p2, e.sport)
+                        and EventMatcher.dates_compatible(ket, e.start_time)):
+                    match = ke
+                    break
+            if match:
+                used.add(match.get('event_ticker', ''))
+                enriched.append(replace(
+                    e, kalshi_event_ticker=match.get('event_ticker'),
+                    kalshi_series_ticker=match.get('series_ticker'),
+                    kalshi_markets=match.get('markets', []) or []))
+            else:
+                enriched.append(e)
+        recovered = sum(1 for a, b in zip(events, enriched) if a is not b)
+        if recovered:
+            print(f"[heatmap] recovered Kalshi side for {recovered} finished game(s)")
+        return enriched
 
     @staticmethod
     def _series_label(r):
@@ -6597,11 +7144,7 @@ class HistoricalOddsWidget(QWidget):
             # the async load_data clear races with the seed). The live overlay rebuilds
             # on the next flush.
             if self._is_future_market:
-                self._remove_overlay_items()
-                self.plot_widget.clear()
-                self._hover_series = []
-                self._hide_hover()
-                self._hide_summaries()
+                self._clear_plotted_series()
 
             # Retarget per-source keys for the new market.
             source_info = []
@@ -6815,72 +7358,75 @@ class HistoricalOddsWidget(QWidget):
                     print(f"Time range: {start_time} to {end_time}")
                     print(f"{'='*80}\n")
 
-                    # Fetch from Kalshi if available (may be multiple markets for moneyline).
-                    # Futures SKIP this: the live overlay's per-candidate seed
-                    # (_apply_live_history_seed) supplies palette-coloured history for the
-                    # whole tier — drawing update_plot's venue-coloured, top-5-capped
-                    # lines here would just overlap them with cyan duplicates.
-                    if unified_market.has_kalshi() and not self._is_future_market:
-                        for idx, k_ticker in enumerate(unified_market.kalshi_tickers):
-                            try:
-                                k_title = unified_market.kalshi_titles[idx]
-                                print(f"Fetching Kalshi data for: {k_title}")
-                                print(f"  Ticker: {k_ticker}")
-                                print(f"  Event ticker: {unified_market.kalshi_event_ticker}")
-                                print(f"  Series: {unified_market.kalshi_event_ticker.split('-')[0]}")
+                    # Fetch every Kalshi ticker + Polymarket outcome CONCURRENTLY.
+                    # These were awaited one-at-a-time (up to 4 sequential round-trips
+                    # for a Both moneyline: 2 Kalshi sides + 2 PM outcomes), which is
+                    # the bulk of a market/event switch's latency. gather collapses the
+                    # phase to ~1 round-trip; each fetch isolates its own errors so one
+                    # failure doesn't sink the rest, and all results land in the same
+                    # all_snapshots (draw order is timestamp-sorted downstream).
+                    fetch_coros = []
 
-                                kalshi_snapshots = await self.kalshi_client.get_historical_candlesticks(
-                                    session,
-                                    k_ticker,
-                                    unified_market.kalshi_event_ticker.split('-')[0],
-                                    start_time,
-                                    end_time,
+                    # Kalshi (may be multiple markets for a moneyline). Futures SKIP
+                    # this: the live overlay's per-candidate seed (_apply_live_history_seed)
+                    # supplies palette-coloured history for the whole tier — drawing
+                    # update_plot's venue-coloured, top-5-capped lines here would just
+                    # overlap them with cyan duplicates.
+                    if unified_market.has_kalshi() and not self._is_future_market:
+                        k_series = unified_market.kalshi_event_ticker.split('-')[0]
+
+                        async def _fetch_kalshi(k_ticker, k_title):
+                            print(f"Fetching Kalshi data for: {k_title} ({k_ticker})")
+                            try:
+                                snaps = await self.kalshi_client.get_historical_candlesticks(
+                                    session, k_ticker, k_series, start_time, end_time,
                                     period_interval=kalshi_interval_value,
-                                    market_type=unified_market.market_type  # Pass market type for correct market key
-                                )
-                                all_snapshots.extend(kalshi_snapshots)
-                                print(f"  ✅ Got {len(kalshi_snapshots)} Kalshi snapshots")
+                                    market_type=unified_market.market_type)
+                                print(f"  ✅ Got {len(snaps)} Kalshi snapshots ({k_ticker})")
+                                return snaps
                             except Exception as e:
-                                print(f"  ❌ Error fetching Kalshi data: {e}")
+                                print(f"  ❌ Error fetching Kalshi data ({k_ticker}): {e}")
                                 import traceback
                                 traceback.print_exc()
+                                return []
 
-                    # Fetch from Polymarket if available (may have multiple outcomes)
+                        for idx, k_ticker in enumerate(unified_market.kalshi_tickers):
+                            fetch_coros.append(
+                                _fetch_kalshi(k_ticker, unified_market.kalshi_titles[idx]))
+
+                    # Polymarket (may have multiple outcomes, e.g. both teams).
                     if unified_market.has_polymarket():
-                        try:
-                            market_obj = unified_market.polymarket_market
+                        market_obj = unified_market.polymarket_market
+                        if market_obj.outcome_prices and len(market_obj.clob_token_ids) > 0:
                             print(f"Fetching Polymarket data for: {market_obj.question}")
 
-                            if market_obj.outcome_prices and len(market_obj.clob_token_ids) > 0:
-                                # Fetch data for ALL outcomes (e.g., both teams for moneyline)
-                                for outcome_idx, token_id in enumerate(market_obj.clob_token_ids):
-                                    # Get the outcome name from the market's outcomes list
-                                    if hasattr(market_obj, 'outcomes') and outcome_idx < len(market_obj.outcomes):
-                                        outcome_name = market_obj.outcomes[outcome_idx]
-                                    else:
-                                        # Fallback to using question
-                                        outcome_name = f"{market_obj.question} - Outcome {outcome_idx + 1}"
+                            async def _fetch_poly(token_id, outcome_name):
+                                print(f"  Outcome: {outcome_name} ({token_id})")
+                                try:
+                                    snaps = await self.polymarket_client.get_historical_candlesticks(
+                                        session, token_id, outcome_name, start_time, end_time,
+                                        fidelity=kalshi_interval_value,  # align with Kalshi
+                                        market_type=unified_market.market_type)
+                                    print(f"    ✅ Got {len(snaps)} PM snapshots ({outcome_name})")
+                                    return snaps
+                                except Exception as e:
+                                    print(f"  ❌ Error fetching Polymarket data ({outcome_name}): {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    return []
 
-                                    print(f"  Outcome {outcome_idx + 1}: {outcome_name}")
-                                    print(f"    Token ID: {token_id}")
+                            for outcome_idx, token_id in enumerate(market_obj.clob_token_ids):
+                                if hasattr(market_obj, 'outcomes') and outcome_idx < len(market_obj.outcomes):
+                                    outcome_name = market_obj.outcomes[outcome_idx]
+                                else:
+                                    outcome_name = f"{market_obj.question} - Outcome {outcome_idx + 1}"
+                                fetch_coros.append(_fetch_poly(token_id, outcome_name))
+                        else:
+                            print("  ⚠️  No token IDs available for Polymarket market")
 
-                                    poly_snapshots = await self.polymarket_client.get_historical_candlesticks(
-                                        session,
-                                        token_id,
-                                        outcome_name,
-                                        start_time,
-                                        end_time,
-                                        fidelity=kalshi_interval_value,  # Use same interval as Kalshi for alignment
-                                        market_type=unified_market.market_type  # Pass market type for correct market key
-                                    )
-                                    all_snapshots.extend(poly_snapshots)
-                                    print(f"    ✅ Got {len(poly_snapshots)} snapshots")
-                            else:
-                                print("  ⚠️  No token IDs available for Polymarket market")
-                        except Exception as e:
-                            print(f"  ❌ Error fetching Polymarket data: {e}")
-                            import traceback
-                            traceback.print_exc()
+                    if fetch_coros:
+                        for snaps in await asyncio.gather(*fetch_coros):
+                            all_snapshots.extend(snaps)
 
                 # === LEGACY DICT PATH (OLD) ===
                 elif selected_market_data:
@@ -6939,10 +7485,15 @@ class HistoricalOddsWidget(QWidget):
                 # did not).
                 self.start_live_updates()
             elif self.live_mode:
-                # Live market with no historical snapshots (futures). The canvas was
-                # already cleared synchronously at market-switch time (on_market_changed)
-                # to avoid racing the seed; here we just keep the live timer running and
-                # re-evaluate the Market Post / Event Start markers (hidden for futures).
+                # Live market with no historical snapshots. update_plot — which clears
+                # the canvas via plot_widget.clear() — is skipped here, so the PREVIOUS
+                # event's plotted lines would persist under the new live overlay. Futures
+                # were already cleared synchronously at market-switch time (on_market_changed,
+                # to avoid racing the seed); for a non-futures market whose candlestick fetch
+                # simply came back empty, clear the stale series NOW so switching events
+                # actually flushes the old lines. The live overlay rebuilds on the next flush.
+                if not self._is_future_market:
+                    self._clear_plotted_series()
                 self._ensure_market_post_line()
                 self._ensure_start_line()
                 self.start_live_updates()
@@ -7320,10 +7871,13 @@ class HistoricalOddsWidget(QWidget):
         prices-history (both -> 4 ticks/min via the shared aggregator). Merges with
         any live ticks newer than the seed, time-sorted. Called on live entry and on
         every feed/side/market change (which clear per-series ticks)."""
-        # Seed in candle mode (games) OR for futures (lines mode): futures lines need
-        # history so every candidate's palette-coloured line spans the market life,
-        # not just the few live ticks since the widget opened.
-        if not (self.live_mode and (self.candle_mode or self._is_future_market)):
+        # Seed whenever live: the live overlay is now the SOLE renderer of the K/PM
+        # series in Live mode (update_plot no longer draws their history lines — that
+        # caused a stale dotted layer to overlap the candles). So the overlay must
+        # carry the market's history in BOTH line and candle mode, not just candles/
+        # futures — otherwise switching to line mode would collapse the series to just
+        # the handful of live ticks since the widget opened.
+        if not self.live_mode:
             return
         # Fetch every series' seed history CONCURRENTLY (was sequential — painfully
         # slow for futures with up to ~40 candidates). Concurrency is LOW: Kalshi's
@@ -7380,8 +7934,7 @@ class HistoricalOddsWidget(QWidget):
             pad = max((end_x - start_x) * 0.02, 30)
             vb = self.plot_widget.getViewBox()
             vb.setXRange(start_x - pad, end_x + pad, padding=0)
-            vb.enableAutoRange(axis='y', enable=False)
-            vb.setYRange(0, 100, padding=0)
+            vb.enableAutoRange(axis='y', enable=True)  # %-axis auto-fits visible data
         # Futures: constrain the view so zoom/pan can't escape into nonsense. Implied %
         # is always 0-100 (lock the Y axis — no reason to zoom probability), and X is
         # bounded to the market's life span so you can't wander off to empty years.
@@ -7647,10 +8200,16 @@ class HistoricalOddsWidget(QWidget):
             if not self.bookmaker_visible.get(bookmaker, True):
                 continue
 
-            # In candle mode the prediction markets render as candlesticks (the
-            # live overlay seeded from real OHLC), so suppress their LINES here —
-            # lines are reserved for TheOddsAPI sportsbook series.
-            if self.candle_mode and bookmaker in ('kalshi', 'polymarket'):
+            # In LIVE mode the persistent live overlay OWNS Kalshi/Polymarket
+            # rendering — it draws them as a line OR candles (seeded with history)
+            # and mutates in place every tick. Drawing them HERE too would (a) double
+            # the line, and (b) — because this static layer is only rebuilt on full
+            # redraws — leave a STALE dotted-line layer overlaying the candles the
+            # instant candle_mode flips without an update_plot (the candles+lines
+            # overlap bug). So suppress K/PM here whenever the live overlay is active,
+            # regardless of candle_mode. Lines here are reserved for the sportsbook
+            # (TheOddsAPI/ProphetX) series and the non-live polling path.
+            if (self.live_mode or self.candle_mode) and bookmaker in ('kalshi', 'polymarket'):
                 continue
 
             color = self._color_for_bookmaker(bookmaker, bm_idx)
@@ -7700,6 +8259,17 @@ class HistoricalOddsWidget(QWidget):
             return None
         p = SPORTSBOOK_LOGO_DIR / fn
         return str(p) if p.exists() else None
+
+    def _venue_marker(self, venue, hue, size=14):
+        """Small inline brand-logo <img> tagging which exchange a price belongs to
+        (Kalshi / Polymarket), for the corner summary boxes. Falls back to a
+        hue-coloured dot when a venue has no logo asset."""
+        logo = self._bookmaker_logo_path(venue)
+        if logo:
+            return (f"<img src='{logo}' width='{size}' height='{size}' "
+                    f"style='vertical-align:middle'>")
+        r, g, b = hue
+        return f"<span style='color:#{r:02x}{g:02x}{b:02x}'>&#9679;</span>"
 
     @staticmethod
     def _cents_to_am(cents):
@@ -7753,6 +8323,24 @@ class HistoricalOddsWidget(QWidget):
                 except Exception:
                     pass
             s['items'] = None
+
+    def _clear_plotted_series(self):
+        """Wipe the previous market's plotted line/point series + hover registry
+        from the canvas, then re-add the scene chrome (crosshair, start/post markers,
+        heat image) that plot_widget.clear() drops. Used on the paths where the heavy
+        update_plot — which normally does exactly this via clear() — does NOT run:
+        futures (no historical fetch) and live markets whose historical fetch came
+        back empty. Without it a prior event's lines linger under the new live
+        overlay. Live overlay items are removed too and rebuild on the next flush."""
+        self._remove_overlay_items()
+        self.plot_widget.clear()
+        self._hover_series = []
+        self._hide_hover()
+        self._hide_summaries()
+        self._ensure_crosshair()
+        self._ensure_start_line()
+        self._ensure_market_post_line()
+        self._ensure_heat_img()
 
     def _rebuild_live_items(self):
         """(Re)create the persistent overlay items for every active live series and
@@ -7849,13 +8437,14 @@ class HistoricalOddsWidget(QWidget):
         for s in self.live_series:
             self._render_overlay_set(s['ticks'], s['items'], rxmin, rxmax)
 
-        # --- Auto-follow: scroll X to newest ticks; keep full 0-100% in view. ---
+        # --- Auto-follow: scroll the TIME axis to the newest ticks. The %-axis
+        # auto-fits to the visible data (mouse y is disabled), so we only drive X
+        # here — locking y to 0-100 would flatten the candles to a hairline. ---
         if follow is not None:
             last_t, right_pad = follow
             vb = self.plot_widget.getViewBox()
             vb.setXRange(xmin, xmax, padding=0)
-            vb.enableAutoRange(axis='y', enable=False)
-            vb.setYRange(0, 100, padding=0)
+            vb.enableAutoRange(axis='y', enable=True)
 
         # Repaint the liquidity heatmap from the columns inside the new window.
         if self.heatmap_mode:
@@ -8488,7 +9077,10 @@ class HistoricalOddsWidget(QWidget):
 
     def _set_summary_label(self, band_key, html):
         label = self.summary_label_top if band_key == 'pos' else self.summary_label_bottom
-        label.setText(html)
+        # Centre every line within the box: the box sizes to its WIDEST line (the
+        # move/range row), so left-aligned lines left the % row hugging the left edge
+        # with dead space to its right. text-align:center balances all rows.
+        label.setText(f"<div style='text-align:center'>{html}</div>")
         label.adjustSize()
         label.show()
         self._position_overlays()
@@ -8847,10 +9439,10 @@ class HistoricalOddsWidget(QWidget):
         implied = [p for p in (american_to_implied_pct(a) for a in all_american_prices)
                    if p is not None]
         if implied:
-            # Show the FULL probability range so the hard 0%/100% floor & ceiling
-            # are always in view (Polymarket/Kalshi style) — no more zooming into
-            # a narrow data-fit band that hides how far the market is from certain.
-            self.plot_widget.setYRange(0, 100)
+            # The %-axis auto-fits to the visible data (mouse y is disabled), so the
+            # candles/lines always fill the vertical space at a readable height and the
+            # view stays reversible. Just make sure autorange is engaged for y here.
+            self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
 
             # Y-axis label + ticks: implied % primary, american odds in parens,
             # at round values with fainter minor gridlines. Ticks are (re)built
