@@ -369,7 +369,10 @@ _QL_BRIGHT  = "#c8daf0"
 _QL_ACCENT  = "#00c896"
 _QL_F       = "8pt"
 _QL_ROW_H   = 19
-_QL_SCROLL_H = 4 * _QL_ROW_H + 3 * 2   # 4 visible rows + gaps = 82px
+# 3 visible rows (scrolls beyond) — sized so the QueryList column's top edge
+# stays level with the Fetch Odds button row while showing one more slot than
+# the minimal 2-row fit against the button-row + ticker stack beside it.
+_QL_SCROLL_H = 3 * _QL_ROW_H + 2 * 2   # 3 visible rows + gaps = 61px
 
 _QL_CB_STYLE = f"""
 QCheckBox {{
@@ -897,27 +900,28 @@ class ModernOddsWindow(QMainWindow):
         }
     """
 
+    # Compact toolbar styles — Fetch/Props/TT share the panel-toggle row, so they
+    # match its 9pt / 4px-padding metrics (~26px tall) instead of the old
+    # oversized 24px-font row.
     fetch_odds_button_style = """
     QPushButton {
         background-color: #dc9437;  /* Orange */
         color: white; /* text color */
         border: 1px solid #0056b3;
-        padding: 5px 10px;
-        margin-right: 5px;
-        border-radius: 4px;
-        width: 200px;
-        font-size: 24px;
+        padding: 4px 12px;
+        border-radius: 3px;
+        font-size: 9pt;
+        font-weight: bold;
     }"""
 
     props_button_style = """
         QPushButton {
             background-color: #007bff;  /* Blue */
             color: white;
-            border: 3px solid #0056b3;
-            border-radius: 4px;
-            width: 72px;
-            height: 36px;
-            font-size: 12px;
+            border: 1px solid #0056b3;
+            border-radius: 3px;
+            padding: 4px 10px;
+            font-size: 9pt;
         }
         QPushButton:disabled {
             background-color: #909090;
@@ -1010,7 +1014,7 @@ class ModernOddsWindow(QMainWindow):
         league_layout.setContentsMargins(0, 0, 0, 0)
         league_layout.setSpacing(4)
         self.query_list = QueryList()
-        league_layout.addWidget(self.query_list, 0, Qt.AlignmentFlag.AlignBottom)
+        league_layout.addWidget(self.query_list, 0, Qt.AlignmentFlag.AlignTop)
 
         # Create toggle buttons
         self.stream_toggle_button = QPushButton("Show Streaming Links ▼")
@@ -1093,8 +1097,30 @@ class ModernOddsWindow(QMainWindow):
         right_side_layout.setContentsMargins(0, 0, 0, 0)  # No margins
         right_side_layout.setSpacing(2)  # Minimal spacing between buttons and widget
 
-        # Create a horizontal layout for the buttons — stretch pushes them to the right
+        # Action buttons (Fetch Odds, Props, TT) share this row with the panel
+        # toggles: left-aligned, with the stretch pushing the toggles right.
+        # This replaced the old dedicated action-button row under the ticker.
+        self.fetch_odds_button = QPushButton("Fetch Odds 🎰")
+        self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)
+
+        self.props_button = QPushButton("Props ➣➣")
+        self.props_button.setObjectName("market_props")
+        self.props_button.setEnabled(False)
+        self.props_button.setStyleSheet(self.props_button_style)
+
+        self.tt_button = QPushButton("TT🏓")
+        self.tt_button.setObjectName("market_tt")
+        self.tt_button.setStyleSheet(self.props_button_style)
+
+        self.props_availability_label = QLabel("No Props available for this league")
+        self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
+        self.props_availability_label.setVisible(False)
+
         buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.fetch_odds_button)
+        buttons_layout.addWidget(self.props_button)
+        buttons_layout.addWidget(self.tt_button)
+        buttons_layout.addWidget(self.props_availability_label)
         buttons_layout.addStretch(1)
         buttons_layout.addWidget(self.stream_toggle_button)
         buttons_layout.addWidget(self.news_toggle_button)
@@ -1154,19 +1180,10 @@ class ModernOddsWindow(QMainWindow):
 
         # right_side_container gets stretch=1 so ticker fills the remaining width
         league_layout.addWidget(right_side_container, 1)
-        # NOTE: self.layout.addLayout(league_layout) is deferred until ticker_section
-        # is built so it can be parented into right_side_layout before we commit.
 
-        # --------- TICKER + CONTROLS SECTION ---------
-        ticker_section = QWidget()
-        ticker_section_layout = QVBoxLayout(ticker_section)
-        ticker_section_layout.setContentsMargins(0, 0, 0, 0)
-        ticker_section_layout.setSpacing(2)
-        if DEBUG_OUTLINES: ticker_section.setStyleSheet(""" QWidget { border: 4px solid #00FFFF; } """);
-
+        # --------- TICKER ---------
         # Choose transition style: "flip_card" or "split_reveal"
         self.ticker_tape = TickerTape(transition_style="flip_card")
-        ticker_section_layout.addWidget(self.ticker_tape)
 
         # Initialize prediction markets worker for ticker
         self.prediction_markets_worker = PredictionMarketsWorker()
@@ -1178,54 +1195,14 @@ class ModernOddsWindow(QMainWindow):
         # land in the same window as the news fetch (6s) — see startup-stagger notes.
         QTimer.singleShot(8000, self.prediction_markets_worker.start)
 
-        # Action buttons row (Fetch Odds, Props, TT) — no splitter needed now that
-        # streaming widget is TuneInWidget — a self-contained floating dropdown.
-        controls_container = QWidget()
-        if DEBUG_OUTLINES: controls_container.setStyleSheet(""" QWidget { border: 4px solid #00FFFF; } """);
-        controls_layout = QVBoxLayout(controls_container)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(2)
-
-        action_buttons_widget = QWidget()
-        if DEBUG_OUTLINES: action_buttons_widget.setStyleSheet(""" QWidget { border: 4px solid #00FF00; } """);
-        action_buttons_layout = QHBoxLayout(action_buttons_widget)
-        action_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        action_buttons_layout.setSpacing(4)
-
-        self.fetch_odds_button = QPushButton("Fetch Odds 🎰")
-        self.fetch_odds_button.setStyleSheet(self.fetch_odds_button_style)
-        action_buttons_layout.addWidget(self.fetch_odds_button)
-
-        self.props_button = QPushButton("Props ➣➣")
-        self.props_button.setObjectName("market_props")
-        self.props_button.setEnabled(False)
-        self.props_button.setStyleSheet(self.props_button_style)
-        action_buttons_layout.addWidget(self.props_button)
-
-        self.tt_button = QPushButton("TT🏓")
-        self.tt_button.setObjectName("market_tt")
-        self.tt_button.setStyleSheet(self.props_button_style)
-        action_buttons_layout.addWidget(self.tt_button)
-
-        self.props_availability_label = QLabel("No Props available for this league")
-        self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
-        self.props_availability_label.setVisible(False)
-        action_buttons_layout.addWidget(self.props_availability_label)
-
-        action_buttons_layout.addStretch()
-        # Auto-update controls get appended (right-aligned) into this same row
-        # later in init — they belong with the odds table, not the window foot.
-        self._toolbar_layout = action_buttons_layout
-        controls_layout.addWidget(action_buttons_widget)
-
         # TuneInWidget is itself the floating dropdown — no wrapper needed
         self.tune_in_widget = TuneInWidget(self.stream_toggle_button)
 
-        ticker_section_layout.addWidget(controls_container)
-
-        # Now that ticker_section is complete, nest it in right_side_layout so it
-        # sits to the RIGHT of query_list in the same horizontal row.
-        right_side_layout.addWidget(ticker_section, 1)
+        # Ticker sits directly under the button row. Stretch-0 add + trailing
+        # stretch keep it at its natural height — any slack in the top strip
+        # stays as empty space below the tape instead of inflating it.
+        right_side_layout.addWidget(self.ticker_tape)
+        right_side_layout.addStretch(1)
         self.layout.addLayout(league_layout)
 
         # --------- ODDS SECTION ---------
@@ -3211,7 +3188,10 @@ def main():
     import sys as _sys_si
     _sys_si.setswitchinterval(0.001)
 
-    app = QApplication([])
+    # Pass argv (not []) so Qt WebEngine's Chromium gets a program name — it aborts
+    # ("CommandLine cannot be properly initialized") when a QWebEngineView is created
+    # under a QApplication built with an empty argument list. Used by the volume heat map.
+    app = QApplication(_sys_si.argv)
 
     # Create qasync event loop FIRST, before any async operations
     loop = qasync.QEventLoop(app)
