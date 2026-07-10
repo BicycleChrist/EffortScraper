@@ -3523,7 +3523,13 @@ class OrderBookWidget(QWidget):
                 fm = QFontMetrics(item.font())
             widest = max(widest, fm.horizontalAdvance(item.text()))
         if widest:
-            pad = 14 if self.compact_mode else 24
+            # Overhead beyond the raw text advance: the widget stylesheet's
+            # QTableWidget::item horizontal padding (4px×2 compact / 12px×2
+            # full) plus the style's ~3px×2 text margins — none of which
+            # QFontMetrics sees. Measured 15px in compact mode; anything at
+            # or under that leaves strings a pixel from the elide boundary
+            # (the "first market truncated, next market fine" symptom).
+            pad = 22 if self.compact_mode else 38
             tbl.setColumnWidth(0, widest + pad)
 
     def renderSideSeparatorRow(self, row: int, label: str):

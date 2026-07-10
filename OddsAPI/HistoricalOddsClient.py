@@ -28,6 +28,8 @@ from polymarketquery import (PolymarketSportsClient, PolymarketStreamClient,
                              PolymarketLiveBook, place_pm_order, get_pm_open_orders,
                              cancel_pm_order)
 import re
+import math
+import bisect
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -2602,6 +2604,45 @@ class FilterableEventCombo(QComboBox):
             self.setCurrentIndex(int(orig_i))   # fires currentIndexChanged
 
 
+class CandleBodyItem(pg.BarGraphItem):
+    """BarGraphItem whose dataBounds honors orthoRange.
+
+    Stock BarGraphItem.dataBounds ignores orthoRange and reports the full extent
+    of EVERY bar. With the ViewBox in autoVisible-y mode that meant the %-axis was
+    fitted to all rendered candles — including the off-screen overdraw margin,
+    whose truncated edge candle changes shape on every live flush as the follow
+    window slides — so the whole chart bounced vertically at ~30 fps in candle
+    mode (lines were fine: PlotDataItem clips its bounds to the visible window).
+    This subclass clips the reported y-extent to the bars whose x-slot intersects
+    the visible x-range (and vice versa), restoring parity with the line items.
+    """
+
+    def dataBounds(self, ax, frac=1.0, orthoRange=None):
+        opts = self.opts
+        x = opts.get('x')
+        if x is None or len(x) == 0:
+            return None, None
+        x = np.asarray(x, dtype=float)
+        n = x.size
+        y0 = np.broadcast_to(np.asarray(opts.get('y0') if opts.get('y0') is not None
+                                        else 0.0, dtype=float), (n,))
+        h = np.broadcast_to(np.asarray(opts.get('height') if opts.get('height') is not None
+                                       else 0.0, dtype=float), (n,))
+        w = opts.get('width')
+        w = float(np.max(np.asarray(w, dtype=float))) if w is not None and np.ndim(w) else float(w or 0.0)
+        xlo, xhi = x - w / 2.0, x + w / 2.0
+        ylo, yhi = np.minimum(y0, y0 + h), np.maximum(y0, y0 + h)
+        lo, hi = (xlo, xhi) if ax == 0 else (ylo, yhi)
+        olo, ohi = (ylo, yhi) if ax == 0 else (xlo, xhi)
+        if orthoRange is not None:
+            mask = (ohi >= orthoRange[0]) & (olo <= orthoRange[1])
+            if not mask.any():
+                return None, None
+            lo, hi = lo[mask], hi[mask]
+        pw = self._penWidth[0] * 0.5 if getattr(self, '_penWidth', None) else 0.0
+        return float(lo.min()) - pw, float(hi.max()) + pw
+
+
 class HistoricalOddsWidget(QWidget):
     """Widget for displaying historical odds movement with point change handling"""
 
@@ -2914,6 +2955,13 @@ class HistoricalOddsWidget(QWidget):
             _ax = self.plot_widget.getAxis(_ax_name)
             _ax.setPen(pg.mkPen('#2a3340'))
             _ax.setTextPen(pg.mkPen('#7e8794'))
+        # Fix the %-axis width: its tick labels ("55.0% (-122)") change length as
+        # the range moves, and letting the axis auto-size makes the whole plot
+        # rect shift sideways on every re-tick — visible as chart wobble. Sized
+        # to the widest realistic label instead of auto.
+        _lw = QFontMetrics(self.plot_widget.getAxis('left').font()
+                           or QFont()).horizontalAdvance("88.88% (-8888)") + 14
+        self.plot_widget.getAxis('left').setWidth(_lw)
 
         # Liquidity heatmap layer — an ImageItem that paints resting book depth as a
         # phosphor ribbon. Sits at the very back (negative z) so candles, the spread
@@ -2992,17 +3040,12 @@ class HistoricalOddsWidget(QWidget):
         # separate on-chart tag — keeps it off the lines entirely.
 
         # Time-to-resolution countdown — the one genuinely-new readout vs the corner
-        # boxes (which already carry last/move/range/updated). Top-LEFT (logos +
-        # summaries own the right, the control strip owns the centre). Ticks once a
+        # boxes (which already carry last/move/range/updated). Rendered as a segment
+        # of the x-axis legend (next to the Market Post / Event Start swatches, see
+        # _rebuild_time_legend) rather than a floating top-left label. Ticks once a
         # second; counts DOWN to first pitch, then flips to "LIVE +elapsed". Hidden
         # when the event start time is unknown (date-only tickers).
-        self.countdown_label = QLabel(self.plot_widget)
-        self.countdown_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.countdown_label.setTextFormat(Qt.TextFormat.RichText)
-        self.countdown_label.setStyleSheet(
-            "background: rgba(13,17,23,225); border:1px solid #2a3340;"
-            " border-radius:3px; padding:2px 6px; font-family:monospace;")
-        self.countdown_label.hide()
+        self._countdown_html = None
         self.countdown_timer = QTimer(self)
         self.countdown_timer.setInterval(1000)
         self.countdown_timer.timeout.connect(self._update_countdown)
@@ -4831,9 +4874,11 @@ class HistoricalOddsWidget(QWidget):
                 self._refresh_live_items()
         else:
             # Freeze the TIME axis where it is for inspection; the %-axis keeps
-            # auto-fitting to the visible data (mouse can't touch y).
+            # fitting to the visible data via _fit_live_y (mouse can't touch y).
             vb.enableAutoRange(x=False)
-            vb.enableAutoRange(axis='y', enable=True)
+            if self.live_mode:
+                (vxmin, vxmax), _ = vb.viewRange()
+                self._fit_live_y(vxmin, vxmax, smooth=False)
 
     def _on_user_range_change(self, *args):
         """User panned/zoomed by hand -> switch to MANUAL view control.
@@ -4853,10 +4898,12 @@ class HistoricalOddsWidget(QWidget):
         if self.auto_follow:
             # Taking manual control of the TIME axis -> stop auto-scroll.
             self.follow_check.setChecked(False)
-        # Keep the %-axis auto-fitting to the visible data after the x-zoom/pan (a
-        # manual range change can drop y off autorange; re-assert it so the view stays
-        # a pure function of the x-window and remains reversible).
-        self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
+        # Re-fit the %-axis to the new x-window IMMEDIATELY (not just in the
+        # debounced re-render): the view stays a pure function of the x-window —
+        # reversible — and the fit carries the 0-100 overzoom blend, which
+        # pyqtgraph's own autorange (capped at the data's peak/trough) cannot do.
+        (vxmin, vxmax), _ = self.plot_widget.getViewBox().viewRange()
+        self._fit_live_y(vxmin, vxmax, smooth=False)
         if not hasattr(self, '_zoom_render_timer'):
             self._zoom_render_timer = QTimer(self)
             self._zoom_render_timer.setSingleShot(True)
@@ -7794,8 +7841,12 @@ class HistoricalOddsWidget(QWidget):
         # own full Y-lock in the seed.
         if not self._is_future_market:
             vb = self.plot_widget.getViewBox()
-            vb.setLimits(xMin=None, xMax=None, yMin=0, yMax=100,
-                         minYRange=2, maxYRange=None)
+            xlo, xhi = self._live_x_limits()
+            # maxXRange caps wheel zoom-out at the allowed span outright (limits
+            # alone would let scaleBy overshoot and clamp back).
+            vb.setLimits(xMin=xlo, xMax=xhi,
+                         maxXRange=(xhi - xlo) if xhi is not None else None,
+                         yMin=0, yMax=100, minYRange=2, maxYRange=None)
 
     async def _enter_live_mode(self):
         """Switch the widget into sub-second websocket Live mode (Kalshi or
@@ -7934,7 +7985,7 @@ class HistoricalOddsWidget(QWidget):
             pad = max((end_x - start_x) * 0.02, 30)
             vb = self.plot_widget.getViewBox()
             vb.setXRange(start_x - pad, end_x + pad, padding=0)
-            vb.enableAutoRange(axis='y', enable=True)  # %-axis auto-fits visible data
+            self._fit_live_y(start_x - pad, end_x + pad, smooth=False)
         # Futures: constrain the view so zoom/pan can't escape into nonsense. Implied %
         # is always 0-100 (lock the Y axis — no reason to zoom probability), and X is
         # bounded to the market's life span so you can't wander off to empty years.
@@ -7947,11 +7998,14 @@ class HistoricalOddsWidget(QWidget):
             vb.setLimits(xMin=min(all_t) - xpad, xMax=max(all_t) + xpad,
                          yMin=0, yMax=100, minYRange=100, maxYRange=100)
         else:
-            # Clear the futures X-bounds so games get free X zoom again (setLimits is
-            # sticky on the ViewBox), but keep the implied-% Y axis clamped to its HARD
-            # [0, 100] floor/ceiling — probability can't scroll past its valid range.
-            vb.setLimits(xMin=None, xMax=None, yMin=0, yMax=100,
-                         minYRange=2, maxYRange=None)
+            # Games: bound X to the market life (Market Post -> live edge, now
+            # refined by the seeded ticks) with small scroll pads on both sides,
+            # and cap zoom-out at that span (maxXRange). Y keeps its HARD [0, 100]
+            # floor/ceiling — probability can't scroll past its valid range.
+            xlo, xhi = self._live_x_limits()
+            vb.setLimits(xMin=xlo, xMax=xhi,
+                         maxXRange=(xhi - xlo) if xhi is not None else None,
+                         yMin=0, yMax=100, minYRange=2, maxYRange=None)
         # Re-evaluate the Market Post / Event Start markers: futures skip update_plot
         # (where these normally refresh), so without this they'd linger from the last
         # regular game. Both epoch sources return None for futures -> the lines hide.
@@ -8300,7 +8354,7 @@ class HistoricalOddsWidget(QWidget):
         band_fill = pg.FillBetweenItem(band_lo, band_hi, brush=pg.mkBrush(r, g, b, 40))
         cwicks = pg.PlotDataItem([], [], connect='finite',
                                  pen=pg.mkPen(r, g, b, 220))
-        cbodies = pg.BarGraphItem(x=[], width=[], y0=[], height=[])
+        cbodies = CandleBodyItem(x=[], width=[], y0=[], height=[])
         # z-order: band (back) -> line -> candles (front)
         for it in (band_lo, band_hi, band_fill, line, cwicks, cbodies):
             self.plot_widget.addItem(it)
@@ -8400,9 +8454,13 @@ class HistoricalOddsWidget(QWidget):
         for k in ('band_lo', 'band_hi', 'band_fill'):
             items[k].setVisible(show_band)
 
-        # --- Candles ---
+        # --- Candles --- (gets the FULL tick list + window: it re-clips on a
+        # bucket-aligned boundary so the first visible candle aggregates its
+        # complete bucket and carries the true prev-close, keeping candle shapes
+        # stable while the window slides instead of morphing at the clip edge.)
         if self.candle_mode:
-            self._refresh_live_candles(sub, to_pct, items['cbodies'], items['cwicks'])
+            self._refresh_live_candles(ticks, to_pct, items['cbodies'], items['cwicks'],
+                                       xmin, xmax)
         items['cbodies'].setVisible(self.candle_mode)
         items['cwicks'].setVisible(self.candle_mode)
 
@@ -8421,6 +8479,14 @@ class HistoricalOddsWidget(QWidget):
             else:
                 window = self.live_follow_window_s
                 right_pad = 5
+            # Clamp the follow window to the allowed x-span (maxXRange): early in
+            # a market's life the preferred window can exceed it, and a too-wide
+            # setXRange gets shrunk about its CENTER — sliding the live edge off
+            # screen. Keep the right edge pinned instead.
+            if not self._is_future_market:
+                xlo, xhi = self._live_x_limits()
+                if xhi is not None:
+                    window = max(min(window, (xhi - xlo) - right_pad), 30)
             return last_t - window, last_t + right_pad, (last_t, right_pad)
         (vxmin, vxmax), _ = self.plot_widget.getViewBox().viewRange()
         return vxmin, vxmax, None
@@ -8437,42 +8503,208 @@ class HistoricalOddsWidget(QWidget):
         for s in self.live_series:
             self._render_overlay_set(s['ticks'], s['items'], rxmin, rxmax)
 
-        # --- Auto-follow: scroll the TIME axis to the newest ticks. The %-axis
-        # auto-fits to the visible data (mouse y is disabled), so we only drive X
-        # here — locking y to 0-100 would flatten the candles to a hairline. ---
+        # --- Auto-follow: scroll the TIME axis to the newest ticks, then fit the
+        # %-axis to the visible ticks OURSELVES (smoothed glide toward the target,
+        # instant only for containment). Re-enabling pyqtgraph's y-autorange here
+        # re-fitted the axis from item bounds on every ~30fps flush, so any
+        # sub-percent bounds wobble rescaled the whole chart — the candle-mode
+        # vertical jitter. ---
+        # Keep the X bounds tracking the live edge: the right limit must advance
+        # with new ticks / wall clock, or follow mode would catch up to the clamp
+        # and freeze. setLimits is a cheap state update; it only acts on range set.
+        if not self._is_future_market:
+            xlo, xhi = self._live_x_limits()
+            if xhi is not None:
+                self.plot_widget.getViewBox().setLimits(
+                    xMin=xlo, xMax=xhi, maxXRange=xhi - xlo)
+
         if follow is not None:
             last_t, right_pad = follow
             vb = self.plot_widget.getViewBox()
             vb.setXRange(xmin, xmax, padding=0)
-            vb.enableAutoRange(axis='y', enable=True)
+            self._fit_live_y(xmin, xmax)
+        else:
+            # Manual view: the x-window is frozen, but keep the %-axis fitted to
+            # what's visible (incl. the 0-100 overzoom blend) as new ticks land;
+            # the smoothed glide damps the per-flush wiggle.
+            self._fit_live_y(xmin, xmax)
 
         # Repaint the liquidity heatmap from the columns inside the new window.
         if self.heatmap_mode:
             self._refresh_heatmap()
 
-    def _refresh_live_candles(self, ticks, to_pct, cbodies, cwicks):
+    # How far past the data span the x-view must zoom out before the %-axis
+    # reaches the full 0-100 probability box (3.0 == view spans 3x the data).
+    _Y_OVERZOOM_FULL = 3.0
+
+    def _fit_live_y(self, xmin, xmax, smooth=True):
+        """Own the %-axis: fit it to the data inside the visible [xmin, xmax].
+
+        Two regimes, both pure functions of the x-window (so zooming is
+        reversible):
+        - view within the data span -> fit to the visible values, padded;
+        - view zoomed OUT past the data span -> blend the fitted range toward
+          the full 0-100% probability box, reaching it at ~3x the data span.
+          The old autorange capped the y-axis at the series' peak/trough no
+          matter how far out you zoomed; this lets the wheel keep going to the
+          whole probability range and come back in to a data-fitted view.
+
+        smooth=True (per-flush ticks): glide the current range toward the target
+        by a fixed fraction per flush (~30fps exponential ease, like animated
+        rescaling in mainstream charting libs), expanding instantly only as far
+        as needed to keep visible data on screen. The earlier design snapped the
+        whole range once a hysteresis threshold tripped, which read as a drastic
+        interval jump and momentarily distorted the candles. smooth=False (user
+        zoom/pan): apply the target directly so the view tracks the wheel
+        deterministically.
+        """
+        to_pct = self._cents_to_pct
+        lo = hi = None
+        t_first = t_last = None
+        for s in self.live_series:
+            ticks = s['ticks']
+            if not ticks:
+                continue
+            if t_first is None or ticks[0]['t'] < t_first:
+                t_first = ticks[0]['t']
+            if t_last is None or ticks[-1]['t'] > t_last:
+                t_last = ticks[-1]['t']
+            i0 = bisect.bisect_left(ticks, xmin, key=lambda tk: tk['t'])
+            i1 = bisect.bisect_right(ticks, xmax, key=lambda tk: tk['t'])
+            sub = ticks[i0:i1]
+            # Bound the scan: stride dense windows to ~2000 samples (a missed
+            # 1-tick extreme is sub-pixel at that density) but always keep the
+            # newest tick so the live edge is never cut off.
+            if len(sub) > 2000:
+                stride = len(sub) // 2000 + 1
+                sub = sub[::stride] + [ticks[i1 - 1]]
+            include_band = self.show_spread_band
+            for tk in sub:
+                vals = ((tk['price'], tk['bid'], tk['ask']) if include_band
+                        else (tk['price'],))
+                for v in vals:
+                    p = to_pct(v)
+                    if p is None:
+                        continue
+                    if lo is None or p < lo:
+                        lo = p
+                    if hi is None or p > hi:
+                        hi = p
+        # Static sportsbook lines (drawn by update_plot, registered for hover)
+        # count toward the fit too — else the fit to K/PM ticks alone could clip
+        # them off the top/bottom of the view.
+        for s in getattr(self, '_hover_series', []):
+            ts, pct = s.get('ts'), s.get('pct')
+            if ts is None or getattr(ts, 'size', 0) == 0:
+                continue
+            i0 = int(np.searchsorted(ts, xmin))
+            i1 = int(np.searchsorted(ts, xmax, side='right'))
+            if i1 <= i0:
+                continue
+            seg = pct[i0:i1]
+            seg = seg[np.isfinite(seg)]
+            if seg.size == 0:
+                continue
+            slo, shi = float(seg.min()), float(seg.max())
+            lo = slo if lo is None else min(lo, slo)
+            hi = shi if hi is None else max(hi, shi)
+        if lo is None:
+            return
+        pad = max(hi - lo, 0.5) * 0.10
+        tlo, thi = max(lo - pad, 0.0), min(hi + pad, 100.0)
+
+        # Overzoom blend toward the full probability box. With the x-view clamped
+        # to the market life on BOTH sides (game markets), full 0-100 is reached
+        # exactly when the view fills the ALLOWED x-range — the y-axis absorbs
+        # the zoom-out the confined x can't, in that small horizontal space.
+        # Unbounded x (no limits set) falls back to the fixed 3x-data-span ramp.
+        vb = self.plot_widget.getViewBox()
+        if t_first is not None and t_last is not None:
+            ds = max(t_last - t_first, 60.0)
+            xlim = vb.state['limits']['xLimits']
+            # pyqtgraph stores "no limit" as ±1e307 (not None) — treat as unbounded.
+            if all(v is not None and abs(v) < 1e306 for v in xlim):
+                max_vs = xlim[1] - xlim[0]
+            else:
+                max_vs = ds * self._Y_OVERZOOM_FULL
+            f = ((xmax - xmin) - ds) / max(max_vs - ds, 1e-9)
+            if f > 0:
+                f = min(f, 1.0)
+                tlo, thi = tlo * (1.0 - f), thi + (100.0 - thi) * f
+
+        # This method owns the y-range outright — leaving pyqtgraph's autorange
+        # armed alongside it would refit from item bounds per flush anyway.
+        vb.enableAutoRange(axis='y', enable=False)
+        if not smooth:
+            vb.setYRange(tlo, thi, padding=0)
+            return
+        cur_lo, cur_hi = vb.viewRange()[1]
+        # Exponential glide: step a fixed fraction of the remaining distance each
+        # flush (~0.18 @ 30fps ≈ 150ms time constant) so rescaling reads as one
+        # continuous motion instead of a snap.
+        ALPHA = 0.18
+        new_lo = cur_lo + (tlo - cur_lo) * ALPHA
+        new_hi = cur_hi + (thi - cur_hi) * ALPHA
+        # Containment: while gliding, never leave visible data outside the view —
+        # jump exactly as far as the data edge, and let the padding ease in after.
+        if lo < new_lo:
+            new_lo = lo
+        if hi > new_hi:
+            new_hi = hi
+        # Deadband: skip sub-0.1%-of-span moves — ends the glide near the target
+        # instead of asymptotically re-painting forever.
+        cur_span = max(cur_hi - cur_lo, 1e-9)
+        if (abs(new_lo - cur_lo) < cur_span * 0.001
+                and abs(new_hi - cur_hi) < cur_span * 0.001):
+            return
+        vb.setYRange(new_lo, new_hi, padding=0)
+
+    # Adaptive-coarsening bucket ladder (seconds). Snapping the effective bucket
+    # to fixed steps keeps candle widths/edges STABLE while zooming — a raw
+    # span/N bucket changes continuously with every wheel notch and pan frame,
+    # which made every candle morph (re-bucketed) on each zoom step.
+    _CANDLE_BUCKET_LADDER = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900,
+                             1800, 3600, 7200, 14400, 43200, 86400)
+
+    def _refresh_live_candles(self, ticks, to_pct, cbodies, cwicks,
+                              wxmin=None, wxmax=None):
         """Aggregate ticks into OHLC (implied %) and push into the candle items.
 
-        Candles are now drawn in implied-% space, which is linear, so bodies no
-        longer distort near 50% the way they did on the american-odds axis.
+        Candles are drawn in implied-% space, which is linear, so bodies don't
+        distort near 50% the way they did on the american-odds axis.
 
-        TODO(live-candles): remaining heuristics to revisit:
-          - min body height (doji) is a flat 0.5%, not scaled to the visible y-range
-          - "Max" bucket assumes a ~0.25s tick cadence; real spacing varies, so
-            candles can overlap/gap in bursty/idle stretches
-          - width/visible-count are global constants, not user-tunable in the UI
+        Receives the FULL tick list plus the render window [wxmin, wxmax] and
+        clips internally on a BUCKET-ALIGNED left edge: the first visible candle
+        always aggregates its complete bucket, and its open carries over from the
+        tick just before the window. Clipping candles mid-bucket (the old way)
+        re-shaped the edge candle and re-seeded the prev-close chain on every
+        pan/follow step, so candle bodies flickered as the window slid.
         """
         bucket = self.candle_bucket_s
         # Adaptive coarsening: cap the rendered candle count so a zoomed-out
-        # full-history view doesn't draw thousands of sub-pixel bars (the source
-        # of the zoom-out render lag). Zoomed in, the user's bucket is used as-is.
-        if ticks:
-            span = ticks[-1]['t'] - ticks[0]['t']
-            if span > 0:
-                MAX_CANDLES = 700
-                eff = span / MAX_CANDLES
-                if bucket <= 0 or eff > bucket:
-                    bucket = max(eff, 1.0)
+        # full-history view doesn't draw thousands of sub-pixel bars. Based on
+        # the WINDOW span (stable under panning), snapped to the ladder.
+        if wxmin is not None and wxmax is not None and wxmax > wxmin:
+            MAX_CANDLES = 700
+            eff = (wxmax - wxmin) / MAX_CANDLES
+            if eff > (bucket if bucket > 0 else 0.25):
+                bucket = next((s for s in self._CANDLE_BUCKET_LADDER if s >= eff),
+                              None)
+                if bucket is None:  # beyond the ladder: whole days
+                    bucket = math.ceil(eff / 86400.0) * 86400.0
+
+        # Bucket-aligned clip + previous-close carry-in.
+        eff_bucket = bucket if bucket > 0 else 0.25
+        prev_close = None
+        if wxmin is not None and ticks:
+            import bisect
+            t0 = math.floor(wxmin / eff_bucket) * eff_bucket
+            i0 = bisect.bisect_left(ticks, t0, key=lambda tk: tk['t'])
+            i1 = bisect.bisect_right(ticks, wxmax, key=lambda tk: tk['t'])
+            if i0 > 0:
+                prev_close = to_pct(ticks[i0 - 1]['price'])
+            ticks = ticks[i0:i1]
+
         groups, order = {}, []
         for tk in ticks:
             pct = to_pct(tk['price'])
@@ -8487,9 +8719,15 @@ class HistoricalOddsWidget(QWidget):
             cwicks.setData([], [])
             return
 
+        # Minimum body height (doji): scale to the visible y-span so a flat bar
+        # stays a thin sliver at every zoom level. The old flat 0.5% became a
+        # huge slab once the y-axis was fitted to a quiet 2-3% band.
+        yr = self.plot_widget.getViewBox().viewRange()[1]
+        yspan = yr[1] - yr[0]
+        min_h = max(yspan * 0.006, 0.02) if yspan > 0 else 0.1
+
         # Width tracks the bucket (Max -> tick cadence ~0.25s), filling ~88% of the
         # slot so neighbouring candles read as distinct but chunky.
-        eff_bucket = bucket if bucket > 0 else 0.25
         width = eff_bucket * 0.88
         centers, body_y0, body_h, brushes = [], [], [], []
         wick_x, wick_y = [], []
@@ -8500,7 +8738,6 @@ class HistoricalOddsWidget(QWidget):
         # (open==close -> all green) even while the series steps DOWN between bars;
         # prev-close opens make declines render red as expected. The wick still
         # spans the intra-bar high/low (extended to include the open).
-        prev_close = None
         for key in order:
             vals = groups[key]
             c = vals[-1]
@@ -8510,7 +8747,7 @@ class HistoricalOddsWidget(QWidget):
             cx = key + (eff_bucket / 2.0 if bucket > 0 else 0)
             centers.append(cx)
             body_y0.append(min(o, c))
-            body_h.append(max(abs(c - o), 0.5))
+            body_h.append(max(abs(c - o), min_h))
             brushes.append(pg.mkBrush(*(up if c >= o else down)))
             wick_x += [cx, cx, float('nan')]
             wick_y += [lo, hi, float('nan')]
@@ -8749,17 +8986,6 @@ class HistoricalOddsWidget(QWidget):
             logo_bot_left = w - pm.width() - margin
             self.logo_label_bottom.move(logo_bot_left, data_bottom - pm.height() - margin)
 
-        # Countdown pinned top-LEFT. Drop it below the control strip when that's
-        # shown so it never stacks on the floating controls.
-        cd = getattr(self, 'countdown_label', None)
-        if cd is not None and cd.isVisible():
-            cd_y = margin
-            if ov is not None and getattr(self, '_controls_visible', False) \
-                    and ov.isVisible() and ov.x() < margin + cd.width():
-                cd_y = ov.y() + ov.height() + gap
-            cd.move(margin, cd_y)
-            cd.raise_()
-
         if self.summary_label_top.isVisible():
             s = self.summary_label_top
             s.move(logo_top_left - gap - s.width(), margin)
@@ -8769,37 +8995,32 @@ class HistoricalOddsWidget(QWidget):
 
 
     def _update_countdown(self):
-        """1s tick: refresh the top-left countdown to the event start. Counts down
-        pre-game ('⏱ 2:14:08 to start'); after start flips to 'LIVE +H:MM:SS'."""
-        lbl = getattr(self, 'countdown_label', None)
-        if lbl is None:
-            return
+        """1s tick: refresh the countdown segment of the x-axis legend. Counts down
+        pre-game ('⏱ 2:14:08 to start'); after start flips to 'LIVE +H:MM:SS'.
+        Lives in the axis label alongside the Market Post / Event Start swatches
+        (see _rebuild_time_legend); only rebuilds the label when the text changes."""
         epoch = self._event_start_epoch()
-        if epoch is None:
-            if lbl.isVisible():
-                lbl.hide()
-            return
-        from datetime import datetime as _dt
-        # _event_start_epoch() returns a POSIX timestamp; datetime.now().timestamp()
-        # is the matching POSIX 'now', so the difference is correct regardless of tz.
-        rem = epoch - _dt.now().timestamp()
+        html = None
+        if epoch is not None:
+            from datetime import datetime as _dt
+            # _event_start_epoch() returns a POSIX timestamp; datetime.now().timestamp()
+            # is the matching POSIX 'now', so the difference is correct regardless of tz.
+            rem = epoch - _dt.now().timestamp()
 
-        def _hms(sec):
-            sec = int(abs(sec)); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
-            return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            def _hms(sec):
+                sec = int(abs(sec)); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
+                return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-        if rem > 0:
-            html = (f"<span style='color:#7e8794'>&#9201; </span>"
-                    f"<span style='color:#e0b050;font-weight:bold'>{_hms(rem)}</span>"
-                    f"<span style='color:#7e8794'> to start</span>")
-        else:
-            html = (f"<span style='color:#5bd075;font-weight:bold'>&#9679; LIVE</span>"
-                    f"<span style='color:#7e8794'> +{_hms(rem)}</span>")
-        lbl.setText(html)
-        lbl.adjustSize()
-        lbl.show()
-        lbl.raise_()
-        self._position_overlays()
+            if rem > 0:
+                html = (f"<span style='color:#7e8794'>&#9201; </span>"
+                        f"<span style='color:#e0b050;font-weight:bold'>{_hms(rem)}</span>"
+                        f"<span style='color:#7e8794'> to start</span>")
+            else:
+                html = (f"<span style='color:#5bd075;font-weight:bold'>&#9679; LIVE</span>"
+                        f"<span style='color:#7e8794'> +{_hms(rem)}</span>")
+        if html != self._countdown_html:
+            self._countdown_html = html
+            self._rebuild_time_legend()
 
     # Back-compat alias: older call sites used the logo-only name.
     _position_side_logos = _position_overlays
@@ -9164,9 +9385,34 @@ class HistoricalOddsWidget(QWidget):
             return None
         return self._market_open_epoch()
 
+    def _live_x_limits(self):
+        """(xMin, xMax) view limits for a live game market. Left: the Market Post
+        (open) time — there is never data before the market was posted. Right: the
+        live edge (newest tick / now / the event start, whichever is furthest).
+        Both get breathing room (~5% of the market life, min 5 min) so the user
+        can scroll slightly past either end without wandering into empty weeks.
+        Confining BOTH sides means zooming out quickly runs out of x-room and the
+        0-100 y-blend does the rest (see _fit_live_y). (None, None) when no
+        anchor time is known. The right limit must be re-applied as ticks arrive
+        (see _refresh_live_items) or follow mode would catch up to the clamp."""
+        post = self._market_open_epoch()
+        first = min((s['ticks'][0]['t'] for s in self.live_series if s['ticks']),
+                    default=None)
+        known = [v for v in (post, first) if v is not None]
+        if not known:
+            return None, None
+        start = min(known)
+        last = max((s['ticks'][-1]['t'] for s in self.live_series if s['ticks']),
+                   default=None)
+        es = self._event_start_epoch()
+        end = max(v for v in (last, es, datetime.now().timestamp()) if v is not None)
+        pad = max((end - start) * 0.05, 300)
+        return start - pad, end + pad
+
     def _rebuild_time_legend(self):
         """Set the bottom "Time" axis label with a swatch for each visible marker
-        (Market Post, Event Start), so both legends coexist instead of clobbering."""
+        (Market Post, Event Start) plus the start countdown / LIVE-elapsed segment,
+        so all the legends coexist instead of clobbering."""
         parts = ["Time"]
         mp = getattr(self, '_market_post_line', None)
         if mp is not None and mp.isVisible():
@@ -9176,6 +9422,8 @@ class HistoricalOddsWidget(QWidget):
         if sl is not None and sl.isVisible():
             hexc = '#%02x%02x%02x' % START_LINE_COLOR
             parts.append(f"<span style='color:{hexc}'>&#9476;&#9476; Event Start</span>")
+        if getattr(self, '_countdown_html', None):
+            parts.append(self._countdown_html)
         self.plot_widget.setLabel('bottom', "&nbsp;&nbsp;&nbsp;&nbsp;".join(parts))
 
     def _ensure_start_line(self):
@@ -9441,8 +9689,10 @@ class HistoricalOddsWidget(QWidget):
         if implied:
             # The %-axis auto-fits to the visible data (mouse y is disabled), so the
             # candles/lines always fill the vertical space at a readable height and the
-            # view stays reversible. Just make sure autorange is engaged for y here.
-            self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
+            # view stays reversible. Only for the STATIC path — in live mode
+            # _fit_live_y owns the y-range (autorange would fight it per flush).
+            if not getattr(self, 'live_mode', False):
+                self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
 
             # Y-axis label + ticks: implied % primary, american odds in parens,
             # at round values with fainter minor gridlines. Ticks are (re)built
