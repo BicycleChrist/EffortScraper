@@ -815,7 +815,10 @@ class QueryList(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._slot_area)
         self._scroll.setWidgetResizable(True)
-        self._scroll.setFixedHeight(_QL_SCROLL_H)
+        # Min-height (not fixed) so the slot box can stretch to absorb any
+        # slack when the top strip is bound by the button-row + ticker beside
+        # it — keeps the REGION/ADD row pinned to the strip's bottom edge.
+        self._scroll.setMinimumHeight(_QL_SCROLL_H)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setStyleSheet(
@@ -824,22 +827,24 @@ class QueryList(QWidget):
             f"QScrollBar::handle:vertical{{background:{_QL_DIM};border-radius:1px;min-height:12px;}}"
             f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
         )
-        outer.addWidget(self._scroll)
+        outer.addWidget(self._scroll, 1)
 
-        self.add_btn = QPushButton("+ ADD")
-        self.add_btn.setFixedHeight(16)
-        self.add_btn.setStyleSheet(self._ADD_STYLE)
-        self.add_btn.clicked.connect(self.add_slot)
-        outer.addWidget(self.add_btn)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background:{_QL_BORDER};border:none;")
-        outer.addWidget(sep)
+        # REGION selector and + ADD share one row (region left, add right) —
+        # saves the stacked region row's height under the slot box.
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(2)
 
         self.region = _QLRegionWidget()
-        outer.addWidget(self.region)
+        bottom_row.addWidget(self.region, 1)
+
+        self.add_btn = QPushButton("+ ADD")
+        self.add_btn.setFixedHeight(_QL_ROW_H)
+        self.add_btn.setStyleSheet(self._ADD_STYLE)
+        self.add_btn.clicked.connect(self.add_slot)
+        bottom_row.addWidget(self.add_btn, 1)
+
+        outer.addLayout(bottom_row)
 
         self.add_slot()
 
@@ -1014,7 +1019,9 @@ class ModernOddsWindow(QMainWindow):
         league_layout.setContentsMargins(0, 0, 0, 0)
         league_layout.setSpacing(4)
         self.query_list = QueryList()
-        league_layout.addWidget(self.query_list, 0, Qt.AlignmentFlag.AlignTop)
+        # No alignment flag: the QueryList fills the strip's full height, its
+        # slot box stretching so REGION/ADD sits level with the ticker bottom.
+        league_layout.addWidget(self.query_list, 0)
 
         # Create toggle buttons
         self.stream_toggle_button = QPushButton("Show Streaming Links ▼")
