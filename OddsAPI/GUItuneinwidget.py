@@ -33,9 +33,18 @@ class StreamLoadWorker(QThread):
             if not self._is_running:
                 return
 
-            # Stage 1: Get all game page URLs
+            # ATP Challenger TV discovery (official OTT API, ~30 status checks)
+            # runs concurrently with the whole box-network scrape and is
+            # merged into all_streams just before the stage-2 emit.
+            chtv_executor = ThreadPoolExecutor(max_workers=1)
+            chtv_future = chtv_executor.submit(GUItunein.get_challenger_tv_streams)
+
+            # Stage 1: Get all game page URLs.
+            # One worker per URL: every entry is a different domain, so full
+            # fan-out doesn't increase per-site burst (each site's own league
+            # pages are throttled inside get_box_network_links).
             all_game_urls = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=max(1, len(self.urls))) as executor:
                 futures = [executor.submit(GUItunein.get_href_links, url) for url in self.urls]
                 for future in concurrent.futures.as_completed(futures):
                     if not self._is_running:
@@ -78,6 +87,14 @@ class StreamLoadWorker(QThread):
             if not self._is_running:
                 return
 
+            # Merge the Challenger TV live feeds scraped in parallel
+            try:
+                all_streams.update(chtv_future.result(timeout=60))
+            except Exception as e:
+                self.error_occurred.emit(f"Challenger TV feeds failed: {e}")
+            finally:
+                chtv_executor.shutdown(wait=False)
+
             # Emit stage 2 completion
             self.stage2_complete.emit(all_streams)
 
@@ -97,14 +114,38 @@ class TuneInWidget(QFrame):
         super().__init__(parent_win)
         self._toggle_btn = toggle_btn
         self.hide()
-        QApplication.instance().installEventFilter(self)
-        if parent_win:
-            parent_win.installEventFilter(self)  # reposition on resize/move
+        # Outside-click dismiss + parent-resize repositioning only matter
+        # while the panel is on screen, so both event filters are installed
+        # on show and removed on hide (see show/hideEvent). The old permanent
+        # app-wide install in __init__ made EVERY event in the application
+        # run this widget's Python eventFilter — a per-event tax the stall
+        # watchdog caught mid-cascade during other widgets' show storms
+        # (e.g. the injury-news toggle).
 
         # URLs to be parsed (streaming aggregator main pages)
         self.urls = [
             #"https://www.nflbite.is/",          # NFL games with 10-15 streams each
-            "https://istreameast.app/v52"  # Multi-sport aggregator
+            "https://istreameast.app/v52",  # Multi-sport aggregator
+            # "Box" network — one domain per sport (mlbbox.me nav-items).
+            # GUItunein crawls each domain's league sub-pages for game links.
+            "https://nflbox.io",                                    # NFL
+            "https://nflbox.io/football/college-football",          # CFB
+            "https://nbabox.co",                                    # NBA
+            "https://nbabox.co/watch-college-basketball-online",    # NCAAM
+            "https://mlbbox.me",                                    # MLB
+            "https://nhlbox.me",                                    # NHL
+            "https://mmastream.me",                                 # UFC/MMA
+            "https://boxingbox.net",                                # Boxing
+            "https://tennisonline.me",                              # Tennis
+            "https://soccerbox.me",                                 # Soccer
+            "https://rugbybox.me",                                  # Rugby
+            "https://f1box.co",                                     # F1
+            "https://motogpstream.me",                              # MotoGP
+            "https://golfstreams.me",                               # Golf
+            "https://dartsstreams.com",                             # Darts
+            "https://cricwatch.io",                                 # Cricket
+            # "https://cracksports.me",  # multi-sport hub of the same network;
+            #                            # skipped — duplicates the per-sport domains
         ]
 
         # League names for filtering
@@ -239,13 +280,31 @@ class TuneInWidget(QFrame):
                 self._reposition()
         return False
 
+    def showEvent(self, event):
+        QApplication.instance().installEventFilter(self)
+        if self.parent():
+            self.parent().installEventFilter(self)  # reposition on resize/move
+        super().showEvent(event)
+
     def hideEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
+        if self.parent():
+            self.parent().removeEventFilter(self)
         super().hideEvent(event)
         if self._toggle_btn:
             self._toggle_btn.setChecked(False)
             self._toggle_btn.setText("Show Streaming Links ▼")
 
     def popup_below(self, btn):
+        # Re-resolve the button's real top-level window at popup time. At
+        # construction the button may not be attached to the main window yet
+        # (its window() then returns an intermediate container, whose bounds
+        # would clip the dropdown just below the ticker). Re-parenting here
+        # makes the overlay float over the full main window regardless of
+        # widget-tree build order.
+        win = btn.window()
+        if self.parent() is not win:
+            self.setParent(win)
         self._reposition()
         self.show()
         self.raise_()
@@ -328,13 +387,30 @@ class TuneInWidget(QFrame):
           parts[-1] = "42249792"  (numeric ID)
           parts[-2] = "vegas-golden-knights-colorado-avalanche"  (team slug)
           parts[-3] = "nhl-playoffs"  (sport/league slug)
+
+        Box network structure:
+          https://mlbbox.me/mlb/boston-red-sox-vs-texas-rangers-stream
+          https://boxingbox.net/watch-billam-smith-vs-rozicki-live-stream-online
         """
         try:
+            if GUItunein.is_challenger_tv_url(game_url):
+                return GUItunein.challenger_game_name(game_url)
+
             parts = game_url.rstrip('/').split('/')
 
             if len(parts) >= 2 and parts[-1].isnumeric():
                 game_name = parts[-2].replace('-', ' ').title()
                 return game_name
+
+            if GUItunein.is_box_network_url(game_url):
+                slug = parts[-1]
+                slug = slug.removeprefix('watch-')
+                for suffix in ('-live-stream-online', '-stream-online',
+                               '-live-stream', '-online-stream', '-stream'):
+                    if slug.endswith(suffix):
+                        slug = slug.removesuffix(suffix)
+                        break
+                return slug.replace('-', ' ').title()
         except:
             pass
 
