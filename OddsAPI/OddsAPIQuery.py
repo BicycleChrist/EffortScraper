@@ -340,7 +340,9 @@ def get_game_status(game_data, scores_data=None):
         tuple: (status_text, is_live_bool, scores_text)
     """
     game_id = game_data.get('id')
-    commence_time_str = game_data.get('commence_time', '')
+    # `or ''` — some OI sources (CRIS boards) carry commence_time=None,
+    # and fromisoformat(None) raises TypeError, not ValueError.
+    commence_time_str = game_data.get('commence_time') or ''
     
     # Try to find this game in scores data first
     if scores_data:
@@ -360,6 +362,10 @@ def get_game_status(game_data, scores_data=None):
                     return "🔴 LIVE", True, scores_text
     
     # Fallback to time-based detection
+    if not commence_time_str:
+        # No start time at all (e.g. a CRIS-only OI record) — keep the
+        # game, just don't claim a state.
+        return "TBD", False, ""
     try:
         commence_time = datetime.fromisoformat(commence_time_str)
         current_time = datetime.now(timezone.utc)

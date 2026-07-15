@@ -52,7 +52,9 @@ from polymarketquery import fetch_and_process_markets
 from prediction_markets_worker import PredictionMarketsWorker
 from LiquidityWidget import ProphetXBrowser
 from prophetx_async import ProphetXWorker
+import OwlsInsightClient as owlsinsight_adapter
 import feedparser
+import re
 import traceback
 import qasync
 import asyncio
@@ -358,6 +360,12 @@ _QUERY_SPORT_LIST = [
     for label, key in _leagues.items()
     if key in GAME_MARKETS
 ]
+# Owls Insight native slots ("oi:" pseudo sport keys): coverage TheOddsAPI
+# doesn't list (full-depth tennis down to ITF, esports, cricket/darts/...).
+# refresh_data routes these through owlsinsight_adapter.fetch_oi_games
+# instead of PropClient. Their market checkboxes come from OI_GAME_MARKETS.
+_QUERY_SPORT_LIST += owlsinsight_adapter.OI_QUERY_SPORTS
+GAME_MARKETS.update(owlsinsight_adapter.OI_GAME_MARKETS)
 
 _QL_BG      = "#0b1520"
 _QL_BG2     = "#101e2e"
@@ -1119,6 +1127,18 @@ class ModernOddsWindow(QMainWindow):
         self.tt_button.setObjectName("market_tt")
         self.tt_button.setStyleSheet(self.props_button_style)
 
+        # DonBest-style live screen (Owls Insight realtime fast lane).
+        # Standalone window with its own poll loop — independent of the
+        # Fetch Odds cycle and TheOddsAPI credits.
+        self.screen_button = QPushButton("Screen ▤")
+        self.screen_button.setObjectName("market_screen")
+        self.screen_button.setStyleSheet(self.props_button_style)
+        self.screen_button.setToolTip(
+            "Live odds screen — 2 rows per game, all books, "
+            "realtime Pinnacle w/ limits")
+        self.screen_button.clicked.connect(self.open_odds_screen)
+        self._screen_windows = []
+
         self.props_availability_label = QLabel("No Props available for this league")
         self.props_availability_label.setStyleSheet("color: #6c757d; font-style: italic;")
         self.props_availability_label.setVisible(False)
@@ -1127,6 +1147,7 @@ class ModernOddsWindow(QMainWindow):
         buttons_layout.addWidget(self.fetch_odds_button)
         buttons_layout.addWidget(self.props_button)
         buttons_layout.addWidget(self.tt_button)
+        buttons_layout.addWidget(self.screen_button)
         buttons_layout.addWidget(self.props_availability_label)
         buttons_layout.addStretch(1)
         buttons_layout.addWidget(self.stream_toggle_button)
@@ -1471,6 +1492,51 @@ class ModernOddsWindow(QMainWindow):
         popup_layout.setContentsMargins(12, 10, 12, 10)
         popup_layout.setSpacing(8)
         popup_layout.addWidget(self.auto_update_check)
+
+        # Owls Insight merge toggle: appends sharp books (Pinnacle w/ limits,
+        # CRIS, Circa, Vegas boards, ...) from the OI API into each game's
+        # book columns. Append-only — never overrides a TheOddsAPI cell —
+        # and fail-soft, so an expired OI key just means no extra columns.
+        self.oi_books_check = QCheckBox("Owls Insight books (Pinnacle, Circa…)")
+        self.oi_books_check.setChecked(True)
+        popup_layout.addWidget(self.oi_books_check)
+
+        # In-table fast lane: realtime Pinnacle refresh of the VISIBLE
+        # oi: tab's cells, surgical in-place updates (no table rebuild).
+        self.oi_live_check = QCheckBox("Live Pinnacle tick (oi: tabs)")
+        self.oi_live_check.setChecked(True)
+        oi_live_row = QHBoxLayout()
+        oi_live_row.setSpacing(6)
+        oi_live_row.addWidget(self.oi_live_check)
+        self.oi_live_interval = QSpinBox()
+        self.oi_live_interval.setRange(1, 30)
+        self.oi_live_interval.setValue(3)
+        self.oi_live_interval.setSuffix(" s")
+        self.oi_live_interval.valueChanged.connect(
+            lambda v: self.oi_live_timer.setInterval(v * 1000))
+        oi_live_row.addWidget(self.oi_live_interval)
+        oi_live_row.addStretch()
+        popup_layout.addLayout(oi_live_row)
+
+        self.oi_live_timer = QTimer(self)
+        self.oi_live_timer.setInterval(self.oi_live_interval.value() * 1000)
+        self.oi_live_timer.timeout.connect(self._on_oi_live_tick)
+        self.oi_live_timer.start()
+        self._oi_tick_task = None
+
+        # Game ordering for oi: tabs (applied on the next Fetch Odds)
+        oi_sort_row = QHBoxLayout()
+        oi_sort_row.setSpacing(6)
+        oi_sort_row.addWidget(QLabel("OI sort:"))
+        self.oi_sort_combo = QComboBox()
+        for label, mode in owlsinsight_adapter.OI_SORT_MODES:
+            self.oi_sort_combo.addItem(label, mode)
+        # applies immediately to the visible oi: tab AND to future fetches
+        self.oi_sort_combo.currentIndexChanged.connect(self._on_oi_sort_changed)
+        oi_sort_row.addWidget(self.oi_sort_combo)
+        oi_sort_row.addStretch()
+        popup_layout.addLayout(oi_sort_row)
+
         interval_row = QHBoxLayout()
         interval_row.setSpacing(6)
         interval_row.addWidget(QLabel("Update Interval:"))
@@ -1973,6 +2039,11 @@ class ModernOddsWindow(QMainWindow):
                 else:
                     header_item.setForeground(QColor('black'))
             else:
+                # explicit un-bold: reused items keep the header font when a
+                # market row lands where a header used to sit (OI re-sort)
+                font = QFont()
+                font.setBold(False)
+                header_item.setFont(font)
                 market_color = QColor(color)
                 market_color.setAlpha(230)
                 header_item.setBackground(market_color)
@@ -2044,7 +2115,13 @@ class ModernOddsWindow(QMainWindow):
                     tab_data.previous_data[(row_label, bm)] = current_value
 
                 # Maintain consistent background and text color when not highlighted
-                if not row_data.get('is_header') and item.background().color().alpha() != 180:  # Don't override highlight
+                if row_data.get('is_header'):
+                    # Header rows: odds cells stay the table's default dark —
+                    # a clean separator strip. Recycled items keep the pale
+                    # market color otherwise (visible after OI re-sorts).
+                    item.setData(Qt.ItemDataRole.BackgroundRole, None)
+                    item.setData(Qt.ItemDataRole.ForegroundRole, None)
+                elif item.background().color().alpha() != 180:  # Don't override highlight
                     market_color = QColor(color)
                     market_color.setAlpha(230)
                     item.setBackground(market_color)
@@ -2368,6 +2445,8 @@ class ModernOddsWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.fetch_odds_button.setEnabled(False)
+        # blocks the OI fast tick while the table is being rebuilt
+        self._refresh_running = True
 
         # Update last update time
         current_time = datetime.now().strftime("%H:%M:%S")
@@ -2393,13 +2472,37 @@ class ModernOddsWindow(QMainWindow):
 
                     tab_data = self.create_league_tab(league_name, sport_key, current_markets)
                     current_df = tab_data.to_dataframe() if tab_data.table_rows else None
+                    if current_df is not None and not current_df.index.is_unique:
+                        # A duplicated index (possible in tabs built before
+                        # the header-dedup guard) makes .at return a Series
+                        # and crashes the diff below.
+                        current_df = current_df[~current_df.index.duplicated(keep='first')]
+
+                    # "oi:" slots are served entirely by Owls Insight —
+                    # no PropClient, no TheOddsAPI credits, no scores feed
+                    # (status falls back to commence_time in get_game_status).
+                    is_oi_slot = sport_key.startswith("oi:")
 
                     self.data_manager.sport_key = sport_key
-                    self.data_manager.prop_client = PropClient(sport_key)
+                    oi_slate = None
+                    if is_oi_slot:
+                        scores_data = None
+                        games = await owlsinsight_adapter.fetch_oi_games(
+                            session, sport_key, wanted_markets=current_markets,
+                            sort_mode=self.oi_sort_combo.currentData())
+                    else:
+                        self.data_manager.prop_client = PropClient(sport_key)
+                        scores_data = await scores_query(sport_key, session=session)
+                        games = await self.data_manager.prop_client.get_games(session)
 
-                    scores_data = await scores_query(sport_key, session=session)
-
-                    games = await self.data_manager.prop_client.get_games(session)
+                        # Owls Insight sharp-book slate: ONE flat-rate request
+                        # covers every game in the slot. None when the sport is
+                        # uncovered (e.g. Summer League), toggle is off, or the
+                        # fetch fails — merge_oi_books(odds, None) is a no-op,
+                        # so the TheOddsAPI-only path is preserved exactly.
+                        if self.oi_books_check.isChecked():
+                            oi_slate = await owlsinsight_adapter.fetch_oi_slate(
+                                session, sport_key, wanted_markets=current_markets)
                     print(f"[{league_name}] Fetched {len(games) if isinstance(games, list) else 0} games")
 
                     if not isinstance(games, list):
@@ -2422,17 +2525,23 @@ class ModernOddsWindow(QMainWindow):
                         slot_progress = (index + 1) / total_games if total_games else 1
                         self.progress.setValue(int((slot_base + slot_progress / total_slots) * 100))
 
-                        if index > 0:
-                            await asyncio.sleep(0.034)
+                        if is_oi_slot:
+                            # fetch_oi_games returned complete odds dicts
+                            odds = game
+                        else:
+                            if index > 0:
+                                await asyncio.sleep(0.034)
 
-                        odds = await self.data_manager.prop_client.get_event_odds(
-                            session, game_id, current_markets,
-                            region=region_str, include_links=True, include_sids=True,
-                            include_bet_limits=True,
-                        )
+                            odds = await self.data_manager.prop_client.get_event_odds(
+                                session, game_id, current_markets,
+                                region=region_str, include_links=True, include_sids=True,
+                                include_bet_limits=True,
+                            )
 
                         if odds is None:
                             continue
+
+                        owlsinsight_adapter.merge_oi_books(odds, oi_slate)
 
                         home_team = odds.get('home_team', 'Unknown')
                         away_team = odds.get('away_team', 'Unknown')
@@ -2441,6 +2550,17 @@ class ModernOddsWindow(QMainWindow):
                         if status_result is None:
                             continue
                         status_text, is_live, scores_text = status_result
+                        if is_oi_slot:
+                            # OI feeds carry an explicit isLive flag from the
+                            # realtime window — trust it over the crude
+                            # "started by clock = LIVE for 4h" heuristic.
+                            if odds.get('is_live'):
+                                status_text, is_live = "🔴 LIVE", True
+                            elif is_live:
+                                # started per clock but the realtime feed
+                                # doesn't flag it live (finished, or covered
+                                # by retail books only)
+                                status_text, is_live = "Started", False
 
                         if not hasattr(tab_data, 'game_status'):
                             tab_data.game_status = {}
@@ -2449,12 +2569,33 @@ class ModernOddsWindow(QMainWindow):
                         }
 
                         game_header = f"Game: {home_team} vs {away_team} [{status_text}]"
+                        if odds.get('league') and is_oi_slot:
+                            # OI slates span tournaments/competitions; the
+                            # league tag is the only way to tell ATP Bastad
+                            # from ITF Nottingham in one tab.
+                            game_header = (f"Game: {odds['league']} — "
+                                           f"{home_team} vs {away_team} [{status_text}]")
+                        if is_oi_slot and not is_live:
+                            ct = owlsinsight_adapter._parse_iso(
+                                odds.get('commence_time'))
+                            if ct:
+                                game_header += (" · starts "
+                                                f"{ct.astimezone():%a %H:%M}")
                         if scores_text:
                             game_header += f" - {scores_text}"
+                        if game_header in new_table_data:
+                            # Same matchup twice in one slate (e.g. doubles
+                            # pairs on consecutive days). A duplicate header
+                            # duplicates the DataFrame index, and .at then
+                            # returns a Series — qualify with start time.
+                            game_header += f" · {(odds.get('commence_time') or '?')[:16]}"
                         new_table_rows.append(game_header)
                         new_table_data[game_header] = {
                             'is_header': True, 'game_id': game_id,
-                            'status_info': tab_data.game_status[game_id]
+                            'status_info': tab_data.game_status[game_id],
+                            # sort metadata for live re-ordering (OI sort)
+                            'commence_time': odds.get('commence_time'),
+                            'league': odds.get('league'),
                         }
 
                         for bm in odds.get('bookmakers', []):
@@ -2541,6 +2682,7 @@ class ModernOddsWindow(QMainWindow):
 
             traceback.print_exc()
         finally:
+            self._refresh_running = False
             self.fetch_odds_button.setEnabled(True)
             self._set_banner_state("IDLE")
             self._update_banner_quota()
@@ -2679,6 +2821,9 @@ class ModernOddsWindow(QMainWindow):
                  table.setItem(row_idx, 0, header_item)
              else:
                  header_item.setText(row_label)
+                 # reused items keep their old game_id otherwise — wrong
+                 # once rows are re-ordered (OI sort) and games shift rows
+                 header_item.game_id = game_id
 
              # Apply header styling
              if row_data.get('is_header'):
@@ -2688,6 +2833,11 @@ class ModernOddsWindow(QMainWindow):
                  header_item.setBackground(color)
                  header_item.setForeground(QColor('black'))
              else:
+                 # explicit un-bold: reused items keep the header font when
+                 # a market row lands where a header used to sit (OI re-sort)
+                 font = QFont()
+                 font.setBold(False)
+                 header_item.setFont(font)
                  market_color = QColor(color)
                  market_color.setAlpha(230)
                  header_item.setBackground(market_color)
@@ -2703,6 +2853,7 @@ class ModernOddsWindow(QMainWindow):
                      table.setItem(row_idx, col_idx, item)
                  else:
                      item.setText(current_value)
+                     item.game_id = game_id
 
                  # Attach the betslip deep-link (outcome link, else event page per game)
                  link = (tab_data.cell_links.get((row_label, bm))
@@ -2750,7 +2901,13 @@ class ModernOddsWindow(QMainWindow):
                          pass
                  else:
                      # No change, maintain consistent background and text color
-                     if not row_data.get('is_header'):
+                     if row_data.get('is_header'):
+                         # header rows: keep odds cells at the default dark
+                         # background (clean separator strip); recycled items
+                         # otherwise keep stale market colors after re-sorts
+                         item.setData(Qt.ItemDataRole.BackgroundRole, None)
+                         item.setData(Qt.ItemDataRole.ForegroundRole, None)
+                     else:
                          market_color = QColor(color)
                          market_color.setAlpha(230)
                          item.setBackground(market_color)
@@ -2759,6 +2916,319 @@ class ModernOddsWindow(QMainWindow):
          # Resize the table
          table.resizeColumnsToContents()
          table.resizeRowsToContents()
+
+    # ── OI in-table fast lane ────────────────────────────────────────────
+    # Realtime Pinnacle prices ticked straight into the visible oi: tab's
+    # existing cells every few seconds. Surgical: only cells whose value
+    # actually changed are touched (setText + flash), so the cost per tick
+    # is proportional to line movement, not table size. Structural changes
+    # (new matches, moved spread points → new row labels) still arrive via
+    # the normal Fetch Odds cycle.
+
+    def _on_oi_live_tick(self):
+        if not self.oi_live_check.isChecked():
+            return
+        if getattr(self, "_refresh_running", False):
+            return                      # full refresh owns the table right now
+        if self._oi_tick_task and not self._oi_tick_task.done():
+            return                      # previous tick still in flight
+        if self._find_visible_oi_tab() is None:
+            return
+        try:
+            self._oi_tick_task = asyncio.create_task(self._oi_fast_tick())
+        except RuntimeError:
+            pass                        # no running loop (shutdown)
+
+    def _find_visible_oi_tab(self):
+        for tab_data in self.league_tabs.values():
+            tw = getattr(tab_data, "table_widget", None)
+            if (tw is not None and tw.isVisible()
+                    and str(getattr(tab_data, "sport_key", "")).startswith("oi:")):
+                return tab_data
+        return None
+
+    async def _oi_fast_tick(self):
+        tab_data = self._find_visible_oi_tab()
+        if tab_data is None:
+            return
+        try:
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=15, connect=6)) as session:
+                # realtime window only — small payload, live/imminent events
+                games = await owlsinsight_adapter.fetch_oi_games(
+                    session, tab_data.sport_key, wanted_markets=None,
+                    include_unified=False, log=lambda *a: None)
+        except Exception as e:  # noqa: BLE001 — the tick must never crash the UI
+            _gated_print(f"[OI live] tick fetch failed: {e}")
+            return
+        if getattr(self, "_refresh_running", False):
+            return
+        self._apply_oi_live_update(tab_data, games)
+
+    _OI_LABEL_RE = re.compile(r"^(?P<matchup>.+?) \| (?P<rest>.+)$")
+    _OI_SPREAD_RE = re.compile(r"^Spread: (?P<name>.+?) (?P<pt>-?\d+(?:\.\d+)?)$")
+    _OI_TOTAL_RE = re.compile(r"^Total (?P<name>Over|Under) (?P<pt>-?\d+(?:\.\d+)?)$")
+    _OI_ML_RE = re.compile(r"^Moneyline: (?P<name>.+)$")
+    _OI_GENERIC_RE = re.compile(r"^(?P<key>[A-Za-z0-9_]+): (?P<name>.+)$")
+
+    def _oi_index_rows(self, tab_data):
+        """Parse the tab's row labels into lookups the tick can use:
+        (matchup, market_key, outcome_name) -> {point: row}, plus header
+        rows by game_id and each matchup's block end (insert anchor)."""
+        line_rows, header_rows, block_end = {}, {}, {}
+        for row, label in enumerate(tab_data.table_rows):
+            rd = tab_data.table_data.get(label) or {}
+            if rd.get("is_header"):
+                header_rows[rd.get("game_id")] = row
+                continue
+            m = self._OI_LABEL_RE.match(label)
+            if not m:
+                continue
+            matchup, rest = m.group("matchup"), m.group("rest")
+            block_end[matchup] = max(block_end.get(matchup, -1), row)
+            sm = self._OI_SPREAD_RE.match(rest)
+            if sm:
+                key, pt = ("spreads", sm.group("name")), float(sm.group("pt"))
+            elif (tm := self._OI_TOTAL_RE.match(rest)):
+                key, pt = ("totals", tm.group("name")), float(tm.group("pt"))
+            elif (mm := self._OI_ML_RE.match(rest)):
+                key, pt = ("h2h", mm.group("name")), None
+            elif (gm := self._OI_GENERIC_RE.match(rest)):
+                key, pt = (gm.group("key"), gm.group("name")), None
+            else:
+                continue
+            line_rows.setdefault((matchup,) + key, {})[pt] = row
+        return line_rows, header_rows, block_end
+
+    def _oi_rename_row(self, tab_data, table, row, old_label, new_label):
+        """Rename a row label in every structure that keys on it."""
+        tab_data.table_rows[row] = new_label
+        if old_label in tab_data.table_data:
+            tab_data.table_data[new_label] = tab_data.table_data.pop(old_label)
+        item = table.item(row, 0)
+        if item is not None:
+            item.setText(new_label)
+        for d in (tab_data.cell_limits, tab_data.cell_links):
+            for k in [k for k in d if k[0] == old_label]:
+                d[(new_label, k[1])] = d.pop(k)
+
+    def _apply_oi_live_update(self, tab_data, games):
+        table = tab_data.table_widget
+        if table is None or "Pinnacle" not in tab_data.bookmakers:
+            return
+        col = tab_data.bookmakers.index("Pinnacle") + 1   # col 0 = label
+        line_rows, header_rows, block_end = self._oi_index_rows(tab_data)
+        changed = 0
+
+        def bump_indexes(from_row):
+            for d in line_rows.values():
+                for k in d:
+                    if d[k] >= from_row:
+                        d[k] += 1
+            for k in header_rows:
+                if header_rows[k] is not None and header_rows[k] >= from_row:
+                    header_rows[k] += 1
+            for k in block_end:
+                if block_end[k] >= from_row:
+                    block_end[k] += 1
+
+        def flash(item, new_val, old_val, game_id):
+            try:
+                up = float(new_val.split()[0]) > float(old_val.split()[0])
+                item.setBackground(QColor(0, 200, 0, 180) if up
+                                   else QColor(200, 0, 0, 180))
+                item.setForeground(QColor("black"))
+                base = QColor(tab_data.get_game_color(game_id))
+                base.setAlpha(230)
+                QTimer.singleShot(3000, lambda i=item, c=base: (
+                    i.setBackground(c), i.setForeground(QColor("black"))))
+            except (ValueError, IndexError, TypeError):
+                pass
+
+        def update_cell(row, label, new_val, limit, gid):
+            nonlocal changed
+            rd = tab_data.table_data.get(label)
+            item = table.item(row, col)
+            if rd is None or item is None:
+                return
+            if limit:
+                tab_data.cell_limits[(label, "Pinnacle")] = limit
+                item.setData(BET_LIMIT_ROLE, format_bet_limit(limit))
+            old_val = rd.get("Pinnacle", "")
+            if not new_val or new_val == old_val:
+                return
+            rd["Pinnacle"] = new_val
+            item.setText(new_val)
+            flash(item, new_val, old_val, rd.get("game_id", gid))
+            changed += 1
+
+        for g in games:
+            matchup = f"{g.get('home_team', '')} vs {g.get('away_team', '')}"
+            gid = g.get("id", "")
+
+            # LIVE flip on the header row when the feed flags in-play
+            if g.get("is_live"):
+                hrow = header_rows.get(gid)
+                if hrow is not None:
+                    old_label = tab_data.table_rows[hrow]
+                    if "🔴" not in old_label:
+                        new_label = re.sub(r"\[[^\]]*\]", "[🔴 LIVE]",
+                                           old_label, count=1)
+                        new_label = re.sub(r" · starts .*$", "", new_label)
+                        self._oi_rename_row(tab_data, table, hrow,
+                                            old_label, new_label)
+                        status = (tab_data.table_data.get(new_label, {})
+                                  .get("status_info"))
+                        if status:
+                            status["text"], status["is_live"] = "🔴 LIVE", True
+
+            for bm in g.get("bookmakers", []):
+                if bm.get("title") != "Pinnacle":
+                    continue
+                for market in bm.get("markets", []):
+                    mkey = market.get("key")
+                    for outcome in market.get("outcomes", []):
+                        name = outcome.get("name", "")
+                        pt = outcome.get("point")
+                        limit = outcome.get("bet_limit")
+                        new_val = self.format_price(outcome)
+                        group = line_rows.get((matchup, mkey, name))
+                        if mkey in ("spreads", "totals") and pt is not None:
+                            if group and float(pt) in group:
+                                row = group[float(pt)]
+                                update_cell(row, tab_data.table_rows[row],
+                                            new_val, limit, gid)
+                                continue
+                            if not group:
+                                continue   # market absent — full refresh adds it
+                            # THE LINE MOVED (e.g. -1.5 -> -2.5): vacate the
+                            # stale Pinnacle cells, then land the new point on
+                            # a fresh row inserted at the game block's end.
+                            for orow in group.values():
+                                olabel = tab_data.table_rows[orow]
+                                ord_ = tab_data.table_data.get(olabel, {})
+                                if ord_.get("Pinnacle"):
+                                    ord_.pop("Pinnacle", None)
+                                    tab_data.cell_limits.pop(
+                                        (olabel, "Pinnacle"), None)
+                                    itm = table.item(orow, col)
+                                    if itm is not None:
+                                        itm.setText("")
+                                        itm.setData(BET_LIMIT_ROLE, None)
+                            anchor = block_end.get(matchup)
+                            if anchor is None:
+                                continue
+                            new_label = (f"{matchup} | "
+                                         f"{self.format_market_label(mkey, outcome)}")
+                            row = anchor + 1
+                            table.insertRow(row)
+                            base = QColor(tab_data.get_game_color(gid))
+                            base.setAlpha(230)
+                            for c in range(len(tab_data.bookmakers) + 1):
+                                it = ColoredTableItem(
+                                    new_label if c == 0 else "", gid)
+                                it.setBackground(base)
+                                it.setForeground(QColor("black"))
+                                table.setItem(row, c, it)
+                            tab_data.table_rows.insert(row, new_label)
+                            tab_data.table_data[new_label] = {"game_id": gid}
+                            bump_indexes(row)
+                            group[float(pt)] = row
+                            update_cell(row, new_label, new_val, limit, gid)
+                        else:
+                            row = (group or {}).get(None)
+                            if row is None:
+                                continue
+                            update_cell(row, tab_data.table_rows[row],
+                                        new_val, limit, gid)
+        if changed:
+            _gated_print(f"[OI live] {changed} Pinnacle cells updated")
+
+    def _on_oi_sort_changed(self, _ix):
+        """Live re-sort of the visible oi: tab. Reorders the game blocks in
+        tab_data and re-renders through update_table_with_changes — the same
+        proven path every full refresh uses — so items, links, limits, and
+        colors stay consistent. Never raises: any surprise leaves the table
+        as-is and the new order still applies on the next fetch."""
+        try:
+            if getattr(self, "_refresh_running", False):
+                return                      # fetch in flight owns the table
+            tab_data = self._find_visible_oi_tab()
+            if tab_data is None or not tab_data.table_rows:
+                return
+            self._refresh_running = True    # hold the fast tick off
+            try:
+                self._resort_oi_tab(tab_data,
+                                    self.oi_sort_combo.currentData())
+            finally:
+                self._refresh_running = False
+        except Exception as e:  # noqa: BLE001 — a sort must never break the grid
+            print(f"[OI sort] re-sort failed (table left unchanged): {e}")
+            traceback.print_exc()
+
+    def _resort_oi_tab(self, tab_data, mode):
+        # 1. Split table_rows into game blocks (header + its outcome rows).
+        #    Orphan rows before the first header keep their position at top.
+        blocks, orphans, current = [], [], None
+        for label in tab_data.table_rows:
+            rd = tab_data.table_data.get(label, {})
+            if rd.get("is_header"):
+                current = {"labels": [label], "meta": rd}
+                blocks.append(current)
+            elif current is not None:
+                current["labels"].append(label)
+            else:
+                orphans.append(label)
+
+        # 2. Sort via the client's sort_oi_games so all four modes behave
+        #    exactly like a fresh fetch. Each block becomes a minimal game
+        #    dict; the pinnacle limit is rebuilt from cell_limits so the
+        #    "limit" mode has data (bet_limit lives per outcome there).
+        proxies = []
+        for block in blocks:
+            meta = block["meta"]
+            max_limit = max((tab_data.cell_limits.get((lab, "Pinnacle")) or 0
+                             for lab in block["labels"]), default=0)
+            proxies.append({
+                "_block": block,
+                "is_live": (meta.get("status_info") or {}).get("is_live", False),
+                "commence_time": meta.get("commence_time"),
+                "league": meta.get("league"),
+                "bookmakers": [{"markets": [{"outcomes": [
+                    {"bet_limit": max_limit}]}]}],
+            })
+        owlsinsight_adapter.sort_oi_games(proxies, mode)
+
+        # 3. Flatten back and re-render. update_table_with_changes rewrites
+        #    every cell from table_data by row order, so nothing else in
+        #    tab_data needs to move (labels, limits, links are label-keyed).
+        tab_data.table_rows = orphans + [lab for p in proxies
+                                         for lab in p["_block"]["labels"]]
+        self.update_table_with_changes(tab_data, {})
+        # 4. Re-apply the active text filter to the new row order.
+        if self.search_bar.text().strip():
+            self.filter_table()
+
+    def open_odds_screen(self):
+        """Open the DonBest-style live screen, seeded from the active slot's
+        sport when it maps to OI coverage (tennis otherwise)."""
+        from oddsscreen import OddsScreenWindow, SCREEN_SPORTS
+        initial = "oi:tennis"
+        screen_keys = {k for _l, k in SCREEN_SPORTS}
+        for sport_key, _league, _mkts, _regions in self.query_list.get_queries():
+            if sport_key in screen_keys:
+                initial = sport_key
+                break
+            mapped = owlsinsight_adapter.map_sport_key(sport_key)
+            if mapped and f"oi:{mapped}" in screen_keys:
+                initial = f"oi:{mapped}"
+                break
+        win = OddsScreenWindow(initial_sport=initial)
+        win.destroyed.connect(
+            lambda *_: self._screen_windows.remove(win)
+            if win in self._screen_windows else None)
+        self._screen_windows.append(win)
+        win.show()
 
     def handle_calc_button(self):
         """Show the odds-converter/calculator."""
@@ -2801,30 +3271,39 @@ class ModernOddsWindow(QMainWindow):
                 current_table.setRowHidden(row, False)
             return
 
-        # Filter rows based on search term
+        # Pass 1 — find matches. A game HEADER match (e.g. the tournament
+        # name, which only appears on the header row) must reveal the whole
+        # game block, so remember which games matched via each row's
+        # game_id (ColoredTableItem carries it).
+        matched_rows = set()
+        matched_games = set()
         for row in range(current_table.rowCount()):
-            # Get the market/outcome text (first column)
             header_item = current_table.item(row, 0)
             if not header_item:
-                current_table.setRowHidden(row, True)
                 continue
-
-            row_text = header_item.text().lower()
-
-            # Also check bookmaker odds in other columns
-            match_found = search_term in row_text
-
+            match_found = search_term in header_item.text().lower()
             if not match_found:
                 # Check odds values in bookmaker columns
                 for col in range(1, current_table.columnCount()):
                     item = current_table.item(row, col)
-                    if item and item.text():
-                        if search_term in item.text().lower():
-                            match_found = True
-                            break
+                    if item and item.text() and search_term in item.text().lower():
+                        match_found = True
+                        break
+            if match_found:
+                matched_rows.add(row)
+                game_id = getattr(header_item, "game_id", None)
+                if game_id:
+                    matched_games.add(game_id)
 
-            # Show/hide row based on match
-            current_table.setRowHidden(row, not match_found)
+        # Pass 2 — show matched rows plus every row of a matched game.
+        for row in range(current_table.rowCount()):
+            visible = row in matched_rows
+            if not visible:
+                header_item = current_table.item(row, 0)
+                game_id = getattr(header_item, "game_id", None) \
+                    if header_item else None
+                visible = bool(game_id) and game_id in matched_games
+            current_table.setRowHidden(row, not visible)
 
     def _attach_search_to_header(self, table=None):
         """Parent the filter bar onto the given (or current) table's header and
