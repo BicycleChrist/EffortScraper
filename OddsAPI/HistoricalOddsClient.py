@@ -1,6 +1,7 @@
 import qasync
 import asyncio
 import aiohttp
+import orjson
 import time as _time   # module-level alias for the per-frame Live hot path (no per-call import)
 from datetime import datetime, timedelta
 
@@ -2066,6 +2067,24 @@ class KalshiHistoricalOddsClient:
         print(f"Fetched {len(out)} OHLC candles for {market_ticker}")
         return out
 
+    async def get_large_trades(self, market_tickers, min_notional_usd=100.0,
+                               top_n=200, max_trades_per_market=20000):
+        """Async wrapper around KalshiClient.find_large_trades — scans each
+        market's full public trade history (since posting, newest-first) for
+        prints whose taker notional clears the threshold. Returns the per-market
+        dict: {ticker: {'large_trades': [normalized], 'trades_scanned': ...}}.
+        Runs on the default executor like get_ohlc_candles (paginated REST,
+        ~0.7s per 5k trades)."""
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: self.kalshi_client.find_large_trades(
+                market_tickers=list(market_tickers),
+                min_notional_usd=min_notional_usd,
+                top_n=top_n,
+                max_trades_per_market=max_trades_per_market))
+        return res.get('markets', {})
+
 
 # ---------------------------------------------------------------------------
 # Combined Kalshi × Polymarket volume heat map — DATA LAYER ONLY
@@ -2372,6 +2391,16 @@ class VolumeHeatmap:
                                          key=lambda x: -x.value)]
 
 
+def _fmt_cents(v):
+    """Cents label: whole cents render bare ('56'), fractional at ONE decimal
+    ('54.5') — PM quotes at 0.1¢, so anything finer is float-subtraction noise
+    (e.g. 54.6 - 54.5 must show '0.1', never '0.10000000000000142')."""
+    if v is None:
+        return None
+    r = round(float(v), 1)
+    return f"{r:.0f}" if r == int(r) else f"{r:.1f}"
+
+
 class OrderbookLadderWidget(QWidget):
     """Compact live depth ladder for the YES outcome
 
@@ -2430,11 +2459,11 @@ class OrderbookLadderWidget(QWidget):
         # Mid row: spread (left) + last (right)
         p.fillRect(0, y, w, rh, QColor(22, 27, 34))
         p.setFont(self._font_b)
-        spr = f"spr {self._spread}¢" if self._spread is not None else "spr —"
+        spr = f"spr {_fmt_cents(self._spread)}¢" if self._spread is not None else "spr —"
         p.setPen(QColor(150, 160, 170))
         p.drawText(QRectF(6, y, w - 12, rh),
                    int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), spr)
-        last = f"last {self._last}¢" if self._last is not None else "last —"
+        last = f"last {_fmt_cents(self._last)}¢" if self._last is not None else "last —"
         if self._stale:
             last += " ·resync"
         p.setPen(QColor(224, 176, 80))
@@ -2455,7 +2484,8 @@ class OrderbookLadderWidget(QWidget):
         p.setFont(self._font)
         p.setPen(color.lighter(125))
         p.drawText(QRectF(6, y, 54, rh),
-                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), f"{price}¢")
+                   int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                   f"{_fmt_cents(price)}¢")
         p.setPen(QColor(200, 206, 214))
         p.drawText(QRectF(w - 76, y, 70, rh),
                    int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), f"{qty:,}")
@@ -2968,6 +2998,7 @@ class HistoricalOddsWidget(QWidget):
         # band, the start line and the crosshair all draw on top of it. Hidden until
         # the Heat toggle is on; filled per tick in _refresh_heatmap().
         self._ensure_heat_img()
+        self._ensure_whale_scatter()
         # Implied chance is a probability: 0% and 100% are HARD floor/ceiling.
         # Bound the Y view so it can never pan/zoom past the valid range (no more
         # scrolling into negative % or above 100%). minYRange keeps a sane floor
@@ -3031,7 +3062,7 @@ class HistoricalOddsWidget(QWidget):
             lbl.setTextFormat(Qt.TextFormat.RichText)
             lbl.setStyleSheet(
                 "background: rgba(18,22,28,210); border:1px solid #39414b;"
-                " border-radius:3px; padding:4px 8px;")
+                " border-radius:3px; padding:3px 6px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.hide()
 
@@ -3226,7 +3257,15 @@ class HistoricalOddsWidget(QWidget):
         self.candle_bucket.setFixedWidth(64)
         self.candle_bucket.setToolTip("Candle aggregation window (Max = one candle per tick)")
         self.candle_bucket.currentIndexChanged.connect(self._on_candle_bucket_changed)
-        row2.addWidget(self.candle_check); row2.addWidget(self.candle_bucket); row2.addStretch(1)
+        self.whales_check = QCheckBox("Whales")
+        self.whales_check.setChecked(True)
+        self.whales_check.setToolTip(
+            "Overlay large trades on the chart as dots sized by notional\n"
+            "(threshold follows the LARGE TRADES $ selector; hover for details)")
+        self.whales_check.stateChanged.connect(self._on_whales_toggled)
+        self.show_whale_dots = True
+        row2.addWidget(self.candle_check); row2.addWidget(self.candle_bucket)
+        row2.addWidget(self.whales_check); row2.addStretch(1)
         lc.addLayout(row2)
         pb.addWidget(self.live_controls)
 
@@ -3249,6 +3288,52 @@ class HistoricalOddsWidget(QWidget):
         self.ob_ladders_layout.setContentsMargins(0, 0, 0, 0)
         self.ob_ladders_layout.setSpacing(4)
         obl.addWidget(self.ob_ladders_box)
+
+        # --- LARGE TRADES (whale tape; Kalshi only) --------------------------
+        # Seeded by a REST scan of the market's full trade history since posting
+        # (_refresh_large_trades, alongside the candle seed), then appended live
+        # from the trade WS frames (_note_live_trade). The combo filters the
+        # cached master list (floored at _LT_FLOOR) without refetching.
+        self.large_trades_box = QWidget()
+        ltl = QVBoxLayout(self.large_trades_box)
+        ltl.setContentsMargins(0, 6, 0, 0); ltl.setSpacing(2)
+        lt_head = QHBoxLayout(); lt_head.setSpacing(6)
+        lt_title = QLabel("LARGE TRADES"); lt_title.setObjectName("sect")
+        self.large_trade_min_combo = QComboBox()
+        for lbl, v in (("$100", 100.0), ("$250", 250.0), ("$500", 500.0),
+                       ("$1k", 1000.0), ("$2.5k", 2500.0), ("$5k", 5000.0)):
+            self.large_trade_min_combo.addItem(lbl, v)
+        self.large_trade_min_combo.setCurrentIndex(2)
+        self.large_trade_min_combo.setFixedWidth(64)
+        self.large_trade_min_combo.setToolTip(
+            "Minimum taker notional to show a print (block trades always show)")
+        self.large_trade_min_combo.currentIndexChanged.connect(
+            self._render_large_trades)
+        lt_head.addWidget(lt_title); lt_head.addStretch(1)
+        lt_head.addWidget(self.large_trade_min_combo)
+        ltl.addLayout(lt_head)
+        self.large_trades_list = QListWidget()
+        self.large_trades_list.setStyleSheet(
+            "QListWidget{background:#0d1117;border:1px solid #222a35;"
+            "font-family:monospace;font-size:10px;color:#cfd6df;outline:0;}"
+            "QListWidget::item{padding:1px 4px;}"
+            "QListWidget::item:selected{background:#1b2430;}")
+        self.large_trades_list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        # Rows are formatted to fit one line (k-abbreviated size/notional, side
+        # carried by the row colour) — a horizontal scrollbar is never warranted.
+        self.large_trades_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.large_trades_list.setFixedHeight(150)
+        self.large_trades_list.itemClicked.connect(self._on_large_trade_clicked)
+        ltl.addWidget(self.large_trades_list)
+        obl.addWidget(self.large_trades_box)
+        self.large_trades_box.setVisible(False)
+        self._large_trades = []       # normalized master list (>= _LT_FLOOR)
+        self._large_trade_ids = set()  # trade_id dedupe (REST seed vs WS append)
+        self._lt_fetch_gen = 0         # discards a stale scan after market switch
+        self._whale_selected_tid = None  # tape row click -> illuminated marker
+        self._whale_pulse_n = 0          # remaining pulse ticks on the selection
 
         pb.addWidget(self.ob_section)
 
@@ -3776,6 +3861,297 @@ class HistoricalOddsWidget(QWidget):
             self.ob_ladders_layout.addWidget(lad)
             s['readout'], s['ladder'] = ro, lad
 
+    # ------------------------------------------------------------------
+    # LARGE TRADES viewer — REST history seed + live WS appends
+    # ------------------------------------------------------------------
+    _LT_FLOOR = 100.0   # master-scan threshold; the combo filters DOWN from this
+    _LT_MAX_ROWS = 120  # rendered rows cap (master list itself is unbounded-ish)
+
+    async def _refresh_large_trades(self):
+        """Seed the LARGE TRADES tape: scan each active market's full public
+        trade history for prints >= the $100 floor — Kalshi via the paginated
+        /markets/trades scan, Polymarket via data-api /trades (server-side CASH
+        filter), both normalized to one shape. Called alongside the candle seed
+        on live entry / market / feed / side changes; a generation counter
+        discards a scan that a switch outran."""
+        if not hasattr(self, 'large_trades_box'):
+            return
+        self._lt_fetch_gen += 1
+        gen = self._lt_fetch_gen
+        self._large_trades, self._large_trade_ids = [], set()
+        self._whale_selected_tid = None
+        self.large_trades_list.clear()
+        # Futures chart ~40 candidates but only the OB-flagged head warrants a
+        # (paginated) history scan each — mirror the ladder gating.
+        k_tickers = sorted({s['key'] for s in self.live_series
+                            if s.get('venue') == 'kalshi' and s.get('show_ob', True)})
+        pm_tokens = sorted({s['key'] for s in self.live_series
+                            if s.get('venue') == 'polymarket' and s.get('show_ob', True)})
+        if not self.live_mode or not (k_tickers or pm_tokens):
+            self.large_trades_box.setVisible(False)
+            return
+        self.large_trades_box.setVisible(True)
+        tasks = []
+        if k_tickers:
+            tasks.append(self.kalshi_client.get_large_trades(
+                k_tickers, min_notional_usd=self._LT_FLOOR))
+        if pm_tokens:
+            # PM scan is sync (gamma token->conditionId resolve + data-api
+            # /trades with the notional filter pushed server-side) — executor.
+            pmc = getattr(self.polymarket_client, 'polymarket_client',
+                          self.polymarket_client)
+            tasks.append(asyncio.get_event_loop().run_in_executor(
+                None, lambda: pmc.find_large_trades(
+                    pm_tokens, min_notional_usd=self._LT_FLOOR)))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if gen != self._lt_fetch_gen or not self.live_mode:
+            return  # market switched while the scan ran — stale, drop it
+        norm = []
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"[large-trades] seed failed: {res}")
+            elif isinstance(res, dict):   # Kalshi: {ticker: {'large_trades': …}}
+                for info in res.values():
+                    norm.extend(info.get('large_trades', []))
+            else:                          # Polymarket: flat normalized list
+                norm.extend(res or [])
+        for n in norm:
+            tid = n.get('trade_id')
+            if tid and tid in self._large_trade_ids:
+                continue
+            if tid:
+                self._large_trade_ids.add(tid)
+            self._large_trades.append(n)
+        self._render_large_trades()
+
+    def _note_live_trade(self, inner):
+        """A live Kalshi WS `trade` message for an active market — append it to
+        the tape if it clears the floor (block trades always). Cheap: trades are
+        rare next to orderbook deltas, and a full re-render is ~120 rows."""
+        try:
+            self._append_large_trade(KalshiClient.normalize_trade(inner))
+        except Exception as e:
+            print(f"[large-trades] live append failed: {e}")
+
+    def _note_pm_live_trade(self, ev):
+        """A live Polymarket `last_trade_price` event — append to the tape if
+        it's on an active token and clears the floor. Defensive on `size`:
+        the market channel usually carries it, but skip the event if not."""
+        try:
+            asset = str(ev.get('asset_id') or '')
+            if asset not in self._active_pm_keys():
+                return
+            price = float(ev.get('price') or 0)
+            size = float(ev.get('size') or 0)
+            if not price or not size:
+                return
+            ts = float(ev.get('timestamp') or 0)
+            if ts > 1e12:   # ms epoch guard
+                ts /= 1000.0
+            if not ts:
+                ts = _time.time()
+            side = str(ev.get('side') or '').upper()
+            self._append_large_trade({
+                'trade_id': f"pmws:{asset[-10:]}:{ts}:{size}",
+                'ticker': asset, 'ts': ts,
+                'created_time': datetime.fromtimestamp(ts).strftime(
+                    '%Y-%m-%dT%H:%M:%S'),
+                'contracts': size, 'yes_price': price, 'no_price': price,
+                'taker_side': 'yes' if side == 'BUY' else 'no',
+                'notional_usd': size * price, 'is_block_trade': False,
+            })
+        except Exception as e:
+            print(f"[large-trades] pm live append failed: {e}")
+
+    def _append_large_trade(self, n):
+        """Shared live-append tail: floor check, trade_id dedupe, re-render."""
+        if not n['is_block_trade'] and n['notional_usd'] < self._LT_FLOOR:
+            return
+        tid = n.get('trade_id')
+        if tid and tid in self._large_trade_ids:
+            return
+        if tid:
+            self._large_trade_ids.add(tid)
+        self._large_trades.append(n)
+        self._render_large_trades()
+
+    def _render_large_trades(self, *_):
+        """Redraw the tape from the cached master list, filtered by the combo
+        threshold, newest first. Side colour = taker direction (YES green /
+        NO red); off-book block trades get an amber tag."""
+        if not hasattr(self, 'large_trades_list'):
+            return
+        thr = self.large_trade_min_combo.currentData() or 500.0
+        rows = [n for n in self._large_trades
+                if n['is_block_trade'] or n['notional_usd'] >= thr]
+        rows.sort(key=lambda n: n['ts'], reverse=True)
+        self.large_trades_list.clear()
+        multi = len({n.get('ticker') for n in rows}) > 1
+        for n in rows[:self._LT_MAX_ROWS]:
+            when = (datetime.fromtimestamp(n['ts']).strftime('%m-%d %H:%M')
+                    if n['ts'] else '—')
+            side = (n['taker_side'] or '?').upper()
+            price = n['no_price'] if side == 'NO' else n['yes_price']
+            pc = f"{int(round((price or 0) * 100))}¢"
+            # Distinguish outcomes when several markets stream (e.g. both sides
+            # of a match): Kalshi via the ticker's trailing candidate code, PM
+            # via the outcome name (its token id is 77 meaningless digits).
+            tag = (n.get('outcome') or (n.get('ticker') or '').rsplit('-', 1)[-1])[:3]
+            head = f"{tag:<3} " if multi else ""
+            # One-line row: k-abbreviated size/notional; the taker side is NOT
+            # spelled out — the row colour carries it (green YES / red NO).
+            txt = (f"{head}{when} {self._fmt_k(n['contracts']):>5}@{pc:<3}"
+                   f" {'$' + self._fmt_k(n['notional_usd']):>6}")
+            if n['is_block_trade']:
+                txt += " ◼"
+            item = QListWidgetItem(txt)
+            item.setData(Qt.ItemDataRole.UserRole, n.get('trade_id'))
+            if n['is_block_trade']:
+                item.setForeground(QColor(255, 191, 64))
+            elif side == 'NO':
+                item.setForeground(QColor(214, 92, 92))
+            else:
+                item.setForeground(QColor(94, 201, 124))
+            item.setToolTip(
+                f"{n.get('ticker')}\n{n.get('created_time') or when}\n"
+                f"taker {side}: {n['contracts']:,.2f} contracts\n"
+                f"yes={n['yes_price']} no={n['no_price']}\n"
+                f"notional ${n['notional_usd']:,.2f}"
+                + (f"\ntrader: {n['trader']}" if n.get('trader') else "")
+                + ("\nOFF-BOOK BLOCK TRADE" if n['is_block_trade'] else ""))
+            self.large_trades_list.addItem(item)
+        self._update_whale_dots()
+
+    def _ensure_whale_scatter(self):
+        """Create the whale-dot ScatterPlotItem if needed and (re)add it to the
+        scene — same lifecycle as _ensure_heat_img: plot_widget.clear() drops it,
+        so every clear() path must re-add. ignoreBounds keeps prints outside the
+        view from stretching auto-range; pxMode keeps dot sizes zoom-invariant."""
+        if getattr(self, '_whale_scatter', None) is None:
+            self._whale_scatter = pg.ScatterPlotItem(
+                pxMode=True, hoverable=True,
+                pen=pg.mkPen(10, 14, 18, 220),
+                tip=lambda x, y, data: data)
+            # Above candles/lines (0) and the start/post markers (54/55), below
+            # the crosshair (200) so tracking still reads over the dots.
+            self._whale_scatter.setZValue(60)
+        self._whale_scatter.setVisible(
+            getattr(self, 'show_whale_dots', True) and getattr(self, 'live_mode', False))
+        # Re-add only when clear() actually dropped it — a second addItem on a
+        # present item makes pyqtgraph warn 'Item already added to PlotItem'.
+        if self._whale_scatter not in self.plot_widget.getPlotItem().items:
+            self.plot_widget.addItem(self._whale_scatter, ignoreBounds=True)
+
+    def _on_whales_toggled(self, state):
+        self.show_whale_dots = bool(state)
+        self._update_whale_dots()
+
+    def _update_whale_dots(self):
+        """Sync the chart's whale dots with the LARGE TRADES tape: one dot per
+        rendered print at (execution time, charted price), radius ~ sqrt(notional),
+        tape colours (YES green / NO red / block amber). Dots plot the YES price
+        flipped for complemented series (NO focus / k_complement) so they land on
+        the line actually drawn; tickers not charted get no dot."""
+        if getattr(self, '_whale_scatter', None) is None:
+            return
+        show = (self.show_whale_dots and getattr(self, 'live_mode', False)
+                and bool(self._large_trades))
+        if show:
+            thr = self.large_trade_min_combo.currentData() or 500.0
+            # Both venues: normalized trades carry the charted series key as
+            # 'ticker' (Kalshi market ticker / PM CLOB token id).
+            series_by_key = {s['key']: s for s in self.live_series}
+            rows = [n for n in self._large_trades
+                    if (n['is_block_trade'] or n['notional_usd'] >= thr)
+                    and n['ts'] and n['yes_price'] is not None
+                    and n.get('ticker') in series_by_key]
+        else:
+            rows = []
+        if not rows:
+            self._whale_scatter.setData([])
+            self._whale_scatter.setVisible(False)
+            return
+        # Whale-dense markets (PM futures can hold thousands of $500+ prints)
+        # would smear into noise and slow the scatter — keep the biggest few
+        # hundred; the tape's $ selector is the user's finer decluttering tool.
+        if len(rows) > 400:
+            rows = sorted(rows, key=lambda n: n['notional_usd'],
+                          reverse=True)[:400]
+        nmax = max(n['notional_usd'] for n in rows) or 1.0
+        # Directional markers: ▲ green = YES taker, ▼ red = NO taker, ◆ amber =
+        # off-book block. Translucent fill + brighter same-hue edge reads crisper
+        # over candles than the old outlined circles.
+        style = {
+            'yes':   ('t1', pg.mkBrush(94, 201, 124, 150), pg.mkPen(150, 255, 190, 200)),
+            'no':    ('t',  pg.mkBrush(214, 92, 92, 150),  pg.mkPen(255, 150, 150, 200)),
+            'block': ('d',  pg.mkBrush(255, 191, 64, 165), pg.mkPen(255, 224, 130, 220)),
+        }
+        sel = self._whale_selected_tid
+        pulse_up = self._whale_pulse_n % 2 == 1
+        spots = []
+        for n in rows:
+            s = series_by_key[n['ticker']]
+            cents = n['yes_price'] * 100.0
+            if s.get('k_complement') or s.get('no'):
+                cents = 100.0 - cents
+            y = self._cents_to_pct(cents)
+            if y is None:
+                continue
+            side = (n['taker_side'] or '?').upper()
+            kind = ('block' if n['is_block_trade']
+                    else 'no' if side == 'NO' else 'yes')
+            sym, brush, pen = style[kind]
+            size = 6.0 + 12.0 * (n['notional_usd'] / nmax) ** 0.5
+            if sel is not None and n.get('trade_id') == sel:
+                # Illuminated: white ring + solid fill, enlarged, with a brief
+                # pulse right after the tape click (_whale_pulse_tick).
+                r, g, b, _ = brush.color().getRgb()
+                brush = pg.mkBrush(r, g, b, 255)
+                pen = pg.mkPen(255, 255, 255, 240, width=2)
+                size *= 1.75 if pulse_up else 1.4
+            spots.append({
+                'pos': (n['ts'], y), 'symbol': sym, 'size': size,
+                'brush': brush, 'pen': pen,
+                'data': (f"{n.get('ticker')}\n{n.get('created_time') or ''}\n"
+                         f"taker {side}: {n['contracts']:,.0f} @ "
+                         f"{int(round(cents))}¢  ${n['notional_usd']:,.0f}"
+                         + (f"\ntrader: {n['trader']}" if n.get('trader') else "")
+                         + ("\nOFF-BOOK BLOCK TRADE" if n['is_block_trade'] else "")),
+            })
+        self._whale_scatter.setData(spots)
+        self._whale_scatter.setVisible(True)
+
+    def _on_large_trade_clicked(self, item):
+        """Tape row click → illuminate that print's chart marker: white ring,
+        solid fill, enlarged, plus a short attention pulse."""
+        self._whale_selected_tid = item.data(Qt.ItemDataRole.UserRole)
+        self._whale_pulse_n = 6
+        if not hasattr(self, '_whale_pulse_timer'):
+            self._whale_pulse_timer = QTimer(self)
+            self._whale_pulse_timer.setInterval(130)
+            self._whale_pulse_timer.timeout.connect(self._whale_pulse_tick)
+        self._whale_pulse_timer.start()
+        self._update_whale_dots()
+
+    def _whale_pulse_tick(self):
+        self._whale_pulse_n -= 1
+        if self._whale_pulse_n <= 0:
+            self._whale_pulse_n = 0
+            self._whale_pulse_timer.stop()
+        self._update_whale_dots()
+
+    @staticmethod
+    def _fmt_k(v):
+        """Compact quantity: 850 → '850', 23037 → '23k', 1.4M → '1.4m'."""
+        v = float(v)
+        if v >= 1e6:
+            return f"{v / 1e6:.1f}m"
+        if v >= 10000:
+            return f"{v / 1e3:.0f}k"
+        if v >= 1000:
+            return f"{v / 1e3:.1f}k"
+        return f"{v:,.0f}"
+
     def _rebuild_futures_field(self):
         """(Re)build the FIELD list — every candidate of the active futures market,
         ranked by price, click-to-focus. Charted candidates get their line colour; the
@@ -4220,6 +4596,9 @@ class HistoricalOddsWidget(QWidget):
         # Re-seed the (new) series' history so the overlay line/candles span the
         # market life, not just live ticks (runs in both line and candle mode).
         asyncio.ensure_future(self._apply_live_history_seed())
+        # Seed the LARGE TRADES tape for the (new) series over the same market
+        # life (Kalshi + Polymarket); live trade frames append from here on.
+        asyncio.ensure_future(self._refresh_large_trades())
 
     def _unsubscribe_from_current_market(self):
         """Unsubscribe every active series' key from its venue feed."""
@@ -4270,6 +4649,11 @@ class HistoricalOddsWidget(QWidget):
                 self._on_live_book_gap(tkr)
             if tkr in self._active_kalshi_keys():
                 self._live_dirty = True
+                # Whale tape: trade frames are rare next to orderbook deltas, and
+                # the substring gate keeps the hot delta path free of any Python
+                # JSON parse — only actual trades pay the orjson.loads.
+                if '"type":"trade"' in raw[:64]:
+                    self._note_live_trade(orjson.loads(raw).get('msg') or {})
         except Exception as e:
             print(f"Error processing Kalshi raw frame: {e}")
 
@@ -4298,6 +4682,7 @@ class HistoricalOddsWidget(QWidget):
                 return
             self.live_book.apply(msg)
             self._live_dirty = True
+            self._note_live_trade(inner)
         except Exception as e:
             print(f"Error processing live trade: {e}")
 
@@ -4420,6 +4805,15 @@ class HistoricalOddsWidget(QWidget):
             hit = bool(touched and (set(touched) & active))
             if hit:
                 self._live_dirty = True
+            # Whale tape: last_trade_price frames are rare next to book/price
+            # deltas — the substring gate keeps the hot path parse-free. The
+            # frame may be an event array, so scan the whole string and let
+            # _note_pm_live_trade filter by active token.
+            if '"event_type":"last_trade_price"' in raw:
+                msg = orjson.loads(raw)
+                for e in (msg if isinstance(msg, list) else [msg]):
+                    if isinstance(e, dict) and e.get('event_type') == 'last_trade_price':
+                        self._note_pm_live_trade(e)
             if self._pm_debug:
                 # Bisect a paused PM book: are frames arriving, do their asset_ids
                 # match the active series keys, and does the native book hold depth?
@@ -4464,6 +4858,7 @@ class HistoricalOddsWidget(QWidget):
             self.pm_live_book.apply(ev)
             if ev.get('asset_id') in self._active_pm_keys():
                 self._live_dirty = True
+                self._note_pm_live_trade(ev)
         except Exception as e:
             print(f"Error processing Polymarket trade: {e}")
 
@@ -4964,7 +5359,7 @@ class HistoricalOddsWidget(QWidget):
         if label is None:
             return
         def c(v):
-            return f"{v}¢" if v is not None else "—"
+            return f"{_fmt_cents(v)}¢" if v is not None else "—"
         bid, ask, last = state.get('best_bid'), state.get('best_ask'), state.get('last_trade')
         spread = (ask - bid) if (bid is not None and ask is not None) else None
         stale = " <span style='color:#d08770'>·resync</span>" if state.get('stale') else ""
@@ -5107,12 +5502,18 @@ class HistoricalOddsWidget(QWidget):
 
         def _track(s):
             """Current price (cents) for a series, updating its running open/min/max.
-            Returns None when the series has no usable price yet."""
+            Falls back to the newest seeded tick before the live book state is up,
+            so the corner box populates the moment history arrives instead of
+            waiting for the first WS delta. Returns None with no usable price."""
             st = self._series_state(s)
-            if not st:
-                return None
-            mid = st.get('mid')
-            cents = mid if mid is not None else st.get('last_trade')
+            cents = None
+            if st:
+                mid = st.get('mid')
+                cents = mid if mid is not None else st.get('last_trade')
+            if cents is None:
+                ticks = s.get('ticks') or []
+                if ticks:
+                    cents = ticks[-1].get('price')
             if cents is None or not (0.0 < cents < 100.0):
                 return None
             cents = float(cents)
@@ -5123,25 +5524,82 @@ class HistoricalOddsWidget(QWidget):
                 s['_lbl_max'] = max(s['_lbl_max'], cents)
             return cents
 
-        def _move_html(s, cents, lead):
-            """Corner-box HTML: a bold coloured lead line + open→cur move/range/time."""
-            r, g, b = s['hue']
-            open_v = s['_lbl_open']
-            delta = cents - open_v
-            rng = s['_lbl_max'] - s['_lbl_min']
-            if delta > 0:
-                arrow, dcolor = '▲', (80, 200, 120)
-            elif delta < 0:
-                arrow, dcolor = '▼', (220, 90, 90)
+        def _life_range(s):
+            """Market-life trading band (p05–p95 of the tick-price distribution)
+            for the gauge anchors. Raw min/max let a few minutes of thin
+            post-open trading own the anchors for the market's entire life,
+            pinning the marker mid-gauge forever; clipping to the 5th–95th
+            percentile of TIME spent at each price (seed ticks are uniform in
+            time, so tick-count ≈ time-weight) keeps the band where the market
+            has actually traded. Incremental 0.1¢-bin histogram over the full
+            history (seed + live): O(new ticks) upkeep per call, O(bins) query;
+            a reseed swaps the tick-list head, which busts the cache."""
+            ticks = s.get('ticks') or []
+            if not ticks:
+                return None
+            head_t = ticks[0]['t']
+            cached = s.get('_life_hist')
+            if cached and cached[0] == head_t and len(ticks) >= cached[1]:
+                hist, new = cached[2], ticks[cached[1]:]
             else:
-                arrow, dcolor = '■', (170, 170, 170)
-            dhex = '#%02x%02x%02x' % dcolor
+                hist, new = [0] * 1001, ticks
+            for tk in new:
+                p = tk.get('price')
+                if p is not None and 0 < p < 100:
+                    hist[int(p * 10 + 0.5)] += 1
+            s['_life_hist'] = (head_t, len(ticks), hist)
+            total = sum(hist)
+            if not total:
+                return None
+            lo_n, hi_n = total * 0.05, total * 0.95
+            acc, lo, hi = 0, None, None
+            for i, c in enumerate(hist):
+                if not c:
+                    continue
+                if lo is None and acc + c > lo_n:
+                    lo = i / 10.0
+                acc += c
+                if acc >= hi_n:
+                    hi = i / 10.0
+                    break
+            if lo is None:
+                return None
+            return lo, (hi if hi is not None else lo)
+
+        def _move_html(s, cents, lead):
+            """Corner-box HTML (condensed 'B2a' layout): a 9pt venue-priced lead
+            with the since-viewing ▲Δ, over a 7pt market-life range gauge —
+            `lo ▁▁▌▁▁ hi` shows WHERE price sits within everything this market
+            has traded (anchored to the seeded history, so it matches the chart
+            and is stable across reopens) — and a dimmed clock."""
+            r, g, b = s['hue']
+            delta = cents - s['_lbl_open']
+            # Delta renders only once there IS a move (>= 0.05 so it can't show
+            # as 0.0) — the old grey '■0.0' placeholder was dead ink.
+            if round(abs(delta), 1) >= 0.1:
+                arrow, dhex = (('▲', '#50c878') if delta > 0
+                               else ('▼', '#dc5a5a'))
+                dspan = (f"&nbsp;&nbsp;<span style='color:{dhex}'>"
+                         f"{arrow}{abs(delta):.1f}</span>")
+            else:
+                dspan = ""
+            lr = _life_range(s)
+            if lr:
+                lo, hi = min(lr[0], cents), max(lr[1], cents)
+                frac = 0.5 if hi <= lo else (cents - lo) / (hi - lo)
+                idx = min(5, max(0, int(frac * 6)))
+                cell = '&#9601;'
+                # &nbsp; between the anchors and the track: with the marker at
+                # either extreme it otherwise touches the lo/hi numerals.
+                gauge = (f"{lo:.1f}&nbsp;<span style='color:#4a525c'>{cell * idx}</span>"
+                         f"<span style='color:#{r:02x}{g:02x}{b:02x}'>&#9612;</span>"
+                         f"<span style='color:#4a525c'>{cell * (5 - idx)}</span>&nbsp;{hi:.1f}")
+            else:
+                gauge = "&#8212;"
             return (
-                f"<div style='font-size:11pt'>{lead}</div>"
-                f"<div style='font-size:9pt;color:#c8c8c8'>{open_v:.1f}%&#8594;{cents:.1f}% "
-                f"<span style='color:{dhex}'>{arrow}{abs(delta):.1f}</span> "
-                f"<span style='color:#8a93a0'>· rng {rng:.1f}%</span></div>"
-                f"<div style='font-size:7pt;color:#7e8794'>updated {updated}</div>")
+                f"<div style='font-size:9pt'>{lead}{dspan}</div>"
+                f"<div style='font-size:7pt;color:#aab2bc'>{gauge}"
+                f"&nbsp;&nbsp;<span style='color:#6b7480'>{updated}</span></div>")
 
         # Futures: too many candidates for the favourite/underdog split — just show the
         # top-2 by current price, one per corner (named, line-coloured).
@@ -5155,7 +5613,7 @@ class HistoricalOddsWidget(QWidget):
                     continue
                 s, cents = scored[idx]
                 r, g, b = s['hue']
-                mark = self._venue_marker(s.get('venue'), s['hue'])
+                mark = self._venue_marker(s.get('venue'), s['hue'], size=11)
                 lead = (f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
                         f"font-weight:bold'>{s['outcome']} {cents:.1f}%</span>")
                 self._set_summary_label(band, _move_html(s, cents, lead))
@@ -5179,10 +5637,10 @@ class HistoricalOddsWidget(QWidget):
             spans = []
             for s, cents in items:
                 r, g, b = s['hue']
-                mark = self._venue_marker(s.get('venue'), s['hue'])
+                mark = self._venue_marker(s.get('venue'), s['hue'], size=11)
                 spans.append(f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
                              f"font-weight:bold'>{cents:.1f}%</span>")
-            big = "&nbsp;&nbsp;&nbsp;&nbsp;".join(spans)
+            big = "&nbsp;&nbsp;".join(spans)
             # Move/range line tracks the band's first series.
             s0, c0 = items[0]
             self._set_summary_label(band, _move_html(s0, c0, big))
@@ -8012,6 +8470,10 @@ class HistoricalOddsWidget(QWidget):
         self._ensure_market_post_line()
         self._ensure_start_line()
         self._refresh_live_items()
+        # Populate the corner boxes NOW from the seeded history (_track falls
+        # back to the newest tick). Waiting for the next flush left them hidden
+        # until the first WS delta — a long time on a quiet pregame market.
+        self._update_live_summaries(datetime.now().timestamp())
 
     def _seed_window(self, end):
         """(start_epoch, kalshi_period_interval, pm_fidelity_min) for seeding the
@@ -8222,6 +8684,10 @@ class HistoricalOddsWidget(QWidget):
         self._heat_last_sample_t = 0.0
         if self._heat_img is not None:
             self._heat_img.setVisible(False)
+        # Whale dots are live-only chrome — drop them with the overlay.
+        if getattr(self, '_whale_scatter', None) is not None:
+            self._whale_scatter.setData([])
+            self._whale_scatter.setVisible(False)
 
     async def update_plot(self, snapshots):
         """Enhanced plotting with point change visualization"""
@@ -8288,6 +8754,9 @@ class HistoricalOddsWidget(QWidget):
         if getattr(self, 'live_mode', False):
             self._rebuild_live_items()
             self._refresh_live_items()
+            # update_plot hid the corner boxes up top; re-show them immediately
+            # instead of leaving them dark until the next WS delta flush.
+            self._update_live_summaries(datetime.now().timestamp())
 
         # Crosshair lines + the event-start marker are scene items, so clear()
         # removed them — re-add.
@@ -8295,6 +8764,7 @@ class HistoricalOddsWidget(QWidget):
         self._ensure_start_line()
         self._ensure_market_post_line()
         self._ensure_heat_img()
+        self._ensure_whale_scatter()
 
     @staticmethod
     def _color_for_bookmaker(bookmaker, idx):
@@ -8395,6 +8865,7 @@ class HistoricalOddsWidget(QWidget):
         self._ensure_start_line()
         self._ensure_market_post_line()
         self._ensure_heat_img()
+        self._ensure_whale_scatter()
 
     def _rebuild_live_items(self):
         """(Re)create the persistent overlay items for every active live series and

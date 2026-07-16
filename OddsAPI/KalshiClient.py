@@ -259,12 +259,15 @@ class KalshiClient:
                                     data=body, base_url=self.TRADE_BASE_URL)
 
     def get_orders(self, ticker: str = None, status: str = "resting") -> Dict:
+        """List orders via GET /portfolio/orders on TRADE_BASE_URL. NOTE: listing
+        lives at /portfolio/orders — only order CREATION uses /portfolio/events/orders
+        (GET there 404s). status='resting' = open/working orders."""
         params = {}
         if ticker:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        return self._signed_request("GET", "/portfolio/events/orders",
+        return self._signed_request("GET", "/portfolio/orders",
                                     params=params, base_url=self.TRADE_BASE_URL)
 
     def cancel_order(self, order_id: str) -> Dict:
@@ -552,6 +555,246 @@ class KalshiClient:
 
         endpoint = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
         return self._make_request("GET", endpoint, params=params)
+
+    def get_markets_candlesticks_batch(
+        self,
+        tickers: List[str],
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 60,
+    ) -> Dict[str, List[Dict]]:
+        """Batch candlestick fetch (GET /markets/candlesticks) — up to 100 market
+        tickers per request, no series scope. Returns {market_ticker: [candles]}.
+
+        Used to derive accurate USD-notional volume for the heat map: each candle
+        carries volume_fp (contracts that period) AND price.mean_dollars (the mean
+        traded price that period), so SUM(volume_fp * mean_dollars) is a genuine
+        price-weighted dollar figure — not lifetime-contracts * current-price.
+
+        Chunks the ticker list to stay under the 100-ticker cap; with hourly candles
+        over ~24h each chunk is well under the 10,000-candle response cap. Tickers
+        whose chunk fails are simply absent from the returned map (caller falls back).
+        """
+        out: Dict[str, List[Dict]] = {}
+        # Keep each chunk under both the 100-ticker cap and the 10k-candle cap.
+        spans = max(1, int((int(end_ts) - int(start_ts)) // (period_interval * 60)) + 1)
+        chunk_size = max(1, min(100, 9000 // max(1, spans)))
+        for i in range(0, len(tickers), chunk_size):
+            chunk = [t for t in tickers[i:i + chunk_size] if t]
+            if not chunk:
+                continue
+            try:
+                resp = self._make_request("GET", "/markets/candlesticks", params={
+                    "market_tickers": ",".join(chunk),
+                    "start_ts": int(start_ts),
+                    "end_ts": int(end_ts),
+                    "period_interval": period_interval,
+                })
+            except Exception as e:
+                print(f"[candles-batch] chunk of {len(chunk)} failed: {e}")
+                continue
+            # Response shape varies by API version — accept the documented
+            # per-market list under a few plausible keys, keyed by market_ticker.
+            rows = (resp.get("market_candlesticks")
+                    or resp.get("candlesticks")
+                    or resp.get("markets") or [])
+            if isinstance(rows, dict):
+                rows = rows.values()
+            for row in rows:
+                tk = row.get("market_ticker") or row.get("ticker")
+                if tk:
+                    out[tk] = row.get("candlesticks", []) or []
+        return out
+
+    @staticmethod
+    def candle_dollar_volume(candles: List[Dict]) -> float:
+        """USD notional traded across candles = SUM(volume_fp * mean_price).
+
+        volume_fp is fixed-point contract count (may arrive as a string); mean is
+        the period's mean traded YES price — preferred in dollars (mean_dollars),
+        falling back to a cents field (mean) which is scaled to dollars. Buckets
+        with no trades (null price) contribute nothing."""
+        total = 0.0
+        for cd in candles or []:
+            vol = cd.get("volume_fp", cd.get("volume"))
+            price = cd.get("price") or {}
+            mean = price.get("mean_dollars")
+            if mean is None:
+                mean = price.get("mean")
+                # Legacy cents field: prices >1 are cents, scale to dollars.
+                if mean is not None and float(mean) > 1:
+                    mean = float(mean) / 100.0
+            try:
+                total += float(vol) * float(mean)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    # ------------------------------------------------------------------
+    # TRADE HISTORY / LARGE-TRADE DETECTION
+    # ------------------------------------------------------------------
+    def get_trades(
+        self,
+        ticker: Optional[str] = None,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        limit: int = 1000,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Single page of GET /markets/trades (public, newest-first).
+
+        Returns {'trades': [...], 'cursor': str} — empty cursor means last page.
+        Each trade: trade_id, ticker, count_fp (string, 2dp contracts),
+        yes_price_dollars / no_price_dollars (strings), taker_side ('yes'/'no'),
+        created_time (ISO 8601), is_block_trade.
+        """
+        params: Dict[str, Any] = {"limit": max(1, min(1000, limit))}
+        if ticker:
+            params["ticker"] = ticker
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        if cursor:
+            params["cursor"] = cursor
+        return self._make_request("GET", "/markets/trades", params=params)
+
+    def get_all_trades(
+        self,
+        ticker: str,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        max_trades: int = 20000,
+    ) -> List[Dict[str, Any]]:
+        """Full trade history for one market, following the cursor until exhausted
+        (or max_trades, a guard against ultra-liquid markets). Newest-first, as
+        served. With no min_ts this is every trade since the market posted."""
+        out: List[Dict[str, Any]] = []
+        cursor = None
+        while len(out) < max_trades:
+            page = self.get_trades(ticker=ticker, min_ts=min_ts, max_ts=max_ts,
+                                   limit=1000, cursor=cursor)
+            trades = page.get("trades") or []
+            out.extend(trades)
+            cursor = page.get("cursor") or ""
+            if not cursor or not trades:
+                break
+        return out[:max_trades]
+
+    @staticmethod
+    def normalize_trade(t: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten a raw trade into floats. notional_usd is the taker's cost
+        (contracts * taker-side price); tolerates legacy integer count /
+        cents-price fields alongside the current *_fp / *_dollars strings."""
+        try:
+            contracts = float(t.get("count_fp", t.get("count", 0)) or 0)
+        except (TypeError, ValueError):
+            contracts = 0.0
+
+        def _price(dollars_key: str, cents_key: str) -> Optional[float]:
+            v = t.get(dollars_key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+            v = t.get(cents_key)
+            try:
+                return float(v) / 100.0 if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        yes_price = _price("yes_price_dollars", "yes_price")
+        no_price = _price("no_price_dollars", "no_price")
+        taker_side = t.get("taker_side") or t.get("taker_outcome_side") or ""
+        side_price = no_price if taker_side == "no" else yes_price
+        created = t.get("created_time") or ""
+        try:
+            ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            # WS `trade` messages carry an epoch `ts` instead of created_time.
+            try:
+                ts = float(t.get("ts") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+        return {
+            "trade_id": t.get("trade_id"),
+            "ticker": t.get("ticker") or t.get("market_ticker"),
+            "ts": ts,
+            "created_time": created,
+            "contracts": contracts,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "taker_side": taker_side,
+            "notional_usd": contracts * (side_price or 0.0),
+            "is_block_trade": bool(t.get("is_block_trade")),
+        }
+
+    def find_large_trades(
+        self,
+        event_ticker: Optional[str] = None,
+        market_tickers: Optional[List[str]] = None,
+        min_notional_usd: float = 500.0,
+        min_contracts: Optional[float] = None,
+        top_n: Optional[int] = None,
+        since_ts: Optional[int] = None,
+        max_trades_per_market: int = 20000,
+        workers: int = 4,
+    ) -> Dict[str, Any]:
+        """Scan an event's trade history for large trades.
+
+        Pass either event_ticker (markets resolved via GET /events/<t>) or an
+        explicit market_tickers list. A trade is 'large' if its taker notional
+        >= min_notional_usd (or contracts >= min_contracts when given); block
+        trades are always included. top_n additionally caps each market's list
+        to its N largest by notional. With since_ts=None history runs back to
+        the market's posting.
+
+        Returns:
+            {'event_ticker': ..., 'markets': {ticker: {
+                'large_trades': [normalized, sorted notional desc],
+                'trades_scanned': int, 'total_notional_usd': float,
+                'largest_notional_usd': float}}}
+        """
+        tickers = list(market_tickers or [])
+        if not tickers and event_ticker:
+            ev = self.get_event(event_ticker, with_nested_markets=True)
+            markets = (ev.get("event") or {}).get("markets") or ev.get("markets") or []
+            tickers = [m.get("ticker") for m in markets if m.get("ticker")]
+        if not tickers:
+            raise ValueError("find_large_trades needs event_ticker or market_tickers")
+
+        def scan(tk: str) -> Dict[str, Any]:
+            raw = self.get_all_trades(tk, min_ts=since_ts,
+                                      max_trades=max_trades_per_market)
+            norm = [self.normalize_trade(t) for t in raw]
+            large = [n for n in norm
+                     if n["is_block_trade"]
+                     or (min_contracts is not None and n["contracts"] >= min_contracts)
+                     or n["notional_usd"] >= min_notional_usd]
+            large.sort(key=lambda n: n["notional_usd"], reverse=True)
+            if top_n is not None:
+                large = large[:top_n]
+            return {
+                "large_trades": large,
+                "trades_scanned": len(norm),
+                "total_notional_usd": sum(n["notional_usd"] for n in norm),
+                "largest_notional_usd": max((n["notional_usd"] for n in norm), default=0.0),
+            }
+
+        results: Dict[str, Any] = {}
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(workers, len(tickers)))) as pool:
+            futs = {pool.submit(scan, tk): tk for tk in tickers}
+            for fut in cf.as_completed(futs):
+                tk = futs[fut]
+                try:
+                    results[tk] = fut.result()
+                except Exception as e:
+                    print(f"[large-trades] {tk}: {e}")
+                    results[tk] = {"large_trades": [], "trades_scanned": 0,
+                                   "total_notional_usd": 0.0,
+                                   "largest_notional_usd": 0.0, "error": str(e)}
+        return {"event_ticker": event_ticker, "markets": results}
 
     def print_events_summary(self, events_data: Dict[str, Any], max_events: int = 10):
         """

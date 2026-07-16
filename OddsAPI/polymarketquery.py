@@ -1136,6 +1136,155 @@ class PolymarketSportsClient:
             print(f"      ⚠️  Error fetching trades: {e}")
             return [], []
 
+    # ------------------------------------------------------------------
+    # TRADE HISTORY / LARGE-TRADE DETECTION (mirrors KalshiClient's layer)
+    #
+    # data-api /trades only honors the `market` (conditionId) filter — the
+    # asset/asset_id params are silently IGNORED and return global trades —
+    # so scans go token -> conditionId (resolve_market_by_token) -> /trades.
+    # filterType=CASH&filterAmount pushes the notional threshold server-side.
+    # ------------------------------------------------------------------
+    def resolve_market_by_token(self, token_id: str) -> Optional[Dict]:
+        """gamma /markets?clob_token_ids= lookup for one CLOB token. Returns
+        {'condition_id', 'token_ids', 'question', 'outcomes'} (cached — both
+        tokens of the pair map to the same entry) or None."""
+        cache = getattr(self, '_token_market_cache', None)
+        if cache is None:
+            cache = self._token_market_cache = {}
+        if token_id in cache:
+            return cache[token_id]
+        try:
+            r = self.session.get(f"{self.GAMMA_API}/markets",
+                                 params={"clob_token_ids": token_id}, timeout=15)
+            r.raise_for_status()
+            rows = r.json() or []
+            if not rows:
+                cache[token_id] = None
+                return None
+            m = rows[0]
+            toks = m.get('clobTokenIds')
+            if isinstance(toks, str):
+                toks = json.loads(toks)
+            outs = m.get('outcomes')
+            if isinstance(outs, str):
+                outs = json.loads(outs)
+            info = {'condition_id': m.get('conditionId'),
+                    'token_ids': list(toks or []),
+                    'outcomes': list(outs or []),
+                    'question': m.get('question', '')}
+            for t in info['token_ids']:
+                cache[t] = info
+            return info
+        except Exception as e:
+            print(f"[pm-trades] resolve {str(token_id)[:12]}…: {e}")
+            return None
+
+    def get_market_trades(self, condition_id: str,
+                          min_notional_usd: Optional[float] = None,
+                          since_ts: Optional[float] = None,
+                          max_trades: int = 20000) -> List[Dict]:
+        """Full public trade history for one market (data-api /trades, newest-
+        first, offset-paginated 500/page). min_notional_usd is applied SERVER-
+        side via filterType=CASH, so a large-trade scan rarely needs a second
+        page. Rows carry side/price/size/timestamp/outcome/asset + the trader's
+        name/pseudonym."""
+        out: List[Dict] = []
+        offset = 0
+        while len(out) < max_trades:
+            params: Dict = {"market": condition_id, "limit": 500,
+                            "offset": offset, "takerOnly": "true"}
+            if min_notional_usd:
+                params["filterType"] = "CASH"
+                params["filterAmount"] = int(min_notional_usd)
+            try:
+                r = self.session.get(f"{self.DATA_API}/trades",
+                                     params=params, timeout=15)
+                if r.status_code == 429:
+                    time.sleep(0.5)
+                    continue
+                if r.status_code == 400:
+                    break  # data-api hard-caps offset (~3500) — end of feed
+                r.raise_for_status()
+                rows = r.json() or []
+            except Exception as e:
+                print(f"[pm-trades] {condition_id[:12]}… page@{offset}: {e}")
+                break
+            out.extend(rows)
+            # Newest-first: once the page tail predates since_ts we have it all.
+            if since_ts and rows and float(rows[-1].get('timestamp') or 0) < since_ts:
+                break
+            if len(rows) < 500:
+                break
+            offset += len(rows)
+        if since_ts:
+            out = [t for t in out if float(t.get('timestamp') or 0) >= since_ts]
+        return out[:max_trades]
+
+    @staticmethod
+    def normalize_trade(t: Dict) -> Dict:
+        """Flatten a data-api trade row into the same shape KalshiClient.
+        normalize_trade produces, so the widget's tape/dots consume both venues
+        identically. Price semantics: yes_price == no_price == the traded
+        token's fill price (what printed on the charted line); taker_side maps
+        BUY -> 'yes' (▲) / SELL -> 'no' (▼); notional is the actual cash."""
+        try:
+            price = float(t.get('price') or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            size = float(t.get('size') or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        try:
+            ts = float(t.get('timestamp') or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts > 1e12:   # ms epoch guard
+            ts /= 1000.0
+        side = str(t.get('side') or '').upper()
+        tx = t.get('transactionHash') or ''
+        asset = str(t.get('asset') or '')
+        created = (datetime.fromtimestamp(ts, timezone.utc)
+                   .strftime('%Y-%m-%dT%H:%M:%SZ') if ts else '')
+        return {
+            # tx hash alone isn't unique (one tx can carry several fills)
+            "trade_id": f"pm:{tx}:{asset[-10:]}:{ts}:{size}",
+            "ticker": asset,
+            "ts": ts,
+            "created_time": created,
+            "contracts": size,
+            "yes_price": price,
+            "no_price": price,
+            "taker_side": 'yes' if side == 'BUY' else 'no',
+            "notional_usd": size * price,
+            "is_block_trade": False,
+            "trader": t.get('name') or t.get('pseudonym') or '',
+            "outcome": t.get('outcome') or '',
+        }
+
+    def find_large_trades(self, token_ids: Iterable[str],
+                          min_notional_usd: float = 500.0,
+                          since_ts: Optional[float] = None) -> List[Dict]:
+        """Scan the markets behind the given CLOB tokens for large prints and
+        return normalized trades ON THOSE TOKENS (sibling-outcome trades are
+        not remapped — chart the sibling to see its flow), sorted by notional
+        desc. Sync — callers run it on an executor."""
+        wanted = {str(k) for k in token_ids if k}
+        conds: Dict[str, bool] = {}
+        for k in wanted:
+            info = self.resolve_market_by_token(k)
+            if info and info.get('condition_id'):
+                conds[info['condition_id']] = True
+        out: List[Dict] = []
+        for cid in conds:
+            for row in self.get_market_trades(cid, min_notional_usd=min_notional_usd,
+                                              since_ts=since_ts):
+                n = self.normalize_trade(row)
+                if n['ticker'] in wanted and n['notional_usd'] >= min_notional_usd:
+                    out.append(n)
+        out.sort(key=lambda n: n['notional_usd'], reverse=True)
+        return out
+
 
 # ============================================================================
 # Polymarket live WebSocket feed (sub-second market channel)
