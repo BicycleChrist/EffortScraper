@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSlider, QLabel, QComboBox, QGroupBox, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsItemGroup, QGraphicsLineItem, QGraphicsRectItem, QGridLayout, QListWidget, QDoubleSpinBox, QTabWidget,
-    QSizePolicy
+    QSizePolicy, QProgressBar, QStackedWidget
 )
 # Import QOpenGLWidget from the correct module
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -22,21 +22,94 @@ from OpenGL.GLU import *
 from OpenGL.GLUT import *
 from OpenGL.GLUT.fonts import *
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QSurfaceFormat, QIcon, QLinearGradient, QRadialGradient, QPolygonF
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QSizeF, QPoint, pyqtSignal, QPropertyAnimation, QEasingCurve, QThread, QObject
 import sys
 import random
+import time
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
-from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, get_stadium_wall_height, WindVectorWidget
+from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, get_stadium_wall_height, WindVectorWidget, get_park_for_team
 from player_overlay_widget import PlayerBBEOverlay
 from weatherman import open_weather_key
 from pathlib import Path
 from pywavefront import Wavefront
 import csv
-from test_pitch_simulation import savant_row_to_pitch_trajectory
+from pitch_sim import savant_row_to_pitch_trajectory
 
 LOG_BALL_PHYSICS = False
+
+# ==============================================
+# ML Distance Residual Predictor
+# Loads distance_residual_model.lgb (trained by train_distance_model.py).
+# Adds a learned residual to the physics distance to match Statcast hit_distance_sc.
+# ==============================================
+_ML_MODEL = None
+_ML_MODEL_TRIED = False
+
+def _load_ml_distance_model():
+    global _ML_MODEL, _ML_MODEL_TRIED
+    if _ML_MODEL_TRIED:
+        return _ML_MODEL
+    _ML_MODEL_TRIED = True
+    try:
+        import lightgbm as lgb
+        path = Path(__file__).parent / "distance_residual_model.lgb"
+        if not path.exists():
+            print(f"[ml] distance model not found at {path}")
+            return None
+        _ML_MODEL = lgb.Booster(model_file=str(path))
+        print(f"[ml] loaded distance residual model ({len(_ML_MODEL.feature_name())} features)")
+    except Exception as e:
+        print(f"[ml] failed to load distance model: {e}")
+        _ML_MODEL = None
+    return _ML_MODEL
+
+
+def predict_distance_residual(record: dict, park: str):
+    """Predict the residual (ft) to add to physics distance for a BBE.
+
+    Returns None when the model is unavailable, the park is unknown to the
+    model, or required features are missing.
+    """
+    model = _load_ml_distance_model()
+    if model is None or not park:
+        return None
+    try:
+        import pandas as pd
+        feat_names = model.feature_name()
+        row = {}
+        for name in feat_names:
+            if name == "park":
+                row[name] = park
+            elif name == "pitch_type":
+                row[name] = record.get("pitch_type") or "UNK"
+            elif name == "spray_angle":
+                hc_x = record.get("hc_x")
+                hc_y = record.get("hc_y")
+                if hc_x is None or hc_y is None:
+                    return None
+                hc_x, hc_y = float(hc_x), float(hc_y)
+                if math.isnan(hc_x) or math.isnan(hc_y):
+                    return None
+                dx = hc_x - 125.42
+                dy = 198.27 - hc_y
+                row[name] = math.degrees(math.atan2(dx, dy)) if dy > 0 else 0.0
+            else:
+                v = record.get(name)
+                try:
+                    row[name] = float(v) if v is not None else float("nan")
+                except (TypeError, ValueError):
+                    row[name] = float("nan")
+        df = pd.DataFrame([row], columns=feat_names)
+        for cat_col in ("park", "pitch_type"):
+            if cat_col in df.columns:
+                df[cat_col] = df[cat_col].astype("category")
+        return float(model.predict(df)[0])
+    except Exception as e:
+        print(f"[ml] residual prediction failed: {e}")
+        return None
+
 
 # Foul balls without spray cords are sim'd as 0 deg HLA and therefore end up in CF within BBE events
 # Pitch trail colors by pitch type (matches test_pitch_viewer.py)
@@ -99,7 +172,8 @@ class BallFlightSimulator:
         self.g = 9.81  # m/s^2, gravity
         self.m = 0.145  # kg, baseball mass
         self.d = 0.074  # m, baseball diameter
-        self.C_d = 0.3  # drag coefficient
+        self.C_d = 0.40  # drag coefficient (calibrated 2026 to zero physics bias on 5k BBE sample;
+                         # high end of Nathan's 0.30–0.45 literature range, absorbs missing drag-crisis effect)
         self.C_l = 0.2  # lift coefficient (for Magnus effect)
         self.omega = 1800  # rpm, typical spin rate
 
@@ -110,7 +184,7 @@ class BallFlightSimulator:
 
     def calculate_trajectory(self, exit_velocity, vlaunch_angle, hlaunch_angle, wind_speed, wind_direction,
                              temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0,
-                             pressure_pa=None):
+                             pressure_pa=None, cd_override=None, cl_override=None, omega_override=None):
         """Calculate ball trajectory based on initial conditions and environment
 
         Standard coordinate system:
@@ -182,16 +256,25 @@ class BallFlightSimulator:
 
         t_span = (0, 10)  # 10 seconds covers any realistic ball flight
 
-        solution = solve_ivp(
-            lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho_fn),
-            t_span,
-            initial_state,
-            method='RK45',
-            max_step=0.05,
-            rtol=1e-6,
-            atol=1e-6,
-            first_step=0.01
-        )
+        # Optional aerodynamic-coefficient overrides (used by calibration scripts).
+        # Save & restore so this stays a per-call override, not a side-effect.
+        _saved_cd, _saved_cl, _saved_omega = self.C_d, self.C_l, self.omega
+        if cd_override    is not None: self.C_d   = cd_override
+        if cl_override    is not None: self.C_l   = cl_override
+        if omega_override is not None: self.omega = omega_override
+        try:
+            solution = solve_ivp(
+                lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho_fn),
+                t_span,
+                initial_state,
+                method='RK45',
+                max_step=0.05,
+                rtol=1e-6,
+                atol=1e-6,
+                first_step=0.01
+            )
+        finally:
+            self.C_d, self.C_l, self.omega = _saved_cd, _saved_cl, _saved_omega
 
         # Convert position to imperial units for display
         x = solution.y[0] * 3.28084  # m to ft (distance toward center field)
@@ -734,7 +817,7 @@ class StadiumView(QGraphicsView):
 
                 boundary_item = QGraphicsPathItem(field_boundary)
                 boundary_item.setPen(QPen(QColor(139, 69, 19), 4))
-                boundary_item.setBrush(QBrush())
+                boundary_item.setBrush(QBrush(QColor(34, 90, 34, 180)))
                 self.stadium_layer.addToGroup(boundary_item)
 
         else:
@@ -765,8 +848,23 @@ class StadiumView(QGraphicsView):
                     wall_points[i] = None
 
             if any(p is not None for p in wall_points):
-                field_boundary = QPainterPath()
                 home_plate_point = QPointF(home_plate_x, home_plate_y)
+                valid_seq = [p for p in wall_points if p is not None]
+
+                # Filled outfield polygon (home → walls → home) drawn first
+                fill_path = QPainterPath()
+                fill_path.moveTo(home_plate_point)
+                for p in valid_seq:
+                    fill_path.lineTo(p)
+                fill_path.lineTo(home_plate_point)
+
+                fill_item = QGraphicsPathItem(fill_path)
+                fill_item.setPen(QPen(Qt.PenStyle.NoPen))
+                fill_item.setBrush(QBrush(QColor(34, 90, 34, 180)))
+                self.stadium_layer.addToGroup(fill_item)
+
+                # Outline path preserves gap handling so broken segments don't draw bogus lines
+                field_boundary = QPainterPath()
 
                 in_segment = False
                 first_valid = next((p for p in wall_points if p is not None), None)
@@ -1307,6 +1405,11 @@ class UmpireView3D(QOpenGLWidget):
         # Model loaded in background thread — display list compiled when it arrives
         self.ballpark_model = None
         self._precomputed_meshes = None
+        self._effort_meshes = []
+        self._effort_t0 = time.time()
+        self._effort_timer = QTimer(self)
+        self._effort_timer.timeout.connect(self.update)
+        self._effort_timer.start(33)  # ~30fps repaint to drive logo pulse
         self._model_load_pending = True
         import threading
         threading.Thread(target=self._load_model_bg, daemon=True).start()
@@ -1439,6 +1542,7 @@ class UmpireView3D(QOpenGLWidget):
         import array
         vertices = model.vertices
         result = []
+        effort = []
 
         for mesh in model.mesh_list:
             mesh_name = getattr(mesh, 'name', '') or ''
@@ -1466,9 +1570,15 @@ class UmpireView3D(QOpenGLWidget):
                                 v1[0], v1[1], v1[2],
                                 v2[0], v2[1], v2[2]))
 
-            result.append((mat, gl_data))
+            # Effort logo mesh is rendered separately each frame so it can pulse
+            if "Effort" in mesh_name:
+                effort.append(gl_data)
+            else:
+                result.append((mat, gl_data))
 
-        print(f"[model] pre-computed {sum(len(d)//12 for _,d in result)} triangles on bg thread")
+        self._effort_meshes = effort
+        print(f"[model] pre-computed {sum(len(d)//12 for _,d in result)} triangles "
+              f"({sum(len(d)//12 for d in effort)} Effort) on bg thread")
         return result
 
     def update_ball_tracking(self):
@@ -2039,6 +2149,10 @@ void main() {
         if _use_ppx:
             self._stadium_shader.release()
 
+        # Effort logo: gold neon-sign emissive pulse, redrawn each frame
+        if self._effort_meshes:
+            self._draw_effort_logo()
+
         # Outfield geometry (ground, wall, warning track, foul lines/poles)
         # is compiled into a display list that is rebuilt only when the stadium changes.
         if getattr(self, '_outfield_display_list', None):
@@ -2301,6 +2415,111 @@ void main() {
         glPopMatrix()
         glEndList()
         print(f"[model] display list compiled ({sum(len(d)//12 for _,d in precomputed)} triangles)")
+
+    def _draw_effort_logo(self):
+        """Render the Effort logo mesh as an emissive sign with a sweeping
+        light pulse that traces across the text every few seconds.
+
+        Drawn outside the stadium display list so the sweep can animate.
+        Pass 1: solid emissive core (warm gold, gentle breath pulse).
+        Pass 2: additive sweep — per-vertex brightness driven by a Gaussian
+        window centered on a moving x-position that crosses the bounding box.
+        """
+        # ------------------------------------------------------------------ #
+        # One-time bbox compute along whichever axis has the largest extent.
+        # That axis is the natural "left→right" direction of the text.
+        # ------------------------------------------------------------------ #
+        if not hasattr(self, '_effort_bbox') or self._effort_bbox is None:
+            mins = [float('inf')] * 3
+            maxs = [float('-inf')] * 3
+            for gl_data in self._effort_meshes:
+                n = len(gl_data)
+                for i in range(0, n, 12):
+                    for j in (3, 6, 9):
+                        for a in range(3):
+                            v = gl_data[i + j + a]
+                            if v < mins[a]: mins[a] = v
+                            if v > maxs[a]: maxs[a] = v
+            spans = [maxs[a] - mins[a] for a in range(3)]
+            sweep_axis = max(range(3), key=lambda a: spans[a])
+            self._effort_bbox = (mins, maxs, sweep_axis, spans[sweep_axis])
+
+        mins, maxs, axis, span = self._effort_bbox
+
+        t = time.time() - self._effort_t0
+
+        # Slow breath pulse for the base emission
+        breath = 0.5 + 0.5 * math.sin(t * 1.6)
+        base_r = 1.0
+        base_g = 0.78 + 0.15 * breath
+        base_b = 0.25 + 0.45 * breath
+
+        # Sweep cycle: ~3.5s, sweep travels from one bbox edge past the other
+        SWEEP_PERIOD = 3.5
+        SWEEP_WIDTH  = max(span * 0.18, 0.05)   # gaussian sigma, in model units
+        cycle = (t % SWEEP_PERIOD) / SWEEP_PERIOD
+        # Travel slightly past both ends so the trail enters/exits cleanly
+        sweep_pos = mins[axis] - SWEEP_WIDTH + cycle * (span + 2 * SWEEP_WIDTH)
+        inv_two_sigma_sq = 1.0 / (2.0 * SWEEP_WIDTH * SWEEP_WIDTH)
+
+        glPushAttrib(GL_LIGHTING_BIT | GL_CURRENT_BIT | GL_ENABLE_BIT |
+                     GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT | GL_POLYGON_BIT)
+
+        # ------------------------------------------------------------------ #
+        # Pass 1 — solid emissive core (writes depth, populates buffer)
+        # ------------------------------------------------------------------ #
+        glEnable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,  [0.10, 0.07, 0.02, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  [0.30, 0.22, 0.05, 1.0])
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 0.9, 0.5, 1.0])
+        glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 96.0)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, [base_r, base_g, base_b, 1.0])
+
+        for gl_data in self._effort_meshes:
+            n = len(gl_data)
+            glBegin(GL_TRIANGLES)
+            for i in range(0, n, 12):
+                nx, ny, nz = gl_data[i], gl_data[i+1], gl_data[i+2]
+                if nx or ny or nz:
+                    glNormal3f(nx, ny, nz)
+                glVertex3f(gl_data[i+3], gl_data[i+4], gl_data[i+5])
+                glVertex3f(gl_data[i+6], gl_data[i+7], gl_data[i+8])
+                glVertex3f(gl_data[i+9], gl_data[i+10], gl_data[i+11])
+            glEnd()
+
+        # ------------------------------------------------------------------ #
+        # Pass 2 — additive sweep highlight (per-vertex Gaussian intensity)
+        # ------------------------------------------------------------------ #
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)   # additive
+        glDepthMask(GL_FALSE)
+        # Bright white-hot core for the sweep
+        sweep_r, sweep_g, sweep_b = 1.0, 0.95, 0.75
+        # Vertex coord offset within gl_data (axis maps to slot 3+axis, 6+axis, 9+axis)
+        a = axis
+
+        for gl_data in self._effort_meshes:
+            n = len(gl_data)
+            glBegin(GL_TRIANGLES)
+            for i in range(0, n, 12):
+                for vbase in (3, 6, 9):
+                    v_axis = gl_data[i + vbase + a]
+                    d = v_axis - sweep_pos
+                    intensity = math.exp(-(d * d) * inv_two_sigma_sq)
+                    if intensity < 0.01:
+                        glColor4f(0.0, 0.0, 0.0, 0.0)
+                    else:
+                        glColor4f(sweep_r, sweep_g, sweep_b, intensity)
+                    glVertex3f(gl_data[i + vbase],
+                               gl_data[i + vbase + 1],
+                               gl_data[i + vbase + 2])
+            glEnd()
+
+        glPopAttrib()
 
     def _compile_outfield_display_list(self):
         """Compile procedural outfield geometry into a GL display list.
@@ -2954,6 +3173,11 @@ class SplitView(QWidget):
         self.trajectory_data = None
         self.current_frame = 0
 
+        # ML residual correction toggle (driven by the ML correction button)
+        self.ml_correction_enabled = True
+        self._ml_residual_ft = None
+        self._ml_actual_ft = None
+
         # Pitch animation state
         self.pitch_trajectory_data = None
         self.animation_phase = "idle"  # "idle" | "pitch" | "flight"
@@ -3425,6 +3649,20 @@ class SplitView(QWidget):
         # (pitch spin ≠ batted ball spin; Savant doesn't publish batted ball spin)
         spin_rate = self._estimate_batted_ball_spin(la)
 
+        # ML residual: park feature uses the BBE's actual home park when known,
+        # falling back to the currently loaded stadium so altitude in physics
+        # lines up with what the model saw at training time.
+        if self.ml_correction_enabled:
+            park = get_park_for_team(record.get("home_team")) or self.stadium_name
+            self._ml_residual_ft = predict_distance_residual(record, park)
+        else:
+            self._ml_residual_ft = None
+        actual = record.get("hit_distance_sc")
+        try:
+            self._ml_actual_ft = float(actual) if actual is not None else None
+        except (TypeError, ValueError):
+            self._ml_actual_ft = None
+
         self.simulate_ball_flight(
             exit_velocity=int(round(ev)),
             vlaunch_angle=int(round(la)),
@@ -3616,12 +3854,25 @@ class SplitView(QWidget):
         self.flight_stats_list.addItem(stats_text)
         self.flight_stats_list.scrollToBottom()
 
-        # Update the flight info label
+        # Update the flight info label — show ML-corrected distance alongside
+        # physics whenever a residual prediction was stashed by _on_simulate_bbe.
+        ml_residual = getattr(self, "_ml_residual_ft", None)
+        ml_actual = getattr(self, "_ml_actual_ft", None)
+        if ml_residual is not None:
+            ml_dist = distance + ml_residual
+            dist_str = f"Phys: {distance:.1f} ft | ML: {ml_dist:.1f} ft (Δ {ml_residual:+.1f})"
+            if ml_actual is not None:
+                dist_str += f" | Actual: {ml_actual:.0f} ft"
+        else:
+            dist_str = f"Distance: {distance:.1f} ft"
         self.flight_info_label.setText(
-            f"Distance: {distance:.1f} ft | Max Height: {max_height:.1f} ft | "
+            f"{dist_str} | Max Height: {max_height:.1f} ft | "
             f"Exit Vel: {exit_velocity} mph | Launch: {vlaunch_angle}°/{hlaunch_angle}° | Spin: {spin_rate} rpm"
             f" | {hit_result}"
         )
+        # One-shot: clear so subsequent manual sims don't reuse stale ML data
+        self._ml_residual_ft = None
+        self._ml_actual_ft = None
 
         # Start animation timer
         self.animation_phase = "flight"
@@ -3760,6 +4011,69 @@ class SplitView(QWidget):
         return distance >= wall_distance and final_height > wall_ht
 
 
+# ==============================================
+# BBE Update Worker (off-thread Savant scrape)
+# Runs the incremental update from savant_bbe_fetch in a QThread so the
+# Qt event loop keeps painting while the scrape progresses.
+# ==============================================
+class BBEUpdateWorker(QObject):
+    progress = pyqtSignal(int, int)   # done, total
+    status   = pyqtSignal(str)
+    finished = pyqtSignal(dict)       # combined result dict
+    error    = pyqtSignal(str)
+
+    def __init__(self, year: int, jobs: list,
+                 delay: float = 1.2, workers: int = 10):
+        """jobs is a list of (player_type, csv_path) tuples — one update per."""
+        super().__init__()
+        self.year = year
+        self.jobs = jobs
+        self.delay = delay
+        self.workers = workers
+
+    def run(self):
+        try:
+            import savant_bbe_fetch
+            n_jobs = len(self.jobs) or 1
+            combined_results = []
+            for i, (player_type, csv_path) in enumerate(self.jobs):
+                self.status.emit(f"{player_type.capitalize()}s:")
+                # Map this job's 0..total progress into the global bar's slice.
+                base_pct = int(round(100.0 * i / n_jobs))
+                slice_pct = int(round(100.0 / n_jobs))
+                def _progress_cb(done, total, base=base_pct, sl=slice_pct):
+                    if total <= 0:
+                        return
+                    pct = base + int(round(sl * done / total))
+                    self.progress.emit(pct, 100)
+                def _status_cb(msg, pt=player_type):
+                    self.status.emit(f"{pt.capitalize()}s: {msg}")
+                result = savant_bbe_fetch.update(
+                    year=self.year,
+                    delay=self.delay,
+                    workers=self.workers,
+                    output_path=csv_path,
+                    player_type=player_type,
+                    progress_cb=_progress_cb,
+                    status_cb=_status_cb,
+                )
+                combined_results.append((player_type, result or {}))
+
+            # Build a one-line summary for the HUD label
+            notes = []
+            for pt, r in combined_results:
+                added = r.get("added")
+                if added is None:
+                    notes.append(f"{pt}s: full pull")
+                else:
+                    notes.append(f"{pt}s: +{added:,}")
+            self.finished.emit({"note": " | ".join(notes), "jobs": combined_results})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
 class MLBWeatherApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3847,6 +4161,21 @@ class MLBWeatherApp(QMainWindow):
         self.track_ball_btn.clicked.connect(ToggleBallTracking)
         tb_layout.addWidget(self.track_ball_btn)
         ToggleBallTracking(); ToggleBallTracking()  # toggle twice to set initial css
+
+        # -- ML correction toggle --
+        self.ml_correction_btn = QPushButton("ML correction")
+        ml_on_css  = "QPushButton { background-color: #00FF00; color: white; border: 1px solid #444; padding: 4px 10px; font-size: 11px; }"
+        ml_off_css = "QPushButton { background-color: #FF0000; color: white; border: 1px solid #444; padding: 4px 10px; font-size: 11px; }"
+        def ToggleMLCorrection():
+            sw = self.stadium_widget
+            sw.ml_correction_enabled = not sw.ml_correction_enabled
+            self.ml_correction_btn.setStyleSheet(ml_on_css if sw.ml_correction_enabled else ml_off_css)
+        self.ml_correction_btn.clicked.connect(ToggleMLCorrection)
+        tb_layout.addWidget(self.ml_correction_btn)
+        # Sync initial CSS to the SplitView's default state (enabled).
+        self.ml_correction_btn.setStyleSheet(
+            ml_on_css if self.stadium_widget.ml_correction_enabled else ml_off_css
+        )
 
         tb_layout.addWidget(self._tb_separator())
 
@@ -4000,6 +4329,7 @@ class MLBWeatherApp(QMainWindow):
         # Wind override controls
         wind_group = QGroupBox("Override Weather")
         wind_layout = QGridLayout()
+        wind_layout.setHorizontalSpacing(6)
 
         wind_layout.addWidget(QLabel("Wind Speed (mph):"), 0, 0)
         self.wind_speed_spin = QSpinBox()
@@ -4019,6 +4349,7 @@ class MLBWeatherApp(QMainWindow):
         # Ball position controls
         position_group = QGroupBox("Ball Starting Position (feet)")
         position_layout = QGridLayout()
+        position_layout.setHorizontalSpacing(6)
 
         position_layout.addWidget(QLabel("X (center field):"), 0, 0)
         self.x_pos_spin = QDoubleSpinBox()
@@ -4054,6 +4385,12 @@ class MLBWeatherApp(QMainWindow):
         wind_group.setLayout(wind_layout)
         bottom_controls.addWidget(wind_group)
 
+        # Cap each spinbox in these groups so the grid's column 1 doesn't
+        # stretch wide and leave a big empty gap between label and input.
+        for sb in (self.x_pos_spin, self.y_pos_spin, self.z_pos_spin,
+                   self.wind_speed_spin, self.wind_dir_spin):
+            sb.setMaximumWidth(70)
+
         # Action buttons (in drawer: lighting + weather update)
         button_layout = QVBoxLayout()
 
@@ -4068,6 +4405,28 @@ class MLBWeatherApp(QMainWindow):
         self.update_weather_btn = QPushButton("Update Weather Data")
         self.update_weather_btn.clicked.connect(self.update_weather)
         button_layout.addWidget(self.update_weather_btn)
+
+        # -- Update BBE events: button swaps for a progress bar while scraping --
+        self.update_bbe_stack = QStackedWidget()
+        self.update_bbe_btn = QPushButton("Update BBE Events")
+        self.update_bbe_btn.clicked.connect(self._start_bbe_update)
+        self.update_bbe_progress = QProgressBar()
+        self.update_bbe_progress.setRange(0, 100)
+        self.update_bbe_progress.setFormat("Preparing… %p%")
+        self.update_bbe_progress.setTextVisible(True)
+        # QProgressBar defaults to Expanding horizontally, which made the whole
+        # button column grow to fill the bottom_controls row. Match the button's
+        # Minimum/Fixed policy so the column collapses back near its old width.
+        for w in (self.update_bbe_progress, self.update_bbe_btn, self.update_bbe_stack):
+            w.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.update_bbe_stack.addWidget(self.update_bbe_btn)        # index 0
+        self.update_bbe_stack.addWidget(self.update_bbe_progress)   # index 1
+        self.update_bbe_stack.setFixedHeight(self.update_weather_btn.sizeHint().height())
+        button_layout.addWidget(self.update_bbe_stack)
+
+        # Worker plumbing — held on self to survive past the start handler
+        self._bbe_thread = None
+        self._bbe_worker = None
 
         button_layout.addStretch()
         bottom_controls.addLayout(button_layout)
@@ -4342,6 +4701,77 @@ class MLBWeatherApp(QMainWindow):
 
     def update_weather(self):
         self.stadium_widget.fetch_weather_data()
+
+    # ---------------- BBE incremental update (off-thread) ------------------ #
+    def _start_bbe_update(self):
+        """Kick off a Savant BBE incremental scrape in a background QThread."""
+        if self._bbe_thread is not None and self._bbe_thread.isRunning():
+            return  # already running
+
+        # Resolve CSV paths next to this script — one job per player type so
+        # both batter and pitcher CSVs stay current.
+        from datetime import datetime as _dt
+        year = _dt.now().year
+        here = Path(__file__).parent
+        jobs = [
+            ("batter",  str(here / f"savant_bbe_{year}.csv")),
+            ("pitcher", str(here / f"savant_pitcher-bbe_{year}.csv")),
+        ]
+
+        # Swap button for progress bar
+        self.update_bbe_progress.setValue(0)
+        self.update_bbe_progress.setFormat("Fetching leaderboard… %p%")
+        self.update_bbe_stack.setCurrentIndex(1)
+
+        self._bbe_thread = QThread(self)
+        self._bbe_worker = BBEUpdateWorker(year=year, jobs=jobs)
+        self._bbe_worker.moveToThread(self._bbe_thread)
+
+        # Wire signals (queued connections cross thread boundaries automatically)
+        self._bbe_thread.started.connect(self._bbe_worker.run)
+        self._bbe_worker.progress.connect(self._on_bbe_progress)
+        self._bbe_worker.status.connect(self._on_bbe_status)
+        self._bbe_worker.finished.connect(self._on_bbe_finished)
+        self._bbe_worker.error.connect(self._on_bbe_error)
+
+        # Cleanup chain
+        self._bbe_worker.finished.connect(self._bbe_thread.quit)
+        self._bbe_worker.error.connect(self._bbe_thread.quit)
+        self._bbe_thread.finished.connect(self._bbe_worker.deleteLater)
+        self._bbe_thread.finished.connect(self._bbe_thread.deleteLater)
+        self._bbe_thread.finished.connect(self._bbe_cleanup_refs)
+
+        self._bbe_thread.start()
+
+    def _on_bbe_status(self, msg: str):
+        self.update_bbe_progress.setFormat(f"{msg} %p%")
+
+    def _on_bbe_progress(self, done: int, total: int):
+        if total <= 0:
+            return
+        # Worker now emits (global_pct, 100) already normalised across batter
+        # and pitcher passes — just drive the bar value, leave format text to
+        # the status signal so the player-type prefix stays visible.
+        pct = int(round(100.0 * done / total))
+        self.update_bbe_progress.setValue(pct)
+
+    def _on_bbe_finished(self, result: dict):
+        self.update_bbe_progress.setValue(100)
+        note = result.get("note") if isinstance(result, dict) else ""
+        if note:
+            self.update_bbe_progress.setFormat(f"Done — {note}")
+        else:
+            self.update_bbe_progress.setFormat("Done")
+        # Swap back to button after a short visible-completion beat
+        QTimer.singleShot(2000, lambda: self.update_bbe_stack.setCurrentIndex(0))
+
+    def _on_bbe_error(self, msg: str):
+        self.update_bbe_progress.setFormat(f"Error: {msg[:40]}")
+        QTimer.singleShot(3500, lambda: self.update_bbe_stack.setCurrentIndex(0))
+
+    def _bbe_cleanup_refs(self):
+        self._bbe_worker = None
+        self._bbe_thread = None
 
 
     def show_lighting_controls(self):
