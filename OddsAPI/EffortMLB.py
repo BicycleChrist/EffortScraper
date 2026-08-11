@@ -12464,6 +12464,15 @@ class BullpenPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 2, 0, 2)
         root.setSpacing(0)
+        # The panel takes every pixel the pitcher column has left under the SP
+        # form panel and _do_cap fits the rows to it. The minimum is EXPLICIT
+        # so it beats the layout's own minimumSizeHint — that hint includes
+        # the table's pinned height, which is derived from the height we were
+        # last given, and letting it become the floor would make the panel
+        # unshrinkable the moment the window got shorter.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(self._MIN_PANEL_H)
 
         self._table = QTableWidget()
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -12471,6 +12480,10 @@ class BullpenPanel(QWidget):
         self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._table.verticalHeader().hide()
         self._table.verticalHeader().setDefaultSectionSize(17)
+        # setRowHeight is CLAMPED by this — it defaults to ~21px off the
+        # style/font, so _do_cap's squeeze below that was silently ignored
+        # and a pen in a short window scrolled instead of tightening up.
+        self._table.verticalHeader().setMinimumSectionSize(self._ROW_H_MIN)
         self._table.setAlternatingRowColors(True)
         # Status rides next to the name (col 1) as a short code so it's
         # always visible without scrolling to the far right.
@@ -12936,32 +12949,22 @@ class BullpenPanel(QWidget):
                    self._hdr_box.sizeHint().width() + 4))
         w = 2 * table.frameWidth() + 2
         w += sum(table.columnWidth(c) for c in range(table.columnCount()))
-        # Room for the vertical scrollbar's gutter ONLY when there will be
-        # one. There never is: _cap_panel_height below pins this table's
-        # height to exactly its rows, so it has nothing to scroll and the bar
-        # stays at range (0,0). Reserving it unconditionally left a dead
-        # ~16px lane inside the frame to the right of the last column — a
-        # gutter for a scrollbar that does not exist. (The note this replaces
-        # measured content 880 vs viewport 868 back when the height was not
-        # pinned; it now measures 851 vs 867, i.e. over-corrected the other
-        # way.) Same shape of bug as the horizontal allowance below.
-        # No allowance at all. Consulting the live scrollbar here is
-        # circular: this runs BEFORE _cap_panel_height pins the height, so
-        # the bar's range still reflects the previous (shorter) table and the
-        # gutter comes straight back. The bar cannot appear once the height
-        # is pinned to exactly the rows, so there is nothing to reserve. If
-        # that pinning is ever removed, the last column will clip and this is
-        # the line to restore.
+        # Columns only — no vertical-scrollbar gutter here. Reserving it
+        # unconditionally left a dead ~16px lane inside the frame to the
+        # right of the last column, and the bar only exists when the pen is
+        # deeper than the window (rows already at their floor); _do_cap adds
+        # the gutter to this width in that case and takes it away again.
+        # Consulting the live scrollbar HERE would be circular: this runs
+        # before the rows are sized, so the bar's range still reflects the
+        # previous table.
         # PIN, don't just cap — third time this lesson has come up in this
         # file. Sharing a row with the usage strip, a maximum alone let the
         # layout squeeze the table to its size hint (256px of a needed 855)
         # and hand the remainder to the strip.
+        self._content_w = w
         table.setMinimumWidth(w)
         table.setMaximumWidth(w)
-        # Bottom edge hugs the last reliever too. Capping the PANEL as well
-        # stops the splitter from growing this section past its data — the
-        # surplus height goes to the SP form section instead. Keep room for
-        # the h-scrollbar (the pen table is usually wider than the pane).
+        # Fit the rows to whatever height the panel has been given.
         self._cap_panel_height()
         self._place_hdr_box()
         # same order the table was just built in, so row i lines up with
@@ -12986,19 +12989,27 @@ class BullpenPanel(QWidget):
         self._usage.update()
 
     def _cap_panel_height(self):
-        """Fixed panel height = data height: the splitter can neither grow
-        this section past its rows nor squeeze relievers behind a scrollbar —
-        surplus goes to the SP form section.
+        """Fit the table to the height the panel was GIVEN, not to its data.
 
-        Called from BOTH _render and _render_edge: the matchup strip is part
-        of the height budget but becomes visible on its own schedule (the
-        second pen of the game arrives later), and leaving it out squeezed
-        the table by the strip's own height, hiding the last reliever."""
+        The panel used to pin itself to its own row height (min == max ==
+        rows) and the pitcher column handed the surplus to a trailing
+        spacer. That is exactly the two failure modes in the screenshot:
+        a pen with more arms than the window has room for was squeezed
+        below its pinned height and CLIPPED mid-reliever, and a short pen
+        left a dead band under the last row. Now the panel takes the whole
+        remaining column height and the ROWS absorb the difference, so the
+        last reliever always lands on the bottom edge.
+
+        Called from _render, _render_edge and resizeEvent: the matchup strip
+        is part of the height budget but becomes visible on its own schedule
+        (the second pen of the game arrives later), and leaving it out
+        squeezed the table by the strip's own height."""
         table = self._table
         if not table.rowCount() or getattr(self, "_capping", False):
             return
-        # setMaximumHeight can itself move the scrollbar range, which is
-        # wired back to this method — one level of re-entry is enough
+        self._fitted_h = self.height()
+        # setMinimumHeight/row resizing can itself move the scrollbar range,
+        # which is wired back to this method — one level of re-entry is enough
         self._capping = True
         try:
             self._do_cap(table)
@@ -13006,55 +13017,104 @@ class BullpenPanel(QWidget):
             self._capping = False
 
     # Enough for the header strip plus ~4 relievers. Below this the panel is
-    # not worth showing, and above it the maximum governs anyway.
+    # not worth showing; there is no maximum any more — the panel fills the
+    # column down to the bottom of the window.
     _MIN_PANEL_H = 120
+    # Row height bounds. The floor is what an 8pt row can be read at (and is
+    # pushed into the vertical header's minimumSectionSize, which otherwise
+    # clamps setRowHeight at ~21px and swallows the squeeze); the ceiling
+    # stops a six-arm pen in a very tall window from becoming a ladder of
+    # banded stripes. A shallow pen under a tall window is the one case that
+    # still leaves slack — the alternative is 60px rows.
+    _ROW_H_MIN = 13
+    _ROW_H_MAX = 34
 
     def _do_cap(self, table):
-        h = 2 * table.frameWidth() + table.horizontalHeader().height()
-        h += sum(table.rowHeight(r) for r in range(table.rowCount()))
+        n = table.rowCount()
+        chrome = 2 * table.frameWidth() + table.horizontalHeader().height()
         # Room for the horizontal scrollbar ONLY when there will be one.
         # This was unconditional, and the pen table usually fits (content 869
         # vs an 881px viewport at 1900px wide), so it was reserving 14px of
-        # dead strip under the last reliever on every render — and because
-        # this panel is height-capped, that 14px came straight out of the SP
-        # form section above it.
+        # dead strip under the last reliever on every render.
         # Compare COLUMNS to VIEWPORT. Comparing the widget-width figure
         # (frame + padding + columns) against the viewport is off by the
         # frame allowance and falsely trips by a couple of pixels.
         cols_w = sum(table.columnWidth(c)
                      for c in range(table.columnCount()))
         if cols_w > table.viewport().width():
-            h += table.horizontalScrollBar().sizeHint().height()
-        # Pin, don't cap. Once the table shares a row with the usage strip
-        # the layout will happily give it LESS than its rows (it came out
-        # 192 against a needed 208), which raises a vertical scrollbar, which
-        # narrows the viewport, which raises a horizontal one — the two
-        # allowances then chase each other. Fixing the height breaks the loop.
-        table.setMinimumHeight(h)
-        table.setMaximumHeight(h)
-        panel_h = h + 4                # + root layout margins
-        # the header row is as tall as whichever of its two widgets is
-        # showing — the label hides when a pen's strength is unknown, but
-        # the availability bar beside it can still have arms to draw
-        panel_h += max(
+            chrome += table.horizontalScrollBar().sizeHint().height()
+
+        # What the panel actually has to spend, minus everything above the
+        # table: root layout margins plus the matchup strip row (as tall as
+        # whichever of its two widgets is showing — the label hides when a
+        # pen's strength is unknown, but the availability bar beside it can
+        # still have arms to draw).
+        overhead = 4 + max(
             self._edge_label.height() if self._edge_label.isVisible() else 0,
             self._avail_bar.height() if self._avail_bar.isVisible() else 0)
-        # MAXIMUM pinned, MINIMUM not. The table above stays pinned — that
-        # is what breaks the scrollbar chase described there — but pinning
-        # the PANEL's minimum too made this widget unshrinkable, and the SP
-        # form panel above it is unshrinkable as well (its own minimum is the
-        # sum of its left column). Two immovable objects in one column: when
-        # the window was a few pixels shorter than their combined minimum,
-        # Qt squeezed below the minimum and the SP panel's children
-        # physically OVERLAPPED — the arsenal table's last row drawn under
-        # the tunnel table's header.
-        #
-        # With a floor instead, the pen is the one that yields: it clips a
-        # reliever off the bottom, which is visible and obvious, rather than
-        # corrupting a neighbouring panel's layout. It still gets its full
-        # height whenever there is room, because the maximum is unchanged.
-        self.setMaximumHeight(panel_h)
-        self.setMinimumHeight(min(panel_h, self._MIN_PANEL_H))
+        body = self.height() - overhead - chrome
+
+        # Before the first real layout pass self.height() is a placeholder
+        # (the startup overlay renders this panel while the whole UI is
+        # hidden). Fall back to the data height; refresh_layout/resizeEvent
+        # re-run this once Qt has resolved the column.
+        laid_out = body >= self._ROW_H_MIN
+        if not laid_out:
+            body = 17 * n
+        rh = max(self._ROW_H_MIN, min(self._ROW_H_MAX, body // n))
+        # Spread the remainder one pixel at a time over the top rows so the
+        # last row's bottom edge is the panel's bottom edge — a uniform
+        # rh leaves up to n-1 px of dead strip under the pen.
+        extra = body - rh * n if rh < self._ROW_H_MAX else 0
+        extra = max(0, min(n, extra))
+        for r in range(n):
+            table.setRowHeight(r, rh + (1 if r < extra else 0))
+
+        h = chrome + rh * n + extra
+        # A pen too deep for the window still has to be reachable: below the
+        # row floor the table scrolls rather than hiding arms off the bottom,
+        # and the width grows by the gutter so the L7 column does not clip.
+        v_scroll = laid_out and h > self.height() - overhead
+        table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if v_scroll
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        gutter = (table.verticalScrollBar().sizeHint().width()
+                  if v_scroll else 0)
+        w = getattr(self, "_content_w", table.maximumWidth()) + gutter
+        table.setMinimumWidth(w)
+        table.setMaximumWidth(w)
+        if v_scroll:
+            h = max(self._ROW_H_MIN * 2 + chrome, self.height() - overhead)
+        # Pin, don't cap. Sharing a row with the usage strip, the layout will
+        # happily give the table LESS than its rows (it came out 192 against a
+        # needed 208), which raises a vertical scrollbar, which narrows the
+        # viewport, which raises a horizontal one — the two allowances then
+        # chase each other. Fixing the height breaks the loop.
+        table.setMinimumHeight(h)
+        table.setMaximumHeight(h)
+        # The strip beside the table reads row geometry back off it, so it
+        # follows the new row heights — but only if it repaints.
+        self._usage.update()
+
+    def resizeEvent(self, e):
+        """The panel's height is the column's leftover, so it is only known
+        here — re-fit the rows to it on every resize (window resize, rail
+        collapse, SP form panel growing or shrinking)."""
+        super().resizeEvent(e)
+        if getattr(self, "_capping", False):
+            # Pinning the table re-enters the column's layout, which can
+            # resize US mid-fit, and the re-entry guard swallows that call —
+            # the rows then stay fitted to the height we no longer have (the
+            # pen kept 21px rows in a panel squeezed to its 120px floor).
+            # Re-fit once the current pass has unwound; it settles as soon as
+            # the height stops moving.
+            QTimer.singleShot(0, self._refit_if_stale)
+        else:
+            self._cap_panel_height()
+
+    def _refit_if_stale(self):
+        if self.height() != getattr(self, "_fitted_h", None):
+            self._cap_panel_height()
 
 
 class FieldDefenseView(QWidget):
@@ -19398,26 +19458,28 @@ class MLBWindow(QMainWindow):
         # Pitcher half: SP form on top, bullpen below — full window height
         self.pitcher_form_panel = PitcherFormPanel(self.stats)
         self.bullpen_panel = BullpenPanel(self.stats)
-        # NOT a splitter. `_cap_panel_height` pins the bullpen panel's height
-        # to exactly its rows (min == max), so a vertical splitter could
-        # never move it — the handle was 14px of dead grab area fighting a
-        # pin, and it was taking that height from the SP form above. A plain
-        # column gives the pen its data height and every remaining pixel to
-        # the form. If the pen is ever made collapsible it should collapse
-        # HORIZONTALLY, which is the axis its 25 columns actually run on.
+        # NOT a splitter. The SP form panel is content-sized and the bullpen
+        # panel fits its ROWS to whatever height is left (`_do_cap`), so
+        # there is no ratio for a handle to set — it would be 14px of dead
+        # grab area taking height from the form above. If the pen is ever
+        # made collapsible it should collapse HORIZONTALLY, which is the axis
+        # its 25 columns actually run on.
         pitcher_col = QWidget()
         pcol = QVBoxLayout(pitcher_col)
         pcol.setContentsMargins(0, 0, 0, 0)
         pcol.setSpacing(0)
-        # stretch=0, NOT 1. The form panel's two columns each end in a
-        # trailing spacer, so with stretch=1 it swallowed every spare pixel
-        # into those spacers — a dead band between the hitter strip and the
-        # pen — and then pushed the 229px bullpen panel off the bottom of the
-        # window. At 0 it takes its content height, the pen sits directly
-        # under it, and any surplus pools BELOW the pen where it is harmless.
+        # Form panel stretch=0, NOT 1: its two columns each end in a trailing
+        # spacer, so with stretch=1 it swallowed every spare pixel into those
+        # spacers — a dead band between the hitter strip and the pen — and
+        # then pushed the bullpen panel off the bottom of the window. At 0 it
+        # takes its content height.
         pcol.addWidget(self.pitcher_form_panel, stretch=0)
-        pcol.addWidget(self.bullpen_panel, stretch=0)
-        pcol.addStretch(1)
+        # The pen takes the rest, all the way to the bottom edge, and grows
+        # or shrinks its ROW HEIGHTS to land the last reliever on it. There is
+        # no trailing spacer any more: surplus pooled below the pen is the
+        # dead band in the screenshot, and a pen deeper than the window was
+        # squeezed under its own pinned height and clipped mid-row.
+        pcol.addWidget(self.bullpen_panel, stretch=1)
 
         # Batter half: detail panel + advanced stats tabs
         self.player_detail_panel = PlayerDetailPanel()
