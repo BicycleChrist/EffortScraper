@@ -43,7 +43,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -147,6 +147,35 @@ def prune_slate_cache(keep_days: int = 3):
                 d.rmdir()
             except OSError:
                 pass
+
+
+# --- season play-by-play checkpoint: the ONE cache in this file that is
+# deliberately NOT keyed on the date.
+#
+# The manager board's inputs are derived from every FINAL game of the season,
+# and a final game's play-by-play never changes again. Keying its aggregate
+# on the slate date therefore re-downloaded the entire season (~1,650 games,
+# ~0.115MB each even trimmed) every morning to learn about the ~15 games that
+# were played overnight. This file stores the DERIVED accumulators — per-club
+# stints/decisions/run-value events/ABS plus the league RE24, win-expectancy,
+# TTO and umpire tables — alongside the set of gamePks they were built from,
+# so a later run folds in only the gamePks it has never seen.
+#
+# !! COUPLING !!  The league tables and `games` MUST travel together: the
+# tables are sums over exactly those gamePks, so loading tables from one
+# source and the game set from another would either double-count games or
+# drop them. Bump PBP_CK_VERSION in the SAME edit as any change to what the
+# derivation functions produce, or an old file deserialises into the new
+# shape and the symptom is silently wrong aggregates, never an error.
+#
+# EFFORTMLB_NO_SLATE_CACHE=1 turns this off too, which means a full ~1,650
+# game walk on every launch — that is the point of the flag, but know what
+# you are asking for.
+PBP_CK_VERSION = 1
+
+
+def _pbp_ck_path(season) -> Path:
+    return SAVE_DIR / "pbp" / f"season_{season}_v{PBP_CK_VERSION}.json"
 
 
 def _encode_tuple_keyed(d: dict) -> list:
@@ -2214,6 +2243,40 @@ SEASON_SCHED_FIELDS = ",".join((
 ))
 
 
+def _final_games(sched: Optional[dict]) -> List[tuple]:
+    """[(gamePk, home id, away id)] for the FINAL games of a season schedule,
+    DEDUPED by gamePk.
+
+    Only finals: an in-progress game's play-by-play is still growing, and the
+    checkpoint would freeze a half-played game forever.
+
+    !! The dedupe is load-bearing !!  The season schedule lists ~22 gamePks
+    TWICE — a suspended game appears under both the date it started and the
+    date it resumed. Left in, both copies clear the `already seen` check
+    before either fetch completes, so those games are downloaded twice AND
+    folded into the league tables twice. That is a non-uniform double count,
+    unlike the old per-club pass whose double-count was uniform and cancelled
+    out of every mean. It also inflated the progress readout to 1,777 games
+    against a real 1,755."""
+    out = []
+    seen = set()
+    for d in (sched or {}).get("dates") or []:
+        for g in d.get("games") or []:
+            if (g.get("status") or {}).get("abstractGameState") != "Final":
+                continue
+            try:
+                pk = g["gamePk"]
+                if pk in seen:
+                    continue
+                seen.add(pk)
+                out.append((pk,
+                            g["teams"]["home"]["team"]["id"],
+                            g["teams"]["away"]["team"]["id"]))
+            except KeyError:
+                continue
+    return out
+
+
 # StatsAPI `fields=` whitelist for the season-long officials schedule that
 # builds {gamePk: home-plate umpire}.
 UMPIRE_SCHED_FIELDS = ",".join((
@@ -2743,6 +2806,10 @@ def decision_counts(pbp: dict, home_id: int, away_id: int) -> Dict[int, dict]:
 # +y toward CF (the same anchor the HR-widget spray chart uses). Angle 0 is
 # dead centre, -45 the LF line, +45 the RF line.
 _SPRAY_HP = (125.42, 198.27)
+# feet per grid pixel. The replay's hitData conversion and the pitch-detail
+# spray chart below both key off this; reconstructing a feed-stated 397 ft
+# home run through it lands at 398.2 ft.
+_SPRAY_SCALE = 2.51
 # Six 15-degree sectors from the LF line (-45) to the RF line (+45). Finer
 # than thirds because the fielder AND the direction he has to move both change
 # inside a third — the 3B hole and the line are the same "left" third but they
@@ -3389,6 +3456,46 @@ def summarize_stints(stints: List[dict]) -> Optional[dict]:
     }
 
 
+def _tendencies_from_acc(a: Optional[dict]) -> Optional[dict]:
+    """One club's cached manager-tendency dict from its season accumulators.
+
+    Shared by the league-wide prefetch and the per-club method so the two
+    cannot drift — they write the SAME cache key, and a difference between
+    them would surface as a club whose numbers change depending on which
+    path happened to build it.
+
+    !! COUPLING !! Adding a key here means bumping `mgr_tend_v5_` at both
+    call sites, or older cache entries deserialise into the new shape with
+    the new feature silently blank."""
+    if not a:
+        return None
+    data = summarize_stints(a["stints"])
+    if not data:
+        return None
+    dec = a["dec"]
+    if dec.get("games"):
+        g = dec["games"]
+        data["decisions"] = {
+            "games": int(g),
+            "sac_bunt": dec["sac_bunt"] / g,
+            "sb_att": dec["sb_att"] / g,
+            "sb_rate": (dec["sb_ok"] / dec["sb_att"]
+                        if dec["sb_att"] else None),
+            "pinch_hit": dec["pinch_hit"] / g,
+            "ibb": dec["ibb"] / g,
+            "mound_visit": dec["mound_visit"] / g,
+            "def_move": dec["def_move"] / g,
+        }
+        data["rv_events"] = a["rv"]
+        data["sb_by_base"] = {b: dec.get(f"sb_{b}", 0)
+                              for b in ("2b", "3b", "home")}
+        data["cs_by_base"] = {b: dec.get(f"cs_{b}", 0)
+                              for b in ("2b", "3b", "home")}
+    if a["abs"].get("n"):
+        data["abs"] = summarize_abs(a["abs"])
+    return data
+
+
 def _stints_by_pitcher(rp: List[dict]) -> Dict[int, dict]:
     """Per-reliever deployment: the game states he actually gets brought
     into. A closer used only with a lead of 1-3 is a very different asset
@@ -3681,6 +3788,10 @@ class MLBPropStats:
         self._tto_acc: Dict[int, Dict[tuple, List[float]]] = {}
         # {gamePk: called-pitch tallies} + {gamePk: home-plate umpire}
         self._ump_acc: Dict[int, dict] = {}
+        # season play-by-play checkpoint: {"games": set, "teams": {tid: acc}}
+        # loaded lazily from disk; the league tables above ride with it
+        self._pbp_ck: Optional[dict] = None
+        self._pbp_lock = asyncio.Lock()
         self._ump_by_game: Optional[tuple] = None    # (ts, {pk: name})
         self._arsenal_stats: Optional[tuple] = None  # (ts, {(pid, pt): row})
         self._arm_angles: Optional[tuple] = None     # (ts, {pid: angle})
@@ -3704,6 +3815,15 @@ class MLBPropStats:
         # single-flight locks (see _fetch_savant_csv)
         self._savant_csv: Dict[str, tuple] = {}
         self._savant_csv_locks: Dict[str, asyncio.Lock] = {}
+        # (pid, player_type, year) -> single-flight lock for _get_pitch_detail
+        self._pitch_detail_locks: Dict[tuple, asyncio.Lock] = {}
+        # single-flight for the league-wide boards that memoise by hand
+        self._xstats_locks: Dict[str, asyncio.Lock] = {}
+        self._frv_lock = asyncio.Lock()
+        self._proj_locks: Dict[str, asyncio.Lock] = {}
+        # {pid: [xwobacon, bbe] | None} for season-1 — see get_prior_wobacon.
+        # Permanent (a finished season cannot change); None until read.
+        self._prior_wobacon: Optional[Dict[str, Optional[list]]] = None
         self._bullpen_lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -4213,29 +4333,23 @@ class MLBPropStats:
         ptype = "pitcher" if group == "pitching" else "batter"
         cached = self._xstats.get(ptype)
         if not cached or time.time() - cached[0] >= PITCH_SPLITS_TTL:
-            url = SAVANT_XSTATS_URL.format(player_type=ptype, year=self.season)
-            board: Dict[int, dict] = {}
-            text = dev_cache_get(url)
-            if text is None:
-                async with self._sem:
-                    try:
-                        async with session.get(url, headers=SAVANT_HEADERS,
-                                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                            if resp.status == 200:
-                                # BOM corrupts the quoted first column and
-                                # shifts every field — strip before parsing
-                                text = (await resp.text()).lstrip("﻿")
-                                dev_cache_put(url, text)
-                    except Exception as e:
-                        print(f"EffortMLB: xstats fetch failed: {e}")
-            if text:
-                import io as _io
-                for row in csv.DictReader(_io.StringIO(text)):
-                    try:
-                        board[int(row["player_id"])] = row
-                    except (KeyError, ValueError):
-                        continue
-            self._xstats[ptype] = (time.time(), board)
+            lock = self._xstats_locks.setdefault(ptype, asyncio.Lock())
+            async with lock:
+                cached = self._xstats.get(ptype)
+                if not cached or time.time() - cached[0] >= PITCH_SPLITS_TTL:
+                    # Via _fetch_savant_csv rather than a bespoke fetch: it
+                    # already does the BOM strip and the DictReader pass, and
+                    # brings the per-URL single-flight lock this board was
+                    # missing (every batter on the slate wants the same one).
+                    url = SAVANT_XSTATS_URL.format(player_type=ptype,
+                                                   year=self.season)
+                    board: Dict[int, dict] = {}
+                    for row in await self._fetch_savant_csv(session, url):
+                        try:
+                            board[int(row["player_id"])] = row
+                        except (KeyError, ValueError):
+                            continue
+                    self._xstats[ptype] = (time.time(), board)
         row = self._xstats[ptype][1].get(player_id)
         if not row:
             return None
@@ -4784,6 +4898,20 @@ class MLBPropStats:
         setattr(self, attr, (now, board))
         return board
 
+    async def get_sprint_speed(self, session: aiohttp.ClientSession
+                               ) -> Dict[int, dict]:
+        """Sprint speed (ft/s) and home-to-first, keyed by MLBAM id.
+
+        The replay moves each baserunner at HIS speed, so a 30 ft/s burner
+        visibly beats a 25 ft/s catcher to the next bag instead of every
+        runner gliding at the same rate."""
+        return await self._savant_board(
+            session, "_sprint_board",
+            "https://baseballsavant.mlb.com/leaderboard/sprint_speed"
+            "?year={year}&position=&team=&min=10&csv=true",
+            ("player_id",),
+            {"speed": "sprint_speed", "hp_1b": "hp_to_1b"})
+
     async def get_projections(self, session: aiohttp.ClientSession,
                               stats: str = "bat",
                               system: str = "rfangraphsdc"
@@ -4797,6 +4925,19 @@ class MLBPropStats:
         mem = self._proj_cache.get(ck)
         if mem:
             return mem
+        lock = self._proj_locks.setdefault(ck, asyncio.Lock())
+        async with lock:
+            mem = self._proj_cache.get(ck)
+            if mem:
+                return mem
+            return await self._fetch_projections(session, stats, system, ck)
+
+    async def _fetch_projections(self, session: aiohttp.ClientSession,
+                                 stats: str, system: str, ck: str
+                                 ) -> Dict[int, dict]:
+        """Uncached body of `get_projections` — call through that. The
+        projections tab asks for several boards at once, and FanGraphs 403s
+        per-IP on burst, so overlapping identical pulls are worth avoiding."""
         raw = slate_cache_get(ck)
         rows = None
         if raw:
@@ -4991,8 +5132,8 @@ class MLBPropStats:
             hx, hy = r.get("hc_x"), r.get("hc_y")
             if hx is None or hy is None or r["desc"] != "hit_into_play":
                 continue
-            x = (hx - 125.42) * 2.51
-            y = (198.27 - hy) * 2.51
+            x = (hx - _SPRAY_HP[0]) * _SPRAY_SCALE
+            y = (_SPRAY_HP[1] - hy) * _SPRAY_SCALE
             ev = r.get("event") or ""
             if ev == "home_run":
                 cat = "HR"
@@ -5055,13 +5196,33 @@ class MLBPropStats:
         by-pitch and by-velocity aggregations run off this cache.
 
         `year` defaults to the current season; BMIELKE passes the prior one to
-        build its player-specific prior."""
+        build its player-specific prior.
+
+        Single-flight per key, for the same reason `_fetch_savant_csv` is:
+        `_show_player_detail` spawns five concurrent tasks and three of them
+        (pitch splits, BMIELKE, zone grids) want the SAME (player, type,
+        year) rows, so without the lock they all miss the empty cache
+        together and each pull the full-season CSV. Measured on one hitter
+        click: 4 fetches / 4.56MB where 3 unique keys were needed."""
         year = year or self.season
         key = (player_id, player_type, year)
         cached = self._pitch_splits.get(key)
         if cached and time.time() - cached[0] < PITCH_SPLITS_TTL:
             return cached[1]
+        lock = self._pitch_detail_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = self._pitch_splits.get(key)
+            if cached and time.time() - cached[0] < PITCH_SPLITS_TTL:
+                return cached[1]
+            return await self._fetch_pitch_detail(
+                session, player_id, player_type, year)
 
+    async def _fetch_pitch_detail(self, session: aiohttp.ClientSession,
+                                  player_id: int, player_type: str,
+                                  year: int) -> List[dict]:
+        """Uncached body of `_get_pitch_detail` — always call through that,
+        never directly, or the single-flight guarantee is lost."""
+        key = (player_id, player_type, year)
         url = SAVANT_SEARCH_URL.format(year=year, player_id=player_id,
                                        player_type=player_type)
         text = dev_cache_get(url) or ""
@@ -5221,15 +5382,40 @@ class MLBPropStats:
             sp = zone_cells(prows, stand_filter=stand or None)
         return bat, sp
 
+    def _prior_path(self) -> Path:
+        return SAVE_DIR / f"bmielke_prior_{self.season - 1}.json"
+
+    def _prior_load(self) -> Dict[str, Optional[list]]:
+        """The on-disk prior store, read once per process."""
+        if self._prior_wobacon is None:
+            try:
+                p = self._prior_path()
+                self._prior_wobacon = (json_loads(p.read_text())
+                                       if p.exists() else {})
+            except Exception:
+                self._prior_wobacon = {}
+        return self._prior_wobacon
+
     async def get_prior_wobacon(self, session: aiohttp.ClientSession,
                                 player_id: int) -> tuple:
         """(xwOBAcon, batted balls) for LAST season — BMIELKE's prior.
 
-        Costs one extra Savant CSV the first time a hitter is opened, then
-        rides the same 1h cache as everything else. Returns (None, None) on
-        any failure, and BMIELKE falls back to the league prior — which is
-        what it did before v9, so a miss is a degradation and never an
-        error."""
+        Cached PERMANENTLY on disk, keyed by prior season. That season is
+        final: the two scalars this returns cannot change, but deriving them
+        costs a ~0.8MB full-season pitch-by-pitch CSV, and the 1h in-memory
+        TTL it used to ride meant every hitter re-downloaded his immutable
+        prior once an hour, every session — measured as half the Savant bytes
+        of a lineup click-through. A sub-25-BBE miss is stored as null so
+        those hitters stop re-downloading too.
+
+        Returns (None, None) on any failure, and BMIELKE falls back to the
+        league prior — which is what it did before v9, so a miss is a
+        degradation and never an error."""
+        store = self._prior_load()
+        key = str(player_id)
+        if key in store:
+            hit = store[key]
+            return (None, None) if hit is None else (hit[0], hit[1])
         try:
             rows = await self._get_pitch_detail(session, player_id, "batter",
                                                 year=self.season - 1)
@@ -5239,9 +5425,16 @@ class MLBPropStats:
         xw = [r.get("xwoba") or 0.0 for r in rows
               if r.get("ev") is not None and r.get("hc_x") is not None
               and r.get("hc_y") is not None]
-        if len(xw) < 25:
-            return None, None
-        return sum(xw) / len(xw), len(xw)
+        # An EMPTY pull is a failed/throttled fetch, not a real sub-25 hitter
+        # — recording it as a null would make that failure permanent.
+        out = None if len(xw) < 25 else [sum(xw) / len(xw), len(xw)]
+        if rows or out is not None:
+            store[key] = out
+            try:
+                self._prior_path().write_text(json.dumps(store))
+            except OSError as e:
+                print(f"EffortMLB: prior store write failed: {e}")
+        return (None, None) if out is None else (out[0], out[1])
 
     async def get_per_game_statcast(self, session: aiohttp.ClientSession,
                                     player_id: int,
@@ -5819,78 +6012,12 @@ class MLBPropStats:
             {"sportId": "1", "season": str(self.season),
              "teamId": str(team_id), "gameType": "R",
              "fields": SEASON_SCHED_FIELDS})
-        games = []
-        for d in (sched or {}).get("dates") or []:
-            for g in d.get("games") or []:
-                if (g.get("status") or {}).get(
-                        "abstractGameState") != "Final":
-                    continue
-                try:
-                    games.append((g["gamePk"],
-                                  g["teams"]["home"]["team"]["id"],
-                                  g["teams"]["away"]["team"]["id"]))
-                except KeyError:
-                    continue
+        games = _final_games(sched)
         if not games:
             return None
 
-        stints: List[dict] = []
-        decisions: Dict[str, float] = defaultdict(float)
-        rv_events: List[dict] = []
-        abs_acc: Dict[str, float] = defaultdict(float)
-
-        async def one(gp, hid, aid):
-            async with self._sem:
-                try:
-                    async with session.get(
-                            f"{STATS_BASE}/game/{gp}/playByPlay",
-                            params={"fields": PBP_FIELDS},
-                            timeout=aiohttp.ClientTimeout(total=45)) as resp:
-                        if resp.status != 200:
-                            return
-                        pbp = json_loads(await resp.read())
-                except Exception:
-                    return
-            stints.extend(s for s in pitching_stints(pbp, hid, aid)
-                          if s["team"] == team_id)
-            for k, v in decision_counts(pbp, hid, aid).get(team_id,
-                                                           {}).items():
-                decisions[k] += v
-            rv_events.extend(rv_events_from_pbp(pbp, hid, aid).get(team_id,
-                                                                   []))
-            for k, v in abs_challenges(pbp, hid, aid).get(team_id,
-                                                          {}).items():
-                abs_acc[k] += v
-            # RE24 is a LEAGUE table — every game seen by any team's fetch
-            # feeds it (each game arrives twice, once per club, which is a
-            # uniform double-count and so leaves the means unbiased)
-            re24_from_pbp(pbp, self._re24_acc)
-            we_from_pbp(pbp, self._we_acc, self._we_trans)
-            tto_from_pbp(pbp, self._tto_acc)
-            umpire_game_stats(pbp, gp, self._ump_acc)
-
-        await asyncio.gather(*(one(*g) for g in games))
-        data = summarize_stints(stints)
-        if data and decisions.get("games"):
-            g = decisions["games"]
-            data["decisions"] = {
-                "games": int(g),
-                "sac_bunt": decisions["sac_bunt"] / g,
-                "sb_att": decisions["sb_att"] / g,
-                "sb_rate": (decisions["sb_ok"] / decisions["sb_att"]
-                            if decisions["sb_att"] else None),
-                "pinch_hit": decisions["pinch_hit"] / g,
-                "ibb": decisions["ibb"] / g,
-                "mound_visit": decisions["mound_visit"] / g,
-                "def_move": decisions["def_move"] / g,
-            }
-            data["rv_events"] = rv_events
-            data["sb_by_base"] = {b: decisions.get(f"sb_{b}", 0)
-                                  for b in ("2b", "3b", "home")}
-            data["cs_by_base"] = {b: decisions.get(f"cs_{b}", 0)
-                                  for b in ("2b", "3b", "home")}
-        if data and abs_acc.get("n"):
-            data["abs"] = summarize_abs(abs_acc)
+        ck = await self._ingest_pbp(session, games)
+        data = _tendencies_from_acc(ck["teams"].get(team_id))
         if data:
             self._mgr_tend[team_abbr] = (time.time(), data)
             blob = json.dumps(data)
@@ -5898,64 +6025,107 @@ class MLBPropStats:
             slate_cache_put(dc_key, blob)
         return data
 
-    async def prefetch_manager_tendencies(self, session: aiohttp.ClientSession,
-                                          progress: Optional[Callable] = None
-                                          ) -> None:
-        """Build EVERY club's manager tendencies in ONE league-wide pass.
+    # ------------------------------------------- season play-by-play walk
 
-        `get_manager_tendencies` is per-club, and each club's pass walks its
-        own ~110 games — but a game has TWO clubs, so the season's ~1,650
-        games were being downloaded ~3,300 times. That factor of two is the
-        whole cold-start cost of the Managers tab (each play-by-play is
-        ~0.6MB, and they share the file-wide 8-way semaphore with everything
-        else the window is loading).
+    def _pbp_ck_load(self) -> dict:
+        """Load (once per session) the season checkpoint, with the league
+        tables it was built from. See PBP_CK_VERSION for why the tables and
+        the gamePk set are one file."""
+        if self._pbp_ck is not None:
+            return self._pbp_ck
+        ck: dict = {"games": set(), "teams": {}}
+        p = _pbp_ck_path(self.season)
+        if SLATE_CACHE and p.exists():
+            try:
+                raw = json_loads(p.read_bytes())
+                for tid, a in (raw["teams"] or {}).items():
+                    ck["teams"][int(tid)] = {
+                        "stints": a["stints"],
+                        "dec": defaultdict(float, a["dec"]),
+                        "rv": a["rv"],
+                        "abs": defaultdict(float, a["abs"]),
+                    }
+                self._re24_acc = _decode_tuple_keyed(raw["re24"])
+                self._we_acc = _decode_tuple_keyed(raw["we_acc"])
+                self._we_trans = {(tuple(a), tuple(b)): n
+                                  for a, b, n in raw["we_trans"]}
+                self._tto_acc = {int(t): _decode_tuple_keyed(v)
+                                 for t, v in raw["tto"]}
+                self._ump_acc = {int(k): v for k, v in raw["ump"]}
+                ck["games"] = set(raw["games"])
+                print(f"EffortMLB: play-by-play checkpoint — "
+                      f"{len(ck['games'])} games already folded in "
+                      f"({len(self._we_trans)} WE transitions)")
+            except Exception as e:
+                # Partial state is worse than none: a half-decoded file
+                # would leave league tables counting games the set no longer
+                # claims. Throw ALL of it away and rebuild.
+                print(f"EffortMLB: play-by-play checkpoint unreadable ({e}); "
+                      "rebuilding from scratch")
+                ck = {"games": set(), "teams": {}}
+                self._re24_acc, self._we_acc, self._we_trans = {}, {}, {}
+                self._tto_acc, self._ump_acc = {}, {}
+        self._pbp_ck = ck
+        return ck
 
-        Here each gamePk is fetched exactly ONCE and dispatched to both
-        clubs' accumulators. Same inputs, same per-club output, same cache
-        keys — so a warm start is unaffected and the per-club method still
-        works standalone.
-
-        Clubs already in the slate cache are skipped, and if every club is
-        cached this returns without a single request.
-        """
-        if not self._teams:
+    def _pbp_ck_save(self) -> None:
+        ck = self._pbp_ck
+        if not SLATE_CACHE or not ck:
             return
-        by_id = dict(self._teams)                     # team id -> abbr
-        need: Dict[int, str] = {}
-        for tid, abbr in by_id.items():
-            dc_key = f"mgr_tend_v5_{abbr}_{self.season}"
-            if self._mgr_tend.get(abbr):
-                continue
-            if dev_cache_get(dc_key) or slate_cache_get(dc_key):
-                continue
-            need[tid] = abbr
-        if not need:
-            return
+        try:
+            payload = {
+                "games": sorted(ck["games"]),
+                "teams": {str(t): {"stints": a["stints"], "dec": dict(a["dec"]),
+                                   "rv": a["rv"], "abs": dict(a["abs"])}
+                          for t, a in ck["teams"].items()},
+                "re24": _encode_tuple_keyed(self._re24_acc),
+                "we_acc": _encode_tuple_keyed(self._we_acc),
+                "we_trans": [[list(a), list(b), n]
+                             for (a, b), n in self._we_trans.items()],
+                "tto": [[t, _encode_tuple_keyed(v)]
+                        for t, v in self._tto_acc.items()],
+                "ump": [[str(k), v] for k, v in self._ump_acc.items()],
+            }
+            p = _pbp_ck_path(self.season)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(p)                    # never a half-written checkpoint
+        except Exception as e:
+            print(f"EffortMLB: play-by-play checkpoint write failed: {e}")
 
-        # ONE league schedule, not thirty team schedules
-        sched = await self._get_json(
-            session, f"{STATS_BASE}/schedule",
-            {"sportId": "1", "season": str(self.season), "gameType": "R",
-             "fields": SEASON_SCHED_FIELDS})
-        games = []
-        for d in (sched or {}).get("dates") or []:
-            for g in d.get("games") or []:
-                if (g.get("status") or {}).get(
-                        "abstractGameState") != "Final":
-                    continue
-                try:
-                    hid = g["teams"]["home"]["team"]["id"]
-                    aid = g["teams"]["away"]["team"]["id"]
-                except KeyError:
-                    continue
-                if hid in need or aid in need:
-                    games.append((g["gamePk"], hid, aid))
-        if not games:
-            return
+    async def _ingest_pbp(self, session: aiohttp.ClientSession,
+                          games: List[tuple],
+                          progress: Optional[Callable] = None) -> dict:
+        """Fold every game in `games` the checkpoint has NOT already seen
+        into the per-club accumulators and the league tables, and return the
+        checkpoint.
 
-        acc = {tid: {"stints": [], "decisions": defaultdict(float),
-                     "rv": [], "abs": defaultdict(float)}
-               for tid in need}
+        This is the only place play-by-play is downloaded. Each gamePk is
+        fetched exactly once ever — a FINAL game's play-by-play is immutable,
+        so on the day after a full walk this makes ~15 requests, not ~1,650.
+
+        The raw play-by-play is deliberately NOT routed through _get_json:
+        that dev-caches every response, and a season at ~0.115MB each would
+        bury savedata/devcache. Only the derived aggregate is persisted.
+
+        Serialised on `_pbp_lock`. The manager board fans out over thirty
+        clubs at once and every club's schedule overlaps every other's — two
+        ingests running together would both fetch the same gamePk before
+        either marked it seen, and fold it into the league tables TWICE. The
+        lock costs nothing in the normal case: the second caller wakes up to
+        find its games already folded in and returns without a request."""
+        async with self._pbp_lock:
+            return await self._ingest_pbp_locked(session, games, progress)
+
+    async def _ingest_pbp_locked(self, session: aiohttp.ClientSession,
+                                 games: List[tuple],
+                                 progress: Optional[Callable] = None) -> dict:
+        ck = self._pbp_ck_load()
+        seen = ck["games"]
+        todo = [g for g in games if g[0] not in seen]
+        if not todo:
+            return ck
         done = [0]
 
         async def one(gp, hid, aid):
@@ -5975,57 +6145,70 @@ class MLBPropStats:
             rvs = rv_events_from_pbp(pbp, hid, aid)
             chg = abs_challenges(pbp, hid, aid)
             for tid in (hid, aid):
-                a = acc.get(tid)
+                a = ck["teams"].get(tid)
                 if a is None:
-                    continue
+                    a = ck["teams"][tid] = {
+                        "stints": [], "dec": defaultdict(float),
+                        "rv": [], "abs": defaultdict(float)}
                 a["stints"].extend(s for s in stints if s["team"] == tid)
                 for k, v in dec.get(tid, {}).items():
-                    a["decisions"][k] += v
+                    a["dec"][k] += v
                 a["rv"].extend(rvs.get(tid, []))
                 for k, v in chg.get(tid, {}).items():
                     a["abs"][k] += v
-            # League tables, ONCE per game. The per-club path visits every
-            # game twice and so double-counts these; that is harmless there
-            # because every consumer reads a MEAN and a uniform double-count
-            # leaves means untouched. Counting once here is simply correct,
-            # and it is why the reported table sizes are about half what the
-            # per-club path produced.
+            # League tables, ONCE per game — `seen` is what guarantees it,
+            # for both clubs of this game and for every later run.
             re24_from_pbp(pbp, self._re24_acc)
             we_from_pbp(pbp, self._we_acc, self._we_trans)
             tto_from_pbp(pbp, self._tto_acc)
             umpire_game_stats(pbp, gp, self._ump_acc)
+            # Marked only after every accumulator has taken it: a game that
+            # errored out above must be retried next run, not skipped.
+            seen.add(gp)
             done[0] += 1
             if progress and done[0] % 25 == 0:
-                progress(done[0], len(games))
+                progress(done[0], len(todo))
 
-        await asyncio.gather(*(one(*g) for g in games))
+        await asyncio.gather(*(one(*g) for g in todo))
+        self._pbp_ck_save()
+        return ck
 
-        for tid, abbr in need.items():
-            a = acc[tid]
-            data = summarize_stints(a["stints"])
+    async def prefetch_manager_tendencies(self, session: aiohttp.ClientSession,
+                                          progress: Optional[Callable] = None
+                                          ) -> None:
+        """Build EVERY club's manager tendencies in ONE league-wide pass.
+
+        Two things this avoids. A game has TWO clubs, so thirty per-club
+        walks download the season's ~1,650 games ~3,300 times — here each
+        gamePk is dispatched to both clubs' accumulators from a single fetch.
+        And the season checkpoint means only games never folded in before are
+        fetched at all, so the day after a full walk costs ~15 games.
+
+        Same per-club output and same cache keys as the per-club method, so a
+        warm start is unaffected and that method still works standalone."""
+        if not self._teams:
+            return
+
+        # ONE league schedule, not thirty team schedules. It is fetched even
+        # when every club is cached — it is one small request, and it is how
+        # we learn which gamePks are new.
+        sched = await self._get_json(
+            session, f"{STATS_BASE}/schedule",
+            {"sportId": "1", "season": str(self.season), "gameType": "R",
+             "fields": SEASON_SCHED_FIELDS})
+        games = _final_games(sched)
+        if not games:
+            return
+
+        ck = await self._ingest_pbp(session, games, progress)
+
+        # Rebuilt for every club from the in-memory accumulators (cheap, no
+        # I/O) rather than only for clubs that missed the cache — otherwise
+        # last night's games would sit in the checkpoint unreported.
+        for tid, abbr in self._teams.items():
+            data = _tendencies_from_acc(ck["teams"].get(tid))
             if not data:
                 continue
-            dec = a["decisions"]
-            if dec.get("games"):
-                g = dec["games"]
-                data["decisions"] = {
-                    "games": int(g),
-                    "sac_bunt": dec["sac_bunt"] / g,
-                    "sb_att": dec["sb_att"] / g,
-                    "sb_rate": (dec["sb_ok"] / dec["sb_att"]
-                                if dec["sb_att"] else None),
-                    "pinch_hit": dec["pinch_hit"] / g,
-                    "ibb": dec["ibb"] / g,
-                    "mound_visit": dec["mound_visit"] / g,
-                    "def_move": dec["def_move"] / g,
-                }
-                data["rv_events"] = a["rv"]
-                data["sb_by_base"] = {b: dec.get(f"sb_{b}", 0)
-                                      for b in ("2b", "3b", "home")}
-                data["cs_by_base"] = {b: dec.get(f"cs_{b}", 0)
-                                      for b in ("2b", "3b", "home")}
-            if a["abs"].get("n"):
-                data["abs"] = summarize_abs(a["abs"])
             self._mgr_tend[abbr] = (time.time(), data)
             blob = json.dumps(data)
             dc_key = f"mgr_tend_v5_{abbr}_{self.season}"
@@ -6034,53 +6217,30 @@ class MLBPropStats:
 
     # ---------------------------------------------------- slate persistence
 
-    _LEAGUE_TABLES_KEY = "league_tables_v1"
-
     def save_league_tables(self):
         """Persist the league tables the play-by-play walk builds.
 
-        These MUST travel with the per-team manager cache. A cached team
-        returns before the walk runs, so on a warm start nothing populates
-        RE24, the win-expectancy grid, the times-through-order bins or the
-        umpire tallies — the manager board would come up instantly with the
-        leverage, run-expectancy and umpire features silently empty. That is
-        the exact failure mode the dev-cache schema note warns about, so the
-        tables are cached alongside, not left to be rebuilt."""
-        try:
-            payload = {
-                "re24": _encode_tuple_keyed(self._re24_acc),
-                "we_acc": _encode_tuple_keyed(self._we_acc),
-                "we_trans": [[list(a), list(b), n]
-                             for (a, b), n in self._we_trans.items()],
-                "tto": [[t, _encode_tuple_keyed(v)]
-                        for t, v in self._tto_acc.items()],
-                "ump": [[str(k), v] for k, v in self._ump_acc.items()],
-            }
-            slate_cache_put(self._LEAGUE_TABLES_KEY, json.dumps(payload))
-        except Exception as e:
-            print(f"EffortMLB: league table cache write failed: {e}")
+        These MUST travel with the set of games they were summed over, which
+        is why they live in the season checkpoint rather than a table of
+        their own: restoring tables built from one set of gamePks next to a
+        game set claiming another would double-count or drop games, and the
+        symptom would be quietly wrong run expectancy, not an error.
+
+        `_ingest_pbp` already saves after folding in new games; this stays so
+        the board's end-of-load call is still correct (and cheap — it rewrites
+        the same file)."""
+        self._pbp_ck_save()
 
     def load_league_tables(self) -> bool:
-        raw = slate_cache_get(self._LEAGUE_TABLES_KEY)
-        if not raw:
-            return False
-        try:
-            p = json_loads(raw)
-            self._re24_acc = _decode_tuple_keyed(p["re24"])
-            self._we_acc = _decode_tuple_keyed(p["we_acc"])
-            self._we_trans = {(tuple(a), tuple(b)): n
-                              for a, b, n in p["we_trans"]}
-            self._tto_acc = {int(t): _decode_tuple_keyed(v)
-                             for t, v in p["tto"]}
-            self._ump_acc = {int(k): v for k, v in p["ump"]}
-            print(f"EffortMLB: slate cache — league tables restored "
-                  f"({len(self._ump_acc)} games, {len(self._we_trans)} "
-                  f"WE transitions)")
-            return True
-        except Exception as e:
-            print(f"EffortMLB: league table cache unreadable ({e}); "
-                  "rebuilding from play-by-play")
-            return False
+        """Restore the league tables from the season checkpoint.
+
+        A club served from the slate cache returns without walking any
+        play-by-play, so on a warm start nothing else would populate RE24,
+        the win-expectancy grid, the TTO bins or the umpire tallies — the
+        manager board would come up instantly with the leverage,
+        run-expectancy and umpire features silently empty."""
+        self._pbp_ck_load()
+        return bool(self._re24_acc)
 
     def run_expectancy(self, min_n: int = 200) -> Dict[tuple, float]:
         """League RE24 table built from whatever play-by-play has been seen:
@@ -6092,6 +6252,44 @@ class MLBPropStats:
     def leverage_index(self) -> Dict[tuple, float]:
         """Empirical Leverage Index per game state (league average = 1.0)."""
         return build_leverage(self._we_acc, self._we_trans)
+
+    async def warm_we_surface(self):
+        """Precompute the win-expectancy surface on a worker thread.
+
+        `annotate_win_expectancy` is synchronous and memoises the fit on
+        `_we_surface`, so warming that cache here means the Replay tab finds
+        it ready instead of running a ~190ms sklearn fit on the UI thread —
+        measured as the single largest named stall during startup, landing
+        mid-animation.
+
+        Worth offloading precisely BECAUSE it is sklearn: the fit spends its
+        time in BLAS with the GIL released, unlike the play-by-play
+        `json.loads` where threading bought nothing.
+
+        Call once the league tables are FINAL. The cache key is the table
+        sizes, so warming against tables that then grow just refits later.
+        """
+        acc, trans = self._we_acc, self._we_trans
+        if not acc:
+            return
+        sig = (len(acc), len(trans))
+        cached = getattr(self, "_we_surface", None)
+        if cached and cached[0] == sig:
+            return
+
+        def _fit():
+            states = {k for pair in trans for k in pair} | set(acc)
+            we = smooth_win_expectancy(acc, states)
+            if not we:
+                we = {k: v[0] / v[1] for k, v in acc.items() if v[1] >= 30}
+            return we, build_leverage(acc, trans)
+
+        try:
+            we, li = await asyncio.get_event_loop().run_in_executor(None, _fit)
+        except Exception as e:
+            print(f"EffortMLB: WE surface warm failed: {e}")
+            return
+        self._we_surface = (sig, we, li)
 
     def tto_run_values(self) -> Dict[int, float]:
         """Runs allowed per batter faced by a STARTER, by times through the
@@ -6313,6 +6511,14 @@ class MLBPropStats:
         page source (note: `const`, not the `var` the park-factor page uses)."""
         if self._frv_cache is not None:
             return self._frv_cache
+        async with self._frv_lock:
+            if self._frv_cache is not None:
+                return self._frv_cache
+            return await self._fetch_fielding_runs(session)
+
+    async def _fetch_fielding_runs(self, session: aiohttp.ClientSession
+                                   ) -> Dict[str, dict]:
+        """Uncached body of `get_fielding_runs` — call through that."""
         out: Dict[str, dict] = {}
         try:
             async with self._sem:
@@ -6832,15 +7038,16 @@ class MLBPropStats:
 
 import pyqtgraph as pg
 from PyQt6.QtCore import (Qt, QUrl, QRect, QRectF, QEvent, QPoint, QPointF,
-                          QSize, pyqtSignal, QTimer)
+                          QSize, pyqtSignal, QTimer, QElapsedTimer, QObject)
 from PyQt6.QtGui import (QColor, QFont, QPixmap, QPainter, QPainterPath,
-                         QIcon, QAction, QPen, QTextDocument)
+                         QIcon, QAction, QPen, QTextDocument, QPolygonF,
+                         QFontMetrics, QRadialGradient)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QSizePolicy,
     QGridLayout, QComboBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QScrollArea, QPushButton,
-    QMenu, QToolButton, QLayout, QCheckBox,
+    QMenu, QToolButton, QLayout, QCheckBox, QLineEdit, QStackedWidget,
 )
 
 _STATS_TABLE_QSS = """
@@ -11140,6 +11347,11 @@ class ManagerBoardTab(QWidget):
     Loads lazily on first show: a season of play-by-play per team is ~110
     requests, so the board fills in team by team rather than blocking."""
 
+    # Emitted when the first full load settles (success OR failure) — the
+    # startup overlay waits on it. Always emitted exactly once, or the window
+    # would stay behind the loader.
+    load_finished = pyqtSignal()
+
     # (key into the tendency dict, header, decimals, is_pct)
     _COLS = [
         ("sp_ip", "SP IP", 2, False), ("sp_pitches", "NP", 0, False),
@@ -11462,6 +11674,15 @@ class ManagerBoardTab(QWidget):
 
     def showEvent(self, a0):
         super().showEvent(a0)
+        self.ensure_loaded()
+
+    def ensure_loaded(self):
+        """Kick the load without needing to be shown.
+
+        The startup overlay HIDES the whole UI while it builds, so showEvent
+        never fires during startup and this board would sit empty until the
+        overlay's watchdog gave up. Idempotent, so the showEvent path is
+        still correct for a normal first view."""
         if not self._loaded and self._stats is not None:
             self._loaded = True
             asyncio.create_task(self._load())
@@ -11469,6 +11690,13 @@ class ManagerBoardTab(QWidget):
     # ------------------------------------------------------------ loading
 
     async def _load(self):
+        try:
+            await self._load_inner()
+        finally:
+            # Exactly once, on every path — the startup overlay is waiting.
+            self.load_finished.emit()
+
+    async def _load_inner(self):
         try:
             async with self._stats.http() as session:
                 if not await self._stats.ensure_roster(session):
@@ -11513,6 +11741,11 @@ class ManagerBoardTab(QWidget):
                         self._add_row(abbr, d)
                     self._status.setText(
                         f"Loaded {done[0]}/{len(teams)} clubs…")
+                    # Hand the loop back between clubs. Warm, every one of
+                    # these is a cache hit, so all 30 rows would otherwise be
+                    # built in one unbroken block with no repaint in between
+                    # — which is exactly when the startup overlay freezes.
+                    await asyncio.sleep(0)
 
                 await asyncio.gather(*(one(t) for t in teams))
         except Exception as e:
@@ -12159,7 +12392,14 @@ class PenUsageStrip(QWidget):
                 break
             y = hdr_h + t.rowViewportPosition(i)
             rh = t.rowHeight(i)
-            if rh <= 0 or y + rh > self.height():
+            # Skip only rows that start past the bottom. Testing the row's
+            # END dropped the whole cell for a row hanging a few pixels over,
+            # so the last reliever silently lost his week whenever this strip
+            # came out marginally shorter than the table — which is what a
+            # layout measured before Qt resolved it does. QPainter clips the
+            # overhang by itself; a partially drawn last row is honest, an
+            # absent one is not.
+            if rh <= 0 or y >= self.height():
                 continue
             # newest first in the data; draw oldest LEFT so time runs toward
             # the table, i.e. toward tonight
@@ -12727,6 +12967,23 @@ class BullpenPanel(QWidget):
         # same order the table was just built in, so row i lines up with
         # reliever i beside it
         self._usage.set_rows(rows)
+
+    def refresh_layout(self):
+        """Re-measure after the panel has actually been laid out.
+
+        Everything in `_do_cap` is measured off a LAID-OUT table — row
+        heights and `viewport().width()` above all — but the startup overlay
+        renders this panel while the whole UI is hidden, so those come back
+        against a layout Qt never resolved and the height gets pinned near
+        `_MIN_PANEL_H`. `PenUsageStrip.paintEvent` then drops every row whose
+        bottom falls past its own (too short) height, so relievers lost their
+        week of work. Clicking to another game only appeared to fix it: that
+        re-rendered while visible.
+        """
+        if not self._table.rowCount():
+            return
+        self._cap_panel_height()
+        self._usage.update()
 
     def _cap_panel_height(self):
         """Fixed panel height = data height: the splitter can neither grow
@@ -15760,8 +16017,505 @@ async def _main():
 #    Right: batter half — Player Detail / Advanced Stats tabs.
 # ===========================================================================
 
-from PyQt6.QtWidgets import (QMainWindow, QSplitter, QTabWidget, QListWidget,
-                             QListWidgetItem, QStyledItemDelegate, QStyle)
+from PyQt6.QtWidgets import (QMainWindow, QSplitter, QSplitterHandle,
+                             QTabWidget, QListWidget, QListWidgetItem,
+                             QStyledItemDelegate, QStyle)
+
+
+QML_DIR = Path(__file__).resolve().parent / "qml"
+
+
+class QuickSeamLoader(QObject):
+    """Startup overlay that lives INSIDE the main window but animates on Qt
+    Quick's render thread.
+
+    Qt allows no thread but the GUI thread to touch widgets, so a QPainter
+    overlay can only animate in the gaps between panel construction — which
+    is what made it hitch. The way out is not to move widget work off-thread
+    (impossible) but to render the overlay with something that is not a
+    widget: a QQuickView, whose threaded render loop keeps drawing while the
+    GUI thread is busy.
+
+    !! It must be `createWindowContainer`, and it must NOT be QQuickWidget !!
+    Both put Qt Quick in a widget UI, but `QQuickWidget` renders through an
+    FBO on the GUI THREAD (documented, and measured: it stalls exactly like
+    QPainter did). `createWindowContainer` embeds the QQuickView as a real
+    native child window that keeps its own render thread. Measured with the
+    GUI thread hard-blocked for 1.5s: 112 render passes still delivered,
+    worst gap 14.3ms.
+
+    A separate top-level overlay window also works but was rejected — it did
+    not reliably keep stacking above the main window, so the UI was visible
+    populating underneath it.
+    """
+
+    finished = pyqtSignal()
+
+    def __init__(self, host: QWidget, steps: List[tuple]):
+        super().__init__(host)
+        self._host = host
+        self._steps = list(steps)
+        self._pending = {k for k, _ in self._steps}
+        from PyQt6.QtQuick import QQuickView
+        v = QQuickView()
+        # Transparent clear colour so the OpacityAnimator fade dissolves into
+        # the finished UI behind it rather than into an opaque plate.
+        v.setColor(QColor(0, 0, 0, 0))
+        v.setResizeMode(QQuickView.ResizeMode.SizeRootObjectToView)
+        v.setSource(QUrl.fromLocalFile(str(QML_DIR / "SeamLoader.qml")))
+        if v.status() != QQuickView.Status.Ready:
+            for e in v.errors():
+                print(f"EffortMLB: QML loader error: {e.toString()}")
+            raise RuntimeError("SeamLoader.qml failed to load")
+        self._view = v
+        self._root = v.rootObject()
+        self._root.faded.connect(self._on_faded)
+        self._container = QWidget.createWindowContainer(v, host)
+        self._container.setGeometry(host.rect())
+        self._label(self._steps[0][1] if self._steps else "loading…")
+        self._container.show()
+        self._container.raise_()
+
+    def _label(self, text: str):
+        if self._root is not None:
+            self._root.setProperty("label", text)
+
+    def setGeometry(self, rect):
+        """Named to match SeamLoader so the window can drive either."""
+        if self._container is not None:
+            self._container.setGeometry(rect)
+
+    def raise_(self):
+        if self._container is not None:
+            self._container.raise_()
+
+    def step(self, key: str, label: Optional[str] = None):
+        self._pending.discard(key)
+        if self._root is not None:
+            total = max(1, len(self._steps))
+            self._root.setProperty(
+                "progress", (total - len(self._pending)) / total)
+        nxt = label or next((l for k, l in self._steps if k in self._pending),
+                            None)
+        if nxt:
+            self._label(nxt)
+
+    def finish(self):
+        if self._root is None:
+            return
+        self._pending.clear()
+        self._root.setProperty("progress", 1.0)
+        self._label("ready")
+        self._root.setProperty("fading", True)
+
+    def _on_faded(self):
+        c, self._container = self._container, None
+        self._view = self._root = None
+        if c is not None:
+            c.hide()
+            c.deleteLater()
+        self.finished.emit()
+
+
+class StartupTracker:
+    """Records every asyncio task created while the startup overlay is up.
+
+    Hand-listing what to wait for does not work here: panels spawn their own
+    fetches from inside plain Qt calls — `PitcherFormPanel.show_pitcher()`
+    and `BullpenPanel.show_team()` both `create_task` internally — so the
+    overlay lifted while the SP card and the pen table were still filling,
+    which is exactly what it exists to prevent. A task factory catches all of
+    it, including tasks that later spawn tasks of their own.
+
+    EXCLUDE holds the deliberately long-lived ones. `_show_umpire` backs off
+    for up to 57s by design and `_poll_lineups` runs all afternoon; waiting on
+    either would mean never lifting the overlay.
+    """
+
+    EXCLUDE = ("_show_umpire", "_poll_lineups", "_init_async")
+
+    def __init__(self, loop):
+        self._loop = loop
+        self._prev = loop.get_task_factory()
+        self._tasks: set = set()
+        self._on = False
+
+    def install(self):
+        def factory(loop, coro, **kw):
+            if self._prev is not None:
+                t = self._prev(loop, coro, **kw)
+            else:
+                t = asyncio.Task(coro, loop=loop, **kw)
+            if self._on:
+                name = getattr(coro, "__qualname__", "") or str(coro)
+                if not any(x in name for x in self.EXCLUDE):
+                    self._tasks.add(t)
+                    t.add_done_callback(self._tasks.discard)
+            return t
+        self._on = True
+        self._loop.set_task_factory(factory)
+
+    def uninstall(self):
+        self._on = False
+        try:
+            self._loop.set_task_factory(self._prev)
+        except Exception:
+            pass
+
+    async def drain(self, quiet_rounds: int = 3, gap: float = 0.05):
+        """Block until nothing tracked is outstanding, and stays that way.
+
+        The re-check matters: a task finishing is often what spawns the next
+        one (a fetch completing then populating a panel), so a single empty
+        observation is not proof that startup has settled."""
+        me = asyncio.current_task()
+        empty = 0
+        while empty < quiet_rounds:
+            pending = [t for t in self._tasks if not t.done() and t is not me]
+            if pending:
+                empty = 0
+                await asyncio.gather(*pending, return_exceptions=True)
+                continue
+            empty += 1
+            await asyncio.sleep(gap)
+
+
+class SeamLoader(QWidget):
+    """Full-cover startup overlay: a baseball seam inking itself in.
+
+    The seam is the REAL curve on the sphere, not a decorative squiggle:
+    z = A·sin(2t) with the xy radius pinned to sqrt(1 - z²), which is
+    identically on the unit sphere and is exactly the baseball/tennis seam
+    shape. It is rotated in 3-D and orthographically projected each frame, so
+    the far side of the stitching correctly dims out as the ball turns.
+
+    !! SMOOTHNESS !!  The qasync loop IS the UI thread (see the loop-blocking
+    notes elsewhere in this file), so a CPU-bound stretch of startup work
+    cannot be painted through — frames WILL be dropped. Everything here is
+    therefore driven off a wall clock rather than a frame counter: a dropped
+    frame skips motion forward instead of slowing it down, so the animation
+    reads as smooth-with-a-hitch rather than as stuttering slow-motion. The
+    other half of that bargain lives in the startup path, which has to yield
+    often enough for the repaint to land at all.
+
+    Progress is LERPED toward the step count rather than snapped to it, so a
+    milestone landing reads as the seam continuing to ink rather than as a
+    jump.
+    """
+
+    finished = pyqtSignal()
+
+    SEAM_A = 0.76          # seam amplitude — 0.76 is the baseball proportion
+    N = 400                # seam samples (precomputed once)
+    STITCHES = 60
+    FADE_MS = 460
+    IDLE_MS = 26           # a frame this quick means the loop is keeping up
+    # ~300ms of unbroken calm. Six frames (100ms) was measured to be too
+    # short a window: untracked fan-out work surfaced just after it passed
+    # and stalled the fade anyway.
+    IDLE_FRAMES = 18
+    IDLE_CAP = 4000        # but never wait longer than this to start fading
+
+    BG = QColor("#151a21")
+    BALL_HI = QColor("#fbfcfd")
+    BALL_MID = QColor("#e4e8ec")
+    BALL_LO = QColor("#aab3bd")
+    RED = QColor("#e74c3c")
+    RED_FRESH = QColor("#ff8a7a")
+    RING = QColor("#34495E")
+    GRN = QColor("#2ecc71")
+    TXT = QColor("#ecf0f1")
+    DIM = QColor("#7f8c8d")
+
+    def __init__(self, parent, steps: List[tuple]):
+        super().__init__(parent)
+        self._steps = list(steps)            # [(key, label), ...]
+        self._pending = {k for k, _ in self._steps}
+        self._label = self._steps[0][1] if self._steps else "loading…"
+        self._shown = 0.0                    # lerped progress actually drawn
+        self._fade_start: Optional[int] = None
+        self._armed: Optional[int] = None    # finish() requested at (ms)
+        self._calm = 0                       # consecutive on-time frames
+        self._clock = QElapsedTimer()
+        self._clock.start()
+        self._last = 0
+        # Precompute the seam once — 400 sin/cos pairs per frame is pure
+        # waste when the curve never changes, only its orientation does.
+        self._seam = [self._seam_pt(i / self.N * 2 * math.pi)
+                      for i in range(self.N + 1)]
+        self.setAutoFillBackground(False)
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self.update)
+        self._timer.start(16)
+
+    # ------------------------------------------------------------- geometry
+
+    @classmethod
+    def _seam_pt(cls, t: float) -> tuple:
+        z = cls.SEAM_A * math.sin(2 * t)
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        return (r * math.cos(t), r * math.sin(t), z)
+
+    @staticmethod
+    def _rot(p: tuple, ax: float, ay: float) -> tuple:
+        x, y, z = p
+        c, s = math.cos(ay), math.sin(ay)
+        x, z = x * c + z * s, -x * s + z * c
+        c, s = math.cos(ax), math.sin(ax)
+        y, z = y * c - z * s, y * s + z * c
+        return (x, y, z)
+
+    # -------------------------------------------------------------- driving
+
+    def step(self, key: str, label: Optional[str] = None):
+        """Mark one startup milestone done. Unknown/repeat keys are ignored
+        so a caller can fire defensively without double-counting."""
+        if key in self._pending:
+            self._pending.discard(key)
+        if label:
+            self._label = label
+        else:
+            nxt = next((l for k, l in self._steps if k in self._pending), None)
+            if nxt:
+                self._label = nxt
+
+    def finish(self):
+        """Begin the fade-out once the loop is actually idle. Idempotent.
+
+        The fade is the part of this that gets looked at hardest — it is the
+        moment attention is on the overlay rather than on whatever is behind
+        it — so it is the one stretch that must not stutter. Startup work is
+        not perfectly fenced (a game selection fans out tasks nobody awaits),
+        and a 400ms stall landing mid-fade reads as the window hanging right
+        as it opens. So arm here and let `paintEvent` start the fade only
+        after IDLE_FRAMES consecutive on-time frames prove the loop is free.
+
+        IDLE_CAP bounds the wait: if the loop never goes quiet, fading a bit
+        roughly still beats not fading at all."""
+        if self._fade_start is None and not self._armed:
+            self._armed = self._clock.elapsed()
+            self._pending.clear()
+            self._label = "ready"
+
+    # ---------------------------------------------------------------- paint
+
+    def paintEvent(self, a0):
+        now = self._clock.elapsed()
+        dt = max(0.0, (now - self._last) / 1000.0)
+        self._last = now
+        t = now / 1000.0
+
+        # Wait for the loop to go quiet before committing to the fade.
+        if self._armed is not None and self._fade_start is None:
+            self._calm = self._calm + 1 if dt * 1000 <= self.IDLE_MS else 0
+            if (self._calm >= self.IDLE_FRAMES
+                    or now - self._armed >= self.IDLE_CAP):
+                self._fade_start = now
+
+        alpha = 1.0
+        if self._fade_start is not None:
+            alpha = 1.0 - min(1.0, (now - self._fade_start) / self.FADE_MS)
+            if alpha <= 0.0:
+                self._timer.stop()
+                self.hide()
+                self.finished.emit()
+                self.deleteLater()
+                return
+
+        total = max(1, len(self._steps))
+        target = (total - len(self._pending)) / total
+        # Time-constant lerp, NOT a per-frame constant: the rate must not
+        # depend on how many frames actually landed.
+        self._shown += (target - self._shown) * min(1.0, dt * 3.2)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setOpacity(alpha)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), self.BG)
+
+        cx, cy = w / 2.0, h / 2.0 - 18
+        R = max(46.0, min(w, h) * 0.16)
+
+        # ---- ball body
+        g = QRadialGradient(cx - R * 0.4, cy - R * 0.45, R * 1.5)
+        g.setColorAt(0.0, self.BALL_HI)
+        g.setColorAt(0.55, self.BALL_MID)
+        g.setColorAt(1.0, self.BALL_LO)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(QPointF(cx, cy), R, R)
+
+        # ---- seam, rotated + projected
+        ay = t * 0.62
+        ax = 0.42 + math.sin(t * 0.31) * 0.16
+        pts = [self._rot(q, ax, ay) for q in self._seam]
+        inked = self._smooth(self._shown)
+        upto = int(inked * self.N)
+
+        pen = QPen()
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        for i in range(upto):
+            a, b = pts[i], pts[i + 1]
+            front = (a[2] + b[2]) * 0.5 > 0
+            col = QColor(self.RED)
+            col.setAlphaF((0.95 if front else 0.16) * alpha)
+            pen.setColor(col)
+            pen.setWidthF(2.1 if front else 1.4)
+            p.setPen(pen)
+            p.drawLine(QPointF(cx + a[0] * R, cy - a[1] * R),
+                       QPointF(cx + b[0] * R, cy - b[1] * R))
+
+        # ---- stitches: V pairs perpendicular to the seam tangent
+        s = R * 0.085
+        for i in range(self.STITCHES):
+            u = i / self.STITCHES
+            if u > inked:
+                break
+            j = int(u * self.N)
+            a, b = pts[j], pts[min(j + 1, self.N)]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L = math.hypot(dx, dy) or 1e-6
+            nx, ny = -dy / L, dx / L
+            px, py = cx + a[0] * R, cy - a[1] * R
+            front = a[2] > 0
+            age = min(1.0, max(0.0, (inked - u) * 26.0))
+            col = QColor(self.RED if age >= 1.0 else self.RED_FRESH)
+            col.setAlphaF((0.95 if front else 0.14)
+                          * (0.55 + 0.45 * (1.0 - age)) * alpha)
+            pen.setColor(col)
+            pen.setWidthF(1.9 if front else 1.2)
+            p.setPen(pen)
+            tip = QPointF(px + nx * s, py - ny * s)
+            p.drawLine(QPointF(px - nx * s - dx / L * s * 0.5,
+                               py + ny * s + dy / L * s * 0.5), tip)
+            p.drawLine(QPointF(px - nx * s + dx / L * s * 0.5,
+                               py + ny * s - dy / L * s * 0.5), tip)
+
+        # ---- progress ring
+        # NoBrush first: the ball's radial gradient is still the active brush,
+        # and drawEllipse FILLS. Left set, the ring painted a solid disc of
+        # radius 1.34R straight over the seam — which read as "the ball is
+        # too big and the stitching never appears".
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        rr = R * 1.34
+        box = QRectF(cx - rr, cy - rr, rr * 2, rr * 2)
+        col = QColor(self.RING)
+        col.setAlphaF(alpha)
+        pen.setColor(col)
+        pen.setWidthF(2.5)
+        p.setPen(pen)
+        p.drawEllipse(box)
+        col = QColor(self.GRN)
+        col.setAlphaF(alpha)
+        pen.setColor(col)
+        p.setPen(pen)
+        # Qt angles are 1/16 degree, counter-clockwise from 3 o'clock
+        p.drawArc(box, 90 * 16, -int(self._smooth(self._shown) * 360 * 16))
+
+        # ---- wordmark + status
+        f = QFont(self.font())
+        f.setPointSizeF(15.0)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 5.0)
+        p.setFont(f)
+        col = QColor(self.TXT)
+        col.setAlphaF(alpha)
+        p.setPen(col)
+        p.drawText(QRectF(0, cy + rr + 26, w, 26),
+                   int(Qt.AlignmentFlag.AlignHCenter), "EFFORTMLB")
+        f.setPointSizeF(9.5)
+        f.setBold(False)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.0)
+        p.setFont(f)
+        col = QColor(self.DIM)
+        col.setAlphaF(alpha)
+        p.setPen(col)
+        p.drawText(QRectF(0, cy + rr + 52, w, 20),
+                   int(Qt.AlignmentFlag.AlignHCenter), self._label)
+
+        # ---- step pips
+        n = len(self._steps)
+        done = n - len(self._pending)
+        pw, gap = 16, 6
+        tw = n * pw + (n - 1) * gap
+        sx = (w - tw) / 2.0
+        for i in range(n):
+            col = QColor(self.GRN if i < done else self.RING)
+            col.setAlphaF((1.0 if i < done else 0.55) * alpha)
+            p.fillRect(QRectF(sx + i * (pw + gap), cy + rr + 78, pw, 3), col)
+        p.end()
+
+    @staticmethod
+    def _smooth(v: float) -> float:
+        v = 0.0 if v < 0 else (1.0 if v > 1 else v)
+        return v * v * (3 - 2 * v)
+
+
+class InsetSplitterHandle(QSplitterHandle):
+    """A splitter handle that reads as part of the panel on its LEFT rather
+    than as a trough between the two panels.
+
+    Qt always places a handle in the gap BETWEEN two widgets, and there is no
+    way to move one inside a child. What actually sells "inside the lineup
+    panel" is where the panel's BORDER falls: fill the handle with the rail's
+    own background and redraw its 1px border down the handle's far edge, and
+    the grip is now enclosed by the panel outline instead of floating outside
+    it. The rail is visually RAIL_W + handleWidth wide as a result.
+
+    `inset` is set per-handle after construction — the pitcher|tabs handle is
+    a genuine resizer between two equals and keeps the plain look.
+    """
+
+    BG = QColor("#151a21")        # LineupRail's background
+    BORDER = QColor("#2C3E50")    # ...and its border
+    GRIP = QColor("#5D6D7E")
+    GRIP_HOVER = QColor("#dc9437")
+
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self.inset = False
+        self._hover = False
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, a0):
+        self._hover = False
+        self.update()
+        super().leaveEvent(a0)
+
+    def paintEvent(self, a0):
+        if not self.inset:
+            super().paintEvent(a0)
+            return
+        p = QPainter(self)
+        # Without this the 2.8px grip dots quantise away to nothing.
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = self.rect()
+        p.fillRect(r, self.BG)
+        # the rail's border, moved to the OUTSIDE of the grip. The rail's own
+        # right border is suppressed by MLBWindow so this is the only one.
+        p.setPen(self.BORDER)
+        p.drawLine(r.right(), r.top(), r.right(), r.bottom())
+        # grip: a short dotted rule at the vertical centre
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.GRIP_HOVER if self._hover else self.GRIP)
+        cx, cy, n, gap = r.center().x() + 0.5, r.center().y(), 7, 4.5
+        for i in range(n):
+            p.drawEllipse(QPointF(cx, cy + (i - (n - 1) / 2) * gap), 1.4, 1.4)
+        p.end()
+
+
+class InsetSplitter(QSplitter):
+    """QSplitter whose handles are `InsetSplitterHandle`. Which of them
+    actually draw inset is decided by the caller (see MLBWindow)."""
+
+    def createHandle(self):
+        return InsetSplitterHandle(self.orientation(), self)
 
 # Default market/line a rail click summarizes with — the detail panel's
 # stat/line controls re-summarize from there
@@ -16137,6 +16891,2472 @@ class LineupRail(QListWidget):
                                      r["position"])
 
 
+
+# ===========================================================================
+# 4. GAME REPLAY
+# ===========================================================================
+#
+# A Gameday-class replay of a finished (or in-progress) game, driven by the
+# StatsAPI live feed and rendered on the REAL park outline from weatherman's
+# polar wall equations.
+#
+#   ReplayFeed   - fetch + per-gamePk disk cache of the v1.1 live feed
+#   build_replay - feed dict -> ReplayGame (the whole script, precomputed)
+#   ReplayTab    - the tab, plus the painters it owns
+#
+# Everything the animation needs is computed ONCE in build_replay. The qasync
+# loop is the UI thread, so nothing here derives geometry inside a timer tick;
+# a frame is a lookup, not a calculation.
+#
+# Why this does NOT reuse `PBP_FIELDS`: that whitelist is tuned for the
+# manager board's aggregates and carries none of the pitch coordinates, hit
+# data or fielding credits a replay is made of. This is a different endpoint
+# (v1.1 feed/live, not v1 playByPlay) with its own whitelist below.
+
+REPLAY_DIR = SAVE_DIR / "replay"
+FEED_BASE = "https://statsapi.mlb.com/api/v1.1"
+# the feed names bases "1B"/"2B"/"3B"; this fixes their index order
+_BASE_ORDER = ("1B", "2B", "3B")
+
+# --- feed whitelist --------------------------------------------------------
+# The untrimmed feed is ~0.87MB per game. Every name below is one the parser
+# under it actually reads.
+#
+# !! COUPLING !!  `fields` is a whitelist applied at EVERY depth, and ancestor
+# keys must be listed too (`coordinates` as well as `pX`). Consumers all use
+# .get() with defaults, so a key you forget to add reads as absent rather than
+# raising. If you make the parser read a NEW key, add it here in the SAME edit
+# or the feature silently computes nothing.
+GUMBO_FIELDS = ",".join((
+    "metaData", "timeStamp",
+    # gameData
+    "gameData", "teams", "home", "away", "abbreviation", "teamName", "id",
+    "venue", "name", "datetime", "officialDate", "status", "abstractGameState",
+    # plays
+    "liveData", "plays", "allPlays",
+    "result", "event", "eventType", "description", "rbi",
+    "awayScore", "homeScore", "isOut",
+    "about", "atBatIndex", "halfInning", "isTopInning", "inning",
+    "isScoringPlay", "hasOut", "isComplete",
+    "count", "balls", "strikes", "outs",
+    "matchup", "batter", "fullName", "batSide", "code", "pitcher", "pitchHand",
+    "runners", "movement", "originBase", "start", "end", "outBase", "outNumber",
+    "details", "runner", "isScoringEvent", "playIndex",
+    "credits", "player", "position", "credit",
+    "playEvents", "isPitch", "type", "call", "isInPlay", "isStrike", "isBall",
+    "index", "pitchNumber", "isSubstitution",
+    "pitchData", "startSpeed", "strikeZoneTop", "strikeZoneBottom",
+    "coordinates", "pX", "pZ", "x0", "y0", "z0", "vX0", "vY0", "vZ0",
+    "aX", "aY", "aZ", "pfxX", "pfxZ", "extension",
+    "hitData", "launchSpeed", "launchAngle", "totalDistance", "trajectory",
+    "coordX", "coordY", "location",
+    # linescore + boxscore
+    "linescore", "innings", "num", "runs", "hits", "errors",
+    "boxscore", "players", "person", "battingOrder", "allPositions",
+    "seasonStats", "batting", "pitching", "avg", "ops", "homeRuns", "era",
+    "strikeOuts", "baseOnBalls", "inningsPitched", "whip", "stats",
+    "numberOfPitches", "jerseyNumber",
+))
+
+
+@dataclass
+class Pitch:
+    """One pitch, with everything needed to draw it and fly it."""
+    number: int
+    code: str                     # call code: B, C, S, F, X, D, E, ...
+    desc: str                     # "Called Strike"
+    ptype: str                    # "FF"
+    pname: str                    # "4-Seam Fastball"
+    mph: Optional[float]
+    px: Optional[float]           # plate crossing, feet from centre
+    pz: Optional[float]
+    sz_top: Optional[float]
+    sz_bot: Optional[float]
+    balls: int                    # count AFTER this pitch
+    strikes: int
+    in_play: bool
+    # release + constant-acceleration kinematics; same shape pitch_sim eats
+    kin: Optional[dict] = None
+
+
+@dataclass
+class Hit:
+    ev: Optional[float]
+    la: Optional[float]
+    distance: Optional[float]
+    trajectory: str
+    # derived from the spray grid, in the physics convention used everywhere
+    # else in this codebase: 0 deg = dead centre, + toward RF
+    angle: Optional[float]
+    calc_distance: Optional[float]
+
+
+@dataclass
+class Play:
+    index: int
+    inning: int
+    is_top: bool
+    event: str
+    event_type: str
+    desc: str
+    outs_before: int
+    outs_after: int
+    bases_before: Tuple[bool, bool, bool]
+    bases_after: Tuple[bool, bool, bool]
+    away_score: int
+    home_score: int
+    scoring: bool
+    batter_id: int
+    batter: str
+    bat_side: str
+    pitcher_id: int
+    pitcher: str
+    pitch_hand: str
+    pitches: List[Pitch] = field(default_factory=list)
+    hit: Optional[Hit] = None
+    # position abbr -> (player id, name), as of THIS play
+    defense: Dict[str, Tuple[int, str]] = field(default_factory=dict)
+    # fielders credited on the play, in order (position abbr)
+    credits: List[str] = field(default_factory=list)
+    # every runner's journey this play: {id, name, frm, to, out}, where base
+    # numbers are 0 = batter's box, 1/2/3 = bases, 4 = scored
+    runner_moves: List[dict] = field(default_factory=list)
+    # who is standing on each bag as the play STARTS: {1|2|3: (id, name)}.
+    # bases_before only says a bag is occupied; a man who was already there
+    # and does not move never appears in runner_moves, so without this he
+    # renders as an anonymous empty tile.
+    runners_on: Dict[int, Tuple[int, str]] = field(default_factory=dict)
+    pitcher_pitches: int = 0      # this pitcher's cumulative pitch count
+    # priced from the season's OWN tables by annotate_win_expectancy
+    we: Optional[float] = None          # home win expectancy BEFORE the play
+    we_delta: Optional[float] = None    # swing this play produced, home POV
+    li: Optional[float] = None          # leverage index of the state
+
+
+@dataclass
+class ReplayGame:
+    game_pk: int
+    away: str
+    home: str
+    away_id: int
+    home_id: int
+    venue: str
+    date: str
+    final: bool
+    plays: List[Play]
+    innings: List[dict]           # [{num, away, home}]
+    totals: Dict[str, dict]       # {'away': {r,h,e}, 'home': {...}}
+    lineups: Dict[str, List[dict]]
+    season_stats: Dict[int, dict]
+
+
+# ===========================================================================
+# fetch
+# ===========================================================================
+
+class ReplayFeed:
+    """Fetches and caches the live feed for one game at a time.
+
+    A FINAL game's feed never changes again, so it is cached on disk forever
+    and re-read instead of re-fetched — the same reasoning as the season
+    play-by-play checkpoint. A game still in progress is never written to
+    disk, because its feed is still growing.
+    """
+
+    def __init__(self):
+        self._mem: Dict[int, dict] = {}
+
+    @staticmethod
+    def _path(game_pk: int) -> Path:
+        return REPLAY_DIR / f"{game_pk}.json"
+
+    async def get(self, session: aiohttp.ClientSession, game_pk: int,
+                  refresh: bool = False) -> Optional[dict]:
+        """Feed for one game. `refresh` forces a re-fetch.
+
+        Only FINAL games are memoised or written to disk. A live game's feed
+        grows with every pitch, so serving it from cache would freeze the
+        replay at whatever the score was the first time you opened it.
+        """
+        if not refresh and game_pk in self._mem:
+            return self._mem[game_pk]
+        p = self._path(game_pk)
+        if not refresh and p.exists():
+            try:
+                data = json_loads(p.read_bytes())
+                self._mem[game_pk] = data
+                return data
+            except Exception as e:
+                print(f"Replay: cached feed for {game_pk} unreadable ({e})")
+        try:
+            async with session.get(
+                    f"{FEED_BASE}/game/{game_pk}/feed/live",
+                    params={"fields": GUMBO_FIELDS},
+                    timeout=aiohttp.ClientTimeout(total=45)) as resp:
+                if resp.status != 200:
+                    print(f"Replay: feed {game_pk} HTTP {resp.status}")
+                    return None
+                raw = await resp.read()
+        except Exception as e:
+            print(f"Replay: feed {game_pk} failed: {e}")
+            return None
+        try:
+            data = json_loads(raw)
+        except ValueError as e:
+            print(f"Replay: feed {game_pk} unparseable: {e}")
+            return None
+        state = (((data.get("gameData") or {}).get("status") or {})
+                 .get("abstractGameState"))
+        if state == "Final":
+            self._mem[game_pk] = data
+            try:
+                REPLAY_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".tmp")
+                tmp.write_bytes(raw)
+                tmp.replace(p)
+            except OSError as e:
+                print(f"Replay: feed cache write failed: {e}")
+        return data
+
+
+# ===========================================================================
+# build
+# ===========================================================================
+
+def _spray_to_physics(cx, cy) -> Tuple[Optional[float], Optional[float]]:
+    """Savant spray pixel coords -> (distance ft, angle deg).
+
+    Angle is the physics convention used across this codebase: 0 = dead
+    centre, + toward RF, - toward LF.
+    """
+    if cx is None or cy is None:
+        return None, None
+    dx = (cx - _SPRAY_HP[0]) * _SPRAY_SCALE
+    dy = (_SPRAY_HP[1] - cy) * _SPRAY_SCALE
+    if dy <= 0:
+        return None, None
+    return math.hypot(dx, dy), math.degrees(math.atan2(dx, dy))
+
+
+def _starting_defense(box_side: dict) -> Dict[str, Tuple[int, str]]:
+    """The alignment at first pitch.
+
+    `battingOrder` on a boxscore player is slot*100 plus a substitution
+    index, so a starter's ends in "00" — the top-level `battingOrder` list is
+    the END-of-game order and will happily tell you a pinch hitter started.
+    `allPositions[0]` is the position he took first.
+
+    Under the DH the starting PITCHER is in no batting slot at all, so he
+    never appears in that walk; `pitchers[0]` is the one who threw first.
+    Without this the mound reads empty until the first pitching change.
+    """
+    players = box_side.get("players") or {}
+    out: Dict[str, Tuple[int, str]] = {}
+    for p in players.values():
+        bo = p.get("battingOrder")
+        if not bo or not str(bo).endswith("00"):
+            continue
+        aps = p.get("allPositions") or []
+        if not aps:
+            continue
+        abbr = aps[0].get("abbreviation")
+        if not abbr or abbr == "DH":
+            continue
+        out[abbr] = (p["person"]["id"], p["person"]["fullName"])
+    if "P" not in out:
+        for pid in (box_side.get("pitchers") or [])[:1]:
+            p = players.get(f"ID{pid}")
+            if p:
+                out["P"] = (pid, p["person"]["fullName"])
+    return out
+
+
+def build_replay(feed: dict) -> Optional[ReplayGame]:
+    gd, ld = feed.get("gameData") or {}, feed.get("liveData") or {}
+    all_plays = (ld.get("plays") or {}).get("allPlays") or []
+    if not all_plays:
+        return None
+    teams = gd.get("teams") or {}
+    box = (ld.get("boxscore") or {}).get("teams") or {}
+
+    # defense per side, walked forward through substitutions
+    defense = {"home": _starting_defense(box.get("home") or {}),
+               "away": _starting_defense(box.get("away") or {})}
+    names = {}
+    for side in ("home", "away"):
+        for p in ((box.get(side) or {}).get("players") or {}).values():
+            names[p["person"]["id"]] = p["person"]["fullName"]
+
+    bases: List[Optional[int]] = [None, None, None]
+    cur_half = None
+    pitch_counts: Dict[int, int] = {}
+    plays: List[Play] = []
+
+    for raw in all_plays:
+        about = raw.get("about") or {}
+        res = raw.get("result") or {}
+        mu = raw.get("matchup") or {}
+        inning, is_top = about.get("inning"), about.get("isTopInning")
+        half = (inning, is_top)
+        if half != cur_half:
+            cur_half = half
+            bases = [None, None, None]
+        # the side ON DEFENSE for this play
+        dside = "home" if is_top else "away"
+
+        bases_before = tuple(b is not None for b in bases)
+        runners_on = {i + 1: (bases[i], names.get(bases[i], ""))
+                      for i in range(3) if bases[i] is not None}
+        outs_before = _outs_before(raw, plays, half)
+
+        # --- substitutions take effect for the NEXT play, but a pitching
+        # change mid-at-bat must show immediately, so they are applied as the
+        # events are walked rather than after the play.
+        pitches: List[Pitch] = []
+        balls = strikes = 0
+        hit: Optional[Hit] = None
+        for e in (raw.get("playEvents") or []):
+            if e.get("isSubstitution"):
+                _apply_sub(e, defense[dside], names)
+                continue
+            if not e.get("isPitch"):
+                continue
+            det = e.get("details") or {}
+            code = ((det.get("call") or {}).get("code")
+                    or det.get("code") or "")
+            in_play = bool(det.get("isInPlay"))
+            if det.get("isBall") and not in_play:
+                balls = min(4, balls + 1)
+            elif det.get("isStrike") and not in_play:
+                strikes = min(3, strikes + 1)
+            pd = e.get("pitchData") or {}
+            co = pd.get("coordinates") or {}
+            kin = None
+            if co.get("vY0") is not None:
+                kin = {k: co.get(k) for k in
+                       ("x0", "y0", "z0", "vX0", "vY0", "vZ0", "aX", "aY", "aZ")}
+            pt = det.get("type") or {}
+            pitches.append(Pitch(
+                number=e.get("pitchNumber") or len(pitches) + 1,
+                code=code,
+                desc=(det.get("call") or {}).get("description")
+                or det.get("description") or "",
+                ptype=pt.get("code") or "", pname=pt.get("description") or "",
+                mph=pd.get("startSpeed"),
+                px=co.get("pX"), pz=co.get("pZ"),
+                sz_top=pd.get("strikeZoneTop"), sz_bot=pd.get("strikeZoneBottom"),
+                balls=balls, strikes=strikes, in_play=in_play, kin=kin))
+            hd = e.get("hitData")
+            if hd:
+                hc = hd.get("coordinates") or {}
+                d, ang = _spray_to_physics(hc.get("coordX"), hc.get("coordY"))
+                hit = Hit(ev=hd.get("launchSpeed"), la=hd.get("launchAngle"),
+                          distance=hd.get("totalDistance"),
+                          trajectory=hd.get("trajectory") or "",
+                          angle=ang, calc_distance=d)
+
+        pid = (mu.get("pitcher") or {}).get("id")
+        if pid is not None:
+            pitch_counts[pid] = pitch_counts.get(pid, 0) + len(pitches)
+
+        # --- advance the bases with the play's runner movements
+        credits: List[str] = []
+        moves: List[dict] = []
+        for r in (raw.get("runners") or []):
+            mv = r.get("movement") or {}
+            det = r.get("details") or {}
+            rid = (det.get("runner") or {}).get("id")
+            start, end = mv.get("start"), mv.get("end")
+            # A retired runner has end=None; where he was RETIRED is in
+            # outBase. Without it a man forced at second stands on first for
+            # the whole play instead of running into the out.
+            dest = end if end else (mv.get("outBase") if mv.get("isOut")
+                                    else None)
+            moves.append({
+                "id": rid,
+                "name": ((det.get("runner") or {}).get("fullName") or ""),
+                "frm": _base_num(start), "to": _base_num(dest),
+                "out": bool(mv.get("isOut"))})
+            if start in _BASE_ORDER and bases[_BASE_ORDER.index(start)] == rid:
+                bases[_BASE_ORDER.index(start)] = None
+            if mv.get("isOut"):
+                continue                      # off the bases entirely
+            if end in _BASE_ORDER:
+                bases[_BASE_ORDER.index(end)] = rid
+            # 'score' and None both mean "no longer on a base"
+            for c in (r.get("credits") or []):
+                ab = (c.get("position") or {}).get("abbreviation")
+                if ab and ab not in credits:
+                    credits.append(ab)
+
+        live_pa = not about.get("isComplete", True)
+        ev = res.get("event") or ""
+        desc = res.get("description") or ""
+        if live_pa and not ev:
+            # the at-bat in progress has no result yet; say so rather than
+            # rendering a blank row in the log
+            b = pitches[-1].balls if pitches else 0
+            k = pitches[-1].strikes if pitches else 0
+            ev = "AT BAT"
+            desc = (f"{(mu.get('batter') or {}).get('fullName', '')} batting, "
+                    f"{b}-{k}")
+        plays.append(Play(
+            index=about.get("atBatIndex", len(plays)),
+            inning=inning or 1, is_top=bool(is_top),
+            event=ev, event_type=res.get("eventType") or "",
+            desc=desc,
+            outs_before=outs_before,
+            outs_after=(raw.get("count") or {}).get("outs", outs_before),
+            bases_before=bases_before,
+            bases_after=tuple(b is not None for b in bases),
+            away_score=res.get("awayScore", 0), home_score=res.get("homeScore", 0),
+            scoring=bool(about.get("isScoringPlay")),
+            batter_id=(mu.get("batter") or {}).get("id") or 0,
+            batter=(mu.get("batter") or {}).get("fullName") or "",
+            bat_side=(mu.get("batSide") or {}).get("code") or "",
+            pitcher_id=pid or 0,
+            pitcher=(mu.get("pitcher") or {}).get("fullName") or "",
+            pitch_hand=(mu.get("pitchHand") or {}).get("code") or "",
+            pitches=pitches, hit=hit,
+            defense=dict(defense[dside]), credits=credits,
+            runner_moves=_dedupe_moves(moves), runners_on=runners_on,
+            pitcher_pitches=pitch_counts.get(pid, 0)))
+
+    ls = ld.get("linescore") or {}
+    innings = [{"num": i.get("num"),
+                "away": (i.get("away") or {}).get("runs"),
+                "home": (i.get("home") or {}).get("runs")}
+               for i in (ls.get("innings") or [])]
+    lt = ls.get("teams") or {}
+    totals = {s: {"r": (lt.get(s) or {}).get("runs", 0),
+                  "h": (lt.get(s) or {}).get("hits", 0),
+                  "e": (lt.get(s) or {}).get("errors", 0)}
+              for s in ("away", "home")}
+
+    lineups, season = {}, {}
+    for side in ("away", "home"):
+        rows = []
+        for p in ((box.get(side) or {}).get("players") or {}).values():
+            bo = p.get("battingOrder")
+            season[p["person"]["id"]] = p.get("seasonStats") or {}
+            if bo and str(bo).endswith("00"):
+                aps = p.get("allPositions") or []
+                rows.append({"order": int(bo) // 100,
+                             "id": p["person"]["id"],
+                             "name": p["person"]["fullName"],
+                             "pos": aps[0].get("abbreviation") if aps else ""})
+        lineups[side] = sorted(rows, key=lambda r: r["order"])
+
+    return ReplayGame(
+        game_pk=feed.get("gamePk") or 0,
+        away=(teams.get("away") or {}).get("abbreviation") or "AWY",
+        home=(teams.get("home") or {}).get("abbreviation") or "HOM",
+        away_id=(teams.get("away") or {}).get("id") or 0,
+        home_id=(teams.get("home") or {}).get("id") or 0,
+        venue=(gd.get("venue") or {}).get("name") or "",
+        date=(gd.get("datetime") or {}).get("officialDate") or "",
+        final=(((gd.get("status") or {}).get("abstractGameState")) == "Final"),
+        plays=plays, innings=innings, totals=totals,
+        lineups=lineups, season_stats=season)
+
+
+
+def _base_num(b) -> int:
+    """Feed base label -> index. 0 is the batter's box, 4 is a run scored."""
+    return {None: 0, "1B": 1, "2B": 2, "3B": 3, "score": 4}.get(b, 0)
+
+
+def _dedupe_moves(moves: List[dict]) -> List[dict]:
+    """One entry per runner: where he began the play and where he ended it.
+
+    The feed emits a `runners` row per movement, so a man who goes first to
+    third on a single appears twice. Collapsing to (first origin, last
+    destination) is what the animation needs — the intermediate hop is on the
+    same base path anyway.
+    """
+    out: Dict[int, dict] = {}
+    for m in moves:
+        rid = m["id"]
+        if rid is None:
+            continue
+        if rid in out:
+            out[rid]["to"] = m["to"]
+            out[rid]["out"] = out[rid]["out"] or m["out"]
+        else:
+            out[rid] = dict(m)
+    return [m for m in out.values()
+            if (m["to"] != m["frm"] or m["out"])
+            # a strikeout/flyout victim goes 0 -> 0: he was never on a base
+            # and drawing him would park a tile on home plate
+            and not (m["frm"] == 0 and m["to"] == 0)]
+
+
+def _outs_before(raw: dict, plays: List[Play], half) -> int:
+    """Outs at the START of a play.
+
+    The feed's `count.outs` on a play is the count at its END, so the start
+    is the previous play's end — unless this is the first play of a half,
+    which always starts at zero.
+    """
+    if not plays:
+        return 0
+    prev = plays[-1]
+    if (prev.inning, prev.is_top) != half:
+        return 0
+    return prev.outs_after
+
+
+def _apply_sub(e: dict, d: Dict[str, Tuple[int, str]],
+               names: Dict[int, str]) -> None:
+    """Fold one substitution action into the DEFENSIVE side's alignment.
+
+    Only defensive changes move a glove. An offensive substitution (pinch
+    hitter or runner) changes nobody's position until that player later takes
+    the field, which arrives as its own defensive_switch.
+
+    The event does not name a team, so the caller passes the side: a pitching
+    change or a defensive switch always belongs to whoever is in the field on
+    the play carrying it. Deciding by position instead would put every away
+    pitching change on the home club, since "P" is a key in both alignments.
+    """
+    det = e.get("details") or {}
+    if (det.get("eventType") or "") not in (
+            "defensive_substitution", "defensive_switch",
+            "pitching_substitution"):
+        return
+    pos = (e.get("position") or {}).get("abbreviation")
+    pid = (e.get("player") or {}).get("id")
+    if not pos or pid is None or pos == "DH":
+        return
+    for k, v in list(d.items()):
+        if v[0] == pid and k != pos:
+            del d[k]                      # he moved; vacate the old spot
+    d[pos] = (pid, names.get(pid, ""))
+
+
+
+def annotate_win_expectancy(game: ReplayGame, stats) -> bool:
+    """Attach win expectancy, its per-play swing, and leverage to every play.
+
+    Priced from the SEASON'S OWN win-expectancy grid — the same tables the
+    manager board builds off the play-by-play checkpoint — not an imported
+    table. Reads from disk only; never touches the network.
+
+    Note the tables are current-season. Replaying an older game still works,
+    but its win probabilities are then priced off this season's league
+    behaviour, which is an approximation (WE grids move very little year to
+    year) rather than a measurement of that season.
+    """
+    if stats is None:
+        return False
+    if not getattr(stats, "_we_acc", None):
+        try:
+            stats.load_league_tables()
+        except Exception:
+            return False
+    acc = getattr(stats, "_we_acc", None) or {}
+    trans = getattr(stats, "_we_trans", None) or {}
+    if not acc:
+        return False
+    # Fitting the WE surface costs ~45ms, and under qasync that is 45ms of
+    # frozen UI. A live poll re-annotates every 15s while the league tables
+    # it fits are IDENTICAL between polls, so the fit is cached against the
+    # table sizes and only redone when the checkpoint actually grows.
+    sig = (len(acc), len(trans))
+    cached = getattr(stats, "_we_surface", None)
+    if cached and cached[0] == sig:
+        we, li = cached[1], cached[2]
+    else:
+        try:
+            states = {k for pair in trans for k in pair} | set(acc)
+            we = smooth_win_expectancy(acc, states)
+            if not we:
+                we = {k: v[0] / v[1] for k, v in acc.items() if v[1] >= 30}
+            li = build_leverage(acc, trans)
+        except Exception as e:
+            print(f"Replay: win expectancy unavailable ({e})")
+            return False
+        stats._we_surface = (sig, we, li)
+
+    def key(pl: Play):
+        base = ((1 if pl.bases_before[0] else 0) |
+                (2 if pl.bases_before[1] else 0) |
+                (4 if pl.bases_before[2] else 0))
+        # lead is from the HOME club's view, and the scores on a play are its
+        # END state, so the state entering play i uses play i-1's scores
+        return we_key(pl.inning, pl.is_top, pl._lead_before, base,
+                      pl.outs_before)
+
+    prev_a = prev_h = 0
+    for pl in game.plays:
+        pl._lead_before = prev_h - prev_a
+        prev_a, prev_h = pl.away_score, pl.home_score
+    for pl in game.plays:
+        k = key(pl)
+        pl.we = we.get(k)
+        pl.li = li.get(k)
+    # the swing of a play is the change in WE it produced: the next state's
+    # value minus this one's, with the final play resolving to the result
+    final = game.plays[-1]
+    outcome = 1.0 if final.home_score > final.away_score else (
+        0.0 if final.home_score < final.away_score else None)
+    for i, pl in enumerate(game.plays):
+        if pl.we is None:
+            continue
+        nxt = game.plays[i + 1].we if i + 1 < len(game.plays) else outcome
+        if nxt is not None:
+            pl.we_delta = nxt - pl.we
+    return any(pl.we is not None for pl in game.plays)
+
+
+# ===========================================================================
+# park geometry
+# ===========================================================================
+
+# MLB renames parks faster than weatherman's table does, and one differs only
+# by case. Without this map five of the thirty clubs silently fall back to a
+# generic outline — and it fails quietly, because a missing key just means
+# "no polar_coords" rather than an error.
+VENUE_ALIASES = {
+    "oriole park at camden yards": "Camden Yards",
+    "rate field": "Guaranteed Rate Field",              # renamed 2025
+    "daikin park": "Minute Maid Park",                  # renamed 2025
+    "uniqlo field at dodger stadium": "Dodger Stadium",
+    "loandepot park": "LoanDepot Park",                 # case only
+}
+
+# Fallback for neutral sites and spring parks weatherman has never seen.
+GENERIC_WALL = [(0, 330), (15, 365), (30, 395), (45, 400),
+                (60, 395), (75, 365), (90, 330)]
+
+
+def resolve_venue(name: str):
+    """Venue name -> the key weatherman's STADIUM_DATA actually uses."""
+    if not name:
+        return None
+    try:
+        import weatherman as W
+    except Exception:
+        return None
+    data = W.STADIUM_DATA
+    if name in data:
+        return name
+    low = name.lower()
+    alias = VENUE_ALIASES.get(low)
+    if alias and alias in data:
+        return alias
+    for k in data:
+        if k.lower() == low:
+            return k
+    return None
+
+
+def wall_profile(venue: str, step: float = 1.0):
+    """[(angle_from_centre_deg, distance_ft)] for the outfield wall.
+
+    Angle is the convention the rest of this file uses — 0 = dead centre,
+    + toward RF — converted from weatherman's polar table, where 0 is the RF
+    line and 90 the LF line.
+    """
+    key = resolve_venue(venue)
+    if key is None:
+        return [(45.0 - a, d) for a, d in GENERIC_WALL], None
+    import weatherman as W
+    out = []
+    a = 0.0
+    while a <= 90.0:
+        d = W.get_stadium_wall_distance(key, a)
+        if d:
+            out.append((45.0 - a, d))
+        a += step
+    if not out:
+        return [(45.0 - a, d) for a, d in GENERIC_WALL], None
+    out.sort(key=lambda t: t[0])
+    return out, key
+
+
+def wall_height(venue: str, angle_from_centre: float) -> float:
+    key = resolve_venue(venue)
+    if key is None:
+        return 8.0
+    import weatherman as W
+    return W.get_stadium_wall_height(key, 45.0 - angle_from_centre)
+
+
+# ===========================================================================
+# widgets
+# ===========================================================================
+
+# Replay palette. These are the window's own colours, named locally so the
+# replay's painters read as one piece; PITCH_COLORS and the headshot cache
+# above are shared with the rest of the file rather than duplicated.
+GROUND = "#151a21"
+PANEL = "#1a2029"
+PANEL_HI = "#1E2A38"
+RULE = "#2C3E50"
+RULE_DIM = "#243140"
+INK = "#c9d6e2"
+DIM = "#7d8b9b"
+FAINT = "#4e5b68"
+OUT_C = "#E74C3C"
+SAFE_C = "#2ECC71"
+LEV_C = "#F4D03F"
+INFO_C = "#3498DB"
+
+TURF = "#16241e"
+TURF_HI = "#1b2c24"
+DIRT = "#2b2119"
+
+# where each fielder stands: (angle off dead centre, feet from the plate)
+# Where each fielder stands: (angle off dead centre, feet from the plate).
+# 1B and 3B are deliberately deeper and more toward the middle than a real
+# corner plays. A runner on the bag is now a TILE, not a dot, so the corner
+# needs to clear ~48ft rather than ~36 — at their true ~110ft depth the two
+# tiles overlap at any usable scale. The cost is that the corners read a
+# little deep; the benefit is you can see who is standing on the base.
+# Six infield tiles plus up to three runner tiles have to share a ~130ft
+# radius while the park runs to 400, and a tile is a FIXED pixel size — so the
+# infield is where crowding bites. The middle infielders are pulled wider and
+# deeper than a real alignment to buy separation from the corners (SS/3B come
+# out ~65ft apart instead of ~41), and the corners sit deep enough to clear a
+# runner standing on the bag.
+FIELDER_SPOTS = {
+    "P": (0, 60.5), "C": (0, -9), "1B": (38, 129), "2B": (16, 163),
+    "SS": (-16, 163), "3B": (-38, 127), "LF": (-30, 288),
+    "CF": (2, 318), "RF": (30, 292),
+}
+BASE_SPOTS = {"1B": (45, 90), "2B": (0, 127.3), "3B": (-45, 90)}
+
+
+class HeadshotCache:
+    """Disk-backed headshot pixmaps, fetched once and reused.
+
+    Shared by every widget that draws a face, so a player who appears as both
+    a fielder puck and a rail card is downloaded once.
+    """
+
+    def __init__(self):
+        self._pix: Dict[int, QPixmap] = {}
+        self._pending: set = set()
+        self._nam = QNetworkAccessManager()
+        self._nam.finished.connect(self._on_reply)
+        self._listeners = []
+
+    def subscribe(self, fn):
+        self._listeners.append(fn)
+
+    def get(self, pid: int) -> Optional[QPixmap]:
+        if not pid:
+            return None
+        if pid in self._pix:
+            return self._pix[pid]
+        f = HEADSHOT_DIR / f"{pid}.png"
+        if f.exists():
+            pm = QPixmap(str(f))
+            if not pm.isNull():
+                self._pix[pid] = pm
+                return pm
+        if pid not in self._pending:
+            self._pending.add(pid)
+            req = QNetworkRequest(QUrl(HEADSHOT_URL.format(pid=pid)))
+            req.setAttribute(QNetworkRequest.Attribute.User, pid)
+            self._nam.get(req)
+        return None
+
+    def _on_reply(self, reply: QNetworkReply):
+        pid = reply.request().attribute(QNetworkRequest.Attribute.User)
+        self._pending.discard(pid)
+        data = reply.readAll()
+        reply.deleteLater()
+        pm = QPixmap()
+        if pm.loadFromData(data) and not pm.isNull():
+            self._pix[pid] = pm
+            try:
+                HEADSHOT_DIR.mkdir(exist_ok=True)
+                pm.save(str(HEADSHOT_DIR / f"{pid}.png"), "PNG")
+            except Exception:
+                pass
+            for fn in self._listeners:
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+
+_HEADSHOTS: Optional[HeadshotCache] = None
+
+
+def headshots() -> HeadshotCache:
+    global _HEADSHOTS
+    if _HEADSHOTS is None:
+        _HEADSHOTS = HeadshotCache()
+    return _HEADSHOTS
+
+
+def _portrait(pm: QPixmap, w: int) -> QPixmap:
+    """The WHOLE headshot scaled into a 2:3 frame — nothing cropped.
+
+    MLB headshots are 120x180. A square frame can only ever show two thirds
+    of that, which cut every player off at the chest. Matching the frame to
+    the source's own aspect renders the full portrait instead of a slice of
+    it, so the only thing that changes with size is scale.
+    """
+    h = int(round(w * 1.5))
+    out = QPixmap(w, h)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    src = pm.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+    p.drawPixmap(int((w - src.width()) / 2), int((h - src.height()) / 2), src)
+    p.end()
+    return out
+
+
+class FieldView(QWidget):
+    """Top-down park view: real wall geometry, fielders, runners, ball.
+
+    The flight of a batted ball is drawn as a STRAIGHT radial line, because
+    from above that is what it is — the arc is in the vertical plane and is
+    not visible in plan. Height is carried by the ball marker swelling toward
+    its apex and by a shrinking ground shadow, the same cue the HR widget's
+    2D stadium view uses.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(220, 220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
+        self._profile = []
+        self._venue_key = None
+        self.venue = ""
+        self.play: Optional[Play] = None
+        self.ball_t = -1.0          # -1 = no ball in flight
+        self.ball_angle = 0.0
+        self.ball_dist = 0.0
+        self.callout = ""
+        self.callout_sub = ""
+        # 0..1 through the action of the play; drives runners and the fielder
+        # converging on the ball. -1 means the play is shown at rest.
+        self.action_t = -1.0
+        self.speeds: Dict[int, float] = {}
+        self._circ: Dict[int, QPixmap] = {}
+        headshots().subscribe(self.update)
+
+    def set_venue(self, venue: str):
+        if venue == self.venue:
+            return
+        self.venue = venue
+        self._profile, self._venue_key = wall_profile(venue)
+        self.update()
+
+    def set_play(self, play: Optional[Play]):
+        self.play = play
+        self.ball_t = -1.0
+        self.action_t = -1.0
+        self.callout = self.callout_sub = ""
+        self.update()
+
+    # -- base paths -------------------------------------------------------
+    def _base_point(self, i: int) -> QPointF:
+        """Corner of the diamond by index: 0/4 home, 1/2/3 the bags."""
+        if i <= 0 or i >= 4:
+            return self._pt(0, 0)
+        return self._pt(*BASE_SPOTS[("1B", "2B", "3B")[i - 1]])
+
+    def _runner_point(self, frm: int, to: int, f: float) -> QPointF:
+        """Where a runner is, f of the way from base `frm` to base `to`."""
+        if to <= frm:
+            return self._base_point(frm)
+        pos = frm + max(0.0, min(1.0, f)) * (to - frm)
+        leg = int(pos)
+        frac = pos - leg
+        a, b = self._base_point(leg), self._base_point(min(4, leg + 1))
+        return QPointF(a.x() + (b.x() - a.x()) * frac,
+                       a.y() + (b.y() - a.y()) * frac)
+
+    def _runner_rates(self) -> Dict[int, float]:
+        """Bases-per-unit-time for each runner, from HIS sprint speed.
+
+        Normalised so the slowest man on the play arrives exactly as the
+        action ends — the point is the relative order of arrivals, which is
+        real, not the wall-clock duration, which is compressed anyway.
+        """
+        if not self.play:
+            return {}
+        rates = {}
+        for m in self.play.runner_moves:
+            legs = max(1, m["to"] - m["frm"])
+            spd = self.speeds.get(m["id"]) or 27.0     # league average ft/s
+            rates[m["id"]] = spd / (90.0 * legs)       # legs per second
+        if rates:
+            slowest = min(rates.values())
+            rates = {k: v / slowest for k, v in rates.items()}
+        return rates
+
+    def start_flight(self, angle: float, dist: float):
+        self.ball_angle, self.ball_dist, self.ball_t = angle, dist, 0.0
+
+    # -- geometry ---------------------------------------------------------
+    def _xform(self):
+        prof = self._profile or [(0, 400)]
+        max_y = max(d * math.cos(math.radians(a)) for a, d in prof)
+        max_x = max(abs(d * math.sin(math.radians(a))) for a, d in prof)
+        w, h = self.width(), self.height()
+        # side/top leave room for the distance plates that sit OUTSIDE the wall
+        top, bot, side = 26, 44, 26
+        sc = min((h - top - bot) / max(max_y, 1.0),
+                 (w / 2 - side) / max(max_x, 1.0))
+        # In a narrow pane the fit is WIDTH-limited, so the park is shorter
+        # than the band it lives in. Pinning home plate to the floor then
+        # dumps all the slack above the outfield wall as dead sky — measured
+        # at 502px in an 891px pane. Centre the drawn park in the band.
+        slack = max(0.0, (h - top - bot) - max_y * sc)
+        return w / 2.0, top + slack / 2.0 + max_y * sc, sc
+
+    def _pt(self, a: float, d: float) -> QPointF:
+        cx, cy, sc = self._x
+        r = math.radians(a)
+        return QPointF(cx + d * sc * math.sin(r), cy - d * sc * math.cos(r))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(GROUND))
+        if not self._profile:
+            return
+        self._x = self._xform()
+        cx, cy, sc = self._x
+
+        # fair territory
+        poly = QPolygonF([self._pt(a, d) for a, d in self._profile])
+        poly.append(self._pt(0, 0))
+        grad = QRadialGradient(QPointF(cx, cy), max(1.0, 420 * sc))
+        grad.setColorAt(0.0, QColor(TURF_HI))
+        grad.setColorAt(1.0, QColor("#111c17"))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawPolygon(poly)
+
+        # NOTE: no mown-grass arcs, no warning-track band, no dirt shading.
+        # They were decoration, and at this scale the concentric arcs read as
+        # a wifi glyph sitting under the park. The polar outline IS the
+        # drawing; everything else here is a real marking on a real field.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#4a5c6b"), 2.5, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline(QPolygonF([self._pt(a, d) for a, d in self._profile]))
+
+        # infield: base paths as chalk, nothing more
+        b1, b2, b3 = (self._pt(*BASE_SPOTS[k]) for k in ("1B", "2B", "3B"))
+        p.setPen(QPen(QColor(201, 214, 226, 97), 1.6))
+        p.drawPolygon(QPolygonF([self._pt(0, 0), b1, b2, b3]))
+
+        # foul lines out to the poles
+        p.setPen(QPen(QColor(201, 214, 226, 80), 1.4))
+        for a, d in (self._profile[0], self._profile[-1]):
+            p.drawLine(self._pt(0, 0), self._pt(a, d))
+
+        # mound and bases
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(201, 214, 226, 76), 1.2))
+        p.drawEllipse(self._pt(0, 60.5), 5.5 * sc, 5.5 * sc)
+        # Once the action has played out the bags hold the END state, or the
+        # markers contradict the runner tiles standing on them.
+        if not self.play:
+            occupied = (False, False, False)
+        elif self.action_t >= 1.0:
+            occupied = self.play.bases_after
+        else:
+            occupied = self.play.bases_before
+        p.setPen(QPen(QColor(RULE), 1))
+        for i, k in enumerate(("1B", "2B", "3B")):
+            pt = self._pt(*BASE_SPOTS[k])
+            p.setBrush(QColor(LEV_C) if occupied[i] else QColor(232, 239, 245))
+            p.save()
+            p.translate(pt)
+            p.rotate(45)
+            s = 5.0
+            p.drawRect(QRectF(-s, -s, 2 * s, 2 * s))
+            p.restore()
+        hp = self._pt(0, 0)
+        p.setBrush(QColor(232, 239, 245))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygonF([
+            QPointF(hp.x() - 5, hp.y() - 5), QPointF(hp.x() + 5, hp.y() - 5),
+            QPointF(hp.x() + 5, hp.y()), QPointF(hp.x(), hp.y() + 5),
+            QPointF(hp.x() - 5, hp.y())]))
+
+        # Wall distances, in plates OUTSIDE the outline. Drawn INSIDE the
+        # wall they crossed it at both corners, where the foul line and the
+        # fence converge and there is no clear ground to sit on.
+        f = QFont("monospace", 7)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        marks = [self._profile[0], (0.0, self._wall_at(0.0) or 0),
+                 self._profile[-1]]
+        for a, d in marks:
+            if not d:
+                continue
+            wall = self._pt(a, d)
+            r = math.radians(a)
+            txt = f"{d:.0f}"
+            bw = fm.horizontalAdvance(txt) + 10
+            bh = 15
+            # push the plate along the ray out of home plate, so it clears
+            # the fence on whatever bearing that corner happens to sit
+            box = QRectF(wall.x() + math.sin(r) * 15 - bw / 2,
+                         wall.y() - math.cos(r) * 15 - bh / 2, bw, bh)
+            if box.left() < 2:
+                box.moveLeft(2)
+            if box.right() > self.width() - 2:
+                box.moveRight(self.width() - 2)
+            if box.top() < 2:
+                box.moveTop(2)
+            p.setBrush(QColor(PANEL))
+            p.setPen(QPen(QColor(RULE), 1))
+            p.drawRect(box)
+            p.setPen(QColor(DIM))
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter, txt)
+
+        self._draw_fielders(p, sc)
+        self._draw_runners(p, sc)
+        self._draw_ball(p, sc)
+        self._draw_callout(p)
+        p.end()
+
+    def _wall_at(self, angle: float) -> Optional[float]:
+        best = None
+        for a, d in self._profile:
+            if best is None or abs(a - angle) < abs(best[0] - angle):
+                best = (a, d)
+        return best[1] if best else None
+
+    @staticmethod
+    def _surname(name: str) -> str:
+        """Last name, skipping a generational suffix.
+
+        `name.split()[-1]` turned Julio Rodriguez Jr. into "Jr." — several
+        players a game land on this.
+        """
+        parts = [x for x in (name or "").split() if x]
+        if not parts:
+            return ""
+        if len(parts) > 1 and parts[-1].rstrip(".").upper() in (
+                "JR", "SR", "II", "III", "IV", "V"):
+            return parts[-2]
+        return parts[-1]
+
+    def _plate(self, p: QPainter, cx: float, cy: float, text: str,
+               fg: str = DIM, accent: bool = False, side: str = "below"):
+        """A name on a filled plate.
+
+        Bare text sat directly on the wall outline and the foul lines, which
+        ran straight through the glyphs. The plate is opaque, so wherever a
+        label lands it stays readable.
+        """
+        if not text:
+            return
+        f = QFont("monospace", 7)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        w = fm.horizontalAdvance(text) + 8
+        h = 12
+        if side == "left":
+            box = QRectF(cx - w, cy - h / 2, w, h)
+        elif side == "right":
+            box = QRectF(cx, cy - h / 2, w, h)
+        else:
+            box = QRectF(cx - w / 2, cy, w, h)
+        p.setBrush(QColor(26, 32, 41, 232))
+        p.setPen(QPen(QColor(LEV_C if accent else RULE), 1))
+        p.drawRect(box)
+        p.setPen(QColor(fg))
+        p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_fielders(self, p: QPainter, sc: float):
+        if not self.play:
+            return
+        d = max(15, min(24, int(21 * min(1.0, sc / 1.05))))
+        hgt = int(round(d * 1.5))
+        f = QFont("monospace", 7)
+        p.setFont(f)
+        for pos, (pid, name) in sorted(self.play.defense.items()):
+            spot = FIELDER_SPOTS.get(pos)
+            if not spot:
+                continue
+            pt = self._pt(*spot)
+            involved = pos in (self.play.credits or [])
+            # The man credited FIRST is the one who got to the ball, so he
+            # converges on where the ball actually went. Statcast does not
+            # publish fielder tracks, but the start (his position) and the
+            # end (the ball's own coordinates) are both real — only the route
+            # between them is drawn as a straight line.
+            if (involved and self.action_t >= 0.0 and self.play.credits
+                    and pos == self.play.credits[0] and self.play.hit
+                    and self.play.hit.angle is not None):
+                # clamp to the fence: a ball off the wall reports a landing
+                # point, and without this the fielder chases it out of the park
+                bd = (self.play.hit.calc_distance
+                      or self.play.hit.distance or 0)
+                wall = self._wall_at(self.play.hit.angle)
+                if wall:
+                    bd = min(bd, wall - 6)
+                tgt = self._pt(self.play.hit.angle, bd)
+                f = min(1.0, self.action_t)
+                pt = QPointF(pt.x() + (tgt.x() - pt.x()) * f,
+                             pt.y() + (tgt.y() - pt.y()) * f)
+            pm = self._circ.get(pid)
+            if pm is None or pm.width() != d:
+                raw = headshots().get(pid)
+                if raw is not None:
+                    pm = _portrait(raw, d)
+                    self._circ[pid] = pm
+            box = QRectF(pt.x() - d / 2 - 1.5, pt.y() - hgt / 2 - 1.5,
+                         d + 3, hgt + 3)
+            p.setPen(QPen(QColor(LEV_C if involved else INFO_C),
+                          2.0 if involved else 1.4))
+            p.setBrush(QColor(PANEL))
+            p.drawRect(box)
+            if pm is not None:
+                p.drawPixmap(int(pt.x() - d / 2), int(pt.y() - hgt / 2), pm)
+            else:
+                # headshots arrive asynchronously; an empty ring says nothing,
+                # so the position stands in until the face lands
+                p.setPen(QColor(DIM))
+                p.drawText(QRectF(pt.x() - d / 2, pt.y() - 6, d, 12),
+                           Qt.AlignmentFlag.AlignCenter, pos)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            short = self._surname(name)
+            # The corners wear their plate OUTWARD, beside the tile: below it
+            # sits on the runner holding that bag, and above it collides with
+            # SS/2B, who are only ~65ft away on a diagram this tight.
+            lab = f"{pos} {short}".strip()
+            col = INK if involved else DIM
+            if pos == "3B":
+                self._plate(p, pt.x() - d / 2 - 4, pt.y(), lab, col,
+                            accent=involved, side="left")
+            elif pos == "1B":
+                self._plate(p, pt.x() + d / 2 + 4, pt.y(), lab, col,
+                            accent=involved, side="right")
+            else:
+                self._plate(p, pt.x(), pt.y() + hgt / 2 + 3, lab, col,
+                            accent=involved)
+
+    def _draw_runners(self, p: QPainter, sc: float):
+        """Baserunners as headshot tiles, on their bags or between them."""
+        if not self.play:
+            return
+        moving = self.action_t >= 0.0
+        rates = self._runner_rates() if moving else {}
+        drawn = []
+        movers = set()
+        if moving:
+            for m in self.play.runner_moves:
+                movers.add(m["id"])
+                f = min(1.0, self.action_t * rates.get(m["id"], 1.0))
+                if m["out"] and f >= 1.0:
+                    continue                     # retired: off the diamond
+                if m["to"] >= 4 and f >= 1.0:
+                    continue                     # scored: off the diamond
+                pt = self._runner_point(m["frm"], m["to"], f)
+                drawn.append((pt, m["id"], m["name"],
+                              m["out"] and f >= 0.95))
+        # Everyone who was ON a bag and did NOT move stays on it — including
+        # while the play runs. Drawing only the movers made a runner who
+        # holds his base disappear the moment the play was selected.
+        for i, on in enumerate(self.play.bases_before):
+            if not on:
+                continue
+            pid, nm = self.play.runners_on.get(i + 1, (0, ""))
+            if pid and pid in movers:
+                continue
+            drawn.append((self._base_point(i + 1), pid, nm, False))
+        # a runner tile is smaller than a fielder's so the bag stays visible
+        w = max(12, min(18, int(16 * min(1.0, sc / 1.05))))
+        hgt = int(round(w * 1.5))
+        for pt, pid, name, out in drawn:
+            pm = self._circ.get(("r", pid, w))
+            if pm is None and pid:
+                raw = headshots().get(pid)
+                if raw is not None:
+                    pm = _portrait(raw, w)
+                    self._circ[("r", pid, w)] = pm
+            box = QRectF(pt.x() - w / 2 - 1.5, pt.y() - hgt / 2 - 1.5,
+                         w + 3, hgt + 3)
+            p.setPen(QPen(QColor(OUT_C if out else LEV_C), 2.0))
+            p.setBrush(QColor(PANEL))
+            p.drawRect(box)
+            if pm is not None:
+                p.drawPixmap(int(pt.x() - w / 2), int(pt.y() - hgt / 2), pm)
+            if name:
+                self._plate(p, pt.x(), pt.y() + hgt / 2 + 3,
+                            self._surname(name), OUT_C if out else LEV_C,
+                            accent=not out)
+
+    def _draw_ball(self, p: QPainter, sc: float):
+        if self.ball_t < 0:
+            return
+        t = min(1.0, self.ball_t)
+        end = self._pt(self.ball_angle, self.ball_dist)
+        start = self._pt(0, 0)
+        cur = QPointF(start.x() + (end.x() - start.x()) * t,
+                      start.y() + (end.y() - start.y()) * t)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(LEV_C), 2.2, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
+        p.drawLine(start, cur)
+        lift = math.sin(t * math.pi)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, int(115 - lift * 75)))
+        p.drawEllipse(QPointF(cur.x(), cur.y() + 3), 3 - lift * 1.6,
+                      3 - lift * 1.6)
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(cur, 3.4 + lift * 3.6, 3.4 + lift * 3.6)
+        if t >= 1.0:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(LEV_C), 1.6))
+            p.drawEllipse(end, 6, 6)
+
+    def _draw_callout(self, p: QPainter):
+        if not self.callout:
+            return
+        p.setPen(QColor(LEV_C))
+        f = QFont()
+        f.setPointSize(15)
+        f.setBold(True)
+        p.setFont(f)
+        # bottom-left: the top of the frame is the park, and a callout there
+        # sat on top of the outfield wall
+        h = self.height()
+        p.drawText(QRectF(12, h - 44, self.width() - 24, 24),
+                   Qt.AlignmentFlag.AlignLeft, self.callout)
+        p.setPen(QColor(DIM))
+        p.setFont(QFont("monospace", 7))
+        p.drawText(QRectF(12, h - 20, self.width() - 24, 14),
+                   Qt.AlignmentFlag.AlignLeft, self.callout_sub)
+
+
+class ZoneView(QWidget):
+    """Strike zone from the catcher's view with the at-bat's pitches.
+
+    The zone box is the batter's OWN zone as measured on the last pitch of
+    the at-bat — Statcast sets top/bottom per pitch from the hitter's stance,
+    so a fixed rulebook rectangle would put pitches on the wrong side of the
+    line for tall and short hitters alike.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self.pitches: List[Pitch] = []
+        self.shown = 0
+
+    def set_pitches(self, pitches: List[Pitch], shown: int = 0):
+        self.pitches, self.shown = pitches, shown
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(PANEL))
+        w, h = self.width(), self.height()
+        top = bot = None
+        for pt in self.pitches:
+            if pt.sz_top and pt.sz_bot:
+                top, bot = pt.sz_top, pt.sz_bot
+        top, bot = top or 3.4, bot or 1.6
+        half = 0.83
+        # A FIXED view, not a fit-to-pitches one. Fitting sounds right until
+        # a curveball in the dirt drags the span so wide that the strike zone
+        # shrinks to a stamp in the middle — which is what it did. Gameday
+        # keeps the zone a constant size and lets the plot area hold the
+        # misses; anything past the edge is clamped to it and drawn hollow.
+        VX, LO_Z, HI_Z = 1.75, 0.05, 4.75
+        span_x, span_z = VX * 2, HI_Z - LO_Z
+        sc = min(w / span_x, h / span_z) * 0.94
+        cx, cz = w / 2.0, h / 2.0
+        mid = (LO_Z + HI_Z) / 2.0
+
+        def px(x):
+            return cx + x * sc
+
+        def pz(z):
+            return cz - (z - mid) * sc
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(FAINT), 1.4))
+        p.drawRect(QRectF(px(-half), pz(top), 2 * half * sc,
+                          (top - bot) * sc))
+        p.setPen(QPen(QColor(RULE), 0.7))
+        for i in (1, 2):
+            x = -half + i * 2 * half / 3
+            p.drawLine(QPointF(px(x), pz(top)), QPointF(px(x), pz(bot)))
+            z = top - i * (top - bot) / 3
+            p.drawLine(QPointF(px(-half), pz(z)), QPointF(px(half), pz(z)))
+
+        # home plate in plan, under the zone — the depth cue Gameday uses
+        py = pz(LO_Z) - 4
+        plate = QPolygonF([QPointF(px(-half), py - 9), QPointF(px(half), py - 9),
+                           QPointF(px(half), py - 4), QPointF(cx, py),
+                           QPointF(px(-half), py - 4)])
+        p.setPen(QPen(QColor(RULE), 1.0))
+        p.drawPolygon(plate)
+
+        f = QFont("monospace", 7)
+        f.setBold(True)
+        p.setFont(f)
+        for i, pt in enumerate(self.pitches[:self.shown]):
+            if pt.px is None or pt.pz is None:
+                continue
+            c = QColor(PITCH_COLORS.get(pt.ptype, "#95A5A6"))
+            cxp, czp = pt.px, pt.pz
+            outside = not (-VX < cxp < VX and LO_Z < czp < HI_Z)
+            cxp = max(-VX + 0.13, min(VX - 0.13, cxp))
+            czp = max(LO_Z + 0.13, min(HI_Z - 0.13, czp))
+            centre = QPointF(px(cxp), pz(czp))
+            r = 9.0 if pt.in_play else 8.0
+            if outside:
+                # clamped: hollow, so a pitch at the edge is never mistaken
+                # for one that actually crossed there
+                p.setBrush(QColor(PANEL))
+                p.setPen(QPen(c, 2.0))
+            else:
+                p.setBrush(c)
+                p.setPen(QPen(QColor(GROUND), 1.4))
+            p.drawEllipse(centre, r, r)
+            p.setPen(QColor(c if outside else QColor(GROUND)))
+            p.drawText(QRectF(centre.x() - 9, centre.y() - 7, 18, 14),
+                       Qt.AlignmentFlag.AlignCenter, str(i + 1))
+        p.end()
+
+
+class ScoreStrip(QWidget):
+    """Linescore, score, count, outs and the base diamond."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(62)
+        self.game: Optional[ReplayGame] = None
+        self.play: Optional[Play] = None
+        self.count = (0, 0)
+
+    def set_game(self, g: Optional[ReplayGame]):
+        self.game = g
+        self.update()
+
+    def set_play(self, play: Optional[Play], count=(0, 0)):
+        self.play, self.count = play, count
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        g = QLinearGradient(0, 0, 0, self.height())
+        g.setColorAt(0, QColor("#1b2330"))
+        g.setColorAt(1, QColor(GROUND))
+        p.fillRect(self.rect(), QBrush(g))
+        p.setPen(QPen(QColor(RULE), 1))
+        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        if not self.game:
+            return
+        pl = self.play
+        a_sc = pl.away_score if pl else 0
+        h_sc = pl.home_score if pl else 0
+        batting_top = pl.is_top if pl else True
+
+        # club + runs
+        f = QFont()
+        f.setBold(True)
+        f.setPointSize(13)
+        for i, (ab, sc, is_bat) in enumerate((
+                (self.game.away, a_sc, batting_top),
+                (self.game.home, h_sc, not batting_top))):
+            y = 6 + i * 26
+            p.setFont(f)
+            p.setPen(QColor(LEV_C if is_bat else INK))
+            p.drawText(QRectF(12, y, 70, 22),
+                       Qt.AlignmentFlag.AlignVCenter, ab)
+            p.setPen(QColor(LEV_C if is_bat else INK))
+            p.drawText(QRectF(80, y, 34, 22),
+                       Qt.AlignmentFlag.AlignRight |
+                       Qt.AlignmentFlag.AlignVCenter, str(sc))
+
+        # linescore
+        mf = QFont("monospace", 7)
+        p.setFont(mf)
+        innings = self.game.innings or []
+        cw = 20
+        # centred in the space between the club block and the count readout,
+        # so a 9-inning game and a 15-inning one both sit where the eye looks
+        span = (len(innings) + 3) * cw + 8
+        x0 = max(140, 126 + ((self.width() - 200) - 126 - span) / 2)
+        cur = (pl.inning if pl else 1)
+        p.setPen(QColor(FAINT))
+        for j, inn in enumerate(innings):
+            p.drawText(QRectF(x0 + j * cw, 3, cw, 12),
+                       Qt.AlignmentFlag.AlignCenter, str(inn["num"]))
+        for i, side in enumerate(("away", "home")):
+            y = 17 + i * 15
+            for j, inn in enumerate(innings):
+                n = inn["num"]
+                played = n < cur or (n == cur and
+                                     (side == "away" or not batting_top))
+                v = inn[side]
+                txt = "" if (not played or v is None) else str(v)
+                if n == cur and ((side == "away") == batting_top):
+                    p.fillRect(QRectF(x0 + j * cw, y - 2, cw, 14),
+                               QColor(PANEL_HI))
+                p.setPen(QColor(INK if n == cur else DIM))
+                p.drawText(QRectF(x0 + j * cw, y, cw, 12),
+                           Qt.AlignmentFlag.AlignCenter, txt)
+        # R H E
+        xr = x0 + len(innings) * cw + 8
+        p.setPen(QColor(FAINT))
+        for k, lab in enumerate("RHE"):
+            p.drawText(QRectF(xr + k * cw, 3, cw, 12),
+                       Qt.AlignmentFlag.AlignCenter, lab)
+        for i, side in enumerate(("away", "home")):
+            y = 17 + i * 15
+            t = self.game.totals.get(side, {})
+            vals = (a_sc if side == "away" else h_sc, t.get("h", 0),
+                    t.get("e", 0))
+            p.setPen(QColor(INK))
+            for k, v in enumerate(vals):
+                p.drawText(QRectF(xr + k * cw, y, cw, 12),
+                           Qt.AlignmentFlag.AlignCenter, str(v))
+
+        # count / outs / diamond
+        rx = self.width() - 176
+        p.setPen(QColor(FAINT))
+        p.setFont(QFont("monospace", 6))
+        p.drawText(QRectF(rx, 8, 60, 10), Qt.AlignmentFlag.AlignLeft, "COUNT")
+        p.drawText(QRectF(rx + 66, 8, 40, 10), Qt.AlignmentFlag.AlignLeft, "OUTS")
+        bf = QFont("monospace", 11)
+        bf.setBold(True)
+        p.setFont(bf)
+        p.setPen(QColor(INK))
+        p.drawText(QRectF(rx, 22, 60, 20), Qt.AlignmentFlag.AlignLeft,
+                   f"{self.count[0]}-{self.count[1]}")
+        outs = pl.outs_before if pl else 0
+        for i in range(3):
+            c = QColor(OUT_C) if i < outs else QColor(PANEL)
+            p.setBrush(c)
+            p.setPen(QPen(QColor(OUT_C if i < outs else FAINT), 1))
+            p.drawEllipse(QPointF(rx + 72 + i * 12, 30), 4.5, 4.5)
+        occ = pl.bases_before if pl else (False, False, False)
+        cx, cy, s = rx + 140, 30, 9
+        for i, (dx, dy) in enumerate(((s, 0), (0, -s), (-s, 0))):
+            p.setBrush(QColor(LEV_C) if occ[i] else QColor(PANEL))
+            p.setPen(QPen(QColor(LEV_C if occ[i] else FAINT), 1.2))
+            p.save()
+            p.translate(cx + dx, cy + dy)
+            p.rotate(45)
+            p.drawRect(QRectF(-4, -4, 8, 8))
+            p.restore()
+        p.end()
+
+
+class PlayLogDelegate(QStyledItemDelegate):
+    """Two-line play entry: event headline over its description."""
+
+    def sizeHint(self, opt, idx) -> QSize:
+        return QSize(200, 54)
+
+    def paint(self, p, opt, idx):
+        play: Play = idx.data(Qt.ItemDataRole.UserRole)
+        if play is None:
+            return
+        r = opt.rect
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(r, QColor(PANEL_HI) if sel else QColor(PANEL))
+        if sel:
+            p.fillRect(QRectF(r.left(), r.top(), 2, r.height()), QColor(LEV_C))
+        p.setPen(QPen(QColor(RULE_DIM), 1))
+        p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
+
+        p.setFont(QFont("monospace", 7))
+        p.setPen(QColor(FAINT))
+        p.drawText(QRectF(r.left() + 8, r.top() + 6, 26, 12),
+                   Qt.AlignmentFlag.AlignLeft,
+                   f"{'▲' if play.is_top else '▼'}{play.inning}")
+
+        f = QFont()
+        f.setPointSize(8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(LEV_C if play.scoring else INK))
+        p.drawText(QRectF(r.left() + 38, r.top() + 5, r.width() - 46, 14),
+                   Qt.AlignmentFlag.AlignLeft, play.event or play.event_type)
+
+        f2 = QFont()
+        f2.setPointSize(8)
+        p.setFont(f2)
+        p.setPen(QColor(DIM))
+        p.drawText(QRectF(r.left() + 38, r.top() + 19, r.width() - 46, 30),
+                   int(Qt.AlignmentFlag.AlignLeft) |
+                   int(Qt.TextFlag.TextWordWrap), play.desc)
+        p.restore()
+
+
+def _abbrev(name: str) -> str:
+    """Last-ditch club abbreviation from the NAME.
+
+    Only used when the roster's id->abbr map is unavailable, and it is a poor
+    substitute: the last word's first three letters gives BRA/YAN/NAT where
+    the real abbreviations are ATL/NYY/WSH. Prefer the team id.
+    """
+    parts = name.split()
+    return (parts[-1][:3] if parts else name[:3]).upper()
+
+
+def _card(title: str) -> Tuple[QFrame, QVBoxLayout]:
+    f = QFrame()
+    f.setStyleSheet(f"QFrame{{background:{PANEL};border:0;"
+                    f"border-bottom:1px solid {RULE_DIM};}}")
+    v = QVBoxLayout(f)
+    v.setContentsMargins(12, 9, 12, 9)
+    v.setSpacing(7)
+    lab = QLabel(title)
+    lab.setStyleSheet(f"color:{FAINT};font-family:monospace;font-size:9px;"
+                      "font-weight:600;letter-spacing:2px;border:0;")
+    v.addWidget(lab)
+    return f, v
+
+
+class _Stat(QWidget):
+    """Three-up value/label block used under the rail cards."""
+
+    def __init__(self, labels: List[str]):
+        super().__init__()
+        self.setStyleSheet("border:0;")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(1)
+        self.vals = []
+        for lb in labels:
+            box = QWidget()
+            box.setStyleSheet(f"background:{PANEL_HI};")
+            v = QVBoxLayout(box)
+            v.setContentsMargins(6, 4, 6, 4)
+            v.setSpacing(1)
+            val = QLabel("—")
+            val.setStyleSheet(f"color:{INK};font-family:monospace;"
+                              "font-size:13px;font-weight:600;border:0;")
+            cap = QLabel(lb)
+            cap.setStyleSheet(f"color:{FAINT};font-family:monospace;"
+                              "font-size:9px;letter-spacing:1px;border:0;")
+            v.addWidget(val)
+            v.addWidget(cap)
+            h.addWidget(box)
+            self.vals.append(val)
+
+    def set(self, *values):
+        for lab, v in zip(self.vals, values):
+            lab.setText("—" if v is None else str(v))
+
+    def tint(self, colour: str):
+        for lab in self.vals:
+            lab.setStyleSheet(f"color:{colour};font-family:monospace;"
+                              "font-size:13px;font-weight:600;border:0;")
+
+
+
+# schedule whitelist for the game browser: one request covers a whole season
+SEASON_BROWSE_FIELDS = ",".join((
+    "dates", "date", "games", "gamePk", "gameDate",
+    "status", "abstractGameState", "detailedState",
+    "teams", "home", "away", "team", "id", "name", "score", "isWinner",
+    "venue", "gameNumber", "doubleHeader",
+))
+
+
+class WERibbon(QWidget):
+    """Win expectancy across the game, with leverage shading, as a scrubber.
+
+    This is the thing a replay has that a box score does not: every play
+    carries the swing it actually produced, priced off the season's own
+    win-expectancy grid rather than an imported table.
+    """
+
+    scrub = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(86)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.game: Optional[ReplayGame] = None
+        self.idx = 0
+        self.has_we = False
+
+    def set_game(self, g: Optional[ReplayGame], has_we: bool):
+        self.game, self.has_we = g, has_we
+        self.update()
+
+    def set_index(self, i: int):
+        self.idx = i
+        self.update()
+
+    def _plot(self):
+        return QRectF(44, 16, max(1, self.width() - 58), self.height() - 34)
+
+    def mousePressEvent(self, e):
+        if not self.game:
+            return
+        r = self._plot()
+        n = len(self.game.plays)
+        f = (e.position().x() - r.left()) / max(1.0, r.width())
+        self.scrub.emit(max(0, min(n - 1, int(round(f * (n - 1))))))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(GROUND))
+        if not self.game:
+            return
+        r = self._plot()
+        plays = self.game.plays
+        n = len(plays)
+        p.setFont(QFont("monospace", 6))
+
+        if not self.has_we:
+            p.setPen(QColor(FAINT))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       "win expectancy unavailable — open Managers once to "
+                       "build the season tables")
+            return
+
+        def X(i):
+            return r.left() + r.width() * (i / max(1, n - 1))
+
+        def Y(v):
+            return r.bottom() - r.height() * v
+
+        # gridlines at 0 / 50 / 100
+        for v, lab in ((1.0, "100%"), (0.5, "50%"), (0.0, "0%")):
+            y = Y(v)
+            p.setPen(QPen(QColor(RULE_DIM), 1,
+                          Qt.PenStyle.DashLine if v == 0.5 else Qt.PenStyle.SolidLine))
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            p.setPen(QColor(FAINT))
+            p.drawText(QRectF(2, y - 7, 38, 14),
+                       Qt.AlignmentFlag.AlignRight |
+                       Qt.AlignmentFlag.AlignVCenter, lab)
+
+        # leverage as shading under the curve — where the game was decided
+        for i, pl in enumerate(plays):
+            if not pl.li or pl.li < 1.3:
+                continue
+            a = min(46, int((pl.li - 1.3) * 26))
+            w = max(1.5, r.width() / n)
+            p.fillRect(QRectF(X(i) - w / 2, r.top(), w, r.height()),
+                       QColor(244, 208, 63, a))
+
+        pts = [(i, pl.we) for i, pl in enumerate(plays) if pl.we is not None]
+        if len(pts) > 1:
+            poly = QPolygonF([QPointF(X(i), Y(v)) for i, v in pts])
+            area = QPolygonF(poly)
+            area.append(QPointF(X(pts[-1][0]), Y(0.5)))
+            area.append(QPointF(X(pts[0][0]), Y(0.5)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(52, 152, 219, 46))
+            p.drawPolygon(area)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(INFO_C), 1.7))
+            p.drawPolyline(poly)
+
+        # inning ticks
+        p.setPen(QColor(FAINT))
+        last = None
+        for i, pl in enumerate(plays):
+            if pl.inning != last and pl.is_top:
+                last = pl.inning
+                p.setPen(QPen(QColor(RULE_DIM), 1))
+                p.drawLine(QPointF(X(i), r.top()), QPointF(X(i), r.bottom()))
+                p.setPen(QColor(FAINT))
+                p.drawText(QRectF(X(i) - 9, r.bottom() + 2, 18, 12),
+                           Qt.AlignmentFlag.AlignCenter, str(pl.inning))
+
+        # playhead + its readout
+        cur = plays[self.idx]
+        x = X(self.idx)
+        p.setPen(QPen(QColor(LEV_C), 1.6))
+        p.drawLine(QPointF(x, r.top() - 4), QPointF(x, r.bottom() + 4))
+        if cur.we is not None:
+            p.setBrush(QColor(LEV_C))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(x, Y(cur.we)), 3.4, 3.4)
+            bits = [f"{self.game.home} {cur.we * 100:.0f}%"]
+            if cur.we_delta is not None:
+                bits.append(f"{cur.we_delta * 100:+.1f}")
+            if cur.li:
+                bits.append(f"LI {cur.li:.2f}")
+            p.setPen(QColor(LEV_C))
+            p.setFont(QFont("monospace", 7))
+            p.drawText(QRectF(r.left(), 1, r.width(), 13),
+                       Qt.AlignmentFlag.AlignRight, "   ".join(bits))
+        p.end()
+
+
+class GameBrowser(QWidget):
+    """Search and load any game of the season."""
+
+    chosen = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 6, 10, 8)
+        v.setSpacing(6)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("search team or date…")
+        self.search.setStyleSheet(
+            f"QLineEdit{{background:{GROUND};color:{INK};border:1px solid {RULE};"
+            f"padding:4px 7px;font-family:monospace;font-size:11px;}}")
+        self.search.textChanged.connect(self._filter)
+        v.addWidget(self.search)
+        self.list = QListWidget()
+        self.list.setStyleSheet(
+            f"QListWidget{{background:{GROUND};color:{INK};border:1px solid {RULE};"
+            f"font-family:monospace;font-size:11px;}}"
+            f"QListWidget::item{{padding:3px 6px;}}"
+            f"QListWidget::item:selected{{background:{PANEL_HI};color:{LEV_C};}}"
+            f"QScrollBar:vertical{{background:{GROUND};width:9px;border:0;}}"
+            f"QScrollBar::handle:vertical{{background:{RULE};min-height:24px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}")
+        self.list.itemClicked.connect(self._pick)
+        v.addWidget(self.list, 1)
+        self._rows: List[dict] = []
+
+    def set_games(self, rows: List[dict]):
+        self._rows = rows
+        self._filter(self.search.text())
+
+    def _filter(self, txt: str):
+        t = (txt or "").strip().lower()
+        self.list.clear()
+        shown = 0
+        for g in self._rows:
+            if t and t not in g["hay"]:
+                continue
+            it = QListWidgetItem(g["label"])
+            it.setData(Qt.ItemDataRole.UserRole, g["pk"])
+            self.list.addItem(it)
+            shown += 1
+            if shown >= 400:            # a season is 2,400+; keep it snappy
+                break
+
+    def _pick(self, item: QListWidgetItem):
+        self.chosen.emit(int(item.data(Qt.ItemDataRole.UserRole)))
+
+
+class TopBand(QWidget):
+    """The strip under the scoreboard: WE ribbon, expandable to the browser."""
+
+    COLLAPSED = 112
+    EXPANDED = 232
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(self.COLLAPSED)
+        self.setStyleSheet(f"background:{GROUND};")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        head = QWidget()
+        head.setFixedHeight(24)
+        head.setStyleSheet(f"background:{PANEL};border-bottom:1px solid {RULE_DIM};")
+        h = QHBoxLayout(head)
+        h.setContentsMargins(12, 0, 8, 0)
+        self.title = QLabel("")
+        self.title.setStyleSheet(f"color:{DIM};font-family:monospace;font-size:10px;"
+                                 f"letter-spacing:1px;border:0;")
+        h.addWidget(self.title, 1)
+        self.toggle = QPushButton("⌄ GAMES")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{DIM};border:0;"
+            f"font-family:monospace;font-size:10px;letter-spacing:1px;}}"
+            f"QPushButton:hover{{color:{INFO_C};}}")
+        self.toggle.clicked.connect(self._toggle)
+        h.addWidget(self.toggle)
+        v.addWidget(head)
+        self.stack = QStackedWidget()
+        self.ribbon = WERibbon()
+        self.browser = GameBrowser()
+        self.stack.addWidget(self.ribbon)
+        self.stack.addWidget(self.browser)
+        v.addWidget(self.stack, 1)
+
+    def _toggle(self):
+        opening = self.stack.currentIndex() == 0
+        self.stack.setCurrentIndex(1 if opening else 0)
+        self.setFixedHeight(self.EXPANDED if opening else self.COLLAPSED)
+        self.toggle.setText("⌃ CLOSE" if opening else "⌄ GAMES")
+
+    def show_ribbon(self):
+        if self.stack.currentIndex() != 0:
+            self._toggle()
+
+
+class LineupPanel(QWidget):
+    """Both starting lineups for the game being replayed.
+
+    A historical replay has no live lineup rail to lean on, and the boxscore's
+    top-level batting order is the END-of-game one, so this uses the same
+    starters walk the defensive alignment does: slot from `battingOrder`
+    ending in "00", position from `allPositions[0]`.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(158)
+        self.game: Optional[ReplayGame] = None
+        self.play: Optional[Play] = None
+
+    def set_game(self, g):
+        self.game = g
+        self.update()
+
+    def set_play(self, play):
+        self.play = play
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(GROUND))
+        p.setPen(QPen(QColor(RULE), 1))
+        p.drawLine(0, 0, self.width(), 0)
+        if not self.game:
+            return
+        w = self.width()
+        colw = w / 2.0
+        active = None
+        if self.play:
+            active = self.play.batter_id
+        for c, side in enumerate(("away", "home")):
+            x = c * colw + 14
+            abbr = self.game.away if side == "away" else self.game.home
+            f = QFont("monospace", 8)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor(INK))
+            p.drawText(QRectF(x, 7, colw - 20, 13),
+                       Qt.AlignmentFlag.AlignLeft, f"{abbr} LINEUP")
+            p.setPen(QPen(QColor(RULE_DIM), 1))
+            p.drawLine(QPointF(x, 23), QPointF(x + colw - 28, 23))
+            fm = QFont("monospace", 8)
+            for i, row in enumerate(self.game.lineups.get(side, [])[:9]):
+                y = 28 + i * 14
+                on = row["id"] == active
+                p.setFont(fm)
+                p.setPen(QColor(FAINT))
+                p.drawText(QRectF(x, y, 14, 13),
+                           Qt.AlignmentFlag.AlignLeft, str(row["order"]))
+                p.setPen(QColor(INFO_C if not on else LEV_C))
+                p.drawText(QRectF(x + 16, y, 26, 13),
+                           Qt.AlignmentFlag.AlignLeft, row["pos"] or "")
+                p.setPen(QColor(LEV_C if on else INK))
+                nm = row["name"]
+                if len(nm) > 20:
+                    parts = nm.split()
+                    nm = (parts[0][0] + ". " + " ".join(parts[1:])) if len(parts) > 1 else nm
+                p.drawText(QRectF(x + 46, y, colw - 74, 13),
+                           Qt.AlignmentFlag.AlignLeft, nm)
+        p.setPen(QPen(QColor(RULE_DIM), 1))
+        p.drawLine(QPointF(colw, 6), QPointF(colw, self.height() - 6))
+        p.end()
+
+
+class _MatchupRow(QWidget):
+    """One line of the matchup strip: face, name, hand, inline stats.
+
+    Replaces the tall two-card rail. Those cards spent ~330px of column on
+    two headshots and six stat tiles; at 40px a row this says the same thing
+    and hands the difference to the park.
+    """
+
+    def __init__(self, tag: str):
+        super().__init__()
+        self.setFixedHeight(50)
+        self.setStyleSheet("border:0;")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(9)
+        self.tag = tag
+        self.head = QLabel()
+        self.head.setFixedSize(29, 44)
+        self.head.setStyleSheet(f"background:{PANEL_HI};border:1px solid {RULE};")
+        h.addWidget(self.head)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self.name = QLabel("—")
+        self.name.setStyleSheet(f"color:{INK};font-size:12px;font-weight:600;"
+                                f"border:0;")
+        self.sub = QLabel("")
+        self.sub.setStyleSheet(f"color:{FAINT};font-family:monospace;"
+                               f"font-size:9px;letter-spacing:1px;border:0;")
+        col.addStretch(1)
+        col.addWidget(self.name)
+        col.addWidget(self.sub)
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        self.stats = QLabel("")
+        self.stats.setAlignment(Qt.AlignmentFlag.AlignRight |
+                                Qt.AlignmentFlag.AlignVCenter)
+        self.stats.setStyleSheet(f"color:{DIM};font-family:monospace;"
+                                 f"font-size:11px;border:0;")
+        h.addWidget(self.stats)
+        self._pid = 0
+
+    def set(self, pid: int, name: str, sub: str, stats: str):
+        self._pid = pid
+        self.name.setText(name or "—")
+        self.sub.setText(f"{self.tag} · {sub}" if sub else self.tag)
+        self.stats.setText(stats)
+        self.refresh_head()
+
+    def refresh_head(self):
+        pm = headshots().get(self._pid)
+        self.head.setPixmap(_portrait(pm, 29) if pm else QPixmap())
+
+
+class ReplayTab(QWidget):
+    """The Replay tab: scoreboard, park view, play log and transport.
+
+    One QTimer drives everything. A frame advances a counter and asks the
+    views to repaint from state that build_replay already computed — no
+    trajectory maths happens on the loop thread, which is also the UI thread
+    under qasync.
+    """
+
+    TICK_MS = 33
+    PITCH_TICKS = 17          # ~0.56s between pitches at 1x
+    FLIGHT_TICKS = 42
+    HOLD_TICKS = 24
+    GAP_TICKS = 20
+
+    def __init__(self, stats=None, parent=None):
+        super().__init__(parent)
+        self._stats = stats
+        self._feed = ReplayFeed()
+        self.game: Optional[ReplayGame] = None
+        self._idx = 0
+        self._shown = 0
+        self._phase = "idle"
+        self._t = 0
+        self._speed = 1
+        self._loaded_pk = None
+        self._season_rows: List[dict] = []
+        self._has_we = False
+        # live polling: only while the game is in progress AND the tab is on
+        # screen, so a background tab never sits refetching a 0.24MB feed
+        self._live = False
+        self._follow = True
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(15000)
+        self._live_timer.timeout.connect(self._poll_live)
+
+        self.setStyleSheet(f"QWidget{{background:{GROUND};color:{INK};}}")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.score = ScoreStrip()
+        root.addWidget(self.score)
+
+        self.band = TopBand()
+        self.band.ribbon.scrub.connect(self._on_scrub)
+        self.band.browser.chosen.connect(self._on_browse_pick)
+        root.addWidget(self.band)
+
+        # A plain layout, NOT a QSplitter. The splitter renegotiated both
+        # panes every time the parent tab area was dragged, so the park would
+        # jump or the side column collapse mid-resize. A fixed side column
+        # and an expanding park resize predictably at any window size.
+        body = QWidget()
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+        self.field = FieldView()
+        ll.addWidget(self.field, 1)
+        # The park is WIDTH-limited in any realistic pane, so the vertical
+        # slack under it is free real estate — the lineups cost the field
+        # nothing.
+        self.lineups = LineupPanel()
+        ll.addWidget(self.lineups)
+        bl.addWidget(left, 1)
+
+        side = QWidget()
+        side.setStyleSheet(f"background:{PANEL};")
+        sv = QVBoxLayout(side)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+
+        # --- compact matchup strip: two rows instead of two tall cards
+        mw = QWidget()
+        mw.setStyleSheet(f"background:{PANEL};border-bottom:1px solid {RULE_DIM};")
+        mv = QVBoxLayout(mw)
+        mv.setContentsMargins(10, 8, 10, 8)
+        mv.setSpacing(7)
+        self.p_row = _MatchupRow("P")
+        self.b_row = _MatchupRow("AB")
+        mv.addWidget(self.p_row)
+        mv.addWidget(self.b_row)
+        sv.addWidget(mw)
+
+        zc, zv = _card("ZONE · CATCHER'S VIEW")
+        self.zone = ZoneView()
+        self.zone.setMinimumHeight(212)
+        zv.addWidget(self.zone)
+        self.seq = QLabel("")
+        self.seq.setWordWrap(True)
+        self.seq.setStyleSheet(f"color:{DIM};font-family:monospace;"
+                               f"font-size:9px;border:0;")
+        zv.addWidget(self.seq)
+        sv.addWidget(zc)
+
+        hc, hv = _card("BATTED BALL")
+        self.hit_stat = _Stat(["EV MPH", "LA °", "DIST FT"])
+        hv.addWidget(self.hit_stat)
+        self.hit_note = QLabel("awaiting contact")
+        self.hit_note.setStyleSheet(f"color:{FAINT};font-family:monospace;"
+                                    f"font-size:9px;letter-spacing:1px;border:0;")
+        hv.addWidget(self.hit_note)
+        sv.addWidget(hc)
+
+        lh = QLabel("PLAY BY PLAY")
+        lh.setStyleSheet(f"color:{FAINT};font-family:monospace;font-size:9px;"
+                         f"font-weight:600;letter-spacing:2px;padding:7px 12px;"
+                         f"background:{PANEL};border-bottom:1px solid {RULE_DIM};")
+        sv.addWidget(lh)
+
+        self.log = QListWidget()
+        self.log.setItemDelegate(PlayLogDelegate())
+        self.log.setStyleSheet(
+            f"QListWidget{{background:{PANEL};border:0;}}"
+            f"QListWidget::item{{border:0;}}"
+            f"QScrollBar:vertical{{background:{PANEL};width:9px;border:0;}}"
+            f"QScrollBar::handle:vertical{{background:{RULE};min-height:24px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{"
+            f"height:0;}}"
+            f"QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{{"
+            f"background:{PANEL};}}")
+        self.log.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.log.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.log.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.log.currentRowChanged.connect(self._on_log_row)
+        sv.addWidget(self.log, 1)
+
+        side.setFixedWidth(300)
+        side.setStyleSheet(f"background:{PANEL};border-left:1px solid {RULE};")
+        bl.addWidget(side)
+        self._body = body
+        root.addWidget(body, 1)
+
+        bar = QWidget()
+        bar.setFixedHeight(42)
+        bar.setStyleSheet(f"background:{PANEL};border-top:1px solid {RULE};")
+        bh = QHBoxLayout(bar)
+        bh.setContentsMargins(12, 6, 12, 6)
+        bh.setSpacing(6)
+        btn_css = (f"QPushButton{{background:{PANEL_HI};color:{INK};"
+                   f"border:1px solid {RULE};font-family:monospace;"
+                   f"font-size:12px;padding:5px 10px;}}"
+                   f"QPushButton:hover{{border-color:{INFO_C};}}")
+        self.b_prev = QPushButton("⏮")
+        self.b_play = QPushButton("▶ Play")
+        self.b_next = QPushButton("⏭")
+        self.b_spd = QPushButton("1×")
+        for bt in (self.b_prev, self.b_play, self.b_next, self.b_spd):
+            bt.setStyleSheet(btn_css)
+            bt.setCursor(Qt.CursorShape.PointingHandCursor)
+            bh.addWidget(bt)
+        self.b_play.setMinimumWidth(76)
+        self.b_prev.clicked.connect(lambda: self.goto(self._idx - 1))
+        self.b_next.clicked.connect(lambda: self.goto(self._idx + 1))
+        self.b_play.clicked.connect(self.toggle)
+        self.b_spd.clicked.connect(self._cycle_speed)
+        self.status = QLabel("")
+        self.status.setStyleSheet(f"color:{DIM};font-family:monospace;"
+                                  f"font-size:10px;border:0;")
+        bh.addSpacing(10)
+        bh.addWidget(self.status, 1)
+        root.addWidget(bar)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.TICK_MS)
+        self._timer.timeout.connect(self._tick_fn)
+        headshots().subscribe(self._refresh_heads)
+
+    # ------------------------------------------------------------- loading
+
+    async def load_game(self, session, game_pk: int):
+        if game_pk == self._loaded_pk:
+            return
+        self.status.setText(f"Loading {game_pk}…")
+        feed = await self._feed.get(session, game_pk)
+        if not feed:
+            self.status.setText("Feed unavailable")
+            return
+        game = build_replay(feed)
+        if not game:
+            self.status.setText("No plays in feed")
+            return
+        self._loaded_pk = game_pk
+        self.set_game(game)
+        if self._stats is not None and not self.field.speeds:
+            try:
+                board = await self._stats.get_sprint_speed(session)
+                self.field.speeds = {pid: v["speed"] for pid, v in board.items()
+                                     if v.get("speed")}
+                self.field.update()
+            except Exception as e:
+                print(f"Replay: sprint speeds unavailable ({e})")
+
+    async def load_season(self, session, season: int):
+        """One request covers the whole season's browsable game list."""
+        if self._season_rows:
+            return
+        try:
+            async with session.get(
+                    "https://statsapi.mlb.com/api/v1/schedule",
+                    params={"sportId": "1", "season": str(season),
+                            "gameType": "R", "fields": SEASON_BROWSE_FIELDS},
+                    timeout=aiohttp.ClientTimeout(total=45)) as resp:
+                if resp.status != 200:
+                    return
+                data = json_loads(await resp.read())
+        except Exception as e:
+            print(f"Replay: season index failed: {e}")
+            return
+        # the roster walk's id -> abbreviation map is the authoritative one
+        tmap = dict(getattr(self._stats, "_teams", {}) or {})
+        rows = []
+        for d in (data or {}).get("dates") or []:
+            date = d.get("date") or ""
+            for g in d.get("games") or []:
+                st = (g.get("status") or {}).get("abstractGameState")
+                if st != "Final":
+                    continue
+                try:
+                    a = g["teams"]["away"]
+                    h = g["teams"]["home"]
+                    an, hn = a["team"]["name"], h["team"]["name"]
+                    aa = tmap.get(a["team"].get("id")) or _abbrev(an)
+                    ha = tmap.get(h["team"].get("id")) or _abbrev(hn)
+                    label = (f"{date}  {aa:>3} {a.get('score', 0):>2}"
+                             f" @ {ha:>3} {h.get('score', 0):<2}"
+                             f"  {(g.get('venue') or {}).get('name', '')}")
+                    rows.append({"pk": g["gamePk"], "label": label,
+                                 "hay": f"{date} {an} {hn} {aa} {ha}".lower()})
+                except KeyError:
+                    continue
+        rows.reverse()                    # most recent first
+        self._season_rows = rows
+        self.band.browser.set_games(rows)
+
+    def _on_scrub(self, i: int):
+        self.stop()
+        self.goto(i)
+
+    # -------------------------------------------------------------- live
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self._live and not self._live_timer.isActive():
+            self._live_timer.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._live_timer.stop()
+
+    def _poll_live(self):
+        if not (self._live and self._stats and self._loaded_pk):
+            return
+
+        async def go():
+            try:
+                async with self._stats.http() as session:
+                    feed = await self._feed.get(session, self._loaded_pk,
+                                                refresh=True)
+            except Exception as e:
+                print(f"Replay: live poll failed: {e}")
+                return
+            if not feed:
+                return
+            game = build_replay(feed)
+            if game:
+                self._apply_live(game)
+        asyncio.create_task(go())
+
+    def _apply_live(self, game: ReplayGame):
+        """Fold a refreshed feed in without stealing the user's place.
+
+        Following means sitting on the newest play; scrub back and the tab
+        stops following, so an arriving pitch does not yank the view away
+        from whatever you were watching.
+        """
+        old = self.game
+        was_last = self._idx >= len(old.plays) - 1 if old else True
+        self._follow = self._follow and was_last
+        keep = self._idx
+        added = len(game.plays) - (len(old.plays) if old else 0)
+        if old and added >= 0 and old.game_pk == game.game_pk:
+            # Incremental: only the tail moves. Clearing and re-adding every
+            # row cost ~45ms of UI thread per poll and threw away the
+            # scroll position with it.
+            self._patch_log(game, len(old.plays))
+        else:
+            self.set_game(game, keep_place=None if self._follow else keep)
+            return
+        self.game = game
+        self._has_we = annotate_win_expectancy(game, self._stats)
+        self.band.ribbon.set_game(game, self._has_we)
+        self.lineups.set_game(game)
+        self.score.set_game(game)
+        self.goto(len(game.plays) - 1 if self._follow
+                  else min(keep, len(game.plays) - 1))
+        if not game.final:
+            self.status.setText(
+                f"● LIVE  {game.away} @ {game.home} · {game.venue}"
+                + (f"  (+{added} play{'s' if added != 1 else ''})"
+                   if added > 0 else ""))
+
+    def _on_browse_pick(self, pk: int):
+        if self._stats is None or pk == self._loaded_pk:
+            return
+        self.band.show_ribbon()
+        self.status.setText(f"Loading {pk}…")
+
+        async def go():
+            try:
+                async with self._stats.http() as session:
+                    await self.load_game(session, pk)
+            except Exception as e:
+                self.status.setText(f"Load failed: {e}")
+        asyncio.create_task(go())
+
+    def _patch_log(self, game: ReplayGame, old_n: int):
+        """Refresh the tail of the log rather than rebuilding it.
+
+        The previously-last row is re-pointed too: an at-bat that read
+        "AT BAT — Simpson batting, 0-1" last poll is a strikeout now.
+        """
+        self.log.blockSignals(True)
+        if old_n and self.log.count() >= old_n:
+            self.log.item(old_n - 1).setData(
+                Qt.ItemDataRole.UserRole, game.plays[old_n - 1])
+        for pl in game.plays[old_n:]:
+            it = QListWidgetItem()
+            it.setData(Qt.ItemDataRole.UserRole, pl)
+            self.log.addItem(it)
+        self.log.blockSignals(False)
+        self.log.viewport().update()
+
+    def set_game(self, game: ReplayGame, keep_place: Optional[int] = None):
+        self.stop()
+        self.game = game
+        self.field.set_venue(game.venue)
+        self.score.set_game(game)
+        self.lineups.set_game(game)
+        self.log.blockSignals(True)
+        self.log.clear()
+        for pl in game.plays:
+            it = QListWidgetItem()
+            it.setData(Qt.ItemDataRole.UserRole, pl)
+            self.log.addItem(it)
+        self.log.blockSignals(False)
+        self._has_we = annotate_win_expectancy(game, self._stats)
+        self.band.ribbon.set_game(game, self._has_we)
+        self.band.title.setText(
+            f"{game.date}   {game.away} @ {game.home}   ·   {game.venue}")
+        self._live = not game.final
+        if self._live and self.isVisible() and not self._live_timer.isActive():
+            self._live_timer.start()
+        elif not self._live:
+            self._live_timer.stop()
+        key = resolve_venue(game.venue)
+        self.status.setText(
+            ("● LIVE  " if self._live else "")
+            + f"{game.away} @ {game.home} · {game.date} · {game.venue}"
+            + ("" if key else "  (no wall data — generic outline)"))
+        if keep_place is not None:
+            self.goto(min(keep_place, len(game.plays) - 1))
+        elif self._live:
+            self.goto(len(game.plays) - 1)      # a live game opens at NOW
+        else:
+            self.goto(0)
+
+    # ------------------------------------------------------------ playback
+
+    def goto(self, i: int, animate: bool = False):
+        if not self.game:
+            return
+        self._idx = max(0, min(len(self.game.plays) - 1, i))
+        # leaving the newest play means the user wants to look at something;
+        # returning to it resumes following
+        self._follow = self._idx >= len(self.game.plays) - 1
+        play = self.game.plays[self._idx]
+        self._shown = 0 if animate else len(play.pitches)
+        self._phase = "pitches" if animate else "idle"
+        self._t = 0
+        self.field.set_play(play)
+        if not animate:
+            self.field.action_t = 1.0     # settled: runners on their bags
+        self.lineups.set_play(play)
+        if not animate and play.hit and play.hit.angle is not None:
+            self._show_hit(play)
+        self._sync(play)
+        if self.log.currentRow() != self._idx:
+            self.log.blockSignals(True)
+            self.log.setCurrentRow(self._idx)
+            self.log.blockSignals(False)
+        self.log.scrollToItem(self.log.item(self._idx),
+                              QAbstractItemView.ScrollHint.EnsureVisible)
+        self.band.ribbon.set_index(self._idx)
+
+    def _sync(self, play: Play):
+        pitches = play.pitches[:self._shown]
+        count = ((pitches[-1].balls, pitches[-1].strikes) if pitches
+                 else (0, 0))
+        self.score.set_play(play, count)
+        self.zone.set_pitches(play.pitches, self._shown)
+        self.seq.setText("   ".join(
+            f"{i+1} {p.ptype} {p.mph:.0f}" if p.mph else f"{i+1} {p.ptype}"
+            for i, p in enumerate(pitches)))
+        ss = self.game.season_stats
+        bat = (ss.get(play.batter_id) or {}).get("batting") or {}
+        pit = (ss.get(play.pitcher_id) or {}).get("pitching") or {}
+        self.p_row.set(play.pitcher_id, play.pitcher, f"{play.pitch_hand}HP",
+                       f"{play.pitcher_pitches}P   {pit.get('era', '—')} ERA")
+        self.b_row.set(play.batter_id, play.batter, f"{play.bat_side}HB",
+                       f"{bat.get('avg', '—')}   {bat.get('homeRuns', 0)} HR"
+                       f"   {bat.get('ops', '—')}")
+        if play.hit and self._shown >= len(play.pitches):
+            self._show_hit(play)
+        else:
+            self.hit_stat.set(None, None, None)
+            self.hit_stat.tint(INK)
+            self.hit_note.setText("awaiting contact")
+
+    def _show_hit(self, play: Play):
+        h = play.hit
+        if not h:
+            return
+        self.hit_stat.set(
+            f"{h.ev:.1f}" if h.ev else None,
+            f"{h.la:.0f}" if h.la is not None else None,
+            f"{h.distance:.0f}" if h.distance else None)
+        self.hit_stat.tint(LEV_C)
+        self.hit_note.setText((h.trajectory or "").replace("_", " ").upper())
+
+    def _refresh_heads(self):
+        """Headshots arrive asynchronously; repaint whatever is on screen."""
+        self.p_row.refresh_head()
+        self.b_row.refresh_head()
+
+    def toggle(self):
+        if self._timer.isActive():
+            self.stop()
+        else:
+            self.play()
+
+    def play(self):
+        if not self.game:
+            return
+        if self._phase == "idle":
+            self.goto(self._idx, animate=True)
+        self._timer.start()
+        self.b_play.setText("⏸ Pause")
+
+    def stop(self):
+        self._timer.stop()
+        self.b_play.setText("▶ Play")
+
+    def _cycle_speed(self):
+        self._speed = {1: 2, 2: 4, 4: 1}[self._speed]
+        self.b_spd.setText(f"{self._speed}×")
+
+    def _on_log_row(self, row: int):
+        if row >= 0 and row != self._idx:
+            self.stop()
+            self.goto(row)
+
+    def _tick_fn(self):
+        if not self.game:
+            return
+        play = self.game.plays[self._idx]
+        self._t += self._speed
+        if self._phase == "pitches":
+            if self._t >= self.PITCH_TICKS:
+                self._t = 0
+                if self._shown < len(play.pitches):
+                    self._shown += 1
+                    self._sync(play)
+                    last = play.pitches[self._shown - 1]
+                    if last.in_play and play.hit and play.hit.angle is not None:
+                        self.field.start_flight(
+                            play.hit.angle,
+                            play.hit.distance or play.hit.calc_distance or 300)
+                        self._phase = "flight"
+                else:
+                    if play.runner_moves and not play.hit:
+                        self._phase = "runners"
+                        self._t = 0
+                    else:
+                        self._phase = "gap"
+        elif self._phase == "runners":
+            self.field.action_t = min(1.0, self._t / self.FLIGHT_TICKS)
+            self.field.update()
+            if self._t >= self.FLIGHT_TICKS:
+                self._t = 0
+                self._phase = "gap"
+        elif self._phase == "flight":
+            self.field.ball_t = min(1.0, self._t / self.FLIGHT_TICKS)
+            self.field.action_t = min(
+                1.0, self._t / (self.FLIGHT_TICKS + self.HOLD_TICKS))
+            self.field.update()
+            if self._t >= self.FLIGHT_TICKS + self.HOLD_TICKS:
+                self.field.callout = play.event.upper()
+                self.field.callout_sub = self._hit_line(play)
+                self.field.update()
+                self._t = 0
+                self._phase = "gap"
+        elif self._phase == "gap":
+            if self._t >= self.GAP_TICKS:
+                if self._idx >= len(self.game.plays) - 1:
+                    self.stop()
+                    return
+                self.goto(self._idx + 1, animate=True)
+
+    @staticmethod
+    def _hit_line(play: Play) -> str:
+        h = play.hit
+        if not h:
+            return ""
+        bits = []
+        if h.ev:
+            bits.append(f"{h.ev:.1f} MPH")
+        if h.la is not None:
+            bits.append(f"{h.la:.0f}°")
+        if h.distance:
+            bits.append(f"{h.distance:.0f} FT")
+        return " · ".join(bits)
+
+
 class MLBWindow(QMainWindow):
     """Standalone MLB viewer: game banner on top; lineup rail | pitcher half
     (SP form + bullpen) | batter half (Player Detail / Advanced Stats)."""
@@ -16154,7 +19374,17 @@ class MLBWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        # The real UI lives in its own container so startup can HIDE it rather
+        # than merely cover it. A covered-but-visible widget tree is still
+        # laid out and repainted by Qt on every change underneath the overlay,
+        # and that cost lands on the GUI thread — which is the only thread
+        # allowed to paint the loader. Hidden, Qt skips it entirely.
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._content = QWidget()
+        outer.addWidget(self._content)
+        root = QVBoxLayout(self._content)
         root.setContentsMargins(2, 2, 2, 2)
         root.setSpacing(3)
 
@@ -16203,10 +19433,16 @@ class MLBWindow(QMainWindow):
         # running event loop at construction
         self.advanced_stats_widget = None
         self.manager_tab = None
+        self.replay_tab = None
         # a game may be selected before the Managers tab exists
         self._last_game_teams: List[str] = []
+        # ...and before the Replay tab does, so its gamePk waits here
+        self._pending_replay_pk: Optional[int] = None
 
-        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = InsetSplitter(Qt.Orientation.Horizontal)
+        # Wide enough that the inset grip is a comfortable grab target — the
+        # rail|pitcher handle is also the rail's collapse toggle.
+        self.main_splitter.setHandleWidth(9)
         self.main_splitter.addWidget(self.rail)
         self.main_splitter.addWidget(pitcher_col)
         self.main_splitter.addWidget(self.detail_tabs)
@@ -16230,11 +19466,128 @@ class MLBWindow(QMainWindow):
         # Pen table needs ~882px to show every column without scrolling;
         # detail panel min is ~820 — split the 1900px budget accordingly
         self.main_splitter.setSizes([self.RAIL_W, 890, 838])
+        # handle(1) is the rail|pitcher gutter; handle(2) (pitcher|tabs) is a
+        # real resizer between two equals and stays plain.
+        h = self.main_splitter.handle(1)
+        if isinstance(h, InsetSplitterHandle):
+            h.inset = True
+            # Drop the rail's OWN right border — the handle redraws it on its
+            # far edge. Left in, the two lines bracket the grip into a strip
+            # of its own, which is the outside-the-panel look being replaced.
+            self.rail.setStyleSheet(
+                self.rail.styleSheet() + "\nQListWidget { border-right: 0; }")
         root.addWidget(self.main_splitter, stretch=1)
+
+        # The startup overlay needs a window HANDLE to parent itself to, which
+        # does not exist until the window is shown — see showEvent.
+        self._loader = None
+        self._loader_started = False
+        central.installEventFilter(self)
 
         # Async init once the qasync loop is running
         QTimer.singleShot(0, lambda: asyncio.create_task(self._init_async()))
         self._cap_window_to_screen()
+
+    # ------------------------------------------------------- startup overlay
+
+    # Order matters only for the label shown; the pips fill as each lands.
+    LOAD_STEPS = [
+        ("tabs",       "building panels…"),
+        ("roster",     "loading roster…"),
+        ("schedule",   "fetching today's slate…"),
+        ("lineups",    "posting lineups…"),
+        ("percentile", "percentile boards…"),
+        ("bullpen",    "bullpen availability…"),
+        ("managers",   "walking the league's play-by-play…"),
+    ]
+
+    # A hung fetch must never trap the window behind the overlay.
+    LOAD_TIMEOUT_MS = 90_000
+
+    def showEvent(self, a0):
+        super().showEvent(a0)
+        if not self._loader_started:
+            self._loader_started = True
+            self._install_loader()
+
+    def _install_loader(self):
+        """In-window overlay, and the real UI hidden behind it.
+
+        Deliberately NOT a separate always-on-top window: layering a transient
+        window over the main one is unreliable (it lost stacking and the panels
+        were visible populating underneath), and it is not what a splash inside
+        an application window should be.
+
+        In-window means the GUI thread paints it, and Qt permits no other
+        thread to — widgets and QPixmap are main-thread-only, full stop. So
+        smoothness here is bought by giving the GUI thread less to do, not by
+        moving the animation off it: `_content` is HIDDEN for the whole load,
+        which is what stops Qt laying out and repainting thirty panels
+        underneath an overlay nobody can see through anyway."""
+        central = self.centralWidget()
+        self._content.hide()
+        try:
+            self._loader = QuickSeamLoader(central, self.LOAD_STEPS)
+        except Exception as e:
+            print(f"EffortMLB: Quick loader unavailable ({e}); "
+                  f"using the QPainter overlay")
+            self._loader = SeamLoader(central, self.LOAD_STEPS)
+            self._loader.setGeometry(central.rect())
+            # Built in showEvent, i.e. into an ALREADY-visible parent, so Qt
+            # does not show it for us the way it would for a child made in
+            # __init__.
+            self._loader.show()
+        self._loader.finished.connect(self._on_loader_faded)
+        self._loader.raise_()
+
+    def _reveal_content(self):
+        """Show the finished UI underneath the overlay, then fade it out.
+
+        Order matters: showing `_content` triggers the one and only full
+        layout pass for the whole window, and that pass has to happen while
+        the overlay is still opaque or it is seen as a flash of unstyled
+        panels snapping into place."""
+        if self._content.isVisible():
+            return
+        self._content.show()
+        if self._loader is not None:
+            self._loader.raise_()
+        # Panels that measured themselves while hidden have to re-measure now
+        # that Qt has resolved a real layout. Deferred one turn so the show's
+        # layout pass has actually run before anything reads geometry back.
+        QTimer.singleShot(0, self._relayout_after_reveal)
+
+    def _relayout_after_reveal(self):
+        try:
+            self.bullpen_panel.refresh_layout()
+        except Exception as e:
+            print(f"EffortMLB: post-reveal relayout failed: {e}")
+
+    def _on_loader_faded(self):
+        self._loader = None
+
+    def _sync_loader(self):
+        if self._loader is not None:
+            self._loader.setGeometry(self.centralWidget().rect())
+
+    def eventFilter(self, a0, a1):
+        """Keep the overlay covering the window as it is resized."""
+        if (a1 is not None and self._loader is not None
+                and a1.type() == QEvent.Type.Resize
+                and a0 is self.centralWidget()):
+            self._sync_loader()
+        return super().eventFilter(a0, a1)
+
+    def _load_step(self, key: str):
+        if self._loader is not None:
+            self._loader.step(key)
+
+    def _loader_done(self):
+        # Reveal FIRST, so the layout pass happens under an opaque overlay,
+        # then start the fade. The loader nulls itself out when it has faded.
+        self._reveal_content()
+        if self._loader is not None:
+            self._loader.finish()
 
     # -------------------------------------------------------- window sizing
 
@@ -16250,6 +19603,8 @@ class MLBWindow(QMainWindow):
 
     def moveEvent(self, a0):
         self._cap_window_to_screen()
+        # The Quick overlay is its OWN window, so it has to be dragged along.
+        self._sync_loader()
         super().moveEvent(a0)
 
     def closeEvent(self, a0):
@@ -16265,6 +19620,23 @@ class MLBWindow(QMainWindow):
     # ------------------------------------------------------------ async init
 
     async def _init_async(self):
+        watchdog = QTimer(self)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(self._loader_done)
+        watchdog.start(self.LOAD_TIMEOUT_MS)
+        self._tracker = StartupTracker(asyncio.get_event_loop())
+        self._tracker.install()
+        try:
+            await self._init_async_inner()
+            # Everything named above has landed; now wait for everything the
+            # panels kicked off on their own before revealing the window.
+            await self._tracker.drain()
+        finally:
+            self._tracker.uninstall()
+            watchdog.stop()
+            self._loader_done()
+
+    async def _init_async_inner(self):
         try:
             from TrackingStatsWidget import AdvancedStatsWidget
             self.advanced_stats_widget = AdvancedStatsWidget()
@@ -16273,37 +19645,111 @@ class MLBWindow(QMainWindow):
                                     "Advanced Stats")
         except Exception as e:
             print(f"EffortMLB: Advanced Stats tab unavailable: {e}")
+        # Hand the loop back between tabs. Each of these builds a full widget
+        # tree (tables, plots, delegates) and Qt gives no yield points inside
+        # that, so constructing all four back to back was one unbroken block
+        # with no repaint in it — the overlay's biggest single stall.
+        await asyncio.sleep(0)
         # League manager/bullpen board — lazy, loads on first view
         self.manager_tab = ManagerBoardTab(self.stats)
         self.detail_tabs.addTab(self.manager_tab, "Managers")
+        await asyncio.sleep(0)
         # The only forward-looking surface in the window, so it gets its own
         # tab rather than being mixed into the SP card where a projection
         # would read as another measurement. Lazy like the board above.
         self.projections_tab = ProjectionsTab(self.stats)
         self.detail_tabs.addTab(self.projections_tab, "Projections")
+        await asyncio.sleep(0)
+        # Game replay off the live feed. Lazy like the others: it holds no
+        # data until a game is selected, and the feed for a FINAL game is
+        # fetched once ever and then read from disk.
+        self.replay_tab = ReplayTab(self.stats)
+        self.detail_tabs.addTab(self.replay_tab, "Replay")
+        await asyncio.sleep(0)
+        if self._pending_replay_pk:
+            self._load_replay(self._pending_replay_pk)
         # Nothing is selected at launch, so Player Detail would leave the
         # WIDEST pane in the window empty until the first click. The league
         # board needs no selection to be worth reading, and a player click
         # switches away from it (see _show_player_detail). Making it current
         # also trips its lazy showEvent load, so it fills while you work.
+        # The board's load is kicked by showEvent, so arm the completion hook
+        # BEFORE making it current or the signal can fire into nothing.
+        mgr_done = asyncio.get_event_loop().create_future()
+
+        def _mgr_finished():
+            if not mgr_done.done():
+                mgr_done.set_result(True)
+        self.manager_tab.load_finished.connect(_mgr_finished)
         self.detail_tabs.setCurrentWidget(self.manager_tab)
+        # setCurrentWidget cannot trip the board's lazy showEvent while the
+        # whole UI is hidden behind the overlay, so start it explicitly.
+        self.manager_tab.ensure_loaded()
         if self._last_game_teams:
             self.manager_tab.set_highlight(self._last_game_teams)
+        self._load_step("tabs")
         try:
             async with self.stats.http() as session:
                 if not await self.stats.ensure_roster(session):
                     print("EffortMLB: roster load failed")
                     return
+                self._load_step("roster")
                 games = await self.stats._get_schedule(session)
         except Exception as e:
             print(f"EffortMLB: init failed: {e}")
             return
+        self._load_step("schedule")
+        # BEFORE select(0): choosing a game loads the Replay tab, which calls
+        # the SYNCHRONOUS annotate_win_expectancy. Restore the league tables
+        # and fit the surface off-thread first so that call is a cache hit —
+        # warming it after the manager board (where the tables are final) is
+        # too late to save the one fit that lands mid-animation.
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, self.stats.load_league_tables)
+            await self.stats.warm_we_surface()
+        except Exception as e:
+            print(f"EffortMLB: league table warm failed: {e}")
         self.banner.set_games(games, self.stats._teams)
         if games:
             self.banner.select(0)
         self._start_lineup_poll(games)
-        asyncio.create_task(self._load_percentile_data())
-        asyncio.create_task(self._populate_bullpen_teams())
+        self._load_step("lineups")
+
+        async def _percentiles():
+            await self._load_percentile_data()
+            self._load_step("percentile")
+
+        async def _pen():
+            await self._populate_bullpen_teams()
+            self._load_step("bullpen")
+
+        async def _mgr():
+            # showEvent may never fire (offscreen, or the tab was swapped
+            # before it painted) — the watchdog in _init_async is the backstop
+            # for that, so this simply waits.
+            await mgr_done
+            # League tables are final now — fit the WE surface off-thread so
+            # the Replay tab's synchronous annotate never does it inline.
+            try:
+                await self.stats.warm_we_surface()
+            except Exception as e:
+                print(f"EffortMLB: WE warm failed: {e}")
+            self._load_step("managers")
+
+        async def _game():
+            # Whatever `banner.select(0)` above fanned out (rail decoration,
+            # replay + win-expectancy fit, SP card).
+            for t in list(getattr(self, "_game_tasks", ())):
+                try:
+                    await t
+                except Exception:
+                    pass
+
+        # The overlay stays up until ALL of it has landed. Exceptions are
+        # swallowed per-branch so one dead board cannot hold the window.
+        await asyncio.gather(_percentiles(), _pen(), _mgr(), _game(),
+                             return_exceptions=True)
 
     # ------------------------------------------------------- lineup polling
     #
@@ -16441,10 +19887,39 @@ class MLBWindow(QMainWindow):
 
     # ------------------------------------------------------- game selection
 
+    def _load_replay(self, game_pk: int):
+        """Hand a gamePk to the Replay tab, holding it if the tab isn't up
+        yet (it is built in _init_async, which may not have run)."""
+        self._pending_replay_pk = game_pk
+        if self.replay_tab is None:
+            return
+
+        async def go():
+            try:
+                async with self.stats.http() as session:
+                    await self.replay_tab.load_game(session, game_pk)
+                    # the browser's season index is one request and is what
+                    # makes historical replays reachable from inside the tab
+                    await self.replay_tab.load_season(session,
+                                                      self.stats.season)
+            except Exception as e:
+                print(f"EffortMLB: replay load failed: {e}")
+        asyncio.create_task(go())
+
     def _on_game_selected(self, game: dict):
+        # Tasks this selection fans out, so the startup overlay can wait on
+        # them — `banner.select(0)` fires this DURING init, and its work was
+        # previously untracked, which is why a 380ms replay/win-expectancy
+        # stall used to land in the middle of the fade. `_show_umpire` is
+        # deliberately NOT tracked: it backs off for up to 57s by design.
+        self._game_tasks = []
+        pk = game.get("gamePk")
+        if pk:
+            self._load_replay(pk)
         self.rail.set_game(game, self.stats)
         self._rail_gen = getattr(self, "_rail_gen", 0) + 1
-        asyncio.create_task(self._decorate_rail(self._rail_gen))
+        self._game_tasks.append(
+            asyncio.create_task(self._decorate_rail(self._rail_gen)))
         # Seed the pitcher half with the away probable until a click refines
         away = game.get("teams", {}).get("away", {})
         home = game.get("teams", {}).get("home", {})

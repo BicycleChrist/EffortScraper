@@ -68,6 +68,80 @@ def _smoothstep(t):
     return t * t * (3.0 - 2.0 * t)
 
 
+def _smootherstep(t):
+    """Quintic ease — C2, where `_smoothstep` is only C1.
+
+    Used where a blend WINDOW opens or closes inside the swing: the probe reads
+    |d2p/ds2|, so a C1 join shows up as a spike at the window edge even though
+    the motion looks continuous. Blending the follow-through's two grip
+    reconciliations with the cubic put a 216 bump exactly at the window end."""
+    t = max(0.0, min(1.0, t))
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+
+# ---------------------------------------------------------------------------
+# The barrel path — a cubic Bezier, parameterised by ARC LENGTH.
+#
+# Arc length is the whole point: Savant's swing length is a distance travelled,
+# and its bat speed is a speed along that distance. Parameterise by arc length
+# and both become exact by construction instead of by search — the shape solve
+# only has to hit the total length, and the speed profile is then the kinematic
+# sequence applied to it.
+#
+# The inversion (arc length -> Bezier parameter) is a table built once per
+# solve. It is interpolated with a CUBIC Hermite in sigma, not linearly: the
+# slope du/dsigma = 1/|P'(u)| is known exactly at every node, so the inverse is
+# C1 and the barrel does not pick up a kink at every table node. A linear
+# inversion shows up directly in the |d2p/ds2| the probe measures.
+_ARC_N = 96
+_GL3 = ((-0.7745966692414834, 0.5555555555555556),
+        (0.0, 0.8888888888888888),
+        (0.7745966692414834, 0.5555555555555556))
+
+
+def _bez(Q, u):
+    a = 1.0 - u
+    w0, w1, w2, w3 = a * a * a, 3.0 * a * a * u, 3.0 * a * u * u, u * u * u
+    return (w0 * Q[0][0] + w1 * Q[1][0] + w2 * Q[2][0] + w3 * Q[3][0],
+            w0 * Q[0][1] + w1 * Q[1][1] + w2 * Q[2][1] + w3 * Q[3][1],
+            w0 * Q[0][2] + w1 * Q[1][2] + w2 * Q[2][2] + w3 * Q[3][2])
+
+
+def _bez_d(Q, u):
+    a = 1.0 - u
+    w0, w1, w2 = 3.0 * a * a, 6.0 * a * u, 3.0 * u * u
+    return (w0 * (Q[1][0] - Q[0][0]) + w1 * (Q[2][0] - Q[1][0])
+            + w2 * (Q[3][0] - Q[2][0]),
+            w0 * (Q[1][1] - Q[0][1]) + w1 * (Q[2][1] - Q[1][1])
+            + w2 * (Q[3][1] - Q[2][1]),
+            w0 * (Q[1][2] - Q[0][2]) + w1 * (Q[2][2] - Q[1][2])
+            + w2 * (Q[3][2] - Q[2][2]))
+
+
+def _bez_arc_table(sg):
+    """Cumulative arc length at _ARC_N+1 nodes, by 3-point Gauss-Legendre per
+    segment. Returns the total length, which is the quantity the shape solve
+    bisects against the measured swing length."""
+    Q = (sg["Q0"], sg["Q1"], sg["Q2"], sg["Q3"])
+    n, h = _ARC_N, 1.0 / _ARC_N
+    us = [k * h for k in range(n + 1)]
+    sp = []
+    for u in us:
+        d = _bez_d(Q, u)
+        sp.append(math.sqrt(_dot(d, d)))
+    cum = [0.0] * (n + 1)
+    for k in range(n):
+        tot = 0.0
+        for x, w in _GL3:
+            d = _bez_d(Q, us[k] + h * 0.5 * (x + 1.0))
+            tot += w * math.sqrt(_dot(d, d))
+        cum[k + 1] = cum[k] + tot * h * 0.5
+    sg["arc_u"], sg["arc_s"], sg["arc_sp"] = us, cum, sp
+    sg["L"] = cum[-1]
+    return cum[-1]
+
+
 # ---------------------------------------------------------------------------
 # Swing timing — the kinematic sequence.
 #
@@ -88,15 +162,26 @@ _CONTACT_P = _DOWNSWING_S / (_DOWNSWING_S + _FOLLOW_S)
 _SEQ_PELVIS = 0.34
 _SEQ_TORSO = 0.46
 _SEQ_WRIST = 0.86
-_SEQ_BARREL = 0.86
+_SEQ_BARREL = 0.78      # solved, not picked — see the timing note below
 _SEQ_K = 7.0
 
-# Sanity anchor for the whole timing model: a ~7.2 ft sweet-spot path covered
-# in ~140 ms ending at ~72 mph is what the league-median row on Savant's board
-# implies, and a ramp whose mean speed is half its peak reproduces all three at
-# once. That is why the barrel is still ACCELERATING at contact here — the
-# pelvis/torso/arm have already peaked and are decelerating (the sequence), but
-# the hands peak last, at the ball.
+# Sanity anchor for the whole timing model. RE-DERIVED TWICE, and the second
+# time against real swings rather than against prose.
+#
+# Savant's note that bat tracking begins "generally around 150 ms" before impact
+# was read as meaning that window IS the downswing, and `_SEQ_BARREL` was set to
+# 0.95 to make `t_down` land there. Driveline's landmark data says otherwise:
+# the time a real hitter takes to cover the 1.841 m of sweet-spot path that
+# Savant reports as 7.2 ft of bat head is **92 ms** (p10 78, p90 150), because
+# tracking starts while the bat is barely moving and little path accumulates
+# early. The window is a duration of DATA, not of swing.
+#
+# So the ramp is much less extreme than the 0.95 version: mean speed over the
+# window is 1.841/0.092 = 20 m/s against ~32 at contact, a 63% ratio, where
+# 0.95 implies 38%. `_SEQ_BARREL` = 0.78 puts `t_down` at 96 ms median against
+# the measured 92. The barrel is still ACCELERATING at contact — the
+# pelvis/torso/arm have peaked and are decelerating, the hands peak last, at
+# the ball — just not as violently as the misreading implied.
 _MPH = 0.44704
 
 
@@ -136,6 +221,220 @@ def _seq_d(tau, c, k=_SEQ_K):
 #                overlay already uses for depth_in_box / dist_off_plate.
 _STANCE_IN = 0.0254
 _STANCE_DATA_PATH = Path(__file__).resolve().parent / "complete_batting_stances.json"
+
+# ---------------------------------------------------------------------------
+# Reference swing — MOTION WARPING.
+#
+# `swing_reference.json` is CMU Graphics Lab mocap trial 124_07 ("Baseball
+# Swing"), run through forward kinematics, normalised (pelvis at the origin,
+# feet axis onto +X, scaled to this figure's hip/shoulder heights) and
+# resampled onto swing phase with contact pinned at 0.538. 61 samples.
+#
+# Why this and not more solving: three separate attempts to place the body
+# analytically all put the bat through the hitter, because the barrel arc is
+# solved from Savant's measurements and the body was placed independently —
+# nothing tied them together. A recorded swing is natural by construction, so
+# the body and the hand PATH come from it, and the measured arc keeps the
+# barrel. The two meet at the one constraint that actually links them: the bat
+# is rigid, so the grip must sit BAT_SWEET from the sweet spot. The mocap hand
+# is projected onto that sphere — it keeps the real path's shape and stays out
+# of the body, while the barrel stays exactly where the measurements put it.
+#
+# Measured against the model it replaces: the mocap hand path runs 46-58 cm
+# from the spine; the analytic one ran 17-20 cm.
+_SWING_REF_PATH = Path(__file__).resolve().parent / "swing_reference.json"
+_SWING_REF = None
+
+
+def swing_reference():
+    """Lazy-load the reference swing; None if the file is missing (the figure
+    then falls back to the analytic pose)."""
+    global _SWING_REF
+    if _SWING_REF is None:
+        try:
+            import json as _json
+            with open(_SWING_REF_PATH) as fh:
+                _SWING_REF = _json.load(fh)
+        except Exception as e:
+            print(f"sp_flight_viewer: reference swing unavailable: {e}")
+            _SWING_REF = False
+    return _SWING_REF or None
+
+
+def swing_ref_at(s):
+    """Reference joints at swing phase `s`, linearly interpolated.
+
+    Returns a dict of (x, y, z) in the reference frame: +X toward the pitcher,
+    +Y up, +Z toward the PLATE, origin at the hitter's pelvis on the ground."""
+    ref = swing_reference()
+    if not ref:
+        return None
+    fr = ref["frames"]
+    n = len(fr)
+    t = max(0.0, min(1.0, s)) * (n - 1)
+    i1 = int(t)
+    i2 = min(n - 1, i1 + 1)
+    i0 = max(0, i1 - 1)
+    i3 = min(n - 1, i2 + 1)
+    a = t - i1
+    # CATMULL-ROM, not linear. Linear interpolation of the samples is only C0,
+    # so every one of the 61 sample boundaries is a kink in velocity — that
+    # alone tripled the figure's median |d2p/ds2| (10 -> 30) when the
+    # reference was first wired in. A cubic through the neighbouring samples
+    # is C1 and costs nothing.
+    a2 = a * a
+    a3 = a2 * a
+    c0 = -0.5 * a3 + a2 - 0.5 * a
+    c1 = 1.5 * a3 - 2.5 * a2 + 1.0
+    c2 = -1.5 * a3 + 2.0 * a2 + 0.5 * a
+    c3 = 0.5 * a3 - 0.5 * a2
+    out = {}
+    for k in fr[i1]:
+        if k == "s":
+            continue
+        p0, p1, p2, p3 = fr[i0][k], fr[i1][k], fr[i2][k], fr[i3][k]
+        out[k] = tuple(c0 * p0[d] + c1 * p1[d] + c2 * p2[d] + c3 * p3[d]
+                       for d in range(3))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The barrel path — MEASURED, from 673 real swings.
+#
+# Source: Driveline OpenBiomechanics (`hitting_landmarks.zip`, dataset-v1),
+# CC BY-NC-SA 4.0. The `sweet_spot_*` channel is the barrel itself, so the path
+# does not have to be invented: for every swing, walk back from contact until
+# 1.841 m of sweet-spot path has accumulated (= the 7.2 ft of BAT HEAD that
+# Savant reports), express it in cylindrical coordinates about that hitter's own
+# spine axis, and take the median shape.
+#
+# What comes out is a SPIRAL, and it is nothing like the fixed-radius circle
+# this model used to swing. Over Savant's window the barrel goes from 36% of its
+# contact radius and 71 cm ABOVE contact, winding out and down, bottoming out
+# 3 cm below the ball at u≈0.87 and rising into it — that last dip is the attack
+# angle, and it falls out of the data rather than being imposed.
+#
+# The circle was the whole reason the bat swept through the hitter. A real
+# barrel NEVER comes near the body: minimum distance from the sweet spot to the
+# thorax axis is p10 33.9 cm / median 39.7, and 0 of 675 swings come inside
+# 17 cm. Ours ran a median 6.9 cm, min 0.6. In these coordinates clearance is
+# just `rho >= CLEAR_MIN` and the profile satisfies it by construction — the
+# path can no longer pass through the hitter no matter what the solve does.
+#
+# Sweep over the window is 165.1 deg (p10 137, p90 197) against the 92 deg the
+# circle needed for the same path length, i.e. the old swing radius was far too
+# big. Coordinates are the SWING PLANE's: the axis is the plane normal, not
+# vertical. A first pass used a vertical axis and had to bolt the tilt on
+# afterwards through an out-of-plane correction that grew to 21 cm and buckled
+# the path. Savant's `swing_tilt` IS this plane, and the measured plane tilt
+# (median 31.9 deg) sits right inside the board's range, which is the check
+# that the two definitions are the same thing.
+_OBP_U = 33
+_OBP_R = (
+    +0.3827, +0.3880, +0.3900, +0.3912, +0.3971, +0.4017,
+    +0.4093, +0.4169, +0.4249, +0.4377, +0.4510, +0.4644,
+    +0.4784, +0.4942, +0.5101, +0.5277, +0.5482, +0.5710,
+    +0.5910, +0.6149, +0.6384, +0.6627, +0.6910, +0.7188,
+    +0.7466, +0.7763, +0.8068, +0.8395, +0.8716, +0.9037,
+    +0.9361, +0.9686, +1.0000)
+# OUT-OF-PLANE drift, metres. The swing is not planar early — the barrel sits
+# 28 cm out of the plane it will finish in — but it converges to the plane with
+# zero slope by contact, which is exactly why Savant can define swing tilt over
+# the last 40 ms. The old code faked this with a `roll` that stood the early
+# plane up; here it is measured.
+_OBP_H = (
+    +0.2840, +0.2637, +0.2475, +0.2319, +0.2166, +0.2055,
+    +0.1942, +0.1846, +0.1725, +0.1618, +0.1496, +0.1398,
+    +0.1275, +0.1166, +0.1074, +0.0961, +0.0859, +0.0753,
+    +0.0657, +0.0566, +0.0475, +0.0403, +0.0338, +0.0272,
+    +0.0214, +0.0159, +0.0108, +0.0073, +0.0044, +0.0018,
+    +0.0005, +0.0001, +0.0000)
+# Measured contact radius about the swing axis (m): median 0.969, p10 0.855,
+# p90 1.056. Not used as an input — the solve derives it — but it is the number
+# the derived value is checked against.
+_OBP_RC = 0.969
+# Measured horizontal offset from the hitter's THORAX at contact to the contact
+# point: 0.528 m toward the pitcher (and 0.704 toward the plate, 0.420 below the
+# thorax midpoint). Used to reconcile Savant's stance-referenced batter position
+# with where the hitter's body actually is when he hits the ball.
+_OBP_CONTACT_FWD = 0.528
+_OBP_SWEEP = math.radians(165.1)
+CLEAR_MIN = 0.34
+
+
+def _obp_at(tab, u):
+    """Sample a measured profile at normalised sweep `u` (Catmull-Rom)."""
+    n = len(tab)
+    t = max(0.0, min(1.0, u)) * (n - 1)
+    i1 = int(t)
+    i2 = min(n - 1, i1 + 1)
+    i0 = max(0, i1 - 1)
+    i3 = min(n - 1, i2 + 1)
+    a = t - i1
+    a2, a3 = a * a, a * a * a
+    return (tab[i0] * (-0.5 * a3 + a2 - 0.5 * a)
+            + tab[i1] * (1.5 * a3 - 2.5 * a2 + 1.0)
+            + tab[i2] * (-1.5 * a3 + 2.0 * a2 + 0.5 * a)
+            + tab[i3] * (0.5 * a3 - 0.5 * a2))
+
+
+_REF_YAW = None
+
+
+def swing_ref_yaw():
+    """Rotation PROGRESS of the pelvis and the shoulders over the reference
+    swing, each normalised to 0 at the load and 1 at the finish.
+
+    Only the timing is taken, not the amplitude or the direction: those are
+    this figure's own (validated handedness, validated load/finish poses), and
+    swapping both at once would make a regression impossible to attribute. What
+    the reference supplies is the SHAPE of the two curves — a real hitter's
+    pelvis and shoulders do not follow tidy logistics, and the gap between them
+    is the X-factor. Measured on the reference: the shoulders turn 177 deg and
+    the hips 142 deg, separated by ~20 deg at the load.
+
+    Returns (pelvis, shoulder) lists of `n` samples on uniform phase, or None."""
+    global _REF_YAW
+    if _REF_YAW is None:
+        ref = swing_reference()
+        if not ref:
+            _REF_YAW = False
+        else:
+            def curve(a, b):
+                out, prev = [], None
+                for fr in ref["frames"]:
+                    p, q = fr[a], fr[b]
+                    th = math.atan2(p[2] - q[2], p[0] - q[0])
+                    if prev is not None:            # unwrap
+                        while th - prev > math.pi:
+                            th -= 2 * math.pi
+                        while th - prev < -math.pi:
+                            th += 2 * math.pi
+                    prev = th
+                    out.append(th)
+                span = out[-1] - out[0]
+                if abs(span) < 1e-6:
+                    return [k / (len(out) - 1) for k in range(len(out))]
+                return [(t - out[0]) / span for t in out]
+            _REF_YAW = (curve("hip_l", "hip_r"), curve("sh_l", "sh_r"))
+    return _REF_YAW or None
+
+
+def _ref_curve_at(curve, s):
+    """Sample a normalised reference curve at phase `s` (Catmull-Rom, to match
+    `swing_ref_at` — a linear read is only C0 and kinks the yaw rate)."""
+    n = len(curve)
+    t = max(0.0, min(1.0, s)) * (n - 1)
+    i1 = int(t)
+    i2 = min(n - 1, i1 + 1)
+    i0 = max(0, i1 - 1)
+    i3 = min(n - 1, i2 + 1)
+    a = t - i1
+    a2, a3 = a * a, a * a * a
+    return (curve[i0] * (-0.5 * a3 + a2 - 0.5 * a)
+            + curve[i1] * (1.5 * a3 - 2.5 * a2 + 1.0)
+            + curve[i2] * (-1.5 * a3 + 2.0 * a2 + 0.5 * a)
+            + curve[i3] * (0.5 * a3 - 0.5 * a2))
 
 
 def _stance_foot_to_physics(f, bside):
@@ -265,6 +564,7 @@ class PitchFlightView(UmpireView3D):
         # Swing animation progress 0..1 (None = loaded, pre-swing). The barrel
         # reaches the ball at _CONTACT_P; SPFlightWindow drives it.
         self._swing_phase = None
+        self._recover = None        # 0..1 ease from the finish back to load
         self._sg_cache = None       # (key, solved swing) — the solve iterates
         # Foot progress runs on the PITCH clock, not the swing clock: the
         # scraped moments are keyed to pitch release and bat-ball intercept.
@@ -588,9 +888,22 @@ class PitchFlightView(UmpireView3D):
         """Swing progress 0..1 (None = loaded, pre-swing)."""
         self._swing_phase = p
 
+    def set_recover(self, r):
+        """0..1 blend from the finished follow-through back to the load pose.
+
+        Without this the figure SNAPS: the swing holds at phase 1.0, then the
+        next pitch in the queue calls reset_swing() and the pose jumps
+        straight from the wrapped finish to the cocked load — the arms
+        visibly yanked back across the body in a single frame. It is not a
+        defect of the swing solve, which is why it never showed up in the
+        pose-continuity numbers: both poses are fine, it is the CUT between
+        them that reads as the jerk."""
+        self._recover = r
+
     def reset_swing(self):
         self._swing_phase = None
         self._foot_phase = None
+        self._recover = None
 
     def set_foot_phase(self, p):
         """Pitch progress 0..1 from release to bat-ball intercept (None = the
@@ -697,13 +1010,155 @@ class PitchFlightView(UmpireView3D):
                 S[1] + u[1] * d * 0.5 + by_ / bl * bend,
                 S[2] + u[2] * d * 0.5 + bz_ / bl * bend)
 
-    # Bat geometry. Every Savant swing metric (attack angle/direction, tilt,
-    # swing length) is measured on the SWEET SPOT, ~6" in from the tip, so
-    # that is the point the solve pins to the ball; the tip is drawn beyond.
+
+    # Torso cylinder the grip is warped out of, and the softness of that warp.
+    # 0.32 is MEASURED, not guessed: CMU mocap trial 124_07 ("Baseball Swing")
+    # run through forward kinematics says a real hitter's hands never come
+    # closer than 36cm to his own spine axis through the swing. This model had
+    # them at 17-20cm — its hand path was about half as wide as a real one,
+    # which is the actual reason the bat kept ending up inside the hitter.
+    SPINE_R = 0.32
+    SPINE_SOFT = 0.05
+
+    def _spine_warp(self, p, a, b, hint=None):
+        """Smoothly map the inside of the torso cylinder to the outside.
+
+        This is the standard animation fix for limbs penetrating the body, and
+        the important part is that it is a CONTINUOUS SPACE WARP applied to
+        every point unconditionally — not a collision test with a corrective
+        push. A test has a threshold, the threshold is crossed between frames,
+        and the correction switches on and off: that is what made both earlier
+        attempts here jitter (peak |d2p/ds2| of 48,000 and 8,478 against a
+        median of ~10). A softplus radial profile has no branch at all:
+
+            r' = R + k*ln(1 + exp((r - R)/k))
+
+        r' -> r for r >> R, r' -> R for r << R, and it is C-infinity in
+        between, so nothing can pop."""
+        d = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        L2 = _dot(d, d)
+        t = 0.0 if L2 < 1e-9 else max(0.0, min(1.0, (
+            (p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]
+            + (p[2] - a[2]) * d[2]) / L2))
+        q = (a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t)
+        w = (p[0] - q[0], p[1] - q[1], p[2] - q[2])
+        r = math.sqrt(_dot(w, w))
+        R, k = self.SPINE_R, self.SPINE_SOFT
+        x = (r - R) / k
+        # ln(1+e^x) without overflowing for large x
+        sp = x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+        r2 = R + k * sp
+        if r < 1e-6:
+            u = hint or (0.0, 1.0, 0.0)
+        else:
+            u = (w[0] / r, w[1] / r, w[2] / r)
+        return (q[0] + u[0] * r2, q[1] + u[1] * r2, q[2] + u[2] * r2)
+
+    @staticmethod
+    def _reach_clamp(p, S, R, k=0.06):
+        """Pull point `p` inside radius `R` of `S`, softly.
+
+        The mirror image of `_spine_warp`: that one maps the inside of a
+        cylinder out, this maps the outside of a sphere in. Same softplus, same
+        reason — a hard clamp has a threshold and the threshold gets crossed
+        between frames."""
+        d = (p[0] - S[0], p[1] - S[1], p[2] - S[2])
+        r = math.sqrt(_dot(d, d))
+        if r < 1e-6:
+            return p
+        x = (R - r) / k
+        sp = x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+        r2 = R - k * sp                         # -> r below R, -> R above it
+        return (S[0] + d[0] / r * r2, S[1] + d[1] / r * r2,
+                S[2] + d[2] / r * r2)
+
+    def _reach_cap(self, sweet, bd, S, Ls, R_arm, k=0.12):
+        """Rotate the bat about its SWEET SPOT until the grip is inside the
+        lead arm's reach of shoulder `S`, and return the new bat direction.
+
+        This is the lever the body used to pull instead. The old code, when the
+        grip came out further from the shoulder than an arm is long, TRANSLATED
+        the whole upper body to it — which is why the figure's head travelled
+        109 cm through a swing that should move it about 9. But the grip is the
+        FREE end: the barrel is what Savant measures, the bat is rigid, so any
+        rotation about the sweet spot costs none of the measured quantities and
+        moves only the hands. Rotate the bat, do not walk the hitter.
+
+        The reachable set of bat directions is a spherical cap about the
+        direction to the shoulder, with half-angle `a_max` from the law of
+        cosines on the triangle (sweet, grip, shoulder). The clamp into it is a
+        SOFTPLUS on the angle, not a threshold, for the same reason
+        `_spine_warp` is: a hard clamp switches on between frames and pops."""
+        v = (S[0] - sweet[0], S[1] - sweet[1], S[2] - sweet[2])
+        d0 = math.sqrt(_dot(v, v))
+        if d0 < 1e-6:
+            return bd
+        u = (v[0] / d0, v[1] / d0, v[2] / d0)
+        cos_max = (Ls * Ls + d0 * d0 - R_arm * R_arm) / (2.0 * Ls * d0)
+        if cos_max <= -1.0:                     # every direction is reachable
+            return bd
+        a_max = math.acos(min(1.0, cos_max))
+        a = math.acos(max(-1.0, min(1.0, _dot(bd, u))))
+        x = (a_max - a) / k
+        sp = x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+        a2 = a_max - k * sp                     # -> a when slack, -> a_max when not
+        turn = a - a2
+        if turn <= 1e-6 or a < 1e-6:
+            return bd
+        ax = _cross(bd, u)
+        al = math.sqrt(_dot(ax, ax))
+        if al < 1e-9:
+            return bd
+        ax = (ax[0] / al, ax[1] / al, ax[2] / al)
+        c, s_ = math.cos(turn), math.sin(turn)  # Rodrigues about ax
+        adb = _dot(ax, bd)
+        return _norm((bd[0] * c + (ax[1] * bd[2] - ax[2] * bd[1]) * s_
+                      + ax[0] * adb * (1 - c),
+                      bd[1] * c + (ax[2] * bd[0] - ax[0] * bd[2]) * s_
+                      + ax[1] * adb * (1 - c),
+                      bd[2] * c + (ax[0] * bd[1] - ax[1] * bd[0]) * s_
+                      + ax[2] * adb * (1 - c)))
+
+    # Bat geometry. Savant measures its swing metrics at TWO different points
+    # on the bat and the difference matters more than it looks:
+    #
+    #   bat speed     "measured at the sweet-spot of the bat" — 6" in from the
+    #                 head. Attack angle, attack direction and swing tilt are
+    #                 all derived off the same point's velocity, so the sweet
+    #                 spot is what the solve pins to the ball.
+    #   swing length  "the total (sum) distance in feet traveled of the HEAD of
+    #                 the bat in X/Y/Z space, from start of tracking data until
+    #                 impact point" — the TIP, not the sweet spot.
+    #
+    # This model fitted the sweet spot's path to swing length until 2026-08-10.
+    # The head rides 6" further out, so its arc is ~19% longer at any pivot
+    # radius: pinning the sweet spot to 7.2 ft made the head travel 8.59 ft
+    # (measured, all 210 board hitters). That is a swing that starts a fifth of
+    # an arc too far back, which is exactly what the over-the-head loop in the
+    # path overlay was. See `_head_path_len`.
     BAT_LEN = 0.84
-    BAT_SWEET = 0.66
+    BAT_SWEET = BAT_LEN - 0.152     # the definition's 6", exactly
     ARM_REACH = 0.76        # shoulder → hands, before the torso has to lean
+    LEAN_MAX = 0.12         # hard ceiling on that lean — see the note in
+                            # `_body_pose`; uncapped, it cost 109 cm of head
     PIVOT_SHIFT = 0.55      # how far the pivot rides in toward the body at load
+    # Barrel radius at contact. FREE — tangency is exact for any value, since
+    # the pivot is placed perpendicular to the attack vector — so this is the
+    # parameter that decides where the swing circle sits relative to the
+    # hitter, and it was one constant for all 201 tracked hitters.
+    R_CONTACT = 1.05
+    # Bat-to-torso angle at the top of the downswing — Blast Motion's "Early
+    # Connection", measured on 677 real swings by 98 hitters in Driveline's
+    # open OpenBiomechanics dataset (`bat_torso_angle_ds`): p10 92.9, median
+    # 108.1, p90 126.0 deg. LEAGUE-GENERIC on purpose: across those swings the
+    # load angle correlates with nothing we hold for an MLB hitter.
+    BAT_TORSO_LOAD = math.radians(108.1)
+    # Where the GRIP is at the top of the downswing. `lag0` is derived by
+    # aiming the bat at this point, so it sets the bat's angle for the whole
+    # early swing.
+    GRIP_LOAD_BACK = 0.18       # behind the box point, toward the catcher
+    GRIP_LOAD_Y = 1.30
+    GRIP_LOAD_OUT = 0.04        # away from the plate
 
     def _swing_geometry(self, b, bx, bz, bside):
         """Solved swing for this batter at this box position (cached — the
@@ -721,12 +1176,6 @@ class PitchFlightView(UmpireView3D):
         The bat is modelled the way the literature does (Cross, *Mechanics of
         swinging a bat*): two links, the arm turning about the body and the bat
         turning about the hands with a wrist lag held early and released late.
-        What that buys over the fixed-radius circle this replaced is an
-        effective radius that GROWS through the swing, a barrel that
-        accelerates into the zone instead of sweeping at a constant rate, a
-        path that starts steep and flattens into the tilt plane, and a bat that
-        is rigid at every instant — the grip is the other end of the same link,
-        not a point pinned onto the barrel after the fact.
 
         Solved against the measured data, in this order:
           · the swing PLANE, from swing tilt, containing the attack vector;
@@ -735,10 +1184,8 @@ class PitchFlightView(UmpireView3D):
             construction;
           · `dphi`, bisected so the sweet spot's PATH LENGTH over the downswing
             equals the measured swing length;
-          · `t_down`, from the measured bat speed — how long the downswing
-            takes, rather than a constant for every hitter;
-          · `lag0`, aiming the grip back at the rear shoulder at load (the one
-            piece the data says nothing about, and it moves none of the above).
+          · `t_down`, from the measured bat speed;
+          · `lag0`, aiming the grip back at the rear shoulder at load.
 
                 Returns None when the batter has no tracked swing data."""
         IN = 0.0254
@@ -752,45 +1199,26 @@ class PitchFlightView(UmpireView3D):
         Ls = self.BAT_SWEET
 
         # Contact point. Savant's two intercept fields are the SAME depth
-        # measured from two origins — league-wide, batter_y_position +
-        # intercept_y_vs_plate == intercept_y_vs_batter to within a third of an
-        # inch (median 28.6 + 2.8 vs 31.0). So intercept_vs_batter is a DEPTH
-        # in front of the hitter, not a lateral reach out over the plate, and
-        # using it as one (as this did) pushed contact ~2 ft too far toward the
-        # plate and ~1.5 ft too far out front. Depth comes from vs_plate;
-        # laterally the board has no coordinate, and contact averages out
-        # essentially over the plate, a touch to the batter's side.
+        # measured from two origins — batter_y_position + intercept_y_vs_plate
+        # == intercept_y_vs_batter. So intercept_vs_batter is a DEPTH in front
+        # of the hitter, not a lateral reach out over the plate.
         C = (0.216 + ivp * IN, 0.90, bz * 0.10)
 
-        # Sweet-spot velocity at contact: forward (+X toward the pitcher), up by
-        # the attack angle, azimuth off centre by the attack direction.
         a_h = _norm((math.cos(adr), 0.0, -bside * math.sin(adr)))
         atk = _norm((a_h[0] * math.cos(av), math.sin(av), a_h[2] * math.cos(av)))
 
-        # Swing-plane normal. The plane must (a) contain the attack vector (the
-        # barrel is tangent to it at contact) and (b) sit at swing_tilt from
-        # horizontal, i.e. its NORMAL sits at swing_tilt from vertical — a flat
-        # swing is a horizontal plane with a vertical normal. Among the
-        # perpendiculars to atk, n = cos·u1 + sin·w with u1 the up-most ⟂-atk
-        # direction (itself `attack_angle` off vertical) and w horizontal ⟂-atk;
-        # n·up = cos(a)·cos(attack), so cos(a) = cos(tilt)/cos(attack) leans it
-        # exactly swing_tilt off vertical. Two solutions (the plane leans either
-        # way) — keep the one that rides HIGH on the hitter's side and low out
-        # over the plate, which is the way a swing plane actually leans.
-        #
+        # Swing-plane normal: contains the attack vector and sits at swing_tilt
+        # from horizontal, i.e. its NORMAL sits at swing_tilt from vertical.
         # NOTE: this used to finish with n = cross(atk, N), which takes a vector
-        # lying IN the plane and treats it as the normal — 90° out. Every swing
-        # came out sweeping a near-VERTICAL plane (a loop up over the hitter's
-        # head) no matter what his tilt actually was, which is most of why the
-        # old overlay looked wrong from every camera.
+        # lying IN the plane and treats it as the normal — 90 deg out.
         u1 = _norm((-atk[1] * atk[0], 1.0 - atk[1] * atk[1], -atk[1] * atk[2]))
         w = _norm(_cross(atk, (0.0, 1.0, 0.0)))
         cos_a = max(-1.0, min(1.0, math.cos(tr) / max(1e-6, math.cos(av))))
         sin_a = math.sqrt(max(0.0, 1.0 - cos_a * cos_a))
         best = None
-        for s in (sin_a, -sin_a):
-            n_c = _norm((cos_a * u1[0] + s * w[0], cos_a * u1[1] + s * w[1],
-                         cos_a * u1[2] + s * w[2]))
+        for sgn in (sin_a, -sin_a):
+            n_c = _norm((cos_a * u1[0] + sgn * w[0], cos_a * u1[1] + sgn * w[1],
+                         cos_a * u1[2] + sgn * w[2]))
             if n_c[1] < 0.0:
                 n_c = (-n_c[0], -n_c[1], -n_c[2])
             score = -n_c[2] * bside                    # high on his side
@@ -798,140 +1226,279 @@ class PitchFlightView(UmpireView3D):
                 best = (score, n_c)
         n_c = best[1]
 
-        # The swing is a rotation about ONE axis: `n`, the normal of the tilt
-        # plane, running through the hitter's own body. Both the hands and the
-        # barrel sweep circles about that axis — parallel planes, the barrel's
-        # offset from the hands' by however far the bat sticks out along the
-        # axis. That offset is the whole reason this cannot be modelled as a
-        # single plane through the contact point: the hands are ~0.7 m off the
-        # barrel's plane, so projecting the body into it (as a plane-through-C
-        # model must) puts the pivot out over the plate and the swing comes out
-        # rotating the wrong way entirely.
         e2 = atk                                   # in-plane, = attack vector
         e1 = _norm(_cross(n_c, e2))                # in-plane, ⟂ attack vector
 
-        # Barrel pivot. Every quantity Savant measures is a property of the
-        # BARREL — the plane it sweeps, the direction and angle it crosses the
-        # ball at, how far it travels, how fast it is going. So the barrel's
-        # path is what gets solved, and the body is hung off it afterwards.
-        #
-        # (A body-first solve was tried: hands on a circle about the spine, bat
-        # as a second link. It cannot be made to fit. Savant puts contact ~31"
-        # in FRONT of the hitter, and at that depth every rotation about his
-        # spine carries the barrel ~40 deg to the pull side of the measured
-        # attack direction — the barrel at contact is extending, not orbiting
-        # the spine, so its instantaneous centre is not the spine at all.)
-        #
-        # The pivot therefore sits perpendicular to the attack vector inside the
-        # swing plane, up and behind the ball, which makes the barrel tangent to
-        # the measured attack angle at contact by construction.
         tp = -bside                                # +1 = toward the plate
-        m = e1 if e1[1] >= 0.0 else (-e1[0], -e1[1], -e1[2])   # up-and-back
-        f1 = (-m[0], -m[1], -m[2])                 # pivot → ball at contact
         f2 = atk                                   # tangent at contact
-        R_c = 1.05                                 # barrel radius at contact
-        O = (C[0] + R_c * m[0], C[1] + R_c * m[1], C[2] + R_c * m[2])
 
-        sg = {"C": C, "atk": atk, "n": n_c, "e1": e1, "e2": e2, "m": m,
-              "f1": f1, "f2": f2, "O": O, "R_c": R_c, "dR": 0.30,
-              "O_load": O, "Ls": Ls, "BAT": self.BAT_LEN, "s_c": _CONTACT_P,
+        # SWING AXIS — the hitter's own spine, a vertical line through the box
+        # point. The whole path lives in cylindrical coordinates about it, which
+        # is what makes the barrel's distance from the hitter an explicit
+        # coordinate instead of an emergent accident. The old pivot construction
+        # put the centre of a fixed-radius circle wherever tangency happened to
+        # place it, and the barrel then cut straight through the torso.
+        h_c = C[1]
+
+        # Tangency at contact, exactly, as two slope corrections. Decompose the
+        # measured attack vector's horizontal part in (rhat, phat): the ratio of
+        # those two components IS the ratio of radial growth to angular rate, so
+        # once the sweep is known both slopes are forced.
+        sg = {"C": C, "atk": atk, "n": n_c, "e1": e1, "e2": e2, "f2": f2,
+              "BX": bx, "BZ": bz, "h_c": h_c,
+              "A": (bx, 1.24, bz), "rc": _OBP_RC, "axis_off": 0.0, "h0": 0.0,
+              "rhat": (1.0, 0.0, 0.0), "phat": (0.0, 0.0, 1.0),
+              "alpha": 0.0, "beta": 1.0,
+              "swdir": 1.0, "kH": 1.0, "dRs": 0.0, "dHs": 0.0, "c2": 0.0,
+              "Ls": Ls, "BAT": self.BAT_LEN, "s_c": _CONTACT_P,
               "lag0": math.radians(-62.0), "wrap": math.radians(150.0),
-              "h_contact": C, "h_finish": C, "roll": 0.0,
-              "dphi": 2.2, "gn0": 0.0, "k_barrel": _SEQ_K,
+              "h_contact": C, "h_finish": C,
+              "dphi": _OBP_SWEEP, "gn0": 0.0, "k_barrel": _SEQ_K,
+              "v_in": (0.0, 0.0, 0.0), "w_in": 0.0,
               "t_down": _DOWNSWING_S}
 
-        # Axis roll. Savant's swing tilt is defined over the 40 ms BEFORE
-        # contact only, so it is honoured exactly there and the earlier path is
-        # allowed to stand up steeper — the shape a real barrel traces, and it
-        # keeps the load from being tipped through the hitter's own head.
-        th = math.radians(16.0)
-        sg["roll"] = max((th, -th),
-                         key=lambda t: -abs(n_c[1] * math.cos(t)
-                                            - f1[1] * math.sin(t)))
-
-        # The two measured scalars then fix the rest:
-        #   dphi   — how far the barrel swings, bisected so its PATH LENGTH over
-        #            the downswing equals the measured swing length;
-        #   t_down — how long that takes, from the measured bat speed. The
-        #            barrel's radius is momentarily stationary at contact (the
-        #            growth term is squared), so its speed there is simply
-        #            R_c·dphi·B'(1)/t_down and this is a division, not a search.
+        sg["fwd"] = max(0.0, min(0.60, (b["depth_in_box"] + ivp) * IN
+                                 - _OBP_CONTACT_FWD)) if b.get("depth_in_box") else 0.0
         target = (b.get("swing_length") or 7.2) * FT_TO_M
         v_target = max(1.0, (b.get("bat_speed") or 72.0) * _MPH)
 
-        # The pivot MIGRATES. Held fixed, a 130 deg sweep back from a pivot
-        # that sits ~0.3 m outside the hitter parks the barrel at load about
-        # 0.7 m off his back side — sticking out sideways rather than cocked
-        # over the rear shoulder, which is what read as the hitter facing the
-        # wrong way. A real barrel starts at the shoulder and the centre of its
-        # curvature travels out as the arms extend. So the pivot eases from a
-        # load position (the one that puts the barrel over the rear shoulder)
-        # to the solved contact pivot, arriving by the 40 ms window where the
-        # measurements live — value AND rate settled, so tangency, attack angle
-        # and bat speed at contact are untouched.
-        # Anchor the load by the GRIP and the bat's angle out of it — hands
-        # back at the rear shoulder, barrel up and behind it — and let the
-        # barrel's own start follow from that, rather than placing the barrel
-        # and hoping the grip lands somewhere human.
-        # Pull the pivot toward the hitter's rear shoulder at load, capped, so
-        # the barrel starts near his body instead of ~0.7 m off his back side.
-        # Pinning the load barrel to an exact pose instead makes the pivot
-        # travel so far that most of the measured swing length is covered by
-        # that translation, which flattens the speed profile and squeezes the
-        # downswing under 110 ms — well short of the ~140 ms a real one takes.
-        rear_sh = (bx - 0.19, 1.45, bz)
-        shift = (rear_sh[0] - O[0], rear_sh[1] - O[1], rear_sh[2] - O[2])
-        slen = math.sqrt(_dot(shift, shift)) or 1.0
-        k = min(1.0, self.PIVOT_SHIFT / slen)
-        sg["O_load"] = (O[0] + shift[0] * k, O[1] + shift[1] * k,
-                        O[2] + shift[2] * k)
-        grip_load = (bx - 0.18, 1.30, bz - tp * 0.04)
-        if True:
-            lo, hi = 0.5, 4.0
-            for _ in range(30):
-                mid = 0.5 * (lo + hi)
-                sg["dphi"] = mid
-                if self._sweet_path_len(sg) < target:
-                    lo = mid
-                else:
-                    hi = mid
-            sg["dphi"] = 0.5 * (lo + hi)
+        grip_load = (bx - self.GRIP_LOAD_BACK, self.GRIP_LOAD_Y,
+                     bz - tp * self.GRIP_LOAD_OUT)
+        # Bisect the sweep against the measured swing length, on the BAT HEAD —
+        # the point Savant sums that distance over.
+        lo, hi = 0.5, 5.0
+        for _ in range(34):
+            mid = 0.5 * (lo + hi)
+            sg["dphi"] = mid
+            self._solve_tangency(sg)
+            if self._head_path_len(sg) < target:
+                lo = mid
+            else:
+                hi = mid
+        sg["dphi"] = 0.5 * (lo + hi)
+        self._solve_tangency(sg)
+        sg["head_len"] = self._head_path_len(sg)
+        # Duration, from the bat speed — which is measured at the SWEET SPOT,
+        # so this must not use the head's arc.
+        #
+        # `|dP/du|` at contact is taken from the path itself now. The old code
+        # could use the closed form `R_c*dphi` because the path was a circle of
+        # known radius; the spiral's speed at contact also carries the radial
+        # and vertical growth, and a closed form for it would just be this
+        # derivative written out.
+        sg["sweet_len"] = self._sweet_path_len(sg)
+        hh = 1e-5
+        pa = self._barrel_at(sg, 1.0 - hh)[0]
+        pb = self._barrel_at(sg, 1.0)[0]
+        dPdu = math.dist(pa, pb) / hh
         B1 = _seq_d(1.0, _SEQ_BARREL, sg["k_barrel"])
-        sg["t_down"] = max(0.100, min(0.220, R_c * sg["dphi"] * B1 / v_target))
-        # Where the GRIP starts. The barrel's path is measured, but nothing in
-        # the data says where the hands are on it, and letting the lag angle
-        # default left them out over the plate at load instead of back at the
-        # rear shoulder. So aim the bat at load: the barrel is wherever the
-        # solved arc starts, and the lag is set so the grip points back at the
-        # rear shoulder from there. The lag then unwinds to zero at contact, so
-        # this costs the measured quantities nothing — the barrel path, the
-        # attack angle and the bat speed are all untouched by it.
-        p0 = self._pose_at(sg, 0.0)
-        d = (p0["sweet"][0] - grip_load[0], p0["sweet"][1] - grip_load[1],
-             p0["sweet"][2] - grip_load[2])
-        roll0 = sg["roll"]
-        cr, sr = math.cos(roll0), math.sin(roll0)
-        f1r = (f1[0] * cr + n_c[0] * sr, f1[1] * cr + n_c[1] * sr,
-               f1[2] * cr + n_c[2] * sr)
-        nr = (n_c[0] * cr - f1[0] * sr, n_c[1] * cr - f1[1] * sr,
-              n_c[2] * cr - f1[2] * sr)
-        a1, a2, an = _dot(d, f1r), _dot(d, f2), _dot(d, nr)
-        ang = math.atan2(a2, a1)
-        lag = ang - (-sg["dphi"])
-        while lag > math.pi:
-            lag -= 2 * math.pi
-        while lag < -math.pi:
-            lag += 2 * math.pi
-        sg["lag0"] = max(math.radians(-150.0), min(math.radians(20.0), lag))
+        sg["t_down"] = max(0.060, min(0.260, dPdu * B1 / v_target))
+
+        # Where the GRIP starts: aim the bat at load so the grip sits back
+        # over the rear shoulder. The lag unwinds to zero at contact, where the
+        # bat points straight out along the radius, so this costs the measured
+        # quantities nothing.
+        sweet0, er0, et0 = self._barrel_at(sg, 0.0)
+        d = (sweet0[0] - grip_load[0], sweet0[1] - grip_load[1],
+             sweet0[2] - grip_load[2])
+        a1 = _dot(d, er0)
+        a2 = _dot(d, et0)
+        an = _dot(d, n_c)
+        sg["lag0"] = max(math.radians(-150.0),
+                         min(math.radians(20.0), math.atan2(a2, a1)))
         sg["gn0"] = max(-2.0, min(2.0, an / max(1e-6, math.hypot(a1, a2))))
 
         sg["tangent_err"] = self._tangent_err(sg)
         sg["contact_mph"] = self._contact_speed(sg) / _MPH
-        # Follow-through anchors: where the grip is at contact, and where it
-        # finishes — up and across in front of the lead shoulder.
         sg["h_contact"] = self._pose_at(sg, sg["s_c"])["hands"]
-        sg["h_finish"] = (bx + 0.16, 1.42, bz + tp * 0.26)
+        # Follow-through finish: the REFERENCE swing's contact->finish
+        # DISPLACEMENT, not its absolute finish position.
+        _rf1, _rfc = swing_ref_at(1.0), swing_ref_at(sg["s_c"])
+        hc0 = sg["h_contact"]
+        if _rf1 is not None and _rfc is not None:
+            sg["h_finish"] = (
+                hc0[0] + (_rf1["hands"][0] - _rfc["hands"][0]),
+                hc0[1] + (_rf1["hands"][1] - _rfc["hands"][1]),
+                hc0[2] + tp * (_rf1["hands"][2] - _rfc["hands"][2]))
+        else:
+            sg["h_finish"] = (bx + 0.34, 1.50, bz + tp * 0.34)
+        # The bat keeps turning in the SWING PLANE it was already in, and the
+        # axis MUST come from a cross product rather than being `n_c` directly.
+        #
+        # This was a real handedness bug and it is worth understanding, because
+        # nothing else in the file trips it. Under the mirror that takes a RHB
+        # to a LHB, `M Rot(a, t) M^-1 == Rot(Ma, -t)`: rotating by the same
+        # positive `wrap` about the mirrored normal turns the bat the WRONG WAY
+        # round for a left-hander. `_reach_cap` is immune because its axis is
+        # `cross(bd, u)`, and a cross product picks up the compensating sign
+        # flip under a reflection; a plain vector does not.
+        #
+        # `cross(rhat, phat)` is +n or -n depending on which way this hitter's
+        # swing turns, so it both selects the correct direction and mirrors
+        # correctly. Measured before: the bat tip was up to 168 cm from where
+        # the mirrored right-handed solve puts it, on every LHB, from contact
+        # to the finish. After: 0.00 cm.
+        sg["wrap_axis"] = _norm(_cross(sg["rhat"], sg["phat"]))
+        sg["wrap"] = math.radians(115.0)
+        sg["bd_contact"] = sg["rhat"]
+        # Start tangents for the follow-through Hermite, measured off the
+        # pre-contact branch — the only definition that makes the halves agree.
+        h = 1e-4
+        s_c = sg["s_c"]
+        pm = self._pose_at(sg, s_c - h)
+        hc = sg["h_contact"]
+        scale = (1.0 - s_c) / h
+        v_in = ((hc[0] - pm["hands"][0]) * scale,
+                (hc[1] - pm["hands"][1]) * scale,
+                (hc[2] - pm["hands"][2]) * scale)
+        # NO clamp on the tangent: clamping TRUNCATES the incoming velocity,
+        # which is a speed discontinuity at contact, and that is the louder
+        # artefact by far.
+        sg["v_in"] = v_in
+
+        # Angle of the bat inside the swing plane, measured in the frame the
+        # bat is actually built in now: radially out at contact, turning toward
+        # the sweep direction.
+        _pr, _pp = sg["rhat"], sg["phat"]
+
+        def _plane_ang(dv):
+            return math.atan2(_dot(dv, _pp), _dot(dv, _pr))
+        w_in = (_plane_ang(self._pose_at(sg, s_c)["dir"])
+                - _plane_ang(pm["dir"]))
+        while w_in > math.pi:
+            w_in -= 2 * math.pi
+        while w_in < -math.pi:
+            w_in += 2 * math.pi
+        w_in *= scale
+        sg["w_in"] = max(-abs(sg["wrap"]) * 1.6,
+                         min(abs(sg["wrap"]) * 1.6, w_in))
         return sg
+
+    # Width of the corrections that enforce tangency and swing tilt at contact.
+    # They are bumps that vanish at u=1 in position, so nothing they do can move
+    # the contact point; they only shape the approach to it.
+    _CORR_SIGMA = 0.28
+
+    @staticmethod
+    def _corr_w(u, sigma=_CORR_SIGMA):
+        """Slope bump: 0 at contact, unit derivative there, decaying backwards."""
+        d = 1.0 - u
+        return -d * math.exp(-(d / sigma) ** 2)
+
+    def _barrel_at(self, sg, u):
+        """Sweet spot, radial direction and tangential direction at normalised
+        sweep `u` (0 = the start of Savant's measured window, 1 = contact).
+
+        Cylindrical about the SWING PLANE's normal. Radius and out-of-plane
+        drift are the measured profile; the sweep is this hitter's own solved
+        angle. Clearance is the radius itself, floored at `CLEAR_MIN`, so the
+        barrel cannot enter the hitter whatever the solve does."""
+        u = max(0.0, min(1.0, u))
+        R = _obp_at(_OBP_R, u) + sg["dRs"] * self._corr_w(u)
+        rho = sg["rc"] * R
+        if rho < CLEAR_MIN:                        # softplus floor, never a step
+            k = 0.06
+            x = (rho - CLEAR_MIN) / k
+            sp = x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+            rho = CLEAR_MIN + k * sp
+        Hn = (_obp_at(_OBP_H, u) * sg["kH"] + sg["dHs"] * self._corr_w(u)
+              + sg["h0"])
+        th = -sg["dphi"] * (1.0 - u)
+        ct, st = math.cos(th), math.sin(th)
+        rh, ps, n = sg["rhat"], sg["phat"], sg["n"]
+        er = (ct * rh[0] + st * ps[0], ct * rh[1] + st * ps[1],
+              ct * rh[2] + st * ps[2])
+        et = (-st * rh[0] + ct * ps[0], -st * rh[1] + ct * ps[1],
+              -st * rh[2] + ct * ps[2])
+        A = sg["A"]
+        sweet = (A[0] + rho * er[0] + Hn * n[0],
+                 A[1] + rho * er[1] + Hn * n[1],
+                 A[2] + rho * er[2] + Hn * n[2])
+        return sweet, er, et
+
+    def _solve_tangency(self, sg):
+        """Place the swing axis so the measured attack vector is consistent with
+        the measured spiral, then read the residual corrections. Closed form.
+
+        The AXIS is solved, not assumed. The profile says the barrel is still
+        growing radially at contact at a known rate (`Rp/dphi`), and the
+        measured attack vector says which way it is travelling; those two agree
+        for exactly one axis direction in the plane. Pinning the axis at the
+        hitter's stance point instead leaves the mismatch to be absorbed by
+        correction bumps, which is what buckled the first attempt.
+
+        Because the plane normal comes from `swing_tilt` and the attack vector
+        lies IN that plane, swing tilt and attack angle/direction are all exact
+        by construction and nothing has to be corrected for them."""
+        h = 1e-4
+        Rp = (_obp_at(_OBP_R, 1.0) - _obp_at(_OBP_R, 1.0 - h)) / h
+        atk, C, n = sg["atk"], sg["C"], sg["n"]
+        kap = Rp / max(1e-6, sg["dphi"])           # radial growth per radian
+        # In-plane basis (p, q) with p along the attack vector.
+        p = _norm((atk[0] - _dot(atk, n) * n[0], atk[1] - _dot(atk, n) * n[1],
+                   atk[2] - _dot(atk, n) * n[2]))
+        q = _cross(n, p)
+        # rhat at angle psi off p, with cos(psi)/|sin(psi)| = kap.
+        psi0 = math.atan2(1.0, kap)
+        #
+        # `rc`, the contact radius about the swing axis, is MEASURED — median
+        # 0.969 m over the 675 landmark swings — so it is not a free parameter.
+        rc = _OBP_RC
+        bxc = sg["BX"] + sg.get("fwd", 0.0)
+        torso_a = (bxc, 0.98, sg["BZ"])
+        torso_b = (bxc, 1.50, sg["BZ"])
+        # AXIS PLACEMENT IS THE ONE PIECE STILL UNRESOLVED — read this before
+        # touching it. Four approaches have been tried and MEASURED.
+        #
+        # Real swings put the barrel's closest approach to the thorax (39.7 cm)
+        # within a centimetre of the profile's own minimum radius (0.383 x
+        # 0.969 = 37 cm). That can only be true if the swing axis and the spine
+        # are essentially the same line. Getting both that AND in-plane tangency
+        # out of one axis has not worked yet:
+        #
+        #   direction from tangency, positioned nearest the stance point
+        #       -> barrel 9.7 cm off the torso; cuts through him
+        #   same, but `rc` scanned for clearance
+        #       -> degenerate; every hitter at the floor with a 220 deg sweep
+        #   direction from tangency, branch chosen by clearance
+        #       -> 0/200 through the torso, BUT the axis is off the body, so
+        #          the whole swing goes with it and the grip ends up 93 cm
+        #          beyond the arms. A bat the hitter cannot hold is worse than
+        #          one that clips him.
+        #   axis anchored ON the thorax (what is here)
+        #       -> figure coherent, arms reach, `dRs` ~1.2 deforms the radius
+        #          near contact by ~10 cm, clearance 15.1 cm
+        #
+        # The trap that cost the most time: the in-plane angle this
+        # construction needs and the horizontal angle the landmark data reports
+        # are NOT the same angle, which made them look reconciled at 64.3 vs
+        # 65.1 deg when they were not. Compare them in the same frame.
+        A = (bxc, 1.24, sg["BZ"])
+        w = (C[0] - A[0], C[1] - A[1], C[2] - A[2])
+        wn = _dot(w, n)
+        wp = (w[0] - wn * n[0], w[1] - wn * n[1], w[2] - wn * n[2])
+        rc = math.sqrt(_dot(wp, wp))
+        if rc < 1e-6:
+            rc, wp = _OBP_RC, p
+        rh = (wp[0] / rc, wp[1] / rc, wp[2] / rc)
+        sg["h0"] = wn
+        ps = _cross(n, rh)
+        if _dot(atk, ps) < 0.0:                    # tangential, forward
+            ps = (-ps[0], -ps[1], -ps[2])
+        sg["rhat"], sg["phat"], sg["rc"], sg["A"] = rh, ps, rc, A
+        sg["axis_off"] = math.hypot(A[0] - sg["BX"], A[2] - sg["BZ"])
+        alpha = _dot(atk, rh)
+        beta = abs(_dot(atk, ps)) or 1e-6
+        sg["alpha"], sg["beta"], sg["swdir"] = alpha, beta, 1.0
+        sg["kH"] = 1.0
+        # Residual only — zero when the axis solve was not clamped.
+        sg["dRs"] = sg["dphi"] * alpha / beta - Rp
+        # The profile's out-of-plane drift lands with a slope of about -0.003
+        # rather than a clean zero (it is a median of 675 noisy swings). Left
+        # alone that tips the barrel very slightly out of the measured plane at
+        # contact and shows up as 0.30 deg of tangency error, so it is zeroed.
+        Hp = (_obp_at(_OBP_H, 1.0) - _obp_at(_OBP_H, 1.0 - h)) / h
+        sg["dHs"] = -Hp
 
     def _contact_speed(self, sg):
         """Sweet-spot speed at contact (m/s). Phase maps linearly to time
@@ -951,84 +1518,108 @@ class PitchFlightView(UmpireView3D):
         v = _norm((c[0] - a[0], c[1] - a[1], c[2] - a[2]))
         return math.degrees(math.acos(max(-1.0, min(1.0, _dot(v, sg["atk"])))))
 
-    def _sweet_path_len(self, sg, steps=28):
-        """Length of the sweet spot's path over the downswing (m) — the thing
-        Savant's swing length measures."""
+    def _path_len(self, sg, key, steps=28):
+        """Length of `key`'s path over the downswing (m)."""
         prev, tot = None, 0.0
         for k in range(steps + 1):
-            q = self._pose_at(sg, sg["s_c"] * k / steps)["sweet"]
+            q = self._pose_at(sg, sg["s_c"] * k / steps)[key]
             if prev is not None:
                 tot += math.dist(prev, q)
             prev = q
         return tot
 
+    def _head_path_len(self, sg, steps=28):
+        """Length of the BAT HEAD's path over the downswing (m) — the thing
+        Savant's swing length actually measures. The head is the tip, 6" beyond
+        the sweet spot; `_pose_at` already carries it as "tip"."""
+        return self._path_len(sg, "tip", steps)
+
+    def _sweet_path_len(self, sg, steps=28):
+        """Length of the SWEET SPOT's path over the downswing (m). NOT what
+        swing length measures — kept because bat speed lives on this point, so
+        the timing solve needs its arc."""
+        return self._path_len(sg, "sweet", steps)
+
     def _pose_at(self, sg, s):
         """Hands / sweet spot / bat tip at swing progress `s` (0..1).
 
         The barrel rides its solved arc, its radius growing into contact as the
-        wrists release — that growth is what makes the barrel accelerate into
-        the zone rather than sweep at a constant rate. The bat TRAILS the radius
-        by a lag angle that unwinds late (the "late hit"), and the hands are the
-        other end of that same rigid bat, so the grip and the barrel can never
-        disagree. Both the radius growth and the lag are squared/eased to zero
-        at contact, which leaves the barrel exactly tangent to the measured
-        attack vector there."""
+        wrists release. The bat TRAILS the radius by a lag angle that unwinds
+        late (the "late hit"), and the hands are the other end of that same
+        rigid bat, so the grip and the barrel can never disagree. Both the
+        radius growth and the lag are squared/eased to zero at contact, which
+        leaves the barrel exactly tangent to the measured attack vector."""
         s_c = sg["s_c"]
         if s <= s_c:
             tau = s / s_c if s_c else 1.0
             B = _seq(tau, _SEQ_BARREL, sg["k_barrel"])
             W = _seq(tau, _SEQ_WRIST)
-            phi = -sg["dphi"] * (1.0 - B)
-            R = sg["R_c"] - sg["dR"] * (1.0 - B) ** 2
+            sweet, er, et = self._barrel_at(sg, B)
+            # The bat TRAILS the radius by a lag that unwinds late (the "late
+            # hit"), so at contact it points straight out along the radius —
+            # arms extended, which is what the measured pose is. The grip is
+            # the other end of the same rigid bat, so the two can never
+            # disagree, and the lag being zero at contact means none of this
+            # touches the measured quantities.
             psi = sg["lag0"] * (1.0 - W)
-            settle = _smoothstep(tau / 0.72)
-            roll = sg["roll"] * (1.0 - settle)
-            O = _lerp3(sg["O_load"], sg["O"], settle)
+            gn = sg["gn0"] * (1.0 - _smoothstep(tau / 0.72))
+            cb, sb = math.cos(psi), math.sin(psi)
+            n = sg["n"]
+            bd = _norm((cb * er[0] + sb * et[0] + gn * n[0],
+                        cb * er[1] + sb * et[1] + gn * n[1],
+                        cb * er[2] + sb * et[2] + gn * n[2]))
+            hands = (sweet[0] - sg["Ls"] * bd[0], sweet[1] - sg["Ls"] * bd[1],
+                     sweet[2] - sg["Ls"] * bd[2])
+            tip = (hands[0] + sg["BAT"] * bd[0], hands[1] + sg["BAT"] * bd[1],
+                   hands[2] + sg["BAT"] * bd[2])
+            return {"hands": hands, "sweet": sweet, "tip": tip, "dir": bd}
         else:
             # Past contact the HANDS lead, not the barrel: they decelerate and
             # pull back in toward the lead shoulder while the bat keeps turning
             # about them and wraps over that shoulder. Driving the wrap off the
             # barrel's arc instead flips the bat end-for-end and flings the grip
             # ~2 m off the body, which no amount of torso lean can absorb.
-            t2 = (s - s_c) / max(1e-6, 1.0 - s_c)
-            F = 1.0 - (1.0 - min(1.0, t2)) ** 2          # decelerating
+            t2 = min(1.0, (s - s_c) / max(1e-6, 1.0 - s_c))
+            # CUBIC HERMITE, not an eased lerp. `1-(1-t)^2` leaves the follow-
+            # through with a nonzero initial rate that has nothing to do with
+            # how fast the hands were actually travelling at contact, so the
+            # figure changed speed instantly on the contact frame — measured at
+            # 1.42 -> 3.31 m per unit phase, a 90-110x spike in |d2p/ds2| and
+            # the single loudest source of the jerk. Hermite with the incoming
+            # velocity as its start tangent is continuous in BOTH position and
+            # speed, and still arrives at rest.
+            t3 = t2 * t2
+            t4 = t3 * t2
+            h00 = 2.0 * t4 - 3.0 * t3 + 1.0
+            h10 = t4 - 2.0 * t3 + t2
+            h01 = -2.0 * t4 + 3.0 * t3
+            v_in = sg["v_in"]
+            hc, hf = sg["h_contact"], sg["h_finish"]
+            hands = (h00 * hc[0] + h10 * v_in[0] + h01 * hf[0],
+                     h00 * hc[1] + h10 * v_in[1] + h01 * hf[1],
+                     h00 * hc[2] + h10 * v_in[2] + h01 * hf[2])
             settle = 1.0
-            hands = _lerp3(sg["h_contact"], sg["h_finish"], F)
-            wr = sg["wrap"] * F
-            cb, sb = math.cos(wr), math.sin(wr)
-            f1, f2 = sg["f1"], sg["f2"]
-            bd = (cb * f1[0] + sb * f2[0], cb * f1[1] + sb * f2[1],
-                  cb * f1[2] + sb * f2[2])
+            # The bat's WRAP gets the same treatment — it is an angle on the
+            # same clock, and starting it from rest made the barrel visibly
+            # hesitate at the ball before the wrap took over.
+            wr = h00 * 0.0 + h10 * sg["w_in"] + h01 * sg["wrap"]
+            # Slerp the bat from its contact direction to the named finish
+            # pose about the shortest-arc axis (Rodrigues).
+            ax = sg["wrap_axis"]
+            bc = sg["bd_contact"]
+            cw, sw = math.cos(wr), math.sin(wr)
+            adb = _dot(ax, bc)
+            bd = _norm((bc[0] * cw + (ax[1] * bc[2] - ax[2] * bc[1]) * sw
+                        + ax[0] * adb * (1 - cw),
+                        bc[1] * cw + (ax[2] * bc[0] - ax[0] * bc[2]) * sw
+                        + ax[1] * adb * (1 - cw),
+                        bc[2] * cw + (ax[0] * bc[1] - ax[1] * bc[0]) * sw
+                        + ax[2] * adb * (1 - cw)))
             sweet = (hands[0] + sg["Ls"] * bd[0], hands[1] + sg["Ls"] * bd[1],
                      hands[2] + sg["Ls"] * bd[2])
             tip = (hands[0] + sg["BAT"] * bd[0], hands[1] + sg["BAT"] * bd[1],
                    hands[2] + sg["BAT"] * bd[2])
             return {"hands": hands, "sweet": sweet, "tip": tip, "dir": bd}
-        f1, f2, n = sg["f1"], sg["f2"], sg["n"]
-        if roll:                                    # stand the early plane up
-            cr, sr = math.cos(roll), math.sin(roll)
-            f1, n = (f1[0] * cr + n[0] * sr, f1[1] * cr + n[1] * sr,
-                     f1[2] * cr + n[2] * sr), \
-                    (n[0] * cr - sg["f1"][0] * sr, n[1] * cr - sg["f1"][1] * sr,
-                     n[2] * cr - sg["f1"][2] * sr)
-        cp, sp = math.cos(phi), math.sin(phi)
-        sweet = (O[0] + R * (cp * f1[0] + sp * f2[0]),
-                 O[1] + R * (cp * f1[1] + sp * f2[1]),
-                 O[2] + R * (cp * f1[2] + sp * f2[2]))
-        # The bat leans OUT of the swing plane early — a cocked bat sticks up
-        # out of the plane its barrel will later sweep, and forcing it flat in
-        # there is what left the grip stranded across the chest at load. The
-        # lean is gone by the time the plane settles, so contact is unaffected.
-        cb, sb = math.cos(phi + psi), math.sin(phi + psi)
-        gn = sg["gn0"] * (1.0 - settle)
-        bd = _norm((cb * f1[0] + sb * f2[0] + gn * n[0],
-                    cb * f1[1] + sb * f2[1] + gn * n[1],
-                    cb * f1[2] + sb * f2[2] + gn * n[2]))
-        hands = (sweet[0] - sg["Ls"] * bd[0], sweet[1] - sg["Ls"] * bd[1],
-                 sweet[2] - sg["Ls"] * bd[2])
-        tip = (hands[0] + sg["BAT"] * bd[0], hands[1] + sg["BAT"] * bd[1],
-               hands[2] + sg["BAT"] * bd[2])
-        return {"hands": hands, "sweet": sweet, "tip": tip, "dir": bd}
 
     def _draw_batter(self):
         """3-D batter reconstruction from the Savant swing-path + stance data.
@@ -1073,8 +1664,15 @@ class PitchFlightView(UmpireView3D):
             glVertex3f(*self._p2m(px, 0.006, pz))
         glEnd()
 
-    def _draw_batter_figure(self, b, bx, bz, bside, sg, pp, setup):
-        """Batter driven by ONE kinematic chain, feet → pelvis → torso →
+    def _body_pose(self, b, bx, bz, bside, sg, pp, setup):
+        """Every joint of the figure at swing progress `pp`, as plain numbers.
+
+        Split out of the drawing so the pose can be MEASURED (bat-vs-torso
+        clearance, frame-to-frame jerk) and so the swing solve can react to
+        the body instead of the body being hung off the barrel and hoped for.
+        `_draw_batter_figure` is now only the GL calls.
+
+        Batter driven by ONE kinematic chain, feet → pelvis → torso →
         shoulders → arms → bat, in kinematic-sequence order.
 
         Nothing is pinned after the fact: the hands come out of the solved
@@ -1086,6 +1684,24 @@ class PitchFlightView(UmpireView3D):
         measured intercept is further out than the arms can reach the TORSO
         leans to it rather than the arm stretching."""
         IN = 0.0254
+        # Savant's batter reference is NOT the hitter's torso at contact, and
+        # the gap is big enough to have looked like a barrel-path defect.
+        #
+        # Savant's own identity puts contact `batter_y_position + intercept_
+        # y_vs_plate` in front of the batter's tracked position — 0.955 m for
+        # the median hitter. Driveline's landmarks put contact 0.528 m in front
+        # of the THORAX at contact. Both are right: the tracked position is a
+        # stance reference and the hitter has strode and rotated away from it by
+        # the time he hits the ball. Standing the figure at the stance point
+        # left the barrel a median 5.4 cm off his torso; carrying him to his
+        # contact-time position puts it at 37.5 cm, against the 39.7 real
+        # swings hold. Per hitter, so a deep-in-the-box hitter carries further.
+        ivp_ = b.get("intercept_vs_plate")
+        dep_ = b.get("depth_in_box")
+        fwd = 0.0
+        if ivp_ is not None and dep_ is not None:
+            fwd = max(0.0, min(0.60, (dep_ + ivp_) * IN - _OBP_CONTACT_FWD))
+        bx = bx + fwd
         half = (b.get("foot_sep") or 30.0) * IN / 2.0
         st = math.radians(-(b.get("stance_angle") or 0.0))   # +open
         fc, fs = math.cos(st), math.sin(st)
@@ -1101,6 +1717,9 @@ class PitchFlightView(UmpireView3D):
             tau = min(1.0, pp / s_c) if s_c else 1.0
             post = max(0.0, (pp - s_c) / max(1e-6, 1.0 - s_c))
         fpost = 1.0 - (1.0 - min(1.0, post)) ** 2
+        # Phase the reference swing is read at — clamped to the load while the
+        # figure is in setup. Needed by the weight shift, the yaw and the head.
+        s_now = 0.0 if (setup or sg is None) else pp
         seq_p = _seq(tau, _SEQ_PELVIS)
         seq_t = _seq(tau, _SEQ_TORSO)
 
@@ -1127,14 +1746,27 @@ class PitchFlightView(UmpireView3D):
             back_f = (cx - half * fc, 0.0, cz - bside * half * fs)
             foot_axes = ((fc, bside * fs), (fc, bside * fs))
 
-        # Stable weight point. The pelvis sits over the REAR hip at load and
-        # eases toward the feet centre on the pelvis's own slot in the sequence.
+        # Stable weight point — the pelvis, shifting off the rear side onto the
+        # feet centre through the stride.
+        #
+        # This is MEASURED off the reference now, and the amount matters more
+        # than it looks: the old rule put the pelvis 75% of the way from the
+        # feet centre to the BACK FOOT at load (the `0.25` below) and then
+        # walked it all the way in, which is 35 cm of pelvis travel. The
+        # reference hitter's pelvis moves 20.6 cm. Everything above the pelvis
+        # inherits that error, and it was the largest single contributor to the
+        # figure's head travel once the reach lunge was capped.
         feet_cx = (front_f[0] + back_f[0]) / 2.0
         feet_cz = (front_f[2] + back_f[2]) / 2.0
-        rear_hip_x = back_f[0] + (feet_cx - back_f[0]) * 0.25
-        rear_hip_z = back_f[2] + (feet_cz - back_f[2]) * 0.25
-        ax_ = rear_hip_x + (feet_cx - rear_hip_x) * seq_p
-        az_ = rear_hip_z + (feet_cz - rear_hip_z) * seq_p
+        rp_, rp1_ = swing_ref_at(s_now), swing_ref_at(1.0)
+        if rp_ is not None and rp1_ is not None:
+            ax_ = feet_cx + (rp_["pelvis"][0] - rp1_["pelvis"][0])
+            az_ = feet_cz + tp * (rp_["pelvis"][2] - rp1_["pelvis"][2])
+        else:
+            rear_hip_x = back_f[0] + (feet_cx - back_f[0]) * 0.25
+            rear_hip_z = back_f[2] + (feet_cz - back_f[2]) * 0.25
+            ax_ = rear_hip_x + (feet_cx - rear_hip_x) * seq_p
+            az_ = rear_hip_z + (feet_cz - rear_hip_z) * seq_p
 
         # Feet. The scrape's foot axis is a LINE, not a direction — it comes
         # from a symmetric cleat glyph, so its sign is meaningless. Resolve it
@@ -1149,25 +1781,24 @@ class PitchFlightView(UmpireView3D):
             if t[1] * tp < 0.0:
                 t = (-t[0], -t[1])
             toes.append(t)
-        glLineWidth(3.4)
-        glColor4f(0.40, 0.88, 0.98, 0.95)
-        glBegin(GL_LINES)
-        for f, t in zip((front_f, back_f), toes):
-            heel = (f[0] - 0.07 * t[0], f[1] + 0.01, f[2] - 0.07 * t[1])
-            toe = (f[0] + 0.15 * t[0], f[1] + 0.01, f[2] + 0.15 * t[1])
-            self._seg(heel, toe)
-            # toe splay — an asymmetric foot so which way he stands is legible
-            for sgn in (1.0, -1.0):
-                self._seg(toe, (toe[0] - 0.05 * t[0] - sgn * 0.045 * t[1],
-                                toe[1],
-                                toe[2] - 0.05 * t[1] + sgn * 0.045 * t[0]))
-        glEnd()
 
         # Pelvis and shoulders turn on SEPARATE clocks: the pelvis fires first
-        # and the shoulders lag ~25° behind it at load (the X-factor), then
-        # close that gap and pass it through contact.
-        yaw_h = bside * (-0.10 + 1.40 * seq_p + 0.25 * fpost)
-        yaw_s = bside * (-0.42 + 1.97 * seq_t + 0.30 * fpost)
+        # and the shoulders lag behind it at load (the X-factor), then close
+        # that gap and pass it through contact.
+        #
+        # The two progress curves are the RECORDED ones (`swing_ref_yaw`), not
+        # a pair of logistics — the amplitudes and directions below are still
+        # this figure's own, only the shape of the turn comes from the mocap.
+        # The old `_seq` pair is the fallback when the reference is missing.
+        ryaw = swing_ref_yaw()
+        if ryaw is not None:
+            prog_h = _ref_curve_at(ryaw[0], s_now)
+            prog_s = _ref_curve_at(ryaw[1], s_now)
+            yaw_h = bside * (-0.10 + 1.65 * prog_h)
+            yaw_s = bside * (-0.42 + 2.27 * prog_s)
+        else:
+            yaw_h = bside * (-0.10 + 1.40 * seq_p + 0.25 * fpost)
+            yaw_s = bside * (-0.42 + 1.97 * seq_t + 0.30 * fpost)
 
         def rot(px, pz, yaw):
             cy_, sy_ = math.cos(yaw), math.sin(yaw)
@@ -1185,6 +1816,97 @@ class PitchFlightView(UmpireView3D):
         if sg is not None:
             pose = self._pose_at(sg, 0.0 if setup else pp)
             hands, bat_tip, sweet = pose["hands"], pose["tip"], pose["sweet"]
+            # Warp the GRIP out of the torso and rebuild the bat rigidly from
+            # it. The barrel is the measured half of the swing and is left
+            # exactly where the solve put it; the grip is the free half (the
+            # bat only has to stay BAT_SWEET long), so it is the end that
+            # moves. Two fixed passes — a fixed count keeps the whole thing a
+            # smooth function of the phase.
+            if sweet is not None:
+                torso_a = ((lh_x + rh_x) / 2.0, hip_y, (lh_z + rh_z) / 2.0)
+                torso_b = (sc_x, sh_y, sc_z)
+                Ls = self.BAT_SWEET
+                s_now2 = 0.0 if setup else pp
+                if s_now2 <= s_c:
+                    # DOWNSWING: the barrel is the measured half, so pin the
+                    # sweet spot and let the warp rotate the bat about it.
+                    # Two constraints share that one rotation — the grip has to
+                    # stay OUT of the torso and INSIDE the lead arm's reach —
+                    # and both are softplus-smoothed, so alternating them a
+                    # fixed number of times stays a smooth function of phase.
+                    lead0 = (ls_x, sh_y, ls_z)
+                    # The cap FADES OUT into contact. It has to: past contact
+                    # the follow-through owns the grip and cannot apply the
+                    # same rotation, so a cap still biting at s_c is a step in
+                    # the grip — measured at 6.0 cm median, 18.6 cm worst, and
+                    # it put the hands' |d2p/ds2| up to 7139 from 228. It costs
+                    # nothing to give up: the reach overshoot at contact is
+                    # already -16 cm, i.e. the arms are comfortably inside
+                    # their reach exactly where the measurements live.
+                    tau_ = (s_now2 / s_c) if s_c else 1.0
+                    w_cap = 1.0 - _smootherstep((tau_ - 0.55) / 0.45)
+                    for _ in range(3):
+                        hands = self._spine_warp(hands, torso_a, torso_b,
+                                                 hint=(0.0, 0.0, -tp))
+                        bd = _norm((hands[0] - sweet[0], hands[1] - sweet[1],
+                                    hands[2] - sweet[2]))
+                        if w_cap > 1e-4:
+                            bc = self._reach_cap(sweet, bd, lead0, Ls,
+                                                 self.ARM_REACH)
+                            bd = _norm(_lerp3(bd, bc, w_cap))
+                        hands = (sweet[0] + Ls * bd[0], sweet[1] + Ls * bd[1],
+                                 sweet[2] + Ls * bd[2])
+                    bd = _norm((sweet[0] - hands[0], sweet[1] - hands[1],
+                                sweet[2] - hands[2]))
+                else:
+                    # FOLLOW-THROUGH: nothing is measured here and the bat's
+                    # direction is the deliberate wrap pose, so TRANSLATE the
+                    # bat with the warped grip instead of rotating it about a
+                    # sweet spot that is itself derived from the grip — doing
+                    # that spun the bat about a meaningless anchor and is what
+                    # stood it up across the chest at the finish.
+                    # ...and pulled back inside the arm, radially about the
+                    # lead shoulder. Without this the wrap drifted the grip up
+                    # to 1.37 m off the spine — a distance the old code hid by
+                    # walking the whole torso after it.
+                    #
+                    # Two reconciliations are blended here, and the blend is
+                    # what makes the contact seam vanish. TRANSLATING the bat
+                    # with the warped grip is the right thing at the finish
+                    # (rotating it about a sweet spot that is itself derived
+                    # from the grip stands the bat up across the chest), but it
+                    # is NOT what the downswing does one sample earlier, and
+                    # that mismatch was a 2 cm step in the grip. So the first
+                    # 15% of the follow-through eases out of the downswing's
+                    # own operation — pin the sweet spot, warp, re-rigidify —
+                    # into the translation. At t2=0 the two branches are
+                    # identical by construction.
+                    lead0 = (ls_x, sh_y, ls_z)
+                    bdB = pose["dir"]
+                    hB = self._reach_clamp(
+                        self._spine_warp(hands, torso_a, torso_b,
+                                         hint=(0.0, 0.0, -tp)),
+                        lead0, self.ARM_REACH)
+                    sweetA = (hands[0] + Ls * bdB[0], hands[1] + Ls * bdB[1],
+                              hands[2] + Ls * bdB[2])
+                    hA = hands
+                    for _ in range(3):
+                        hA = self._spine_warp(hA, torso_a, torso_b,
+                                              hint=(0.0, 0.0, -tp))
+                        d_ = _norm((hA[0] - sweetA[0], hA[1] - sweetA[1],
+                                    hA[2] - sweetA[2]))
+                        hA = (sweetA[0] + Ls * d_[0], sweetA[1] + Ls * d_[1],
+                              sweetA[2] + Ls * d_[2])
+                    bdA = _norm((sweetA[0] - hA[0], sweetA[1] - hA[1],
+                                 sweetA[2] - hA[2]))
+                    wB = _smootherstep(post / 0.15)
+                    hands = _lerp3(hA, hB, wB)
+                    bd = _norm(_lerp3(bdA, bdB, wB))
+                    sweet = (hands[0] + Ls * bd[0], hands[1] + Ls * bd[1],
+                             hands[2] + Ls * bd[2])
+                bat_tip = (hands[0] + self.BAT_LEN * bd[0],
+                           hands[1] + self.BAT_LEN * bd[1],
+                           hands[2] + self.BAT_LEN * bd[2])
         else:
             # No tracked swing: a static cocked stance, bat up over the rear
             # shoulder, so the overlay still reads as a hitter in the box.
@@ -1197,35 +1919,131 @@ class PitchFlightView(UmpireView3D):
                        hands[2] + self.BAT_LEN * d[2])
             sweet = None
 
-        # Reach: if the hands are further from the shoulder than an arm is
-        # long, the TORSO goes to them. Leaning is what a hitter actually does
-        # to cover the outer third; stretching the arm is what used to make the
-        # figure snap into a straight, ballooned limb.
+        # NOTE: the bat currently sweeps THROUGH the torso mid-downswing for
+        # every tracked hitter — measured across all 201 on the board, median
+        # 23% of the swing. A per-frame
+        # collision correction was tried here and removed: rotating the bat
+        # about its sweet spot costs none of the measured quantities, but the
+        # pose it is correcting is off by ~17cm (the shaft crosses the spine
+        # axis itself), so the rotation needed is ~120 deg and the result
+        # jerks far worse than the penetration it fixes. The fix belongs in
+        # the path solve — see the shape note in `_solve_swing`.
+
+        # Reach. This used to translate the WHOLE upper body onto the hands by
+        # the full overshoot, uncapped, which is where the figure's 109 cm of
+        # head travel came from (a real hitter moves his head ~9 cm, and even
+        # the reference swing only moves it 44). The grip is now pulled into
+        # reach by rotating the bat about its sweet spot instead — see
+        # `_reach_cap` — so all that is left here is a small, BOUNDED lean for
+        # whatever the rotation could not absorb, which is a real thing hitters
+        # do to cover the outer third. Softplus-bounded, so it never pops.
         lead_sh = (ls_x, sh_y, ls_z)
         need = math.dist(hands, lead_sh) - self.ARM_REACH
         if need > 0.0:
+            k = self.LEAN_MAX * 0.5
+            lean = self.LEAN_MAX * (1.0 - math.exp(-need / max(1e-6, k)))
             u = _norm((hands[0] - lead_sh[0], hands[1] - lead_sh[1],
                        hands[2] - lead_sh[2]))
-            for dxu, w_ in ((need, 1.0),):
+            for dxu, w_ in ((lean, 1.0),):
                 sc_x += u[0] * dxu * w_
                 sc_z += u[2] * dxu * w_
                 ls_x += u[0] * dxu * w_
                 ls_z += u[2] * dxu * w_
                 rs_x += u[0] * dxu * w_
                 rs_z += u[2] * dxu * w_
-            ax_ += u[0] * need * 0.45
-            az_ += u[2] * need * 0.45
-            lh_x += u[0] * need * 0.45
-            lh_z += u[2] * need * 0.45
-            rh_x += u[0] * need * 0.45
-            rh_z += u[2] * need * 0.45
+            ax_ += u[0] * lean * 0.45
+            az_ += u[2] * lean * 0.45
+            lh_x += u[0] * lean * 0.45
+            lh_z += u[2] * lean * 0.45
+            rh_x += u[0] * lean * 0.45
+            rh_z += u[2] * lean * 0.45
 
-        lead_hip = (lh_x, hip_y, lh_z)
-        rear_hip = (rh_x, hip_y, rh_z)
-        pelvis_c = ((lh_x + rh_x) / 2.0, hip_y, (lh_z + rh_z) / 2.0)
-        shoulder_c = (sc_x, sh_y, sc_z)
-        lead_sh = (ls_x, sh_y, ls_z)
-        rear_sh = (rs_x, sh_y, rs_z)
+        # Head. Taken from the reference as an offset off the shoulder centre,
+        # in WORLD axes and deliberately NOT rotated by the shoulder yaw: the
+        # head staying still while the shoulders turn under it is the whole
+        # point. The reference's own head moves 3.3 cm vertically across the
+        # entire swing, which is what "head still" actually looks like.
+        head_c = (sc_x, sh_y + head_dy, sc_z)
+        rh_ = swing_ref_at(s_now)
+        if rh_ is not None:
+            # Anchored to the SHOULDER CENTRE. Anchoring to the pelvis was
+            # tried and is worse (58.5 cm of head travel against 53.5): our
+            # pelvis carries the weight shift forward and the reference head
+            # moves forward too, so the two ADD, where the shoulder centre's
+            # yaw swing partly cancels them.
+            #
+            # What is taken is the head's MOTION relative to the shoulders, not
+            # its absolute offset: the reference's head marker sits ~35 cm above
+            # sh_c (it is the top of the skull, and mocap marker placement is
+            # not this figure's proportions), so using the raw offset stretched
+            # the neck to 29 cm and left the head visibly floating. Subtracting
+            # the offset at the load makes s=0 identical to the pose this figure
+            # already had, and everything after it is the mocap's.
+            r0_ = swing_ref_at(0.0)
+            dx_ = ((rh_["head"][0] - rh_["sh_c"][0])
+                   - (r0_["head"][0] - r0_["sh_c"][0]))
+            dy_ = ((rh_["head"][1] - rh_["sh_c"][1])
+                   - (r0_["head"][1] - r0_["sh_c"][1]))
+            dz_ = ((rh_["head"][2] - rh_["sh_c"][2])
+                   - (r0_["head"][2] - r0_["sh_c"][2]))
+            head_c = (sc_x + dx_, sh_y + head_dy + dy_, sc_z + tp * dz_)
+
+        return {
+            "front_f": front_f, "back_f": back_f, "toes": toes,
+            "lead_hip": (lh_x, hip_y, lh_z), "rear_hip": (rh_x, hip_y, rh_z),
+            "pelvis_c": ((lh_x + rh_x) / 2.0, hip_y, (lh_z + rh_z) / 2.0),
+            "shoulder_c": (sc_x, sh_y, sc_z),
+            "lead_sh": (ls_x, sh_y, ls_z), "rear_sh": (rs_x, sh_y, rs_z),
+            "head_c": head_c,
+            "hands": hands, "bat_tip": bat_tip, "sweet": sweet,
+            "sh_y": sh_y, "hip_y": hip_y, "head_dy": head_dy,
+        }
+
+    def _draw_batter_figure(self, b, bx, bz, bside, sg, pp, setup):
+        """Draw the figure from `_body_pose` — GL only, no geometry."""
+        rec = getattr(self, "_recover", None)
+        if rec is not None and sg is not None and 0.0 < rec < 1.0:
+            # Ease the whole pose from the finish back to the load. Lerping
+            # the JOINTS (rather than the phase) is what makes this possible —
+            # phase 1.0 -> 0.0 would replay the swing backwards.
+            a = self._body_pose(b, bx, bz, bside, sg, 1.0, False)
+            c = self._body_pose(b, bx, bz, bside, sg, 0.0, True)
+            w = _smoothstep(rec)
+            j = {}
+            for k, va in a.items():
+                vc = c.get(k)
+                if isinstance(va, tuple) and vc is not None and len(va) == 3 \
+                        and all(isinstance(x, (int, float)) for x in va):
+                    j[k] = _lerp3(va, vc, w)
+                elif isinstance(va, (int, float)) and isinstance(vc, (int, float)):
+                    j[k] = va + (vc - va) * w
+                else:
+                    j[k] = vc if w > 0.5 else va
+        else:
+            j = self._body_pose(b, bx, bz, bside, sg, pp, setup)
+        front_f, back_f, toes = j["front_f"], j["back_f"], j["toes"]
+        lead_hip, rear_hip = j["lead_hip"], j["rear_hip"]
+        pelvis_c, shoulder_c = j["pelvis_c"], j["shoulder_c"]
+        lead_sh, rear_sh = j["lead_sh"], j["rear_sh"]
+        hands, bat_tip, sweet = j["hands"], j["bat_tip"], j["sweet"]
+        ls_x, ls_z = lead_sh[0], lead_sh[2]
+        rs_x, rs_z = rear_sh[0], rear_sh[2]
+        sc_x, sc_z = shoulder_c[0], shoulder_c[2]
+        sh_y, head_dy = j["sh_y"], j["head_dy"]
+
+        glLineWidth(3.4)
+        glColor4f(0.40, 0.88, 0.98, 0.95)
+        glBegin(GL_LINES)
+        for f, t in zip((front_f, back_f), toes):
+            heel = (f[0] - 0.07 * t[0], f[1] + 0.01, f[2] - 0.07 * t[1])
+            toe = (f[0] + 0.15 * t[0], f[1] + 0.01, f[2] + 0.15 * t[1])
+            self._seg(heel, toe)
+            # toe splay — an asymmetric foot so which way he stands is legible
+            for sgn in (1.0, -1.0):
+                self._seg(toe, (toe[0] - 0.05 * t[0] - sgn * 0.045 * t[1],
+                                toe[1],
+                                toe[2] - 0.05 * t[1] + sgn * 0.045 * t[0]))
+        glEnd()
 
         glLineWidth(2.6)
         glColor4f(0.55, 0.90, 0.98, 0.95)
@@ -1271,23 +2089,26 @@ class PitchFlightView(UmpireView3D):
             glVertex3f(*self._p2m(*sweet))
             glEnd()
 
+        # Head — from the pose, which now carries it off the reference swing
+        # rather than welding it to the top of the spine.
+        hc_ = j["head_c"]
         glLineWidth(2.2)                            # cap bill — he looks out at
         glColor4f(0.55, 0.90, 0.98, 0.9)            # the pitcher, so this reads
         glBegin(GL_LINES)                           # as which way he is turned
-        hy = sh_y + head_dy
-        self._seg((sc_x + 0.07, hy, sc_z), (sc_x + 0.20, hy - 0.02, sc_z))
+        self._seg((hc_[0] + 0.07, hc_[1], hc_[2]),
+                  (hc_[0] + 0.20, hc_[1] - 0.02, hc_[2]))
         glEnd()
         glLineWidth(2.2)                            # neck
         glColor4f(0.55, 0.90, 0.98, 0.9)
         glBegin(GL_LINES)
-        self._seg(shoulder_c, (sc_x, sh_y + head_dy - 0.10, sc_z))
+        self._seg(shoulder_c, (hc_[0], hc_[1] - 0.10, hc_[2]))
         glEnd()
         glLineWidth(1.8)                            # head
         glBegin(GL_LINE_LOOP)
         for k in range(18):
             a = 2 * math.pi * k / 18
-            glVertex3f(*self._p2m(sc_x + 0.10 * math.cos(a),
-                                  sh_y + head_dy + 0.10 * math.sin(a), sc_z))
+            glVertex3f(*self._p2m(hc_[0] + 0.10 * math.cos(a),
+                                  hc_[1] + 0.10 * math.sin(a), hc_[2]))
         glEnd()
 
     def _draw_swing_path(self, sg, p, pp):
@@ -1736,8 +2557,9 @@ class SPFlightWindow(QMainWindow):
             if self._contact_frame is not None:
                 self.view.set_swing_phase(1.0)   # hold the finished follow-through
                 self.view.set_foot_phase(1.0)    # ...on the planted front foot
+                self._start_recover()
             self.view.update()
-            if self._queue:
+            if self._queue and self._contact_frame is None:
                 QTimer.singleShot(300, self._next_in_queue)
             return
         i = self.current_frame
@@ -1776,6 +2598,40 @@ class SPFlightWindow(QMainWindow):
         if i <= cf:
             return pc * (i - sf) / max(1, cf - sf)
         return min(1.0, pc + (1 - pc) * (i - cf) / max(1, self._follow_frames))
+
+    # Hold the finish, then EASE back to the load pose. The next pitch only
+    # goes once that is done, so a queued arsenal flyby never cuts from a
+    # wrapped follow-through straight to a cocked stance.
+    _RECOVER_HOLD_MS = 260
+    _RECOVER_MS = 420
+
+    def _start_recover(self):
+        self._recover_t0 = None
+        if getattr(self, "_recover_timer", None) is None:
+            self._recover_timer = QTimer(self)
+            self._recover_timer.timeout.connect(self._tick_recover)
+        QTimer.singleShot(self._RECOVER_HOLD_MS, self._begin_recover)
+
+    def _begin_recover(self):
+        import time as _t
+        self._recover_t0 = _t.monotonic()
+        self._recover_timer.start(16)
+
+    def _tick_recover(self):
+        import time as _t
+        if self._recover_t0 is None:
+            return
+        r = (_t.monotonic() - self._recover_t0) * 1000.0 / self._RECOVER_MS
+        if r >= 1.0:
+            self._recover_timer.stop()
+            self._recover_t0 = None
+            self.view.reset_swing()
+            self.view.update()
+            if self._queue:
+                QTimer.singleShot(120, self._next_in_queue)
+            return
+        self.view.set_recover(r)
+        self.view.update()
 
     def _next_in_queue(self):
         if self._queue:
