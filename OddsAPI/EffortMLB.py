@@ -8007,7 +8007,10 @@ class PlayerDetailPanel(QWidget):
 
         content_lay = QVBoxLayout(self._content)
         content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(6)
+        # 4, was 6. With the per-game strip gone this is three gaps (header,
+        # matchup box, sub-tabs) rather than four, and every pixel here comes
+        # straight off the height each view has to work in.
+        content_lay.setSpacing(4)
 
         # -- header: LEFT block = [headshot | name+stats] on top with the
         #    selector row filling the full width below it; matchup strip right
@@ -8188,8 +8191,16 @@ class PlayerDetailPanel(QWidget):
         # height, does not collide with them.
         self._banner_text = pg.TextItem(anchor=(0, 0))
         self._banner_text.setZValue(50)
-        # Its own full-width row between the header and the chart area
-        content_lay.addWidget(self._banner)
+        # NOT added to the layout. The strip plotted per-game xwOBAcon with
+        # the prop outcome as the bar colour — which is the same series, game
+        # for game, that the Form tab's trend plot draws directly below it,
+        # only smaller and without axes. It cost 38px of every view (plus the
+        # layout spacing) to restate one of them.
+        #
+        # The widget itself is KEPT and still rendered: `_render_banner`
+        # writes to it on every summary, several callers reach for it, and a
+        # hidden plot costs nothing. Re-add this line to bring the strip back.
+        self._banner.hide()
 
         # -- analytical section: SUB-TABS, not a side-by-side row.
         #
@@ -8790,10 +8801,19 @@ class PlayerDetailPanel(QWidget):
         # tables stack in one column to the right of a bigger field, and the
         # flow height is unchanged because the table stack was already the
         # tallest thing in the row.
-        # 244, was 262. The aspect-locked field loses ~7% but it buys the
-        # merged window table the room to sit BESIDE it instead of below —
-        # which was ~450px of dead canvas down the right of this row.
-        spray_page.setFixedWidth(244)
+        # 220. Sized so the widest row on the tab — spray + gap + the window
+        # table at 484 with BABIP spelled out — lands exactly on the flow's
+        # right edge with nothing spare. Every pixel this gives up goes to a
+        # table; every pixel it takes back pushes one off the row. The
+        # both times to buy a table the room to sit BESIDE it rather than
+        # below: first the merged window table (which had left ~450px of dead
+        # canvas down the right of this row), then the Seen/Loc pair, which
+        # measured 469 against the 451 that was free — 18px short, and there
+        # is no header slack left in either table to find it in. Then BABIP
+        # took the window table to 477 against 473, and 4px is the difference
+        # between it sharing this row and taking one of its own (which cost
+        # 230px of flow height when it happened).
+        spray_page.setFixedWidth(220)
         spray_page.setFixedHeight(222)
         self._form_lay.addWidget(trend_page)
         # The one-line answer to the question the plot above provokes. A
@@ -8825,7 +8845,9 @@ class PlayerDetailPanel(QWidget):
             "and Sweet the 8-32 band Statcast scores. EV and barrels can "
             "both hold while a hitter goes cold, and the usual reason is the "
             "angle — the same swing hit on the ground is an out.")
-        _ff = FlowHost(); self._form_flow = _ff
+        # spacing 5, not the default 8: three gaps across this flow, and the
+        # width goes to the spray chart instead.
+        _ff = FlowHost(spacing=5); self._form_flow = _ff
         self._form_flow.addWidget(spray_page)
         self._form_flow.addWidget(self._tbl_form)
         self._tbl_attack = self._make_stats_table()
@@ -8837,8 +8859,19 @@ class PlayerDetailPanel(QWidget):
             "not on a pitch count, so it lines up with the plot.\n\n"
             "A slump that is just variance looks FLAT here. Deltas of a few "
             "points are noise — the row is worth reading when the mix moves "
-            "5+ points or the zone rate moves with it.")
-        self._form_flow.addWidget(self._tbl_attack)
+            "5+ points or the zone rate moves with it.\n\n"
+            "Zn = share of pitches in the zone, FS = first-pitch strikes.")
+        # Seen and Loc travel as ONE flow item. Left to the skyline fill they
+        # drifted apart — Seen tucked under the window table and Loc dropped
+        # to the next row on the far side of the panel — and they are the
+        # pair you read against each other: what the staff is throwing him
+        # and where it ends up. A container also makes their adjacency
+        # independent of how wide either happens to be.
+        self._seen_pair = QWidget()
+        _pair = QHBoxLayout(self._seen_pair)
+        _pair.setContentsMargins(0, 0, 0, 0)
+        _pair.setSpacing(4)
+        _pair.addWidget(self._tbl_attack, alignment=Qt.AlignmentFlag.AlignTop)
         self._tbl_dir = self._make_stats_table()
         self._tbl_dir.setToolTip(
             "Where he hits the ball, split by WHERE IT WAS PITCHED.\n\n"
@@ -8851,8 +8884,12 @@ class PlayerDetailPanel(QWidget):
             "'\u0394Seen' how it has moved in the current window (that part is "
             "the pitcher). Read together they separate the two.\n\n"
             "Bands are batter-relative and spray is oppo-signed, so a lefty "
-            "and a righty read the same.")
-        self._form_flow.addWidget(self._tbl_dir)
+            "and a righty read the same.\n\n"
+            "Loc = the pitch-location band (In / Mid / Out), Cen/Opp = "
+            "centre and opposite field, \u0394 = how the share of pitches to "
+            "that band has moved in the current window.")
+        _pair.addWidget(self._tbl_dir, alignment=Qt.AlignmentFlag.AlignTop)
+        _pair.addStretch(0)
         self._tbl_rest = self._make_stats_table()
         self._tbl_rest.setToolTip(
             "Contact quality by days off before the game — the schedule half "
@@ -8864,6 +8901,27 @@ class PlayerDetailPanel(QWidget):
             "Pooled per pitch, not averaged per game, so a one-batted-ball "
             "afternoon cannot outvote a full one. Watch the BBE column — a "
             "bucket with 15 batted balls is a curiosity, not a finding.")
+        # Order IS the layout under a skyline fill. Rest is narrow enough to
+        # fill the pocket beside the spray under the window table; the pair
+        # and the discipline block then share the row beneath.
+        self._form_flow.addWidget(self._seen_pair)
+        self._tbl_dwin = self._make_stats_table()
+        self._tbl_dwin.setToolTip(
+            "Plate discipline by window — the FASTEST-moving thing on this "
+            "tab.\n\n"
+            "Swing and strikeout rates are reliable in ~50-60 plate "
+            "appearances; home-run rate needs ~170 and BABIP ~820 balls in "
+            "play. So when a hitter changes, this is where it shows up first "
+            "— results are the last thing to move, not the first.\n\n"
+            "Chase is swings at pitches outside the rulebook zone, Z-Sw "
+            "swings at pitches inside it, Z-Con contact on those swings, and "
+            "SwStr whiffs as a share of ALL pitches. A slump with the "
+            "discipline row flat is variance; one with chase climbing is not."
+            "\n\nZone is the STRICT rulebook zone — ball centre over the "
+            "plate — which is what makes these line up with FanGraphs.\n\n"
+            "Chs = chase, Z-Sw/Z-Con = swing and contact on pitches in the "
+            "zone, SwS = swinging strikes over all pitches.")
+        self._form_flow.addWidget(self._tbl_dwin)
         self._form_flow.addWidget(self._tbl_rest)
         # FORM ONLY: the tables scroll UNDER a pinned plot.
         #
@@ -8885,9 +8943,19 @@ class PlayerDetailPanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         # transparent: the viewport otherwise paints Qt's default base colour
         # over the panel's dark background
+        # Slim scrollbar: the default is ~15px of the panel's width, taken
+        # off the widest row on the tab, for a control that only needs to be
+        # grabbable.
         self._form_scroll.setStyleSheet(
             "QScrollArea, QScrollArea > QWidget > QWidget "
-            "{ background: transparent; }")
+            "{ background: transparent; }"
+            "QScrollBar:vertical { width: 8px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: #3A4757;"
+            " border-radius: 4px; min-height: 24px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+            " { background: transparent; }")
         self._form_scroll.setMinimumHeight(self._PAGE_SCROLL_MIN)
         self._form_scroll.setWidget(_ff)
         self._form_lay.addWidget(self._form_scroll, stretch=1)
@@ -9140,7 +9208,7 @@ class PlayerDetailPanel(QWidget):
 
         for name in ("_tbl_velo", "_tbl_pitch", "_tbl_situ", "_tbl_count",
                      "_tbl_gamelog", "_tbl_bb", "_tbl_mix", "_tbl_zone",
-                     "_tbl_disc", "_tbl_form", "_tbl_attack", "_tbl_dir",
+                     "_tbl_disc", "_tbl_form", "_tbl_attack", "_tbl_dir", "_tbl_dwin",
                      "_tbl_rest", "_tbl_split", "_tbl_plus",
                      "_tbl_bio", "_tbl_lev", "_tbl_pbot", "_tbl_az",
                      "_tbl_pfx"):
@@ -9817,17 +9885,21 @@ class PlayerDetailPanel(QWidget):
         # dropping below it into a full-width row of its own. "xw" is what the
         # Arsenal tab already calls the same number.
         headers = ["Win", stat, "N", "EV", "Brl", "xwOBA", "Bel", "Whf",
-                   "GB", "LD", "FB", "PU", "Swt"]
+                   "GB", "LD", "FB", "PU", "Swt", "BABIP"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         # xwOBA keeps its full name but at a smaller point size: the header
         # was the widest thing in its column, so the LABEL was setting the
         # width rather than the .353 underneath it.
-        _h = table.horizontalHeaderItem(5)
-        if _h is not None:
-            _hf = _h.font()
-            _hf.setPointSizeF(max(6.0, _hf.pointSizeF() - 1.5))
-            _h.setFont(_hf)
+        # Same treatment for both long labels: keep the full name but shrink
+        # the point size, because the HEADER was setting the column width
+        # rather than the .353 underneath it.
+        for _c in (5, 13):
+            _h = table.horizontalHeaderItem(_c)
+            if _h is not None:
+                _hf = _h.font()
+                _hf.setPointSizeF(max(6.0, _hf.pointSizeF() - 1.5))
+                _h.setFont(_hf)
         for c, tip in (
                 (2, "Batted balls behind the row — the sample every rate "
                     "beside it is standing on. Greyed cells have not reached "
@@ -9868,6 +9940,7 @@ class PlayerDetailPanel(QWidget):
 
         season = agg(games)
         mix_of = self._la_mix_fn()
+        babip_of = self._babip_fn()
         _sn, season_mix = mix_of(games)
         table.setRowCount(len(rows))
         for r, (lab, gs) in enumerate(rows):
@@ -9939,9 +10012,53 @@ class PlayerDetailPanel(QWidget):
                         f"{mn} batted balls — ground-ball and fly-ball rates "
                         f"need ~80 before they mean much.")
                 table.setItem(r, c, it)
+            bn, bab = babip_of(gs)
+            it = cell(f"{bab:.3f}".lstrip("0") if bab is not None else "—")
+            if bab is not None:
+                # Always dimmed at any window a season can produce — 820
+                # balls in play is the bar and a full year is ~300. That is
+                # the point of showing it: it says how much of the line
+                # beside it was the ball finding grass.
+                it.setForeground(QColor("#6C7A89"))
+                it.setToolTip(
+                    f"{bn} balls in play. BABIP needs ~820 before it "
+                    f"correlates 0.7 with itself — the least stable number "
+                    f"on this tab, and mostly not the hitter.")
+            table.setItem(r, 13, it)
         self._fit_table(table)
         self._sync_flank_widths()
         self._render_form_verdict(summary, games, season)
+
+    def _babip_fn(self):
+        """Return `games -> (n_bip, babip)` off the raw batted balls.
+
+        Home runs are out of BOTH halves by definition — they are not in
+        play — so they are excluded by EVENT rather than by batted-ball type
+        (a home run still ships as a fly ball).
+
+        This is the least stable number on the tab by a distance: ~820 balls
+        in play before it correlates 0.7 with itself, against ~50 for exit
+        velocity. A full season is ~300, so it is dimmed in every window
+        including All, which is the honest reading — a hot or cold BABIP is
+        the definition of the part of a slump that is not the hitter."""
+        rows = getattr(self, "_pitch_rows", None) or []
+        by_date: Dict[str, list] = {}
+        for r in rows:
+            if not r.get("date"):
+                continue
+            if r.get("bb_type") not in ("ground_ball", "fly_ball",
+                                        "line_drive", "popup"):
+                continue
+            by_date.setdefault(r["date"], []).append(r.get("event") or "")
+
+        def babip_of(gs):
+            evs = [e for g in gs for e in by_date.get(g.date, ())
+                   if e != "home_run"]
+            if not evs:
+                return 0, None
+            hits = sum(1 for e in evs if e in ("single", "double", "triple"))
+            return len(evs), hits / len(evs)
+        return babip_of
 
     def _la_mix_fn(self):
         """Return `games -> (n, mix)` over launch-angle buckets.
@@ -9976,6 +10093,103 @@ class PlayerDetailPanel(QWidget):
                 "Sweet": sum(1 for v in las if 8 <= v <= 32) / n,
             }
         return mix_of
+
+    def _render_discipline_windows(self, summary: PropStatSummary):
+        """Chase / zone-swing / contact over the same windows as the form
+        table beside it.
+
+        This is the earliest-warning block on the tab. Swing and strikeout
+        rates settle in ~50-60 PA where home-run rate takes ~170 and BABIP
+        ~820 balls in play, so a real change in approach is visible here
+        while the results columns are still noise. It also separates the two
+        stories a cold stretch can tell: chasing more is the hitter, seeing
+        fewer strikes is the staff (that half is the Seen table).
+
+        Headers stay short on purpose — these columns are ~4 characters of
+        data, so a long label sets the width and pushes the table out of the
+        row it should share.
+        """
+        table = self._tbl_dwin
+        table.setRowCount(0); table.clearSpans()
+        rows = getattr(self, "_pitch_rows", None)
+        games = self._filtered_games(summary)
+        if not rows or not games:
+            table.setColumnCount(1)
+            table.setHorizontalHeaderLabels(["Discipline — no pitch data"])
+            self._fit_table(table); self._sync_flank_widths(); return
+        by_date: Dict[str, list] = {}
+        for r in rows:
+            if r.get("date"):
+                by_date.setdefault(r["date"], []).append(r)
+        headers = ["Disc", "Pit", "Sw", "Chs", "Z-Sw", "Z-Con", "SwS"]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        cell = self._cell
+
+        def disc_of(gs):
+            pit = sw = whiff = zn = zsw = zcon = oz = ochase = 0
+            for g in gs:
+                for r in by_date.get(g.date, ()):
+                    pit += 1
+                    swung = r["desc"] in _SWING_DESCS
+                    sw += swung
+                    whiff += r["desc"] in _WHIFF_DESCS
+                    iz = MLBPropStats._in_zone(r)
+                    if iz is None:
+                        continue
+                    if iz:
+                        zn += 1
+                        if swung:
+                            zsw += 1
+                            zcon += r["desc"] not in _WHIFF_DESCS
+                    else:
+                        oz += 1
+                        ochase += swung
+            if not pit:
+                return None
+            return {"Pit": pit,
+                    "Sw": sw / pit,
+                    "Chase": (ochase / oz) if oz else None,
+                    "Z-Sw": (zsw / zn) if zn else None,
+                    "Z-Con": (zcon / zsw) if zsw else None,
+                    "SwStr": whiff / pit}
+
+        wins = [(lab, games[-n:] if n else games)
+                for n, lab in self._FORM_WINDOWS]
+        wins = [(lab, g) for lab, g in wins if g]
+        base = disc_of(games)
+        table.setRowCount(len(wins))
+        for r, (lab, gs) in enumerate(wins):
+            d = disc_of(gs)
+            table.setItem(r, 0, cell(lab, align_right=False))
+            if not d:
+                for c in range(1, len(headers)):
+                    table.setItem(r, c, cell("—"))
+                continue
+            table.setItem(r, 1, cell(str(d["Pit"])))
+            for c, key in enumerate(("Sw", "Chase", "Z-Sw", "Z-Con", "SwStr"),
+                                    start=2):
+                v = d[key]
+                it = cell(f"{v:.0%}" if v is not None else "—")
+                # Coloured against HIS OWN season, not the league: the point
+                # of a form view is what has changed about this hitter. Five
+                # points is the same bar the attack table uses for calling a
+                # move real. Chase and SwStr up is bad; the others are
+                # directionally neutral, so only the two with a right answer
+                # get a colour.
+                b = (base or {}).get(key)
+                if (v is not None and b is not None and lab != "All"
+                        and key in ("Chase", "SwStr")
+                        and abs(v - b) >= 0.05):
+                    it.setForeground(QColor("#E74C3C" if v > b
+                                            else "#2ECC71"))
+                if d["Pit"] < 150:
+                    it.setToolTip(
+                        f"{d['Pit']} pitches — swing rates need roughly a "
+                        f"50-60 PA sample before they mean much.")
+                table.setItem(r, c, it)
+        self._fit_table(table)
+        self._sync_flank_widths()
 
     def _render_form_verdict(self, summary, games, season):
         """Rank the current window against every same-length window he has
@@ -10088,15 +10302,19 @@ class PlayerDetailPanel(QWidget):
             table.setHorizontalHeaderLabels(
                 ["Attack profile — needs a full season to compare"])
             self._fit_table(table); self._sync_flank_widths(); return
-        headers = ["Seen", "FB", "Brk", "Off", "Zone", "F-Str", "Whf"]
+        headers = ["Seen", "FB", "Brk", "Off", "Zn", "FS", "Whf"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         cell = self._cell
         pct = lambda v: f"{v:.0%}" if v is not None else "—"
         keys = ("fb", "brk", "off", "zone", "fstr", "whiff")
+        # "Season" was the widest cell in column 0 and therefore set its
+        # width; the rows are unambiguous at three characters.
+        _short = {"Recent": "Rec", "Season": "Szn"}
         table.setRowCount(len(data) + 1)
         for r, d in enumerate(data):
-            table.setItem(r, 0, cell(d["split"], align_right=False))
+            table.setItem(r, 0, cell(_short.get(d["split"], d["split"]),
+                                     align_right=False))
             for c, k in enumerate(keys, start=1):
                 table.setItem(r, c, cell(pct(d[k])))
         # delta row — the reason the table exists
@@ -10130,7 +10348,7 @@ class PlayerDetailPanel(QWidget):
             table.setColumnCount(1)
             table.setHorizontalHeaderLabels(["Direction — no located contact"])
             self._fit_table(table); self._sync_flank_widths(); return
-        headers = ["Pitched", "BBE", "Pull", "Cent", "Oppo", "Seen", "\u0394Seen"]
+        headers = ["Loc", "N", "Pull", "Cen", "Opp", "Seen", "\u0394"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         cell = self._cell
@@ -10395,6 +10613,13 @@ class PlayerDetailPanel(QWidget):
         if self._summary is not None:
             self._render_attack(self._summary)
             self._render_direction(self._summary)
+            # These read `_pitch_rows` too — the window table for its
+            # launch-angle mix, the discipline table for everything it has.
+            # They are rendered from the summary hook, which fires BEFORE
+            # this one, so without a redraw here their columns stay blank
+            # until something else happens to repaint them.
+            self._render_form_windows(self._summary)
+            self._render_discipline_windows(self._summary)
 
     def set_spray(self, points: List[tuple]):
         """Season spray points [(x_ft, y_ft, cat)] for the shown player."""
@@ -11339,6 +11564,7 @@ class PlayerDetailPanel(QWidget):
             self._render_form_windows(self._summary)
             self._render_attack(self._summary)
             self._render_direction(self._summary)
+            self._render_discipline_windows(self._summary)
 
     def _update_chart(self, summary: PropStatSummary):
         self._render_banner(summary)
@@ -11347,6 +11573,7 @@ class PlayerDetailPanel(QWidget):
         self._render_form_windows(summary)
         self._render_attack(summary)
         self._render_direction(summary)
+        self._render_discipline_windows(summary)
 
     # -------------------------------------------------------------- banner
 
