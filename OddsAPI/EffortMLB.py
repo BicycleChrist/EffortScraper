@@ -36,6 +36,7 @@ import hashlib
 import json
 import math
 import os
+import statistics
 import time
 import unicodedata
 from collections import defaultdict
@@ -171,7 +172,10 @@ def prune_slate_cache(keep_days: int = 3):
 # EFFORTMLB_NO_SLATE_CACHE=1 turns this off too, which means a full ~1,650
 # game walk on every launch — that is the point of the flag, but know what
 # you are asking for.
-PBP_CK_VERSION = 1
+# v2: pinch-hit outcomes and matchup handedness. Both are derived per play,
+# so a v1 file has no way to supply them — it would deserialise cleanly and
+# report every club's pinch hitting as blank.
+PBP_CK_VERSION = 2
 
 
 def _pbp_ck_path(season) -> Path:
@@ -2308,6 +2312,9 @@ PBP_FIELDS = ",".join((
     "allPlays",
     "about", "inning", "isTopInning",
     "matchup", "pitcher", "batter",
+    # handedness of the matchup AS IT WAS TAKEN — a switch hitter reports the
+    # side he actually batted from, which is what a platoon read needs
+    "batSide", "pitchHand",
     "postOnFirst", "postOnSecond", "postOnThird", "id",
     "result", "homeScore", "awayScore", "eventType",
     "count", "outs", "balls", "strikes",
@@ -2727,6 +2734,7 @@ def rv_events_from_pbp(pbp: dict, home_id: int, away_id: int
     modelled. (Steals are handled separately — they fire mid-at-bat, where
     the play's post-state doesn't isolate them.)"""
     out: Dict[int, List[dict]] = {home_id: [], away_id: []}
+    ph = pinch_hit_plays(pbp)
     for p, base, outs, runs, is_top, _rest in walk_half_innings(pbp):
         ev = (p.get("result") or {}).get("eventType") or ""
         if ev.startswith("sac_bunt"):
@@ -2735,6 +2743,13 @@ def rv_events_from_pbp(pbp: dict, home_id: int, away_id: int
         elif ev == "intent_walk":
             kind = "ibb"
             team = home_id if is_top else away_id      # pitching side
+        elif id(p) in ph:
+            # A pinch hitter's trip is a plate appearance like any other, so
+            # its before/after states are observable and the run value is
+            # measured. Note this is the OUTCOME of the move, which is mostly
+            # the hitter; the decision quality is PHplt beside it.
+            kind = "ph"
+            team = away_id if is_top else home_id      # batting side
         else:
             continue
         end_outs = (p.get("count") or {}).get("outs")
@@ -2747,6 +2762,62 @@ def rv_events_from_pbp(pbp: dict, home_id: int, away_id: int
     return out
 
 
+# Plate-appearance outcome classes, by StatsAPI eventType. Anything not
+# listed is an ordinary out (field_out, force_out, the double plays, etc).
+_PA_TB = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
+_PA_BB = ("walk", "intent_walk")
+_PA_SF = ("sac_fly", "sac_fly_double_play")
+_PA_SAC = ("sac_bunt", "sac_bunt_double_play")
+_PA_K = ("strikeout", "strikeout_double_play", "strikeout_triple_play")
+
+
+def pinch_hit_plays(pbp: dict) -> Dict[int, bool]:
+    """`id(play)` -> is_top, for every plate appearance a pinch hitter takes.
+
+    Keyed by the identity of the play dict because both consumers walk the
+    SAME in-memory feed, and the alternatives are worse: play index is not in
+    the field whitelist, and (inning, half, batter) collides when a club bats
+    around and the pinch hitter comes up twice in one half.
+
+    The substitution is announced inside the very play the man then bats in,
+    so the actions are scanned before the batter is checked. He is dropped
+    from the pending set once he bats: only the FIRST trip is the pinch-hit
+    appearance — after that he is just a position player who is in the game.
+    A hitter announced and then pulled by a counter-move never bats, and
+    simply stays pending harmlessly."""
+    out: Dict[int, bool] = {}
+    pend: Dict[bool, set] = {True: set(), False: set()}
+    for p in (pbp.get("allPlays") or []):
+        top = bool((p.get("about") or {}).get("isTopInning"))
+        for e in (p.get("playEvents") or []):
+            if e.get("type") != "action":
+                continue
+            d = e.get("details") or {}
+            if (d.get("eventType") == "offensive_substitution"
+                    and "pinch-hitter" in (d.get("description") or "").lower()):
+                pid = (e.get("player") or {}).get("id")
+                if pid:
+                    pend[top].add(pid)
+        bid = ((p.get("matchup") or {}).get("batter") or {}).get("id")
+        if bid in pend[top]:
+            pend[top].discard(bid)
+            out[id(p)] = top
+    return out
+
+
+def _has_platoon_edge(matchup: dict) -> Optional[bool]:
+    """Did the BATTER hold the platoon advantage in this matchup?
+
+    Opposite hands is the edge. A switch hitter reports the side he chose,
+    so he simply always has it — which is the truth, and is why carrying one
+    is worth roster space."""
+    b = ((matchup.get("batSide") or {}).get("code") or "").upper()
+    p = ((matchup.get("pitchHand") or {}).get("code") or "").upper()
+    if b not in ("L", "R") or p not in ("L", "R"):
+        return None
+    return b != p
+
+
 def decision_counts(pbp: dict, home_id: int, away_id: int) -> Dict[int, dict]:
     """Per-team managerial decision tallies for one game.
 
@@ -2756,12 +2827,37 @@ def decision_counts(pbp: dict, home_id: int, away_id: int) -> Dict[int, dict]:
     is thrown out to end the at-bat, and as a mid-at-bat ACTION otherwise —
     so both are counted (they're disjoint, never the same event twice)."""
     out = {home_id: defaultdict(float), away_id: defaultdict(float)}
+    ph = pinch_hit_plays(pbp)
     for p in (pbp.get("allPlays") or []):
         about = p.get("about") or {}
         top = about.get("isTopInning")
         bat = away_id if top else home_id
         pit = home_id if top else away_id
         ev = (p.get("result") or {}).get("eventType") or ""
+        # Pinch hitting as a plate appearance. `pinch_hit` below is the COUNT
+        # of the lever being pulled; these are what came of pulling it.
+        if id(p) in ph:
+            o = out[bat]
+            o["ph_pa"] += 1
+            o["ph_tb"] += _PA_TB.get(ev, 0)
+            if ev in _PA_TB:
+                o["ph_h"] += 1
+            elif ev in _PA_BB:
+                o["ph_bb"] += 1
+            elif ev == "hit_by_pitch":
+                o["ph_hbp"] += 1
+            elif ev in _PA_SF:
+                o["ph_sf"] += 1
+            elif ev in _PA_SAC:
+                o["ph_sac"] += 1
+            elif ev == "catcher_interf":
+                o["ph_ci"] += 1
+            if ev in _PA_K:
+                o["ph_k"] += 1
+            edge = _has_platoon_edge(p.get("matchup") or {})
+            if edge is not None:
+                o["ph_plat_n"] += 1
+                o["ph_plat_edge"] += 1 if edge else 0
         if ev.startswith("sac_bunt"):
             out[bat]["sac_bunt"] += 1
         elif ev.startswith("stolen_base"):
@@ -3456,6 +3552,34 @@ def summarize_stints(stints: List[dict]) -> Optional[dict]:
     }
 
 
+def _pinch_hit_line(dec: Dict[str, float]) -> dict:
+    """A club's season pinch-hitting line from the raw tallies.
+
+    Gated at 25 plate appearances: below that an OPS is a coin toss, and a
+    blank cell is a better answer than a number nobody should read. Clubs
+    with a DH and a short bench genuinely do pinch hit this rarely."""
+    pa = dec.get("ph_pa") or 0
+    out: Dict[str, Optional[float]] = {"ph_pa": pa}
+    pn = dec.get("ph_plat_n") or 0
+    if pn:
+        out["ph_plat"] = (dec.get("ph_plat_edge") or 0) / pn
+    if pa < 25:
+        return out
+    bb = dec.get("ph_bb") or 0
+    hbp = dec.get("ph_hbp") or 0
+    sf = dec.get("ph_sf") or 0
+    sac = dec.get("ph_sac") or 0
+    ci = dec.get("ph_ci") or 0
+    h = dec.get("ph_h") or 0
+    ab = pa - bb - hbp - sf - sac - ci
+    ob_denom = ab + bb + hbp + sf
+    if ab > 0 and ob_denom > 0:
+        out["ph_ops"] = ((h + bb + hbp) / ob_denom
+                         + (dec.get("ph_tb") or 0) / ab)
+    out["ph_k"] = (dec.get("ph_k") or 0) / pa
+    return out
+
+
 def _tendencies_from_acc(a: Optional[dict]) -> Optional[dict]:
     """One club's cached manager-tendency dict from its season accumulators.
 
@@ -3464,7 +3588,7 @@ def _tendencies_from_acc(a: Optional[dict]) -> Optional[dict]:
     them would surface as a club whose numbers change depending on which
     path happened to build it.
 
-    !! COUPLING !! Adding a key here means bumping `mgr_tend_v5_` at both
+    !! COUPLING !! Adding a key here means bumping `mgr_tend_v6_` at both
     call sites, or older cache entries deserialise into the new shape with
     the new feature silently blank."""
     if not a:
@@ -3485,6 +3609,7 @@ def _tendencies_from_acc(a: Optional[dict]) -> Optional[dict]:
             "ibb": dec["ibb"] / g,
             "mound_visit": dec["mound_visit"] / g,
             "def_move": dec["def_move"] / g,
+            **_pinch_hit_line(dec),
         }
         data["rv_events"] = a["rv"]
         data["sb_by_base"] = {b: dec.get(f"sb_{b}", 0)
@@ -5992,7 +6117,7 @@ class MLBPropStats:
         # NOTE the key said v4 while the comment above described v5 — the
         # bump was written down and not applied, which is precisely how a
         # pre-`abs` entry gets deserialised into the new shape.
-        dc_key = f"mgr_tend_v5_{team_abbr}_{self.season}"
+        dc_key = f"mgr_tend_v6_{team_abbr}_{self.season}"
         dc = dev_cache_get(dc_key) or slate_cache_get(dc_key)
         if dc is not None:
             try:
@@ -6211,7 +6336,7 @@ class MLBPropStats:
                 continue
             self._mgr_tend[abbr] = (time.time(), data)
             blob = json.dumps(data)
-            dc_key = f"mgr_tend_v5_{abbr}_{self.season}"
+            dc_key = f"mgr_tend_v6_{abbr}_{self.season}"
             dev_cache_put(dc_key, blob)
             slate_cache_put(dc_key, blob)
 
@@ -8088,6 +8213,10 @@ class PlayerDetailPanel(QWidget):
         # reads as "the headshot and the stat grid have been removed". They
         # had not; they were simply above the viewport.
         self._sections.currentChanged.connect(self._scroll_to_top)
+        # ...and lift/apply the Form-only height cap, so leaving Form gives
+        # the other pages back their ordinary whole-panel scroll
+        self._sections.currentChanged.connect(
+            lambda *_: self._apply_panel_cap())
         self._sections.setStyleSheet(
             "QTabWidget::pane { border: 0; border-top: 1px solid #2C3E50;"
             " top: -1px; }"
@@ -8434,12 +8563,22 @@ class PlayerDetailPanel(QWidget):
         splits_lay.addWidget(_sf)
         splits_lay.addStretch()
 
+        # EVERY page scrolls INSIDE itself, and the panel is capped to the
+        # viewport (`_apply_panel_cap`), so the identity block — headshot,
+        # stat grid, matchup banner, the game strip and this tab bar — stays
+        # on screen no matter how far down a page you read. Scrolling a long
+        # tab used to carry the player's own name off the top.
+        #
+        # Form is the exception in WHAT it pins, not in how: its page already
+        # holds the trend plot and verdict above its own inner scroll, so
+        # those stay too. Every other page hands its whole content to the
+        # scroll area.
         self._sections.addTab(self._form_page, "Form")
-        self._sections.addTab(profile_page, "Profile")
-        self._sections.addTab(splits_page, "Splits")
-        self._sections.addTab(arsenal_page, "Arsenal")
-        self._sections.addTab(zone_page, "Zone")
-        self._sections.addTab(self._context_page, "Context")
+        self._sections.addTab(self._scrollable(profile_page), "Profile")
+        self._sections.addTab(self._scrollable(splits_page), "Splits")
+        self._sections.addTab(self._scrollable(arsenal_page), "Arsenal")
+        self._sections.addTab(self._scrollable(zone_page), "Zone")
+        self._sections.addTab(self._scrollable(self._context_page), "Context")
         content_lay.addWidget(self._sections, stretch=1)
 
         # -- trend page: the big analytical plot. Rolling average of the
@@ -8651,9 +8790,23 @@ class PlayerDetailPanel(QWidget):
         # tables stack in one column to the right of a bigger field, and the
         # flow height is unchanged because the table stack was already the
         # tallest thing in the row.
-        spray_page.setFixedWidth(262)
+        # 244, was 262. The aspect-locked field loses ~7% but it buys the
+        # merged window table the room to sit BESIDE it instead of below —
+        # which was ~450px of dead canvas down the right of this row.
+        spray_page.setFixedWidth(244)
         spray_page.setFixedHeight(222)
         self._form_lay.addWidget(trend_page)
+        # The one-line answer to the question the plot above provokes. A
+        # rolling line always LOOKS like it has hot and cold stretches — the
+        # eye finds runs in any noisy series — so the shape alone cannot say
+        # whether this one is unusual. This ranks the current window against
+        # every other window of the same length he has had this season.
+        self._form_verdict = QLabel("")
+        self._form_verdict.setObjectName("matchupLine")
+        self._form_verdict.setTextFormat(Qt.TextFormat.RichText)
+        self._form_verdict.setWordWrap(True)
+        self._form_verdict.setStyleSheet("font-size: 8pt; padding: 2px 4px;")
+        self._form_lay.addWidget(self._form_verdict)
         self._tbl_form = self._make_stats_table()
         self._tbl_form.setToolTip(
             "Rolling form. The plot above shows the SHAPE; this puts numbers "
@@ -8663,7 +8816,15 @@ class PlayerDetailPanel(QWidget):
             "table of a single repeated line.\n\n"
             "Rates are pooled over the window (total barrels / total batted "
             "balls), not an average of per-game rates, so a one-batted-ball "
-            "game cannot swing it.")
+            "game cannot swing it.\n\n"
+            "BBE is the sample each rate stands on; a greyed rate has not "
+            "reached the point where it correlates 0.7 with itself. Bel is "
+            "that window's xwOBAcon regressed to his own season at n/(n+k) — "
+            "the number to trust when the raw one looks extreme.\n\n"
+            "GB/LD/FB/PU are the launch-angle mix (<10, 10-25, 25-50, >50) "
+            "and Sweet the 8-32 band Statcast scores. EV and barrels can "
+            "both hold while a hitter goes cold, and the usual reason is the "
+            "angle — the same swing hit on the ground is an out.")
         _ff = FlowHost(); self._form_flow = _ff
         self._form_flow.addWidget(spray_page)
         self._form_flow.addWidget(self._tbl_form)
@@ -8704,8 +8865,32 @@ class PlayerDetailPanel(QWidget):
             "afternoon cannot outvote a full one. Watch the BBE column — a "
             "bucket with 15 batted balls is a curiosity, not a finding.")
         self._form_flow.addWidget(self._tbl_rest)
-        self._form_lay.addWidget(_ff)
-        self._form_lay.addStretch()
+        # FORM ONLY: the tables scroll UNDER a pinned plot.
+        #
+        # The whole panel lives in one QScrollArea, so scrolling to reach the
+        # lower tables carried the trend plot off the top of the screen — and
+        # that plot is interactive (hover crosshair, the Stats menu), so the
+        # one thing you want on screen while reading the tables is the thing
+        # that left. A second scroll area around JUST the flow keeps the plot
+        # and its verdict line fixed.
+        #
+        # `_apply_panel_cap` is the other half: it holds the whole panel to
+        # the viewport so the outer scroll has nothing to move.
+        self._form_scroll = QScrollArea()
+        self._form_scroll.setWidgetResizable(True)
+        self._form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._form_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._form_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # transparent: the viewport otherwise paints Qt's default base colour
+        # over the panel's dark background
+        self._form_scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget "
+            "{ background: transparent; }")
+        self._form_scroll.setMinimumHeight(self._PAGE_SCROLL_MIN)
+        self._form_scroll.setWidget(_ff)
+        self._form_lay.addWidget(self._form_scroll, stretch=1)
 
     def eventFilter(self, obj, ev):
         if obj is self._trend_plot:
@@ -8829,17 +9014,35 @@ class PlayerDetailPanel(QWidget):
 
     # ---------------------------------------------- stats-grid table infra
 
-    def _scroll_to_top(self, *_):
-        """Walk up to the enclosing QScrollArea and return it to the top.
+    def _outer_scroll(self) -> Optional[QScrollArea]:
+        """The enclosing QScrollArea, found rather than held — the panel does
+        not own it (MLBWindow wraps it, and so does the props window).
 
-        The panel does not own its scroll area — MLBWindow wraps it, and so
-        does the props window — so it has to be found rather than held."""
+        Must NOT match the Form tab's own inner scroll: that one is a CHILD,
+        and this walks up, so it is never a candidate."""
         w = self.parentWidget()
         while w is not None:
             if isinstance(w, QScrollArea):
-                w.verticalScrollBar().setValue(0)
-                return
+                return w
             w = w.parentWidget()
+        return None
+
+    def _scroll_to_top(self, *_):
+        """Return the newly-shown tab to the top.
+
+        Each page owns its scroll now, so resetting the OUTER one no longer
+        does anything useful — a page you had read to the bottom came back
+        still at the bottom. The outer one is reset too, for the short-window
+        case where the cap is off and it is the one that moved."""
+        page = self._sections.currentWidget()
+        inner = (page if isinstance(page, QScrollArea)
+                 else getattr(self, "_form_scroll", None)
+                 if page is self._form_page else None)
+        if inner is not None:
+            inner.verticalScrollBar().setValue(0)
+        sc = self._outer_scroll()
+        if sc is not None:
+            sc.verticalScrollBar().setValue(0)
 
     def _make_stats_table(self) -> QTableWidget:
         t = QTableWidget()
@@ -9003,6 +9206,75 @@ class PlayerDetailPanel(QWidget):
         # next combo change, so no heavy re-render on every drag pixel.
         if getattr(self, "_tbl_velo", None) is not None:
             self._sync_flank_widths()
+        self._apply_panel_cap()
+
+    # Qt's "no maximum". Spelled out rather than imported so the intent of
+    # `setMaximumHeight(_UNCAPPED)` reads at the call site.
+    _UNCAPPED = 16777215
+
+    def _scrollable(self, page: QWidget) -> QScrollArea:
+        """Wrap a sub-tab's content in its own vertical scroll area."""
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sc.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # the viewport otherwise paints Qt's default light base over the
+        # panel's dark background
+        sc.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget "
+                         "{ background: transparent; }")
+        sc.setMinimumHeight(self._PAGE_SCROLL_MIN)
+        # !! Load-bearing. Under widgetResizable a QScrollArea sizes its
+        # widget to the VIEWPORT unless the widget's MINIMUM says otherwise —
+        # it never consults sizeHint. Without this the page is pinned at the
+        # viewport height, the scroll range stays 0, and anything past the
+        # fold is simply clipped with no way to reach it (measured: Context
+        # content 480 tall with a child ending at 557). SetMinimumSize makes
+        # the page's minimum the sum of what its children actually need,
+        # which is what gives the scroll area something to scroll.
+        lay = page.layout()
+        if lay is not None:
+            lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        sc.setWidget(page)
+        return sc
+
+    # Floor for a page's scroll viewport — enough for a table header and a
+    # couple of rows, so a short window never collapses one to nothing.
+    _PAGE_SCROLL_MIN = 110
+
+    # Below this the viewport reading is not trustworthy: `_apply_panel_cap`
+    # runs during layout, and mid-construction the outer viewport reports a
+    # placeholder (29px was observed) that would cap the panel to a sliver.
+    _CAP_FLOOR = 320
+
+    def _apply_panel_cap(self):
+        """Hold the panel to the viewport so the OUTER scroll never scrolls.
+
+        Every sub-tab now scrolls inside itself, so the only thing the outer
+        area could scroll is the identity block — headshot, stat grid,
+        matchup banner, game strip, tab bar — and carrying that off the top
+        is exactly what we do not want. Capping the panel to the viewport
+        leaves the outer scrollbar with nothing to do and hands the surplus
+        to whichever page is showing.
+
+        Two things this must not do:
+
+        * Cap to a bogus height. See `_CAP_FLOOR`.
+        * Cap below what the panel needs. Qt does not clip children that are
+          squeezed past their minimums — they physically OVERLAP, and this
+          panel has done it before, drawing one table's rows through
+          another's header. If the window is genuinely too short, leave the
+          cap off and let the outer scroll take over as it used to.
+        """
+        outer = self._outer_scroll()
+        if outer is None:
+            return
+        h = outer.viewport().height()
+        cap = self._UNCAPPED
+        if h >= max(self._CAP_FLOOR, self.minimumSizeHint().height()):
+            cap = h
+        if self.maximumHeight() != cap:
+            self.setMaximumHeight(cap)
 
     def _on_bottom_view_toggle(self, *_):
         """Spray is visible by default now; the action hides it to give the
@@ -9495,8 +9767,26 @@ class PlayerDetailPanel(QWidget):
         self._fit_table(table)
         self._sync_flank_widths()
 
+    # "All", not "Season". The row label is the widest cell in the first
+    # column of a ResizeToContents table, so the word was setting that
+    # column's width — and those ~20px were the last thing keeping this
+    # table from packing beside the spray chart instead of below it.
     _FORM_WINDOWS = ((5, "L5"), (10, "L10"), (15, "L15"), (30, "L30"),
-                     (None, "Season"))
+                     (None, "All"))
+
+    # Sample at which a rate carries as much signal as noise — Carleton's
+    # split-half method, the point where the correlation between two samples
+    # of this size hits 0.7. Used two ways here: to grey out a cell that has
+    # not earned belief yet, and as the k in the regression below.
+    #
+    # EV at 50 batted balls is Carleton's published Statcast figure. Barrel
+    # rate is explicitly slower than EV but has no published number, so 80 is
+    # a deliberate conservative stand-in, as is 100 for xwOBAcon (both are
+    # compound rates and cannot stabilise before their inputs). Whiff rate
+    # rides on K%'s 60 PA, which is roughly 150 swings.
+    # https://library.fangraphs.com/principles/sample-size/
+    _STABILIZE = {"EV": (50, "bbe"), "Brl": (80, "bbe"),
+                  "xwOBA": (100, "bbe"), "Whf": (150, "sw")}
 
     def _render_form_windows(self, summary: PropStatSummary):
         """Rolling form beside the spray chart: the prop stat and the
@@ -9513,16 +9803,50 @@ class PlayerDetailPanel(QWidget):
             table.setHorizontalHeaderLabels(["Form — no games"])
             self._fit_table(table); self._sync_flank_widths(); return
         stat = summary.stat_label or "Stat"
-        headers = ["Window", stat, "EV", "Brl", "xwOBA", "Whf"]
+        # Contact MIX rides in the same table as contact QUALITY. They are
+        # keyed by the identical windows, so as two tables they duplicated
+        # the row labels and the BBE column, cost a whole extra item in a
+        # flow that only fits two columns at this panel width, and split one
+        # reading ("12 batted balls, 80.7 EV, .171 xwOBA, 44% grounders,
+        # sweet spot down 11 points") across two places on screen.
+        # Headers deliberately short. Columns are ResizeToContents, so each
+        # one is as wide as its WIDEST cell — and for a table of 2-4 character
+        # numbers that is the header itself, every time. "xwOBA" over ".353"
+        # and "Sweet" over "33%" were spending ~30px on nothing, which was the
+        # difference between this table packing beside the spray chart and
+        # dropping below it into a full-width row of its own. "xw" is what the
+        # Arsenal tab already calls the same number.
+        headers = ["Win", stat, "N", "EV", "Brl", "xwOBA", "Bel", "Whf",
+                   "GB", "LD", "FB", "PU", "Swt"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
+        # xwOBA keeps its full name but at a smaller point size: the header
+        # was the widest thing in its column, so the LABEL was setting the
+        # width rather than the .353 underneath it.
+        _h = table.horizontalHeaderItem(5)
+        if _h is not None:
+            _hf = _h.font()
+            _hf.setPointSizeF(max(6.0, _hf.pointSizeF() - 1.5))
+            _h.setFont(_hf)
+        for c, tip in (
+                (2, "Batted balls behind the row — the sample every rate "
+                    "beside it is standing on. Greyed cells have not reached "
+                    "the point where the rate correlates 0.7 with itself."),
+                (6, "Believable: the window's xwOBAcon regressed to his own "
+                    "season at n/(n+k), k = the ~100 batted balls that rate "
+                    "needs. A cold week with 12 batted balls barely moves; a "
+                    "cold month with 90 does. This is the number to bet on, "
+                    "not the raw one beside it.")):
+            it = table.horizontalHeaderItem(c)
+            if it is not None:
+                it.setToolTip(tip)
         cell = self._cell
         pg = getattr(self, "_pg_statcast", {}) or {}
         rows = [(lab, games[-n:] if n else games)
                 for n, lab in self._FORM_WINDOWS]
         rows = [(lab, g) for lab, g in rows if g]
-        table.setRowCount(len(rows))
-        for r, (lab, gs) in enumerate(rows):
+
+        def agg(gs):
             ev, brl, bbe, xw, sw, wh = [], 0, 0, [], 0, 0
             for g in gs:
                 s = pg.get(g.date) or {}
@@ -9538,16 +9862,217 @@ class PlayerDetailPanel(QWidget):
                 wh += s.get("whiffs") or 0
             wmean = lambda p: (sum(v * k for v, k in p) / sum(k for _, k in p)
                                if p else None)
+            return {"bbe": bbe, "sw": sw, "EV": wmean(ev),
+                    "Brl": (brl / bbe) if bbe else None,
+                    "xwOBA": wmean(xw), "Whf": (wh / sw) if sw else None}
+
+        season = agg(games)
+        mix_of = self._la_mix_fn()
+        _sn, season_mix = mix_of(games)
+        table.setRowCount(len(rows))
+        for r, (lab, gs) in enumerate(rows):
+            a = agg(gs)
             table.setItem(r, 0, cell(lab, align_right=False))
             table.setItem(r, 1, cell(f"{sum(x.value for x in gs)/len(gs):.2f}"))
-            e = wmean(ev)
-            table.setItem(r, 2, cell(f"{e:.1f}" if e else "—"))
-            table.setItem(r, 3, cell(f"{brl/bbe:.0%}" if bbe else "—"))
-            x = wmean(xw)
-            table.setItem(r, 4, cell(f"{x:.3f}".lstrip("0") if x else "—"))
-            table.setItem(r, 5, cell(f"{wh/sw:.0%}" if sw else "—"))
+            table.setItem(r, 2, cell(str(a["bbe"]) if a["bbe"] else "—"))
+            fmt = {"EV": lambda v: f"{v:.1f}",
+                   "Brl": lambda v: f"{v:.0%}",
+                   "xwOBA": lambda v: f"{v:.3f}".lstrip("0"),
+                   "Whf": lambda v: f"{v:.0%}"}
+            for c, key in ((3, "EV"), (4, "Brl"), (5, "xwOBA"), (7, "Whf")):
+                v = a[key]
+                it = cell(fmt[key](v) if v is not None else "—")
+                k, unit = self._STABILIZE[key]
+                n = a[unit]
+                if v is not None and n < k:
+                    # Not wrong, just not yet earned — dim rather than hide,
+                    # and say how short it is on hover. The whole point of a
+                    # form view is small samples, so refusing to show them
+                    # would empty the table; refusing to FLAG them is how a
+                    # 9-batted-ball hot streak gets read as a change in
+                    # talent.
+                    it.setForeground(QColor("#6C7A89"))
+                    it.setToolTip(
+                        f"{n} of the ~{k} {unit.upper()} this rate needs "
+                        f"before it correlates 0.7 with itself — read it as "
+                        f"a hint, not a fact.")
+                table.setItem(r, c, it)
+            # Regressed to HIS OWN season, weight n/(n+k) — the textbook
+            # shrinkage that the stabilisation point is actually FOR. This is
+            # the column that answers "is the slump real": a cold L5 with 11
+            # batted balls barely moves off his season line, while a cold L30
+            # with 90 does.
+            x, sx = a["xwOBA"], season["xwOBA"]
+            if x is not None and sx is not None and a["bbe"]:
+                k = self._STABILIZE["xwOBA"][0]
+                w = a["bbe"] / (a["bbe"] + k)
+                bel = w * x + (1 - w) * sx
+                it = cell(f"{bel:.3f}".lstrip("0"))
+                it.setToolTip(
+                    f"{a['bbe']} BBE keeps {w:.0%} of the observed "
+                    f"{x:.3f}; the rest regresses to his season {sx:.3f}.")
+                if abs(bel - sx) >= 0.020:
+                    it.setForeground(QColor("#2ECC71" if bel > sx
+                                            else "#E74C3C"))
+                table.setItem(r, 6, it)
+            else:
+                table.setItem(r, 6, cell("—"))
+            # ...and the launch-angle mix for the same window
+            mn, mix = mix_of(gs)
+            for c, key in enumerate(("GB", "LD", "FB", "PU", "Sweet"),
+                                    start=8):
+                if not mix:
+                    table.setItem(r, c, cell("—"))
+                    continue
+                it = cell(f"{mix[key]:.0%}")
+                # Only the sweet-spot column gets a verdict colour: it is the
+                # one with a right answer. More grounders is not worse for
+                # every hitter, and this is read against his own line rather
+                # than the league's.
+                if (key == "Sweet" and season_mix and lab != "All"
+                        and abs(mix[key] - season_mix["Sweet"]) >= 0.05):
+                    it.setForeground(QColor(
+                        "#2ECC71" if mix[key] > season_mix["Sweet"]
+                        else "#E74C3C"))
+                if mn < 80:
+                    it.setToolTip(
+                        f"{mn} batted balls — ground-ball and fly-ball rates "
+                        f"need ~80 before they mean much.")
+                table.setItem(r, c, it)
         self._fit_table(table)
         self._sync_flank_widths()
+        self._render_form_verdict(summary, games, season)
+
+    def _la_mix_fn(self):
+        """Return `games -> (n, mix)` over launch-angle buckets.
+
+        Per-GAME Statcast carries only a MEAN launch angle, which is close to
+        useless — a hitter splitting his contact between choppers and popups
+        averages out at a line drive. The mix has to come from the individual
+        batted balls, and `_pitch_rows` already holds every one of them.
+
+        GB <10, LD 10-25, FB 25-50, PU >50 degrees; Sweet is the 8-32 band
+        Statcast scores. Ground-ball and fly-ball rates are also the fastest
+        batted-ball rates to mean anything (~80 balls in play, against 600
+        for line drives), which is why this belongs in a FORM view at all."""
+        rows = getattr(self, "_pitch_rows", None) or []
+        by_date: Dict[str, list] = {}
+        for r in rows:
+            la = r.get("la")
+            if la is None or not r.get("date"):
+                continue
+            by_date.setdefault(r["date"], []).append(la)
+
+        def mix_of(gs):
+            las = [la for g in gs for la in by_date.get(g.date, ())]
+            n = len(las)
+            if not n:
+                return 0, None
+            return n, {
+                "GB": sum(1 for v in las if v < 10) / n,
+                "LD": sum(1 for v in las if 10 <= v < 25) / n,
+                "FB": sum(1 for v in las if 25 <= v <= 50) / n,
+                "PU": sum(1 for v in las if v > 50) / n,
+                "Sweet": sum(1 for v in las if 8 <= v <= 32) / n,
+            }
+        return mix_of
+
+    def _render_form_verdict(self, summary, games, season):
+        """Rank the current window against every same-length window he has
+        had, and say plainly whether it stands out.
+
+        Why a rank and not a z-score: the run of a rolling average is
+        autocorrelated by construction (consecutive windows share all but one
+        game), so the spread of those windows is the honest yardstick for
+        "unusual for him" — not a standard error that assumes independence.
+
+        The hot-hand literature has moved back toward a real but small effect
+        since Miller & Sanjurjo (2018) corrected the original selection bias,
+        and Green & Zwiebel found pitchers respond to hot hitters by working
+        them differently — which is why this points at the attack table when
+        the approach against him has actually moved. This app's own BMIELKE
+        study found no exploitable hot hand, so the wording stays at "inside
+        his normal range" rather than promising anything."""
+        lbl = self._form_verdict
+        pg = getattr(self, "_pg_statcast", {}) or {}
+        n = self._chart_window_combo.currentData() or 15
+        pairs = [(pg.get(g.date) or {}) for g in games]
+        vals = [(s.get("xw"), s.get("bbe") or 0) for s in pairs]
+        vals = [(v, k) for v, k in vals if v is not None and k]
+        # A starter makes ~30 starts, so a 15-game window leaves nothing to
+        # rank him against and the line simply vanished on every pitcher.
+        # Step down until the season holds enough windows to be a comparison.
+        for cand in (n, 10, 5, 3):
+            if cand <= n and len(vals) >= cand + 3:
+                n = cand
+                break
+        else:
+            lbl.setText("")
+            return
+        if season.get("xwOBA") is None:
+            lbl.setText("")
+            return
+
+        def wmean(seq):
+            k = sum(w for _v, w in seq)
+            return (sum(v * w for v, w in seq) / k) if k else None
+
+        wins = [wmean(vals[i:i + n]) for i in range(len(vals) - n + 1)]
+        wins = [w for w in wins if w is not None]
+        if len(wins) < 4:
+            lbl.setText("")
+            return
+        cur = wins[-1]
+        lower = sum(1 for w in wins if w < cur)
+        sx = season["xwOBA"]
+        # xwOBAcon is contact ALLOWED for a pitcher, so every comparison here
+        # flips: a low window is his best stretch, not his worst.
+        pitcher = summary.market_key.startswith("pitcher")
+        # How many of his other windows this one BEATS. For a batter that is
+        # the windows below it; for a pitcher, the ones above.
+        n_worse = (len(wins) - 1 - lower) if pitcher else lower
+        pctile = n_worse / (len(wins) - 1) if len(wins) > 1 else 0.5
+        hot = (cur <= sx) if pitcher else (cur >= sx)
+        # Extremes only: at 30 overlapping windows the top and bottom few are
+        # a near-certainty, so anything mid-pack is explicitly called normal.
+        n_better = len(wins) - 1 - n_worse
+        if pctile >= 0.85 or pctile <= 0.15:
+            verdict = ("<b style='color:#2ECC71'>his hottest stretch</b>"
+                       if hot else
+                       "<b style='color:#E74C3C'>his coldest stretch</b>")
+            tail = (f"— only {n_better} of his {len(wins)} {n}-game windows "
+                    f"were better" if hot else
+                    f"— only {n_worse} of his {len(wins)} {n}-game windows "
+                    f"were worse")
+        else:
+            verdict = "<b style='color:#95A5A6'>inside his normal range</b>"
+            tail = (f"— {n_worse} of his {len(wins)} {n}-game windows were "
+                    f"worse than this one")
+        fmt3 = lambda v: f"{v:.3f}".lstrip("0")
+        bits = [f"<span style='color:#7F8C8D'>Last {n} games</span> "
+                f"{fmt3(cur)} <span style='color:#7F8C8D'>xwOBAcon vs "
+                f"season</span> {fmt3(sx)} · {verdict} {tail}."]
+        # Did the staffs change how they work him? A slump with a flat attack
+        # profile is variance; one that arrives with the zone rate is not.
+        rows = getattr(self, "_pitch_rows", None)
+        if rows:
+            recent = {g.date for g in games[-n:]}
+            prof = attack_profile(rows, recent)
+            if len(prof) >= 2:
+                moved = []
+                for key, name in (("zone", "zone"), ("fb", "fastballs"),
+                                  ("brk", "breaking"), ("off", "offspeed")):
+                    a, b = prof[0].get(key), prof[1].get(key)
+                    if a is None or b is None:
+                        continue
+                    if abs(a - b) >= 0.05:
+                        moved.append(f"{(a-b)*100:+.0f} pts {name}")
+                if moved:
+                    bits.append(
+                        "<span style='color:#E67E22'>They are working him "
+                        "differently</span> <span style='color:#7F8C8D'>("
+                        + ", ".join(moved) + ") — see Seen below.</span>")
+        lbl.setText(" ".join(bits))
 
     def _render_attack(self, summary: PropStatSummary):
         """Recent-window vs rest-of-season attack profile, on the Form tab."""
@@ -11335,6 +11860,15 @@ class PlayerDetailPanel(QWidget):
 # BULLPEN PANEL (Qt) — dedicated section below the odds grid
 # ===========================================================================
 
+
+def _esc(s: str) -> str:
+    """Angle brackets are literal in a column header and markup everywhere
+    they get printed: the rich-text footer and the pyqtgraph title both parse
+    HTML, so the `<5IP` header silently vanished from both."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 class ManagerBoardTab(QWidget):
     """League board of managerial game-decision tendencies.
 
@@ -11367,7 +11901,10 @@ class ManagerBoardTab(QWidget):
         ("bq_per_start", "BQ/GS", 2, False),
     ]
     _DCOLS = [
-        ("pinch_hit", "PH", 2, False), ("sac_bunt", "Bnt", 2, False),
+        ("pinch_hit", "PH", 2, False),
+        ("ph_ops", "PHops", 3, False), ("ph_k", "PHk%", 0, True),
+        ("ph_plat", "PHplt", 0, True),
+        ("sac_bunt", "Bnt", 2, False),
         ("sb_att", "SB", 2, False), ("sb_rate", "SB%", 0, True),
         ("ibb", "IBB", 2, False), ("mound_visit", "MV", 1, False),
         ("def_move", "DefM", 1, False),
@@ -11392,11 +11929,64 @@ class ManagerBoardTab(QWidget):
     # actually gained runs, rather than just how often it was pulled.
     _RVCOLS = [
         ("bunt_per", "BuntRV", 3, False), ("sb_per", "SBrv", 3, False),
-        ("ibb_per", "IBBrv", 3, False), ("deploy_gap", "Deploy", 2, False),
+        ("ibb_per", "IBBrv", 3, False), ("ph_per", "PHrv", 3, False),
+        ("deploy_gap", "Deploy", 2, False),
     ]
 
     _GOOD = QColor(46, 204, 113)
     _BAD = QColor(231, 76, 60)
+
+    # What each header actually measures. Abbreviated to fit 33 columns into
+    # the table width, which leaves the board unreadable without them.
+    _GLOSS = {
+        "SP IP": "innings per start, bullpen games included",
+        "NP": "starter's pitch count",
+        "<5IP": "starts that failed to reach the 5th",
+        "MidP": "starters pulled with the inning unfinished — the quick-hook "
+                "signature",
+        "Opn": "games begun with an opener",
+        "P/G": "pitchers used per game",
+        "RelIP": "innings the pen has to cover (9 − SP IP)",
+        "RPmid": "relievers brought in mid-inning",
+        "≤3BF": "relief outings of three batters or fewer",
+        "Multi": "relief outings of more than one inning",
+        "Close": "relief outings entered with the score within 2",
+        "TTO3": "starts that reached batter 19 — the third time through, "
+                "worth about −0.35 R/9",
+        "IRS": "inherited runners stranded",
+        "BQ/GS": "runners the starter bequeaths to the pen per start",
+        "PH": "pinch hitters per game",
+        "PHops": "OPS his pinch hitters actually put up (min 25 PA) — mostly "
+                 "a bench-talent read, not a managerial one",
+        "PHk%": "pinch-hit trips ending in a strikeout — the cold-off-the-"
+                "bench tax",
+        "PHplt": "pinch-hit trips taken with the platoon advantage — this is "
+                 "the part of pinch hitting the manager actually controls",
+        "Bnt": "sacrifice bunts per game",
+        "SB": "steal attempts per game",
+        "SB%": "steals succeeding",
+        "IBB": "intentional walks issued per game",
+        "MV": "mound visits per game",
+        "DefM": "defensive substitutions per game",
+        "Chal": "ABS challenges spent per game — a club-discipline trait, "
+                "not a managerial lever",
+        "Ovr%": "this club's challenges that overturned the call",
+        "OvrA%": "opponents' challenges against this club that overturned",
+        "CatOv%": "challenges spent by the catcher that overturned",
+        "BatOv%": "challenges spent by the batter that overturned",
+        "LateC": "challenges spent in the 7th or later of a game within 2 — "
+                 "spending discipline",
+        "Flips": "net at-bat-deciding calls (K/BB gained or erased) swung "
+                 "this club's way",
+        "BuntRV": "run expectancy gained per sacrifice bunt",
+        "SBrv": "run expectancy gained per steal attempt",
+        "IBBrv": "run expectancy gained per intentional walk, pitching side",
+        "PHrv": "run expectancy gained per pinch-hit plate appearance",
+        "Deploy": "SIERA of the arms used late and close minus the rest — "
+                  "negative means the good ones get the big spots",
+        "penERA": "bullpen ERA, the outcome the rest of the board is read "
+                  "against",
+    }
 
     def __init__(self, stats: Optional[MLBPropStats] = None, parent=None):
         super().__init__(parent)
@@ -11407,6 +11997,10 @@ class ManagerBoardTab(QWidget):
         self._siera: Dict[int, float] = {}
         self._rv: Dict[str, dict] = {}
         self._highlight: set = set()
+        # header -> (r vs pen ERA, n), and the league-wide summary the two
+        # purpose-built views footer with
+        self._corr_r: Dict[str, tuple] = {}
+        self._corr_html: str = ""
         self._build_ui()
 
     def set_stats_backend(self, stats: MLBPropStats):
@@ -11451,7 +12045,7 @@ class ManagerBoardTab(QWidget):
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         hdr.setMinimumSectionSize(20)
-        root.addWidget(self._table, stretch=1)
+        root.addWidget(self._table, stretch=3)
 
         # Sorted-bar view of any column on the board — the table answers
         # "what is this club's number", the chart answers "who is unusual"
@@ -11475,11 +12069,14 @@ class ManagerBoardTab(QWidget):
         root.addLayout(bar_row)
 
         self._plot = pg.PlotWidget(background="#151a21")
-        self._plot.setFixedHeight(215)
+        # Was pinned at 215px. With 30 bars and a tick label under each one
+        # that is a strip, not a chart — let it take the height the window
+        # can spare while keeping the table the larger half.
+        self._plot.setMinimumHeight(215)
         self._plot.setMenuEnabled(False)
         self._plot.hideButtons()
         self._plot.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
-        root.addWidget(self._plot)
+        root.addWidget(self._plot, stretch=2)
 
         self._corr = QLabel("")
         self._corr.setWordWrap(True)
@@ -11629,32 +12226,50 @@ class ManagerBoardTab(QWidget):
             p.getViewBox().enableAutoRange()
             (self._plot_ladder if label == self.VIEW_LADDER
              else self._plot_hook)(p)
+            # these two read the whole board, so they get the whole-board line
+            self._corr.setText(self._corr_html)
             return
-        lookup = {h: (k, src) for k, h, _d, _pc, src in
+        # (key, which bag it lives in, decimals, is it a fraction)
+        lookup = {h: (k, src, d, pc) for k, h, d, pc, src in
                   [(k, h, d, pc, "t") for k, h, d, pc in self._COLS]
                   + [(k, h, d, pc, "d") for k, h, d, pc in self._DCOLS]
                   + [(k, h, d, pc, "a") for k, h, d, pc in self._ABSCOLS]
                   + [(k, h, d, pc, "r") for k, h, d, pc in self._RVCOLS]}
+        key, src, dec, is_pct = lookup.get(
+            label, (None, None, 2, False) if label != "penERA"
+            else ("era", "p", 2, False))
+        if key is None and label != "penERA":
+            p.setTitle(f"{_esc(label)} — unknown column", color="#95A5A6",
+                       size="8pt")
+            return
         vals = []
         for abbr, d in self._rows.items():
             if label == "penERA":
                 v = (self._pen.get(abbr) or {}).get("era")
             else:
-                key, src = lookup.get(label, (None, None))
-                if key is None:
-                    continue
                 bag = (d if src == "t" else (d.get("decisions") or {})
                        if src == "d" else (d.get("abs") or {})
                        if src == "a" else self._rv.get(abbr) or {})
                 v = bag.get(key)
-            if isinstance(v, (int, float)):
-                vals.append((abbr, float(v)))
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                # rates are stored as fractions; plot them the way the table
+                # prints them so the axis reads 34%, not 0.34
+                vals.append((abbr, float(v) * (100.0 if is_pct else 1.0)))
         if not vals:
+            # Silence here is what an un-loaded club or a column the season
+            # has no events for looks like — say so rather than leaving the
+            # previous chart's empty frame up.
+            p.setTitle(f"{_esc(label)} — no data yet", color="#95A5A6", size="8pt")
+            self._corr.setText("")
             return
         vals.sort(key=lambda t: t[1])
         xs = list(range(len(vals)))
         ys = [v for _a, v in vals]
-        brushes = [pg.mkBrush("#dc9437") if a in self._highlight
+        # Two clubs, two colours — with both lit the same shade you cannot
+        # tell which end of the league each one is on.
+        order = sorted(self._highlight)
+        tint = {a: self._TEAM_COLORS[i % 2] for i, a in enumerate(order[:2])}
+        brushes = [pg.mkBrush(tint[a]) if a in tint
                    else pg.mkBrush(70, 100, 130) for a, _v in vals]
         p.addItem(pg.BarGraphItem(x=xs, height=ys, width=0.72,
                                   brushes=brushes, pen=None))
@@ -11668,9 +12283,64 @@ class ManagerBoardTab(QWidget):
             a2.setPen(pg.mkPen(90, 100, 115))
             a2.setTextPen(pg.mkPen(140, 150, 162))
         p.getAxis("left").setStyle(tickFont=f)
-        p.addItem(pg.InfiniteLine(pos=0, angle=0,
-                                  pen=pg.mkPen(120, 130, 145, width=1)))
-        p.setTitle(label, color="#95A5A6", size="8pt")
+        lo, hi = min(ys), max(ys)
+        if lo < 0:
+            # only meaningful when the column actually crosses zero (the RV
+            # columns); on a rate it is just the floor
+            p.addItem(pg.InfiniteLine(pos=0, angle=0,
+                                      pen=pg.mkPen(120, 130, 145, width=1)))
+        # The bar heights alone say who is biggest, not who is UNUSUAL: on a
+        # column where the league sits in a tight band every bar looks much
+        # like its neighbour. The median rule is what turns the chart into a
+        # read — how far outside the pack a club actually is.
+        med = statistics.median(ys)
+        med_line = pg.InfiniteLine(
+            pos=med, angle=0,
+            pen=pg.mkPen(150, 160, 175, width=1, style=Qt.PenStyle.DashLine))
+        # Under the labels, which carry an opaque chip — a club sitting near
+        # the league median puts its value label exactly where this line
+        # runs, and a dashed rule struck through 6pt digits is unreadable.
+        med_line.setZValue(1)
+        p.addItem(med_line)
+        # above the line, not centred on it — centred it sat on top of the
+        # y-axis ticks. The bars are sorted, so the left end is always the
+        # short side and there is room over them.
+        f2 = QFont()
+        f2.setPointSize(6)
+        mt = pg.TextItem(f"med {self._fmt_val(med, dec, is_pct)}",
+                         color="#95A5A6", anchor=(0, 1.15),
+                         fill=pg.mkBrush(21, 26, 33, 235))
+        mt.setPos(-0.55, med)
+        mt.setFont(f2)
+        mt.setZValue(10)
+        p.addItem(mt)
+        # Value labels on tonight's clubs only — the point is reading THEIR
+        # number off the chart without hunting for the row in the table.
+        for i, (a, v) in enumerate(vals):
+            if a not in tint:
+                continue
+            t = pg.TextItem(self._fmt_val(v, dec, is_pct),
+                            color=tint[a], anchor=(0.5, 1.0 if v >= 0 else 0),
+                            fill=pg.mkBrush(21, 26, 33, 235))
+            t.setFont(f2)
+            t.setPos(i, v)
+            t.setZValue(10)
+            p.addItem(t)
+        # !! The two purpose-built views LOCK the viewbox (setYRange /
+        # setRange), which switches auto-range OFF for good. Bars drawn
+        # afterwards inherited that dead range and rendered off-screen —
+        # which is why every small-valued column (the rates, the RV numbers)
+        # looked empty while SP IP and penERA happened to survive. Range the
+        # bars explicitly, anchored at the zero baseline they are drawn from.
+        vb = p.getViewBox()
+        top, bot = max(hi, 0.0), min(lo, 0.0)
+        span = (top - bot) or (abs(top) or 1.0)
+        vb.setRange(xRange=(-0.7, len(vals) - 0.3),
+                    yRange=(bot - span * 0.04, top + span * 0.10),
+                    padding=0)
+        p.setTitle(f"{_esc(label)} (%)" if is_pct else _esc(label),
+                   color="#95A5A6", size="8pt")
+        self._column_footer(label, vals, dec, is_pct)
 
     def showEvent(self, a0):
         super().showEvent(a0)
@@ -11772,7 +12442,8 @@ class ManagerBoardTab(QWidget):
             rv: Dict[str, float] = {}
             scored = score_rv_events(d.get("rv_events") or [], re24)
             g = max(1, (d.get("decisions") or {}).get("games") or 1)
-            for kind, key in (("bunt", "bunt_per"), ("ibb", "ibb_per")):
+            for kind, key in (("bunt", "bunt_per"), ("ibb", "ibb_per"),
+                              ("ph", "ph_per")):
                 if kind in scored:
                     rv[key] = scored[kind]["per"]
                     rv[kind + "_n"] = scored[kind]["n"]
@@ -11923,42 +12594,104 @@ class ManagerBoardTab(QWidget):
                                        else QColor(0, 0, 0, 0))
 
     def _render_correlations(self):
-        """Do any of these levers actually go with better relief pitching?"""
+        """Do any of these levers actually go with better relief pitching?
+
+        Correlated PAIRWISE, one column at a time. Building a single matrix
+        and dropping any club with a gap anywhere threw away the whole row
+        for one missing cell — with the RV columns in (Deploy reports only
+        once 20 batters have been faced at each leverage) that is most of the
+        league, and the ABS columns could not be included at all."""
         import numpy as np
-        cols = self._COLS + self._DCOLS
-        pen_era = []
-        rows = []
-        for abbr, d in self._rows.items():
-            pen = self._pen.get(abbr)
-            if not pen:
+        self._corr_r = {}
+        for k, h, _d, _p, src in (
+                [(k, h, d, p, "t") for k, h, d, p in self._COLS]
+                + [(k, h, d, p, "d") for k, h, d, p in self._DCOLS]
+                + [(k, h, d, p, "a") for k, h, d, p in self._ABSCOLS]
+                + [(k, h, d, p, "r") for k, h, d, p in self._RVCOLS]):
+            xs, ys = [], []
+            for abbr, dd in self._rows.items():
+                pen = self._pen.get(abbr)
+                if not pen or pen.get("era") is None:
+                    continue
+                bag = (dd if src == "t" else (dd.get("decisions") or {})
+                       if src == "d" else (dd.get("abs") or {})
+                       if src == "a" else self._rv.get(abbr) or {})
+                v = bag.get(k)
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    continue
+                xs.append(float(v))
+                ys.append(float(pen["era"]))
+            if len(xs) < 10 or float(np.std(xs)) < 1e-9:
                 continue
-            dec = d.get("decisions") or {}
-            vals = [(d.get(k) if k in d else dec.get(k))
-                    for k, _h, _dd, _p in cols]
-            if any(v is None for v in vals):
-                continue
-            rows.append(vals)
-            pen_era.append(pen["era"])
-        if len(rows) < 10:
-            self._corr.setText("")
+            self._corr_r[h] = (float(np.corrcoef(xs, ys)[0, 1]), len(xs))
+        if not self._corr_r:
+            self._corr_html = ""
             return
-        arr = np.array(rows, dtype=float)
-        y = np.array(pen_era, dtype=float)
-        out = []
-        for i, (_k, h, _d, _p) in enumerate(cols):
-            if arr[:, i].std() < 1e-9:
-                continue
-            out.append((h, float(np.corrcoef(arr[:, i], y)[0, 1])))
-        out.sort(key=lambda t: -abs(t[1]))
-        top = out[:6]
+        top = sorted(self._corr_r.items(), key=lambda t: -abs(t[1][0]))[:6]
         body = " · ".join(
-            f"<b style='color:{'#E74C3C' if r > 0 else '#2ECC71'}'>{h}</b> "
-            f"{r:+.2f}" for h, r in top)
-        self._corr.setText(
-            f"<span style='color:#7F8C8D'>Tendency vs bullpen ERA across "
-            f"{len(rows)} clubs (positive = goes with a WORSE pen; "
+            f"<b style='color:{'#E74C3C' if r > 0 else '#2ECC71'}'>{_esc(h)}</b> "
+            f"{r:+.2f}" for h, (r, _n) in top)
+        n = max(n for _r, n in self._corr_r.values())
+        self._corr_html = (
+            f"<span style='color:#7F8C8D'>Strongest tendencies vs bullpen "
+            f"ERA across {n} clubs (positive = goes with a WORSE pen; "
             f"association only, a manager's hand is partly forced by the "
             f"arms he has):</span><br>{body}")
+        self._corr.setText(self._corr_html)
+
+    @staticmethod
+    def _fmt_val(v: float, dec: int, is_pct: bool) -> str:
+        """Values reach the chart already scaled, so this only adds the sign."""
+        return f"{v:.{dec}f}%" if is_pct else f"{v:.{dec}f}"
+
+    @staticmethod
+    def _ordinal(n: int) -> str:
+        return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+    def _column_footer(self, label, vals, dec, is_pct):
+        """What the selected column IS, where the league sits, where tonight's
+        clubs sit in it, and whether it goes with a better pen.
+
+        The footer used to print one static league-wide correlation list that
+        never changed with the selection, so it read as decoration under a
+        chart it had nothing to do with."""
+        ys = [v for _a, v in vals]
+        med = statistics.median(ys)
+        fmt = lambda v: self._fmt_val(v, dec, is_pct)
+        bits = [f"<b style='color:#BDC3C7'>{_esc(label)}</b> — "
+                f"<span style='color:#7F8C8D'>{self._GLOSS.get(label, '')}"
+                f"</span>"]
+        line2 = [f"<span style='color:#7F8C8D'>league</span> {fmt(min(ys))}"
+                 f"–{fmt(max(ys))}, <span style='color:#7F8C8D'>med</span> "
+                 f"{fmt(med)}"]
+        # rank 1 = highest. Deliberately not "good/bad": on most of these
+        # columns neither end is the right answer.
+        desc = sorted(vals, key=lambda t: -t[1])
+        for i, abbr in enumerate(sorted(self._highlight)[:2]):
+            hit = next((j for j, (a, _v) in enumerate(desc) if a == abbr),
+                       None)
+            if hit is None:
+                continue
+            v = desc[hit][1]
+            line2.append(
+                f"<b style='color:{self._TEAM_COLORS[i % 2]}'>{abbr}</b> "
+                f"{fmt(v)} <span style='color:#7F8C8D'>"
+                f"({self._ordinal(hit + 1)} of {len(desc)})</span>")
+        r, n = (self._corr_r or {}).get(label, (None, 0))
+        if r is not None:
+            if abs(r) < 0.2:
+                gloss = f"essentially no association, n={n}"
+            else:
+                strength = ("a weak" if abs(r) < 0.4 else "a moderate"
+                            if abs(r) < 0.6 else "a strong")
+                gloss = (f"{strength} association with a "
+                         f"{'worse' if r > 0 else 'better'} pen, n={n}")
+            line2.append(
+                f"<span style='color:#7F8C8D'>vs pen ERA</span> "
+                f"<b style='color:{'#E74C3C' if r > 0 else '#2ECC71'}'>"
+                f"{r:+.2f}</b> <span style='color:#7F8C8D'>({gloss})</span>")
+        bits.append(" · ".join(line2))
+        self._corr.setText("<br>".join(bits))
 
 
 class _NumItem(QTableWidgetItem):
@@ -14153,6 +14886,61 @@ class UmpireCard(QWidget):
             "sorted by sample size rather than by skill.")
 
 
+class _FillTable(QTableWidget):
+    """Content-sized table that then shares out whatever width is left over.
+
+    `_fit` pins every other table to the exact sum of its content-sized
+    columns, which is right for the ones sitting in a row beside a stretching
+    neighbour. In a COLUMN it leaves the card stopping short of everything
+    stacked with it — the arsenal and tunnel cards ended ~10px inside the
+    percentile bars above them and the plots beside them, which reads as a
+    misalignment rather than as a narrow table.
+
+    Stretching the last section instead would dump every spare pixel into one
+    column; this hands it out in proportion, so the card just reads wider.
+    The size HINT stays at the content width, so the table still never asks
+    the layout for more room than it used to — it only fills what it is
+    given."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._base_widths: List[int] = []
+
+    def remember_widths(self):
+        self._base_widths = [self.columnWidth(c)
+                             for c in range(self.columnCount())]
+        self._spread()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._spread()
+
+    def sizeHint(self) -> QSize:
+        s = super().sizeHint()
+        if self._base_widths:
+            s.setWidth(2 * self.frameWidth() + 2 + sum(self._base_widths))
+        return s
+
+    def _spread(self):
+        base = self._base_widths
+        total = sum(base)
+        if not total:
+            return
+        slack = self.viewport().width() - total
+        if slack <= 0:
+            for c, w in enumerate(base):
+                self.setColumnWidth(c, w)
+            return
+        given = 0
+        for c, w in enumerate(base):
+            add = slack * w // total
+            self.setColumnWidth(c, w + add)
+            given += add
+        # the rounding remainder goes to the name column, which is the one
+        # with variable-length text in it
+        self.setColumnWidth(0, self.columnWidth(0) + slack - given)
+
+
 class PitcherFormPanel(QWidget):
     """Starter recent-form section that sits under the bullpen table: the
     game-by-game log (with per-start FB velo + CSW% joined from the Savant
@@ -14388,6 +15176,12 @@ class PitcherFormPanel(QWidget):
             w.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
             if aspect:
                 w.setAspectLocked(True)
+            # Mean-dot code labels and the corner readout, re-anchored on
+            # every range change — see _place_dot_labels for why placing them
+            # once at draw time is not enough.
+            w._dot_labels = []
+            w.getPlotItem().getViewBox().sigRangeChanged.connect(
+                lambda *_a, _w=w: self._place_dot_labels(_w))
             return w
 
         self._mv_plot = shape_plot()
@@ -14433,7 +15227,7 @@ class PitcherFormPanel(QWidget):
         # Arsenal quick-card: per-pitch Stuff+ / velo / spin fills the gap
         # between the percentile stack and the tables row
         self._ars_table = self._make_table(
-            ["Pitch", "Stf+", "Velo", "Spin", "vLg", "Uq"])
+            ["Pitch", "Stf+", "Velo", "Spin", "vLg", "Uq"], fill=True)
         self._ars_table.setToolTip(
             "Arsenal: FanGraphs Stuff+ with Savant avg velo/spin per pitch. "
             "Pitch cell shows usage%; vLg = spin vs league avg for that pitch."
@@ -14455,7 +15249,8 @@ class PitcherFormPanel(QWidget):
         # they are the levers the ratio cannot distinguish: same slot (Rel),
         # speed gap (dV), and how far apart they finish in movement (dBrk).
         self._tunnel_table = self._make_table(
-            ["Tunnel", "Tun", "Plt", "Rto", "Rel", "\u0394V", "\u0394Brk"])
+            ["Tunnel", "Tun", "Plt", "Rto", "Rel", "\u0394V", "\u0394Brk"],
+            fill=True)
         self._tunnel_table.setToolTip(
             "Pitch tunneling, top 4 pitches by usage. Tun = how far apart the "
             f"pair still is at the commit point ({TUNNEL_COMMIT_Y_FT}ft out, "
@@ -14553,8 +15348,8 @@ class PitcherFormPanel(QWidget):
         root.addLayout(content, stretch=1)
 
     @staticmethod
-    def _make_table(headers: List[str]) -> QTableWidget:
-        t = QTableWidget()
+    def _make_table(headers: List[str], fill: bool = False) -> QTableWidget:
+        t = _FillTable() if fill else QTableWidget()
         t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         t.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         t.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -14564,7 +15359,12 @@ class PitcherFormPanel(QWidget):
         t.setColumnCount(len(headers))
         t.setHorizontalHeaderLabels(headers)
         hdr = t.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # A fill table sets its own column widths, so it must own them —
+        # under ResizeToContents the header overrides every setColumnWidth
+        # and the slack never gets handed out.
+        hdr.setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive if fill
+            else QHeaderView.ResizeMode.ResizeToContents)
         hdr.setStretchLastSection(False)
         hdr.setMinimumSectionSize(18)
         # The VERTICAL header's minimum section size is font-derived and
@@ -15778,10 +16578,48 @@ class PitcherFormPanel(QWidget):
                 item.widget().deleteLater()
         self._zone_plots = []
 
+    def _place_dot_labels(self, w):
+        """(Re)anchor a shape plot's labels against the range it ACTUALLY has.
+
+        Two things make a decision taken at draw time wrong. The label's
+        offset is in PIXELS — it comes from the text's own height — while the
+        frame is in data units, so no fixed data-space padding buys a
+        guaranteed gap. And the range that comes back out of `setRange` is
+        not the range that was put in: aspect lock expands an axis to match
+        the widget, and the widget's geometry is not final until layout runs,
+        so a ±25 request settles at ±25.51 and a release frame's left edge
+        moves ~0.3ft. Labels placed against the requested numbers therefore
+        drifted off the top (the code label of any cluster near the ceiling)
+        and off the left (the "Ex" of the extension readout).
+
+        Wired to sigRangeChanged at construction, so every later relayout
+        re-places them.
+        """
+        vb = w.getPlotItem().getViewBox()
+        (x0, _x1), (y0, y1) = vb.viewRange()
+        px, py = vb.viewPixelSize()
+        for kind, item, x, y in getattr(w, "_dot_labels", ()):
+            if kind == "corner":
+                item.setPos(x0 + (px or 0) * 5, y1)
+                continue
+            # The label's OWN height, asked of the item rather than assumed —
+            # a guessed pixel count is wrong the moment the app font is, and
+            # a label that clears the frame by two pixels still reads as
+            # clipped. The 1.25 covers the anchor's own 0.15 offset and the
+            # mean dot's radius underneath it.
+            h = item.boundingRect().height() or 13.0
+            margin = (py * (h * 1.25 + 6)) if py else (y1 - y0) * 0.16
+            item.setAnchor((0.5, 1.15) if y < y1 - margin else (0.5, -0.15))
+            item.setPos(x, y)
+
     def _render_shapes(self):
         mv_p = self._mv_plot.getPlotItem()
         mv_p.clear()
         self._rel_plot.getPlotItem().clear()
+        # clear() drops the items but not our handles on them — stale entries
+        # would have the re-anchor slot pushing deleted labels around
+        self._mv_plot._dot_labels = []
+        self._rel_plot._dot_labels = []
         self._clear_zones()
         pitches = (self._mv or {}).get("pitches") or []
         if not pitches:
@@ -15815,8 +16653,11 @@ class PitcherFormPanel(QWidget):
             label = pg.TextItem(code, color=color, anchor=(0.5, 1.15))
             label.setPos(pt["mean_hb"], pt["mean_ivb"])
             mv_p.addItem(label)
+            self._mv_plot._dot_labels.append(
+                ("dot", label, pt["mean_hb"], pt["mean_ivb"]))
         mv_p.getViewBox().setRange(xRange=(-lim, lim), yRange=(-lim, lim),
                                    padding=0)
+        self._place_dot_labels(self._mv_plot)
         self._render_zones(pitches)
         self._render_release(pitches)
 
@@ -15928,6 +16769,7 @@ class PitcherFormPanel(QWidget):
             a.setStyle(tickFont=tick_font)
 
         xs_all, zs_all = [], []
+        labels: List[tuple] = []
         ext_n, ext_sum = 0, 0.0
         for pt in pitches:
             code = PITCH_ABBREV.get(pt["pitch"], pt["pitch"])
@@ -15953,9 +16795,10 @@ class PitcherFormPanel(QWidget):
                 data=[pt["pitch"]])
             mean.sigClicked.connect(self._on_mean_clicked)
             p.addItem(mean)
-            label = pg.TextItem(code, color=color, anchor=(0.5, 1.2))
-            label.setPos(pt["mean_rel_x"], pt["mean_rel_z"])
-            p.addItem(label)
+            # Held back until the frame is known — unlike the movement plot's
+            # fixed ±25, this one's range comes from the data below, so which
+            # way a label has to hang cannot be decided yet.
+            labels.append((code, color, pt["mean_rel_x"], pt["mean_rel_z"]))
 
         if not xs_all:
             return
@@ -15970,12 +16813,17 @@ class PitcherFormPanel(QWidget):
         xr, zr = span(xs_all), span(zs_all)
         vb = p.getViewBox()
         vb.setRange(xRange=xr, yRange=zr, padding=0)
+        for code, color, mx, mz in labels:
+            label = pg.TextItem(code, color=color, anchor=(0.5, 1.2))
+            label.setPos(mx, mz)
+            p.addItem(label)
+            self._rel_plot._dot_labels.append(("dot", label, mx, mz))
         if ext_n:
             ext = pg.TextItem(f"Ext {ext_sum / ext_n:.1f}′",
-                              color="#82C4E0", anchor=(0, 0))
-            (vx0, _vx1), (_vz0, vz1) = vb.viewRange()
-            ext.setPos(vx0, vz1)
+                              color="#82C4E0", anchor=(0, -0.15))
             p.addItem(ext)
+            self._rel_plot._dot_labels.append(("corner", ext, 0.0, 0.0))
+        self._place_dot_labels(self._rel_plot)
         self._rel_plot.setToolTip(
             "Release point (catcher's view), feet — colored per pitch type.\n"
             + "\n".join(
@@ -16000,9 +16848,16 @@ class PitcherFormPanel(QWidget):
         table.resizeColumnsToContents()
         w = 2 * table.frameWidth() + 2
         w += sum(table.columnWidth(c) for c in range(table.columnCount()))
-        table.setMaximumWidth(w)
         table.setMinimumWidth(w)   # scrollbars are off — don't let the
                                    # plot's stretch squeeze columns away
+        if isinstance(table, _FillTable):
+            # Floor, not a pin: this one is stacked in a COLUMN, so it takes
+            # the column's width and spreads the extra over its own columns
+            # instead of stopping short of everything above and beside it.
+            table.setMaximumWidth(16777215)
+            table.remember_widths()
+        else:
+            table.setMaximumWidth(w)
         if cap_height:
             # Top-aligned table: hug the rows so no empty frame trails below
             h = 2 * table.frameWidth() + table.horizontalHeader().height()
@@ -18089,15 +18944,19 @@ class FieldView(QWidget):
                            Qt.AlignmentFlag.AlignCenter, pos)
             p.setBrush(Qt.BrushStyle.NoBrush)
             short = self._surname(name)
-            # The corners wear their plate OUTWARD, beside the tile: below it
-            # sits on the runner holding that bag, and above it collides with
-            # SS/2B, who are only ~65ft away on a diagram this tight.
+            # The INFIELD wears its plate OUTWARD, beside the tile, each man
+            # on the side of the diamond he plays: below it sits on the
+            # runner holding that bag, and above it collides with the next
+            # man in, who is only ~65ft away on a diagram this tight.
+            # The middle pair matter as much as the corners — hung below,
+            # their plates land on second base itself, which is exactly where
+            # a runner's own plate goes.
             lab = f"{pos} {short}".strip()
             col = INK if involved else DIM
-            if pos == "3B":
+            if pos in ("3B", "SS"):
                 self._plate(p, pt.x() - d / 2 - 4, pt.y(), lab, col,
                             accent=involved, side="left")
-            elif pos == "1B":
+            elif pos in ("1B", "2B"):
                 self._plate(p, pt.x() + d / 2 + 4, pt.y(), lab, col,
                             accent=involved, side="right")
             else:
