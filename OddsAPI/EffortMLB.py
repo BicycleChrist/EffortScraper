@@ -342,8 +342,36 @@ SAVANT_BATTED_BALL_URL = (
     "https://baseballsavant.mlb.com/leaderboard/batted-ball"
     "?year={year}&team=&min=0&csv=true"
 )
+# EXPECTED HOME RUNS. Savant re-flies every one of his batted balls into all
+# 30 parks; `xhr` is how many would have left an average one, so `hr - xhr` is
+# the part of his HR total that is his PARKS rather than his contact. The
+# doubters / mostly-gone / no-doubters split is the same idea by margin: a
+# no-doubter is out everywhere, a doubter left exactly one yard.
+#
+# The 30-column BY-PARK matrix on the player page is NOT here — that table is
+# built client-side in Savant's own bundle and has no CSV or JSON endpoint
+# behind it (checked: type=park, park=true, byPark=true and split=park all
+# return this same league board). Getting it would mean rendering a 3.5MB
+# player page per hitter in headless Firefox, which is not worth one column.
+SAVANT_XHR_URL = (
+    "https://baseballsavant.mlb.com/leaderboard/home-runs"
+    "?type=batter&year={year}&csv=true"
+)
 # Throwing arm by position, and the outfield jump that OAA only summarises:
 # reaction, burst and route, each as feet vs league.
+# PROJECTED lineups, for the hours before the real ones are posted.
+#
+# MLB publishes no projection: StatsAPI's `lineups` hydrate is empty until a
+# club files its card (mid-afternoon on a 7pm slate) and mlb.com/starting-
+# lineups just prints "TBD". Rotowire's beat writers post an expected lineup
+# per team all day, with the batting order, position and bat side — which is
+# everything the strip needs except an id. GUIMLBlineups already scrapes that
+# page for the team-news widget, so this costs no new scraper.
+#
+# Short TTL: a projection is revised through the afternoon as writers learn
+# more, and being current is the whole point of it. One page covers the slate.
+PROJ_LINEUP_TTL = 10 * 60
+
 SAVANT_ARM_STRENGTH_URL = (
     "https://baseballsavant.mlb.com/leaderboard/arm-strength"
     "?year={year}&team=&min=0&csv=true"
@@ -769,6 +797,40 @@ def fetch_fg_split_sync(split_id: int, stat_type: str = FG_SPLIT_TYPE_ADVANCED,
             out[int(row[i_id])] = rec
         except (IndexError, TypeError, ValueError):
             continue
+    return out
+
+
+def fetch_projected_lineups_sync() -> Dict[str, List[tuple]]:
+    """Today's expected lineups per team abbreviation, in batting order.
+
+    {abbr: [(name, pos, bats), ...]}. Blocking — call from an executor.
+    Returns {} on any failure, which the caller treats as "no projection"
+    rather than "no lineup".
+
+    The scrape itself is GUIMLBlineups.fetch_daily_lineups(), which has been
+    reading this page for the team-news widget all along; this only re-keys
+    its per-matchup output by team. The names it returns are Rotowire's
+    display forms ('C. DeLauter', 'Jose Ramirez') and carry no id — that
+    join is `MLBPropStats._match_lineup_name`.
+    """
+    try:
+        from GUIMLBlineups import fetch_daily_lineups
+    except ImportError as e:
+        print(f"EffortMLB: projected lineups unavailable: {e}")
+        return {}
+    try:
+        matchups = fetch_daily_lineups() or []
+    except Exception as e:
+        print(f"EffortMLB: projected lineups fetch failed: {e}")
+        return {}
+    out: Dict[str, List[tuple]] = {}
+    for m in matchups:
+        for abbr, players in (m.get("Team_Lineups") or {}).items():
+            # A game already under way returns whatever the page still shows;
+            # anything short of nine is a half-rendered card, not a lineup.
+            good = [p for p in players if p and p[0]]
+            if abbr and len(good) >= 9:
+                out[abbr] = good[:9]
     return out
 
 
@@ -1232,7 +1294,15 @@ def batted_ball_profile(rows: List[dict]) -> List[dict]:
     left and right without a flip at the call site."""
     acc = {k: {"gb": 0, "ld": 0, "fb": 0, "pu": 0, "n": 0,
                "pull": 0, "cent": 0, "oppo": 0, "spray_n": 0,
-               "shift": 0, "align_n": 0} for k in _BB_SPLITS}
+               "shift": 0, "align_n": 0,
+               # The CROSS of the two axes above. Trajectory and direction
+               # kept apart cannot express the one batted ball that matters
+               # for power: a 45% pull rate and a 40% air rate are the same
+               # two numbers whether he pulls his fly balls or his grounders,
+               # and those are opposite hitters. Savant's own batted-ball
+               # table is this cross for exactly that reason.
+               "pull_air": 0, "pull_gb": 0, "oppo_air": 0,
+               "cross_n": 0} for k in _BB_SPLITS}
     for r in rows:
         if r.get("ev") is None or r.get("hc_x") is None or r.get("hc_y") is None:
             continue
@@ -1258,6 +1328,15 @@ def batted_ball_profile(rows: List[dict]) -> List[dict]:
             if ang is not None:
                 a["spray_n"] += 1
                 a["pull" if ang < -15 else "oppo" if ang > 15 else "cent"] += 1
+                if la is not None:
+                    # AIR is Savant's cut: everything that is not a ground
+                    # ball (line drives, fly balls and pop-ups together).
+                    a["cross_n"] += 1
+                    air = la >= 10
+                    if ang < -15:
+                        a["pull_air" if air else "pull_gb"] += 1
+                    elif ang > 15 and air:
+                        a["oppo_air"] += 1
             if al:
                 a["align_n"] += 1
                 a["shift"] += al != "Standard"
@@ -1273,6 +1352,9 @@ def batted_ball_profile(rows: List[dict]) -> List[dict]:
             "fb": p("fb", a["n"]), "pu": p("pu", a["n"]),
             "pull": p("pull", a["spray_n"]), "cent": p("cent", a["spray_n"]),
             "oppo": p("oppo", a["spray_n"]), "shift": p("shift", a["align_n"]),
+            "pull_air": p("pull_air", a["cross_n"]),
+            "pull_gb": p("pull_gb", a["cross_n"]),
+            "oppo_air": p("oppo_air", a["cross_n"]),
         })
     return out
 
@@ -1750,7 +1832,9 @@ SPLIT_MIN_PA = 15
 
 def split_profile(splits: Dict[str, Dict[int, dict]], pid: int,
                   season_wrc: Optional[float] = None,
-                  min_pa: float = SPLIT_MIN_PA) -> List[dict]:
+                  min_pa: float = SPLIT_MIN_PA,
+                  batted: Optional[Dict[str, Dict[int, dict]]] = None
+                  ) -> List[dict]:
     """Flatten the league-wide split boards into this hitter's rows.
 
     `splits` is get_fg_splits output — {label: {mlbam: row}}. Returns one dict
@@ -1767,6 +1851,13 @@ def split_profile(splits: Dict[str, Dict[int, dict]], pid: int,
     toggle does, and a row that thin is still a real observation, just one
     whose band is wider than the chart. The default only decides what shows
     by DEFAULT; it is not a claim that thinner splits should be unavailable.
+
+    `batted` is the SAME structure pulled at FG_SPLIT_TYPE_BATTED — the
+    batted-ball profile for each split (GB/LD/FB, HR/FB, Pull%, Hard%). It is
+    optional and joined per label: a split present in one board but not the
+    other simply carries `None` in the missing columns rather than dropping
+    out. The two boards are separate requests and the batted one is allowed
+    to fail on its own.
     """
     def f(v):
         try:
@@ -1801,13 +1892,23 @@ def split_profile(splits: Dict[str, Dict[int, dict]], pid: int,
             if pa is None or pa < min_pa:
                 continue
             wrc = f(row.get("wRC+"))
+            bb_row = ((batted or {}).get(lab) or {}).get(pid) or {}
             rows.append({
                 "group": group, "split": lab, "partition": partition,
                 "pa": pa, "wrc": wrc,
                 "woba": f(row.get("wOBA")), "iso": f(row.get("ISO")),
                 "babip": f(row.get("BABIP")), "avg": f(row.get("AVG")),
                 "obp": f(row.get("OBP")), "slg": f(row.get("SLG")),
+                "ops": f(row.get("OPS")), "wraa": f(row.get("wRAA")),
                 "bb": f(row.get("BB%")), "k": f(row.get("K%")),
+                "bbk": f(row.get("BB/K")),
+                # batted-ball profile — absent unless the type-3 board was
+                # pulled AND carries this label
+                "gb": f(bb_row.get("GB%")), "ld": f(bb_row.get("LD%")),
+                "fb": f(bb_row.get("FB%")), "hrfb": f(bb_row.get("HR/FB")),
+                "pull": f(bb_row.get("Pull%")), "cent": f(bb_row.get("Cent%")),
+                "oppo": f(bb_row.get("Oppo%")), "hard": f(bb_row.get("Hard%")),
+                "soft": f(bb_row.get("Soft%")),
                 "sd": split_noise_sd(pa),
                 "z": split_z(wrc, season_wrc, pa),
             })
@@ -3745,11 +3846,23 @@ def _fnum(v) -> Optional[float]:
 
 
 def norm_name(name: str) -> str:
-    s = unicodedata.normalize("NFKD", name)
+    return " ".join(name_parts(name))
+
+
+def name_parts(name: str) -> List[str]:
+    """Accent-stripped lowercase tokens, generational suffix dropped.
+
+    The suffix is dropped from position 1 ONWARD, never from the first
+    token: a scraped lineup abbreviates first names, and "V. Guerrero" would
+    otherwise lose its "V." to the Roman-numeral entry in `_SUFFIXES` and
+    match on a surname alone.
+    """
+    s = unicodedata.normalize("NFKD", name or "")
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.lower().replace(".", " ").replace("-", " ").replace("'", "")
-    parts = [p for p in s.split() if p and p not in _SUFFIXES]
-    return " ".join(parts)
+    parts = [p for p in s.split() if p]
+    return [p for i, p in enumerate(parts)
+            if i == 0 or p not in _SUFFIXES] or parts
 
 
 # ---------------------------------------------------------------------------
@@ -3929,6 +4042,9 @@ class MLBPropStats:
         # generic Savant boards, all (ts, {pid: dict}) — see _savant_board
         self._swing_take: Optional[tuple] = None
         self._batted_ball_board: Optional[tuple] = None
+        self._xhr_board: Optional[tuple] = None
+        self._proj_lineups: Optional[tuple] = None   # (ts, {abbr: {...}})
+        self._roster_teams: Optional[Dict[str, List[dict]]] = None
         self._arm_board: Optional[tuple] = None
         self._of_jump_board: Optional[tuple] = None
         self._proj_cache: Dict[str, Dict[int, dict]] = {}
@@ -4075,6 +4191,8 @@ class MLBPropStats:
             (self._teams, self._team_name_to_abbr,
              self._roster) = await loop.run_in_executor(
                 None, self._build_roster_maps, data)
+            # derived from the two above — must not outlive them
+            self._roster_teams = None
             print(f"EffortMLB: roster loaded "
                   f"({len(self._roster)} players, {len(self._teams)} teams)")
             return True
@@ -4237,6 +4355,119 @@ class MLBPropStats:
                 if prob and m["probable"] is None:
                     m["probable"] = prob.get("id")
         return maps
+
+    def _match_lineup_name(self, team: str, name: str, pos: str,
+                           bats: str) -> Optional[dict]:
+        """A scraped lineup name -> the roster record, or None.
+
+        Rotowire abbreviates most first names ('C. DeLauter'), so this cannot
+        go through `norm_name` alone: it matches on the SURNAME plus the
+        first initial, inside that team's roster only.
+
+        Two traps live here, both measured against a full slate (162 names):
+        * generational suffixes — 'V. Guerrero' against 'Vladimir Guerrero
+          Jr.' matches nothing if the last token is taken blind, and the
+          suffix must be dropped from position 1 onward only, because 'V.'
+          is itself a Roman numeral and dropping it leaves no first name;
+        * genuine collisions — Philadelphia carries both Weston and Will
+          Wilson at the same position and the same bat side, so 'W. Wilson'
+          is not resolvable from the page at all. Bat side and position
+          narrow it, then playing time; a name that survives all three
+          ambiguous is returned as None rather than guessed, and shows in
+          the strip as a name with no numbers behind it.
+        """
+        if not name:
+            return None
+        pool = self._roster_by_team().get(team) or []
+        # A player the roster cache has on no team, or on his old one: it is
+        # a day stale at worst but a call-up or a deadline pickup can be in
+        # tonight's lineup and still be missing from it. Falling back to the
+        # whole league only helps when the name is unique there, which is the
+        # condition below — 'Luis Garcia' is not, and stays unresolved.
+        wide = [r for r in (self._roster or {}).values()
+                if r.get("position") != "P"]
+
+        parts = name_parts(name)
+        if not parts:
+            return None
+        last, first = parts[-1], parts[0]
+        initial = len(first) <= 1 or "." in name.split()[0]
+
+        def hits(rows):
+            out = []
+            for r in rows:
+                rp = name_parts(r.get("name", ""))
+                if not rp or rp[-1] != last:
+                    continue
+                if (rp[0][:1] == first[:1]) if initial else (rp[0] == first):
+                    out.append(r)
+            return out
+
+        cands = hits(pool)
+        if len(cands) == 1:
+            return cands[0]
+        if not cands:
+            league = hits(wide)
+            return league[0] if len(league) == 1 else None
+        for key, want in (("bats", bats), ("position", pos)):
+            narrowed = [r for r in cands if r.get(key) and r[key] == want]
+            if len(narrowed) == 1:
+                return narrowed[0]
+            if narrowed:
+                cands = narrowed
+        # Still tied: the one who actually plays. The FG board is already in
+        # memory by the time a lineup is drawn, so this costs nothing.
+        board = self._fg_batting or {}
+        with_pa = [(float((board.get(r["id"]) or {}).get("PA") or 0), r)
+                   for r in cands]
+        with_pa.sort(key=lambda t: -t[0])
+        return with_pa[0][1] if with_pa and with_pa[0][0] > 0 else None
+
+    def _roster_by_team(self) -> Dict[str, List[dict]]:
+        """{team abbr: [roster rec]}, built once from the loaded roster."""
+        if self._roster_teams is None:
+            out: Dict[str, List[dict]] = {}
+            for rec in (self._roster or {}).values():
+                abbr = self._teams.get(rec.get("team_id"))
+                if abbr:
+                    out.setdefault(abbr, []).append(rec)
+            self._roster_teams = out
+        return self._roster_teams
+
+    async def get_projected_lineups(self) -> Dict[str, dict]:
+        """{abbr: {'slots': {pid: 1-9}, 'names': {order: name}}} for the
+        teams whose real lineup is not out yet.
+
+        One page for the whole slate, re-fetched every PROJ_LINEUP_TTL. Rows
+        whose name could not be resolved to an id keep their slot and their
+        name and carry `None` for the id, so a projection is never silently
+        nine-minus-one men long."""
+        now = time.time()
+        cached = self._proj_lineups
+        if cached and now - cached[0] < PROJ_LINEUP_TTL:
+            return cached[1]
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, fetch_projected_lineups_sync)
+        out: Dict[str, dict] = {}
+        for abbr, players in (raw or {}).items():
+            team = FG_TEAM_ALIAS.get(abbr, abbr)
+            slots, names, unresolved = {}, {}, 0
+            for i, (name, pos, bats) in enumerate(players, start=1):
+                rec = self._match_lineup_name(team, name, pos, bats)
+                names[i] = (rec or {}).get("name") or name
+                if rec:
+                    slots[rec["id"]] = i
+                else:
+                    unresolved += 1
+            if slots:
+                out[team] = {"slots": slots, "names": names,
+                             "unresolved": unresolved}
+        if out:
+            print(f"EffortMLB: projected lineups for {len(out)} teams "
+                  f"({sum(v['unresolved'] for v in out.values())} names "
+                  f"unresolved)")
+        self._proj_lineups = (now, out)
+        return out
 
     async def _get_person(self, session: aiohttp.ClientSession, pid: int) -> dict:
         if pid not in self._persons:
@@ -4737,6 +4968,17 @@ class MLBPropStats:
             #    Hard%+ means 36% more hard contact than league *for his
             #    park*, which his raw 46.2% Hard% cannot say on its own.
             #    NOTE these are indices, not rates — do not print a % sign.
+            # The RAW rate each index above corrects. Both halves are needed
+            # or the pairing says nothing: an index alone cannot tell a
+            # hitter who pulls a lot from one whose park makes it look that
+            # way, and a raw rate alone cannot say whether it is good HERE.
+            "avg": row.get("AVG"), "obp": row.get("OBP"),
+            "slg": row.get("SLG"), "iso": row.get("ISO"),
+            "babip_raw": row.get("BABIP"),
+            "bb_pct": row.get("BB%"), "k_pct": row.get("K%"),
+            "gb_pct": row.get("GB%"), "fb_pct": row.get("FB%"),
+            "ld_pct": row.get("LD%"),
+            "cent_pct": row.get("Cent%"), "oppo_pct": row.get("Oppo%"),
             "avg_plus": row.get("AVG+"), "obp_plus": row.get("OBP+"),
             "slg_plus": row.get("SLG+"), "iso_plus": row.get("ISO+"),
             "babip_plus": row.get("BABIP+"),
@@ -5122,6 +5364,21 @@ class MLBPropStats:
              "pull_gb": "pull_gb_rate", "pull_air": "pull_air_rate",
              "oppo_air": "oppo_air_rate"})
 
+    async def get_xhr(self, session) -> Dict[int, dict]:
+        """Expected home runs: what his contact was worth in an average park.
+
+        `diff` is hr - xhr with Savant's own sign (NEGATIVE means he has
+        FEWER home runs than his contact deserved). The margin split counts
+        the same balls by how close they were: a no-doubter is out in all 30
+        parks, a doubter left exactly one."""
+        return await self._savant_board(
+            session, "_xhr_board", SAVANT_XHR_URL,
+            ("player_id", "id"),
+            {"hr": "hr_total", "xhr": "xhr", "diff": "xhr_diff",
+             "doubters": "doubters", "mostly_gone": "mostly_gone",
+             "no_doubters": "no_doubters", "no_doubter_pct": "no_doubter_per",
+             "trot": "avg_hr_trot"})
+
     async def get_arm_strength(self, session) -> Dict[int, dict]:
         """Throwing arm by position group (mph)."""
         return await self._savant_board(
@@ -5386,6 +5643,12 @@ class MLBPropStats:
                     "ev": fnum(row.get("launch_speed")),
                     "la": fnum(row.get("launch_angle")),
                     "bb_type": row.get("bb_type") or "",
+                    # Savant's EV-x-LA contact-quality bucket, 1-6 (weak,
+                    # topped, under, flare/burner, solid, barrel). It has
+                    # been in this CSV all along and nothing read it — the
+                    # trajectory cut (`bb_type`) says a fly ball, this says
+                    # whether it was a barrel or a can of corn.
+                    "lsa": fnum(row.get("launch_speed_angle")),
                     "hr": (row.get("events") or "") == "home_run",
                     "xwoba": fnum(row.get("estimated_woba_using_speedangle")),
                     "event": row.get("events") or "",
@@ -7284,11 +7547,20 @@ from PyQt6.QtGui import QBrush, QLinearGradient
 
 
 class CompactPercentileBar(PercentileBar):
-    """Denser PercentileBar: 15px tall, short label, tighter number gutter —
-    fits a 3-column grid under the chart."""
+    """Denser PercentileBar: 15px tall, short label, and the number rides in
+    a bubble at the END OF THE FILL rather than in a gutter of its own.
+
+    Savant's own bars do it this way and the reason is space: a right-hand
+    number column is dead width on every row, while the bubble sits on the
+    bar it belongs to and doubles as the fill's end cap — the eye reads
+    position and value in one stop instead of two.
+    """
 
     LABEL_W = 52
-    NUM_W = 22
+    # Radius of the value bubble. The bar reserves 2R on its right so a
+    # 100th-percentile bubble still lands inside the widget instead of being
+    # clipped by the edge.
+    BUBBLE_R = 8
 
     def __init__(self, label: str, percentile: float = 50.0, parent=None):
         super().__init__(label, percentile, parent)
@@ -7305,7 +7577,10 @@ class CompactPercentileBar(PercentileBar):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         bar_x = self.LABEL_W + 3
-        bar_w = w - bar_x - self.NUM_W - 4
+        # The bubble is centred ON the fill's end, so half of it overhangs
+        # the track at 100 — hence 2R of right margin, not R.
+        r = min(self.BUBBLE_R, max(5, h // 2))
+        bar_w = max(10, w - bar_x - 2 * r - 2)
         bar_h = 6
         bar_y = (h - bar_h) // 2
 
@@ -7327,11 +7602,21 @@ class CompactPercentileBar(PercentileBar):
         p.setBrush(QBrush(grad))
         p.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 3, 3)
 
-        p.setPen(QColor(210, 210, 210))
-        p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-        p.drawText(bar_x + bar_w + 3, 0, self.NUM_W, h,
-                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-                   f"{self.percentile:.0f}")
+        # Value bubble, centred on the end of the fill. Clamped so a 1st- or
+        # 99th-percentile bubble stays fully on the widget.
+        cx = min(max(bar_x + fill_w, bar_x + r), bar_x + bar_w + r)
+        cy = h // 2
+        p.setBrush(QBrush(colour))
+        p.setPen(QPen(QColor(21, 26, 33), 1))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        # Dark text on the fill colour: these are saturated reds through
+        # blues at full value, and dark reads on all of them where white
+        # only reads on some.
+        p.setPen(QColor(16, 20, 26))
+        f = QFont("Segoe UI", 6, QFont.Weight.Bold)
+        p.setFont(f)
+        p.drawText(QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                   Qt.AlignmentFlag.AlignCenter, f"{self.percentile:.0f}")
 
 HEADSHOT_DIR = Path(__file__).resolve().parent / "headshots"
 HEADSHOT_URL = ("https://img.mlbstatic.com/mlb-photos/image/upload/"
@@ -7345,13 +7630,20 @@ PITCHER_STAT_OPTIONS = [(k, ms.display) for k, ms in MARKET_STATS.items()
                         if k.startswith("pitcher") and not ms.yes_no]
 
 # Percentile columns to show, per player type: (df column, short bar label)
+# Grouped by what they measure, not by the board's own order: expected value
+# first, then contact quality, then the plate skills that produce it, then
+# legs. Whiff/SqUp/xOBP are on the same Savant board and were simply never
+# read — Whiff is the half of the discipline pair Chase cannot give (chasing
+# is the decision, whiffing is the result), and squared-up rate is the bat
+# tracking figure that the header's BMIELKE line is partly built on.
 HITTER_PCT_COLS = [
-    ("xwoba", "xwOBA"), ("xslg", "xSLG"), ("xiso", "xISO"),
+    ("xwoba", "xwOBA"), ("xobp", "xOBP"), ("xslg", "xSLG"), ("xiso", "xISO"),
     ("brl_percent", "Brl%"), ("hard_hit_percent", "HH%"),
-    ("exit_velocity", "EV"), ("bat_speed", "BatSpd"),
+    ("exit_velocity", "EV"), ("max_ev", "MaxEV"),
+    ("bat_speed", "BatSpd"), ("squared_up_rate", "SqUp"),
     ("k_percent", "K%"), ("bb_percent", "BB%"),
-    ("chase_percent", "Chase"), ("sprint_speed", "Sprint"),
-    ("max_ev", "MaxEV"),
+    ("whiff_percent", "Whiff"), ("chase_percent", "Chase"),
+    ("sprint_speed", "Sprint"),
 ]
 PITCHER_PCT_COLS = [
     ("xwoba", "xwOBA"), ("xera", "xERA"), ("k_percent", "K%"),
@@ -7446,6 +7738,8 @@ class FlowLayout(QLayout):
     def minimumSize(self):
         s = QSize()
         for it in self._items:
+            if it.isEmpty():        # hidden widget — see the note in _do
+                continue
             s = s.expandedTo(self._effective(it))
         m = self.contentsMargins()
         return s + QSize(m.left() + m.right(), m.top() + m.bottom())
@@ -7521,6 +7815,12 @@ class FlowLayout(QLayout):
 
         bottom = eff.y()
         for it in self._items:
+            # A HIDDEN widget still has a size hint, so without this it holds
+            # its slot in the skyline and leaves a rectangular hole. The
+            # hitter-only blocks hide themselves when a pitcher is shown, and
+            # that is exactly the case where the hole would appear.
+            if it.isEmpty():
+                continue
             hint = self._effective(it)
             w = min(hint.width(), right - left)
             h = hint.height()
@@ -8244,19 +8544,36 @@ class PlayerDetailPanel(QWidget):
         self._form_lay.setContentsMargins(0, 4, 0, 0)
         self._form_lay.setSpacing(6)
 
-        # PROFILE — percentile stack ABOVE the situational table, not beside
-        # it: side by side they need 134 + 373 = 507 in a 394px viewport.
-        # Stacked, the table gets its full natural width and stops scrolling.
+        # PROFILE — TWO BALANCED COLUMNS, not a skyline fill.
+        #
+        # The flow layout packed these eight blocks at 67% coverage: a third
+        # of the tab was holes. It could not do better, because a skyline can
+        # only place blocks it is handed, and the blocks were the wrong
+        # shapes — a 16-row 130px-wide index table (393 tall) next to a
+        # 3-row 368px-wide discipline table (88 tall) leaves a 300px pocket
+        # that nothing else on the tab fits into.
+        #
+        # So the shapes changed too. The three key-value blocks are now laid
+        # out in PAIRS of columns (park indices 8x6 instead of 16x3, stance/
+        # run 6x4 instead of 12x2, xHR 3x4 instead of 6x2) — same numbers,
+        # half the height, and each one lands on a natural seam: rate stats |
+        # batted-ball stats, stance | running, totals | margins.
+        #
+        # With those shapes the two columns balance to within a few pixels of
+        # each other, and the percentile stack — the one elastic block on the
+        # tab, since its bars share the height by grid stretch — takes up
+        # whatever difference is left (`_balance_profile_columns`). The
+        # result has no interior holes at all.
+        #
+        # The columns live INSIDE a FlowHost so a panel too narrow for both
+        # (under _PROFILE_MIN_2COL) wraps them into one column instead of
+        # clipping, which is what the flow was genuinely good at.
         profile_page = QWidget()
         profile_lay = QVBoxLayout(profile_page)
         profile_lay.setContentsMargins(0, 4, 0, 0)
         profile_lay.setSpacing(8)
         pct_holder = QWidget()
-        # HALF width. The bars ran the full panel, which made a percentile
-        # rank look like a precision measurement and wasted the better half
-        # of the row; paired with the discipline table they use the same
-        # space and say more.
-        pct_holder.setFixedWidth(self._PCT_STACK_W)
+        self._pct_holder = pct_holder
         self._pct_grid = QGridLayout(pct_holder)
         self._pct_grid.setContentsMargins(0, 0, 0, 0)
         self._pct_grid.setHorizontalSpacing(0)
@@ -8267,7 +8584,17 @@ class PlayerDetailPanel(QWidget):
             "Batted-ball profile. Trajectory cuts are Statcast's: ground "
             "ball under 10°, line drive to 25°, fly ball to 50°, pop-up "
             "above.\n\n"
-            "Spray is opposite-field-signed, so Pull/Cent/Oppo mean the same "
+            "Pl-Air / Pl-GB / Op-Air are the CROSS of trajectory and "
+            "direction, as a share of all batted balls: pulled in the air, "
+            "pulled on the ground, opposite-field in the air. 'Air' is "
+            "Savant's cut — line drives, fly balls and pop-ups together.\n\n"
+            "Pulled AIR is the batted ball that leaves the yard, and it is "
+            "the reason this replaced the plain Pull/Cent/Oppo shares: those "
+            "cannot tell a hitter who pulls his fly balls from one who pulls "
+            "his grounders into the shift, and they are still on this tab "
+            "(raw and park-adjusted) in the vs-park block. League pull-air "
+            "is ~19%; over 24% is a power profile.\n\n"
+            "Spray is opposite-field-signed, so the directions mean the same "
             "thing for a lefty and a righty.\n\n"
             "vL / vR are versus left- and right-handed pitchers. All values "
             "are percentages; the headers drop the % sign only to keep the "
@@ -8319,14 +8646,77 @@ class PlayerDetailPanel(QWidget):
             "Spd is Bill James' speed score. UBR is non-steal baserunning "
             "runs, wSB steal runs, XBR extra-bases-taken runs; BsR is their "
             "sum and is the figure on the lineup rail.")
-        # pct(365)+disc(~350) pair, then situ(373)+bb(348) pair
-        _pf = FlowHost(); _pfl = _pf
-        _pfl.addWidget(pct_holder)
-        _pfl.addWidget(self._tbl_disc)
-        _pfl.addWidget(self._tbl_situ)
-        _pfl.addWidget(self._tbl_bb)
-        _pfl.addWidget(self._tbl_plus)
-        _pfl.addWidget(self._tbl_bio)
+        # Savant's EV-x-LA contact-quality buckets. The batted-ball table
+        # beside it cuts by TRAJECTORY (gb/ld/fb/pu) and the percentile stack
+        # gives barrel rate as a rank — neither says what the rest of his
+        # contact is. These six partition every ball he puts in play.
+        self._tbl_cq = self._make_stats_table()
+        self._tbl_cq.setToolTip(
+            "Statcast contact quality — every ball in play sorted into one "
+            "of six EV-by-launch-angle buckets (Savant's own "
+            "`launch_speed_angle`, not a local re-derivation).\n\n"
+            "The six partition his batted balls, so the shares sum to 100. "
+            "They cut ACROSS the trajectory table beside this one: a fly "
+            "ball can be a barrel or an 'under', and those are not the same "
+            "event.\n\n"
+            "xwOBA is the average expected wOBA of the balls in that bucket "
+            "and is the column that makes the rest readable — barrels live "
+            "around 1.5 and weak contact near .05 for everyone, so a bucket "
+            "reading far off that is a small sample, not a skill.\n\n"
+            "The shares are NOT coloured: reading one needs a league mark "
+            "for the bucket, and this panel has not measured one, so it does "
+            "not imply a direction it cannot support.")
+        # EXPECTED HOME RUNS — the park half of his power. Nothing else on
+        # the panel separates "he hits it out" from "he plays here": the
+        # park-index block adjusts RATES, not the home-run count itself.
+        self._tbl_xhr = self._make_stats_table()
+        self._tbl_xhr.setToolTip(
+            "Savant's expected home runs. Every one of his batted balls is "
+            "re-flown into all 30 parks; xHR is how many would have left an "
+            "average one.\n\n"
+            "HR−xHR is therefore the part of his home-run total that is his "
+            "PARKS and his luck rather than his contact. Positive means he "
+            "has more than the contact deserved.\n\n"
+            "'No doubt' is how many of those home runs clear the fence in "
+            "ALL 30 parks, and NoDbt% is that count over his home-run total. "
+            "A hitter whose power is mostly wall-scrapers is one road trip "
+            "from a cold streak that is not a slump.\n\n"
+            "(Savant also ships 'doubters' and 'mostly gone' counts. They do "
+            "not add up to the home-run total on any player tested, so "
+            "whatever they count is not a split of his home runs, and they "
+            "are left off rather than captioned with a guess.)\n\n"
+            "Savant builds a 30-column BY-PARK version of this on the player "
+            "page, but it is assembled client-side and has no data endpoint, "
+            "so only the league-average figure is here.")
+
+        # LEFT column — how he COMPARES: his ranks against the league, then
+        # the same peripherals against his own park, then the home-run count
+        # against an average one. RIGHT column — what he DOES: the plate
+        # decision, the ball off the bat, the quality of it, then when and
+        # how he stands and runs.
+        self._prof_left, _lcol = self._profile_column()
+        self._prof_right, _rcol = self._profile_column()
+        for w in (pct_holder, self._tbl_plus, self._tbl_xhr):
+            _lcol.addWidget(w)
+        for w in (self._tbl_disc, self._tbl_bb, self._tbl_cq,
+                  self._tbl_situ, self._tbl_bio):
+            _rcol.addWidget(w)
+        # A trailing stretch in each column so that when the balance cannot
+        # be exact (a hidden block, a pitcher's shorter tab) the slack goes
+        # to the BOTTOM of a column rather than opening a gap between two
+        # blocks in the middle of it.
+        _lcol.addStretch(0)
+        _rcol.addStretch(0)
+        # Every block on this tab fills its column's width — see the
+        # `_expand_full` note in _sync_flank_widths. Without it the columns
+        # would be ragged down their right edges, which is the same wasted
+        # space in a less obvious form.
+        for t in (self._tbl_disc, self._tbl_bb, self._tbl_cq, self._tbl_situ,
+                  self._tbl_bio, self._tbl_plus, self._tbl_xhr):
+            t._expand_full = True
+        _pf = FlowHost(spacing=self._PROFILE_GAP)
+        _pf.addWidget(self._prof_left)
+        _pf.addWidget(self._prof_right)
         profile_lay.addWidget(_pf)
         profile_lay.addStretch()
 
@@ -8563,12 +8953,20 @@ class PlayerDetailPanel(QWidget):
             "wRC+ is park- and league-adjusted, so 100 is average in EVERY "
             "row and the rows are comparable to each other; a triple-slash "
             "line is not.\n\n"
-            "'±' is one sampling sigma at that row's PA and 'z' is how many "
-            "of them the split sits from the player's own season line. Under "
-            "1σ the split is indistinguishable from him just being himself.\n\n"
-            "Share is the row's PA as a fraction of its group, shown only "
-            "for groups that partition the season (platoon, venue, outs, "
-            "slot, inning, month).")
+            "'z' is how many sampling sigmas the split sits from the "
+            "player's own season line. Under 1σ the split is "
+            "indistinguishable from him just being himself. The sigma itself "
+            "is a function of PA alone and is drawn as the band behind every "
+            "dot in the chart above, so it does not spend a column here.\n\n"
+            "The batted-ball block on the right (LD/GB/FB, HR/FB, Pull, "
+            "Oppo, Hard) is a SECOND FanGraphs board joined per split; it is "
+            "blank when that request did not land. Its denominator is balls "
+            "in play, not PA, so those shares are thinner than the row's PA "
+            "suggests.")
+        # This is the tab's only table — it takes the full panel width rather
+        # than hugging its columns, which is what makes room for the rate,
+        # approach and batted-ball blocks side by side.
+        self._tbl_split._expand_full = True
         _sf = FlowHost(); _sfl = _sf
         _sfl.addWidget(self._tbl_split)
         splits_lay.addWidget(_sf)
@@ -8961,13 +9359,17 @@ class PlayerDetailPanel(QWidget):
         self._form_lay.addWidget(self._form_scroll, stretch=1)
 
     def eventFilter(self, obj, ev):
-        if obj is self._trend_plot:
+        # getattr, not attribute access: the Profile flow installs this filter
+        # during construction, BEFORE the trend plot down the page exists, and
+        # the first resize event it delivers arrives in that window.
+        if obj is getattr(self, "_trend_plot", None):
             if ev.type() == QEvent.Type.Resize:
                 self._place_trend_chip_bar()
             elif ev.type() == QEvent.Type.Leave:
                 self._trend_vline.hide()
                 self._trend_htext.hide()
-        elif obj is self._spray_plot and ev.type() == QEvent.Type.Resize:
+        elif (obj is getattr(self, "_spray_plot", None)
+              and ev.type() == QEvent.Type.Resize):
             self._place_spray_legend()
         return super().eventFilter(obj, ev)
 
@@ -9155,6 +9557,11 @@ class PlayerDetailPanel(QWidget):
         # recorded here, while ResizeToContents is still in force, or there is
         # nothing to floor the stretch against later.
         t._natural_c0 = t.columnWidth(0) if t.columnCount() else 0
+        # Per-column natural widths, for the tables that EXPAND to fill the
+        # panel (`_expand_full`). The expansion writes explicit column widths,
+        # so it has to grow from this recorded baseline every time — growing
+        # from the live widths would compound on every resize event.
+        t._natural_cols = [t.columnWidth(c) for c in range(t.columnCount())]
         t.setFixedWidth(w)
 
     # Width the percentile stack gets beside the split table (bars scale
@@ -9165,7 +9572,26 @@ class PlayerDetailPanel(QWidget):
     # half for the discipline table beside it. 350 not 365: the discipline
     # table measures 367, and 365+8+367 = 740 missed the 738 panel by two
     # pixels and bumped the table onto its own row.
-    _PCT_STACK_W = 350
+    # --- Profile tab geometry -------------------------------------------
+    # The RIGHT column holds the three wide tables (discipline, batted ball,
+    # contact quality), so its width is set by the widest of them at natural
+    # size; the LEFT column takes the rest. Below _PROFILE_MIN_2COL the two
+    # would each be under ~300 and every table inside would start scrolling,
+    # so the FlowHost wraps them into a single column instead.
+    _PROFILE_RIGHT_W = 372
+    _PROFILE_GAP = 6
+    _PROFILE_MIN_2COL = 660
+    # Page margins + the scroll gutter, between the panel's cap and the flow
+    # the columns actually sit in. Measured at 20; carried at 24 so the pair
+    # lands a few pixels INSIDE the flow — overshooting by one pixel wraps
+    # them into a single column, undershooting by four costs four pixels.
+    _PROFILE_INSET = 24
+    # Height per percentile bar. The stack is the elastic block that absorbs
+    # the difference between the two columns, and these are the bounds it may
+    # do it within: under 14 the label and the bubble collide, over 30 the
+    # stack reads as a chart rather than a list.
+    _PCT_BAR_MIN = 14
+    _PCT_BAR_MAX = 30
     # The plot no longer sits BESIDE these tables — it has its own tab — so
     # nothing needs reserving for it. This was 272, which in a 394px viewport
     # capped every table at 260 and was the direct cause of the situational
@@ -9179,6 +9605,125 @@ class PlayerDetailPanel(QWidget):
     # made to scroll instead. 64px fits "Runners on" / "Full count" at 8pt,
     # which are the longest labels any of these tables carries.
     _C0_FLOOR = 64
+
+    @staticmethod
+    def _profile_column():
+        """One column of the Profile tab: (container, its layout)."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        return w, lay
+
+    def _profile_column_widths(self, cap: int) -> tuple:
+        """(left, right) column widths for a panel of `cap` usable pixels.
+
+        Returns the same width twice below the two-column threshold — the
+        FlowHost then wraps them and each column runs the full width."""
+        self._prof_two_col = cap >= self._PROFILE_MIN_2COL
+        if not self._prof_two_col:
+            return cap, cap
+        right = self._PROFILE_RIGHT_W
+        return cap - right - self._PROFILE_GAP, right
+
+    def _arrange_profile_blocks(self):
+        """Put each block in the column that keeps the two even.
+
+        There are two arrangements, because there are two tabs. A HITTER has
+        all eight blocks and they split as three left / five right. A PITCHER
+        loses the three hitter-only ones (park indices, stance/running, xHR),
+        which are two of the three on the left — leaving the percentile stack
+        alone against five blocks, and a 12-bar stack cannot legibly stretch
+        to 500px to cover for them. Moving contact quality across restores
+        the balance (measured 337 against 332).
+
+        Re-parenting is not free, so this only runs when the arrangement
+        actually changes, not on every width sync.
+        """
+        left, right = self._prof_left, self._prof_right
+        hitter = not self._tbl_plus.isHidden()
+        if getattr(self, "_prof_mode", None) == hitter:
+            return
+        self._prof_mode = hitter
+        if hitter:
+            order = ((left, (self._pct_holder, self._tbl_plus, self._tbl_xhr)),
+                     (right, (self._tbl_disc, self._tbl_bb, self._tbl_cq,
+                              self._tbl_situ, self._tbl_bio)))
+        else:
+            order = ((left, (self._pct_holder, self._tbl_cq)),
+                     (right, (self._tbl_disc, self._tbl_bb, self._tbl_situ,
+                              self._tbl_plus, self._tbl_xhr, self._tbl_bio)))
+        for col, widgets in order:
+            lay = col.layout()
+            for i, w in enumerate(widgets):
+                # Insert AT ITS INDEX, not "before the last item". Qt takes a
+                # widget out of its old position first, so `count() - 1`
+                # shifts under you and lands the block after the trailing
+                # stretch — which shows up as a 6px gap at the top of the
+                # column and the order quietly rotated by one.
+                lay.insertWidget(i, w)
+
+    def _balance_profile_columns(self):
+        """Make the two Profile columns exactly as tall as each other.
+
+        Every block on the tab has a fixed height (`_fit_table` pins it to
+        its content) except the percentile stack, whose bars share the height
+        by grid stretch. So the balance is arithmetic, not a negotiation:
+        measure both columns, and give the difference to the stack.
+
+        Called after every re-fit, because a table's height changes with the
+        player — a hitter with no vL batted balls has one row fewer, and the
+        hidden hitter-only blocks take a pitcher's right column down by two.
+        """
+        left = getattr(self, "_prof_left", None)
+        right = getattr(self, "_prof_right", None)
+        holder = getattr(self, "_pct_holder", None)
+        if left is None or right is None or holder is None:
+            return
+
+        def col_height(col: QWidget, skip=None) -> int:
+            lay = col.layout()
+            total, n = 0, 0
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None or not w.isVisibleTo(col) or w is skip:
+                    continue
+                total += w.height()
+                n += 1
+            return total + max(0, n - 1) * lay.spacing()
+
+        bars = self._pct_grid.count()
+        if not bars:
+            return
+        if not getattr(self, "_prof_two_col", True):
+            # WRAPPED: the columns are stacked, so there is nothing to
+            # balance against — matching their heights here would stretch the
+            # stack to the height of everything below it (measured: 15 bars
+            # over 500px on a narrow panel). Natural height, and let the
+            # column be as tall as it is.
+            holder.setFixedHeight(bars * 18)
+            for col in (left, right):
+                col.setMaximumHeight(self._UNCAPPED)
+                col.setMinimumHeight(0)
+                col.setFixedHeight(col.sizeHint().height())
+            return
+        # The stack's own share of the left column, then what the right
+        # column needs it to be. Clamped: a stack of 15 bars cannot shrink
+        # below legibility just because the other column is short, and it
+        # should not stretch into a chart just because the other is long.
+        others = col_height(left, skip=holder)
+        want = col_height(right) - others - (self._pct_grid.spacing()
+                                             if others else 0)
+        want = max(bars * self._PCT_BAR_MIN,
+                   min(bars * self._PCT_BAR_MAX, want))
+        holder.setFixedHeight(want)
+        # Columns get an explicit height so the FlowHost (which reads size
+        # hints, not stretch factors) lays them out at the balanced size
+        # rather than at each column's own natural height.
+        h = max(col_height(left), col_height(right))
+        for col in (left, right):
+            col.setFixedHeight(h)
 
     def _available_width(self) -> int:
         """Width the panel actually has to lay out in. When wrapped in a
@@ -9206,17 +9751,98 @@ class PlayerDetailPanel(QWidget):
         cap = (max(260, avail - self._FLANK_MARGIN) if avail else 10 ** 6)
         self._flank_target = cap
 
+        # The Profile tab lays out in two columns, so its blocks answer to
+        # their COLUMN's width, not the panel's. Sizing the columns first
+        # means the loop below has a target for every table on that tab.
+        #
+        # The budget is the panel's cap less a FIXED inset, and deliberately
+        # not the flow's own measured width. Reading the flow looks more
+        # accurate and is a trap: the page lays out under SetMinimumSize, so
+        # the flow's width is partly a function of the column widths this
+        # very calculation sets. One narrow measurement (a sync that lands
+        # before the panel's resize has propagated) then pins the page's
+        # minimum at the narrow value, the flow never grows back, and the tab
+        # is stuck in its single-column fallback for the rest of the session
+        # — which is exactly what a pitcher's tab did.
+        left = getattr(self, "_prof_left", None)
+        right = getattr(self, "_prof_right", None)
+        if left is not None and right is not None:
+            # Which block sits in which column first — the fill targets below
+            # are read off whichever column each one ended up in, so this has
+            # to settle before the widths do.
+            self._arrange_profile_blocks()
+            left_w, right_w = self._profile_column_widths(
+                (cap - self._PROFILE_INSET) if avail
+                else self._PROFILE_MIN_2COL)
+            left.setFixedWidth(left_w)
+            right.setFixedWidth(right_w)
+            for name in ("_tbl_plus", "_tbl_xhr", "_tbl_disc", "_tbl_bb",
+                         "_tbl_cq", "_tbl_situ", "_tbl_bio"):
+                t = getattr(self, name, None)
+                if t is not None:
+                    t._fill_w = (left_w if t.parentWidget() is left
+                                 else right_w)
+            self._pct_holder.setFixedWidth(left_w)
+
         for name in ("_tbl_velo", "_tbl_pitch", "_tbl_situ", "_tbl_count",
                      "_tbl_gamelog", "_tbl_bb", "_tbl_mix", "_tbl_zone",
                      "_tbl_disc", "_tbl_form", "_tbl_attack", "_tbl_dir", "_tbl_dwin",
                      "_tbl_rest", "_tbl_split", "_tbl_plus",
                      "_tbl_bio", "_tbl_lev", "_tbl_pbot", "_tbl_az",
+                     "_tbl_cq", "_tbl_xhr",
                      "_tbl_pfx"):
             t = getattr(self, name, None)
             nat = getattr(t, "_natural_w", 0) if t is not None else 0
             if not nat:
                 continue
-            width = min(nat, cap)
+            # A Profile block fills its COLUMN; everything else, the panel.
+            target = min(cap, getattr(t, "_fill_w", cap))
+            width = min(nat, target)
+            hdr_t = t.horizontalHeader()
+            # A table flagged `_expand_full` takes the WHOLE panel width when
+            # its content is narrower, instead of hugging its columns and
+            # leaving half the tab empty. The surplus is spread evenly across
+            # the columns, with the remainder to the label column, so the
+            # numbers stay evenly spaced rather than all the air landing in
+            # one place.
+            #
+            # It only ever GROWS. A ResizeToContents width IS the content
+            # width — there is no padding in it to reclaim — so squeezing a
+            # column below it does not tighten the table, it elides the
+            # values ("1…" for a PA, ".2…" for an OBP). When the content is
+            # genuinely wider than the panel this falls through to the
+            # ordinary cap-and-scroll path, which loses the right-hand
+            # columns but keeps every visible number readable.
+            # >2 columns: the placeholder states ("Splits — not loaded", which
+            # is what a PITCHER gets, since the FG split ids are hitter-only)
+            # are single-column tables, and stretching one of those across the
+            # panel draws a 738px empty bar where a short label belongs.
+            if (getattr(t, "_expand_full", False) and target > nat
+                    and t.columnCount() > 2):
+                base = getattr(t, "_natural_cols", None) or [
+                    t.columnWidth(c) for c in range(t.columnCount())]
+                n = len(base)
+                extra = target - nat
+                # PROPORTIONAL to each column's natural width, not an equal
+                # slice. Equal slices push a 30px number column and a 90px
+                # label column apart by the same amount, which on a table
+                # stretched half again its width leaves the numbers floating
+                # in the middle of their cells. Proportional keeps the shape
+                # the content asked for — and in the paired blocks it hands
+                # the slack to the two LABEL columns, which are the widest
+                # and the ones that can use it.
+                tot = sum(base) or 1
+                widths = [bw + extra * bw // tot for bw in base]
+                widths[0] += target - nat - sum(w - b for w, b
+                                                in zip(widths, base))
+                hdr_t.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+                for c, w in enumerate(widths):
+                    t.setColumnWidth(c, w)
+                t.setFixedWidth(target)
+                nat_h = getattr(t, "_natural_h", 0)
+                if nat_h:
+                    t.setFixedHeight(nat_h)
+                continue
             t.setFixedWidth(width)
             # Column 0 only stretches when the table was CAPPED; at natural
             # width stretching it just pads the label column with air.
@@ -9238,7 +9864,6 @@ class PlayerDetailPanel(QWidget):
             # Below the floor, column 0 goes Fixed and the table scrolls
             # instead. Scrolling the numeric columns is recoverable; scrolling
             # away the identity column is not.
-            hdr_t = t.horizontalHeader()
             if width < nat:
                 nat_c0 = getattr(t, "_natural_c0", 0)
                 others = sum(t.columnWidth(c)
@@ -9260,6 +9885,10 @@ class PlayerDetailPanel(QWidget):
                 sb = (t.horizontalScrollBar().sizeHint().height()
                       if width < nat else 0)
                 t.setFixedHeight(nat_h + sb)
+        # Heights are final now, so the Profile columns can be squared up —
+        # before the flows re-pin, since the columns' heights are what those
+        # flows are about to lay out.
+        self._balance_profile_columns()
         # Every table above just changed size, which re-wraps the flows they
         # sit in. A FlowHost only re-pins its height on its OWN resize, and
         # resizing a child does not resize the host — so it has to be told,
@@ -9399,9 +10028,15 @@ class PlayerDetailPanel(QWidget):
     # ------------------------------------------------------- FanGraphs splits
 
     def show_fg_splits(self, splits: Dict[str, Dict[int, dict]], pid: int,
-                       season_wrc: Optional[float]):
-        """League-wide FG split boards + which player to pull out of them."""
-        self._fg_split_data = (splits, pid, season_wrc)
+                       season_wrc: Optional[float],
+                       batted: Optional[Dict[str, Dict[int, dict]]] = None):
+        """League-wide FG split boards + which player to pull out of them.
+
+        `batted` is the type-3 (batted-ball) board for the same splits. It
+        arrives on its own request and may be None; the table just leaves
+        those columns empty.
+        """
+        self._fg_split_data = (splits, pid, season_wrc, batted)
         self._render_splits()
 
     def _tonight_splits(self) -> set:
@@ -9430,12 +10065,26 @@ class PlayerDetailPanel(QWidget):
             table.setHorizontalHeaderLabels(["Splits — not loaded"])
             self._fit_table(table)
             return
-        splits, pid, season_wrc = data
+        splits, pid, season_wrc, batted = data
         show_all = self._split_all.isChecked()
         rows = split_profile(splits, pid, season_wrc,
-                             min_pa=0 if show_all else SPLIT_MIN_PA)
+                             min_pa=0 if show_all else SPLIT_MIN_PA,
+                             batted=batted)
         today = self._tonight_splits()
         self._split_chart.set_rows(rows, season_wrc, today)
+        if not rows:
+            # A PITCHER lands here every time — the split ids in FG_SPLIT_IDS
+            # were verified against batting PA and the panel deliberately
+            # passes him an empty board. Drawing the 18-column header over no
+            # rows (with its own h-scrollbar) implies the numbers are still
+            # loading; they are not coming.
+            self._split_head.setText("")
+            table.setColumnCount(1)
+            table.setHorizontalHeaderLabels(
+                ["Splits — hitters only (FanGraphs split boards)"])
+            self._fit_table(table)
+            self._sync_flank_widths()
+            return
 
         # Header: the platoon read, shrunk. This is the one split with a
         # measured true-variance behind it, so it is the only one that gets
@@ -9460,10 +10109,51 @@ class PlayerDetailPanel(QWidget):
             " &nbsp;·&nbsp; ".join(bits)
             or "no season line — splits shown without z-scores")
 
-        headers = ["Split", "PA", "Sh", "wRC+", "±", "z", "wOBA", "ISO",
-                   "BABIP", "BB%", "K%"]
+        # The rate line first (what happened), then the plate approach, then
+        # the batted-ball profile (HOW it happened) — the last block is the
+        # type-3 board and is blank when that request did not land.
+        # The column budget is the PANEL: 18 of these fill it at their natural
+        # widths, and one more does not fit without the table growing an
+        # internal scrollbar. So nothing DERIVABLE from a neighbour gets one.
+        # AVG is inside OBP/SLG/wOBA; OPS is OBP+SLG; BB/K is BB% over K%;
+        # Cent is 1 - Pull - Oppo; share-of-group is PA against the group's
+        # own total; and '±' is a pure function of PA that the chart above
+        # already draws as the band behind every dot.
+        #
+        # The last six carry no '%' because they share one denominator —
+        # BALLS IN PLAY, not PA — and saying so once in the tooltip is
+        # cheaper than six percent signs that also imply the wrong base.
+        headers = ["Split", "PA", "wRC+", "z", "wOBA",
+                   "OBP", "SLG", "ISO", "BABIP", "BB%", "K%",
+                   "LD", "GB", "FB", "HR/FB", "Pull", "Oppo", "Hard"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
+        # Column-0 header stays "Split"; the rest get their own tooltip so a
+        # 20-wide row of abbreviations is still readable.
+        _bip = "\n\nPercent of BALLS IN PLAY, not of PA — a thinner sample "
+        _col_tips = {
+            "PA": "Plate appearances in this split. Everything else in the "
+                  "row is a rate over them, and the sampling band on the "
+                  "chart above is a function of this number alone.",
+            "z": "Sigmas between this split and the player's own season line. "
+                 "Under 1 the split has said nothing.",
+            "LD": "Line drives." + _bip + "than the PA column suggests.",
+            "GB": "Ground balls." + _bip + "than the PA column suggests.",
+            "FB": "Fly balls." + _bip + "than the PA column suggests.",
+            "HR/FB": "Home runs per FLY BALL. The BABIP of power — it swings "
+                     "hard on small samples, so read it against the row's PA.",
+            "Pull": "Pulled." + _bip + "than the PA column suggests.",
+            "Oppo": "The other way." + _bip + "than the PA column suggests.",
+            "Hard": "FanGraphs' hard-hit share (its own batted-ball "
+                    "classification, NOT Statcast's 95mph definition)."
+                    + _bip + "than the PA column suggests.",
+        }
+        for c, h in enumerate(headers):
+            tip = _col_tips.get(h)
+            if tip:
+                item = QTableWidgetItem(h)
+                item.setToolTip(tip)
+                table.setHorizontalHeaderItem(c, item)
         cell = self._cell
         highlight_bg = QColor(24, 42, 58)
         last_group = None
@@ -9501,23 +10191,33 @@ class PlayerDetailPanel(QWidget):
             table.insertRow(rix)
             vals = [
                 f"{r['pa']:.0f}",
-                f"{r['share']*100:.0f}%" if r.get("share") else "",
                 f"{r['wrc']:.0f}" if r.get("wrc") is not None else "",
-                f"±{r['sd']:.0f}" if r.get("sd") else "",
                 f"{z:+.1f}" if z is not None else "",
-                fmt3(r.get("woba")), fmt3(r.get("iso")), fmt3(r.get("babip")),
+                fmt3(r.get("woba")),
+                fmt3(r.get("obp")), fmt3(r.get("slg")),
+                fmt3(r.get("iso")), fmt3(r.get("babip")),
                 pct(r.get("bb")), pct(r.get("k")),
+                pct(r.get("ld")), pct(r.get("gb")), pct(r.get("fb")),
+                pct(r.get("hrfb")), pct(r.get("pull")), pct(r.get("oppo")),
+                pct(r.get("hard")),
             ]
             items = [cell(r["split"], align_right=False)] + [cell(v) for v in vals]
-            # Colour the wRC+ and z cells by SIGMAS — see SplitBandChart
+            # Colour the wRC+ and z cells by SIGMAS — see SplitBandChart.
+            # (2 = wRC+, 3 = z, counting the label column.)
+            _C_WRC, _C_Z = 2, 3
             if z is not None and abs(z) >= 1:
                 col = QColor("#2ECC71") if z > 0 else QColor("#E74C3C")
                 if abs(z) >= 2:
                     col = QColor("#27AE60") if z > 0 else QColor("#C0392B")
-                items[3].setForeground(col)
-                items[5].setForeground(col)
+                items[_C_WRC].setForeground(col)
+                items[_C_Z].setForeground(col)
             else:
-                items[5].setForeground(QColor("#7F8C8D"))
+                items[_C_Z].setForeground(QColor("#7F8C8D"))
+            # The PA column carries the row's own confidence: a rate over 20
+            # trips is a story, not a measurement, and the reader should be
+            # able to see that without doing the arithmetic.
+            if r["pa"] < SPLIT_MIN_PA * 2:
+                items[1].setForeground(QColor("#7F8C8D"))
             if r["split"] in today:
                 for it in items:
                     it.setBackground(highlight_bg)
@@ -9529,6 +10229,23 @@ class PlayerDetailPanel(QWidget):
         table.resizeRowsToContents()
         self._fit_table(table)
         self._sync_flank_widths()
+
+    @staticmethod
+    def _is_night_game(game_time: Optional[str]) -> Optional[bool]:
+        """True if a local 'h:mm AM/PM' first pitch is a NIGHT game.
+
+        MLB's own day/night flag is not on the context, so this reproduces
+        its convention: 5pm local and later is a night game. Returns None
+        when the string is not a time we can read, so the caller can simply
+        not highlight anything rather than guess.
+        """
+        if not game_time:
+            return None
+        try:
+            t = datetime.strptime(game_time.strip().upper(), "%I:%M %p")
+        except (ValueError, AttributeError):
+            return None
+        return t.hour >= 17
 
     def show_situational(self, splits: Dict[str, dict], group: str):
         """Season situational splits (Home/Road, Day/Night, vs L/R) from
@@ -9559,14 +10276,26 @@ class PlayerDetailPanel(QWidget):
                 return None
 
         if hitting:
-            headers = ["Split", "PA", "AVG", "OBP", "SLG", "OPS",
+            headers = ["Time", "PA", "AVG", "OBP", "SLG", "OPS",
                        "HR", "XBH", "SB", "BB%", "K%"]
         else:
             headers = ["Split", "BF", "IP", "ERA", "WHIP",
                        "K", "BB", "HR", "AVGa", "OPSa"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
-        table.setToolTip("Season splits: venue, time of day, platoon")
+        if hitting:
+            table.setToolTip(
+                "Day / night, from MLB StatsAPI.\n\n"
+                "This block used to carry venue, platoon and RISP as well. "
+                "The Splits tab now says all three off the FanGraphs splits "
+                "boards with wRC+, a sampling band and a batted-ball profile "
+                "behind them, which is strictly more than a triple-slash "
+                "line — so only the rows that board CANNOT produce are left "
+                "here. Day/night is one of them.\n\n"
+                "The highlighted row is tonight's, by first pitch (5pm local "
+                "and later counts as a night game).")
+        else:
+            table.setToolTip("Season splits: venue, time of day, platoon")
 
         # Which rows describe today's game (from the matchup context)
         today_codes = set()
@@ -9575,10 +10304,21 @@ class PlayerDetailPanel(QWidget):
             today_codes.add("h" if ctx.is_home else "a")
             if hitting and ctx.opp_pitcher_hand in ("L", "R"):
                 today_codes.add("vl" if ctx.opp_pitcher_hand == "L" else "vr")
+            if hitting:
+                night = self._is_night_game(ctx.game_time)
+                if night is not None:
+                    today_codes.add("n" if night else "d")
+
+        # For a HITTER the venue / platoon / RISP rows are the Splits tab's
+        # job now (and it does it better — see the tooltip above). Day/night
+        # is the one cut the FanGraphs split ids do not cover, so it is the
+        # one that stays. A PITCHER has no FG splits board at all, so his
+        # table keeps every row.
+        codes = ("d", "n") if hitting else MLBPropStats.SITU_CODES
 
         highlight_bg = QColor(24, 42, 58)     # subtle blue row tint
         r = 0
-        for code in MLBPropStats.SITU_CODES:
+        for code in codes:
             s = splits.get(code)
             if not s:
                 continue
@@ -9819,8 +10559,15 @@ class PlayerDetailPanel(QWidget):
         # 388px cap, and the shared column-0 Stretch then squeezed the label
         # column to "ted l". Every cell already prints its own % sign, so the
         # header does not need to. Trimming beats dropping a statistic.
+        # Pull/Cent/Oppo used to sit here as three plain shares — the same
+        # three the park-index table below prints RAW AND park-adjusted, and
+        # two of which the Splits tab now carries per split. What no other
+        # block can say is the CROSS: pulled in the air is the batted ball
+        # that leaves the yard, and pulled on the ground is the one that
+        # finds the shift. So the plain shares go (they are still two blocks
+        # away) and the cross takes their place.
         headers = ["Split", "BBE", "GB", "LD", "FB", "PU",
-                   "Pull", "Cent", "Oppo", "Shift"]
+                   "Pl-Air", "Pl-GB", "Op-Air", "Shift"]
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         cell = self._cell
@@ -9830,8 +10577,17 @@ class PlayerDetailPanel(QWidget):
             table.setItem(r, 0, cell(d["split"], align_right=False))
             table.setItem(r, 1, cell(f"{d['n']}"))
             for c, k in enumerate(("gb", "ld", "fb", "pu",
-                                   "pull", "cent", "oppo", "shift"), start=2):
-                table.setItem(r, c, cell(pct(d[k])))
+                                   "pull_air", "pull_gb", "oppo_air",
+                                   "shift"), start=2):
+                it = cell(pct(d.get(k)))
+                # League pull-air is ~19%; above ~24% is a power profile and
+                # the one cell on this table worth colouring.
+                if k == "pull_air" and d.get(k) is not None:
+                    if d[k] >= 0.24:
+                        it.setForeground(QColor("#2ECC71"))
+                    elif d[k] <= 0.14:
+                        it.setForeground(QColor("#E74C3C"))
+                table.setItem(r, c, it)
         self._fit_table(table)
         self._sync_flank_widths()
 
@@ -10605,10 +11361,155 @@ class PlayerDetailPanel(QWidget):
         self._spray_points = None
         self._swing_row.hide()
 
+    @staticmethod
+    def _fill_paired(table: QTableWidget, headers: List[str],
+                     groups: List[List[list]]):
+        """Lay key-value entries out in side-by-side groups.
+
+        A key-value block is naturally one entry per row, which makes it tall
+        and narrow — the shape that wrecked the Profile tab's packing (a
+        16-row index table stood 393px tall beside 88px of discipline). Laid
+        out in groups it is half the height and twice the width, which is the
+        shape the tab actually has room for.
+
+        THE GROUPS ARE PASSED IN, not sliced off a count, because every block
+        that uses this splits on a MEANING — rate stats | batted-ball stats,
+        stance | running, totals | margins — and a count split silently walks
+        off that seam the moment one value is missing for a player. The
+        groups may be different lengths; the short one just ends early.
+
+        Each entry is a list of already-built QTableWidgetItems. `headers` is
+        either one header set (repeated across the groups) or one per group —
+        the latter is how a block names its own seam, so the reader sees
+        "Stance … Run" rather than the same word twice.
+        """
+        per_group = (headers if headers and isinstance(headers[0], list)
+                     else [headers] * len(groups))
+        per = len(per_group[0])
+        rows = max((len(g) for g in groups), default=0)
+        table.setColumnCount(per * len(groups))
+        table.setHorizontalHeaderLabels(
+            [h for hs in per_group for h in hs])
+        table.setRowCount(rows)
+        for g, entries in enumerate(groups):
+            for r, cells in enumerate(entries):
+                for c, item in enumerate(cells):
+                    table.setItem(r, g * per + c, item)
+
+    # Savant `launch_speed_angle`, best contact first. (label, code)
+    _CQ_BUCKETS = ((6, "Barrel"), (5, "Solid"), (4, "Flare/Burn"),
+                   (3, "Under"), (2, "Topped"), (1, "Weak"))
+
+    def _render_contact_quality(self):
+        """The six EV-x-LA buckets, off the pitch detail already cached."""
+        table = self._tbl_cq
+        table.setRowCount(0)
+        rows = getattr(self, "_pitch_rows", None) or []
+        bip = [r for r in rows if r.get("lsa") in (1.0, 2.0, 3.0, 4.0, 5.0,
+                                                   6.0)]
+        if not bip:
+            table.setColumnCount(1)
+            table.setHorizontalHeaderLabels(["Contact quality — no data"])
+            self._fit_table(table)
+            return
+        headers = ["Contact", "BBE", "%", "xwOBA", "EV"]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        cell = self._cell
+        total = len(bip)
+        table.setRowCount(len(self._CQ_BUCKETS))
+        for r, (code, label) in enumerate(self._CQ_BUCKETS):
+            got = [b for b in bip if b["lsa"] == float(code)]
+            xw = [b["xwoba"] for b in got if b.get("xwoba") is not None]
+            ev = [b["ev"] for b in got if b.get("ev") is not None]
+            vals = [
+                str(len(got)),
+                f"{len(got) / total * 100:.1f}",
+                (f"{sum(xw) / len(xw):.3f}".lstrip("0") if xw else ""),
+                (f"{sum(ev) / len(ev):.1f}" if ev else ""),
+            ]
+            lab = cell(label, align_right=False)
+            if code >= 5:
+                fnt = lab.font(); fnt.setBold(True); lab.setFont(fnt)
+            table.setItem(r, 0, lab)
+            for c, v in enumerate(vals, start=1):
+                it = cell(v)
+                # A bucket nobody hit is not a zero worth reading at full
+                # contrast — grey it so the eye goes to the ones with weight.
+                if not got:
+                    it.setForeground(QColor("#7F8C8D"))
+                table.setItem(r, c, it)
+        table.resizeRowsToContents()
+        self._fit_table(table)
+
+    def set_hitter_boards(self, take: Optional[dict], xhr: Optional[dict]):
+        """Two league-wide Savant boards for the shown hitter: swing/take run
+        value by attack zone, and expected home runs.
+
+        Both were already being fetched for the pitcher panel's opponent
+        strip; this is the same cached board read from the hitter's own
+        page."""
+        self._swing_take_rec = take
+        self._xhr_rec = xhr
+        # The attack-zone table is drawn from the FanGraphs row, which arrives
+        # on a different task — redraw it with whichever half is in hand.
+        self._render_attack_zones(getattr(self, "_swing_fgb", None))
+        self._render_xhr()
+        self._sync_flank_widths()
+
+    # `doubters` and `mostly_gone` are on the board and deliberately NOT here:
+    # they do not reconcile with the home-run total (Larnach 2026 reads 3 + 10
+    # + 5 against 10 actual HR, Alvarez 7 + 24 + 22 against 35), so whatever
+    # they count, it is not a partition of his home runs and this panel will
+    # not print a number it cannot describe. `no_doubter_pct` IS verified —
+    # it equals no_doubters / HR exactly, on every season tested.
+    # (label, key, format, group) — the count and what it should have been on
+    # the left, how convincing they were on the right.
+    _XHR_ROWS = (("HR", "hr", "{:.0f}", 0), ("xHR", "xhr", "{:.1f}", 0),
+                 ("HR−xHR", "diff", "{:+.1f}", 0),
+                 ("No doubt", "no_doubters", "{:.0f}", 1),
+                 ("NoDbt%", "no_doubter_pct", "{:.0f}%", 1),
+                 ("Trot", "trot", "{:.1f}s", 1))
+
+    def _render_xhr(self):
+        table = self._tbl_xhr
+        table.setRowCount(0)
+        rec = getattr(self, "_xhr_rec", None) or {}
+        pairs = [(lab, fmt.format(rec[k]), grp)
+                 for lab, k, fmt, grp in self._XHR_ROWS
+                 if rec.get(k) is not None]
+        if not pairs:
+            # Hidden, not "no data": a hitter with no home runs is simply
+            # absent from this board, and a pitcher never belongs on it.
+            table.setVisible(False)
+            self._fit_table(table)
+            return
+        table.setVisible(True)
+        cell = self._cell
+        groups = ([], [])
+        for label, val, grp in pairs:
+            it = cell(val)
+            if label == "HR−xHR":
+                d = rec.get("diff") or 0
+                # Savant's sign: positive = MORE home runs than the contact
+                # deserved. Coloured as luck, not as skill — green is the
+                # hitter who has been getting away with it and is the one to
+                # fade, so it is deliberately the same green/red the rest of
+                # the panel uses for "running hot" / "running cold".
+                if d >= 2:
+                    it.setForeground(QColor("#2ECC71"))
+                elif d <= -2:
+                    it.setForeground(QColor("#E74C3C"))
+            groups[grp].append([cell(label, align_right=False), it])
+        self._fill_paired(table, [["xHR", ""], ["Margin", ""]], list(groups))
+        table.resizeRowsToContents()
+        self._fit_table(table)
+
     def set_pitch_rows(self, rows: List[dict]):
         """Raw cached pitch detail — the attack profile needs per-pitch rows
         with dates, which none of the aggregated feeds preserve."""
         self._pitch_rows = rows
+        self._render_contact_quality()
         self._render_rest()
         if self._summary is not None:
             self._render_attack(self._summary)
@@ -10633,26 +11534,36 @@ class PlayerDetailPanel(QWidget):
         self.show_swing(getattr(self, "_swing_fgb", None))
 
     # Park-adjusted index rows: (label, index key, raw key, raw format,
-    # higher_is_better). Directionality is per row and NOT uniform — a high
-    # K+ is bad and a high ISO+ is good, so a single colour rule would paint
-    # half the table backwards.
+    # higher_is_better, group). Directionality is per row and NOT uniform — a
+    # high K+ is bad and a high ISO+ is good, so a single colour rule would
+    # paint half the table backwards.
+    #
+    # `group` is the column pair the row lands in — 0 is the rate line, 1 the
+    # batted-ball profile. It is declared rather than derived from position
+    # so a hitter missing one value cannot shift the seam (see _fill_paired).
+    #
+    # The raw column is the point of the table, not decoration: an index of
+    # 123 says he beats his park at something, and only the raw beside it
+    # says what he actually does. Ten of these sixteen used to be blank
+    # because the raw rate was never mapped out of the FanGraphs row — the
+    # column was there, the numbers just were not.
     _PLUS_ROWS = (
-        ("AVG",   "avg_plus",   "xavg",     "f3",  True),
-        ("OBP",   "obp_plus",   None,       None,  True),
-        ("SLG",   "slg_plus",   "xslg",     "f3",  True),
-        ("ISO",   "iso_plus",   None,       None,  True),
-        ("BABIP", "babip_plus", None,       None,  True),
-        ("BB%",   "bb_plus",    None,       None,  True),
-        ("K%",    "k_plus",     None,       None,  False),
-        ("Hard%", "hard_plus",  "hard",     "pct", True),
-        ("Soft%", "soft_plus",  "soft",     "pct", False),
-        ("GB%",   "gb_plus",    None,       None,  None),
-        ("FB%",   "fb_plus",    None,       None,  None),
-        ("LD%",   "ld_plus",    None,       None,  True),
-        ("HR/FB", "hrfb_plus",  "hr_fb",    "pct", True),
-        ("Pull%", "pull_plus",  "pull_pct", "pct", None),
-        ("Cent%", "cent_plus",  None,       None,  None),
-        ("Oppo%", "oppo_plus",  None,       None,  None),
+        ("AVG",   "avg_plus",   "avg",       "f3",  True,  0),
+        ("OBP",   "obp_plus",   "obp",       "f3",  True,  0),
+        ("SLG",   "slg_plus",   "slg",       "f3",  True,  0),
+        ("ISO",   "iso_plus",   "iso",       "f3",  True,  0),
+        ("BABIP", "babip_plus", "babip_raw", "f3",  True,  0),
+        ("BB%",   "bb_plus",    "bb_pct",    "pct", True,  0),
+        ("K%",    "k_plus",     "k_pct",     "pct", False, 0),
+        ("Hard%", "hard_plus",  "hard",      "pct", True,  0),
+        ("Soft%", "soft_plus",  "soft",      "pct", False, 1),
+        ("GB%",   "gb_plus",    "gb_pct",    "pct", None,  1),
+        ("FB%",   "fb_plus",    "fb_pct",    "pct", None,  1),
+        ("LD%",   "ld_plus",    "ld_pct",    "pct", True,  1),
+        ("HR/FB", "hrfb_plus",  "hr_fb",     "pct", True,  1),
+        ("Pull%", "pull_plus",  "pull_pct",  "pct", None,  1),
+        ("Cent%", "cent_plus",  "cent_pct",  "pct", None,  1),
+        ("Oppo%", "oppo_plus",  "oppo_pct",  "pct", None,  1),
     )
 
     def _render_plus(self, fgb: Optional[dict]):
@@ -10662,16 +11573,17 @@ class PlayerDetailPanel(QWidget):
         rows = [r for r in self._PLUS_ROWS
                 if (fgb or {}).get(r[1]) is not None]
         if not rows:
-            table.setColumnCount(1)
-            table.setHorizontalHeaderLabels(["Park-adjusted — no data"])
+            # HIDE rather than draw an empty frame. This table is fed only by
+            # the FanGraphs BATTING row, so on a pitcher it is not "missing
+            # data" that might arrive — it is a block that does not apply, and
+            # a placeholder header for it is just noise on his profile.
+            table.setVisible(False)
             self._fit_table(table)
             return
-        headers = ["vs park", "Idx", "Raw"]
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
+        table.setVisible(True)
         cell = self._cell
-        table.setRowCount(len(rows))
-        for r, (label, ikey, rkey, rfmt, good_high) in enumerate(rows):
+        entries = ([], [])
+        for (label, ikey, rkey, rfmt, good_high, grp) in rows:
             idx = fgb.get(ikey)
             raw = fgb.get(rkey) if rkey else None
             if rfmt == "pct" and isinstance(raw, (int, float)):
@@ -10690,9 +11602,12 @@ class PlayerDetailPanel(QWidget):
                     it_idx.setForeground(QColor("#2ECC71"))
                 elif edge <= -15:
                     it_idx.setForeground(QColor("#E74C3C"))
-            table.setItem(r, 0, cell(label, align_right=False))
-            table.setItem(r, 1, it_idx)
-            table.setItem(r, 2, cell(raw_s))
+            entries[grp].append([cell(label, align_right=False), it_idx,
+                                 cell(raw_s)])
+        # Rate line | batted-ball profile, 8 rows each — each pair headed
+        # by what it is, since "vs park" twice says nothing about the seam.
+        self._fill_paired(table, [["Rate", "Idx", "Raw"],
+                                  ["Batted", "Idx", "Raw"]], list(entries))
         table.resizeRowsToContents()
         self._fit_table(table)
 
@@ -10732,7 +11647,13 @@ class PlayerDetailPanel(QWidget):
             table.setHorizontalHeaderLabels(["Attack zones — no data"])
             self._fit_table(table)
             return
-        headers = ["Attack", "Seen", "Sw", "Con"]
+        # RV is the run value of everything he did in that band — swings and
+        # takes together — from Savant's swing/take board. It is the column
+        # that turns the three rates beside it into a verdict: a hitter can
+        # swing less in the Chase band than league and still lose runs there,
+        # and until this column existed the table could not say so.
+        headers = ["Attack", "Seen", "Sw", "Con", "RV"]
+        take = getattr(self, "_swing_take_rec", None) or {}
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         cell = self._cell
@@ -10769,6 +11690,22 @@ class PlayerDetailPanel(QWidget):
             table.setItem(r, 1, mark(seen, lg_seen, None, "seen"))
             table.setItem(r, 2, mark(sw, lg_sw, sw_good, "swing"))
             table.setItem(r, 3, mark(con, lg_con, True, "contact"))
+            # The board has one figure per BAND, so the two Shadow sub-rows
+            # (in-zone / out) get nothing rather than the parent's number
+            # printed twice as if it were theirs.
+            rv = take.get({"H": "heart", "S": "shadow", "C": "chase",
+                           "W": "waste"}.get(pre, ""))
+            it_rv = cell(f"{rv:+.0f}" if rv is not None else "")
+            if rv is not None:
+                it_rv.setToolTip(
+                    f"{label.strip('· ')}: {rv:+.1f} runs on every pitch in "
+                    f"this band — swings and takes together, over the season "
+                    f"(so it scales with playing time, unlike the rates).")
+                if rv >= 3:
+                    it_rv.setForeground(QColor("#2ECC71"))
+                elif rv <= -3:
+                    it_rv.setForeground(QColor("#E74C3C"))
+            table.setItem(r, 4, it_rv)
         table.resizeRowsToContents()
         self._fit_table(table)
 
@@ -10841,42 +11778,51 @@ class PlayerDetailPanel(QWidget):
         table.resizeRowsToContents()
         self._fit_table(table)
 
+    # (label, key, format, group) — group 0 is where he STANDS, group 1 how
+    # he RUNS. The two are unrelated quantities that shared a block only
+    # because both are one number each; side by side they at least read as
+    # the two lists they are.
+    _BIO_ROWS = (
+        ("Depth in box", "depth_in_box", "{:.1f}\"", 0),
+        ("Off plate", "dist_off_plate", "{:.1f}\"", 0),
+        ("Tilt", "tilt", "{:.1f}°", 0),
+        ("Swing len", "swing_length", "{:.1f}′", 0),
+        ("Attack ang", "attack_angle", "{:+.1f}°", 0),
+        ("Attack dir", "attack_dir", "{:+.1f}°", 0),
+        ("Spd", "spd", "{:.1f}", 1),
+        ("BsR", "bsr", "{:+.1f}", 1),
+        ("UBR", "ubr", "{:+.1f}", 1),
+        ("wSB", "wsb", "{:+.1f}", 1),
+        ("XBR", "xbr", "{:+.1f}", 1),
+        ("TTO%", "tto", "pct", 1),
+    )
+
     def _render_bio(self, fgb: Optional[dict]):
         """Stance geometry + baserunning components."""
         table = self._tbl_bio
         table.setRowCount(0)
         f = fgb or {}
         pairs = []
-        for label, key, fmt in (
-                ("Depth in box", "depth_in_box", "{:.1f}\""),
-                ("Off plate", "dist_off_plate", "{:.1f}\""),
-                ("Tilt", "tilt", "{:.1f}°"),
-                ("Swing len", "swing_length", "{:.1f}′"),
-                ("Attack ang", "attack_angle", "{:+.1f}°"),
-                ("Attack dir", "attack_dir", "{:+.1f}°"),
-                ("Spd", "spd", "{:.1f}"),
-                ("BsR", "bsr", "{:+.1f}"),
-                ("UBR", "ubr", "{:+.1f}"),
-                ("wSB", "wsb", "{:+.1f}"),
-                ("XBR", "xbr", "{:+.1f}"),
-                ("TTO%", "tto", "pct")):
+        for label, key, fmt, grp in self._BIO_ROWS:
             v = f.get(key)
             if v is None:
                 continue
             pairs.append((label, f"{v:.1%}" if fmt == "pct"
-                          else fmt.format(v)))
+                          else fmt.format(v), grp))
         if not pairs:
-            table.setColumnCount(1)
-            table.setHorizontalHeaderLabels(["Stance / running — no data"])
+            # Same reasoning as the park-index table: batting stance and
+            # baserunning do not apply to a pitcher, so the block goes away
+            # rather than standing there empty.
+            table.setVisible(False)
             self._fit_table(table)
             return
-        table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["Stance / run", ""])
+        table.setVisible(True)
         cell = self._cell
-        table.setRowCount(len(pairs))
-        for r, (label, val) in enumerate(pairs):
-            table.setItem(r, 0, cell(label, align_right=False))
-            table.setItem(r, 1, cell(val))
+        groups = ([], [])
+        for label, val, grp in pairs:
+            groups[grp].append([cell(label, align_right=False), cell(val)])
+        self._fill_paired(table, [["Stance", ""], ["Running", ""]],
+                          list(groups))
         table.resizeRowsToContents()
         self._fit_table(table)
 
@@ -14336,7 +15282,8 @@ class OpponentCard(QWidget):
             self._lbl.setText("")
             return
         out = [f"<span style='color:#dc9437;font-weight:bold'>vs {team}</span>"
-               f"<span style='color:#7F8C8D'>{'' if posted else ' *'}</span>"]
+               f"<span style='color:#7F8C8D'>"
+               f"{'' if posted else ' proj'}</span>"]
         for order, name, wrc, pa in rows:
             thin = pa is not None and pa < self._MIN_PA
             if wrc is None:
@@ -14524,7 +15471,13 @@ class OpposingLineupStrip(QWidget):
         self._team, self._rows, self._posted = team, list(rows), posted
         self._hand = hand
         self.setToolTip(
-            "The nine he faces tonight, in posted order.\n\n"
+            ("The nine he faces tonight, in posted order.\n\n" if posted else
+             "PROJECTED lineup — the club has not filed its card yet, so "
+             "this is the beat-writer expectation (Rotowire) rather than the "
+             "official nine. The ORDER and the NAMES are the projection; "
+             "every number beside them is that hitter's real season figure. "
+             "It is replaced by the official card as soon as one exists.\n\n")
+             +
             "wRC+ in parentheses is under 60 PA — a sample, not a rate.\n"
             "B/L/R is the side he bats; gold means he has the platoon "
             "advantage over tonight's starter.\n\n"
@@ -14553,7 +15506,11 @@ class OpposingLineupStrip(QWidget):
         n = len(self._rows)
         # reserve a right gutter for the "vs LAD" tag. Drawn over the last
         # column it landed on top of that hitter's pull-air figure.
-        GUT = 26.0
+        # The gutter holds "vs TEAM", and on a projected card a PROJ badge
+        # under it. It widens only for the badge: a confirmed lineup should
+        # not pay for a label it never draws, and the 14px come straight off
+        # the nine hitter columns (1.5px each at panel width).
+        GUT = 26.0 if self._posted else 40.0
         W = max(1.0, self.width() - GUT)
         cw = W / float(n)
         f_name = QFont(); f_name.setPointSize(7); f_name.setBold(True)
@@ -14673,8 +15630,23 @@ class OpposingLineupStrip(QWidget):
                    Qt.AlignmentFlag.AlignLeft, "vs")
         p.setPen(QColor("#dc9437"))
         p.drawText(QRectF(W + 2, 25, GUT - 4, 11),
-                   Qt.AlignmentFlag.AlignLeft,
-                   f"{self._team}{'' if self._posted else '*'}")
+                   Qt.AlignmentFlag.AlignLeft, self._team)
+        # A projected card is not the club's card, and grey 6pt text was too
+        # quiet a way to say so on a panel where every other number is exact.
+        # A filled badge reads as a flag rather than as another statistic.
+        #
+        # Geometry: 3px under the team line, 34x15 inside a 40px gutter (so
+        # 3px of margin each side), leaving ~20px of clear space beneath it —
+        # the strip is 78 tall and nothing else in the gutter goes below 38.
+        if not self._posted:
+            badge = QRectF(W + 3, 39, GUT - 6, 15)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor("#dc9437")))
+            p.drawRoundedRect(badge, 3, 3)
+            f_badge = QFont(); f_badge.setPointSize(7); f_badge.setBold(True)
+            p.setFont(f_badge)
+            p.setPen(QColor("#12161c"))
+            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, "PROJ")
         p.end()
 
 
@@ -15956,10 +16928,24 @@ class PitcherFormPanel(QWidget):
         m = maps.get(opp) or {}
         slots = m.get("slots") or {}
         posted = bool(m.get("posted") and slots)
+        proj_names = {}
         if not posted:
-            self._opp_card.clear()
-            self._lineup_strip.clear()
-            return
+            # Nothing filed yet — which is the state this panel is in for most
+            # of the day, and it used to mean an empty band across the foot of
+            # it. A beat-writer projection is not the card the club will file,
+            # but it is nine real names in a real order against a known
+            # starter, and every number beside them is exact.
+            try:
+                proj = (await self._stats.get_projected_lineups()).get(opp)
+            except Exception as e:
+                print(f"PitcherFormPanel: projected lineup failed: {e}")
+                proj = None
+            if not proj:
+                self._opp_card.clear()
+                self._lineup_strip.clear()
+                return
+            slots = proj["slots"]
+            proj_names = proj.get("names") or {}
         by_id = {r["id"]: r for r in (self._stats._roster or {}).values()}
         # the two hitter boards the strip is built on — whole-board fetches,
         # cached, so this is one request each per session rather than per man
@@ -15995,6 +16981,19 @@ class PitcherFormPanel(QWidget):
                 "take": take_board.get(int(bid)) or {},
                 "ball": ball_board.get(int(bid)) or {},
             })
+        # A projected name that would not resolve to an id (a collision the
+        # page cannot settle — see _match_lineup_name) still holds its slot,
+        # with the name and no numbers. Dropping it would silently show a
+        # nine-man lineup as eight.
+        for order, nm in sorted(proj_names.items()):
+            if any(r["order"] == order for r in strip_rows):
+                continue
+            rows.append((order, nm, None, None))
+            strip_rows.append({"order": order, "name": nm, "wrc": None,
+                               "pa": None, "bats": None, "take": {},
+                               "ball": {}})
+        rows.sort(key=lambda r: r[0])
+        strip_rows.sort(key=lambda r: r["order"])
         if self._pid == pid:
             self._opp_card.set_lineup(opp, rows, posted)
             self._lineup_strip.set_lineup(opp, strip_rows, posted,
@@ -20513,9 +21512,29 @@ class MLBWindow(QMainWindow):
     # vertical scrollbar's gutter, plus the frame.
     RAIL_W = 200
 
+    # The animated Effort mark, same 200-frame loop every window in the suite
+    # runs (EffortOdds, the props window, the calculator, TT, radio).
+    ICON_FRAMES = 200
+    ICON_MS = 16                      # ~60fps, as elsewhere
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EffortMLB")
+        # Static mark first: the animation only starts once the loader is
+        # done (see `_start_icon_animation`), and until then the window
+        # should still carry the logo rather than Qt's default.
+        self._icon_dir = Path(__file__).resolve().parent / "appicon_frames"
+        self._icon_cache: Dict[int, QIcon] = {}
+        self.icon_frame = 0
+        self.icon_timer = None
+        still = Path(__file__).resolve().parent / "AppIcon.png"
+        if still.exists():
+            self.setWindowIcon(QIcon(str(still)))
+        # Straight away, not after the loader: the mark pulsing while the
+        # slate loads IS the point of it — a still icon over a loading window
+        # is the state it exists to replace. The frame cache below is what
+        # makes that affordable during the busiest stretch this window has.
+        self._start_icon_animation()
         self.stats = MLBPropStats()
 
         central = QWidget()
@@ -20713,6 +21732,38 @@ class MLBWindow(QMainWindow):
 
     def _on_loader_faded(self):
         self._loader = None
+
+    def _start_icon_animation(self):
+        """Run the animated Effort mark, from construction onward.
+
+        Frames are cached as decoded QIcons (the EffortOdds pattern, not the
+        naive one). That matters most during STARTUP, which is when this
+        runs: at 16ms the plain version re-reads a PNG off disk sixty times a
+        second, and on this window that read lands on the qasync loop, which
+        IS the GUI thread — the one already painting the seam loader and
+        laying out thirty panels. Cached, a tick is a dict lookup and a
+        setWindowIcon after the first lap.
+        """
+        if self.icon_timer is not None or not self._icon_dir.is_dir():
+            return
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setSingleShot(False)
+        self.icon_timer.timeout.connect(self.UpdateIcon)
+        self.icon_timer.start(self.ICON_MS)
+
+    def UpdateIcon(self):
+        icon = self._icon_cache.get(self.icon_frame)
+        if icon is None:
+            frame = self._icon_dir / f"frame{self.icon_frame:03d}.png"
+            if not frame.exists():
+                # A short/absent frame set is not worth a timer that fires
+                # sixty times a second forever.
+                self.icon_timer.stop()
+                return
+            icon = QIcon(str(frame))
+            self._icon_cache[self.icon_frame] = icon
+        self.setWindowIcon(icon)
+        self.icon_frame = (self.icon_frame + 1) % self.ICON_FRAMES
 
     def _sync_loader(self):
         if self._loader is not None:
@@ -21247,6 +22298,7 @@ class MLBWindow(QMainWindow):
         asyncio.create_task(self._load_traditional_stats(summary))
         asyncio.create_task(self._load_situational_splits(summary))
         asyncio.create_task(self._load_fg_splits(summary))
+        asyncio.create_task(self._load_hitter_boards(summary))
         if not summary.market_key.startswith("pitcher"):
             asyncio.create_task(self._load_matchup_batter(summary))
 
@@ -21319,10 +22371,45 @@ class MLBWindow(QMainWindow):
         except Exception as e:
             print(f"EffortMLB: FG splits failed: {e}")
             return
+        # The batted-ball board is a SECOND set of ~40 requests. It is fetched
+        # after the advanced one (never concurrently — the chunk pause exists
+        # because bursting `/api/*` 403s the leaders board too) and its
+        # failure is not allowed to take the rate columns down with it.
+        try:
+            batted = await self.stats.get_fg_splits(
+                "B", FG_SPLIT_TYPE_BATTED)
+        except Exception as e:
+            print(f"EffortMLB: FG batted-ball splits failed: {e}")
+            batted = None
         if (self.player_detail_panel.current_player_name()
                 == summary.player_name):
             self.player_detail_panel.show_fg_splits(
-                splits, summary.player_id, (fg or {}).get("wrcplus"))
+                splits, summary.player_id, (fg or {}).get("wrcplus"), batted)
+
+    async def _load_hitter_boards(self, summary):
+        """Swing/take run values + expected home runs for the shown hitter.
+
+        Both are LEAGUE-WIDE Savant CSVs already cached by the pitcher panel
+        (it reads them for the opponent lineup strip), so on any slate where
+        a pitcher card has been opened this costs nothing at all — and at
+        worst it is two boards a session, not two per player."""
+        if summary.market_key.startswith("pitcher"):
+            self.player_detail_panel.set_hitter_boards(None, None)
+            return
+        try:
+            async with self.stats.http() as session:
+                take = await self.stats.get_swing_take(session)
+                xhr = await self.stats.get_xhr(session)
+        except Exception as e:
+            print(f"EffortMLB: hitter boards failed: {e}")
+            return
+        # Re-check AFTER the awaits — a fast click-through would otherwise
+        # write this hitter's boards onto whoever is on screen now.
+        if (self.player_detail_panel.current_player_name()
+                == summary.player_name):
+            self.player_detail_panel.set_hitter_boards(
+                (take or {}).get(summary.player_id),
+                (xhr or {}).get(summary.player_id))
 
     async def _load_traditional_stats(self, summary):
         group = ("pitching" if summary.market_key.startswith("pitcher")
@@ -21337,6 +22424,17 @@ class MLBWindow(QMainWindow):
         if (pairs and self.player_detail_panel.current_player_name()
                 == summary.player_name):
             self.player_detail_panel.show_traditional(pairs)
+        if group != "hitting":
+            # A PITCHER never reaches show_swing below, and the panel is
+            # REUSED across players — so the park-index, stance/baserunning,
+            # leverage, attack-zone and pfx tables kept the last HITTER's
+            # numbers on screen under the pitcher's name. Not a flicker: they
+            # sat there for the whole visit, and a batting stance under a
+            # starter reads as real data. Blanking them is exactly what
+            # show_swing does when handed no row.
+            if (self.player_detail_panel.current_player_name()
+                    == summary.player_name):
+                self.player_detail_panel.show_swing(None)
         if group == "hitting":
             try:
                 fgb = await self.stats.get_fg_batting(summary.player_id)
