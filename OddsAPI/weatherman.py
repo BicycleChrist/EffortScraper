@@ -2,8 +2,15 @@ from PyQt6.QtGui import (QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath,
                          QLinearGradient, QRadialGradient, QPolygonF)
 from PyQt6.QtCore import Qt, QTimer, QPointF
 from PyQt6.QtWidgets import QWidget
+import datetime as _dt
+import hashlib
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+import json
 import math
+import os
 import random
+import time
 import numpy as np
 import requests
 from Creds import open_weather_key
@@ -434,7 +441,11 @@ STADIUM_DATA = {
         "image_path": "MLBstadiumgraphics/CoorsField.gif",
         "lat": 39.7559,
         "lon": -104.9942,
-        "altitude": 5280,  # Famous for high altitude
+        # MLB's venue record says 5190, and the ERA5 grid cell agrees (1585 m
+        # vs 1582). 5280 is the mile-high figure for the 20th row of the upper
+        # deck, not for the field — and this number is a direct air-density
+        # term, so it should be the field.
+        "altitude": 5190,
         "dimensions": {
             "left_field": 347,
             "left_center": 390,
@@ -593,7 +604,7 @@ STADIUM_DATA = {
         "image_path": "MLBstadiumgraphics/KauffmanStadium.gif",
         "lat": 39.0516,
         "lon": -94.4803,
-        "altitude": 750,
+        "altitude": 856,  # was 750; MLB says 856 and the ERA5 grid cell 869 ft
         "dimensions": {
             "left_field": 330,
             "left_center": 375,
@@ -1021,6 +1032,147 @@ STADIUM_DATA = {
 
 
 # ==============================================
+# Park orientation & roof
+# ==============================================
+# `azimuth` is the TRUE COMPASS BEARING, in degrees clockwise from north, of
+# the home-plate -> centre-field axis.  Values come straight from MLB's own
+# venue record (statsapi /api/v1/venues/{id}?hydrate=location -> location.
+# azimuthAngle), as does `roof` (fieldInfo.roofType).
+#
+# Without this the wind cannot be placed on the field at all.  The forecast
+# gives a compass bearing; BallFlightSimulator wants an angle in the field
+# frame (0 = from centre field).  Nothing else in this file records how a
+# park is turned, so before these numbers existed every stadium was implicitly
+# treated as though centre field pointed due north.
+#
+# Spot-checked against park landmarks rather than taken on faith, since a
+# wrong azimuth is invisible — it just quietly moves the wind:
+#   Wrigley 37    -> RF at 82 (Sheffield Ave, E), LF at 352 (Waveland, N)
+#   PNC 116       -> outfield faces the downtown skyline, ESE
+#   Great American 122 -> outfield faces the Ohio River, SE
+#   Oracle 85     -> RF at 130, i.e. McCovey Cove to the SE
+#   Coors 4       -> LF at 319, the Front Range to the NW
+#   Petco 0       -> LF pole at 315, the Western Metal building
+# The three parks reading exactly 0 (Chase, Petco, Progressive) are genuinely
+# oriented near due north; 0 is not a missing-data default here.
+PARK_ORIENTATION = {
+    "American Family Field":        {"azimuth": 129.0,  "roof": "retractable"},
+    "Angel Stadium":                {"azimuth":  43.61, "roof": "open"},
+    "Busch Stadium":                {"azimuth":  62.0,  "roof": "open"},
+    "Camden Yards":                 {"azimuth":  31.0,  "roof": "open"},
+    "Chase Field":                  {"azimuth":   0.0,  "roof": "retractable"},
+    "Citi Field":                   {"azimuth":  13.0,  "roof": "open"},
+    "Citizens Bank Park":           {"azimuth":   9.0,  "roof": "open"},
+    "Comerica Park":                {"azimuth": 150.0,  "roof": "open"},
+    "Coors Field":                  {"azimuth":   4.0,  "roof": "open"},
+    "Dodger Stadium":               {"azimuth":  26.0,  "roof": "open"},
+    "Fenway Park":                  {"azimuth":  45.0,  "roof": "open"},
+    "George M. Steinbrenner Field": {"azimuth":  60.0,  "roof": "open"},
+    "Globe Life Field":             {"azimuth":  30.0,  "roof": "retractable"},
+    "Great American Ball Park":     {"azimuth": 122.0,  "roof": "open"},
+    "Guaranteed Rate Field":        {"azimuth": 127.0,  "roof": "open"},
+    "Kauffman Stadium":             {"azimuth":  46.0,  "roof": "open"},
+    "LoanDepot Park":               {"azimuth": 128.0,  "roof": "retractable"},
+    "Minute Maid Park":             {"azimuth": 343.0,  "roof": "retractable"},
+    "Nationals Park":               {"azimuth":  28.0,  "roof": "open"},
+    "Oracle Park":                  {"azimuth":  85.0,  "roof": "open"},
+    "PNC Park":                     {"azimuth": 116.0,  "roof": "open"},
+    "Petco Park":                   {"azimuth":   0.0,  "roof": "open"},
+    "Progressive Field":            {"azimuth":   0.0,  "roof": "open"},
+    "Rogers Centre":                {"azimuth": 345.0,  "roof": "retractable"},
+    "Sutter Health Park":           {"azimuth":  46.0,  "roof": "open"},
+    "T-Mobile Park":                {"azimuth":  49.0,  "roof": "retractable"},
+    "Target Field":                 {"azimuth": 129.0,  "roof": "open"},
+    "Tropicana Field":              {"azimuth": 359.0,  "roof": "dome"},
+    "Truist Park":                  {"azimuth": 145.0,  "roof": "open"},
+    "Wrigley Field":                {"azimuth":  37.0,  "roof": "open"},
+    "Yankee Stadium":               {"azimuth":  75.0,  "roof": "open"},
+}
+
+# Fold onto STADIUM_DATA so consumers that already hold a park dict can read
+# `azimuth`/`roof` without a second lookup.  Kept as a separate table above
+# because it comes from a different source than the polar wall equations and
+# is refreshed independently.
+for _park, _o in PARK_ORIENTATION.items():
+    if _park in STADIUM_DATA:
+        STADIUM_DATA[_park].update(_o)
+del _park, _o
+
+
+def get_park_azimuth(stadium_name):
+    """Home-plate -> centre-field bearing in degrees clockwise from true
+    north, or None if the park is unknown."""
+    park = STADIUM_DATA.get(stadium_name) or PARK_ORIENTATION.get(stadium_name)
+    return park.get("azimuth") if park else None
+
+
+def get_park_roof(stadium_name):
+    """'open', 'retractable' or 'dome'.  Unknown parks are assumed open."""
+    park = STADIUM_DATA.get(stadium_name) or PARK_ORIENTATION.get(stadium_name)
+    return (park or {}).get("roof", "open")
+
+
+def wind_to_field_frame(met_direction_deg, stadium_name=None, azimuth=None):
+    """Rotate a meteorological wind bearing into BallFlightSimulator's frame.
+
+    Both conventions name the direction the wind blows FROM, and both are
+    measured clockwise when seen from above, so the rotation is a plain
+    subtraction:
+
+        field_angle = (met_bearing - park_azimuth) mod 360
+
+    In the returned frame 0 means the wind arrives from centre field (blowing
+    in), 90 from the first-base/right-field side, 180 from behind the plate
+    (blowing out to centre), 270 from the third-base/left-field side.
+
+    Sanity check, Wrigley (azimuth 37): a south-westerly at 200 maps to 163 —
+    from just off the plate, blowing out toward left-centre, which is the
+    classic Wrigley slugfest wind.  A northerly at 0 maps to 323 — in off
+    Waveland over the left-field wall.
+
+    Returns None when the park's orientation is unknown, so callers can tell
+    "no rotation applied" apart from "rotated by zero".
+    """
+    if azimuth is None and stadium_name is not None:
+        azimuth = get_park_azimuth(stadium_name)
+    if azimuth is None or met_direction_deg is None:
+        return None
+    return (float(met_direction_deg) - float(azimuth)) % 360.0
+
+
+# Statcast home_team code -> STADIUM_DATA park name. Includes legacy and
+# relocated codes (AZ/ARI, KC/KCR, SD/SDP, SF/SFG, TB/TBR, OAK/ATH, CWS/CHW).
+TEAM_TO_PARK = {
+    "ARI": "Chase Field", "AZ": "Chase Field",
+    "ATL": "Truist Park",
+    "BAL": "Camden Yards", "BOS": "Fenway Park",
+    "CHC": "Wrigley Field", "CWS": "Guaranteed Rate Field", "CHW": "Guaranteed Rate Field",
+    "CIN": "Great American Ball Park",
+    "CLE": "Progressive Field", "COL": "Coors Field",
+    "DET": "Comerica Park", "HOU": "Minute Maid Park",
+    "KC": "Kauffman Stadium", "KCR": "Kauffman Stadium",
+    "LAA": "Angel Stadium", "LAD": "Dodger Stadium",
+    "MIA": "LoanDepot Park", "MIL": "American Family Field",
+    "MIN": "Target Field", "NYM": "Citi Field", "NYY": "Yankee Stadium",
+    "OAK": "Sutter Health Park", "ATH": "Sutter Health Park",
+    "PHI": "Citizens Bank Park", "PIT": "PNC Park",
+    "SD": "Petco Park", "SDP": "Petco Park",
+    "SF": "Oracle Park", "SFG": "Oracle Park",
+    "SEA": "T-Mobile Park", "STL": "Busch Stadium",
+    "TB": "Tropicana Field", "TBR": "Tropicana Field",
+    "TEX": "Globe Life Field", "TOR": "Rogers Centre",
+    "WSH": "Nationals Park",
+}
+
+
+def get_park_for_team(team_code):
+    """Return the STADIUM_DATA park name for a Statcast home_team code, or None."""
+    if not team_code:
+        return None
+    return TEAM_TO_PARK.get(str(team_code).upper())
+
+
+# ==============================================
 # Weather Service Component
 # ==============================================
 class WeatherService:
@@ -1052,10 +1204,22 @@ class WeatherService:
         weather_data = {
             "wind_speed": weather_json["wind"]["speed"],
             "wind_direction": weather_json["wind"]["deg"],
+            # Bearing from true north, so it must be rotated by the park's
+            # azimuth before it means anything on a field.  Tagged rather
+            # than assumed because hand-set wind lands in the same key.
+            "wind_frame": "compass",
+            # Gusts drive the spread of a carry estimate, not its centre.
+            # Absent from the payload on calm days.
+            "wind_gust": weather_json["wind"].get("gust"),
             "temperature": weather_json["main"]["temp"],
             "humidity": weather_json["main"]["humidity"],
             "pressure_hpa": pressure_hpa,           # hPa  – for display
             "pressure_pa": pressure_hpa * 100.0,    # Pa   – for physics
+            # Which of the two we actually got.  grnd_level is measured at the
+            # station and is already field level; main.pressure is sea-level
+            # normalised and still needs the altitude reconstruction.  Feeding
+            # the wrong one into that branch costs ~27 ft of carry at Coors.
+            "pressure_frame": "station" if station_hpa is not None else "sealevel",
             "condition": weather_json["weather"][0]["main"],
             "description": weather_json["weather"][0]["description"],
             "precipitation": 0  # Default to 0
@@ -1136,6 +1300,727 @@ class WeatherService:
 
         # Restore painter state
         painter.restore()
+
+# ==============================================
+# Hourly Weather Archive & Forecast
+# ==============================================
+# WeatherService above answers one question — "what is it doing at this park
+# right now" — which is all the live HR widget ever needed.  Everything else
+# needs an hour and a date: what the air was doing when a 2024 fly ball was
+# struck, or what it will be doing at first pitch tonight.
+#
+# Open-Meteo serves all three regimes off one schema, which is why it is here
+# rather than OpenWeather's paid history product:
+#   * no API key, no quota to babysit
+#   * hourly, back to 1940
+#   * `surface_pressure` is STATION pressure, which is exactly the input
+#     calculate_air_density wants.  OpenWeather hands back sea-level-normalised
+#     pressure, which is why BallFlightSimulator carries that whole
+#     high-altitude reconstruction for Coors.  Archive rows do not need it.
+#   * every park in one request, each downscaled to its own field elevation.
+
+OPEN_METEO_ARCHIVE  = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_HIRES    = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+
+# The high-resolution archive only reaches back to 2022; ERA5 covers earlier
+# but on a ~25 km grid, which is coarse for a city-centre stadium.  They
+# disagree — 2024-07-04 19:00 at Wrigley is 8.6mph@165 (ERA5) against
+# 7.2mph@112 (hi-res), a 53 degree difference that would land in a different
+# park-factor bucket.  Rows are tagged with the source they came from so the
+# CPW training run can settle which one actually predicts carry, rather than
+# us guessing now.
+OPEN_METEO_HIRES_EPOCH = "2022-01-01"
+
+_OM_HOURLY_VARS = (
+    "temperature_2m", "relative_humidity_2m", "surface_pressure",
+    "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
+    "precipitation", "cloud_cover", "weather_code",
+)
+
+# Upper levels, so the trajectory can use a real wind profile instead of one
+# surface number.  ERA5 does not carry them (it returns nulls), so they are
+# requested only from the model-based endpoints and their absence is normal.
+_OM_WIND_LEVELS = ("wind_speed_80m", "wind_direction_80m",
+                   "wind_speed_120m", "wind_direction_120m")
+
+# WMO code -> the OpenWeather condition vocabulary WindVectorWidget's
+# _CONDITION_MAP already speaks, so archive rows drive the same scenes as
+# live ones with no branching at the call site.
+_WMO_CONDITIONS = {
+    0:  ("Clear", "clear sky"),
+    1:  ("Clouds", "few clouds"),
+    2:  ("Clouds", "scattered clouds"),
+    3:  ("Clouds", "overcast clouds"),
+    45: ("Fog", "fog"),              48: ("Fog", "depositing rime fog"),
+    51: ("Drizzle", "light drizzle"), 53: ("Drizzle", "moderate drizzle"),
+    55: ("Drizzle", "dense drizzle"), 56: ("Drizzle", "freezing drizzle"),
+    57: ("Drizzle", "dense freezing drizzle"),
+    61: ("Rain", "slight rain"),     63: ("Rain", "moderate rain"),
+    65: ("Rain", "heavy rain"),      66: ("Rain", "freezing rain"),
+    67: ("Rain", "heavy freezing rain"),
+    71: ("Snow", "slight snowfall"), 73: ("Snow", "moderate snowfall"),
+    75: ("Snow", "heavy snowfall"),  77: ("Snow", "snow grains"),
+    80: ("Rain", "slight rain showers"), 81: ("Rain", "moderate rain showers"),
+    82: ("Rain", "violent rain showers"),
+    85: ("Snow", "slight snow showers"), 86: ("Snow", "heavy snow showers"),
+    95: ("Thunderstorm", "thunderstorm"),
+    96: ("Thunderstorm", "thunderstorm with slight hail"),
+    99: ("Thunderstorm", "thunderstorm with heavy hail"),
+}
+
+
+# ----------------------------------------------------------------------------
+# Roofs
+# ----------------------------------------------------------------------------
+# Measured, not assumed: 458 games at the eight roofed parks over 2026-04-01 to
+# 2026-08-12, read off the StatsAPI live feed's gameData.weather block.
+#
+# `closed_rate` is how often the roof was actually shut, and it splits the group
+# in two.  Houston (100%), Miami (95%), Texas (92%) and Arizona (73%) are indoor
+# parks that occasionally open; Toronto (51%), Milwaukee (43%) and Seattle (12%)
+# genuinely vary and are the only ones where predicting roof state is worth
+# effort.  Use it as a prior when the roof state for a game is unknown.
+#
+# `indoor_temp_f` is a climate-control setpoint and is startlingly exact — Texas
+# reported 74 degrees in all 54 closed games (sd 0.0), Miami 72 in all 54,
+# Houston 73 in all 53.  Seattle is the exception and is deliberately None: its
+# roof is an umbrella that covers without enclosing, so closing it does not heat
+# the park (closed games average 54 degrees, simply because it closes when cold).
+# Carry ambient temperature through there instead of overriding it.
+#
+# `wind_factor` is the share of outdoor wind still reaching the field with the
+# roof shut.  Zero for the sealed parks.  Seattle again differs: of its closed
+# games, MLB reported a live wind ("6 mph, Out To LF") in one of four, so 0.25
+# is a weak point estimate off a small sample rather than a fitted number.
+ROOF_BEHAVIOR = {
+    "Minute Maid Park":      {"closed_rate": 1.00, "indoor_temp_f": 73.0, "wind_factor": 0.0},
+    "Tropicana Field":       {"closed_rate": 1.00, "indoor_temp_f": 72.0, "wind_factor": 0.0},
+    "LoanDepot Park":        {"closed_rate": 0.95, "indoor_temp_f": 72.0, "wind_factor": 0.0},
+    "Globe Life Field":      {"closed_rate": 0.92, "indoor_temp_f": 74.0, "wind_factor": 0.0},
+    "Chase Field":           {"closed_rate": 0.73, "indoor_temp_f": 75.6, "wind_factor": 0.0},
+    "Rogers Centre":         {"closed_rate": 0.51, "indoor_temp_f": 68.1, "wind_factor": 0.0},
+    "American Family Field": {"closed_rate": 0.43, "indoor_temp_f": 67.9, "wind_factor": 0.0},
+    "T-Mobile Park":         {"closed_rate": 0.12, "indoor_temp_f": None, "wind_factor": 0.25},
+}
+
+# Tropicana is a fixed dome and reports "Dome"; the retractables report
+# "Roof Closed".  Matching only the latter silently treats every Rays home game
+# as open air.
+_INDOOR_CONDITIONS = ("roof closed", "dome", "closed roof")
+
+# MLB states observed wind in the FIELD frame, in eight buckets.  Values are the
+# field-frame angle the wind blows FROM, matching wind_to_field_frame's output
+# (0 = arriving from centre field).
+MLB_WIND_LABELS = {
+    "In From CF": 0.0,   "In From RF": 45.0,  "In From LF": 315.0,
+    "Out To CF":  180.0, "Out To RF":  225.0, "Out To LF":  135.0,
+    "R To L":     90.0,  "L To R":     270.0,
+}
+
+
+# MLB renames parks faster than this table does, and one differs only by case.
+# Anything keyed on our names — ROOF_BEHAVIOR, PARK_ORIENTATION, STADIUM_DATA —
+# must be looked up through resolve_park_name, or a renamed park silently falls
+# through every lookup and is treated as an unknown open-air field.
+PARK_NAME_ALIASES = {
+    "oriole park at camden yards": "Camden Yards",
+    "rate field": "Guaranteed Rate Field",          # renamed 2025
+    "daikin park": "Minute Maid Park",              # renamed 2025
+    "uniqlo field at dodger stadium": "Dodger Stadium",
+    "loandepot park": "LoanDepot Park",             # case only
+}
+
+
+def resolve_park_name(name):
+    """A venue name from anywhere -> the key this module uses, or None."""
+    if not name:
+        return None
+    if name in STADIUM_DATA or name in PARK_ORIENTATION:
+        return name
+    low = name.lower()
+    alias = PARK_NAME_ALIASES.get(low)
+    if alias:
+        return alias
+    for key in STADIUM_DATA:
+        if key.lower() == low:
+            return key
+    return None
+
+
+def is_indoor_condition(condition):
+    """True when a StatsAPI weather condition string means the roof is shut."""
+    return any(tag in (condition or "").lower() for tag in _INDOOR_CONDITIONS)
+
+
+def roof_closed_prior(park):
+    """How often this park's roof is shut, 0-1.  Open-air parks give 0.0."""
+    return ROOF_BEHAVIOR.get(park, {}).get("closed_rate", 0.0)
+
+
+# Used when a roof is known to be shut over a park we have no measurements for
+# — the Seoul and Tokyo series, or any new venue.  Sealed and around room
+# temperature is much closer than the outdoor forecast, which otherwise reports
+# things like 38F inside the Gocheok Sky Dome.
+_GENERIC_INDOOR = {"closed_rate": 1.0, "indoor_temp_f": 72.0, "wind_factor": 0.0}
+
+
+def apply_roof(row, park, closed=True):
+    """Return a copy of an hourly row with the roof shut over it.
+
+    Wind is scaled rather than zeroed because not every roof seals, and the
+    temperature is replaced only where the park actually climate-controls.
+    Leaves the row untouched when closed is false.
+
+    `park` is matched through resolve_park_name, so a venue arriving under a
+    sponsor's new name still finds its entry.
+    """
+    if not closed:
+        return dict(row, roof_closed=False)
+    behaviour = ROOF_BEHAVIOR.get(resolve_park_name(park) or park) or _GENERIC_INDOOR
+    out = dict(row)
+    factor = behaviour["wind_factor"]
+    for key in ("wind_speed", "wind_gust"):
+        if out.get(key) is not None:
+            out[key] = out[key] * factor
+    if behaviour["indoor_temp_f"] is not None:
+        out["temperature"] = behaviour["indoor_temp_f"]
+    out["roof_closed"] = True
+    out["condition"] = "Dome" if park == "Tropicana Field" else "Roof Closed"
+    out["description"] = "roof closed"
+    out["precipitation"] = 0.0
+    return out
+
+
+def parse_gumbo_weather(weather, park=None):
+    """StatsAPI gameData.weather -> a row in the shape everything else uses.
+
+    This is the OBSERVED condition for a game that has been played, which beats
+    any forecast for backfill.  Its wind direction is already field-relative, so
+    the row carries `wind_frame: "field"` and must NOT be rotated again.
+    Returns None if the block has nothing usable.
+    """
+    if not weather:
+        return None
+    condition = weather.get("condition") or ""
+    indoor = is_indoor_condition(condition)
+    try:
+        temp = float(weather.get("temp"))
+    except (TypeError, ValueError):
+        temp = None
+    speed, field_deg, label = None, None, None
+    wind = weather.get("wind") or ""
+    if "," in wind:
+        speed_s, label = (part.strip() for part in wind.split(",", 1))
+        try:
+            speed = float(speed_s.lower().replace("mph", "").strip())
+        except ValueError:
+            speed = None
+        field_deg = MLB_WIND_LABELS.get(label)
+    return {
+        "wind_speed": speed,
+        "wind_direction": field_deg,
+        "wind_frame": "field",       # already park-relative — do not rotate
+        "wind_label": label,         # None/Calm/Varies survive here for callers
+        "temperature": temp,
+        "condition": condition,
+        "description": condition.lower(),
+        "roof_closed": indoor,
+        "source": "statsapi",
+    }
+
+
+class WeatherArchive:
+    """Hourly weather for ball parks — past, recent and forecast.
+
+    Every method returns rows in the same shape WeatherService.
+    extract_weather_data produces, so a row from 2024 and a row from tonight's
+    forecast are interchangeable at the physics call site.  `wind_direction`
+    is a compass bearing and is tagged `wind_frame: "compass"` accordingly —
+    it still has to go through wind_to_field_frame (or calculate_trajectory's
+    park_azimuth) before it means anything on a field.
+
+    Responses are cached to disk because the CPW backfill re-reads the same
+    park-seasons on every training run, and because a whole season for one
+    park is a single request worth keeping.
+    """
+
+    def __init__(self, cache_dir=None, timeout=60):
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "weather_cache")
+        self.cache_dir = cache_dir
+        self.timeout = timeout
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    # ---------------------------------------------------------------- fetch
+
+    @staticmethod
+    def pick_source(start_date, end_date):
+        """'forecast', 'hires' or 'archive' for a date range.
+
+        Both archives lag real time by a few days, so anything touching the
+        last week has to come from the forecast endpoint (which serves past
+        days too).  Below that, prefer the high-resolution archive and fall
+        back to ERA5 only for dates it does not cover.
+        """
+        today = _dt.date.today()
+        end = _dt.date.fromisoformat(str(end_date)[:10])
+        if end >= today - _dt.timedelta(days=6):
+            return "forecast"
+        if str(start_date)[:10] >= OPEN_METEO_HIRES_EPOCH:
+            return "hires"
+        return "archive"
+
+    def _cache_path(self, key):
+        digest = hashlib.sha1(key.encode()).hexdigest()[:20]
+        return os.path.join(self.cache_dir, f"om_{digest}.json")
+
+    def _request(self, url, params, cache_key=None, retries=3):
+        if cache_key:
+            path = self._cache_path(cache_key)
+            if os.path.exists(path):
+                try:
+                    with open(path) as fh:
+                        return json.load(fh)
+                except (OSError, ValueError):
+                    pass  # corrupt cache entry — just refetch over it
+        last = None
+        for attempt in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=self.timeout)
+                r.raise_for_status()
+                payload = r.json()
+                break
+            except Exception as e:                       # network / 429 / 5xx
+                last = e
+                if attempt == retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
+        else:                                            # pragma: no cover
+            raise last
+        if cache_key:
+            try:
+                with open(self._cache_path(cache_key), "w") as fh:
+                    json.dump(payload, fh)
+            except OSError:
+                pass                                     # cache is a nicety
+        return payload
+
+    # ----------------------------------------------------------- row shaping
+
+    @staticmethod
+    def _rows(block, source):
+        """Open-Meteo's parallel arrays -> a list of per-hour dicts."""
+        hourly = block.get("hourly") or {}
+        times = hourly.get("time") or []
+        out = []
+        for i, stamp in enumerate(times):
+            def val(name):
+                seq = hourly.get(name) or []
+                return seq[i] if i < len(seq) else None
+            code = val("weather_code")
+            cond, desc = _WMO_CONDITIONS.get(
+                int(code) if code is not None else -1, ("Clear", "clear sky"))
+            press_hpa = val("surface_pressure")
+            out.append({
+                "time": stamp,                       # ISO 8601, UTC
+                "wind_speed": val("wind_speed_10m"),
+                "wind_direction": val("wind_direction_10m"),
+                "wind_frame": "compass",
+                "wind_gust": val("wind_gusts_10m"),
+                "temperature": val("temperature_2m"),
+                "humidity": val("relative_humidity_2m"),
+                "pressure_hpa": press_hpa,
+                "pressure_pa": press_hpa * 100.0 if press_hpa is not None else None,
+                # Taken at field level (we send each park's own elevation), so
+                # it must NOT go through BallFlightSimulator's sea-level
+                # reconstruction — see pressure_is_station there.
+                "pressure_frame": "station",
+                "precipitation": val("precipitation"),
+                "cloud_cover": val("cloud_cover"),
+                "wind_speed_80m": val("wind_speed_80m"),
+                "wind_direction_80m": val("wind_direction_80m"),
+                "wind_speed_120m": val("wind_speed_120m"),
+                "condition": cond,
+                "description": desc,
+                "source": source,
+                # What the provider actually resolved us to, so a bad park
+                # coordinate shows up as a number rather than as a quietly
+                # wrong air density.
+                "grid_elevation_m": block.get("elevation"),
+            })
+        return out
+
+    # -------------------------------------------------------------- history
+
+    def hourly_points(self, points, start_date, end_date, source="auto"):
+        """Hourly rows for several locations in ONE request.
+
+        points: sequence of (name, lat, lon, elevation_ft).  Elevation is sent
+        per location so surface_pressure comes back downscaled to the field
+        rather than to whatever the grid cell happens to sit at — the two
+        differ by 36 m at Kauffman, and pressure is a direct air-density term.
+
+        Returns {name: [row, ...]}.
+        """
+        points = list(points)
+        if not points:
+            return {}
+        if source == "auto":
+            source = self.pick_source(start_date, end_date)
+        url = {"archive": OPEN_METEO_ARCHIVE, "hires": OPEN_METEO_HIRES,
+               "forecast": OPEN_METEO_FORECAST}[source]
+
+        params = {
+            "latitude":  ",".join(f"{p[1]:.4f}" for p in points),
+            "longitude": ",".join(f"{p[2]:.4f}" for p in points),
+            "elevation": ",".join(f"{(p[3] or 0) * 0.3048:.0f}" for p in points),
+            "hourly": ",".join(_OM_HOURLY_VARS + (
+                () if source == "archive" else _OM_WIND_LEVELS)),
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+            "timezone": "UTC",
+            "start_date": str(start_date)[:10],
+            "end_date": str(end_date)[:10],
+        }
+        # The variable list MUST be part of the key.  Without it, adding a
+        # field (the 80/120 m wind levels) silently replays cached responses
+        # that never contained it, and the new column comes back 100% null
+        # while every other check still passes.
+        cache_key = f"{source}|{params['latitude']}|{params['elevation']}|" \
+                    f"{params['start_date']}|{params['end_date']}|{params['hourly']}"
+        payload = self._request(url, params, cache_key=cache_key)
+        # One location comes back as an object, several as a list.
+        blocks = payload if isinstance(payload, list) else [payload]
+        return {p[0]: self._rows(b, source)
+                for p, b in zip(points, blocks)}
+
+    def park_hours(self, park, start_date, end_date, source="auto"):
+        """Hourly rows for one park over a date range."""
+        info = STADIUM_DATA.get(park)
+        if not info:
+            return []
+        got = self.hourly_points(
+            [(park, info["lat"], info["lon"], info.get("altitude", 0))],
+            start_date, end_date, source=source)
+        return got.get(park, [])
+
+    def all_parks_hours(self, start_date, end_date, source="auto"):
+        """Every park in STADIUM_DATA over a date range, in one request."""
+        pts = [(name, d["lat"], d["lon"], d.get("altitude", 0))
+               for name, d in sorted(STADIUM_DATA.items())]
+        return self.hourly_points(pts, start_date, end_date, source=source)
+
+    # ------------------------------------------------------------- forecast
+
+    def park_forecast(self, park, forecast_days=3, past_days=0):
+        """Upcoming hourly rows for a park — this is what a game-time lookup
+        wants when the game has not been played yet."""
+        info = STADIUM_DATA.get(park)
+        if not info:
+            return []
+        params = {
+            "latitude": f"{info['lat']:.4f}",
+            "longitude": f"{info['lon']:.4f}",
+            "elevation": f"{info.get('altitude', 0) * 0.3048:.0f}",
+            "hourly": ",".join(_OM_HOURLY_VARS + _OM_WIND_LEVELS),
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch",
+            "timezone": "UTC",
+            "forecast_days": int(forecast_days),
+            "past_days": int(past_days),
+        }
+        # Deliberately uncached: a forecast that is an hour stale is worse
+        # than no cache at all, and it is one cheap request.
+        payload = self._request(OPEN_METEO_FORECAST, params)
+        return self._rows(payload, "forecast")
+
+    # ------------------------------------------------------- point lookup
+
+    def at(self, park, when, source="auto"):
+        """The single hour covering `when` (a UTC datetime) at `park`.
+
+        Rounds to the nearest hour rather than truncating — a 7:10 pm first
+        pitch is better served by the 7 pm row either way, but a 7:50 pm
+        one is not.
+        """
+        if isinstance(when, str):
+            when = _dt.datetime.fromisoformat(when)
+        if when.tzinfo is not None:
+            when = when.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        target = (when + _dt.timedelta(minutes=30)).replace(
+            minute=0, second=0, microsecond=0)
+        day = target.date()
+        if source == "auto":
+            source = self.pick_source(day, day)
+        if source == "forecast":
+            rows = self.park_forecast(park, forecast_days=7, past_days=5)
+        else:
+            rows = self.park_hours(park, day, day, source=source)
+        stamp = target.strftime("%Y-%m-%dT%H:00")
+        for row in rows:
+            if row["time"][:13] == stamp[:13]:
+                return row
+        return None
+
+
+# ==============================================
+# Effective wind
+# ==============================================
+# BallFlightSimulator's `wind_speed` means a UNIFORM, STEADY vector applied
+# over the ball's entire flight, at every height and across the whole field.
+# A forecast (or a stadium anemometer) reports something quite different: a
+# 10 m, open-terrain, hourly-average scalar at one point.  Inside a bowl those
+# diverge — the grandstand blocks and separates the flow, the ball spends most
+# of its flight well above the reference height, gusting means the hourly mean
+# is not what any 5-second flight sees, and in a swirling park the mean bearing
+# says little about any particular ball.
+#
+# Measured on 116k batted balls: real fly-ball distance responds to reported
+# wind at ~0.30-0.41 ft/mph, while the simulator responds at 3.59 (literature
+# for a genuinely uniform wind is 2.5-3, so the ODE itself is fine).  MLB's own
+# on-field reading predicts distance NO BETTER than the grid forecast, so this
+# is not a data-quality problem — the reported number simply is not the
+# quantity the physics wants.
+#
+# The correction therefore lives HERE, at the boundary where a forecast becomes
+# a model input, rather than inside the ODE.  The simulator stays physically
+# honest for a wind you actually know; this function converts a reported wind
+# into the uniform-equivalent that reproduces observed carry.
+#
+# Note what this is NOT: it is not the fraction of air that physically reaches
+# the field.  It is the regression-calibrated effective wind given a surface
+# observation, and it absorbs both genuine bowl attenuation and the fact that
+# a point measurement is a noisy proxy for a whole flow field.
+_WIND_RECEPTIVITY = None
+EFFECTIVE_WIND_FALLBACK = 0.15
+
+
+def wind_receptivity(park=None):
+    """Per-park effective-wind factor, fitted by
+    `python homerunwidget.py calibrate-wind`."""
+    global _WIND_RECEPTIVITY
+    if _WIND_RECEPTIVITY is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "model_data", "wind_receptivity.json")
+        try:
+            with open(path) as fh:
+                _WIND_RECEPTIVITY = json.load(fh)
+        except (OSError, ValueError):
+            _WIND_RECEPTIVITY = {}
+    if not _WIND_RECEPTIVITY:
+        return EFFECTIVE_WIND_FALLBACK
+    key = resolve_park_name(park) or park
+    entry = _WIND_RECEPTIVITY.get(key)
+    if entry and entry.get("wind_mult") is not None:
+        return float(entry["wind_mult"])
+    glob = _WIND_RECEPTIVITY.get("_global", {})
+    return float(glob.get("wind_mult_2pass")
+                 or glob.get("wind_mult") or EFFECTIVE_WIND_FALLBACK)
+
+
+def wind_profile(levels, alpha_default=0.20):
+    """Build a callable h_metres -> wind speed, from measured levels.
+
+    `levels` is {height_m: speed_mph} — normally 10/80/120 m off Open-Meteo.
+    Wind grows with height roughly as a power law, u(h) = u_ref * (h/h_ref)^a,
+    and fitting `a` from two levels beats assuming one: over the corpus it runs
+    well above the 0.14 of open flat terrain, which is what you would expect
+    over a city with a stadium in it.
+
+    Why this matters: the ball flies from 1 m to ~45 m, and the forecast is
+    quoted at 10 m.  Applying the 10 m number flat across the whole flight
+    understates the wind through most of it.  Air density has varied with
+    height in this engine for years; wind was the one input still held
+    constant.
+
+    Falls back to a default exponent when only one level is present, and to a
+    flat profile when none is.
+    """
+    pairs = sorted((float(h), float(s)) for h, s in levels.items()
+                   if s is not None and h and float(s) >= 0)
+    if not pairs:
+        return lambda h: 0.0
+    if len(pairs) == 1:
+        h0, s0 = pairs[0]
+        return lambda h: s0 * (max(h, 0.5) / h0) ** alpha_default
+
+    # Least-squares power law through log(h), log(u); guard the zero-wind case
+    # where the log is undefined.
+    hs = np.array([p[0] for p in pairs])
+    us = np.array([p[1] for p in pairs])
+    good = us > 0.1
+    if good.sum() < 2:
+        h0, s0 = pairs[0]
+        return lambda h: s0 * (max(h, 0.5) / h0) ** alpha_default
+    alpha, log_u0 = np.polyfit(np.log(hs[good]), np.log(us[good]), 1)
+    # A profile that falls off with height, or climbs absurdly, is a bad fit
+    # rather than real weather — clamp to the physically sensible range.
+    alpha_clamped = float(np.clip(alpha, 0.0, 0.45))
+    if abs(alpha_clamped - alpha) < 1e-12:
+        u0 = float(np.exp(log_u0))
+    else:
+        # Re-anchor to the lowest measured level.  Keeping the intercept from
+        # the unclamped fit alongside a clamped exponent is incoherent — it
+        # turned a 9 mph surface reading into 47 mph at 40 m.
+        h_ref, u_ref = hs[good][0], us[good][0]
+        u0 = float(u_ref / h_ref ** alpha_clamped)
+    alpha = alpha_clamped
+    return lambda h: u0 * max(h, 0.5) ** alpha
+
+
+def profile_from_row(row):
+    """wind_profile() built from an hourly row's multi-level wind columns."""
+    return wind_profile({
+        10.0: row.get("wind_speed"),
+        80.0: row.get("wind_speed_80m"),
+        120.0: row.get("wind_speed_120m"),
+    })
+
+
+def effective_wind(speed_mph, park=None):
+    """Reported surface wind -> the uniform-equivalent the trajectory wants.
+
+    Feed THIS to BallFlightSimulator, and keep the reported value for display:
+    a fan reading "12 mph out to left" wants the forecast number, while the
+    sim wants the much smaller wind that actually reproduces observed carry.
+    """
+    if speed_mph is None:
+        return None
+    return float(speed_mph) * wind_receptivity(park)
+
+
+def game_conditions(park, first_pitch_utc, hours=3, roof_closed=None,
+                    archive=None, source="auto"):
+    """Hour-by-hour conditions over a game, ready for the physics engine.
+
+    This is the call the weather tab is built on.  A ball game is not an
+    instant — first pitch and the ninth inning are different environments, and
+    a park factor computed off a single reading averages that away.  Returns
+    `hours` consecutive rows starting at first pitch, which is where
+    BallparkPal's Hour 1 / Hour 2 / Hour 3 columns come from.
+
+    Each row gains `wind_field_deg`, the wind rotated into the field frame, so
+    callers never have to remember to do it.  A row whose park has no azimuth
+    gets None there rather than a plausible-looking wrong number.
+
+    roof_closed: True/False to state it, or None to fall back to the park's
+    measured closure rate — under which an always-indoor park like Minute Maid
+    is treated as closed and a mostly-open one as open.  Pass the real state
+    from StatsAPI whenever the game has been played.
+    """
+    archive = archive or WeatherArchive()
+    if isinstance(first_pitch_utc, str):
+        first_pitch_utc = _dt.datetime.fromisoformat(
+            first_pitch_utc.replace("Z", "+00:00"))
+    if first_pitch_utc.tzinfo is not None:
+        first_pitch_utc = first_pitch_utc.astimezone(
+            _dt.timezone.utc).replace(tzinfo=None)
+
+    start = first_pitch_utc.replace(minute=0, second=0, microsecond=0)
+    end = start + _dt.timedelta(hours=max(1, hours) - 1)
+    if source == "auto":
+        source = archive.pick_source(start.date(), end.date())
+    if source == "forecast":
+        rows = archive.park_forecast(park, forecast_days=7, past_days=5)
+    else:
+        rows = archive.park_hours(park, start.date(), end.date(), source=source)
+
+    if roof_closed is None:
+        roof_closed = roof_closed_prior(park) >= 0.5
+
+    return _finish_hours(rows, park, start, hours, roof_closed)
+
+
+def _finish_hours(rows, park, start, hours, roof_closed):
+    """Slice `rows` to the game's hours and put them in the park's frame.
+
+    Shared by game_conditions and slate_conditions so the single-park and
+    batched paths cannot drift apart -- the roof, the rotation and the wind
+    weighting all have to be applied identically or the tab and any one-off
+    lookup would disagree.
+    """
+    azimuth = get_park_azimuth(park)
+    wanted = [(start + _dt.timedelta(hours=i)).strftime("%Y-%m-%dT%H")
+              for i in range(max(1, hours))]
+    by_hour = {r["time"][:13]: r for r in rows}
+    out = []
+    for stamp in wanted:
+        row = by_hour.get(stamp)
+        if row is None:
+            continue
+        row = apply_roof(row, park, closed=roof_closed)
+        row["wind_field_deg"] = (
+            None if row.get("roof_closed") and not row.get("wind_speed")
+            else wind_to_field_frame(row["wind_direction"], azimuth=azimuth))
+        # Both winds ride along: `wind_speed` is what the forecast says and
+        # what a reader expects to see; `wind_effective_mph` is the weighted
+        # value the trajectory model should actually be given.
+        row["wind_effective_mph"] = effective_wind(row.get("wind_speed"), park)
+        row["wind_receptivity"] = wind_receptivity(park)
+        row["park"] = park
+        out.append(row)
+    return out
+
+
+def slate_conditions(entries, hours=3, archive=None, forecast_days=3,
+                     past_days=1):
+    """game_conditions for a whole slate, in ONE request.
+
+    `entries` is [(park, first_pitch_utc), ...]; returns {park: [row, ...]}.
+
+    Per-park fetching cost 0.83s each and 11.7s for a fourteen-game card --
+    79% of the tab's load, for data Open-Meteo will return in a single
+    multi-location call in 1.4s. Same schema out; the per-row finishing is
+    shared with game_conditions.
+    """
+    archive = archive or WeatherArchive()
+    parks, when = [], {}
+    for park, first_pitch in entries:
+        if park not in STADIUM_DATA:
+            continue
+        t = first_pitch
+        if isinstance(t, str):
+            t = _dt.datetime.fromisoformat(t.replace("Z", "+00:00"))
+        if t.tzinfo is not None:
+            t = t.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        if park not in when:
+            parks.append(park)
+        # A doubleheader lands two games on one park; the earlier start
+        # bounds the window both of them need.
+        when[park] = min(when.get(park, t), t)
+    if not parks:
+        return {}
+
+    points = [(p, STADIUM_DATA[p]["lat"], STADIUM_DATA[p]["lon"],
+               STADIUM_DATA[p].get("altitude", 0)) for p in parks]
+    params = {
+        "latitude": ",".join(f"{p[1]:.4f}" for p in points),
+        "longitude": ",".join(f"{p[2]:.4f}" for p in points),
+        "elevation": ",".join(f"{(p[3] or 0) * 0.3048:.0f}" for p in points),
+        "hourly": ",".join(_OM_HOURLY_VARS + _OM_WIND_LEVELS),
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "timezone": "UTC",
+        "forecast_days": int(forecast_days),
+        "past_days": int(past_days),
+    }
+    # Uncached, like park_forecast: a stale forecast is worse than no cache.
+    payload = archive._request(OPEN_METEO_FORECAST, params)
+    blocks = payload if isinstance(payload, list) else [payload]
+
+    out = {}
+    for (park, *_), block in zip(points, blocks):
+        rows = archive._rows(block, "forecast")
+        start = when[park].replace(minute=0, second=0, microsecond=0)
+        out[park] = _finish_hours(rows, park, start, hours,
+                                  roof_closed_prior(park) >= 0.5)
+    return out
+
 
 def draw_precipitation(painter, precipitation, width, height, is_in_stadium_area_func):
     """Draw precipitation visualization"""
@@ -2033,3 +2918,505 @@ class _Snowflake:
         painter.setBrush(QBrush(grad)); painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(self.x, self.y), r, r)
         painter.restore()
+
+
+# ============================================================================
+# Offline tools
+# ----------------------------------------------------------------------------
+# Batch jobs, not runtime code: the weather backfill that builds the CPW
+# training corpus, and the azimuth check that validates PARK_ORIENTATION.  They
+# live here rather than as loose scripts because they are weather-domain and
+# share this module's tables; pandas is imported lazily inside each so the GUI
+# import path stays light.
+#
+#   python weatherman.py backfill 2024 2025 2026
+#   python weatherman.py report 2024
+#   python weatherman.py validate-azimuth 2026-06-01 2026-06-30
+# ============================================================================
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Generated datasets live together rather than scattered through the source
+# directory.  Regenerable from the tools, so gitignored.
+DATA_DIR = os.path.join(HERE, "model_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+STATS = "https://statsapi.mlb.com/api/v1"
+STATS11 = "https://statsapi.mlb.com/api/v1.1"
+
+STATS = "https://statsapi.mlb.com/api/v1"
+STATS11 = "https://statsapi.mlb.com/api/v1.1"
+
+# The Athletics are ATH in Savant throughout, but StatsAPI only renamed them
+# with the move: team 133 is OAK in 2024 and ATH from 2025.  So this is a
+# FALLBACK, applied only when the code is not already valid for that season —
+# forcing it cost the whole 2025 A's home season (7,893 batted balls, 3.3% of
+# the corpus) to an unmatched join.
+SAVANT_ABBREV_FALLBACK = {"ATH": "OAK", "OAK": "ATH"}
+
+# Statcast gives an inning but no timestamp.  A nine-inning game runs about
+# three hours, so each inning advances the clock ~20 minutes — enough to move a
+# late-game plate appearance into the next hourly bucket, which is the whole
+# point of joining hourly rather than per-game.
+MINUTES_PER_INNING = 20.5
+
+
+def _json(url, timeout=60):
+    with urllib.request.urlopen(url, timeout=timeout) as fh:
+        return json.load(fh)
+
+
+# --------------------------------------------------------------------- games
+
+def team_abbrevs(year):
+    """{team id: abbreviation} for a season."""
+    teams = _json(f"{STATS}/teams?sportId=1&season={year}")["teams"]
+    return {t["id"]: t["abbreviation"] for t in teams}
+
+
+def build_game_index(year, workers=12, cache=True):
+    import pandas as pd
+    """Every regular-season game, with first pitch and MLB's own weather.
+
+    Cached to disk: a finished season never changes, and rebuilding it costs
+    one live-feed request per game — ~2,900 of them.
+    """
+    path = os.path.join(HERE, "weather_cache", f"games_{year}.parquet")
+    if cache and os.path.exists(path):
+        games = pd.read_parquet(path)
+        print(f"[{year}] game index from cache ({len(games)} games)")
+        return games
+    abbrev = team_abbrevs(year)
+    sched = _json(f"{STATS}/schedule?sportId=1&season={year}&gameType=R")
+    rows = []
+    for date in sched["dates"]:
+        for g in date["games"]:
+            if g["status"]["abstractGameState"] != "Final":
+                continue
+            rows.append({
+                "game_pk": g["gamePk"],
+                "game_date": g["officialDate"],
+                "home_abbrev": abbrev.get(g["teams"]["home"]["team"]["id"]),
+                "venue_id": g["venue"]["id"],
+                "venue_name": g["venue"]["name"],
+                "first_pitch_utc": g["gameDate"],
+                "game_number": g.get("gameNumber", 1),
+            })
+    games = pd.DataFrame(rows)
+    print(f"[{year}] {len(games)} final regular-season games, "
+          f"{games.venue_name.nunique()} venues")
+
+    # MLB's observed conditions.  The fields= whitelist takes each response
+    # from ~857 KB to ~370 bytes, which is the difference between this being a
+    # background job and a coffee break.
+    url = (STATS11 + "/game/{}/feed/live"
+           "?fields=gameData,weather,condition,temp,wind")
+
+    def pull(pk):
+        try:
+            return pk, _json(url.format(pk), timeout=45)["gameData"].get("weather", {})
+        except Exception:
+            return pk, {}
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        observed = dict(pool.map(pull, games.game_pk.tolist()))
+
+    obs = []
+    for pk in games.game_pk:
+        w = observed.get(pk) or {}
+        condition = w.get("condition") or ""
+        speed, label = None, None
+        wind = w.get("wind") or ""
+        if "," in wind:
+            speed_s, label = (p.strip() for p in wind.split(",", 1))
+            try:
+                speed = float(speed_s.lower().replace("mph", "").strip())
+            except ValueError:
+                speed = None
+        try:
+            temp = float(w.get("temp"))
+        except (TypeError, ValueError):
+            temp = None
+        obs.append({
+            "obs_condition": condition or None,
+            "obs_temp_f": temp,
+            "obs_wind_mph": speed,
+            "obs_wind_label": label,
+            "obs_wind_field_deg": MLB_WIND_LABELS.get(label),
+            "obs_roof_closed": is_indoor_condition(condition),
+        })
+    got = sum(1 for o in obs if o["obs_condition"])
+    print(f"[{year}] observed weather for {got}/{len(games)} games "
+          f"({100 * got / max(1, len(games)):.1f}%)")
+    games = pd.concat([games, pd.DataFrame(obs)], axis=1)
+    if cache:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        games.to_parquet(path, index=False)
+    return games
+
+
+# -------------------------------------------------------------------- venues
+
+def venue_meta(venue_ids):
+    """{venue id: {name, lat, lon, elevation_ft, azimuth, roof}}.
+
+    Straight from MLB rather than STADIUM_DATA, so neutral sites and former
+    homes — Oakland Coliseum, Rickwood, Tokyo Dome — resolve too.  Those have
+    no wall geometry on our side, but they do have weather.
+    """
+    out = {}
+    for vid in sorted(set(int(v) for v in venue_ids)):
+        try:
+            v = _json(f"{STATS}/venues/{vid}?hydrate=location,fieldInfo")["venues"][0]
+        except Exception as e:
+            print(f"  [warn] venue {vid} lookup failed: {e}")
+            continue
+        loc = v.get("location", {}) or {}
+        coords = loc.get("defaultCoordinates") or {}
+        name = v.get("name")
+        # Our key for this park, if we know it under another name.
+        ours = resolve_park_name(name)
+        roof = (v.get("fieldInfo", {}) or {}).get("roofType", "Open")
+        out[vid] = {
+            "name": name,
+            "lat": coords.get("latitude"),
+            "lon": coords.get("longitude"),
+            "elevation_ft": loc.get("elevation"),
+            "azimuth": loc.get("azimuthAngle"),
+            "roof": (roof or "Open").lower(),
+            # Our own table wins where we have it — those azimuths are the
+            # validated ones (see validate_azimuths below).
+            "park_key": ours,
+            **({"azimuth": PARK_ORIENTATION[ours]["azimuth"],
+                "roof": PARK_ORIENTATION[ours]["roof"]}
+               if ours in PARK_ORIENTATION else {}),
+        }
+    missing = [v["name"] for v in out.values() if v["lat"] is None]
+    if missing:
+        print(f"  [warn] no coordinates for: {missing}")
+    return out
+
+
+# ------------------------------------------------------------------- weather
+
+def fetch_weather(meta, start_date, end_date, archive=None, chunk_days=31):
+    """{venue_id: {'YYYY-MM-DDTHH': row}} over a date range.
+
+    Every venue travels in one request per chunk — Open-Meteo takes parallel
+    comma-separated coordinate lists, and a matching `elevation` list, so each
+    park's surface pressure comes back downscaled to its own field level.
+    Chunked by month purely to keep individual cache entries sane.
+    """
+    archive = archive or WeatherArchive()
+    points = [(vid, m["lat"], m["lon"], m["elevation_ft"] or 0)
+              for vid, m in meta.items() if m["lat"] is not None]
+    index = {vid: {} for vid, *_ in points}
+    start = _dt.date.fromisoformat(str(start_date)[:10])
+    end = _dt.date.fromisoformat(str(end_date)[:10])
+    cursor = start
+    while cursor <= end:
+        stop = min(cursor + _dt.timedelta(days=chunk_days - 1), end)
+        print(f"  weather {cursor} .. {stop} ({len(points)} venues)", flush=True)
+        got = archive.hourly_points(points, cursor, stop)
+        for vid, rows in got.items():
+            for r in rows:
+                index[vid][r["time"][:13]] = r
+        cursor = stop + _dt.timedelta(days=1)
+    return index
+
+
+# ------------------------------------------------------------------- joining
+
+def backfill(year, out_path=None, workers=12):
+    import pandas as pd
+    bbe_path = os.path.join(HERE, f"savant_bbe_{year}.csv")
+    if not os.path.exists(bbe_path):
+        print(f"[{year}] no {bbe_path} — skipping")
+        return None
+    out_path = out_path or os.path.join(DATA_DIR, f"weather_backfill_{year}.parquet")
+
+    bbe = pd.read_csv(bbe_path, usecols=["game_date", "home_team", "inning"],
+                      low_memory=False)
+    print(f"[{year}] {len(bbe)} batted balls")
+
+    games = build_game_index(year, workers=workers)
+    meta = venue_meta(games.venue_id)
+
+    # One game per (date, home team) — except doubleheaders, which a BBE row
+    # cannot distinguish because the corpus carries no game_pk.  Keep game 1
+    # and mark the rows, rather than silently averaging two different evenings.
+    games = games.sort_values(["game_date", "home_abbrev", "game_number"])
+    dh_counts = games.groupby(["game_date", "home_abbrev"]).size()
+    dh_keys = set(dh_counts[dh_counts > 1].index)
+    first = games.drop_duplicates(["game_date", "home_abbrev"], keep="first")
+    by_key = first.set_index(["game_date", "home_abbrev"]).to_dict("index")
+    valid_codes = set(games.home_abbrev.dropna().unique())
+
+    # Pad the window by a day at each end.  Official dates are local, but the
+    # weather index is keyed in UTC: a 7:10 pm first pitch on the west coast is
+    # 02:10 the FOLLOWING UTC day, and innings push it later still.  Without
+    # the pad, every late game on the closing date silently loses its weather.
+    # Window comes from the BBE file, not the schedule.  The schedule runs to
+    # the end of the season; a part-season corpus does not, and fetching the
+    # gap pulls dates near today, which routes to the forecast endpoint and
+    # 400s on a month-wide multi-location request.
+    season_start = (_dt.date.fromisoformat(str(bbe.game_date.min())[:10])
+                    - _dt.timedelta(days=1))
+    season_end = (_dt.date.fromisoformat(str(bbe.game_date.max())[:10])
+                  + _dt.timedelta(days=1))
+    print(f"[{year}] weather window {season_start} .. {season_end}")
+    weather = fetch_weather(meta, season_start, season_end)
+
+    archive_unused = None  # noqa: F841  (kept for readability of the flow)
+    records = []
+    unmatched = 0
+    for game_date, home_team, inning in zip(bbe.game_date, bbe.home_team, bbe.inning):
+        code = home_team if home_team in valid_codes else \
+            SAVANT_ABBREV_FALLBACK.get(home_team, home_team)
+        key = (str(game_date)[:10], code)
+        g = by_key.get(key)
+        if g is None:
+            unmatched += 1
+            records.append({})
+            continue
+        m = meta.get(g["venue_id"], {})
+        rec = {
+            "game_pk": g["game_pk"],
+            "venue_id": g["venue_id"],
+            "venue_name": g["venue_name"],
+            "park_azimuth": m.get("azimuth"),
+            "park_elevation_ft": m.get("elevation_ft"),
+            "roof_type": m.get("roof"),
+            "dh_ambiguous": key in dh_keys,
+            "obs_condition": g["obs_condition"],
+            "obs_temp_f": g["obs_temp_f"],
+            "obs_wind_mph": g["obs_wind_mph"],
+            "obs_wind_label": g["obs_wind_label"],
+            "obs_wind_field_deg": g["obs_wind_field_deg"],
+            "obs_roof_closed": g["obs_roof_closed"],
+        }
+        # First pitch, advanced by the innings already played.
+        fp = _dt.datetime.fromisoformat(g["first_pitch_utc"].replace("Z", "+00:00"))
+        fp = fp.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        try:
+            offset = (float(inning) - 1.0) * MINUTES_PER_INNING
+        except (TypeError, ValueError):
+            offset = 0.0
+        when = fp + _dt.timedelta(minutes=max(0.0, offset))
+        stamp = (when + _dt.timedelta(minutes=30)).replace(
+            minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H")
+        row = weather.get(g["venue_id"], {}).get(stamp)
+        if row is not None:
+            # The roof state we KNOW, from MLB, not the park's base rate.
+            # MLB told us the roof was shut; apply_roof falls back to a
+            # generic sealed-indoor profile for venues we have no measurements
+            # for (Seoul, Tokyo), which beats reporting the outdoor forecast.
+            closed = bool(g["obs_roof_closed"])
+            if closed:
+                row = apply_roof(row, m.get("park_key") or g["venue_name"],
+                                 closed=True)
+            rec.update({
+                "event_time_utc": when.isoformat(timespec="minutes"),
+                "met_temp_f": row["temperature"],
+                "met_humidity": row["humidity"],
+                "met_pressure_hpa": row["pressure_hpa"],
+                "met_wind_mph": row["wind_speed"],
+                "met_wind_compass_deg": row["wind_direction"],
+                "met_wind_field_deg": wind_to_field_frame(
+                    row["wind_direction"], azimuth=m.get("azimuth")),
+                "met_wind_gust_mph": row["wind_gust"],
+                # Upper levels, for weatherman.wind_profile: the ball flies to
+                # ~45 m and the forecast is quoted at 10 m.
+                "met_wind_80m": row.get("wind_speed_80m"),
+                "met_wind_dir_80m": row.get("wind_direction_80m"),
+                "met_wind_120m": row.get("wind_speed_120m"),
+                "met_precip_in": row["precipitation"],
+                "met_cloud_pct": row["cloud_cover"],
+                "met_condition": row["condition"],
+                "met_source": row["source"],
+                "roof_closed": closed,
+            })
+        records.append(rec)
+
+    out = pd.DataFrame.from_records(records)
+    if unmatched:
+        print(f"[{year}] {unmatched} batted balls matched no game "
+              f"({100 * unmatched / len(bbe):.2f}%)")
+    joined = out["met_temp_f"].notna().sum() if "met_temp_f" in out else 0
+    print(f"[{year}] weather joined for {joined}/{len(bbe)} "
+          f"({100 * joined / len(bbe):.1f}%)")
+    if "dh_ambiguous" in out:
+        print(f"[{year}] doubleheader-ambiguous rows: "
+              f"{int(out.dh_ambiguous.fillna(False).sum())}")
+    out.to_parquet(out_path, index=False)
+    print(f"[{year}] -> {out_path}\n")
+    return out
+
+
+def report(year):
+    """Score the Open-Meteo columns against what MLB actually reported.
+
+    This is what the obs_* columns are FOR.  They never enter the model, but
+    they are the only independent check that the met_* columns describe the
+    right park on the right evening — a wrong venue join or a bad azimuth
+    shows up here as agreement collapsing, and nowhere else.
+    """
+    import pandas as pd
+    path = os.path.join(DATA_DIR, f"weather_backfill_{year}.parquet")
+    if not os.path.exists(path):
+        print(f"[{year}] no backfill to report on")
+        return
+    df = pd.read_parquet(path)
+    out = df[df.met_temp_f.notna() & df.obs_temp_f.notna()]
+    open_air = out[~out.obs_roof_closed.fillna(False)]
+    print(f"\n=== {year}: Open-Meteo vs MLB observed ({len(out)} rows, "
+          f"{len(open_air)} open-air) ===")
+
+    d = open_air.met_temp_f - open_air.obs_temp_f
+    print(f"  temperature   bias {d.mean():+5.2f} F   MAE {d.abs().mean():4.2f}   "
+          f"r {np.corrcoef(open_air.met_temp_f, open_air.obs_temp_f)[0, 1]:.3f}")
+
+    w = open_air[open_air.obs_wind_mph.notna() & open_air.met_wind_mph.notna()]
+    d = w.met_wind_mph - w.obs_wind_mph
+    print(f"  wind speed    bias {d.mean():+5.2f} mph MAE {d.abs().mean():4.2f}   "
+          f"r {np.corrcoef(w.met_wind_mph, w.obs_wind_mph)[0, 1]:.3f}")
+
+    # Direction is the one that would expose a bad azimuth.  MLB quantises to
+    # eight buckets, so "within 45 degrees" is the tightest meaningful test.
+    v = w[w.obs_wind_field_deg.notna() & w.met_wind_field_deg.notna()
+          & (w.obs_wind_mph >= 5)]
+    diff = (v.met_wind_field_deg - v.obs_wind_field_deg + 180) % 360 - 180
+    rad = np.radians(diff)
+    R = np.hypot(np.sin(rad).mean(), np.cos(rad).mean())
+    print(f"  wind bearing  circular mean {np.degrees(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())):+5.1f} deg"
+          f"   R {R:.2f}   within one bucket {100 * (diff.abs() <= 45).mean():.0f}%"
+          f"   (n={len(v)})")
+
+    worst = (v.assign(off=diff.abs()).groupby("venue_name")["off"]
+             .agg(["size", "mean"]).sort_values("mean", ascending=False).head(5))
+    print("  largest per-venue bearing disagreement:")
+    print(worst.to_string(float_format=lambda x: f"{x:7.1f}"))
+
+
+
+
+def validate_azimuths(start, end):
+    """Score PARK_ORIENTATION against MLB's own field-relative wind labels.
+
+    GUMBO reports observed wind as e.g. "9 mph, Out To CF" — already in the
+    field frame — while the forecast gives a compass bearing.  Rotating the
+    second by the park azimuth should reproduce the first, so a park whose
+    azimuth is wrong shows up as a rotational offset for that park alone.
+    """
+    import math
+    import numpy as np
+    START, END = str(start)[:10], str(end)[:10]
+    LABEL={"In From CF":0,"In From RF":45,"In From LF":315,
+           "Out To CF":180,"Out To RF":225,"Out To LF":135,
+           "R To L":90,   # from the 1B/RF side, crossing to left
+           "L To R":270}
+    ALIASES={"oriole park at camden yards":"Camden Yards","rate field":"Guaranteed Rate Field",
+             "daikin park":"Minute Maid Park","uniqlo field at dodger stadium":"Dodger Stadium",
+             "loandepot park":"LoanDepot Park"}
+    def park_key(n):
+        if n in STADIUM_DATA: return n
+        a=ALIASES.get(n.lower())
+        if a: return a
+        for k in STADIUM_DATA:
+            if k.lower()==n.lower(): return k
+        return None
+
+    def J(u):
+        return json.load(urllib.request.urlopen(u,timeout=45))
+
+    sched=J(f"{STATS}/schedule?sportId=1&startDate={START}&endDate={END}")
+    games=[]
+    for d in sched["dates"]:
+        for g in d["games"]:
+            if g["status"]["abstractGameState"]!="Final": continue
+            k=park_key(g["venue"]["name"])
+            if k: games.append((g["gamePk"],k))
+    print(f"{len(games)} final games {START}..{END}")
+
+    F=("https://statsapi.mlb.com/api/v1.1/game/{}/feed/live"
+       "?fields=gameData,datetime,dateTime,weather,condition,temp,wind,venue,name")
+    def pull(t):
+        pk,k=t
+        try:
+            d=J(F.format(pk)); gd=d["gameData"]
+            return (pk,k,gd["datetime"]["dateTime"],gd.get("weather",{}))
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        obs=[r for r in ex.map(pull,games) if r]
+    print(f"pulled {len(obs)} feeds")
+
+    roof=sum(1 for _,_,_,w in obs if "Roof" in (w.get("condition") or ""))
+    print(f"  roof-closed games: {roof}")
+
+    # one Open-Meteo request covering every park for the whole window
+    wa=WeatherArchive()
+    pts=[(n,d["lat"],d["lon"],d.get("altitude",0)) for n,d in sorted(STADIUM_DATA.items())]
+    grid=wa.hourly_points(pts,START,END)
+    index={p:{r["time"][:13]:r for r in rows} for p,rows in grid.items()}
+
+    def cdiff(a,b): return (a-b+180)%360-180
+    rows=[]
+    for pk,park,iso,w in obs:
+        cond=w.get("condition") or ""
+        if "Roof" in cond: continue
+        wind=(w.get("wind") or "")
+        if "," not in wind: continue
+        spd_s,lab=[x.strip() for x in wind.split(",",1)]
+        try: spd=float(spd_s.replace("mph","").strip())
+        except ValueError: continue
+        if lab not in LABEL or spd<5: continue     # <5mph label is noise
+        t=_dt.datetime.fromisoformat(iso.replace("Z","+00:00")).replace(tzinfo=None)
+        t=(t+_dt.timedelta(minutes=30)).replace(minute=0,second=0,microsecond=0)
+        row=index.get(park,{}).get(t.strftime("%Y-%m-%dT%H"))
+        if not row or row["wind_direction"] is None: continue
+        ours=wind_to_field_frame(row["wind_direction"],park)
+        rows.append((park,cdiff(ours,LABEL[lab]),spd,row["wind_speed"],lab))
+
+    print(f"\nusable comparisons: {len(rows)}")
+    def circmean(xs):
+        s=sum(math.sin(math.radians(x)) for x in xs); c=sum(math.cos(math.radians(x)) for x in xs)
+        return math.degrees(math.atan2(s,c)), math.hypot(s,c)/len(xs)
+    allm,allR=circmean([r[1] for r in rows])
+    print(f"LEAGUE-WIDE circular mean offset: {allm:+.1f} deg   concentration R={allR:.2f}")
+    within=sum(1 for r in rows if abs(r[1])<=45)/len(rows)
+    print(f"within +-45 deg (one label bucket): {within*100:.0f}%")
+
+    print(f"\n{'park':30}{'n':>4}{'mean off':>10}{'R':>6}  flag")
+    bad=[]
+    for park in sorted({r[0] for r in rows}):
+        xs=[r[1] for r in rows if r[0]==park]
+        if len(xs)<4: continue
+        m,R=circmean(xs)
+        flag=""
+        if abs(m)>40 and R>0.35: flag="<-- CHECK AZIMUTH"; bad.append(park)
+        elif R<0.25: flag="(swirly/unreliable)"
+        print(f"{park:30}{len(xs):4}{m:+10.1f}{R:6.2f}  {flag}")
+    print("\nsuspect parks:",bad or "none")
+
+
+def _tool_main(argv):
+    if len(argv) < 2:
+        print(__doc__ or "", "\ncommands: backfill | report | validate-azimuth")
+        return
+    cmd, rest = argv[1], argv[2:]
+    if cmd == "backfill":
+        years = [int(a) for a in rest if not a.startswith("-")] or [2024, 2025]
+        for y in years:
+            backfill(y)
+            report(y)
+    elif cmd == "report":
+        for y in [int(a) for a in rest if not a.startswith("-")] or [2024, 2025]:
+            report(y)
+    elif cmd == "validate-azimuth":
+        validate_azimuths(rest[0], rest[1])
+    else:
+        print(f"unknown command {cmd!r}")
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _tool_main(_sys.argv)

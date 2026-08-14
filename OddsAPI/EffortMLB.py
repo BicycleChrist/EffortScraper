@@ -904,6 +904,119 @@ def _velo_band(pitch_name: str, velo: Optional[float]) -> Optional[str]:
     return None
 
 
+# Pitch SHAPE bands, the second axis of stuff after velocity. `pfx_x`/`pfx_z`
+# ship in FEET and are break against a spinless pitch, so the magnitude of the
+# pair is total movement — how much the ball is not where it looked like it
+# was going.
+#
+# Both sets of edges are QUARTILES of what a hitter actually sees, measured
+# over the 21,039 cached pitch rows on this machine (14 players' seasons, so
+# weighted by pitches faced rather than by pitcher — which is the weighting
+# these rows want, since they are one hitter's season). Break quartiles came
+# out at 12.1 / 16.4 / 18.7 inches and arm angle at 30.2 / 38.2 / 43.3°;
+# rounded to the edges below the bands hold 25/21/33/21% and ~25% each.
+#
+# Even bands matter here: unequal ones put most of a hitter's season in one
+# row, and a row holding 60% of his pitches cannot differ from his overall
+# line by enough to see.
+BREAK_BAND_ORDER = ["≤12″", "12-16″", "16-19″", "19″+"]
+# Arm SLOT, from Savant's per-pitch `arm_angle` (90° = straight over the top,
+# 0° = horizontal sidearm). True over-the-top is rare — only 8% of pitches
+# come from 50°+ — so the top band is "44 and up", not "vertical".
+SLOT_BAND_ORDER = ["Over 44°+", "High ¾ 38-44", "¾ 30-38", "Side <30°"]
+
+
+def _break_band(row: dict) -> Optional[str]:
+    """Total-movement band for one pitch (pfx feet -> inches)."""
+    hb, ivb = row.get("pfx_x"), row.get("pfx_z")
+    if hb is None or ivb is None:
+        return None
+    mv = 12.0 * math.hypot(hb, ivb)
+    if mv < 12:
+        return BREAK_BAND_ORDER[0]
+    if mv < 16:
+        return BREAK_BAND_ORDER[1]
+    if mv < 19:
+        return BREAK_BAND_ORDER[2]
+    return BREAK_BAND_ORDER[3]
+
+
+def _slot_band(row: dict) -> Optional[str]:
+    """Arm-slot band of the pitcher who threw this pitch."""
+    a = row.get("arm_angle")
+    if a is None:
+        return None
+    if a >= 44:
+        return SLOT_BAND_ORDER[0]
+    if a >= 38:
+        return SLOT_BAND_ORDER[1]
+    if a >= 30:
+        return SLOT_BAND_ORDER[2]
+    return SLOT_BAND_ORDER[3]
+
+
+def arsenal_by_hand(rows: List[dict]) -> Dict[str, Dict[str, dict]]:
+    """A pitcher's usage/whiff per pitch type, split by the BATTER's hand.
+
+    Usage against everybody is the wrong denominator for a matchup: a
+    sweeper that is 30% of his pitches to righties can be 6% of them to
+    lefties, and the season figure — the one the arsenal boards publish —
+    describes neither of the two games he actually pitches.
+
+    {'L': {pitch_name: {'use', 'whiff', 'n'}}, 'R': {...}}; `use` is the
+    share WITHIN that hand, so each hand's shares sum to 1."""
+    acc: Dict[str, Dict[str, dict]] = {"L": {}, "R": {}}
+    tot = {"L": 0, "R": 0}
+    for r in rows:
+        hand = (r.get("stand") or "").upper()
+        pitch = r.get("pitch")
+        if hand not in acc or not pitch:
+            continue
+        tot[hand] += 1
+        b = acc[hand].setdefault(pitch, {"n": 0, "sw": 0, "wh": 0})
+        b["n"] += 1
+        desc = r.get("desc") or ""
+        if desc in _SWING_DESCS:
+            b["sw"] += 1
+            if desc in _WHIFF_DESCS:
+                b["wh"] += 1
+    out: Dict[str, Dict[str, dict]] = {}
+    for hand, per in acc.items():
+        n_all = tot[hand]
+        out[hand] = {
+            p: {"use": (b["n"] / n_all) if n_all else None,
+                "whiff": (b["wh"] / b["sw"]) if b["sw"] else None,
+                "n": b["n"]}
+            for p, b in per.items()}
+    return out
+
+
+def shape_marks(rows: List[dict]) -> Dict[str, List[str]]:
+    """Which of a pitcher's pitch types live in each break band — the tag
+    that turns the hitter's shape table into a matchup rather than a season
+    summary. Types under 3% of his pitches are dropped as noise."""
+    per: Dict[str, Dict[str, int]] = {}
+    n_all = 0
+    for r in rows:
+        band, pitch = _break_band(r), r.get("pitch")
+        if not band or not pitch:
+            continue
+        n_all += 1
+        per.setdefault(pitch, {}).setdefault(band, 0)
+        per[pitch][band] += 1
+    out: Dict[str, List[str]] = {}
+    for pitch, bands in per.items():
+        if sum(bands.values()) < 0.03 * n_all:
+            continue
+        # A pitch belongs to the band it MOSTLY lands in — the same slider
+        # scatters across two bands start to start, and tagging it in both
+        # says nothing.
+        band = max(bands, key=lambda b: bands[b])
+        out.setdefault(band, []).append(
+            PITCH_ABBREV.get(pitch, pitch[:2].upper()))
+    return out
+
+
 def _is_barrel(ev: float, la: float) -> bool:
     """Standard barrel-zone approximation: starts at 98 mph / 26-30°,
     widening ~1° down and ~2° up per mph, capped at the 8-50° window."""
@@ -5923,6 +6036,35 @@ class MLBPropStats:
         splits.sort(key=lambda s: order.get(s.pitch, 99))
         return splits
 
+    async def get_shape_splits(self, session: aiohttp.ClientSession,
+                               player_id: int,
+                               player_type: str = "batter") -> dict:
+        """Results by pitch SHAPE — total break, and the arm slot it came
+        from. Same cached pitch detail as the velo splits, so no extra
+        request; `pfx_x`/`pfx_z` and the per-pitch `arm_angle` have been in
+        that cache all along.
+
+        {'break': [PitchSplit...], 'slot': [PitchSplit...]}, each in its
+        band order."""
+        rows = await self._get_pitch_detail(session, player_id, player_type)
+        out = {}
+        for key, label_fn, order in (("break", _break_band, BREAK_BAND_ORDER),
+                                     ("slot", _slot_band, SLOT_BAND_ORDER)):
+            idx = {band: i for i, band in enumerate(order)}
+            splits = self._aggregate_splits(rows, label_fn)
+            splits.sort(key=lambda s: idx.get(s.pitch, 99))
+            out[key] = splits
+        return out
+
+    async def get_arsenal_by_hand(self, session: aiohttp.ClientSession,
+                                  pitcher_id: int) -> dict:
+        """A starter's mix and whiff rate per pitch type, split by batter
+        hand, plus which break band each of his pitches lives in. Both come
+        off his own cached detail — the same rows the mix-by-count table
+        already reads."""
+        rows = await self._get_pitch_detail(session, pitcher_id, "pitcher")
+        return {"hand": arsenal_by_hand(rows), "marks": shape_marks(rows)}
+
     async def get_sp_form(self, session: aiohttp.ClientSession,
                           pid: int) -> Optional[dict]:
         """Starter recent-form from the pitching game log (cached):
@@ -7273,6 +7415,14 @@ class MLBPropStats:
                 "xwoba": fnum(row.get("est_woba")),
                 "whiff": fnum(row.get("whiff_percent")),
                 "k": fnum(row.get("k_percent")),
+                # PUT-AWAY rate: the share of his two-strike counts with this
+                # pitch that ended in a strikeout. Whiff% says the pitch is
+                # hard to hit; this says it is the one he finishes you with,
+                # which is a different pitch for a lot of starters (the
+                # league's best whiff pitch is often a first-pitch steal).
+                # The column has been in this CSV all along and nothing read
+                # it.
+                "putaway": fnum(row.get("put_away")),
                 "slg": fnum(row.get("slg")),
                 "hh": fnum(row.get("hard_hit_percent")),
                 "pa": fnum(row.get("pa")),
@@ -7654,6 +7804,90 @@ PITCHER_PCT_COLS = [
 ]
 
 # Display abbreviations for pitch names (full name kept as tooltip)
+# --------------------------------------------------------------------------
+# ARSENAL FIT — how much harder to make contact against THIS starter's mix
+# than against the average one, for a given hitter.
+#
+# The naive version of this (weight the hitter's per-pitch-type rates by the
+# pitcher's usage) is what the DFS sites sell and it does not survive a
+# reliability check. Measured on Savant's batter arsenal boards, 2024 vs
+# 2025, 303 hitters / 1,601 hitter-x-type cells:
+#
+#   * Raw per-type residuals correlate YoY at r=0.66 — but that is almost all
+#     the pitch-TYPE main effect (sliders are hard for everybody). It has to
+#     be double-centred: subtract the hitter's own overall rate AND the
+#     league's mean residual for that type, or the number mostly measures
+#     which pitches the pitcher throws, not who is facing them.
+#   * Double-centred, hitter-x-type WHIFF skill is real: r = 0.30 at 100
+#     pitches, 0.52 at 300, true sd ≈ 2.9 whiff points.
+#   * Hitter-x-type CONTACT QUALITY is not: xwOBA residual r = 0.05 at 100
+#     pitches, 0.18 at 300, true sd ≈ 0.012. This is why there is no
+#     xwOBAcon / barrel / hard-hit version of this block — that product is
+#     sold widely and it is noise.
+#   * The displayed index, tested against 54 real starter arsenals: naive
+#     weighting gives YoY r=0.22 with a 2.31-point spread (≈78% noise);
+#     shrunk it gives r=0.375 with a 0.97-point spread, ≈0.6 points of which
+#     is signal. Hence the dead band below — under a point is not a finding.
+#
+# League mean whiff residual per type (2025 board, ~390 hitters each), in
+# points against the hitter's own overall whiff rate:
+ARSENAL_FIT_TYPE_MEAN = {
+    "FF": -3.67, "SI": -10.79, "SL": +7.65, "CH": +5.68, "CU": +6.14,
+    "FC": -2.91, "ST": +6.02, "FS": +9.19,
+    # thin types on the board — folded onto their nearest sibling rather
+    # than given a mean measured on 40 hitters
+    "KC": +6.14, "SV": +7.65, "CS": +6.14, "FO": +9.19, "FT": -10.79,
+}
+# Empirical-Bayes shrinkage: reliability = n/(n+k) for n pitches of that type.
+# Fitted off the measured curve (r=0.21 at n~75, 0.25 at 140, 0.36 at 263,
+# 0.55 at 537 -> k = 280/425/465/447); 400 is the conservative read of that.
+ARSENAL_FIT_K = 400
+# Below this the index is drawn neutral. True spread is ~0.6 points, so a
+# reading inside ±1 is inside the noise of the estimate itself.
+ARSENAL_FIT_DEAD = 1.0
+# Minimum share of the starter's pitches that must match a type the hitter
+# has faced; below it the index describes a different arsenal than his.
+ARSENAL_FIT_MIN_COVER = 0.60
+
+
+def arsenal_fit(splits, usage: Dict[str, float]) -> Optional[dict]:
+    """How this starter's mix scores against one hitter's whiff profile.
+
+    `splits` are the hitter's per-pitch-type PitchSplits, `usage` his
+    opponent's mix keyed by Savant pitch code (shares summing to ~1).
+
+    Returns {'index': points of whiff vs the hitter's OWN norm (positive =
+    this arsenal misses more bats against him than the average one),
+    'cover': share of the starter's pitches priced, 'worst'/'best':
+    (code, contribution) — or None when the hitter has too little of the
+    starter's arsenal on record to say anything."""
+    seen = {}
+    for s in splits or []:
+        code = PITCH_ABBREV.get(s.pitch)
+        if code and s.whiff_pct is not None and s.count:
+            seen[code] = (s.whiff_pct * 100.0, s.count)
+    if not seen:
+        return None
+    tot = sum(n for _, n in seen.values())
+    overall = sum(w * n for w, n in seen.values()) / tot
+    contrib, cover = {}, 0.0
+    for code, share in (usage or {}).items():
+        got = seen.get(code)
+        if not got or share is None:
+            continue
+        whiff, n = got
+        # double-centre, then regress to the mean on this cell's own sample
+        resid = whiff - overall - ARSENAL_FIT_TYPE_MEAN.get(code, 0.0)
+        contrib[code] = share * resid * (n / (n + ARSENAL_FIT_K))
+        cover += share
+    if cover < ARSENAL_FIT_MIN_COVER:
+        return None
+    ranked = sorted(contrib.items(), key=lambda kv: kv[1])
+    return {"index": sum(contrib.values()) / cover, "cover": cover,
+            "n": tot, "best": ranked[0], "worst": ranked[-1],
+            "overall": overall}
+
+
 PITCH_ABBREV = {
     "4-Seam Fastball": "FF", "2-Seam Fastball": "FT", "Fastball": "FA",
     "Sinker": "SI", "Cutter": "FC", "Slider": "SL", "Sweeper": "ST",
@@ -8250,6 +8484,10 @@ class PlayerDetailPanel(QWidget):
         self._arsenal = None
         self._arsenal_pitcher = None
         self._arsenal_stuff = None
+        self._arsenal_platoon = None     # SP mix split by batter hand
+        self._shape_marks = None         # his pitches, per break band
+        self._shape_splits = None        # hitter vs break / arm slot
+        self._sp_pbot = None             # SP PitchingBot row (matchup cols)
         self._sp_card = None
         self._sp_card_name = ""
         self._sp_card_hand = None
@@ -8720,21 +8958,52 @@ class PlayerDetailPanel(QWidget):
         profile_lay.addWidget(_pf)
         profile_lay.addStretch()
 
-        # ARSENAL — velo bands + the pitch-type matchup table.
+        # vs ARSENAL — the matchup table full width on top, then the two
+        # ways of cutting the hitter's season that the matchup table cannot:
+        # by SPEED (velo bands) and by SHAPE (break / arm slot), with the
+        # starter's mix by count between them.
+        #
+        # This tab used to carry five tables, two of which re-listed the same
+        # four pitches as the matchup table to add one column each: the FG
+        # pfx block (its # and Velo were already here; only RV/100 was new)
+        # and PitchingBot (only Cmd and Loc+ were new). Both are folded into
+        # the matchup table now — a column costs ~34px, a duplicate table
+        # cost a whole block of height and made the reader join the rows by
+        # eye.
         arsenal_page = QWidget()
         arsenal_lay = QVBoxLayout(arsenal_page)
         arsenal_lay.setContentsMargins(0, 4, 0, 0)
         arsenal_lay.setSpacing(6)
         self._tbl_velo = self._make_stats_table()
+        self._tbl_break = self._make_stats_table()
+        self._tbl_slot = self._make_stats_table()
+        # Row labels here carry a tag ("13-18″ ◂ FF KC"), which is the one
+        # label on the tab long enough to wrap — and a wrapped row is 34px
+        # tall next to 17px neighbours, which reads as a rendering fault
+        # rather than as a long name. Elide instead; the tooltip has it.
+        self._tbl_break.setWordWrap(False)
+        self._tbl_slot.setWordWrap(False)
         self._tbl_pitch = self._make_stats_table()   # merged SP-mix + splits
-        # Order matters in a flow: velo(395)+mix(327)=722 pairs inside 738,
-        # velo+pitch(471)=866 does not. The widest table goes last so it takes
-        # a row of its own instead of stranding a narrow one beside it.
-        _af = FlowHost(); _afl = _af
-        _afl.addWidget(self._tbl_velo)
         # Pitch-type expander lives INSIDE the matchup table as its last
         # (spanned) row — clicking it toggles the out-of-arsenal pitches
         self._tbl_pitch.cellClicked.connect(self._on_pitch_cell_clicked)
+        # The headline block, and the widest thing on the tab at 17 columns —
+        # it takes the top row on its own and fills the panel.
+        _afh = FlowHost()
+        _afh.addWidget(self._tbl_pitch)
+        arsenal_lay.addWidget(_afh)
+        # PitchingBot's OVERALL line. It was a five-row table whose four pitch
+        # rows are now columns in the matchup table above; what is left is one
+        # sentence about the starter as a whole, which is a caption, not a
+        # block.
+        self._pbot_line = QLabel("")
+        self._pbot_line.setObjectName("matchupLine")
+        self._pbot_line.setWordWrap(True)
+        self._pbot_line.setTextFormat(Qt.TextFormat.RichText)
+        self._pbot_line.hide()
+        arsenal_lay.addWidget(self._pbot_line)
+        _af = FlowHost(spacing=self._ARSENAL_GAP); _afl = _af
+        _afl.addWidget(self._tbl_velo)
         # What the opposing starter actually GOES TO in each count. The table
         # above says what he throws and how the hitter fares against it; this
         # says when he throws it, which is the half that decides what is
@@ -8748,43 +9017,119 @@ class PlayerDetailPanel(QWidget):
             "from the PITCHER's side, so 'Ahead' is 0-2.\n\n"
             "'2K' and '3B' overlap the other columns on purpose; they are the "
             "two counts where the mix actually shifts.")
-        # PitchingBot — the opposing starter graded by a SECOND model, and
-        # the one that has a command term.
-        self._tbl_pbot = self._make_stats_table()
-        self._tbl_pbot.setToolTip(
-            "The opposing starter under FanGraphs' PitchingBot, per pitch, "
-            "beside the Stuff+ already in the matchup table.\n\n"
-            "The reason to carry a second model is COMMAND. Stuff+ grades a "
-            "pitch's shape in isolation and has no location term at all, so "
-            "a pitcher with vicious movement and no idea where it is going "
-            "reads the same as one who spots it. Cmd is the half Stuff+ "
-            "SCALES DIFFER, and the columns are not comparable by eye: "
-            "Stf/Cmd/Ovr are PitchingBot's 20-80 scouting scale (league ~52, "
-            "sd ~4), while Loc+ is FanGraphs' 100-centred Location+ (league "
-            "~101, sd ~6). Both are coloured against their OWN measured "
-            "league mark, at ±1 sd — hover a cell for its z.\n\n"
-            "The two models DISAGREEING on a pitch is the useful signal — it "
-            "usually means shape and location are pulling opposite ways.")
-        _afl.addWidget(self._tbl_mix)
-        _afl.addWidget(self._tbl_pbot)
-        # The batter's own results BY PITCH TYPE, in run value. The matchup
-        # table beside this carries the SP's run value per pitch and the
-        # hitter's contact quality against it, but not the hitter's own RV —
-        # which is the one figure that says "this pitch beats him".
-        self._tbl_pfx = self._make_stats_table()
-        self._tbl_pfx.setToolTip(
-            "The HITTER's run value per 100 pitches by pitch type "
-            "(FanGraphs pfx). Positive is good for the hitter.\n\n"
-            "Rows under 100 pitches seen are dotted and greyed. These "
-            "figures are not sample-gated at source and the tails are wild — "
-            "a hitter can read +43 runs/100 against a knuckle curve he saw "
-            "twenty times. Measured across 240 hitters, the noise sd falls "
-            "6.6 -> 4.0 -> 3.2 -> 2.4 -> 2.0 runs/100 as pitches seen goes "
-            "25 -> 50 -> 75 -> 100 -> 150, so 100 is where it stops being "
-            "mostly noise.\n\n"
-            "Velo is the average velocity he has faced of that type.")
-        _afl.addWidget(self._tbl_pfx)
-        _afl.addWidget(self._tbl_pitch)
+        # The hitter against pitch SHAPE — the axis neither the velo bands
+        # (speed) nor the matchup table (type) can express. A "slider" is
+        # four different pitches depending on how much it breaks and where it
+        # comes from, and both halves of that live in the pitch cache this
+        # panel already holds.
+        #
+        # TWO tables rather than one paired block: they are the same kind of
+        # cut but they pack differently. Slot is the same height as the mix
+        # table and sits under it in the second column; Break pairs with the
+        # fit block on the row below. Joined, the pair was one 680px slab
+        # that could only take a row of its own, which is what opened the
+        # hole under the velo table.
+        _shape_tip = (
+            "The hitter against pitch SHAPE, from every pitch he has seen "
+            "this season — the axis the velo bands (speed) and the matchup "
+            "table (type) both miss. A 95 mph fastball with 18\" of ride and "
+            "one with 8\" are the same row over there and different pitches "
+            "at the plate.\n\n"
+            "{what}\n\n"
+            "Rows tonight's starter occupies are tinted amber.\n\n"
+            "Both sets of bands are QUARTILES of what a hitter actually sees "
+            "(measured over 21k pitch rows), so a row holding most of his "
+            "season — which could not differ from his overall line by enough "
+            "to see — is not possible by construction. Rows under 40 pitches "
+            "are dimmed: that is ~18 swings, where a whiff rate carries a "
+            "±10-point sampling error.")
+        self._tbl_break.setToolTip(_shape_tip.format(what=(
+            "BREAK is total movement — the magnitude of the horizontal and "
+            "induced-vertical break together, in inches. The starter's own "
+            "pitches are tagged onto the band each of them lives in.")))
+        self._tbl_slot.setToolTip(_shape_tip.format(what=(
+            "SLOT is the arm angle the pitch was released from (90° = over "
+            "the top, 0° = sidearm), taken per pitch rather than from the "
+            "starter's season average — so it is the slot he actually "
+            "threw from, drift and all.")))
+        # ARSENAL FIT — the one block on this tab that CROSSES the two halves
+        # of it. Everything above says what he throws and what the hitter
+        # does; this prices the hitter's whiff profile through this starter's
+        # actual mix. Deliberately one number: see the reliability study at
+        # `arsenal_fit` for why there is no contact-quality version of it.
+        self._tbl_fit = self._make_stats_table()
+        self._tbl_fit.setToolTip(
+            "ARSENAL FIT — how many whiff points this starter's mix is worth "
+            "against THIS hitter, over and above the hitter's own overall "
+            "whiff rate. Positive means the arsenal misses more bats against "
+            "him than an average mix would.\n\n"
+            "Each pitch type is double-centred (the hitter's own rate and the "
+            "league's rate for that type both taken out — otherwise the "
+            "number mostly says 'he throws sliders'), then regressed to the "
+            "mean on its own sample, then weighted by his usage vs this "
+            "hitter's hand.\n\n"
+            "MEASURED, on the 2024 vs 2025 Savant arsenal boards (303 "
+            "hitters, 1,601 hitter-by-type cells, checked against 54 real "
+            "starter arsenals):\n"
+            "  · hitter-by-type whiff skill is real — year-to-year r = 0.30 "
+            "at 100 pitches of a type, 0.52 at 300, true sd ≈ 2.9 points.\n"
+            "  · this index, unshrunk, reproduces at r = 0.22 — about 78% of "
+            "it would be noise. Shrunk as it is here, r = 0.375 with a "
+            "0.97-point spread across hitters.\n"
+            "  · so ~0.6 points of that spread is signal, and anything "
+            "inside ±1.0 is drawn neutral because it is inside the noise of "
+            "the estimate.\n\n"
+            "There is NO xwOBA or barrel version of this on purpose: the "
+            "same test puts hitter-by-type CONTACT QUALITY at r = 0.05 "
+            "(true sd 0.012 xwOBA), i.e. not measurable in a season. The "
+            "widely sold 'barrel rate vs his pitch mix' product is that "
+            "number.\n\n"
+            "Coverage is the share of his pitches the hitter has a usable "
+            "record against; under 60% the block hides rather than pricing "
+            "an arsenal it cannot see.")
+        # Mix and fit STACK as one flow item rather than joining the flow
+        # separately. The gap this fills is the one the velo table's extra
+        # rows open beside the shorter mix table — a flow can only pack
+        # left-to-right, so nothing it holds can ever land underneath its
+        # neighbour. Grouped, the second column is mix over fit and comes out
+        # about the velo table's height; ungrouped, the fit block landed on
+        # the first row and pushed the hole down a row instead of closing it.
+        _af_col2 = QWidget()
+        _c2 = QVBoxLayout(_af_col2)
+        _c2.setContentsMargins(0, 0, 0, 0)
+        _c2.setSpacing(6)
+        _c2.addWidget(self._tbl_mix)
+        _c2.addWidget(self._tbl_slot)
+        _c2.addStretch(0)
+        _afl.addWidget(_af_col2)
+        # Break + fit are ONE flow item for the same reason mix + slot are.
+        # This flow is a skyline fill, not a row packer — it slides each
+        # block into the lowest gap that will hold it, so a small block
+        # added last does not stay last: the fit table climbed up beside the
+        # velo table and left break stranded on a row of its own. Boxed
+        # together they move as a unit and stay side by side.
+        _af_row3 = QWidget()
+        _r3 = QHBoxLayout(_af_row3)
+        _r3.setContentsMargins(0, 0, 0, 0)
+        _r3.setSpacing(self._ARSENAL_GAP)
+        _r3.addWidget(self._tbl_break)
+        _r3.addWidget(self._tbl_fit)
+        _r3.addStretch(0)
+        _afl.addWidget(_af_row3)
+        # Both blocks that take a row to themselves fill it rather than
+        # hugging their columns — the matchup table because it is the tab's
+        # headline and the reader's eye has to cross 17 columns of it, the
+        # shape table because a 470px block stranded in a 738px row is the
+        # same wasted space the merge was meant to reclaim.
+        self._tbl_pitch._expand_full = True
+        # Break and fit share the bottom row and fill it between them — see
+        # the `_fill_w` split in _sync_flank_widths. The fit block is two
+        # columns wide, which the expander normally refuses (that guard is
+        # there to stop a one-column "no data" placeholder being stretched
+        # into a 738px empty bar); it opts back in explicitly.
+        self._tbl_break._expand_full = True
+        self._tbl_fit._expand_full = True
+        self._tbl_fit._expand_narrow = True
         arsenal_lay.addWidget(_af)
         arsenal_lay.addStretch()
 
@@ -8985,7 +9330,7 @@ class PlayerDetailPanel(QWidget):
         self._sections.addTab(self._form_page, "Form")
         self._sections.addTab(self._scrollable(profile_page), "Profile")
         self._sections.addTab(self._scrollable(splits_page), "Splits")
-        self._sections.addTab(self._scrollable(arsenal_page), "Arsenal")
+        self._sections.addTab(self._scrollable(arsenal_page), "vs Arsenal")
         self._sections.addTab(self._scrollable(zone_page), "Zone")
         self._sections.addTab(self._scrollable(self._context_page), "Context")
         content_lay.addWidget(self._sections, stretch=1)
@@ -9580,6 +9925,10 @@ class PlayerDetailPanel(QWidget):
     # so the FlowHost wraps them into a single column instead.
     _PROFILE_RIGHT_W = 372
     _PROFILE_GAP = 6
+    # Spacing of the vs-Arsenal tab's flow. Named because the break/fit row
+    # is split against it in _sync_flank_widths — the two numbers have to
+    # agree or the pair wraps.
+    _ARSENAL_GAP = 8
     _PROFILE_MIN_2COL = 660
     # Page margins + the scroll gutter, between the panel's cap and the flow
     # the columns actually sit in. Measured at 20; carried at 24 so the pair
@@ -9784,13 +10133,30 @@ class PlayerDetailPanel(QWidget):
                                  else right_w)
             self._pct_holder.setFixedWidth(left_w)
 
+        # The vs-Arsenal tab's bottom row is a PAIR that has to fill the
+        # panel between them: Break carries seven columns and the fit block
+        # two, so at natural widths they leave ~160px of hole at the end of
+        # the row. Splitting the row between them explicitly is the same
+        # mechanism the Profile tab's two columns use — and it has to live
+        # here rather than at construction because the share is a function
+        # of `cap`, which moves with the splitter.
+        brk = getattr(self, "_tbl_break", None)
+        fit_t = getattr(self, "_tbl_fit", None)
+        if brk is not None and fit_t is not None and avail:
+            # The flow's OWN spacing, not the profile gap — FlowHost
+            # defaults to 8 and a 6 here left the pair two pixels too wide
+            # to share a row, which the flow answers by stacking them.
+            room = cap - self._ARSENAL_GAP
+            brk._fill_w = int(room * 0.62)
+            fit_t._fill_w = room - brk._fill_w
+
         for name in ("_tbl_velo", "_tbl_pitch", "_tbl_situ", "_tbl_count",
                      "_tbl_gamelog", "_tbl_bb", "_tbl_mix", "_tbl_zone",
                      "_tbl_disc", "_tbl_form", "_tbl_attack", "_tbl_dir", "_tbl_dwin",
                      "_tbl_rest", "_tbl_split", "_tbl_plus",
-                     "_tbl_bio", "_tbl_lev", "_tbl_pbot", "_tbl_az",
+                     "_tbl_bio", "_tbl_lev", "_tbl_az", "_tbl_fit",
                      "_tbl_cq", "_tbl_xhr",
-                     "_tbl_pfx"):
+                     "_tbl_break", "_tbl_slot"):
             t = getattr(self, name, None)
             nat = getattr(t, "_natural_w", 0) if t is not None else 0
             if not nat:
@@ -9818,7 +10184,9 @@ class PlayerDetailPanel(QWidget):
             # are single-column tables, and stretching one of those across the
             # panel draws a 738px empty bar where a short label belongs.
             if (getattr(t, "_expand_full", False) and target > nat
-                    and t.columnCount() > 2):
+                    and (t.columnCount() > 2
+                         or (t.columnCount() == 2
+                             and getattr(t, "_expand_narrow", False)))):
                 base = getattr(t, "_natural_cols", None) or [
                     t.columnWidth(c) for c in range(t.columnCount())]
                 n = len(base)
@@ -11298,17 +11666,25 @@ class PlayerDetailPanel(QWidget):
         else:
             opp = "Opp SP: TBD"
 
-        line = " &nbsp;·&nbsp; ".join(parts)
+        # One row per context block — game/park/weather, opposing SP (orange),
+        # batter-side splits (blue). Run together on one wrapped paragraph the
+        # three colours ran into each other mid-line and the wrap point moved
+        # with the text, so which colour started where was different for every
+        # player. Explicit blocks (not <br>, which keeps them one paragraph and
+        # lets the descenders of a wrapped row touch the row below) give each
+        # its own line box with its own leading.
+        rows = [" &nbsp;·&nbsp; ".join(parts)]
         if opp:
-            line += (" &nbsp;&nbsp;<span style='color:#E67E22; "
-                     f"font-weight:bold;'>{opp}</span>")
+            rows.append("<span style='color:#E67E22; "
+                        f"font-weight:bold;'>{opp}</span>")
         # Batter-side context (blue): split vs the SP's hand + career BvP
         batter_bits = [b for b in (ctx.batter_vs_hand, ctx.bvp) if b]
         if batter_bits:
-            line += (" &nbsp;&nbsp;<span style='color:#5DADE2; "
-                     "font-weight:bold;'>" + " · ".join(batter_bits)
-                     + "</span>")
-        self._matchup_line.setText(line)
+            rows.append("<span style='color:#5DADE2; font-weight:bold;'>"
+                        + " · ".join(batter_bits) + "</span>")
+        self._matchup_line.setText(
+            "".join(f"<div style='margin-top:{2 if i else 0}px;'>{r}</div>"
+                    for i, r in enumerate(rows)))
         # Re-render the situational table: today-row highlighting depends on
         # this context and the two fetches race each other
         if self._situ_data:
@@ -11327,9 +11703,17 @@ class PlayerDetailPanel(QWidget):
     def set_pitch_splits_loading(self):
         self._pitch_toggle_row = -1
         self._tbl_pitch.clearSpans()
+        self._pbot_line.hide()
+        # A pitcher's tab hides the shape block outright — put it back before
+        # the next player, who may be a hitter.
+        self._tbl_break.setVisible(True)
+        self._tbl_slot.setVisible(True)
+        self._tbl_fit.setVisible(False)
         for tbl, name in ((self._tbl_pitch, "Matchup"),
                           (self._tbl_velo, "Velo Bands"),
-                          (self._tbl_pbot, "PitchingBot"),
+                          (self._tbl_break, "Break"),
+                          (self._tbl_slot, "Arm slot"),
+                          (self._tbl_mix, "Mix by count"),
                           (self._tbl_situ, "Situational")):
             tbl.setRowCount(0)
             tbl.setColumnCount(1)
@@ -11356,6 +11740,10 @@ class PlayerDetailPanel(QWidget):
         self._arsenal = None          # opposing SP arsenal (batter view)
         self._arsenal_pitcher = None
         self._arsenal_stuff = None
+        self._arsenal_platoon = None  # SP mix split by batter hand
+        self._shape_marks = None      # his pitches, per break band
+        self._shape_splits = None
+        self._sp_pbot = None
         self._sp_card = None
         self._sp_card_name = ""
         self._spray_points = None
@@ -11521,6 +11909,33 @@ class PlayerDetailPanel(QWidget):
             # until something else happens to repaint them.
             self._render_form_windows(self._summary)
             self._render_discipline_windows(self._summary)
+        # The hand the platoon split of the starter's mix is taken on comes
+        # out of these rows, so the matchup table redraws once they land.
+        self._render_matchup()
+
+    def _batter_hand(self) -> str:
+        """Which side the shown hitter bats from, taken from the side he
+        HAS batted from this season rather than from a roster field — a
+        switch-hitter resolves to whichever side most of these numbers were
+        made on, which is the side tonight's starter will see."""
+        rows = getattr(self, "_pitch_rows", None) or []
+        hands = [r.get("stand") for r in rows if r.get("stand") in ("L", "R")]
+        return max(("L", "R"), key=hands.count) if hands else ""
+
+    def set_opposing_platoon(self, data: Optional[dict]):
+        """get_arsenal_by_hand output for tonight's starter: his mix per
+        batter hand, and which break band each of his pitches lives in."""
+        d = data or {}
+        self._arsenal_platoon = d.get("hand") or None
+        self._shape_marks = d.get("marks") or None
+        self._render_matchup()
+        self._render_shape()
+        self._render_fit()
+
+    def set_shape_splits(self, data: Optional[dict]):
+        """Hitter's results by total break and by arm slot."""
+        self._shape_splits = data or None
+        self._render_shape()
 
     def set_spray(self, points: List[tuple]):
         """Season spray points [(x_ft, y_ft, cat)] for the shown player."""
@@ -11729,54 +12144,29 @@ class PlayerDetailPanel(QWidget):
     # thin type is visibly thin rather than silently missing.
     PFX_RV_MIN_PITCHES = 100
 
-    def _render_pfx(self, fgb: Optional[dict]):
-        """Run value per 100 pitches by pitch type, for the batter."""
-        table = self._tbl_pfx
-        table.setRowCount(0)
-        f = fgb or {}
-        total = f.get("pitches") or 0
-        rows = []
-        for label, code in self._PFX_TYPES:
-            use = f.get(f"pfx{code}%")
-            rv = f.get(f"pfxw{code}/C")
-            if not use or rv is None:
-                continue
-            n = use * total
-            rows.append((label, use, n, f.get(f"pfxv{code}"), rv))
-        rows.sort(key=lambda r: -r[1])
-        if not rows:
-            table.setColumnCount(1)
-            table.setHorizontalHeaderLabels(["vs pitch type — no data"])
-            self._fit_table(table)
-            return
-        headers = ["vs type", "Use", "#", "Velo", "RV/100"]
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        cell = self._cell
-        table.setRowCount(len(rows))
-        for r, (label, use, n, velo, rv) in enumerate(rows):
-            thin = n < self.PFX_RV_MIN_PITCHES
-            table.setItem(r, 0, cell(("· " if thin else "") + label,
-                                     align_right=False))
-            table.setItem(r, 1, cell(f"{use:.0%}"))
-            table.setItem(r, 2, cell(f"{n:.0f}"))
-            table.setItem(r, 3, cell(f"{velo:.1f}" if velo else "—"))
-            it = cell(f"{rv:+.1f}")
-            if thin:
-                it.setForeground(QColor("#5D6D7E"))
-                it.setToolTip(
-                    f"{n:.0f} pitches — under the {self.PFX_RV_MIN_PITCHES} "
-                    f"needed for this to mean much. At this sample the "
-                    f"spread is ±3-7 runs/100 on noise alone.")
-            else:
-                it.setForeground(QColor("#2ECC71") if rv >= 1.0
-                                 else QColor("#E74C3C") if rv <= -1.0
-                                 else QColor("#BDC3C7"))
-                it.setToolTip(f"{n:.0f} pitches seen. League spread at this "
-                              f"sample is about ±2 runs/100.")
-            table.setItem(r, 4, it)
-        table.resizeRowsToContents()
-        self._fit_table(table)
+    # Savant pitch_type -> the FanGraphs pfx code the hitter's run value is
+    # filed under. FG splits sweepers out as ST but folds slurves into SL,
+    # and files the four-seamer as FA rather than FF.
+    _PFX_ALIAS = {"FF": "FA", "FA": "FA", "SV": "SL", "FT": "SI",
+                  "KN": "KC", "FO": "FS", "EP": "CU", "CS": "CU"}
+
+    def _pfx_rv(self, pitch_type: Optional[str]) -> tuple:
+        """(rv100, pitches_seen) for the hitter against one pitch type, from
+        the FanGraphs pfx block. (None, 0) when the type is missing.
+
+        This used to be a table of its own on this tab. Its Use / # / Velo
+        columns were already in the matchup table one block over, so the
+        whole block existed to carry ONE number per row — which is a column,
+        not a table."""
+        f = getattr(self, "_swing_fgb", None) or {}
+        if not pitch_type:
+            return None, 0
+        code = self._PFX_ALIAS.get(pitch_type, pitch_type)
+        use = f.get(f"pfx{code}%")
+        rv = f.get(f"pfxw{code}/C")
+        if not use or rv is None:
+            return None, 0
+        return rv, use * (f.get("pitches") or 0)
 
     # (label, key, format, group) — group 0 is where he STANDS, group 1 how
     # he RUNS. The two are unrelated quantities that shared a block only
@@ -11878,64 +12268,66 @@ class PlayerDetailPanel(QWidget):
     }
 
     def show_sp_pitchingbot(self, fgp: Optional[dict], name: str = ""):
-        """Opposing starter's PitchingBot grades, per pitch."""
-        table = self._tbl_pbot
-        table.setRowCount(0)
+        """Opposing starter under PitchingBot.
+
+        The per-pitch grades are COLUMNS of the matchup table (Cmd, Loc+
+        beside Stuff+) — they were a second table listing the same four
+        pitches, which made the reader join two row orders by eye for two
+        numbers. What stays here is the starter's overall line, which is one
+        sentence about one man and belongs in a caption.
+
+        The reason to carry a second model at all is COMMAND: Stuff+ grades
+        a pitch's shape in isolation and has no location term, so a pitcher
+        with vicious movement and no idea where it is going reads the same
+        as one who spots it."""
+        self._sp_pbot = fgp or None
         f = fgp or {}
-        per = f.get("pb_per_pitch") or {}
-        loc = f.get("loc_per_pitch") or {}
-        if not per and f.get("pb_overall") is None:
-            table.setColumnCount(1)
-            table.setHorizontalHeaderLabels(["PitchingBot — no data"])
-            self._fit_table(table)
+        lab = self._pbot_line
+        if not f or f.get("pb_overall") is None:
+            lab.hide()
+            self._render_matchup()
             return
-        headers = ["Bot", "Stf", "Cmd", "Ovr", "Loc+"]
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        cell = self._cell
 
-        def band(v, scope, key):
-            it = cell("—" if v is None else f"{v:.0f}")
+        def piece(title, v, key, fmt="{:.0f}"):
             if v is None:
-                return it
-            mean, sd = self._PBOT_MARKS[(scope, key)]
+                return ""
+            mean, sd = self._PBOT_MARKS[("ALL", key)]
             z = (v - mean) / sd
-            it.setForeground(QColor("#2ECC71") if z >= 1
-                             else QColor("#E74C3C") if z <= -1
-                             else QColor("#BDC3C7"))
-            it.setToolTip(f"{v:.1f} — {z:+.1f} sd vs league "
-                          f"({mean:.1f} ± {sd:.1f})")
-            return it
+            col = ("#2ECC71" if z >= 1 else "#E74C3C" if z <= -1
+                   else "#BDC3C7")
+            return (f"<span style='color:#7F8C8D'>{title}</span> "
+                    f"<span style='color:{col}'>{fmt.format(v)}</span>")
 
-        rows = [("ALL", "ALL", f.get("pb_stuff"), f.get("pb_command"),
-                 f.get("pb_overall"), f.get("location"))]
-        for code, d in sorted(per.items(),
-                              key=lambda kv: -(kv[1].get("o") or 0)):
-            rows.append(("P", code, d.get("s"), d.get("c"), d.get("o"),
-                         loc.get(code)))
-        table.setRowCount(len(rows))
-        for r, (scope, label, s, c, o, l) in enumerate(rows):
-            lab = cell(label, align_right=False)
-            if r == 0:
-                fnt = lab.font(); fnt.setBold(True); lab.setFont(fnt)
-            table.setItem(r, 0, lab)
-            for col, (v, key) in enumerate(
-                    ((s, "s"), (c, "c"), (o, "o"), (l, "l")), start=1):
-                table.setItem(r, col, band(v, scope, key))
-        xrv, pera = f.get("pb_xrv100"), f.get("pb_era")
-        tail = []
-        if xrv is not None:
-            tail.append(f"xRV/100 {xrv:+.2f}")
-        if pera is not None:
-            tail.append(f"botERA {pera:.2f}")
-        if f.get("xera") is not None:
-            tail.append(f"xERA {f['xera']:.2f}")
-        if tail:
-            table.setToolTip(table.toolTip() + "\n\n"
-                             + (name + ": " if name else "")
-                             + " · ".join(tail))
-        table.resizeRowsToContents()
-        self._fit_table(table)
+        who = (name.split()[-1] if name else "SP")
+        bits = [b for b in (
+            piece("Stf", f.get("pb_stuff"), "s"),
+            piece("Cmd", f.get("pb_command"), "c"),
+            piece("Ovr", f.get("pb_overall"), "o"),
+            piece("Loc+", f.get("location"), "l")) if b]
+        for title, key, fmt in (("botERA", "pb_era", "{:.2f}"),
+                                ("xERA", "xera", "{:.2f}"),
+                                ("xRV/100", "pb_xrv100", "{:+.2f}")):
+            v = f.get(key)
+            if v is not None:
+                bits.append(f"<span style='color:#7F8C8D'>{title}</span> "
+                            f"<span style='color:#BDC3C7'>"
+                            f"{fmt.format(v)}</span>")
+        lab.setText(
+            "<div style='font-size:8pt'>"
+            f"<span style='color:#E67E22'>{who} · PitchingBot</span> "
+            + " <span style='color:#4A5A6A'>·</span> ".join(bits) + "</div>")
+        lab.setToolTip(
+            "FanGraphs' PitchingBot on the starter as a whole. The per-pitch "
+            "grades are in the matchup table above.\n\n"
+            "SCALES DIFFER and the figures are not comparable by eye: "
+            "Stf/Cmd/Ovr are PitchingBot's 20-80 scouting scale (league ~52, "
+            "sd ~4), while Loc+ is FanGraphs' 100-centred Location+ (league "
+            "~101, sd ~6). Each is coloured against its OWN measured league "
+            "mark at ±1 sd.\n\n"
+            "botERA is PitchingBot's ERA estimate, xRV/100 its expected run "
+            "value per 100 pitches (negative is good for the pitcher).")
+        lab.show()
+        self._render_matchup()
 
     def show_swing(self, fgb: Optional[dict]):
         """Swing-tracking chip row under the matchup strip (batters):
@@ -11949,7 +12341,10 @@ class PlayerDetailPanel(QWidget):
         self._render_bio(fgb)
         self._render_leverage(fgb)
         self._render_attack_zones(fgb)
-        self._render_pfx(fgb)
+        # The hitter's per-type run value is a COLUMN of the matchup table
+        # now, and this row is where it arrives — so the table has to be
+        # redrawn, not just the block that used to hold it.
+        self._render_matchup()
         self._sync_flank_widths()
         lay = self._swing_lay
         while lay.count():
@@ -12100,6 +12495,9 @@ class PlayerDetailPanel(QWidget):
         self._sp_card_name = pitcher_name
         self._sp_card_hand = hand
         self._render_matchup()
+        # The card carries his arm angle, which is what marks the slot row
+        self._render_shape()
+        self._render_fit()
 
     def show_pitch_splits(self, splits: List[PitchSplit], player_type: str,
                           velo_splits: Optional[List[PitchSplit]] = None):
@@ -12108,6 +12506,7 @@ class PlayerDetailPanel(QWidget):
         self._splits_type = player_type
         self._render_matchup()
         self._render_velo_table()
+        self._render_fit()
 
     def set_opposing_arsenal(self, pitcher_name: str, arsenal: dict,
                              stuff: Optional[dict] = None):
@@ -12119,6 +12518,7 @@ class PlayerDetailPanel(QWidget):
         self._arsenal_pitcher = pitcher_name
         self._arsenal_stuff = stuff
         self._render_matchup()
+        self._render_fit()
 
     _SPLIT_HEADERS = ["Pitch", "#", "Velo", "Whiff", "BBE", "EV", "HH%",
                       "Brl%", "HR", "xwOBA"]
@@ -12161,20 +12561,39 @@ class PlayerDetailPanel(QWidget):
         spine = []
         if card and card.get("rows"):
             for p in card["rows"]:
-                spine.append({"pitch": p["pitch"], "use": p["usage"],
+                spine.append({"pitch": p["pitch"], "pt": p.get("pitch_type"),
+                              "use": p["usage"],
                               "velo": p["velo"], "spin": p["spin"],
                               "stuff": p["stuff"], "rv": p["rv100"],
                               "xw": p["xwoba"], "whiff": p["whiff"],
-                              "woba": p["woba"]})
+                              "woba": p["woba"],
+                              "putaway": p.get("putaway")})
         elif arsenal:
             per_pitch = (self._arsenal_stuff or {}).get("per_pitch") or {}
             for name, a in sorted(arsenal.items(),
                                   key=lambda kv: -kv[1]["usage"]):
-                spine.append({"pitch": name, "use": a["usage"] * 100,
+                spine.append({"pitch": name,
+                              "pt": PITCH_ABBREV.get(name),
+                              "use": a["usage"] * 100,
                               "velo": a.get("speed"), "spin": None,
                               "stuff": per_pitch.get(FG_PITCH_CODES.get(name)),
                               "rv": None, "xw": None, "whiff": None,
-                              "woba": None})
+                              "woba": None, "putaway": None})
+
+        # USAGE AGAINST THIS HITTER'S HAND, when his own pitch rows have
+        # settled the hand and the starter's have been aggregated. The season
+        # figure on the arsenal boards is his mix against everybody, which is
+        # the mix he throws in neither of the two games he actually pitches —
+        # a sweeper can be 30% to righties and 6% to lefties.
+        hand = self._batter_hand() if not is_pitcher else None
+        plat = ((self._arsenal_platoon or {}).get(hand) or {}) if hand else {}
+        for p in spine:
+            b = plat.get(p["pitch"])
+            # Only override once the split is thick enough to beat the season
+            # number it is replacing.
+            if b and b.get("use") is not None and b["n"] >= 25:
+                p["use_all"], p["use"] = p["use"], b["use"] * 100
+                p["use_n"] = b["n"]
 
         if not spine:
             # No SP/arsenal context (no game today, matchup still loading)
@@ -12201,30 +12620,54 @@ class PlayerDetailPanel(QWidget):
         shown_extras = extras if self._show_all_pitches else []
 
         col0 = "Arsenal" if is_pitcher else "Matchup"
-        headers = [col0, "Use%", "Velo", "Stf+", "RV", "xw", "Whf",
-                   "#", "Whf", "HH%", "Brl%", "HR", "xw"]
+        use_hdr = f"Use%v{hand}" if (hand and plat) else "Use%"
+        # The hitter's own run value per type is a BATTER figure (FanGraphs
+        # pfx) — on a pitcher's own arsenal it would be a column of blanks.
+        bat_rv = not is_pitcher
+        headers = ([col0, use_hdr, "Velo", "Stf+", "Cmd", "Loc+", "PA%",
+                    "RV", "xw", "Whf",
+                    "#", "Whf", "HH%", "Brl%", "HR", "xw"]
+                   + (["RV"] if bat_rv else []))
+        _SP_COLS = 10          # column 0 + the nine orange ones
         table.setRowCount(0)
         table.clearSpans()
         table.setColumnCount(len(headers))
         table.setHorizontalHeaderLabels(headers)
         sp_hdr = QColor(230, 126, 34)
         bat_hdr = QColor(93, 173, 226)
-        for c in range(1, 7):
+        # These two calls are the ONLY marker of the orange/blue seam that
+        # this table has ever had, and they have never drawn: the shared
+        # table stylesheet sets `QHeaderView::section { color }`, and a
+        # styled header ignores the per-item foreground role. Harmless to
+        # keep (a future unstyled header would honour them), but the seam is
+        # actually drawn by the spanned banner row below — which it has to
+        # be, now that the two halves each own a `Whf`, an `xw` and an `RV`.
+        for c in range(1, _SP_COLS):
             table.horizontalHeaderItem(c).setForeground(sp_hdr)
-        for c in range(7, 13):
+        for c in range(_SP_COLS, len(headers)):
             table.horizontalHeaderItem(c).setForeground(bat_hdr)
         sp_name = self._sp_card_name or self._arsenal_pitcher or "SP"
         me = self._summary.player_name if self._summary else "player"
-        if is_pitcher:
-            table.setToolTip(
-                f"{me}'s arsenal — orange: pitch quality (usage/velo/Stuff+/"
-                "RV/xwOBA/whiff), blue: contact allowed on that pitch")
-        else:
-            table.setToolTip(
-                f"Orange: {sp_name}'s pitch (usage · velo · Stuff+ · RV/100 "
-                f"· xwOBA allowed · whiff%)  |  Blue: {me} vs that pitch "
-                "type this season (# seen · whiff · HH% · Brl% · HR · "
-                "xwOBAcon). Green = edge for the batter, red = threat.")
+        who = me if is_pitcher else sp_name
+        table.setToolTip(
+            (f"ORANGE — {who}'s pitch: "
+             + ("usage" if not (hand and plat) else
+                f"usage vs {hand}HH (season vs everyone in the tooltip)")
+             + " · velo · Stuff+ · PitchingBot command · Location+ · "
+               "put-away rate · run value per 100 · xwOBA and whiff% "
+               "allowed.\n\n")
+            + ("BLUE — contact allowed on that pitch.\n\n" if is_pitcher else
+               f"BLUE — {me} against that pitch type this season: pitches "
+               "seen · whiff% · hard-hit% · barrel% · HR · xwOBAcon · his "
+               "own run value per 100 (FanGraphs pfx, positive is good for "
+               "the hitter, greyed under 100 pitches seen).\n\n"
+               "Green is an edge for the batter, red a threat.\n\n")
+            + "PA% is the share of his two-strike counts with this pitch "
+              "that ended in a strikeout — the pitch he FINISHES with, "
+              "which for a lot of starters is not his best whiff pitch.\n\n"
+              "Stf+ and Loc+ are 100-centred; Cmd is PitchingBot's 20-80 "
+              "scouting scale (league ~54, sd ~4) and does not compare to "
+              "them by eye.")
 
         cell = self._cell
         green, red = QColor(46, 204, 113), QColor(231, 76, 60)
@@ -12234,9 +12677,57 @@ class PlayerDetailPanel(QWidget):
         w3 = lambda v: "" if v is None else f"{v:.3f}".lstrip("0")
         pct = lambda v: "" if v is None else f"{v:.0%}"
 
-        def batter_cells(s):
+        pbot = self._sp_pbot or {}
+        pb_per = pbot.get("pb_per_pitch") or {}
+        pb_loc = pbot.get("loc_per_pitch") or {}
+
+        def fg_code(pt: Optional[str]) -> str:
+            """Savant pitch_type -> the FG per-pitch column suffix. FG folds
+            sweepers and slurves into SL and files forkballs with splitters,
+            so the alias is tried when the code itself is absent."""
+            if not pt:
+                return ""
+            alias = {"ST": "SL", "SV": "SL", "CS": "CU", "KC": "CU",
+                     "CU": "KC", "FS": "FO", "FO": "FS", "FT": "SI"}
+            if pt in pb_per or pt in pb_loc:
+                return pt
+            return alias.get(pt, pt)
+
+        def graded(v, key):
+            """A PitchingBot / Location+ cell, coloured at ±1 sd against its
+            own scale's measured league mark (the two scales differ by a
+            factor of two — see _PBOT_MARKS)."""
+            it = cell("" if v is None else f"{v:.0f}")
+            if v is None:
+                return it
+            mean, sd = self._PBOT_MARKS[("P", key)]
+            z = (v - mean) / sd
+            it.setForeground(green if z >= 1 else red if z <= -1
+                             else QColor("#BDC3C7"))
+            it.setToolTip(f"{v:.1f} — {z:+.1f} sd vs league "
+                          f"({mean:.1f} ± {sd:.1f})")
+            return it
+
+        def batter_cells(s, pt):
+            rv, seen = self._pfx_rv(pt) if bat_rv else (None, 0)
+            it_rv = cell("" if rv is None else f"{rv:+.1f}")
+            if rv is not None:
+                if seen < self.PFX_RV_MIN_PITCHES:
+                    it_rv.setForeground(QColor("#5D6D7E"))
+                    it_rv.setToolTip(
+                        f"{seen:.0f} pitches — under the "
+                        f"{self.PFX_RV_MIN_PITCHES} needed for this to mean "
+                        f"much. At this sample the spread is ±3-7 runs/100 "
+                        f"on noise alone.")
+                else:
+                    it_rv.setForeground(green if rv >= 1.0 else red
+                                        if rv <= -1.0 else QColor("#BDC3C7"))
+                    it_rv.setToolTip(
+                        f"{seen:.0f} pitches seen. League spread at this "
+                        f"sample is about ±2 runs/100.")
+            tail = [it_rv] if bat_rv else []
             if s is None:
-                return [cell("") for _ in range(6)]
+                return [cell("") for _ in range(6)] + tail
             xw = cell(w3(s.xwobacon))
             if s.xwobacon is not None and s.bbe >= 5:
                 if s.xwobacon >= 0.450:
@@ -12245,9 +12736,37 @@ class PlayerDetailPanel(QWidget):
                     xw.setForeground(red)
             return [cell(str(s.count)), cell(pct(s.whiff_pct)),
                     cell(pct(s.hardhit_pct)), cell(pct(s.barrel_pct)),
-                    cell(str(s.hr)), xw]
+                    cell(str(s.hr)), xw] + tail
 
-        r = 0
+        # Banner row: which half of the table belongs to whom. One 17px row
+        # buys the seam back — without it the reader meets `Whf … Whf` and
+        # `xw … xw` in the same header and has to count columns to know
+        # which side of the matchup he is looking at.
+        table.insertRow(0)
+        band_bg = QColor(26, 32, 41)
+        for start, span, text, colr in (
+                (1, _SP_COLS - 1,
+                 f"◆ {sp_name.split()[-1] if sp_name else 'SP'} throws",
+                 sp_hdr),
+                (_SP_COLS, len(headers) - _SP_COLS,
+                 f"◆ {me.split()[-1] if me else 'batter'} "
+                 + ("allows" if is_pitcher else "vs"), bat_hdr)):
+            it = self._cell(text, align_right=False)
+            it.setForeground(colr)
+            it.setBackground(band_bg)
+            fnt = it.font(); fnt.setBold(True); it.setFont(fnt)
+            table.setItem(0, start, it)
+            table.setSpan(0, start, 1, span)
+            for c in range(start, start + span):
+                if table.item(0, c) is None:
+                    blank = self._cell("")
+                    blank.setBackground(band_bg)
+                    table.setItem(0, c, blank)
+        corner = self._cell("")
+        corner.setBackground(band_bg)
+        table.setItem(0, 0, corner)
+
+        r = 1
         for p in spine:
             table.insertRow(r)
             name_cell = cell(PITCH_ABBREV.get(p["pitch"], p["pitch"]),
@@ -12257,6 +12776,10 @@ class PlayerDetailPanel(QWidget):
                 tip += f" · {p['spin']:.0f} rpm"
             if p["woba"] is not None:
                 tip += f" · wOBA {w3(p['woba'])} allowed"
+            if p.get("use_all") is not None:
+                tip += (f"\n{p['use']:.0f}% vs {hand}HH "
+                        f"({p['use_n']:.0f} pitches) · "
+                        f"{p['use_all']:.0f}% vs everyone")
             name_cell.setToolTip(tip)
             name_cell.setForeground(orange)
             font = name_cell.font()
@@ -12278,9 +12801,26 @@ class PlayerDetailPanel(QWidget):
             spwhf = cell(num(p["whiff"]))
             if (p["whiff"] or 0) >= 35:
                 spwhf.setForeground(red)
-            row_cells = [name_cell, cell(num(p["use"])), cell(num(p["velo"])),
-                         cell(num(p["stuff"], 0)), rv, spxw, spwhf]
-            row_cells += batter_cells(by_name.get(p["pitch"]))
+            code = fg_code(p.get("pt")) or FG_PITCH_CODES.get(p["pitch"], "")
+            pb = pb_per.get(code) or {}
+            use_cell = cell(num(p["use"]))
+            # A usage figure that is NOT the season one the boards publish
+            # says so on the cell, not only in the tooltip.
+            if p.get("use_all") is not None:
+                use_cell.setForeground(QColor(240, 178, 122))
+            pa = cell(num(p.get("putaway"), 0))
+            # League put-away is ~19%; 25%+ is a genuine out pitch.
+            if p.get("putaway") is not None:
+                if p["putaway"] >= 25:
+                    pa.setForeground(red)
+                elif p["putaway"] <= 13:
+                    pa.setForeground(green)
+            row_cells = [name_cell, use_cell, cell(num(p["velo"])),
+                         cell(num(p["stuff"], 0)),
+                         graded(pb.get("c"), "c"),
+                         graded(pb_loc.get(code), "l"),
+                         pa, rv, spxw, spwhf]
+            row_cells += batter_cells(by_name.get(p["pitch"]), p.get("pt"))
             for c, item in enumerate(row_cells):
                 table.setItem(r, c, item)
             r += 1
@@ -12290,8 +12830,9 @@ class PlayerDetailPanel(QWidget):
                              align_right=False)
             name_cell.setToolTip(f"{s.pitch} — not in {sp_name}'s arsenal")
             name_cell.setForeground(grey)
-            row_cells = ([name_cell] + [cell("") for _ in range(6)]
-                         + batter_cells(s))
+            row_cells = ([name_cell]
+                         + [cell("") for _ in range(_SP_COLS - 1)]
+                         + batter_cells(s, PITCH_ABBREV.get(s.pitch)))
             for c, item in enumerate(row_cells):
                 table.setItem(r, c, item)
             r += 1
@@ -12467,6 +13008,189 @@ class PlayerDetailPanel(QWidget):
             if self._splits_type == "batter"
             else "Results allowed by pitch speed band")
         self._fill_split_rows(self._tbl_velo, splits, col0="Velo Band")
+
+    # A band under this many pitches is drawn dimmed. The rates here are
+    # per SWING, and 40 pitches is only ~18 of them at the league's swing
+    # rate — a 25% whiff rate on 18 swings carries a ±10-point sampling sd,
+    # which is wider than the spread between the bands themselves.
+    SHAPE_MIN_PITCHES = 40
+
+    def _render_fit(self):
+        """Arsenal fit — the hitter's whiff profile priced through tonight's
+        starter's actual mix. Hidden for pitcher props (it is a statement
+        about a hitter) and whenever the arsenal is not covered."""
+        table = self._tbl_fit
+        if self._splits_type == "pitcher" or self._splits is None:
+            table.setVisible(False)
+            self._fit_table(table)
+            return
+        # Usage vs this hitter's HAND when the split has settled, his season
+        # mix otherwise — the same preference the matchup table makes.
+        hand = self._batter_hand()
+        plat = ((self._arsenal_platoon or {}).get(hand) or {}) if hand else {}
+        usage = {}
+        for pitch, b in plat.items():
+            code = PITCH_ABBREV.get(pitch)
+            if code and b.get("use") is not None and b["n"] >= 25:
+                usage[code] = b["use"]
+        if not usage:
+            for p in ((self._sp_card or {}).get("rows") or []):
+                if p.get("usage") is not None:
+                    usage[p.get("pitch_type") or
+                          PITCH_ABBREV.get(p["pitch"], "")] = p["usage"] / 100
+            for name, a in (self._arsenal or {}).items():
+                usage.setdefault(PITCH_ABBREV.get(name, ""), a["usage"])
+        usage.pop("", None)
+        fit = arsenal_fit(self._splits, usage)
+        if not fit:
+            table.setVisible(False)
+            self._fit_table(table)
+            return
+        table.setVisible(True)
+        table.setRowCount(0)
+        table.clearSpans()
+        table.setColumnCount(2)
+        who = (self._sp_card_name or self._arsenal_pitcher or "SP")
+        table.setHorizontalHeaderLabels(
+            [f"Arsenal fit — {who.split()[-1]}", ""])
+        cell = self._cell
+        idx = fit["index"]
+        val = cell(f"{idx:+.1f} pts")
+        # Signed for the PITCHER's benefit, like the run-value columns above:
+        # more whiff than the hitter's norm is red for him.
+        val.setForeground(QColor("#E74C3C") if idx >= ARSENAL_FIT_DEAD
+                          else QColor("#2ECC71") if idx <= -ARSENAL_FIT_DEAD
+                          else QColor("#BDC3C7"))
+        val.setToolTip(
+            f"{idx:+.2f} whiff points against his own norm of "
+            f"{fit['overall']:.1f}%.\n"
+            f"League spread of this index is 0.97 points and about 0.6 of "
+            f"that is signal, so ±{ARSENAL_FIT_DEAD:.1f} is the dead band.")
+        rows = [("Whiff vs his norm", val)]
+        for label, (code, c) in (("Toughest", fit["worst"]),
+                                 ("Best for him", fit["best"])):
+            it = cell(f"{code}  {c / fit['cover']:+.1f}")
+            it.setToolTip(f"{code} contributes {c / fit['cover']:+.2f} of the "
+                          f"index — its usage times his shrunk edge on it.")
+            rows.append((label, it))
+        cov = cell(f"{fit['cover']:.0%}")
+        cov.setToolTip(f"{fit['cover']:.0%} of his pitches are types this "
+                       f"hitter has a usable record against "
+                       f"({fit['n']} pitches seen in total).")
+        rows.append(("Coverage", cov))
+        table.setRowCount(len(rows))
+        for r, (label, item) in enumerate(rows):
+            table.setItem(r, 0, cell(label, align_right=False))
+            table.setItem(r, 1, item)
+        table.resizeRowsToContents()
+        self._fit_table(table)
+        self._sync_flank_widths()
+
+    def _render_shape(self):
+        """The hitter against pitch SHAPE — total break in one table, the arm
+        slot it came from in another.
+
+        Neither axis exists anywhere else on this panel: the velo bands cut
+        the same pitches by SPEED and the matchup table by TYPE, and a
+        slider with 6" of break from a sidearmer and one with 17" from over
+        the top are one row in both.
+
+        Tonight's starter is marked ON the rows he occupies — his slot band,
+        and the pitches of his that live in each break band. A pitcher's own
+        rows would be his own arsenal read back to him from one arm slot, so
+        both blocks hide for pitcher props."""
+        data = self._shape_splits
+        if data is None:
+            return
+        pair = ((self._tbl_break, "break", "Break"),
+                (self._tbl_slot, "slot", "Arm slot"))
+        if self._splits_type == "pitcher":
+            for table, _, _ in pair:
+                table.setVisible(False)
+                self._fit_table(table)
+            self._sync_flank_widths()
+            return
+
+        cell = self._cell
+        green, red = QColor(46, 204, 113), QColor(231, 76, 60)
+        dim = QColor(109, 122, 137)
+        amber_bg, amber_fg = QColor(60, 45, 18), QColor(230, 126, 34)
+        pct = lambda v: "" if v is None else f"{v:.0%}"
+        marks = self._shape_marks or {}
+        sp_name = self._sp_card_name or self._arsenal_pitcher or ""
+        who = sp_name.split()[-1] if sp_name else ""
+        sp_slot = (self._sp_card or {}).get("arm_angle")
+        sp_slot_band = _slot_band({"arm_angle": sp_slot}) if sp_slot else None
+
+        for table, key, col0 in pair:
+            splits = data.get(key) or []
+            table.setVisible(True)
+            table.setRowCount(0)
+            table.clearSpans()
+            if not splits:
+                table.setColumnCount(1)
+                table.setHorizontalHeaderLabels(
+                    [f"{col0} — no Statcast data"])
+                self._fit_table(table)
+                continue
+            # No EV column. These two blocks carry two contact-quality
+            # measures already (HH%, xwOBAcon), and shape-level contact
+            # quality is the noisy half of this cut — the reliability study
+            # at `arsenal_fit` puts hitter-by-shape contact quality near
+            # zero signal while whiff is real. The 40px buys the slot table
+            # a place under the mix table instead of a row of its own.
+            headers = [col0, "#", "Whf", "BBE", "HH%", "xwOBA"]
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setRowCount(len(splits))
+            for r, s in enumerate(splits):
+                # At most three codes: a fourth wraps the label column onto a
+                # second line, and a band holding four of his pitch types is
+                # not telling the reader anything a band holding three isn't.
+                tag = (" ".join(marks.get(s.pitch, [])[:3])
+                       if key == "break" else "")
+                hit = (bool(tag) if key == "break"
+                       else s.pitch == sp_slot_band)
+                label = s.pitch + (f"  ◂ {tag}" if tag else
+                                   ("  ◂ " + who if hit and who else ""))
+                lab = cell(label, align_right=False)
+                if hit:
+                    lab.setToolTip(
+                        f"{who}: {tag or f'{sp_slot:.0f}° arm angle'}"
+                        if who else "tonight's starter")
+                xw = cell("" if s.xwobacon is None
+                          else f"{s.xwobacon:.3f}".lstrip("0"))
+                if s.xwobacon is not None and s.bbe >= 15:
+                    if s.xwobacon >= 0.450:
+                        xw.setForeground(green)
+                    elif s.xwobacon <= 0.300:
+                        xw.setForeground(red)
+                cells = [lab, cell(str(s.count)), cell(pct(s.whiff_pct)),
+                         cell(str(s.bbe)), cell(pct(s.hardhit_pct)), xw]
+                thin = s.count < self.SHAPE_MIN_PITCHES
+                for c, item in enumerate(cells):
+                    # The two marks answer different questions and must not
+                    # cancel: the amber says TONIGHT lives on this row, the
+                    # dimming says the numbers on it are too thin to read.
+                    # A thin row he occupies is exactly the row a reader
+                    # needs to see marked AND discounted.
+                    if hit:
+                        item.setBackground(amber_bg)
+                    if thin and c:
+                        item.setForeground(dim)
+                        item.setToolTip(
+                            f"{s.count} pitches — about "
+                            f"{s.count * 0.46:.0f} swings, where a whiff "
+                            f"rate moves ±10 points on noise alone. Too "
+                            f"thin to read as a difference.")
+                    if hit and c == 0:
+                        item.setForeground(amber_fg)
+                        fnt = item.font(); fnt.setBold(True)
+                        item.setFont(fnt)
+                    table.setItem(r, c, item)
+            table.resizeRowsToContents()
+            self._fit_table(table)
+        self._sync_flank_widths()
 
     # --------------------------------------------------------------- chart
 
@@ -20970,6 +21694,652 @@ class _MatchupRow(QWidget):
         self.head.setPixmap(_portrait(pm, 29) if pm else QPixmap())
 
 
+# ===========================================================================
+# Weather / park environment
+# ===========================================================================
+
+_WIND_GOING = [
+    (0,   "\u2193", "In from CF"),   (45,  "\u2199", "In from RF"),
+    (90,  "\u2190", "R to L"),       (135, "\u2196", "Out to LF"),
+    (180, "\u2191", "Out to CF"),    (225, "\u2197", "Out to RF"),
+    (270, "\u2192", "L to R"),       (315, "\u2198", "In from LF"),
+]
+
+# Spray angles the carry profile is evaluated at: 0 is dead centre, positive
+# toward right field, the foul lines at +-45.
+_SPRAY_GRID = list(range(-45, 46, 5))
+
+
+def _wind_glyph(field_deg):
+    """(arrow, label) for a field-frame FROM bearing, or ('', '') if unknown."""
+    if field_deg is None:
+        return "", ""
+    best = min(_WIND_GOING, key=lambda e: abs((field_deg - e[0] + 180) % 360 - 180))
+    return best[1], best[2]
+
+
+class ParkWindView(QWidget):
+    """One park, drawn to its real fence, with tonight's air moving over it.
+
+    Outlines come from weatherman's polar wall equations -- the same
+    get_stadium_wall_distance the hit classifier uses -- sampled every 5
+    degrees across fair territory, so this is the park's actual shape rather
+    than a generic arc.
+
+    A single carry number per game hides the thing that decides home runs:
+    carry is DIRECTIONAL. A crosswind adding fifteen feet down the right-field
+    line takes them off the left, and a park with a short porch cares about
+    that far more than about its average. So the grey outline is the true
+    fence and the coloured one is the EFFECTIVE fence tonight -- the wall moved
+    in by however far the ball carries at that bearing -- with the gap between
+    them filled per segment, green where the park plays smaller than it
+    measures and red where it plays bigger. On a crosswind night the two lines
+    cross, and the fill changes colour at the crossing."""
+
+    # Basepath geometry, feet from the plate on the spray convention
+    _B1, _B2, _B3 = (45.0, 90.0), (0.0, 127.28), (-45.0, 90.0)
+    _MOUND = (0.0, 60.5)
+    _TRACK = 15.0            # warning-track width
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._row = None
+        self.setMinimumHeight(300)
+
+    def set_row(self, row):
+        self._row = row
+        self.update()
+
+    def paintEvent(self, _e):
+        import math
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(GROUND))
+        row = self._row
+        W, H = self.width(), self.height()
+        if not row or not row.get("profile"):
+            p.setPen(QColor(FAINT))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "select a game")
+            p.end()
+            return
+
+        prof = [(s, w, d) for s, w, d in row["profile"] if w]
+        if not prof:
+            p.end()
+            return
+        far = max(w for _, w, _ in prof)
+        # The foul lines are the widest part of the wedge, so the horizontal
+        # fit is set by them; 26px of headroom leaves the CF label on screen.
+        scale = min((H - 58.0) / far, (W / 2.0 - 46.0) / (far * 0.7072))
+        # Centre the wedge vertically. The horizontal fit usually binds, which
+        # left the whole park sitting in the bottom third with dead space above.
+        cx = W / 2.0
+        cy = min(H - 26.0, (H + far * scale) / 2.0 + 8.0)
+
+        def pt(spray, dist):
+            a = math.radians(spray)
+            return QPointF(cx + dist * math.sin(a) * scale,
+                           cy - dist * math.cos(a) * scale)
+
+        # ---- fair territory -------------------------------------------------
+        fair = QPainterPath()
+        fair.moveTo(pt(-45, 0))
+        for s, w, _ in prof:
+            fair.lineTo(pt(s, w))
+        fair.lineTo(pt(45, 0))
+        fair.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(TURF))
+        p.drawPath(fair)
+
+        # ---- warning track, just inside the wall
+        track = QPainterPath()
+        track.moveTo(pt(prof[0][0], prof[0][1]))
+        for s, w, _ in prof:
+            track.lineTo(pt(s, w))
+        for s, w, _ in reversed(prof):
+            track.lineTo(pt(s, max(w - self._TRACK, 0)))
+        track.closeSubpath()
+        p.setBrush(QColor(DIRT))
+        p.drawPath(track)
+
+        # ---- distance arcs, so the fence numbers have a scale behind them
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(RULE_DIM), 1, Qt.PenStyle.DotLine))
+        p.setFont(QFont("", 7))
+        for ring in (300, 350, 400, 450):
+            if ring >= far:
+                continue
+            path = QPainterPath()
+            path.moveTo(pt(-45, ring))
+            for s in range(-45, 46, 5):
+                path.lineTo(pt(s, ring))
+            p.drawPath(path)
+            # On the grass left of centre: on the foul line these collided
+            # with the LF readout and ran off the left edge.
+            q = pt(-26, ring)
+            p.setPen(QColor(FAINT))
+            p.drawText(QPointF(q.x() - 8, q.y() - 3), str(ring))
+            p.setPen(QPen(QColor(RULE_DIM), 1, Qt.PenStyle.DotLine))
+
+        # ---- infield: dirt, basepaths, bags, mound
+        dirt = QPainterPath()
+        dirt.moveTo(pt(0, 12))
+        for s, d in (self._B1, self._B2, self._B3):
+            dirt.lineTo(pt(s, d * 1.10))
+        dirt.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(DIRT))
+        p.drawPath(dirt)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(RULE), 1))
+        diam = QPainterPath()
+        diam.moveTo(pt(0, 0))
+        for s, d in (self._B1, self._B2, self._B3):
+            diam.lineTo(pt(s, d))
+        diam.closeSubpath()
+        p.drawPath(diam)
+        p.setBrush(QColor(INK))
+        p.setPen(Qt.PenStyle.NoPen)
+        for s, d in (self._B1, self._B2, self._B3):
+            b = pt(s, d)
+            p.drawRect(QRectF(b.x() - 2, b.y() - 2, 4, 4))
+        m = pt(*self._MOUND)
+        r = max(9.0 * scale, 2.0)
+        p.setBrush(QColor(DIRT))
+        p.drawEllipse(m, r, r)
+
+        # ---- foul lines out to the poles
+        p.setPen(QPen(QColor(RULE), 1))
+        for s in (-45, 45):
+            p.drawLine(pt(s, 0), pt(s, far))
+
+        # ---- the carry band: real fence vs tonight's effective fence --------
+        p.setPen(Qt.PenStyle.NoPen)
+        for (s0, w0, d0), (s1, w1, d1) in zip(prof, prof[1:]):
+            if d0 is None or d1 is None:
+                continue
+            quad = QPainterPath()
+            quad.moveTo(pt(s0, w0))
+            quad.lineTo(pt(s1, w1))
+            quad.lineTo(pt(s1, w1 - d1))
+            quad.lineTo(pt(s0, w0 - d0))
+            quad.closeSubpath()
+            # Per SEGMENT, so a crosswind that helps one field and hurts the
+            # other changes colour where the lines cross.
+            avg = (d0 + d1) / 2.0
+            col = QColor(SAFE_C if avg > 0 else OUT_C)
+            col.setAlpha(min(150, int(28 + abs(avg) * 7)))
+            p.setBrush(col)
+            p.drawPath(quad)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(DIM), 2))
+        real = QPainterPath()
+        real.moveTo(pt(prof[0][0], prof[0][1]))
+        for s, w, _ in prof:
+            real.lineTo(pt(s, w))
+        p.drawPath(real)
+
+        prev = None
+        for s, w, d in prof:
+            if d is None:
+                continue
+            cur = pt(s, w - d)
+            if prev is not None:
+                p.setPen(QPen(QColor(SAFE_C if d > 0 else OUT_C), 2))
+                p.drawLine(prev, cur)
+            prev = cur
+
+        # ---- wind as a flow across the park --------------------------------
+        h0 = row["hours"][0] if row.get("hours") else {}
+        fd, spd = h0.get("wind_field_deg"), h0.get("wind_speed")
+        if fd is not None and spd:
+            going = (fd + 180.0) % 360.0
+            g = going if going <= 180 else going - 360      # spray convention
+            a = math.radians(g)
+            ux, uy = math.sin(a), -math.cos(a)              # unit, screen coords
+            px, py = -uy, ux                                # perpendicular
+            span = far * scale
+            # Longer and more opaque as it blows harder, so a 4 mph evening
+            # and a 20 mph one do not draw the same picture.
+            length = span * (0.34 + min(spd, 25) / 25.0 * 0.42)
+            mid = QPointF(cx, cy - span * 0.52)
+            p.save()
+            p.setClipPath(fair)                             # only over the grass
+            for k in (-2, -1, 0, 1, 2):
+                off = k * span * 0.17
+                c0 = QPointF(mid.x() + px * off, mid.y() + py * off)
+                tail = QPointF(c0.x() - ux * length / 2, c0.y() - uy * length / 2)
+                head = QPointF(c0.x() + ux * length / 2, c0.y() + uy * length / 2)
+                col = QColor(INFO_C)
+                col.setAlpha(210 if k == 0 else 120 if abs(k) == 1 else 65)
+                p.setPen(QPen(col, 3 if k == 0 else 2, Qt.PenStyle.SolidLine,
+                              Qt.PenCapStyle.RoundCap))
+                p.drawLine(tail, head)
+                for wing in (150, -150):
+                    b = math.radians(g + wing)
+                    p.drawLine(head, QPointF(head.x() + math.sin(b) * (11 if k == 0 else 8),
+                                             head.y() - math.cos(b) * (11 if k == 0 else 8)))
+            p.restore()
+            # Caption pinned to the corner rather than chasing the arrowhead,
+            # which put it on top of the streamlines and the infield.
+            arrow, label = _wind_glyph(fd)
+            eff = h0.get("wind_effective_mph")
+            p.setPen(QColor(INFO_C))
+            p.setFont(QFont("", 9, QFont.Weight.Bold))
+            p.drawText(QPointF(10, 18), f"{arrow} {spd:.0f} mph  {label}")
+            if eff is not None:
+                # NOT "effective wind" -- this is a fitted regression weight,
+                # not a claim about the air. Calling it a wind speed invites
+                # the reasonable objection that 8 mph cannot "really" be 1.5.
+                # Held-out 2026: weight 0.10 minimises distance error, raw
+                # forecast wind (1.0) costs 3.3 ft of MAE.
+                p.setFont(QFont("", 7))
+                p.setPen(QColor(DIM))
+                w = row.get("recept")
+                p.drawText(QPointF(10, 30),
+                           f"simulated at {eff:.1f} mph"
+                           + (f"  (weight {w:.2f})" if w is not None else ""))
+
+        # ---- fence + carry at the three landmarks
+        p.setFont(QFont("", 8))
+        for s, tag in ((-42, "LF"), (0, "CF"), (42, "RF")):
+            e = min(prof, key=lambda r: abs(r[0] - s))
+            q = pt(e[0], e[1] + 26)
+            x = min(max(q.x() - 16, 3.0), W - 58.0)
+            y = min(max(q.y(), 14.0), H - 34.0)
+            p.setPen(QColor(DIM))
+            p.drawText(QPointF(x, y), f"{tag} {e[1]:.0f}")
+            if e[2] is not None:
+                p.setPen(QColor(SAFE_C if e[2] > 0 else OUT_C))
+                p.drawText(QPointF(x, y + 11), f"{e[2]:+.0f} ft")
+
+        # ---- readout strip
+        bits = [row["venue"]]
+        if h0:
+            bits += [f"{h0.get('temperature', 0):.0f}\u00b0F",
+                     f"{h0.get('humidity', 0):.0f}% RH",
+                     f"{h0.get('pressure_hpa', 0):.0f} hPa"]
+        if row.get("alt") is not None:
+            bits.append(f"{row['alt']:,} ft")
+        if row.get("roof") and row["roof"] != "open":
+            bits.append(f"roof {row['roof']}")
+        p.setFont(QFont("", 8))
+        p.setPen(QColor(FAINT))
+        p.drawText(8, H - 9, "   \u00b7   ".join(bits))
+        p.end()
+
+
+class WeatherTab(QWidget):
+    """Tonight's slate as a hitting environment, park by park.
+
+    The window is otherwise about players; this is about the air they play in.
+    The table is the slate at a glance and the diagram below is the selected
+    park drawn to its real fence, because carry is directional and a single
+    per-game number hides the half of the story that decides home runs.
+
+    CARRY is a reference fly ball (103 mph at 28 degrees) against a neutral
+    70F sea-level calm baseline. Deliberately a carry number and not a run or
+    HR park factor: the trajectory model is CALIBRATED for this -- temperature
+    and altitude response slopes measure at zero over 116k batted balls --
+    whereas the run-scoring model is unfinished and would be dressing a guess
+    as a measurement.
+
+    Wind shows the forecast, which is what a reader expects to see; the
+    tooltip carries the much smaller uniform-equivalent actually simulated
+    after the park's fitted receptivity. Reported wind is not the quantity the
+    physics wants, so showing only the first overstates it and only the second
+    looks broken beside any weather app.
+
+    Loads lazily and off-thread -- blocking HTTP plus a few hundred ODE solves,
+    and the qasync loop IS the UI thread."""
+
+    load_finished = pyqtSignal()
+
+    # Wind and temperature run across the three hours the game occupies. A
+    # first-pitch reading alone hides an evening that cools ten degrees or a
+    # wind that swings from out to in by the seventh, and both change the
+    # picture more than the starting value does.
+    _COLS = ["Game", "Park", "Roof", "Rcpt", "Carry",
+             "Wind", "+1h", "+2h", "\u00b0F", "+1h", "+2h", "RH", "Alt"]
+    _WIDTHS = [96, 116, 46, 34, 46, 48, 44, 44, 30, 30, 30, 26, 34]
+    _NHOURS = 3
+
+    REF_EV, REF_LA = 103.0, 28.0
+    # (rtol, atol, max_step) for the carry profile -- see _compute.
+    _TOL = (1e-3, 1e-2, 0.25)
+
+    def __init__(self, stats, parent=None):
+        super().__init__(parent)
+        self._stats = stats
+        self._loaded = False
+        self._rows = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self._title = QLabel("Tonight's hitting environment")
+        self._title.setStyleSheet(f"color:{INK}; font-weight:600;")
+        bar.addWidget(self._title)
+        bar.addStretch(1)
+        self._note = QLabel("")
+        self._note.setStyleSheet(f"color:{DIM}; font-size:10px;")
+        bar.addWidget(self._note)
+        self._refresh = QPushButton("Refresh")
+        self._refresh.setFixedHeight(20)
+        self._refresh.clicked.connect(self._force_reload)
+        bar.addWidget(self._refresh)
+        root.addLayout(bar)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        self._table = QTableWidget(0, len(self._COLS))
+        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(19)
+        # Alternating rows fight the explicit per-cell foregrounds: every other
+        # row washed out against the default alternate base.
+        self._table.setAlternatingRowColors(False)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Never scroll sideways: the park name is the only column that can
+        # afford to elide, and it carries its full text in a tooltip.
+        self._table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._table.setStyleSheet(
+            f"QTableWidget{{background:{PANEL}; color:{INK}; gridline-color:{RULE_DIM};}}"
+            f"QHeaderView::section{{background:{PANEL_HI}; color:{DIM};"
+            f" border:0px; padding:3px;}}"
+            f"QTableWidget::item:selected{{background:{PANEL_HI}; color:{INK};}}")
+        for i, w in enumerate(self._WIDTHS):
+            self._table.setColumnWidth(i, w)
+        self._table.itemSelectionChanged.connect(self._on_select)
+        split.addWidget(self._table)
+
+        self._park = ParkWindView()
+        split.addWidget(self._park)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([300, 620])
+        root.addWidget(split, 1)
+
+        self._footer = QLabel("")
+        self._footer.setStyleSheet(f"color:{FAINT}; font-size:10px;")
+        self._footer.setWordWrap(True)
+        root.addWidget(self._footer)
+
+    # ------------------------------------------------------------- loading
+
+    def showEvent(self, a0):
+        super().showEvent(a0)
+        self.ensure_loaded()
+
+    def ensure_loaded(self):
+        """Idempotent kick -- the startup overlay hides the UI, so showEvent
+        never fires during startup."""
+        if not self._loaded and self._stats is not None:
+            self._loaded = True
+            asyncio.create_task(self._load())
+
+    def _force_reload(self):
+        self._loaded = True
+        asyncio.create_task(self._load())
+
+    async def _load(self):
+        try:
+            self._note.setText("loading...")
+            async with self._stats.http() as session:
+                games = await self._stats._get_schedule(session)
+            loop = asyncio.get_running_loop()
+            self._rows = await loop.run_in_executor(None, self._compute, games)
+            self._render()
+        except Exception as e:
+            self._note.setText(f"unavailable: {e}")
+            print(f"EffortMLB: weather tab failed: {e}")
+        finally:
+            self.load_finished.emit()
+
+    # ------------------------------------------------------------- compute
+
+    def _compute(self, games):
+        """One row per game, with a carry profile across the outfield.
+
+        Runs on a worker thread: ~40 trajectories per game for the profile."""
+        import weatherman as W
+        from homerunwidget import BallFlightSimulator
+
+        sim = BallFlightSimulator()
+        # Display precision, not calibration precision. With the landing point
+        # interpolated the solver can take much longer steps for free: 0.008 ft
+        # of error for 4.7x the speed over ~300 solves a slate.
+        tol = self._TOL
+        neutral = {s: sim.calculate_trajectory(
+            exit_velocity=self.REF_EV, vlaunch_angle=self.REF_LA,
+            hlaunch_angle=s, wind_speed=0.0, wind_direction=0.0,
+            temp=70.0, humidity=50.0, altitude=0.0, tol=tol)["distance"]
+            for s in _SPRAY_GRID}
+
+        # ONE request for the whole card. Per-park fetching was 0.83s each and
+        # 79% of this tab's load time.
+        entries = []
+        for g in games:
+            pk = W.resolve_park_name((g.get("venue") or {}).get("name", ""))
+            if pk and g.get("gameDate"):
+                entries.append((pk, g["gameDate"]))
+        try:
+            slate = W.slate_conditions(entries, hours=self._NHOURS)
+        except Exception as e:
+            print(f"EffortMLB: slate weather failed ({e}); falling back per park")
+            slate = None
+
+        out = []
+        for g in games:
+            venue = (g.get("venue") or {}).get("name", "")
+            park = W.resolve_park_name(venue)
+            teams = g.get("teams", {})
+            # The schedule carries team id and name but NOT the abbreviation.
+            names = getattr(self._stats, "_teams", {}) or {}
+
+            def _abbr(side):
+                t = teams.get(side, {}).get("team") or {}
+                return (names.get(t.get("id")) or t.get("abbreviation")
+                        or (t.get("name") or "").split()[-1][:3].upper())
+
+            try:
+                local = datetime.fromisoformat(
+                    g.get("gameDate", "").replace("Z", "+00:00")).astimezone()
+                when = local.strftime("%-I:%M")
+            except ValueError:
+                local, when = None, ""
+            row = {"venue": venue, "park": park,
+                   "matchup": f"{_abbr('away')} @ {_abbr('home')}", "time": when,
+                   "hours": [], "carry": None, "alt": None, "roof": "",
+                   "recept": None, "profile": []}
+            if park is None or local is None:
+                row["roof"] = "-"
+                out.append(row)
+                continue
+            if slate is not None:
+                hours = slate.get(park) or []
+            else:
+                try:
+                    hours = W.game_conditions(park, g["gameDate"],
+                                              hours=self._NHOURS)
+                except Exception as e:
+                    print(f"  weather: {park}: {e}")
+                    out.append(row)
+                    continue
+            if not hours:
+                out.append(row)
+                continue
+
+            info = W.STADIUM_DATA.get(park, {})
+            row["alt"] = info.get("altitude")
+            row["recept"] = W.wind_receptivity(park)
+            kind = W.get_park_roof(park)
+            if kind == "open":
+                row["roof"] = "open"
+            else:
+                rate = W.roof_closed_prior(park)
+                # Only a PRIOR until the game is played: Toronto and Milwaukee
+                # are coin flips and are shown as such rather than asserted.
+                row["roof"] = ("dome" if kind == "dome" else
+                               "shut" if rate >= 0.85 else
+                               "open" if rate <= 0.20 else f"{rate*100:.0f}%?")
+            row["hours"] = hours
+            first = hours[0]
+            fd = first.get("wind_field_deg")
+            env = dict(wind_speed=first.get("wind_effective_mph") or 0.0,
+                       wind_direction=fd if fd is not None else 0.0,
+                       temp=first.get("temperature") or 70.0,
+                       humidity=first.get("humidity") or 50.0,
+                       altitude=info.get("altitude") or 0.0,
+                       pressure_pa=first.get("pressure_pa"),
+                       pressure_is_station=True,
+                       wind_profile=W.profile_from_row(first))
+            prof = []
+            for s in _SPRAY_GRID:
+                wall = W.get_stadium_wall_distance(park, 45.0 - s)
+                try:
+                    d = sim.calculate_trajectory(
+                        exit_velocity=self.REF_EV, vlaunch_angle=self.REF_LA,
+                        hlaunch_angle=s, tol=tol, **env)["distance"] - neutral[s]
+                except Exception:
+                    d = None
+                prof.append((s, wall, d))
+            row["profile"] = prof
+            mid = [d for s, _, d in prof if d is not None and abs(s) <= 20]
+            row["carry"] = sum(mid) / len(mid) if mid else None
+            out.append(row)
+        out.sort(key=lambda r: -(r["carry"] if r["carry"] is not None else -999))
+        return out
+
+    # -------------------------------------------------------------- render
+
+    def _on_select(self):
+        rows = self._table.selectionModel().selectedRows()
+        if rows and 0 <= rows[0].row() < len(self._rows):
+            self._park.set_row(self._rows[rows[0].row()])
+
+    def _render(self):
+        rows = self._rows
+        self._table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            def put(c, text, colour=INK, tip=""):
+                it = QTableWidgetItem(text)
+                it.setForeground(QColor(colour))
+                # Numerics right-align so the columns read as columns; the two
+                # text columns stay left.
+                if c >= 3:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                        | Qt.AlignmentFlag.AlignVCenter)
+                if tip:
+                    it.setToolTip(tip)
+                self._table.setItem(r, c, it)
+
+            first = row["hours"][0] if row["hours"] else {}
+            put(0, f"{row['matchup'].replace(' @ ', '@')} {row['time']}",
+                INK, f"{row['matchup']}  first pitch {row['time']}")
+            put(1, row["venue"], INK, row["venue"])
+            put(2, row["roof"], DIM if row["roof"] in ("open", "-") else LEV_C,
+                "Retractable roofs show the measured closure rate: before "
+                "first pitch the state is a base rate, not a forecast.")
+            rec = row["recept"]
+            if rec is None:
+                put(3, "")
+            else:
+                lbl = "high" if rec >= 0.16 else "med" if rec >= 0.09 else "low"
+                # The number alone, banded by colour — spelling out "high"
+                # beside it does not fit the column and gets elided.
+                put(3, f"{rec:.2f}",
+                    INFO_C if lbl == "high" else INK if lbl == "med" else DIM,
+                    f"{lbl} wind weight. What the forecast wind is multiplied "
+                    "by before the trajectory sees it -- a fitted weight, not "
+                    "a claim about the air. A surface reading is a poor proxy "
+                    "for the flow a ball crosses, and held-out 2026 error is "
+                    "minimised near 0.10; using the raw forecast costs 3.3 ft "
+                    "of MAE. Ordering across parks cross-validates at +0.71.")
+            carry = row["carry"]
+            if carry is None:
+                put(4, "")
+            else:
+                col = SAFE_C if carry > 3 else OUT_C if carry < -3 else INK
+                put(4, f"{carry:+.0f} ft", col,
+                    "Mean over the centre third of the outfield; the diagram "
+                    "below shows it by direction.")
+            arrow, label = _wind_glyph(first.get("wind_field_deg"))
+            spd = first.get("wind_speed")
+            trend = []
+            for i, hr in enumerate(row["hours"]):
+                a, l = _wind_glyph(hr.get("wind_field_deg"))
+                sp, ef = hr.get("wind_speed"), hr.get("wind_effective_mph")
+                tp = hr.get("temperature")
+                trend.append(
+                    f"H{i+1}  {a} {sp:.0f} mph {l:<11} eff {ef:4.1f}   {tp:.0f}F"
+                    if sp is not None else f"H{i+1}  -")
+            tip = "\n".join(trend)
+            if first:
+                tip += (f"\n\npressure {first.get('pressure_hpa') or 0:.0f} hPa"
+                        f"\nsource   {first.get('source', '?')}")
+            # Wind across the three hours. Tinted by what it is DOING: a
+            # 12 mph reading means opposite things blowing out and blowing in,
+            # and the arrow alone makes the reader do that conversion on every
+            # row of every hour.
+            import math as _m
+            for k in range(self._NHOURS):
+                hr = row["hours"][k] if k < len(row["hours"]) else None
+                if hr is None:
+                    put(5 + k, "", DIM)
+                    continue
+                gl, _lab = _wind_glyph(hr.get("wind_field_deg"))
+                sp, fdg = hr.get("wind_speed"), hr.get("wind_field_deg")
+                wcol = DIM
+                if sp and fdg is not None:
+                    helping = -_m.cos(_m.radians(fdg))      # +1 = straight out
+                    wcol = (SAFE_C if helping > 0.35 else
+                            OUT_C if helping < -0.35 else INK)
+                put(5 + k, f"{gl} {sp:.0f}" if sp is not None else "-", wcol, tip)
+
+            # Temperature across the same hours. Later hours are tinted against
+            # FIRST PITCH rather than absolutely, so the column shows the trend
+            # -- a night cooling out of a hitters' evening is the signal, not
+            # whether 74 degrees is warm.
+            t0 = first.get("temperature")
+            for k in range(self._NHOURS):
+                hr = row["hours"][k] if k < len(row["hours"]) else None
+                t = hr.get("temperature") if hr else None
+                if t is None:
+                    put(8 + k, "", DIM)
+                    continue
+                if k == 0 or t0 is None:
+                    col = INK
+                else:
+                    d = t - t0
+                    col = (SAFE_C if d >= 2 else OUT_C if d <= -2 else DIM)
+                put(8 + k, f"{t:.0f}", col,
+                    tip if k == 0 else f"{t - t0:+.0f}\u00b0F vs first pitch")
+            put(11, f"{first.get('humidity') or 0:.0f}" if first else "", DIM)
+            put(12, f"{row['alt']:,}" if row["alt"] is not None else "", DIM)
+
+        got = sum(1 for x in rows if x["carry"] is not None)
+        self._note.setText(f"{got}/{len(rows)} games")
+        self._footer.setText(
+            "Grey outline is the real fence; coloured is tonight's effective "
+            "fence -- the wall moved in by however far the ball carries at that "
+            "bearing. Carry = 103 mph / 28 deg vs neutral 70F sea level. Wind "
+            "enters the trajectory scaled by a fitted per-park weight, not at "
+            "face value.")
+        if rows:
+            self._table.selectRow(0)
+
+
 class ReplayTab(QWidget):
     """The Replay tab: scoreboard, park view, play log and transport.
 
@@ -21630,9 +23000,21 @@ class MLBWindow(QMainWindow):
         self.main_splitter.setCollapsible(0, True)
         self.main_splitter.setCollapsible(1, False)
         self.main_splitter.setCollapsible(2, False)
-        # Pen table needs ~882px to show every column without scrolling;
-        # detail panel min is ~820 — split the 1900px budget accordingly
-        self.main_splitter.setSizes([self.RAIL_W, 890, 838])
+        # The three columns want more than a 1920px screen has: rail 200 +
+        # pitcher 971 (its own minimum, driven by the pen table, which is
+        # PINNED to its full content width) + the ~760 the detail panel needs
+        # before its tabs stop flip-flopping between one and two columns.
+        #
+        # setSizes alone could not move this — Qt clamps a section to the
+        # widget's minimum, so the panel sat at 707 no matter what was asked
+        # for, and the vs-Arsenal tab's widest row (the velo table beside the
+        # mix/slot column, 731px together) landed just wide enough to wrap.
+        # An explicit minimum on the pitcher column overrides the hint and
+        # lets the split land where it is asked to; the pen gives up ~55px
+        # and still renders (checked in situ), which is the same trade as
+        # dragging the handle left, just made the default.
+        pitcher_col.setMinimumWidth(969)
+        self.main_splitter.setSizes([self.RAIL_W, 969, 767])
         # handle(1) is the rail|pitcher gutter; handle(2) (pitcher|tabs) is a
         # real resizer between two equals and stays plain.
         h = self.main_splitter.handle(1)
@@ -21864,6 +23246,11 @@ class MLBWindow(QMainWindow):
         # fetched once ever and then read from disk.
         self.replay_tab = ReplayTab(self.stats)
         self.detail_tabs.addTab(self.replay_tab, "Replay")
+        await asyncio.sleep(0)
+        # Tonight's air, park by park. Lazy like the rest; its fetch and its
+        # ODE solves both run off-thread.
+        self.weather_tab = WeatherTab(self.stats)
+        self.detail_tabs.addTab(self.weather_tab, "Weather")
         await asyncio.sleep(0)
         if self._pending_replay_pk:
             self._load_replay(self._pending_replay_pk)
@@ -22502,6 +23889,9 @@ class MLBWindow(QMainWindow):
                     session, summary.player_id, player_type)
                 velo_splits = await self.stats.get_velo_splits(
                     session, summary.player_id, player_type)
+                # Break / arm-slot cuts of the same cached rows
+                shape = await self.stats.get_shape_splits(
+                    session, summary.player_id, player_type)
                 # Rides the same cached pitch detail — no extra request
                 counts = await self.stats.get_count_splits(
                     session, summary.player_id, player_type)
@@ -22518,6 +23908,7 @@ class MLBWindow(QMainWindow):
                 == summary.player_name):
             self.player_detail_panel.show_pitch_splits(
                 splits, player_type, velo_splits)
+            self.player_detail_panel.set_shape_splits(shape)
             self.player_detail_panel.show_count_splits(counts)
             self.player_detail_panel.show_batted_ball(bb_prof)
             self.player_detail_panel.show_discipline(disc)
@@ -22577,6 +23968,16 @@ class MLBWindow(QMainWindow):
         try:
             async with self.stats.http() as session:
                 arsenal = None
+                # The mix BY COUNT is the same question for a pitcher prop
+                # as for a batter one — what he goes to when he needs a
+                # strike — and it is his OWN cached detail either way, so it
+                # runs for both. It used to be batter-only, which left an
+                # empty framed block on a pitcher's tab.
+                mix = await self.stats.get_pitch_mix_by_count(
+                    session, card_pid)
+                if (self.player_detail_panel.current_player_name()
+                        == summary.player_name):
+                    self.player_detail_panel.show_pitch_mix(card_name, mix)
                 if not is_pitcher_prop:
                     arsenal = await self.stats.get_pitch_arsenal(
                         session, card_pid)
@@ -22585,12 +23986,13 @@ class MLBWindow(QMainWindow):
                             == summary.player_name):
                         self.player_detail_panel.set_opposing_arsenal(
                             card_name, arsenal)
-                    # His mix BY COUNT — same cached detail the SP card uses
-                    mix = await self.stats.get_pitch_mix_by_count(
+                    # His mix BY BATTER HAND, and which break band each of
+                    # his pitches lives in — same cached rows again.
+                    plat = await self.stats.get_arsenal_by_hand(
                         session, card_pid)
                     if (self.player_detail_panel.current_player_name()
                             == summary.player_name):
-                        self.player_detail_panel.show_pitch_mix(card_name, mix)
+                        self.player_detail_panel.set_opposing_platoon(plat)
                     # Zone grids — both sides off the same cached detail
                     bat_z, sp_z = await self.stats.get_zone_grids(
                         session, summary.player_id, card_pid)
@@ -22607,6 +24009,13 @@ class MLBWindow(QMainWindow):
             return
         self.player_detail_panel.set_sp_card(card, card_name, card_hand)
         sp_stuff = (card or {}).get("fg")
+        # PitchingBot's per-pitch command and Location+ are COLUMNS of the
+        # matchup table now, so a pitcher looking at his own arsenal needs
+        # this row as much as a hitter looking at tonight's starter — it
+        # used to be handed over on the batter branch only, which left both
+        # columns blank on every pitcher's tab.
+        if is_pitcher_prop and sp_stuff:
+            self.player_detail_panel.show_sp_pitchingbot(sp_stuff, card_name)
         if not is_pitcher_prop and ctx is not None:
             if card is not None:
                 ctx.opp_pitcher_arm = card.get("arm_angle")

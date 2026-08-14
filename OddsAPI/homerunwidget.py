@@ -29,7 +29,7 @@ import time
 import numpy as np
 import math
 from scipy.integrate import solve_ivp
-from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, get_stadium_wall_height, WindVectorWidget, get_park_for_team
+from weatherman import WeatherService, STADIUM_DATA, get_stadium_wall_distance, get_stadium_wall_height, WindVectorWidget, get_park_for_team, get_park_azimuth, effective_wind, resolve_park_name
 from player_overlay_widget import PlayerBBEOverlay
 from weatherman import open_weather_key
 from pathlib import Path
@@ -41,7 +41,7 @@ LOG_BALL_PHYSICS = False
 
 # ==============================================
 # ML Distance Residual Predictor
-# Loads distance_residual_model.lgb (trained by train_distance_model.py).
+# Loads model_data/distance_residual_model.lgb (trained by train_distance_model.py).
 # Adds a learned residual to the physics distance to match Statcast hit_distance_sc.
 # ==============================================
 _ML_MODEL = None
@@ -54,7 +54,7 @@ def _load_ml_distance_model():
     _ML_MODEL_TRIED = True
     try:
         import lightgbm as lgb
-        path = Path(__file__).parent / "distance_residual_model.lgb"
+        path = Path(__file__).parent / "model_data" / "distance_residual_model.lgb"
         if not path.exists():
             print(f"[ml] distance model not found at {path}")
             return None
@@ -184,20 +184,67 @@ class BallFlightSimulator:
 
     def calculate_trajectory(self, exit_velocity, vlaunch_angle, hlaunch_angle, wind_speed, wind_direction,
                              temp, humidity, altitude, start_x=0, start_y=0.91, start_z=0,
-                             pressure_pa=None, cd_override=None, cl_override=None, omega_override=None):
+                             pressure_pa=None, cd_override=None, cl_override=None, omega_override=None,
+                             park_azimuth=None, pressure_is_station=False, wind_profile=None,
+                             tol=None):
         """Calculate ball trajectory based on initial conditions and environment
 
         Standard coordinate system:
         - X axis: From home plate toward pitcher's mound/center field (positive)
         - Y axis: Vertical (up is positive)
         - Z axis: From home plate toward third base/left field (negative) or first base/right field (positive)
+
+        wind_direction is the direction the wind blows FROM, and it is
+        interpreted in the FIELD frame: 0 = in from centre field, 90 = from
+        the first-base side, 180 = out to centre field.
+
+        pressure_pa is assumed SEA-LEVEL normalised, because that is what
+        OpenWeather's `main.pressure` is.  Pass pressure_is_station=True for a
+        reading already taken at field level — Open-Meteo's surface_pressure,
+        or OpenWeather's grnd_level — otherwise the high-altitude branch will
+        "correct" an already-correct number into a badly wrong one.
+
+        Pass `park_azimuth` (the home-plate -> centre-field compass bearing,
+        weatherman.get_park_azimuth) whenever wind_direction came from a
+        weather feed, which reports bearings from true north.  Without it a
+        forecast bearing is silently read as a field angle, so the same
+        reading blows out to centre in every park regardless of which way the
+        park actually faces.  Omit it only when the caller has already
+        rotated, or when there is no wind to rotate.
         """
         # Convert inputs to SI units
         v0 = exit_velocity * 0.44704  # mph to m/s
         vertical_angle = np.radians(vlaunch_angle)
         horizontal_angle = np.radians(hlaunch_angle)
         wind = wind_speed * 0.44704  # mph to m/s
+        # Compass -> field frame.  Both conventions are "blows from" and both
+        # run clockwise seen from above, so this is a plain subtraction.
+        if park_azimuth is not None:
+            wind_direction = (float(wind_direction) - float(park_azimuth)) % 360.0
         wind_rad = np.radians(wind_direction)
+
+        # ----------------------------------------------------------------
+        # Height-varying wind.
+        # A fly ball spends most of its flight between 10 and 45 m, but a
+        # forecast reports 10 m.  Wind grows with height, so a single surface
+        # value understates what the ball actually flies through — and it is
+        # the one environmental input still applied as a flat constant, while
+        # air density has varied with height for years (rho_fn above).
+        #
+        # `wind_profile` is a callable h_m -> speed_mph, normally built by
+        # weatherman.wind_profile() from the 10/80/120 m levels.  It is scaled
+        # so that profile(10) matches the wind_speed passed in, which keeps any
+        # receptivity factor applied by the caller intact.
+        # ----------------------------------------------------------------
+        if wind_profile is not None:
+            ref = wind_profile(10.0)
+            scale = (wind / (ref * 0.44704)) if ref and ref > 0.1 else 0.0
+
+            def wind_fn(y_m):
+                return wind_profile(max(y_m, 0.5)) * 0.44704 * scale
+        else:
+            def wind_fn(y_m):
+                return wind
 
         # ----------------------------------------------------------------
         # High-altitude correction
@@ -207,7 +254,14 @@ class BallFlightSimulator:
         # ISA formula instead — it is more accurate than SLP for physics.
         # ----------------------------------------------------------------
         corrected_pressure_pa = pressure_pa
-        if altitude >= self.HIGH_ALTITUDE_THRESHOLD_FT:
+        if pressure_is_station and pressure_pa:
+            # Already the pressure at field level — the reconstruction below
+            # exists only to undo sea-level normalisation, and running it on a
+            # station reading is destructive: 840 hPa at Coors comes out as
+            # 664, a 21 % density error worth ~27 ft of carry.  Open-Meteo's
+            # surface_pressure and OpenWeather's grnd_level are both station.
+            pass
+        elif altitude >= self.HIGH_ALTITUDE_THRESHOLD_FT:
             # Derive station pressure from ISA standard atmosphere
             altitude_m = altitude * 0.3048
             p0_isa = 101325.0
@@ -263,14 +317,19 @@ class BallFlightSimulator:
         if cl_override    is not None: self.C_l   = cl_override
         if omega_override is not None: self.omega = omega_override
         try:
+            # `tol` loosens the solver for display-quality work. The default
+            # 1e-6 with a 0.05 s cap is calibration precision; a carry figure
+            # rounded to the foot does not need it, and a slate of parks is
+            # hundreds of solves.
+            _rtol, _atol, _mstep = (1e-6, 1e-6, 0.05) if tol is None else tol
             solution = solve_ivp(
-                lambda t, y: self.baseball_ode(t, y, wind, wind_rad, rho_fn),
+                lambda t, y: self.baseball_ode(t, y, wind_fn, wind_rad, rho_fn),
                 t_span,
                 initial_state,
                 method='RK45',
-                max_step=0.05,
-                rtol=1e-6,
-                atol=1e-6,
+                max_step=_mstep,
+                rtol=_rtol,
+                atol=_atol,
                 first_step=0.01
             )
         finally:
@@ -292,8 +351,23 @@ class BallFlightSimulator:
         if landing_idx == 0 and y[-1] > field_level:
             landing_idx = len(y) - 1
 
+        # INTERPOLATE the crossing rather than taking the first sample below
+        # it. The solver's steps do not land on the fence-height crossing, so
+        # reading the sample after it reports the ball wherever the integrator
+        # happened to stop -- measured at 2.98, 0.22, -2.59 and -11.30 ft below
+        # contact height for the same batted ball at different step caps, i.e.
+        # several feet of purely numerical noise on every distance, and a
+        # distance that moved when the tolerance did.
+        if landing_idx > 0 and y[landing_idx] < field_level <= y[landing_idx - 1]:
+            y0, y1 = y[landing_idx - 1], y[landing_idx]
+            frac = (y0 - field_level) / (y0 - y1) if y0 != y1 else 0.0
+            xi = x[landing_idx - 1] + frac * (x[landing_idx] - x[landing_idx - 1])
+            zi = z[landing_idx - 1] + frac * (z[landing_idx] - z[landing_idx - 1])
+        else:
+            xi, zi = x[landing_idx], z[landing_idx]
+
         # Calculate total horizontal distance
-        distance = np.sqrt(x[landing_idx]**2 + z[landing_idx]**2)
+        distance = np.sqrt(xi**2 + zi**2)
 
         return {
             "time": solution.t[:landing_idx+1],
@@ -309,13 +383,16 @@ class BallFlightSimulator:
             "start_z": start_z * 3.28084
         }
 
-    def baseball_ode(self, t, state, wind_speed, wind_direction, rho_fn):
+    def baseball_ode(self, t, state, wind_fn, wind_direction, rho_fn):
         """ODE system for baseball flight with height-varying air density.
 
         Parameters:
         t (float): Time variable for time-dependent forces
         state (array): Current state [x, y, z, vx, vy, vz]
-        wind_speed (float): Wind speed in m/s
+        wind_fn (callable): wind_fn(y_m) -> wind speed m/s at height y_m above
+                            the field.  Evaluated every solver step so the wind
+                            grows with height the way the real profile does;
+                            a constant function reproduces the old behaviour.
         wind_direction (float): Wind direction in radians
         rho_fn (callable): Function rho_fn(y_m) -> air density kg/m³ at height y_m
                            above field level.  Evaluated at every solver step so that
@@ -329,7 +406,8 @@ class BallFlightSimulator:
         # Air density at the ball's current height above field level
         air_density = rho_fn(max(y, 0.0))  # clamp to 0 — no negative heights in density calc
 
-        # Wind components with time-dependent variation (like gusts)
+        # Wind at the ball's current height, then a time-dependent wobble.
+        wind_speed = wind_fn(max(y, 0.0))
         wind_variation = 0.1 * np.sin(2 * np.pi * t)  # 10% variation with 1 Hz frequency
         current_wind_speed = wind_speed * (1 + wind_variation)
 
@@ -3411,6 +3489,9 @@ class SplitView(QWidget):
         "condition": "Clear",
         "description": "loading…",
         "precipitation": 0,
+        # 180 here means "out to centre", not "from the south" — this seed is
+        # a pleasant default to sim against, not an observation.
+        "wind_frame": "field",
     }
 
     def fetch_weather_data(self):
@@ -3453,11 +3534,32 @@ class SplitView(QWidget):
         current_text = self.weather_label.text().removesuffix(" (updating…)")
         self.weather_label.setText(current_text + f" (update failed: {error_msg})")
 
+    def _wind_azimuth(self):
+        """Park azimuth to hand BallFlightSimulator, or None when the wind
+        angle we hold is already a field angle.
+
+        weather_data carries a `wind_frame` tag because two different things
+        land in the same `wind_direction` slot: a forecast bearing from true
+        north, and a hand-dialled "blowing out to centre" angle from the
+        drawer.  Rotating the second one would move the manual control's
+        meaning under the user, so only feed data gets rotated.
+        """
+        if not self.weather_data:
+            return None
+        if self.weather_data.get("wind_frame", "compass") != "compass":
+            return None
+        return get_park_azimuth(self.stadium_name)
+
     def set_custom_weather(self, wind_speed, wind_direction):
-        """Set custom weather data for simulation"""
+        """Set custom weather data for simulation.
+
+        The drawer's dial is field-relative — 0 blows in from centre, 180 out
+        to centre — and stays that way regardless of which park is loaded.
+        """
         self.weather_data = {
             "wind_speed": wind_speed,
             "wind_direction": wind_direction,
+            "wind_frame": "field",
             "temperature": 75,  # Default temperature
             "humidity": 50,     # Default humidity
             "pressure_hpa": 1013.25,          # Standard atmosphere
@@ -3584,6 +3686,8 @@ class SplitView(QWidget):
             self.altitude,
             start_x, start_y, start_z,
             pressure_pa=self.weather_data.get("pressure_pa", None),
+            pressure_is_station=self.weather_data.get("pressure_frame") == "station",
+            park_azimuth=self._wind_azimuth(),
         )
 
         # Classify and pick trail color
@@ -3812,7 +3916,9 @@ class SplitView(QWidget):
             start_x,
             start_y,
             start_z,
-            pressure_pa=self.weather_data.get("pressure_pa", None)
+            pressure_pa=self.weather_data.get("pressure_pa", None),
+            pressure_is_station=self.weather_data.get("pressure_frame") == "station",
+            park_azimuth=self._wind_azimuth(),
         )
 
         if LOG_BALL_PHYSICS:
@@ -5098,5 +5204,1323 @@ def main():
     sys.exit(app.exec())
 
 
+# ============================================================================
+# Offline tools — calibration and model training
+# ----------------------------------------------------------------------------
+# Batch jobs that calibrate or train against BallFlightSimulator, which lives
+# in this module.  Not runtime code: nothing here is imported by the widgets,
+# and every heavy dependency (lightgbm, sklearn, pandas, multiprocessing) is
+# imported lazily inside the functions so the GUI import path is unchanged.
+#
+#   python homerunwidget.py calibrate-cd [--cpw]
+#   python homerunwidget.py calibrate-wind [--global] [--workers N]
+#   python homerunwidget.py train-cpw
+#   python homerunwidget.py train-runenv
+#   python homerunwidget.py            # no args -> the widget, as before
+#
+# The multiprocessing workers pickle by qualified name, so the per-row physics
+# helpers below must stay at module level.
+# ============================================================================
+
+import sys as _sys
+import json
+from multiprocessing import Pool, cpu_count
+
+HERE = str(Path(__file__).resolve().parent)
+# Shared with weatherman so both halves of the pipeline read and write the same
+# place; regenerable, so gitignored.
+DATA_DIR = os.path.join(HERE, "model_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+CAL_YEARS = (2024, 2025, 2026)
+CD_SAMPLE_N = 5000
+SEED = 42
+
+# Analysis dependencies, bound on first tool invocation.  Kept out of the
+# module import so the widget never pays for lightgbm/sklearn, and out of the
+# Pool workers' path because the per-row physics helpers below need none of
+# them — workers only touch BallFlightSimulator, _num and _hla_from_hc.
+pd = None
+lgb = None
+minimize_scalar = None
+mean_absolute_error = None
+log_loss = None
+
+
+def _load_analysis_deps():
+    global pd, lgb, minimize_scalar, mean_absolute_error, log_loss
+    if pd is not None:
+        return
+    import pandas as _pd
+    import lightgbm as _lgb
+    from scipy.optimize import minimize_scalar as _ms
+    from sklearn.metrics import mean_absolute_error as _mae, log_loss as _ll
+    pd, lgb, minimize_scalar = _pd, _lgb, _ms
+    mean_absolute_error, log_loss = _mae, _ll
+
+
+def _hla_from_hc(hc_x: float, hc_y: float) -> float:
+    """Savant spray pixel coords -> horizontal launch angle (degrees).
+
+    Home plate at (125.42, 198.27); +HLA is toward right field.  Defined here
+    rather than imported from train_distance_model, which imports THIS module
+    and would make the dependency circular.
+    """
+    dx = hc_x - 125.42
+    dy = 198.27 - hc_y
+    if dy <= 0:
+        return 0.0
+    return math.degrees(math.atan2(dx, dy))
+
+
+def _filter_dataframe(df):
+    """Fly balls and liners with realistic distance and complete features."""
+    needed = ["launch_speed", "launch_angle", "hit_distance_sc",
+              "hc_x", "hc_y", "home_team", "bb_type"]
+    df = df.dropna(subset=needed).copy()
+    df = df[df["bb_type"].isin(["fly_ball", "line_drive"])]
+    df = df[(df["launch_speed"] >= 80) & (df["hit_distance_sc"] >= 150)]
+    from weatherman import TEAM_TO_PARK
+    df["park"] = df["home_team"].map(TEAM_TO_PARK)
+    df = df[df["park"].isin(STADIUM_DATA.keys())]
+    return df.reset_index(drop=True)
+
+
+
+# Constants that lived above the strip points when these tools were merged in
+# from their standalone scripts.  NEUTRAL's absence made every C-Only physics
+# value come back nan through _sim_one's except-clause, silently.
+NEUTRAL = dict(temp=60.0, humidity=50.0, altitude=0.0, wind_speed=0.0,
+               wind_direction=0.0, pressure_pa=None)
+
+# calibrate_wind sizing, against ~960 trajectories/sec on 23 workers.
+GLOBAL_SAMPLE = 4000
+PARK_SAMPLE = 1500
+PARK_TOTAL = 60000
+MIN_PARK_ROWS = 400
+ROUNDS = 2
+
+
+def _tool_imports():
+    """Heavy deps, resolved on first use rather than at import."""
+    import numpy as np, pandas as pd
+    return np, pd
+
+
+def _num(value, default):
+    """float(value) with None and NaN both falling back — NaN is truthy."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(out) else out
+
+
+def _phys_with_cd(args):
+    """Worker: run physics for one row at a given Cd."""
+    row, cd = args
+    sim = BallFlightSimulator()
+    try:
+        hla = _hla_from_hc(row["hc_x"], row["hc_y"])
+        if row.get("_cpw"):
+            press = _num(row.get("met_pressure_hpa"), None)
+            env = dict(
+                temp=_num(row.get("met_temp_f"), 60.0),
+                humidity=_num(row.get("met_humidity"), 50.0),
+                altitude=_num(row.get("park_elevation_ft"), 0.0),
+                wind_speed=_num(row.get("met_wind_mph"), 0.0),
+                # Already field-frame; do NOT pass park_azimuth as well.
+                wind_direction=_num(row.get("met_wind_field_deg"), 0.0),
+                pressure_pa=press * 100.0 if press is not None else None,
+            )
+            station = press is not None
+        else:
+            env = dict(temp=60.0, humidity=50.0,
+                       altitude=float(STADIUM_DATA.get(row["park"], {})
+                                      .get("altitude", 0.0)),
+                       wind_speed=0.0, wind_direction=0.0, pressure_pa=None)
+            station = False
+        traj = sim.calculate_trajectory(
+            exit_velocity=float(row["launch_speed"]),
+            vlaunch_angle=float(row["launch_angle"]),
+            hlaunch_angle=hla,
+            cd_override=cd,
+            pressure_is_station=station,
+            **env,
+        )
+        return float(traj["distance"])
+    except Exception:
+        return float("nan")
+
+
+def evaluate_cd(rows, cd, pool, label="", return_preds=False):
+    preds = np.array(pool.map(_phys_with_cd, [(r, cd) for r in rows], chunksize=64))
+    actual = np.array([r["hit_distance_sc"] for r in rows])
+    mask = ~np.isnan(preds)
+    bias = float(np.mean(preds[mask] - actual[mask]))
+    mae = float(np.mean(np.abs(preds[mask] - actual[mask])))
+    print(f"  Cd={cd:.4f}  N={mask.sum():5d}  bias={bias:+7.2f} ft  "
+          f"MAE={mae:6.2f} ft  {label}")
+    if return_preds:
+        return bias, mae, preds, actual, mask
+    return bias, mae
+
+
+def load_frame(cpw):
+    """Filtered BBE rows, with weather columns joined when cpw is set."""
+    parts = []
+    for year in CAL_YEARS:
+        csv = os.path.join(HERE, f"savant_bbe_{year}.csv")
+        if not os.path.exists(csv):
+            continue
+        print(f"[load] {csv}")
+        df = pd.read_csv(csv, low_memory=False)
+        if cpw:
+            pq = os.path.join(DATA_DIR, f"weather_backfill_{year}.parquet")
+            if not os.path.exists(pq):
+                raise SystemExit(f"--cpw needs {pq}; run "
+                             f"`python weatherman.py backfill` first")
+            wx = pd.read_parquet(pq)
+            if len(wx) != len(df):
+                raise SystemExit(f"{year}: backfill/csv row mismatch")
+            # Join BEFORE filtering — the parquet is in raw csv order.
+            df = pd.concat([df.reset_index(drop=True),
+                            wx.reset_index(drop=True)], axis=1)
+        df = _filter_dataframe(df)
+        if cpw:
+            # The venue actually played at, not where the club plays today.
+            df["park"] = df["venue_name"].fillna(df["park"])
+            df = df.dropna(subset=["met_temp_f", "met_wind_mph"])
+        parts.append(df)
+    df = pd.concat(parts, ignore_index=True)
+    print(f"[load] total filtered: {len(df)}")
+    return df
+
+
+def response_check(rows, preds, actual, mask):
+    """Does the sim respond to the environment with the right SENSITIVITY?
+
+    Getting mean bias to zero only fixes the intercept.  For park factors the
+    slope is what matters: if carry gains too much per degree, every warm park
+    is overrated and every cold one underrated, no matter how good the average
+    looks.  Each slope below should be ~0 if the response is right.
+    """
+    err = preds[mask] - actual[mask]
+    print("\n=== Phase C: environmental response (slope of error, want ~0) ===")
+    for name, key, unit in (("temperature", "met_temp_f", "ft/F"),
+                            ("altitude", "park_elevation_ft", "ft/1000ft"),
+                            ("wind speed", "met_wind_mph", "ft/mph")):
+        x = np.array([_num(r.get(key), np.nan) for r in rows])[mask]
+        ok = ~np.isnan(x)
+        if ok.sum() < 100 or np.nanstd(x[ok]) == 0:
+            continue
+        slope, intercept = np.polyfit(x[ok], err[ok], 1)
+        r = float(np.corrcoef(x[ok], err[ok])[0, 1])
+        shown = slope * 1000 if key == "park_elevation_ft" else slope
+        print(f"  {name:12} slope {shown:+7.3f} {unit:10} r={r:+.3f}")
+
+    # Wind decomposed along the ball's own line — the term park factors lean on
+    fd = np.array([_num(r.get("met_wind_field_deg"), np.nan) for r in rows])[mask]
+    sp = np.array([_num(r.get("met_wind_mph"), np.nan) for r in rows])[mask]
+    sa = np.array([_hla_from_hc(r["hc_x"], r["hc_y"]) for r in rows])[mask]
+    ok = ~(np.isnan(fd) | np.isnan(sp))
+    if ok.sum() > 100:
+        help_ = -sp[ok] * np.cos(np.radians(fd[ok] - sa[ok]))
+        slope = np.polyfit(help_, err[ok], 1)[0]
+        r = float(np.corrcoef(help_, err[ok])[0, 1])
+        print(f"  {'wind_help':12} slope {slope:+7.3f} {'ft/mph':10} r={r:+.3f}"
+              f"   <- the park-factor term")
+
+
+def calibrate_cd_main():
+    _load_analysis_deps()
+    cpw = "--cpw" in sys.argv
+    mode = "CPW (actual weather)" if cpw else "neutral (60F, sea level, calm)"
+    print(f"=== calibrating C_d in {mode} ===\n")
+
+    df = load_frame(cpw)
+    cols = ["park", "hc_x", "hc_y", "launch_speed", "launch_angle", "hit_distance_sc"]
+    if cpw:
+        cols += ["met_temp_f", "met_humidity", "met_pressure_hpa", "met_wind_mph",
+                 "met_wind_field_deg", "park_elevation_ft"]
+    rng = np.random.default_rng(SEED)
+    idx = rng.choice(len(df), size=min(CD_SAMPLE_N, len(df)), replace=False)
+    sample = df.iloc[idx][cols].to_dict("records")
+    for r in sample:
+        r["_cpw"] = cpw
+    print(f"[sample] using {len(sample)} events for calibration")
+
+    with Pool(max(1, cpu_count() - 1)) as pool:
+        print("\n=== Phase A: literature/code Cd checks ===")
+        for cd in (0.30, 0.34, 0.38, 0.40, 0.42, 0.44):
+            evaluate_cd(sample, cd, pool, label="(grid)")
+
+        print("\n=== Phase B: scipy minimize_scalar on |bias| ===")
+        n_evals = [0]
+
+        def objective(cd):
+            n_evals[0] += 1
+            bias, _ = evaluate_cd(sample, cd, pool, label=f"(opt {n_evals[0]})")
+            return abs(bias)
+
+        t0 = time.time()
+        result = minimize_scalar(objective, bounds=(0.28, 0.55), method="bounded",
+                                 options={"xatol": 0.002, "maxiter": 25})
+        cd_opt = result.x
+        print(f"\n[optimize] {n_evals[0]} evals, {time.time() - t0:.1f}s")
+        print(f"  Optimal Cd (zero-bias): {cd_opt:.4f}")
+
+        print("\n=== Final verification at optimum ===")
+        for cd in (cd_opt - 0.01, cd_opt, cd_opt + 0.01):
+            evaluate_cd(sample, cd, pool, label="(verify)")
+        _, _, preds, actual, mask = evaluate_cd(sample, cd_opt, pool,
+                                                label="(response)",
+                                                return_preds=True)
+    if cpw:
+        response_check(sample, preds, actual, mask)
+
+    out = os.path.join(DATA_DIR, "cd_calibration_cpw.txt" if cpw else "cd_calibration.txt")
+    with open(out, "w") as fh:
+        fh.write(f"{cd_opt:.4f}\n")
+    print(f"\n[save] optimal Cd -> {out}")
+
+
+
+
+def _sim(args):
+    """One trajectory under real weather, with wind scaled by `mult`."""
+    row, cd, mult = args
+    sim = BallFlightSimulator()
+    try:
+        press = _num(row.get("met_pressure_hpa"), None)
+        traj = sim.calculate_trajectory(
+            exit_velocity=float(row["launch_speed"]),
+            vlaunch_angle=float(row["launch_angle"]),
+            hlaunch_angle=_hla_from_hc(row["hc_x"], row["hc_y"]),
+            temp=_num(row.get("met_temp_f"), 60.0),
+            humidity=_num(row.get("met_humidity"), 50.0),
+            altitude=_num(row.get("park_elevation_ft"), 0.0),
+            wind_speed=_num(row.get("met_wind_mph"), 0.0) * mult,
+            wind_direction=_num(row.get("met_wind_field_deg"), 0.0),
+            pressure_pa=press * 100.0 if press is not None else None,
+            pressure_is_station=press is not None,
+            cd_override=cd,
+        )
+        return float(traj["distance"])
+    except Exception:
+        return float("nan")
+
+
+def wind_help(rows):
+    """Tailwind component along each ball's own direction, mph."""
+    fd = np.array([_num(r.get("met_wind_field_deg"), np.nan) for r in rows])
+    sp = np.array([_num(r.get("met_wind_mph"), np.nan) for r in rows])
+    sa = np.array([_hla_from_hc(r["hc_x"], r["hc_y"]) for r in rows])
+    return -sp * np.cos(np.radians(fd - sa))
+
+
+def score(rows, cd, mult, pool, helps=None):
+    """(mean bias, slope of residual on wind_help, MAE)."""
+    preds = np.array(pool.map(_sim, [(r, cd, mult) for r in rows], chunksize=64))
+    actual = np.array([r["hit_distance_sc"] for r in rows])
+    h = wind_help(rows) if helps is None else helps
+    ok = ~(np.isnan(preds) | np.isnan(h))
+    err = preds[ok] - actual[ok]          # already masked — do not mask again
+    slope = float(np.polyfit(h[ok], err, 1)[0]) if ok.sum() > 50 else float("nan")
+    return float(err.mean()), slope, float(np.abs(err).mean())
+
+
+def _solve_zero(xs, ys, lo, hi):
+    """x where y crosses zero, from a quadratic through (xs, ys).
+
+    Both responses here are smooth and near-linear, so three probes pin the
+    curve exactly.  A bounded scalar optimiser needs ~12 evaluations to do the
+    same job, and each evaluation is a few thousand ODE solves — the difference
+    is minutes of a saturated CPU per fit.
+
+    Returns NaN when the response never crosses zero in range.  It previously
+    fell back to a clamp, which silently reported a boundary value (1.000) as
+    though it were a fitted one — indistinguishable in the output from a park
+    that genuinely wants full wind.
+    """
+    coeffs = np.polyfit(xs, ys, 2 if len(xs) > 2 else 1)
+    roots = [r.real for r in np.roots(coeffs)
+             if abs(r.imag) < 1e-9 and lo <= r.real <= hi]
+    if roots:
+        # Nearest root to the probed range's centre — the far one is spurious
+        # curvature, not a second physical solution.
+        return min(roots, key=lambda r: abs(r - np.mean(xs)))
+    return float("nan")
+
+
+def fit_global(rows, pool, cd0):
+    """Alternate: multiplier kills the slope, C_d kills the bias."""
+    cd, mult = cd0, 1.0
+    helps = wind_help(rows)
+    for rnd in range(1, ROUNDS + 1):
+        probes = [0.0, 0.5, 1.0]
+        slopes = []
+        for m in probes:
+            _, s, _ = score(rows, cd, m, pool, helps)
+            slopes.append(s)
+            print(f"    mult={m:.2f}  slope={s:+7.3f} ft/mph")
+        mult = _solve_zero(np.array(probes), np.array(slopes), 0.0, 1.5)
+
+        probes_cd = [cd - 0.03, cd, cd + 0.03]
+        biases = []
+        for c in probes_cd:
+            b, _, _ = score(rows, c, mult, pool, helps)
+            biases.append(b)
+            print(f"    cd={c:.4f}  bias={b:+7.2f} ft")
+        cd = _solve_zero(np.array(probes_cd), np.array(biases), 0.30, 0.55)
+
+        b, s, mae = score(rows, cd, mult, pool, helps)
+        print(f"  [round {rnd}] cd={cd:.4f} mult={mult:.4f} -> "
+              f"bias={b:+.2f} ft  slope={s:+.3f} ft/mph  MAE={mae:.2f} ft")
+    return cd, mult
+
+
+def _slope(x, y):
+    return float(np.polyfit(x, y, 1)[0]) if len(x) > 30 else float("nan")
+
+
+def _partial_slope(h, y, controls):
+    """Coefficient on `h` in a regression of y on h plus `controls`.
+
+    A simple slope of the residual on wind_help is CONFOUNDED, and badly.
+    wind_help = -speed * cos(field_dir - spray), so at a park with a prevailing
+    wind it is largely a function of SPRAY ANGLE.  Our physics has real
+    spray-dependent error — Magnus is vertical-only, so the extra carry a
+    pulled fly ball gets from side spin is unmodelled — and that error then
+    masquerades as a wind effect, with a sign set by which way the park's
+    prevailing wind happens to blow.  Fitted naively, a third of the parks came
+    out with NEGATIVE wind response (tailwind shortening the ball), Wrigley
+    ranked 4th, and Angel Stadium ranked 1st despite its forecast carrying
+    almost no information about field wind.
+
+    Controlling for spray (and launch angle / exit velocity, which also shape
+    the residual) isolates the part of the response that is actually wind.
+    """
+    X = np.column_stack([h] + list(controls) + [np.ones(len(h))])
+    ok = np.all(np.isfinite(X), axis=1) & np.isfinite(y)
+    if ok.sum() < 200:
+        return float("nan")
+    coef, *_ = np.linalg.lstsq(X[ok], y[ok], rcond=None)
+    return float(coef[0])
+
+
+def fit_all_parks(rows, pool, cd, shrink_n=2500):
+    """Every park's effective-wind factor from TWO whole-dataset passes.
+
+    The residual slope is linear in the multiplier — the simulator's wind term
+    scales with it — so
+
+        slope(m) = slope(0) + m * S,      S = slope(1) - slope(0)
+
+    and the factor that zeroes it is just -slope(0)/S.  Running the ODE at
+    m=0 and m=1 once over everything therefore yields every park at once, by
+    grouping.  The previous version re-ran three probes PER PARK, which is
+    ~45 passes over a subsample instead of 2 over the whole thing, and gave
+    each park a smaller sample into the bargain.
+
+    Per-park estimates are then shrunk toward the global fit by n/(n+shrink_n).
+    They have to be: the underlying effect is small, so a park's own slope is
+    dominated by noise, and unshrunk values swing from 0.02 to 2.0 in ways no
+    stadium geometry explains.
+    """
+    helps = wind_help(rows)
+    actual = np.array([r["hit_distance_sc"] for r in rows])
+    parks = np.array([r["park"] for r in rows])
+    # Controls: the residual's known structure, so the wind coefficient is not
+    # asked to explain it.  spray enters quadratically (pull and oppo differ,
+    # and both differ from centre).
+    spray = np.array([_hla_from_hc(r["hc_x"], r["hc_y"]) for r in rows])
+    la = np.array([_num(r.get("launch_angle"), np.nan) for r in rows])
+    ev = np.array([_num(r.get("launch_speed"), np.nan) for r in rows])
+
+    print("  pass 1/2: wind off ...", flush=True)
+    p0 = np.array(pool.map(_sim, [(r, cd, 0.0) for r in rows], chunksize=64))
+    print("  pass 2/2: wind full ...", flush=True)
+    p1 = np.array(pool.map(_sim, [(r, cd, 1.0) for r in rows], chunksize=64))
+
+    ok = ~(np.isnan(p0) | np.isnan(p1) | np.isnan(helps))
+    e0, e1, h, pk = p0[ok] - actual[ok], p1[ok] - actual[ok], helps[ok], parks[ok]
+    sp, la, ev = spray[ok], la[ok], ev[ok]
+    ctl = [sp, sp ** 2, la, ev]
+
+    s0_g = _partial_slope(h, e0, ctl)
+    s1_g = _partial_slope(h, e1, ctl)
+    g_mult = -s0_g / (s1_g - s0_g)
+    print(f"\n  GLOBAL: slope(wind off)={s0_g:+.3f}  slope(wind full)={s1_g:+.3f}"
+          f"  -> sim sensitivity {s1_g - s0_g:+.3f} ft/mph, factor {g_mult:.3f}")
+    print(f"  (uncontrolled, for comparison: {_slope(h, e0):+.3f} / "
+          f"{_slope(h, e1):+.3f})")
+
+    out = {}
+    for park in sorted(set(pk)):
+        m = pk == park
+        if m.sum() < MIN_PARK_ROWS:
+            continue
+        c = [x[m] for x in ctl]
+        s0 = _partial_slope(h[m], e0[m], c)
+        s1 = _partial_slope(h[m], e1[m], c)
+        S = s1 - s0
+        raw = -s0 / S if S > 0.5 else float("nan")
+        n = int(m.sum())
+        w = n / (n + shrink_n)
+        shrunk = (w * raw + (1 - w) * g_mult) if not math.isnan(raw) else g_mult
+        out[park] = {"n": n, "raw": None if math.isnan(raw) else round(raw, 3),
+                     "wind_mult": round(float(np.clip(shrunk, 0.0, 1.0)), 3),
+                     "sim_sensitivity": round(S, 3),
+                     "real_response": round(-s0, 3)}
+    return float(g_mult), out
+
+
+def _workers():
+    """Half the cores by default — this runs on the user's desktop, and a
+    scalar optimiser saturating every core to fit one coefficient is a poor
+    trade.  Override with --workers N."""
+    for i, a in enumerate(sys.argv):
+        if a == "--workers" and i + 1 < len(sys.argv):
+            return max(1, int(sys.argv[i + 1]))
+    return max(1, cpu_count() // 2)
+
+
+def calibrate_wind_main():
+    _load_analysis_deps()
+    global_only = "--global" in sys.argv
+    df = load_frame(cpw=True)
+    # A wind multiplier is only identifiable where there IS wind, and roofed
+    # games carry none by construction.
+    df = df[(df.met_wind_mph.fillna(0) >= 3) & (~df.roof_closed.fillna(False))]
+    # Collapse sponsor renames, or a park splits across two rows with half the
+    # sample each: "Guaranteed Rate Field" (2024) and "Rate Field" (2025-26)
+    # are one venue, as are Minute Maid/Daikin and Camden's two spellings.
+    df["park"] = [resolve_park_name(p) or p for p in df["park"]]
+    print(f"[filter] {len(df)} rows with usable wind, "
+          f"{df.park.nunique()} distinct parks")
+
+    cols = ["park", "hc_x", "hc_y", "launch_speed", "launch_angle", "hit_distance_sc",
+            "met_temp_f", "met_humidity", "met_pressure_hpa", "met_wind_mph",
+            "met_wind_field_deg", "park_elevation_ft"]
+    rng = np.random.default_rng(SEED)
+    idx = rng.choice(len(df), size=min(GLOBAL_SAMPLE, len(df)), replace=False)
+    sample = df.iloc[idx][cols].to_dict("records")
+
+    cd0 = 0.4166
+    try:
+        cd0 = float(open(os.path.join(DATA_DIR, "cd_calibration_cpw.txt")).read().strip())
+    except (OSError, ValueError):
+        pass
+
+    nw = _workers()
+    print(f"[cpu] {nw} workers of {cpu_count()} cores")
+    with Pool(nw) as pool:
+        print(f"\n=== global fit (start cd={cd0:.4f}, {len(sample)} rows) ===")
+        b, s, mae = score(sample, cd0, 1.0, pool)
+        print(f"  BEFORE: mult=1.00  bias={b:+.2f} ft  slope={s:+.3f} ft/mph  MAE={mae:.2f}")
+        t0 = time.time()
+        cd, mult = fit_global(sample, pool, cd0)
+        print(f"\n  GLOBAL: cd={cd:.4f}  wind multiplier={mult:.3f}  "
+              f"({time.time() - t0:.0f}s)")
+
+        out = {"_global": {"cd": round(cd, 4), "wind_mult": round(mult, 3)}}
+        if not global_only:
+            print(f"\n=== per-park effective-wind factors (cd={cd:.4f}) ===")
+            rows = df[cols].to_dict("records")
+            if len(rows) > PARK_TOTAL:
+                sub = rng.choice(len(rows), PARK_TOTAL, replace=False)
+                rows = [rows[i] for i in sub]
+            g_mult, parks = fit_all_parks(rows, pool, cd)
+            out["_global"]["wind_mult_2pass"] = round(g_mult, 3)
+            print(f"\n  {'park':32}{'n':>6}{'raw':>7}{'shrunk':>8}{'real ft/mph':>13}")
+            for park in sorted(parks, key=lambda k: parks[k]["wind_mult"]):
+                v = parks[park]
+                raw = "  --  " if v["raw"] is None else f"{v['raw']:6.3f}"
+                print(f"  {park:32}{v['n']:6}{raw:>7}{v['wind_mult']:8.3f}"
+                      f"{v['real_response']:13.3f}")
+                out[park] = v
+
+    path = os.path.join(HERE, "wind_receptivity.json")
+    with open(path, "w") as fh:
+        json.dump(out, fh, indent=1, sort_keys=True)
+    print(f"\n[save] -> {path}")
+
+
+
+
+
+def _load_cd(filename, fallback):
+    """Drag coefficient from a calibration file, or the built-in default."""
+    path = os.path.join(HERE, "model_data", filename)
+    try:
+        with open(path) as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        print(f"[cd] {filename} unreadable — falling back to {fallback}")
+        return fallback
+
+
+# The two configurations need DIFFERENT drag coefficients, and this is the
+# whole reason the CPW physics was worse than neutral before.  A C_d fitted
+# with the environment held at 60F/sea-level/calm has the average real
+# environment absorbed into it; re-using it while ALSO supplying real
+# conditions counts that environment twice, and the ball flies ~7 ft too far.
+CD_NEUTRAL = _load_cd("cd_calibration.txt", 0.40)
+CD_CPW = _load_cd("cd_calibration_cpw.txt", CD_NEUTRAL)
+
+# Weather columns the CPW model is allowed to see.  obs_* is not among them.
+MET_COLS = ["met_temp_f", "met_humidity", "met_pressure_hpa", "met_wind_mph",
+            "met_wind_field_deg", "met_wind_gust_mph", "met_precip_in",
+            "met_cloud_pct"]
+
+
+# ------------------------------- physics ------------------------------------
+
+def _unused_num_cpw(value, default):
+    """float(value), with None AND NaN falling back to `default`.
+
+    `float(nan or 0.0)` is nan, not 0.0 — NaN is truthy — so the obvious
+    `or`-chain silently poisons the environment and the solver returns nan for
+    the whole row.
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(out) else out
+
+
+def _sim_one(row):
+    """One trajectory.  `row` carries a `_cpw` flag choosing the environment."""
+    sim = BallFlightSimulator()
+    try:
+        hla = _hla_from_hc(row["hc_x"], row["hc_y"])
+        if not row["_cpw"]:
+            env = dict(NEUTRAL)
+            station = False
+        else:
+            wind_dir = _num(row.get("met_wind_field_deg"), None)
+            wind_mph = _num(row.get("met_wind_mph"), 0.0)
+            if wind_dir is None:          # unknown bearing -> treat as calm
+                wind_dir, wind_mph = 0.0, 0.0
+            press = _num(row.get("met_pressure_hpa"), None)
+            env = dict(
+                temp=_num(row.get("met_temp_f"), 60.0),
+                humidity=_num(row.get("met_humidity"), 50.0),
+                altitude=_num(row.get("park_elevation_ft"), 0.0),
+                # The uniform-equivalent wind, not the raw forecast: see
+                # weatherman.effective_wind.  A reported 12 mph is not 12 mph
+                # of steady flow over the whole trajectory, and feeding it as
+                # though it were overstates carry by ~8x per mph.
+                wind_speed=effective_wind(wind_mph, row.get("park")),
+                # ALREADY in the field frame — park_azimuth must stay unset or
+                # the rotation is applied twice.
+                wind_direction=wind_dir,
+                pressure_pa=press * 100.0 if press is not None else None,
+            )
+            station = env["pressure_pa"] is not None
+        traj = sim.calculate_trajectory(
+            exit_velocity=float(row["launch_speed"]),
+            vlaunch_angle=float(row["launch_angle"]),
+            hlaunch_angle=hla,
+            pressure_is_station=station,
+            cd_override=CD_CPW if row["_cpw"] else CD_NEUTRAL,
+            **env,
+        )
+        return float(traj["distance"])
+    except Exception:
+        return float("nan")
+
+
+def run_physics(df, cpw, n_workers=None):
+    n_workers = n_workers or max(1, cpu_count() - 1)
+    cols = ["hc_x", "hc_y", "launch_speed", "launch_angle", "park"]
+    if cpw:
+        cols += [c for c in MET_COLS + ["park_elevation_ft"] if c in df.columns]
+    rows = df[cols].to_dict("records")
+    for r in rows:
+        r["_cpw"] = cpw
+    label = "CPW" if cpw else "C-Only"
+    print(f"[physics:{label}] {len(rows)} sims on {n_workers} workers...", flush=True)
+    t0 = time.time()
+    with Pool(n_workers) as pool:
+        # map, not imap_unordered — order must line up with the frame.
+        out = np.array(pool.map(_sim_one, rows, chunksize=64))
+    print(f"[physics:{label}] {time.time() - t0:.1f}s")
+    return out
+
+
+# ------------------------------- features -----------------------------------
+
+def _cpw_contact_features(df):
+    """Everything about how the ball left the bat, and nothing else."""
+    f = pd.DataFrame(index=df.index)
+    f["launch_speed"] = df["launch_speed"]
+    f["launch_angle"] = df["launch_angle"]
+    f["spray_angle"] = df["spray_angle"]
+    for c in ("release_speed", "release_spin_rate", "spin_axis",
+              "pfx_x", "pfx_z", "plate_x", "plate_z", "effective_speed"):
+        if c in df.columns:
+            f[c] = df[c]
+    if "pitch_type" in df.columns:
+        f["pitch_type"] = df["pitch_type"].fillna("UNK").astype("category")
+    return f
+
+
+def _cpw_features(df):
+    """Contact, plus the park and the day's air.
+
+    Wind is handed over decomposed along the ball's own direction rather than
+    as a bare bearing.  A 15 mph wind is a tailwind for a ball hit into it and
+    a crosswind for one hit across it, and the raw angle makes the model
+    rediscover that from scratch for every spray direction.
+    """
+    f = _cpw_contact_features(df)
+    f["park"] = df["park"].astype("category")
+    f["altitude"] = df["park_elevation_ft"] if "park_elevation_ft" in df else np.nan
+    f["roof_closed"] = (df["roof_closed"].fillna(False).astype(int)
+                        if "roof_closed" in df else 0)
+    for c in MET_COLS:
+        if c in df.columns and c != "met_wind_field_deg":
+            f[c] = df[c]
+
+    delta = np.radians(df["met_wind_field_deg"].astype(float) - df["spray_angle"].astype(float))
+    # Effective wind here too, so the feature and the physics agree on what a
+    # "mph" means.  The park factor is then read off a consistent pair.
+    speed = np.array([effective_wind(v, p) or 0.0
+                      for v, p in zip(df["met_wind_mph"], df["park"])])
+    # wind_help > 0 pushes the ball out; wind_cross > 0 pushes it toward RF.
+    f["wind_help"] = -speed * np.cos(delta)
+    f["wind_cross"] = -speed * np.sin(delta)
+    gust = np.array([effective_wind(v, p) or 0.0
+                     for v, p in zip(df["met_wind_gust_mph"], df["park"])])
+    f["gust_help"] = -gust * np.cos(delta)
+    return f
+
+
+# --------------------------------- data -------------------------------------
+
+def _cpw_load_year(year):
+    """BBE rows for a season with the weather columns joined on.
+
+    The backfill parquet is written in the RAW csv's row order, so it is
+    concatenated BEFORE any filtering — filtering first would misalign the two
+    frames silently.
+    """
+    csv = os.path.join(HERE, f"savant_bbe_{year}.csv")
+    pq = os.path.join(DATA_DIR, f"weather_backfill_{year}.parquet")
+    if not os.path.exists(csv):
+        return None
+    df = pd.read_csv(csv, low_memory=False)
+    if os.path.exists(pq):
+        wx = pd.read_parquet(pq)
+        if len(wx) != len(df):
+            raise SystemExit(f"{year}: backfill has {len(wx)} rows, csv has {len(df)} "
+                             "— rerun `python weatherman.py backfill`")
+        df = pd.concat([df.reset_index(drop=True), wx.reset_index(drop=True)], axis=1)
+    else:
+        print(f"[warn] {pq} missing — {year} has no weather")
+    df = _filter_dataframe(df)
+
+    # _filter_dataframe labels the park from TEAM_TO_PARK, which is a snapshot
+    # of where clubs play NOW.  Applied to history it mislabels whole seasons —
+    # 2024 Oakland becomes Sacramento, 2025 Tampa Bay becomes Tropicana.  The
+    # backfill carries the venue the game was actually played at, so it wins.
+    # Former and neutral venues stay as their own categories rather than being
+    # dropped: CPW wants park identity and elevation, not wall geometry.
+    if "venue_name" in df.columns:
+        real = df["venue_name"].fillna(df["park"])
+        moved = int((real != df["park"]).sum())
+        if moved:
+            print(f"[{year}] repointed {moved} rows to the venue actually played at "
+                  f"({sorted(set(real[real != df['park']]))[:4]})")
+        df["park"] = real
+
+    df["spray_angle"] = [
+        _hla_from_hc(x, y) for x, y in zip(df["hc_x"], df["hc_y"])
+    ]
+    df["season"] = year
+    return df
+
+
+def _fit(X_tr, y_tr, X_te, y_te, label, rounds=2000):
+    for col in X_tr.select_dtypes("category").columns:
+        cats = X_tr[col].cat.categories.union(X_te[col].cat.categories)
+        X_tr[col] = X_tr[col].cat.set_categories(cats)
+        X_te[col] = X_te[col].cat.set_categories(cats)
+    cats = list(X_tr.select_dtypes("category").columns)
+    print(f"\n[lgb:{label}] {len(X_tr)} rows x {X_tr.shape[1]} features")
+    ds_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cats, free_raw_data=False)
+    ds_te = lgb.Dataset(X_te, label=y_te, categorical_feature=cats,
+                        reference=ds_tr, free_raw_data=False)
+    params = dict(objective="regression_l1", metric="mae", learning_rate=0.05,
+                  num_leaves=63, min_data_in_leaf=200, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=5, verbose=-1)
+    model = lgb.train(params, ds_tr, num_boost_round=rounds,
+                      valid_sets=[ds_te], valid_names=["test"],
+                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)])
+    return model
+
+
+def train_cpw_main():
+    _load_analysis_deps()
+    train = pd.concat([d for d in (_cpw_load_year(2024), _cpw_load_year(2025)) if d is not None],
+                      ignore_index=True)
+    test = _cpw_load_year(2026)
+    if test is None:
+        raise SystemExit("no 2026 csv to test on")
+    print(f"\n[load] train={len(train)} test={len(test)}")
+    have = train["met_temp_f"].notna().mean() if "met_temp_f" in train else 0.0
+    print(f"[load] train rows with weather: {100 * have:.1f}%")
+
+    # Weather is the point; rows without it cannot be scored by CPW.
+    for name, d in (("train", train), ("test", test)):
+        before = len(d)
+        d.dropna(subset=["met_temp_f", "met_wind_mph"], inplace=True)
+        d.reset_index(drop=True, inplace=True)
+        print(f"[filter] {name}: {before} -> {len(d)} with weather")
+
+    for d in (train, test):
+        d["phys_c"] = run_physics(d, cpw=False)
+        d["phys_cpw"] = run_physics(d, cpw=True)
+    train = train.dropna(subset=["phys_c", "phys_cpw"]).reset_index(drop=True)
+    test = test.dropna(subset=["phys_c", "phys_cpw"]).reset_index(drop=True)
+
+    actual_tr = train["hit_distance_sc"].values
+    actual_te = test["hit_distance_sc"].values
+
+    print("\n" + "=" * 66)
+    print("PHYSICS ALONE (no learned residual)")
+    for label, col in (("C-Only  (neutral air)", "phys_c"),
+                       ("CPW     (actual air)", "phys_cpw")):
+        p = test[col].values
+        print(f"  {label:24} MAE {mean_absolute_error(actual_te, p):6.2f} ft"
+              f"   bias {np.mean(p - actual_te):+6.2f} ft")
+
+    models, preds = {}, {}
+    for label, builder, physcol in (("c_only", _cpw_contact_features, "phys_c"),
+                                    ("cpw", _cpw_features, "phys_cpw")):
+        X_tr, X_te = builder(train), builder(test)
+        y_tr = actual_tr - train[physcol].values
+        y_te = actual_te - test[physcol].values
+        m = _fit(X_tr, y_tr, X_te, y_te, label)
+        models[label] = m
+        preds[label] = test[physcol].values + m.predict(
+            X_te, num_iteration=m.best_iteration)
+
+    print("\n" + "=" * 66)
+    print("PHYSICS + LEARNED RESIDUAL (test = 2026)")
+    for label in ("c_only", "cpw"):
+        p = preds[label]
+        print(f"  {label:8} MAE {mean_absolute_error(actual_te, p):6.2f} ft"
+              f"   bias {np.mean(p - actual_te):+6.2f} ft")
+    gain = (mean_absolute_error(actual_te, preds["c_only"])
+            - mean_absolute_error(actual_te, preds["cpw"]))
+    print(f"\n  park+weather is worth {gain:+.2f} ft of MAE")
+    print("=" * 66)
+
+    # What the park and the air did to each batted ball — the raw material for
+    # park factors, before any aggregation to batter or game.
+    test["park_weather_ft"] = preds["cpw"] - preds["c_only"]
+    by_park = (test.groupby("park")["park_weather_ft"]
+               .agg(["size", "mean", "std"])
+               .sort_values("mean", ascending=False))
+    print("\nCarry added by park & weather, 2026 (ft per batted ball):")
+    print(by_park.to_string(float_format=lambda x: f"{x:7.2f}"))
+
+    imp = pd.DataFrame({"feature": models["cpw"].feature_name(),
+                        "gain": models["cpw"].feature_importance("gain")})
+    print("\nCPW top features by gain:")
+    print(imp.sort_values("gain", ascending=False).head(18).to_string(index=False))
+
+    for label, m in models.items():
+        out = os.path.join(DATA_DIR, f"{label}_distance_model.lgb")
+        m.save_model(out)
+        print(f"[save] {out}")
+
+
+
+
+RUN_VALUE = {"out": -0.27, "1B": 0.47, "2B": 0.78, "3B": 1.09, "HR": 1.40}
+CLASSES = ["out", "1B", "2B", "3B", "HR"]
+
+# Everything that is not a hit is an out for these purposes, including reached
+# -on-error and sacrifices: this models the BATTED BALL, not the defence's
+# execution, which is the same reason expected-outcome metrics treat errors as
+# outs.  Fouls are not balls in play at all and are dropped.
+_HIT = {"single": "1B", "double": "2B", "triple": "3B", "home_run": "HR"}
+_NOT_IN_PLAY = {"foul", "catcher_interf"}
+
+
+def _outcome(event):
+    if event in _NOT_IN_PLAY or not isinstance(event, str):
+        return None
+    return _HIT.get(event, "out")
+
+
+def _re_load_year(year):
+    csv = os.path.join(HERE, f"savant_bbe_{year}.csv")
+    pq = os.path.join(DATA_DIR, f"weather_backfill_{year}.parquet")
+    if not os.path.exists(csv):
+        return None
+    df = pd.read_csv(csv, low_memory=False)
+    if os.path.exists(pq):
+        wx = pd.read_parquet(pq)
+        if len(wx) != len(df):
+            raise SystemExit(f"{year}: backfill/csv row mismatch")
+        df = pd.concat([df.reset_index(drop=True), wx.reset_index(drop=True)], axis=1)
+
+    df["outcome"] = [_outcome(e) for e in df["events"]]
+    df = df.dropna(subset=["outcome", "launch_speed", "launch_angle",
+                           "hc_x", "hc_y", "met_temp_f"])
+    df["spray_angle"] = [_hla_from_hc(x, y) for x, y in zip(df.hc_x, df.hc_y)]
+    df["park"] = [resolve_park_name(p) or p
+                  for p in df["venue_name"].fillna("")]
+    df["season"] = year
+    if "game_pk" not in df.columns:
+        df["game_pk"] = np.nan
+    print(f"[{year}] {len(df)} balls in play  "
+          f"({', '.join(f'{k} {100*(df.outcome==k).mean():.1f}%' for k in CLASSES)})")
+    return df
+
+
+def _wall(park, spray, fn, default):
+    """Fence distance/height where the ball was actually hit.
+
+    Spray is 0 at centre and positive toward right; weatherman's polar table
+    runs 0 at the right-field line to 90 at left, hence 45 - spray.
+    """
+    if not park:
+        return default
+    try:
+        v = fn(park, 45.0 - float(spray))
+    except Exception:
+        return default
+    return default if v is None else float(v)
+
+
+def _re_contact_features(df):
+    f = pd.DataFrame(index=df.index)
+    f["launch_speed"] = df["launch_speed"]
+    f["launch_angle"] = df["launch_angle"]
+    f["spray_angle"] = df["spray_angle"]
+    f["abs_spray"] = df["spray_angle"].abs()
+    if "bb_type" in df:
+        f["bb_type"] = df["bb_type"].fillna("unknown").astype("category")
+    return f
+
+
+def _re_cpw_features(df):
+    f = _re_contact_features(df)
+    f["wall_distance"] = [_wall(p, s, get_stadium_wall_distance, np.nan)
+                          for p, s in zip(df.park, df.spray_angle)]
+    f["wall_height"] = [_wall(p, s, get_stadium_wall_height, 8.0)
+                        for p, s in zip(df.park, df.spray_angle)]
+    f["altitude"] = df["park_elevation_ft"]
+    f["temp_f"] = df["met_temp_f"]
+    f["humidity"] = df["met_humidity"]
+    f["pressure_hpa"] = df["met_pressure_hpa"]
+    f["roof_closed"] = df["roof_closed"].fillna(False).astype(int)
+
+    speed = np.array([effective_wind(v, p) or 0.0
+                      for v, p in zip(df["met_wind_mph"], df["park"])])
+    delta = np.radians(df["met_wind_field_deg"].astype(float)
+                       - df["spray_angle"].astype(float))
+    f["wind_help"] = -speed * np.cos(delta)
+    f["wind_cross"] = -speed * np.sin(delta)
+    f["park"] = df["park"].astype("category")
+    return f
+
+
+def _re_fit(X_tr, y_tr, X_te, y_te, label):
+    for col in X_tr.select_dtypes("category").columns:
+        cats = X_tr[col].cat.categories.union(X_te[col].cat.categories)
+        X_tr[col] = X_tr[col].cat.set_categories(cats)
+        X_te[col] = X_te[col].cat.set_categories(cats)
+    cats = list(X_tr.select_dtypes("category").columns)
+    print(f"\n[lgb:{label}] {len(X_tr)} rows x {X_tr.shape[1]} features")
+    params = dict(objective="multiclass", num_class=len(CLASSES),
+                  metric="multi_logloss", learning_rate=0.05, num_leaves=63,
+                  min_data_in_leaf=200, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=5, verbose=-1)
+    ds_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cats, free_raw_data=False)
+    ds_te = lgb.Dataset(X_te, label=y_te, categorical_feature=cats,
+                        reference=ds_tr, free_raw_data=False)
+    return lgb.train(params, ds_tr, num_boost_round=1500,
+                     valid_sets=[ds_te], valid_names=["test"],
+                     callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)])
+
+
+def train_run_env_main():
+    _load_analysis_deps()
+    # Which season to hold out.  2026 is only March 25 - May 2, so testing on
+    # it yields COLD-WEATHER park factors: the rankings hold up but the levels
+    # understate parks that play warm.  `--test-year 2025` evaluates on a full
+    # season instead, which is what the published factors describe.
+    test_year = 2026
+    for i, a in enumerate(_sys.argv):
+        if a == "--test-year" and i + 1 < len(_sys.argv):
+            test_year = int(_sys.argv[i + 1])
+    train_years = [y for y in CAL_YEARS if y != test_year]
+    print(f"[split] train {train_years}  test {test_year}")
+    train = pd.concat([d for d in (_re_load_year(y) for y in train_years)
+                       if d is not None], ignore_index=True)
+    test = _re_load_year(test_year)
+    if test is None:
+        raise SystemExit(f"no {test_year} data")
+
+    idx = {c: i for i, c in enumerate(CLASSES)}
+    y_tr = train.outcome.map(idx).values
+    y_te = test.outcome.map(idx).values
+    rv = np.array([RUN_VALUE[c] for c in CLASSES])
+
+    models, exp_runs = {}, {}
+    for label, builder in (("c_only", _re_contact_features), ("cpw", _re_cpw_features)):
+        m = _re_fit(builder(train), y_tr, builder(test), y_te, label)
+        p = m.predict(builder(test), num_iteration=m.best_iteration)
+        models[label], exp_runs[label] = m, p @ rv
+        ll = log_loss(y_te, p, labels=list(range(len(CLASSES))))
+        print(f"  {label:8} multi-logloss {ll:.5f}")
+
+    actual = test.outcome.map(RUN_VALUE).values
+    print("\n" + "=" * 68)
+    print(f"EXPECTED RUNS PER BALL IN PLAY (test = {test_year})")
+    for label in ("c_only", "cpw"):
+        e = exp_runs[label]
+        print(f"  {label:8} mean {e.mean():+.4f}   MAE vs actual {np.abs(e - actual).mean():.4f}")
+    print("=" * 68)
+
+    test = test.assign(runs_added=exp_runs["cpw"] - exp_runs["c_only"])
+    g = (test.groupby("park")["runs_added"]
+         .agg(bip="size", runs_per_bip="mean", sd="std")
+         .query("bip >= 150")
+         .sort_values("runs_per_bip", ascending=False))
+    # ~26 balls in play per team-game; league average runs/game ~4.4
+    g["runs_per_game"] = g.runs_per_bip * 26.0
+    g["index_100"] = 100 * (1 + g.runs_per_game / 4.4)
+    print(f"\nRun environment by park, {test_year} (park + weather only):")
+    print(g.to_string(float_format=lambda v: f"{v:9.3f}"))
+
+    imp = pd.DataFrame({"feature": models["cpw"].feature_name(),
+                        "gain": models["cpw"].feature_importance("gain")})
+    imp["share"] = 100 * imp.gain / imp.gain.sum()
+    print("\nCPW features by gain:")
+    print(imp.sort_values("gain", ascending=False)
+          .to_string(index=False, float_format=lambda v: f"{v:12.2f}"))
+
+    test[["game_pk", "park", "runs_added"]].to_parquet(
+        os.path.join(DATA_DIR, f"runs_added_{test_year}.parquet"), index=False)
+    for label, m in models.items():
+        m.save_model(os.path.join(DATA_DIR, f"{label}_runenv_model.lgb"))
+    print(f"\n[save] *_runenv_model.lgb")
+
+
+
+
+
+
+def backtest_runs_main():
+    """Do our park+weather run adjustments predict ACTUAL runs scored?
+
+    The park factors above are internal to the model: they are a difference of
+    two of its own expectations.  This checks them against the scoreboard.
+
+    For every game we sum `runs_added` over its balls in play — the model's
+    claim about what the venue and that evening's air contributed — and then
+    regress the game's real run total on it, controlling for how good the two
+    clubs actually are.
+
+        actual_runs ~ a + b * park_weather_runs + c * team_quality
+
+    A calibrated model gives b ~ 1: one predicted run of park effect shows up
+    as one real run.  b well under 1 means the adjustments are too aggressive,
+    over 1 means too timid.
+
+    Team quality uses each club's ROAD-only scoring and run-prevention rates.
+    Season-long rates are contaminated for this purpose — half of them are
+    earned in the very park whose effect we are trying to measure, which would
+    launder the park factor into the control and hide it.
+    """
+    _load_analysis_deps()
+    import urllib.request, json as _json
+    import numpy as _np
+
+    test_year = 2026
+    for i, a in enumerate(_sys.argv):
+        if a == "--test-year" and i + 1 < len(_sys.argv):
+            test_year = int(_sys.argv[i + 1])
+
+    # Contact-channel factors must come from a DIFFERENT season than the one
+    # being tested, or the backtest grades the model on residuals it was fitted
+    # to and the coefficient is meaningless.
+    contact_season = None
+    for i, a in enumerate(_sys.argv):
+        if a == "--contact-season" and i + 1 < len(_sys.argv):
+            contact_season = int(_sys.argv[i + 1])
+    contact = None
+    if contact_season:
+        cf = os.path.join(DATA_DIR, f"contact_factors_{contact_season}.parquet")
+        if not os.path.exists(cf):
+            raise SystemExit(f"need {cf} — run `contact-factors --season "
+                             f"{contact_season}` first")
+        if contact_season == test_year:
+            raise SystemExit("--contact-season must differ from --test-year "
+                             "(in-sample factors make the backtest circular)")
+        contact = pd.read_parquet(cf).set_index("park")["contact_runs_game"]
+        print(f"[backtest] contact channel from {contact_season} "
+              f"({len(contact)} parks), applied out of sample")
+
+    pq = os.path.join(DATA_DIR, f"runs_added_{test_year}.parquet")
+    if not os.path.exists(pq):
+        raise SystemExit(f"need {pq} — run `train-runenv --test-year {test_year}` first")
+    ra = pd.read_parquet(pq).dropna(subset=["game_pk"])
+    per_game = ra.groupby("game_pk").agg(park_weather_runs=("runs_added", "sum"),
+                                         bip=("runs_added", "size"),
+                                         park=("park", "first")).reset_index()
+
+    url = (f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&season={test_year}"
+           "&gameType=R")
+    with urllib.request.urlopen(url, timeout=90) as fh:
+        sched = _json.load(fh)
+    rows = []
+    for d in sched["dates"]:
+        for g in d["games"]:
+            if g["status"]["abstractGameState"] != "Final":
+                continue
+            h, a = g["teams"]["home"], g["teams"]["away"]
+            if "score" not in h or "score" not in a:
+                continue
+            rows.append({"game_pk": g["gamePk"], "home": h["team"]["id"],
+                         "away": a["team"]["id"], "hr_": h["score"], "ar_": a["score"]})
+    games = pd.DataFrame(rows)
+    print(f"[backtest] {len(games)} final games with scores, "
+          f"{len(per_game)} with modelled batted balls")
+
+    # Road-only rates, so the control cannot absorb the home park's effect.
+    road = games.groupby("away").agg(rs=("ar_", "mean")).rename(columns={"rs": "road_rs"})
+    road_ra = games.groupby("home").agg(ra_=("ar_", "mean")).rename(columns={"ra_": "opp_rs_at_home"})
+    road_allow = games.groupby("away").agg(ra_=("hr_", "mean")).rename(columns={"ra_": "road_ra"})
+    q = road.join(road_allow)
+
+    df = games.merge(per_game, on="game_pk", how="inner")
+    df["actual_runs"] = df.hr_ + df.ar_
+    df["quality"] = (
+        df.home.map(q.road_rs) + df.away.map(q.road_rs)
+        + df.home.map(q.road_ra) + df.away.map(q.road_ra)) / 2.0
+    if contact is not None:
+        df["contact_runs"] = df.park.map(contact).fillna(0.0)
+        df["park_weather_runs"] = df.park_weather_runs + df.contact_runs
+    df = df.dropna(subset=["actual_runs", "park_weather_runs", "quality"])
+    # A game with few modelled batted balls carries little park signal and a
+    # lot of noise; require a realistic count.
+    df = df[df.bip >= 30]
+    print(f"[backtest] {len(df)} games after filtering")
+
+    y = df.actual_runs.values.astype(float)
+    pw = df.park_weather_runs.values.astype(float)
+    ql = df.quality.values.astype(float)
+
+    def ols(X, y):
+        X = _np.column_stack(X + [_np.ones(len(y))])
+        coef, *_ = _np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ coef
+        r2 = 1 - resid.var() / y.var()
+        se = _np.sqrt(_np.diag(_np.linalg.pinv(X.T @ X) * resid.var(ddof=X.shape[1])))
+        return coef, r2, se
+
+    c0, r2_0, _ = ols([ql], y)
+    c1, r2_1, se1 = ols([pw, ql], y)
+    b, t = c1[0], c1[0] / se1[0]
+    print("\n" + "=" * 70)
+    print(f"ACTUAL RUNS BACKTEST — {test_year}")
+    print(f"  quality only            : R^2 {r2_0:.4f}")
+    print(f"  + park/weather runs     : R^2 {r2_1:.4f}   (delta {r2_1 - r2_0:+.4f})")
+    print(f"  coefficient on our term : b = {b:+.3f}  (t = {t:+.2f})")
+    print(f"     b ~ 1 means calibrated; <1 too aggressive, >1 too timid")
+    print(f"  spread of our term      : sd {pw.std():.3f} runs/game")
+    print("=" * 70)
+
+    # Park-level: our mean adjustment vs the park's actual run residual.
+    df["resid"] = y - (c0[0] * ql + c0[1])
+    g = df.groupby("park").agg(games=("resid", "size"), actual_resid=("resid", "mean"),
+                               predicted=("park_weather_runs", "mean"))
+    g = g[g.games >= 20].sort_values("predicted", ascending=False)
+    if len(g) > 2:
+        rho = _np.corrcoef(g.predicted, g.actual_resid)[0, 1]
+        print(f"\nPer-park: corr(predicted park+weather runs, actual run residual) "
+              f"= {rho:+.3f}  over {len(g)} parks")
+        print(g.to_string(float_format=lambda v: f"{v:9.3f}"))
+
+
+
+
+# Run values per plate-appearance event, for the contact channel.  Same scale
+# as RUN_VALUE above (runs above average), so the two channels add.
+PA_RUN_VALUE = {"K": -0.28, "BB": 0.33, "HBP": 0.36}
+
+
+def team_game_logs(season, cache=True):
+    """Per-team, per-game batting lines for a season — 30 requests, ~1 MB.
+
+    The per-game boxscore carries the same numbers but costs 2,400 requests and
+    ~50 MB, because `fields=` cannot strip its player-level block.
+    """
+    import urllib.request, json as _json
+    path = os.path.join(HERE, "weather_cache", f"gamelogs_{season}.parquet")
+    if cache and os.path.exists(path):
+        return pd.read_parquet(path)
+    teams = _json.loads(urllib.request.urlopen(
+        f"https://statsapi.mlb.com/api/v1/teams?sportId=1&season={season}",
+        timeout=60).read())["teams"]
+    rows = []
+    for t in teams:
+        u = (f"https://statsapi.mlb.com/api/v1/teams/{t['id']}/stats?stats=gameLog"
+             f"&group=hitting&season={season}&fields=stats,splits,date,isHome,game,"
+             "gamePk,opponent,id,stat,plateAppearances,strikeOuts,baseOnBalls,"
+             "hitByPitch,runs")
+        try:
+            d = _json.loads(urllib.request.urlopen(u, timeout=60).read())
+        except Exception as e:
+            print(f"  [warn] game log {t['id']}: {e}")
+            continue
+        for sp in (d.get("stats") or [{}])[0].get("splits", []):
+            st = sp.get("stat", {})
+            rows.append({
+                "season": season, "team": t["id"],
+                "opponent": (sp.get("opponent") or {}).get("id"),
+                "game_pk": (sp.get("game") or {}).get("gamePk"),
+                "is_home": bool(sp.get("isHome")),
+                "pa": st.get("plateAppearances"), "k": st.get("strikeOuts"),
+                "bb": st.get("baseOnBalls"), "hbp": st.get("hitByPitch"),
+                "runs": st.get("runs"),
+            })
+    df = pd.DataFrame(rows).dropna(subset=["pa", "game_pk"])
+    df = df[df.pa > 0]
+    if cache:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_parquet(path, index=False)
+    print(f"[gamelogs] {season}: {len(df)} team-games")
+    return df
+
+
+def contact_factors_main():
+    """Park effects on CONTACT RATE — the channel the batted-ball model misses.
+
+    train-runenv only sees balls already in play, so it cannot represent a park
+    that changes whether the ball is put in play at all.  That is not a corner
+    case: the actual-runs backtest understates Coors by 2.4x, and BallparkPal
+    document the same failure for the same reason — thin air flattens breaking
+    balls, hitters strike out less, and more contact happens before ball-flight
+    physics is even involved.
+
+    Method mirrors the runs backtest.  For each team-game, predict K and BB
+    rates from the batting club's ROAD-only rates and the opposing club's
+    road-only rates allowed, then read the park effect off the residual.  Road
+    rates because a season rate is half-earned in the park being measured, and
+    would launder the very effect we want.
+
+    The residual rates are priced with linear weights and added to the
+    batted-ball channel to give a combined run environment.
+    """
+    _load_analysis_deps()
+    import numpy as _np
+
+    season = 2025
+    for i, a in enumerate(_sys.argv):
+        if a == "--season" and i + 1 < len(_sys.argv):
+            season = int(_sys.argv[i + 1])
+
+    logs = team_game_logs(season)
+    from weatherman import build_game_index, resolve_park_name
+    games = build_game_index(season)[["game_pk", "venue_name"]]
+    logs = logs.merge(games, on="game_pk", how="inner")
+    logs["park"] = [resolve_park_name(v) or v for v in logs.venue_name]
+    for c in ("k", "bb", "hbp"):
+        logs[c] = logs[c].fillna(0)
+    logs["k_rate"] = logs.k / logs.pa
+    logs["bb_rate"] = (logs.bb + logs.hbp) / logs.pa
+
+    # Talent, measured away from the park under test.
+    off = logs[~logs.is_home].groupby("team")[["k_rate", "bb_rate"]].mean()
+    off.columns = ["off_k", "off_bb"]
+    # Opponent pitching: rows where the BATTING side is at home means the
+    # opponent is on the road, so these are that staff's road numbers.
+    pit = logs[logs.is_home].groupby("opponent")[["k_rate", "bb_rate"]].mean()
+    pit.columns = ["pit_k", "pit_bb"]
+    lg_k, lg_bb = logs.k_rate.mean(), logs.bb_rate.mean()
+
+    d = logs.join(off, on="team").join(pit, on="opponent").dropna(
+        subset=["off_k", "pit_k", "off_bb", "pit_bb"])
+    d["exp_k"] = d.off_k + d.pit_k - lg_k
+    d["exp_bb"] = d.off_bb + d.pit_bb - lg_bb
+    d["res_k"] = d.k_rate - d.exp_k
+    d["res_bb"] = d.bb_rate - d.exp_bb
+
+    g = d.groupby("park").agg(team_games=("res_k", "size"),
+                              k_res=("res_k", "mean"), bb_res=("res_bb", "mean"))
+    g = g[g.team_games >= 100]
+    # SHRINKAGE, per component, from measured year-over-year reliability
+    # (2024 vs 2025, 28 parks): K residual r=+0.713, BB residual r=+0.318.
+    # A park's strikeout effect largely repeats and is worth trusting; its walk
+    # effect mostly does not and is nearly all sampling noise at ~160 team-games
+    # a season.  Using the raw estimates overshoots — it moved the actual-runs
+    # coefficient from 0.771 down to 0.696, i.e. further from calibrated.
+    K_RELIABILITY = 0.71
+    BB_RELIABILITY = 0.32
+    g["k_res_shrunk"] = g.k_res * K_RELIABILITY
+    g["bb_res_shrunk"] = g.bb_res * BB_RELIABILITY
+
+    # Per PA: a strikeout replaces an average ball in play, a walk likewise.
+    bip_rv = 0.0387          # league mean E[runs | ball in play], from train-runenv
+    g["contact_runs_pa"] = (g.k_res_shrunk * (PA_RUN_VALUE["K"] - bip_rv)
+                            + g.bb_res_shrunk * (PA_RUN_VALUE["BB"] - bip_rv))
+    g["contact_runs_game"] = g.contact_runs_pa * 76.0   # ~38 PA per side
+    g = g.sort_values("contact_runs_game", ascending=False)
+
+    print("\n" + "=" * 74)
+    print(f"CONTACT-RATE PARK EFFECTS — {season}")
+    print("  k_res/bb_res are rate residuals vs road-talent expectation")
+    print("=" * 74)
+    print(g.to_string(float_format=lambda v: f"{v:10.4f}"))
+
+    out = os.path.join(DATA_DIR, f"contact_factors_{season}.parquet")
+    g.reset_index().to_parquet(out, index=False)
+    print(f"\n[save] {out}")
+
+    # Combine with the batted-ball channel and check against real runs.
+    pq = os.path.join(DATA_DIR, f"runs_added_{season}.parquet")
+    if os.path.exists(pq):
+        ra = pd.read_parquet(pq).dropna(subset=["game_pk"])
+        bip = ra.groupby("park")["runs_added"].sum() / \
+            ra.groupby("park")["game_pk"].nunique()
+        comb = pd.DataFrame({"bip_runs_game": bip}).join(g[["contact_runs_game"]])
+        comb["total"] = comb.bip_runs_game + comb.contact_runs_game
+        comb = comb.dropna().sort_values("total", ascending=False)
+        print("\nCombined run environment (runs/game vs average):")
+        print(comb.to_string(float_format=lambda v: f"{v:9.3f}"))
+        print(f"\n  spread: batted-ball {comb.bip_runs_game.max()-comb.bip_runs_game.min():.2f}"
+              f"  contact {comb.contact_runs_game.max()-comb.contact_runs_game.min():.2f}"
+              f"  combined {comb.total.max()-comb.total.min():.2f} runs/game")
+        comb.reset_index().to_parquet(
+            os.path.join(DATA_DIR, f"run_env_combined_{season}.parquet"), index=False)
+
+
+def _tool_main(argv):
+    """Dispatch the offline tools; no subcommand means launch the widget."""
+    cmds = {
+        "calibrate-cd": calibrate_cd_main,
+        "calibrate-wind": calibrate_wind_main,
+        "train-cpw": train_cpw_main,
+        "train-runenv": train_run_env_main,
+        "backtest-runs": backtest_runs_main,
+        "contact-factors": contact_factors_main,
+    }
+    if len(argv) > 1 and argv[1] in cmds:
+        cmds[argv[1]]()
+        return True
+    return False
+
+
 if __name__ == "__main__":
-    main()
+    if not _tool_main(_sys.argv):
+        main()
