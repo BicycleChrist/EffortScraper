@@ -1028,6 +1028,28 @@ class HalfInningState:
         self.outs = 0
 
 
+# The base state as a BITMASK, and the ONE definition of that encoding.
+#
+# **It is a cross-FILE contract, which is why it is a named constant rather
+# than four inline `zip((1, 2, 4), ...)` sums.** `mlb_ml.pa_rows_from_plays`
+# writes the same encoding into `savedata/pa/v2` off StatsAPI's
+# postOnFirst/Second/Third, the ML residual is TRAINED on that column, and
+# `simulate_game` SERVES it from here. Two copies in two files agreeing today
+# is exactly the shape that drifts silently — a model trained on one bit order
+# and served another still returns nine plausible probabilities. `mlb_ml`
+# imports `BASE_STATE_BITS` from here and a test pins the two together.
+BASE_STATE_BITS: Tuple[int, int, int] = (1, 2, 4)     # 1B, 2B, 3B
+
+
+def base_mask(bases: Sequence[Optional[int]]) -> int:
+    """Occupancy bitmask from `HalfInningState.bases`.
+
+    `is not None`, never truthiness: the bases carry the RUNNER'S batting-order
+    index, and the leadoff hitter's index is 0.
+    """
+    return sum(v for v, b in zip(BASE_STATE_BITS, bases) if b is not None)
+
+
 def advance(state: HalfInningState, outcome: int, batter: int,
             rng: random.Random,
             lineup: Optional[List["Batter"]] = None,
@@ -1664,12 +1686,18 @@ def _choose_reliever(side: TeamSide, used: set, lev: float,
 # over whoever is available. It only decides how often the pen is short.
 PEN_AVAILABLE_P = 0.875
 
-# How sharply a mismatch against an arm's measured entry inning / run margin
-# suppresses him. FITTED against the two validation targets in
-# `validate_bullpen_usage` and `closer_entry_profile` — appearance rate and
-# the share of entries that are blowouts — not chosen.
-ENTRY_INNING_SCALE = 0.9
-ENTRY_DIFF_SCALE = 1.6
+# **`ENTRY_INNING_SCALE` and `ENTRY_DIFF_SCALE` were REMOVED 2026-08-23.**
+# They read as live, fitted and load-bearing — "FITTED against the two
+# validation targets ... not chosen" — and were never referenced anywhere in
+# the tree. They were orphaned when the hand-tuned entry scorer was replaced
+# by `deployment_score`'s empirical histograms, which read the manager's real
+# entry distribution per arm instead of penalising a distance from it.
+#
+# Removed rather than left at their old values, on this file's own precedent
+# twelve lines up: "a neutralised knob is dead code with a switch on it".
+# A constant that cannot reach anything is worse than dead — the next person
+# to tune the bullpen reads the docstring, changes the number, measures no
+# effect, and concludes the mechanism does not matter. `sim_state.md` 5.12.
 
 
 @dataclass
@@ -1863,6 +1891,28 @@ ML_HIER_NODES = ""
 # configuration's fingerprint.
 ML_NODE_PARAMS = "shipped"        # "shipped" | "tuned"
 
+# **Which per-PA STATE columns the ML residual is allowed to read.** "" is the
+# incumbent — the adjuster is memoised on (batter, pitcher, side, is_starter)
+# and every state column multiplies that key space, so state was masked out of
+# every deployable model.
+#
+# Measured 2026-08-23 on TEST seasons, joint nine-outcome log loss, both folds:
+# ALL state is +76% on the residual's whole contribution, and BASE-OUT alone is
+# +33% at a key-space cost of only 24 (8 base states x 3 out states). A game
+# has ~270 distinct matchups, so that is ~6,500 rows in ONE batched predict —
+# the "152,000 evaluations" objection in `GameAdjuster` was about predicting
+# per-PA UNBATCHED and does not apply.
+#
+# `tto` measured +22% alone and is deliberately NOT offered here: it is a
+# data-driven re-introduction of `FATIGUE_DECLINE_PER_BF`, which is a
+# DELIBERATE null (Brill/Deshpande/Wyner), and the residual's training data
+# carries exactly the quality-and-selection confound that paper warns about.
+# It needs its own control, as a challenge to a documented result.
+#
+# Lives on `mlb_sim` and not `mlb_ml` so `_slate_overrides` carries it into a
+# forkserver worker — trap 6.
+ML_STATE_COLS = ""                # "" | "baseout"
+
 
 ML_MODEL_FOLD = ""                # which walk-forward fold's model
 
@@ -1916,7 +1966,7 @@ def game_adjuster(season: int, as_of: str, row: dict,
 def pa_rates(bat: "Batter", pit: "Pitcher", *, faced: int = 0,
              oaa: float = 0.0, framing: float = 0.0, is_home: bool = False,
              tilt: float = 0.0, mult: Optional[Dict[int, float]] = None,
-             ml=None) -> List[float]:
+             ml=None, bases: int = 0, outs: int = 0) -> List[float]:
     """One plate appearance's nine-outcome distribution.
 
     `ml` is the optional trained correction from `_ml_adjuster`. It is applied
@@ -1935,7 +1985,7 @@ def pa_rates(bat: "Batter", pit: "Pitcher", *, faced: int = 0,
     rates = apply_multipliers(rates, bat.context)
     rates = apply_multipliers(rates, mult)
     if ml is not None:
-        rates = apply_multipliers(rates, ml(bat, pit, is_home))
+        rates = apply_multipliers(rates, ml(bat, pit, is_home, bases, outs))
     return rates
 
 
@@ -1971,9 +2021,16 @@ def simulate_game(home: TeamSide, away: TeamSide,
     # It must NOT depend on `app_rate` — the selection score already carries
     # that as the base rate, and gating on it here charged it twice and
     # starved the back of the pen (see `PEN_AVAILABLE_P`).
+    # `p.availability` is the rest state carried in from outside — 1.0 fully
+    # available, 0.0 not tonight. Declared and documented on `Pitcher` since
+    # the class was written and, until now, read NOWHERE: the ITP rest filter
+    # deleted resting arms from the roster instead of marking them.
+    #
+    # The draw is ALWAYS taken, so an all-1.0 pen — every path except the ITP
+    # one — consumes the random stream exactly as before and is bit-identical.
     for hf, sd in (("away", away), ("home", home)):
         mound[hf].available = {p.name for p in sd.bullpen
-                               if rng.random() < PEN_AVAILABLE_P}
+                               if rng.random() < PEN_AVAILABLE_P * p.availability}
     bf_by_pitcher: Dict[str, int] = {}
     # Pitches thrown, accumulated from the OUTCOMES actually simulated, so a
     # starter who is walking men and missing bats burns his count faster —
@@ -2042,8 +2099,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
             # The running game resolves first, and can end the inning on a
             # caught stealing — in which case this batter's PA never happens.
             rg_outs_before = state.outs
-            rg_bases_before = sum(v for v, x in zip((1, 2, 4), state.bases)
-                                  if x is not None)
+            rg_bases_before = base_mask(state.bases)
             rg_scorers, rg_events = running_game(state, rng, bat_side.lineup)
             for s in rg_scorers:
                 res.batters.setdefault(
@@ -2077,9 +2133,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
                            "outs_before": rg_outs_before,
                            "outs_after": state.outs,
                            "bases_before": rg_bases_before,
-                           "bases_after": sum(
-                               v for v, x in zip((1, 2, 4), state.bases)
-                               if x is not None),
+                           "bases_after": base_mask(state.bases),
                            "pitcher": pit.name, **ev}
                     for k in ("runner",):
                         if k in ev:
@@ -2094,10 +2148,19 @@ def simulate_game(home: TeamSide, away: TeamSide,
                 return
 
             faced = bf_by_pitcher.get(pit.name, 0)
+            # The base-out state reaches `pa_rates` only for the ML residual;
+            # nothing else in the composition reads it. Computed inside the
+            # guard because the shipped configuration is `ml is None`, and
+            # `base_mask` on every one of ~600M plate appearances in a full
+            # backtest is ~1.4% of the engine's wall clock for a value that
+            # would be discarded.
             rates = pa_rates(bat, pit, faced=faced, oaa=pit_side.oaa,
                              framing=pit_side.framing,
                              is_home=(half == "home"), tilt=form[half],
-                             mult=mult, ml=ml)
+                             mult=mult, ml=ml,
+                             bases=(base_mask(state.bases)
+                                    if ml is not None else 0),
+                             outs=state.outs)
 
             outs_before = state.outs
             before_bases = list(state.bases)
@@ -2119,9 +2182,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
                     # different run expectancy from a runner on first. This is
                     # what `re24_report` needs to score the base-running
                     # constants against the measured RE24 on disk.
-                    "bases_before": sum(
-                        v for v, b in zip((1, 2, 4), before_bases)
-                        if b is not None),
+                    "bases_before": base_mask(before_bases),
                     "runs_before": pending_runs,
                     "score": (runs["away"], runs["home"]),
                 })
@@ -2414,6 +2475,31 @@ LG_AIR_SHARE = 0.55     # league air share of balls in play, the pivot below
 def _num(row: dict, key: str, default: float = 0.0) -> float:
     v = row.get(key)
     return float(v) if isinstance(v, (int, float)) else default
+
+
+def _innings(row: dict, key: str = "IP", default: float = 0.0) -> float:
+    """Innings off the board, which are written in OUTS notation.
+
+    **`65.2` is 65 and TWO THIRDS, not 65.2.** Verified on the 2026 pitching
+    board: the fractional part of `IP` takes only three values — `.0` (315
+    rows), `.1` (239) and `.2` (246), and nothing else. A uniform decimal
+    would put ~20% of rows on each of ten values, so this is unambiguous.
+
+    Read as a plain float the number is short by up to 0.467 innings per
+    pitcher, always in the same direction. Both consumers are in the
+    start-length path and they COMPOUND: `ip_per_outing` comes out low, which
+    under-nets the relief innings in `start_bf_estimate`, which inflates the
+    implied start. Small, systematic, and free to fix.
+    """
+    v = row.get(key)
+    if not isinstance(v, (int, float)):
+        return default
+    whole = int(v)
+    outs = round((float(v) - whole) * 10)
+    if outs not in (0, 1, 2):
+        # not outs notation after all — trust the number as written
+        return float(v)
+    return whole + outs / 3.0
 
 
 def _split_outs_in_play(outs: float, gb: float, fb: float, ld: float,
@@ -6823,11 +6909,28 @@ def clears_fence(traj: dict, wall_dist_ft: float, wall_h_ft: float,
 
 
 def _park(venue: str) -> Optional[dict]:
-    return _wm().STADIUM_DATA.get(venue)
+    """Stadium record, by any of the park's names.
+
+    **Resolves internally**, like `park_run_factor` and `weather_tilt` — the
+    file's convention is that a park accessor takes whatever spelling the
+    caller has. StatsAPI renames parks between seasons ("Rate Field",
+    "Daikin Park", "UNIQLO Field at Dodger Stadium") and an exact-match
+    `.get` on the raw name returned None, which reads downstream as altitude
+    0 and no azimuth rather than as an error.
+    """
+    return _wm().STADIUM_DATA.get(resolve_venue(venue or "") or venue)
 
 
 def park_azimuth(venue: str) -> Optional[float]:
-    rec = _wm().PARK_ORIENTATION.get(venue)
+    """Home-plate -> centre-field compass bearing. Resolves internally.
+
+    A miss here does not raise — it returns None, and `weather_tilt` then
+    drops the wind term entirely while the ball-flight grid falls back to an
+    unrotated bearing. CLAUDE.md records what that costs: every park behaving
+    as though centre field pointed due north, 419-421 ft everywhere against a
+    102 ft real spread.
+    """
+    rec = _wm().PARK_ORIENTATION.get(resolve_venue(venue or "") or venue)
     if isinstance(rec, dict):
         return rec.get("azimuth")
     return rec
@@ -7622,11 +7725,56 @@ def park_wind_factor(venue: Optional[str]) -> float:
         try:
             with open(RECEPTIVITY_PATH) as fh:
                 raw = json.load(fh)
-            raw.pop("_global", None)
+            _glob = (raw.pop("_global", None) or {})
             vals = {k: v["wind_mult"] for k, v in raw.items()
                     if isinstance(v, dict) and v.get("wind_mult")}
             if vals:
-                mean = sum(vals.values()) / len(vals)
+                # **The normaliser is OPEN-AIR parks only.** A park's
+                # `wind_mult` is fitted from how its batted balls respond to
+                # the recorded outdoor wind — and under a shut roof they do not
+                # respond at all, so the fit there measures ROOF USAGE, not park
+                # geometry. It shows: every one of the five retractable parks
+                # comes back with a NEGATIVE real wind response (Rogers Centre
+                # -0.504, American Family -0.245, Chase -0.180, LoanDepot
+                # -0.097), which is physically impossible — wind does not
+                # reduce carry — and Chase is closed 70.5% of the time by
+                # `park_weather_reference`'s own count.
+                #
+                # Averaging those into the divisor dragged it from 0.0976 to
+                # 0.0911 and inflated EVERY open park's factor by ~7%, Sutter
+                # Health Park from 2.305 to 2.470. Each park still keeps its own
+                # `wind_mult`; only the scale they are measured against changes.
+                # **Divide by the scale the fit SHRANK TOWARD, which the file
+                # records and this function was throwing away.** `_global` was
+                # popped and DISCARDED, and the divisor rebuilt as the mean of
+                # the per-park values — a different and worse quantity.
+                #
+                # Each park's `wind_mult` is its raw response regressed toward
+                # `_global.wind_mult_2pass` (0.098) by its own sample size:
+                # correlating the implied shrink weight against n gives **+0.98**
+                # for that target and -0.17 for the other, so 0.098 IS the league
+                # scale. The mean of the SHRUNK values is not — it is dragged by
+                # which parks happen to be thin and by the retractable-roof fits.
+                # Sutter Health Park: 0.225 / 0.0911 = 2.470 under the old mean,
+                # 0.225 / 0.098 = 2.296 against the real scale.
+                #
+                # The OPEN-AIR fallback is the same argument by a second route,
+                # for a file with no `_global`: a park's response is fitted from
+                # how its batted balls answer the recorded OUTDOOR wind, and
+                # under a shut roof they do not answer, so the fit measures ROOF
+                # USAGE. All five retractable parks come back NEGATIVE (Rogers
+                # -0.504, American Family -0.245, Chase -0.180, LoanDepot
+                # -0.097) — wind does not reduce carry — and Chase is closed
+                # 70.5% of the time by `park_weather_reference`'s own count.
+                # The two routes agree to 0.4%.
+                mean = float(_glob.get("wind_mult_2pass") or 0.0)
+                if mean <= 0.0:
+                    _roofs = _wm().STADIUM_DATA
+                    _open = [x for kk, x in vals.items()
+                             if str((_roofs.get(resolve_venue(kk) or kk)
+                                     or {}).get("roof") or "").lower() == "open"]
+                    mean = (sum(_open) / len(_open) if len(_open) >= 10
+                            else sum(vals.values()) / len(vals))
                 lo, hi = PARK_WIND_FACTOR_CLAMP
                 for k, v in vals.items():
                     _PARK_WIND[resolve_venue(k) or k] = max(lo, min(hi, v / mean))
@@ -7929,8 +8077,21 @@ def park_run_factor(venue: Optional[str], season: int = 2026,
                 continue
             for k, v in raw.items():
                 try:
+                    # **Weighted by the games behind it.** Each season's `raw`
+                    # is a home/road run ratio over `home_g` games, and a plain
+                    # `mean` over the window counts a 12-game April sample
+                    # exactly as heavily as a finished 81-game season. The
+                    # count is stored in the file and was never read.
+                    #
+                    # It bites hardest in April, when the current season is the
+                    # noisiest term in the window and still takes a third of
+                    # the weight. The clearest case on the 2026-08 board is
+                    # Sutter Health Park: 81 games in 2025 against 61 so far in
+                    # 2026, and the two disagree 1.1031 to 1.5132 — the widest
+                    # split of any park, at the park with the fewest seasons.
+                    g = float(v.get("home_g") or 0.0)
                     acc.setdefault(resolve_venue(k) or k, []).append(
-                        float(v["raw"]))
+                        (float(v["raw"]), g if g > 0 else 1.0))
                 except (KeyError, TypeError, ValueError):
                     continue
         lo, hi = PARK_RUN_CLAMP
@@ -7940,7 +8101,10 @@ def park_run_factor(venue: Optional[str], season: int = 2026,
             # old behaviour rather than a hole. New and relocated parks land
             # here (Sutter Health, and Camden after the 2025 wall move), and
             # they are exactly the parks where a stale average would be wrong.
-            pf = 1.0 + (statistics.mean(vals) - 1.0) * rel
+            wt = sum(g for _, g in vals)
+            mean = (sum(x * g for x, g in vals) / wt if wt else
+                    statistics.mean([x for x, _ in vals]))
+            pf = 1.0 + (mean - 1.0) * rel
             _PARK_RUN[key][name] = max(lo, min(hi, pf))
     if not venue:
         return 1.0
@@ -8017,7 +8181,24 @@ def _park_outcome_table(season: int,
             got = {}
         else:
             with open(p) as fh:
-                got = {k: v["factor"] for k, v in json.load(fh).items()}
+                # **Keys RESOLVED, because the file stores raw StatsAPI venue
+                # names and those drift between seasons.** Houston's park is
+                # "Minute Maid Park" in 2024 and "Daikin Park" after; the White
+                # Sox's is "Guaranteed Rate Field" then "Rate Field"; Dodger
+                # Stadium becomes "UNIQLO Field at Dodger Stadium" in 2026.
+                #
+                # `measured_park_exposure` looks a park up across a 3-season
+                # window with an exact `.get(venue)`, so a rename silently
+                # collapsed that window: Daikin and Rate Field found 2 seasons
+                # of 3, and Dodger Stadium found **ONE** — the window exists to
+                # stabilise the estimate and two thirds of it was being dropped
+                # with no error. 126 player-shares of exposure affected.
+                #
+                # `park_run_factor` already resolves on the way in; this table
+                # did not. Verified no collisions: 30 raw names resolve to 30
+                # distinct keys in every season.
+                got = {(resolve_venue(k) or k): v["factor"]
+                       for k, v in json.load(fh).items()}
         _PARK_OUTCOME[key] = got
     return got
 
@@ -8270,8 +8451,9 @@ def measured_park_exposure(pid: int, side: str, season: int,
     for venue, w in shares.items():
         acc = [0.0] * N_OUTCOMES
         hits = 0
+        rv = resolve_venue(venue) or venue
         for s in range(season - n + 1, season + 1):
-            f = _park_outcome_table(s, save_dir).get(venue)
+            f = _park_outcome_table(s, save_dir).get(rv)
             if not f:
                 continue
             for i in range(N_OUTCOMES):
@@ -8769,6 +8951,15 @@ def project_game(home_abbr: str, away_abbr: str, venue: Optional[str] = None,
     if live and weather is None and card.get("game_pk"):
         try:
             weather = game_weather(card["game_pk"], date)
+            # **A SCHEDULED game has no observation, and that was silent.**
+            # `game_weather` reads StatsAPI's game-time reading, which does not
+            # exist until the game does, so every forward projection priced at
+            # `weather_tilt = 0.0` — a neutral park on a 95F day. The forecast
+            # is the information set a projection legitimately has.
+            if weather is None:
+                weather = forecast_game_weather(
+                    venue or resolve_venue(card.get("venue") or ""),
+                    card.get("start"))
             if weather and verbose:
                 print(f"  weather: {weather.get('condition')}, "
                       f"{weather.get('temp_f')}F, wind {weather.get('wind_mph')} "
@@ -8808,8 +8999,29 @@ def project_game(home_abbr: str, away_abbr: str, venue: Optional[str] = None,
             print(f"  {tag}: SP {sd.starter.name}{sp_tag}"
                   f"   lineup {lu_tag}   pen {u['pen']}{note}")
 
-    results = simulate_many(home, away, n=n_sims, seed=seed,
-                            weather=weather, venue=venue)
+    # **The rate correction, on the LIVE path too.** This call used to omit
+    # `ml=` entirely, so `project` ran the incumbent whatever `RATE_MODEL`
+    # said while `clv` and `backtest` — the two paths that DO pass it — ran the
+    # variant. Inert while `RATE_MODEL = "baseline"` (`game_adjuster` returns
+    # None), which is exactly why it would have survived until the residual
+    # shipped and then printed a different price from `clv` for the same game
+    # with nothing to say so. Trap 12 in its original costume: the live path is
+    # not covered by the A/B harness, so an optional argument defaulting to
+    # None is a silent divergence there and nowhere else.
+    #
+    # `as_of` is "" — LIVE, the season to date, never a frozen snapshot. A
+    # projection of tonight's game legitimately has today's board.
+    gdate = date or datetime.date.today().isoformat()
+    results = simulate_many(
+        home, away, n=n_sims, seed=seed, weather=weather, venue=venue,
+        ml=game_adjuster(season, "", {
+            "venue": venue or card.get("venue") or "", "date": gdate,
+            "temp_f": (weather or {}).get("temp_f"),
+            "wind_mph": (weather or {}).get("wind_mph"),
+            "wind_label": (weather or {}).get("wind_label") or "",
+            "home_sp": card.get("home_sp") or -1,
+            "away_sp": card.get("away_sp") or -1,
+        }, home, away))
     return {"home": home, "away": away, "results": results,
             "venue": venue, "weather": weather}
 
@@ -8855,6 +9067,30 @@ def _fmt(v):
 # ===========================================================================
 # 12. COMMAND LINE
 # ===========================================================================
+
+
+def league_side(tag: str) -> TeamSide:
+    """A flat league-average side: nine league hitters, a league starter on the
+    real hook curve, and EIGHT league relievers.
+
+    **There were five byte-identical copies of this** — in `re24_report`,
+    `validate_vs_reality`, `_form_probe`, `validate_dispersion` and
+    `multiplier_run_value` — which is how two subtly different synthetic sides
+    come to exist without anyone deciding. It is deliberately NOT `_demo_side`,
+    which tilts the lineup by `quality` and carries only six arms; the two are
+    for different jobs and the names now say so.
+
+    **What it cannot do, stated here rather than rediscovered.** Every arm is
+    identical and none carries deployment traits, so this side structurally
+    cannot express anything margin- or leverage-conditional. A probe of the
+    bullpen's score-awareness built on it measures zero and reads as a clean
+    null (sim_state.md trap 5, three instances). Use real sides for that.
+    """
+    return TeamSide(
+        [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
+        Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
+                hazard=starter_hazard()),
+        [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
 
 
 def _demo_side(name: str, quality: float = 1.0) -> TeamSide:
@@ -10412,26 +10648,61 @@ def _op_client(proxy: Optional[str] = None):
 #
 # The LEAGUE page carries the real slate: `/baseball/usa/mlb/` returned all
 # fifteen of the current day's games. Same parser, different path.
+#
+# **But it is a FIXTURES page, and a finished game leaves it.** Measured
+# 2026-08-23, with all fifteen of that day's games already Final on StatsAPI:
+# `/baseball/usa/mlb/` returned FOUR rows, the nearest a week out, while
+# `/baseball/usa/mlb/results/` carried 50 finished games back through 08-19.
+# So `--date` accepted any past date and could never resolve one — the board
+# came back empty and `run_clv` reported "nothing on the board", which reads
+# as "no games that day" rather than "this path cannot see finished games".
+# A flag that looks like it works and silently produces nothing is the same
+# family as trap 11; the fix is to read BOTH pages.
+#
+# Both are merged rather than switched on the date, because a slate in
+# progress is genuinely mixed: the 1:05 games are on the results page while
+# the 7:05 games are still fixtures, and either page alone is a partial board
+# that looks complete. `date-start-timestamp` is what actually selects the
+# slate, and it is on rows from both.
 _OP_LEAGUE_PATH = {"baseball": "/baseball/usa/mlb/"}
+_OP_RESULTS_PATH = {"baseball": "/baseball/usa/mlb/results/"}
 
 
-def _op_listing(client, sport: str) -> List[dict]:
-    """Listing rows for a sport, preferring its LEAGUE page."""
-    path = _OP_LEAGUE_PATH.get(sport)
-    if not path:
+def _op_page_rows(client, path: str) -> List[dict]:
+    """Listing rows off one OddsPortal league page."""
+    blob = client._next_payload(client._get(path).text)
+    rows = []
+    for mm in client._LISTING_ROW_RE.finditer(blob):
+        obj = client._json_object_at(blob, mm.start())
+        if obj and obj.get("url"):
+            rows.append(obj)
+    return rows
+
+
+def _op_listing(client, sport: str, finished: bool = True) -> List[dict]:
+    """Listing rows for a sport, preferring its LEAGUE pages.
+
+    `finished` also reads the RESULTS page, which is the only place a
+    concluded game appears. Deduped on `url`, which is the row identity — a
+    game can legitimately be on both pages while a slate is in progress.
+    """
+    paths = [p for p in (_OP_LEAGUE_PATH.get(sport),
+                         _OP_RESULTS_PATH.get(sport) if finished else None)
+             if p]
+    if not paths:
         return client._listing_rows(sport)
-    try:
-        blob = client._next_payload(client._get(path).text)
-        rows = []
-        for mm in client._LISTING_ROW_RE.finditer(blob):
-            obj = client._json_object_at(blob, mm.start())
-            if obj and obj.get("url"):
-                rows.append(obj)
-        if rows:
-            return rows
-    except Exception as e:                                     # noqa: BLE001
-        print(f"[clv] league page {path} failed ({e}); "
-              f"falling back to /matches/{sport}/")
+    out, seen = [], set()
+    for path in paths:
+        try:
+            for r in _op_page_rows(client, path):
+                if r["url"] not in seen:
+                    seen.add(r["url"])
+                    out.append(r)
+        except Exception as e:                                 # noqa: BLE001
+            print(f"[clv] league page {path} failed ({e})")
+    if out:
+        return out
+    print(f"[clv] no league rows; falling back to /matches/{sport}/")
     return client._listing_rows(sport)
 
 
@@ -10565,6 +10836,10 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
                 wx = game_weather(int(pr["game_pk"]), date)
             except Exception:                                  # noqa: BLE001
                 wx = None
+        # Scheduled game -> no observation exists yet; use the forecast rather
+        # than pricing at a neutral park. See `forecast_game_weather`.
+        if wx is None:
+            wx = forecast_game_weather(venue, pr.get("start"))
         res = simulate_many(
             home, away, n=n_sims, seed=17, weather=wx, venue=venue,
             ml=game_adjuster(int(date[:4]), "", {
@@ -11004,34 +11279,103 @@ def starter_gs_share(pid: Optional[int], season: int = 2026,
 BF_PER_INNING = 4.30
 
 
+# --- what a real start actually looks like, MEASURED ----------------------
+# 121 PURE starters on the 2026 board (G == GS, so the relief netting below is
+# identically zero and the estimate is exact) span **4.10 to 6.60 IP/start**,
+# median 5.46, p95 6.05. The shipped clamp ceiling was 7.00 — above anything a
+# real starter does — and it CLAMPED rather than refused, so an arm whose
+# netting produced 16.10 IP/start was quietly served as a 7-inning starter.
+START_IP_CEILING = 6.6
+START_IP_FLOOR = 0.7            # a true opener legitimately goes ~1 inning
+
+# `ip_rel` is netted out of season IP and the remainder divided by GS, so an
+# error in it is amplified by **(G - GS) / GS** — up to 59x on the 2026 board,
+# where 86 of 335 arms sit above 3x. Only 34.8% of board pitchers carry a
+# measured `ip_per_outing`; the rest take a 1.0 default, and at high leverage
+# that guess cannot carry the estimate. Above this, refuse.
+START_NET_MAX_LEVERAGE = 1.0
+
+# Median batters faced in a START, by the pitcher's own GS share, over 3,728
+# cached starts in `reliever_stints.json`.
+#
+#   GS share < 0.15   n=168   median  6.0 BF   <- true opener / swingman
+#   0.15 - 0.30       n= 41   median 21.0
+#   0.30 - 0.50       n=177   median 21.0
+#   0.50 - 0.75       n=221   median 21.0
+#   0.75 +            n=3120  median 23.0
+#
+# **The step is at ~0.15, not at `OPENER_GS_SHARE`'s 0.5.** Arms between 0.15
+# and 0.50 throw ordinary 21-batter starts; only below 0.15 does the length
+# collapse. That is the population split the old docstring was reaching for
+# with "a starter pulled by the 2nd averages inning 2.13 while a spot starter
+# goes to inning 5.23", measured here on the cached stints instead.
+START_BF_BY_GS_SHARE: Tuple[Tuple[float, float], ...] = (
+    (0.15, 6.0), (0.75, 21.0), (2.0, 23.0))
+
+
+def population_start_bf(pid: Optional[int], season: int = 2026,
+                        save_dir: Path = SAVE_DIR) -> float:
+    """What an arm with THIS GS share throws in a start, measured.
+
+    The fallback when his own line cannot resolve it. Deliberately not his
+    relief `bf_per_outing`: `start_bf_estimate`'s own docstring says the
+    relief workload is the wrong number for a start, and then the call site
+    used it as the fallback anyway — which is how a man with four real starts
+    was handed a one-inning target.
+    """
+    share = starter_gs_share(pid, season, save_dir)
+    if share is None:
+        return START_BF_BY_GS_SHARE[-1][1]
+    for hi, bf in START_BF_BY_GS_SHARE:
+        if share < hi:
+            return bf
+    return START_BF_BY_GS_SHARE[-1][1]
+
+
 def start_bf_estimate(pid: Optional[int], season: int = 2026,
                       save_dir: Path = SAVE_DIR) -> Optional[float]:
     """Batters this arm faces in a START, from his own IP/GS on the board.
 
-    **His RELIEF workload is the wrong number for this.** The two populations
-    inside "GS/G < 0.5" are far apart — measured over 129 true-opener games,
-    a starter pulled by the 2nd averages inning 2.13 while a spot starter goes
-    to inning 5.23 — and 292 arms carry no relief `bf_per_outing` at all, so a
-    default sends a swingman like Bailey Falter (GS/G 0.40) out for one inning
-    instead of five. IP/GS is measured directly and covers both.
+    **His RELIEF workload is the wrong number for this.** IP is shared with
+    his relief work: Wandy Peralta has 61 IP over 53 G but only 4 GS, so a
+    naive ratio calls him a 15-inning starter. The relief innings are netted
+    out first, using his own measured relief length.
+
+    **Returns None rather than a number it cannot stand behind.** The netting
+    divides by GS, so an error in `ip_rel` is multiplied by (G - GS) / GS. For
+    Lake Bachar — G 41, GS 4, leverage 9.2x — his true 1.59 IP per relief
+    outing against the assumed 1.00 became a **5.5 IP per start** overstatement,
+    and the old clamp turned 7.05 into a 7-inning start: 30.1 batters, the
+    longest projected start on the 2026-08-23 slate, ahead of an arm with 646
+    TBF and 25 starts. Two other arms computed NEGATIVE innings per start
+    (-4.00, -1.80) and were clamped up to 0.7.
+
+    A clamp is the wrong instrument here. It converts "this arithmetic did not
+    resolve" into "this man throws a complete game", which is a plausible
+    wrong answer with nothing attached to say so — `sim_state.md` trap 11. The
+    caller falls back to `population_start_bf`, which is measured.
     """
     if pid is None:
         return None
     row = _pit_row(int(pid), season, save_dir)
-    if row is not None:
-        gs, g, ip = _num(row, "GS"), _num(row, "G"), _num(row, "IP")
-        if gs < 1 or ip <= 0:
-            return None
-        # **IP/GS on its own is wrong for a swingman**, because IP is shared
-        # with his relief work: Wandy Peralta has 61 IP over 53 G but only 4
-        # GS, so a naive ratio calls him a 15-inning starter. Net the relief
-        # innings out first, using his own measured relief length.
-        tr = load_reliever_traits(season).get(int(pid)) or {}
-        ip_rel = float(tr.get("ip_per_outing") or 1.0)
-        ip_start = (ip - max(0.0, g - gs) * ip_rel) / gs
-        ip_start = max(0.7, min(7.0, ip_start))
-        return ip_start * BF_PER_INNING
-    return None
+    if row is None:
+        return None
+    gs, g, ip = _num(row, "GS"), _num(row, "G"), _innings(row, "IP")
+    if gs < 1 or ip <= 0:
+        return None
+    relief = max(0.0, g - gs)
+    tr = load_reliever_traits(season).get(int(pid)) or {}
+    measured = tr.get("ip_per_outing")
+    # **Refuse when the netting is underdetermined.** With no measured relief
+    # length we are guessing, and the guess is amplified by the leverage.
+    if relief > 0 and measured is None and relief / gs > START_NET_MAX_LEVERAGE:
+        return None
+    ip_start = (ip - relief * float(measured or 1.0)) / gs
+    # **Refuse rather than clamp.** Outside the band real starters occupy, the
+    # netting has failed and the number carries no information.
+    if not (START_IP_FLOOR <= ip_start <= START_IP_CEILING):
+        return None
+    return ip_start * BF_PER_INNING
 
 
 def opener_hazard(bf_target: float) -> List[float]:
@@ -11098,11 +11442,16 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
         share = starter_gs_share(sp_id, season, save_dir)
         traits = load_reliever_traits(season).get(int(sp_id)) or {}
         is_opener = share is not None and share < OPENER_GS_SHARE
-        # His own start length where he has one, else his relief outing.
-        # Never a bare default: that is what would send a swingman out for a
-        # single inning.
+        # His own start length where his line can resolve one, else what arms
+        # with HIS GS SHARE actually throw — measured, not his relief outing.
+        #
+        # **The old chain fell back to `traits["bf_per_outing"]`, which is a
+        # RELIEF length**, the very number `start_bf_estimate`'s docstring
+        # says is wrong for a start; and then to a bare 4.5. So the two
+        # outcomes were a 7-inning start (the clamp) or a one-inning one (the
+        # fallback), with nothing in between and no measurement behind either.
         bf_target = (start_bf_estimate(sp_id, season, save_dir)
-                     or traits.get("bf_per_outing") or 4.5)
+                     or population_start_bf(sp_id, season, save_dir))
         hz = opener_hazard(bf_target) if is_opener else (hazard or [])
         sp = make_pitcher(int(sp_id), pit_table, is_starter=True, hazard=hz)
         if sp is None:
@@ -11705,9 +12054,28 @@ def build_pen_from_itp(abbr: str, pit_table: Dict[int, dict],
     for row in state["pen"]:
         raw = row["name"]
         nm = _itp_clean_name(raw)
-        if drop_resting and avail.get(raw) == "likely_rest":
+        # **A resting arm stays on the ROSTER; he is just not available.**
+        # Deleting him shortened the pen — Oakland went to FOUR arms on
+        # 2026-08-23 — and this function's own comment a few lines down says a
+        # short pen "hands his innings to better arms, which is the same error
+        # as truncating the pen at 8". The rest filter was doing exactly that,
+        # unguarded.
+        #
+        # The consequence was not a slightly thin pen but a broken one: with
+        # four arms the sim burned the whole staff in EVERY simulated game and
+        # hit an empty pen on 50.8% of change decisions, against under 4% for
+        # the other 29 clubs. `_choose_reliever` returns None there and all
+        # three call sites read `if nxt is not None`, so the man on the mound
+        # simply stayed — `RELIEF_PULL_DAMAGE` inert and a shelled reliever
+        # unremovable for the rest of the game.
+        #
+        # `_choose_reliever` already has the right shape: it picks from the
+        # READY set and falls back to "everyone rested or burned: go anyway".
+        # Rest belongs in that first tier, not in the roster. Real managers do
+        # the same — out of arms, a tired one pitches the 12th.
+        resting = bool(drop_resting and avail.get(raw) == "likely_rest")
+        if resting:
             rested.append(nm)
-            continue
         hit = by_name.get(_norm_name(nm))
         arm = make_pitcher(hit[0], pit_table) if hit else None
         pid = hit[0] if hit else None
@@ -11729,9 +12097,14 @@ def build_pen_from_itp(abbr: str, pit_table: Dict[int, dict],
         arm.throws = ("L" if (row.get("hand") or "").upper().startswith("L")
                       else "R")
         arm.multi_inning = float(tr.get("ip_per_outing", 1.0)) >= 1.25
+        arm.availability = 0.0 if resting else 1.0
         pen.append(arm)
     rep = {"ok": bool(pen), "n_itp": len(state["pen"]),
            "matched": len(pen), "rested": rested, "unmatched": missing,
+           # arms on the roster vs arms usable TONIGHT. A short pen and a
+           # rested one are different problems and the report must not read
+           # the same for both.
+           "available": sum(1 for p in pen if p.availability > 0.0),
            "days": state.get("days", [])}
     if cache:
         _ITP_PEN_CACHE[key] = (pen, rep)
@@ -11807,9 +12180,10 @@ def validate_bullpen_usage(teams: Sequence[str] = (), n: int = 3000,
 # both the arm coming in and the batter he faced.
 #
 # That gives two things nothing else does:
-#   * the real distribution of entry inning / margin / leverage per role, to
-#     FIT `ENTRY_INNING_SCALE` and `ENTRY_DIFF_SCALE` against instead of
-#     tuning them by eye;
+#   * the real distribution of entry inning / margin / leverage per role. It
+#     is consumed DIRECTLY by `build_deployment` as per-arm histograms rather
+#     than fitted against a pair of penalty scales — the scales that sentence
+#     named were removed 2026-08-23, having reached nothing for some time;
 #   * the real size of the handedness effect, which is otherwise an assertion.
 
 # Keyed on SEASON. It was a single file, so a 2025 backtest was scored with
@@ -12897,12 +13271,7 @@ def re24_report(n: int = 6000, seed: int = 5,
     it is the base-out transition model on its own, which is what the
     advancement constants are.
     """
-    def side(tag):
-        return TeamSide(
-            [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
-            Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
-                    hazard=starter_hazard()),
-            [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
+    side = league_side
 
     home, away = side("H"), side("A")
     logs: List[List[dict]] = []
@@ -13378,12 +13747,7 @@ def real_marks(season: int = 2026, measured: bool = True) -> dict:
 
 def validate_vs_reality(n: int = 20000, seed: int = 5) -> dict:
     """Run the league-average sim and score it against the real marks."""
-    def side(tag):
-        return TeamSide(
-            [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
-            Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
-                    hazard=starter_hazard()),
-            [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
+    side = league_side
 
     res = simulate_many(side("H"), side("A"), n=n, seed=seed)
     runs = [r.runs_home for r in res] + [r.runs_away for r in res]
@@ -13485,12 +13849,7 @@ def _form_probe(sd: float, shift: float, n: int, seed: int) -> dict:
     old = (GAME_FORM_SD, GAME_FORM_MEAN_SHIFT)
     GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = sd, shift
     try:
-        def side(tag):
-            return TeamSide(
-                [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
-                Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
-                        hazard=starter_hazard()),
-                [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
+        side = league_side
         rng = random.Random(seed)
         home, away = side("H"), side("A")
         logs = []
@@ -13587,12 +13946,7 @@ def validate_dispersion(n: int = 6000, seed: int = 11,
     zero here, and read it against `inn18_cov` as the size of what real
     matchups plus an explicit game-level term have to supply.
     """
-    def side(tag):
-        return TeamSide(
-            [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
-            Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
-                    hazard=starter_hazard()),
-            [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
+    side = league_side
 
     rng = random.Random(seed)
     home, away = side("H"), side("A")
@@ -13635,6 +13989,31 @@ SLATE_CACHE = SAVE_DIR / "season_slate_{season}.json"
 SLATE_WINDOW_DAYS = 30
 
 
+def _dedupe_slate(rows: List[dict]) -> List[dict]:
+    """One row per gamePk, the LAST entry winning.
+
+    A game that is rescheduled or resumed comes back under TWO schedule
+    entries sharing the same `pk` and differing only in `start`/`day_night` —
+    five of them across 2025-26, including the Speedway Classic at Bristol
+    Motor Speedway on 2025-08-02, which was rain-delayed. Every slate consumer
+    iterates these rows, so a duplicate counts that game's runs TWICE: in
+    `build_park_run_factors`' home/road means, in the forecast fetch, and in
+    any backtest. 0.2% of games, with no error attached to it.
+
+    **NOT the doubleheader case.** Those legitimately share a date and both
+    clubs while carrying DISTINCT `pk`s — 32 of them in 2025 — and must
+    survive; `probable_for` already had to grow a game number for exactly that
+    reason.
+    """
+    seen: Dict[int, dict] = {}
+    for r in rows:
+        try:
+            seen[int(r["pk"])] = r
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(seen.values(), key=lambda r: (r["date"], r["pk"]))
+
+
 def season_slate(season: int = 2026, start: Optional[str] = None,
                  end: Optional[str] = None, refresh: bool = False,
                  timeout: float = 90.0,
@@ -13653,7 +14032,10 @@ def season_slate(season: int = 2026, start: Optional[str] = None,
     if path.exists() and not refresh:
         try:
             with open(path) as fh:
-                return json.load(fh)
+                # deduped on READ as well as on write: the caches on disk
+                # predate this and re-scraping a season to fix five rows would
+                # be 190 requests for a 0.2% correction
+                return _dedupe_slate(json.load(fh))
         except (OSError, ValueError):
             pass
 
@@ -13675,6 +14057,20 @@ def season_slate(season: int = 2026, start: Optional[str] = None,
         cur = hi + datetime.timedelta(days=1)
 
     out.sort(key=lambda r: (r["date"], r["pk"]))
+    # **One row per gamePk.** A game that is rescheduled or resumed comes back
+    # under TWO schedule entries sharing the same `pk` and differing only in
+    # `start` / `day_night` — five of them in 2025-26, including the Speedway
+    # Classic at Bristol Motor Speedway on 2025-08-02, which was rain-delayed.
+    # Every slate consumer iterates these rows, so a duplicate counts that
+    # game's runs TWICE: in `build_park_run_factors`' home/road means, in the
+    # forecast fetch, and in any backtest. 0.2% of games and no error attached
+    # to it. The LAST entry wins, which is the rescheduled one.
+    #
+    # Note this is NOT the doubleheader case: those legitimately share a date
+    # and both clubs while carrying DISTINCT `pk`s, and 32 of them in 2025
+    # must survive — `probable_for` already had to grow a game number for
+    # exactly that reason (trap 13's neighbour).
+    out = _dedupe_slate(out)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as fh:
@@ -13939,6 +14335,145 @@ def fetch_forecast_weather(season: int = 2026,
         print(f"\n[forecastwx] {season}: {len(out)}/{len(slate)} games -> {path}")
     _progress(f"forecastwx {season} FINISHED {len(out)}/{len(slate)}")
     return out
+
+
+# A nine-inning game spans about three hours, and the weather does not hold
+# still for them. At Sutter Health Park on 2026-08-24 the forecast runs
+# 85.0F/9.8mph at first pitch and 75.0F/7.4mph three hours later — the
+# temperature falls 14.6F and the wind 35%. Priced off first pitch alone that
+# game reads +1.88 runs of weather on the total; across the window it is
+# +1.06, and the game-window MEAN temperature (79.6F) is within 0.2F of the
+# park's own reference, so the entire heat term was an artifact of the hour we
+# happened to sample.
+GAME_WINDOW_HOURS = 3
+
+
+def _game_window_mean(arch, venue: str, start_iso: str) -> Optional[dict]:
+    """Forecast rows averaged over the hours a game actually spans.
+
+    **The wind is averaged as a VECTOR, not as a speed and a bearing.** Wind
+    direction is circular — 350 and 10 degrees average to 0, not to 180 — and
+    what the physics consumes is the out-to-centre COMPONENT, which is exactly
+    the projection of the mean vector. Averaging speed and bearing separately
+    would be wrong in both directions at once.
+    """
+    try:
+        rows = arch.park_forecast(venue, forecast_days=3, past_days=1)
+        t0 = datetime.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        t0 = t0.astimezone(datetime.timezone.utc)
+    except Exception:                                          # noqa: BLE001
+        return None
+    # Round to the NEAREST hour first, as `WeatherArchive.at` does. Truncating
+    # a 01:40 first pitch to 01:00 starts the window 40 minutes before the game
+    # and ends it an hour before the game does — at Sutter that pulled the
+    # hottest, windiest hour of the evening INTO the average and dropped the
+    # calmest one out.
+    t0 = (t0 + datetime.timedelta(minutes=30)).replace(
+        minute=0, second=0, microsecond=0)
+    want = {(t0 + datetime.timedelta(hours=k)).strftime("%Y-%m-%dT%H:00")
+            for k in range(GAME_WINDOW_HOURS)}
+    got = [r for r in rows
+           if str(r.get("time", ""))[:13] + ":00" in {w[:13] + ":00" for w in want}
+           and r.get("temperature") is not None]
+    if len(got) < 2:
+        return None
+    n = float(len(got))
+    u = sum(-(r["wind_speed"] or 0.0)
+            * math.sin(math.radians(r["wind_direction"] or 0.0)) for r in got) / n
+    v = sum(-(r["wind_speed"] or 0.0)
+            * math.cos(math.radians(r["wind_direction"] or 0.0)) for r in got) / n
+    spd = math.hypot(u, v)
+    deg = (math.degrees(math.atan2(-u, -v))) % 360.0
+    out = dict(got[0])
+    out["temperature"] = sum(r["temperature"] for r in got) / n
+    out["wind_speed"], out["wind_direction"] = spd, deg
+    for k in ("humidity", "pressure_hpa"):
+        vals = [r.get(k) for r in got if r.get(k) is not None]
+        if vals:
+            out[k] = sum(vals) / len(vals)
+    return out
+
+
+def forecast_game_weather(venue: Optional[str], start_iso: Optional[str]
+                          ) -> Optional[dict]:
+    """The FORECAST for one scheduled game, in `weather_tilt`'s own shape.
+
+    **The forecast pipeline in this module is retrospective by construction and
+    cannot serve a future game.** `fetch_forecast_weather` iterates
+    `season_slate`, whose docstring is "every COMPLETED regular-season game",
+    and it queries Open-Meteo's PREVIOUS-RUNS archive — it answers "what did
+    the forecast say N days before a game that has already been played", which
+    is a look-ahead control for the backtest, not a forward projection. So a
+    live projection of tomorrow's slate got `weather_tilt = 0.0` on every game:
+    `game_weather` reads StatsAPI's OBSERVATION, and a scheduled game has none.
+    Silent, and weather is worth 0.0317 runs/degF and 0.0618 runs/mph wind-out.
+
+    `weatherman.WeatherService.at()` already picks forecast-vs-archive by date
+    and returns the hour covering first pitch, so this maps its row rather than
+    opening a second Open-Meteo client.
+
+    The frame TAGS are carried through deliberately and not re-derived:
+    Open-Meteo's wind is a COMPASS bearing and must be rotated by the park
+    azimuth, and its `surface_pressure` is already at the park's elevation.
+    Mislabelling either is the error CLAUDE.md records — every park behaving as
+    though centre field pointed due north, and Coors' 840 hPa "corrected" to
+    664 for a 21% density error.
+    """
+    if not venue or not start_iso:
+        return None
+    try:
+        wm = _wm()
+        # **RESOLVE the name first.** StatsAPI's spelling is not our key —
+        # it serves "Rate Field" where `STADIUM_DATA` holds "Guaranteed Rate
+        # Field", and "loanDepot park" against "LoanDepot Park". An exact-match
+        # test on the raw name silently returned None, so an OPEN-roof park
+        # lost its forecast and priced neutral with nothing to say so. Every
+        # other park consumer resolves internally (`park_run_factor`,
+        # `weather_tilt`); this one did not, which is trap 2 — a silent key
+        # miss returns a default, not an error.
+        venue = resolve_venue(venue) or venue
+        if venue not in wm.STADIUM_DATA:
+            return None
+        # `WeatherArchive`, not `WeatherService` — the latter is the
+        # OpenWeather current-conditions client and has no forecast hours.
+        arch = wm.WeatherArchive()
+        row = arch.at(venue, str(start_iso))
+        row = _game_window_mean(arch, venue, str(start_iso)) or row
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not row or row.get("temperature") is None:
+        return None
+    # **The ROOF, which a forecast cannot see and a sky condition is not.**
+    # `weather_tilt` reads `condition` and tests it against
+    # `ROOF_CLOSED_CONDITIONS`; the backtest forecast path carries the OBSERVED
+    # condition through for exactly that reason, and a scheduled game has no
+    # observation to carry. Open-Meteo's `condition` is the WMO SKY code
+    # ("Clear"), so passing it straight through silently disables the roof test
+    # — Chase Field on a 103.6F day took a full +0.65-run heat bonus for a game
+    # that will be played under a shut roof at ~72F.
+    #
+    # A fixed roof is KNOWN and is stamped closed. A RETRACTABLE one is a
+    # decision made on the day, and guessing it is exactly the "correction
+    # added for a plausible reason with no support" this project keeps
+    # recording — so those games get NO forecast and keep the neutral
+    # behaviour they already had. Weather is wired for the parks where it
+    # cannot be confounded, and nowhere else.
+    roof = str(((_wm().STADIUM_DATA.get(venue) or {}).get("roof") or "")).lower()
+    if roof in ("retractable",):
+        return None
+    if roof in ("dome", "fixed", "closed"):
+        return {"condition": "dome", "temp_f": row.get("temperature"),
+                "wind_mph": 0.0, "wind_label": "", "source": "forecast"}
+    return {"condition": row.get("condition"),
+            "temp_f": row.get("temperature"),
+            "wind_mph": row.get("wind_speed"),
+            "wind_dir_deg": row.get("wind_direction"),
+            "pressure_hpa": row.get("pressure_hpa"),
+            "humidity_pct": row.get("humidity"),
+            # tagged, never inferred — see the docstring
+            "pressure_frame": "station",
+            "wind_frame": row.get("wind_frame") or "compass",
+            "source": "forecast"}
 
 
 def _forecast_hour_key(start_iso: Optional[str]) -> Optional[str]:
@@ -14352,12 +14887,7 @@ def multiplier_run_value(n: int = 4000, seed: int = 3,
     through `simulate_game`'s own `context`, so the number comes out of the
     same code path the term itself uses rather than a linear-weights estimate.
     """
-    def side(tag):
-        return TeamSide(
-            [Batter(f"{tag}b{i}", list(LEAGUE_BASELINE)) for i in range(9)],
-            Pitcher(f"{tag}SP", list(LEAGUE_BASELINE), is_starter=True,
-                    hazard=starter_hazard()),
-            [Pitcher(f"{tag}RP{i}", list(LEAGUE_BASELINE)) for i in range(8)])
+    side = league_side
 
     def at(d: float) -> Tuple[float, float]:
         bundle = {HR: d, S1B: d, S2B: d, BB: d,
@@ -15652,14 +16182,21 @@ def handicap_ladder(season: int, price: str = "a",
     return out
 
 
-def ladder_report(season: int, save_dir: Path = SAVE_DIR) -> dict:
+def ladder_report(season: int, save_dir: Path = SAVE_DIR,
+                  lad: Optional[Dict[tuple, dict]] = None) -> dict:
     """Prove the ladder decode rather than trusting it.
 
     Monotonicity and moneyline-bracketing are the two things a sign error or a
     bad de-vig would break, and both are cheap. A silent sign flip here would
     reverse every conclusion drawn from the instrument.
+
+    `lad` lets a caller that has ALREADY decoded the ladder hand it over.
+    `handicap_ladder` is uncached and takes ~31s on a season, and the two
+    invariant tests plus this function were decoding the same 2025 ladder three
+    times — 95s of a 260s suite for one answer.
     """
-    lad = handicap_ladder(season, save_dir=save_dir)
+    if lad is None:
+        lad = handicap_ladder(season, save_dir=save_dir)
     mono_bad = mono_tot = brk_bad = brk_tot = 0
     for v in lad.values():
         r = sorted(v["rungs"].items())
@@ -16646,6 +17183,30 @@ AB_ARMS: Dict[str, Dict[str, object]] = {
     # downstream. Anything it moves is the fit, not the architecture.
     "hier25tuned": {"RATE_MODEL": "blend", "ML_HIER_NODES": "all",
                     "ML_BLEND_ALPHA": 0.25, "ML_NODE_PARAMS": "tuned"},
+    # --- the GAME-STATE residual (4b.5) -----------------------------------
+    # `hier25v2` is the CONTROL: the hierarchy retrained on the current
+    # baseline, no state. The cached `hier25` cannot serve as one — it predates
+    # the joint histogram, the bullpen raking AND the park-decontam baseline,
+    # so three things differ at once.
+    #
+    # `hier25state` is the same model with BASE-OUT served. Measured at PA
+    # level on both TEST seasons it is +33% on the residual's whole
+    # contribution, and every f26 node improved (BB nearly TRIPLED, 0.000435 ->
+    # 0.001190 — walk rate is strongly base-out dependent, which is exactly
+    # what a base-out-blind rate layer cannot express).
+    "hier25v2": {"RATE_MODEL": "blend", "ML_HIER_NODES": "all",
+                 "ML_BLEND_ALPHA": 0.25, "ML_STATE_COLS": ""},
+    "hier25state": {"RATE_MODEL": "blend", "ML_HIER_NODES": "all",
+                    "ML_BLEND_ALPHA": 0.25, "ML_STATE_COLS": "baseout"},
+    # alpha = 1.0. `hier25state` runs at 0.25 because that is what is
+    # comparable to the recorded `hier25`, but 0.25 is a LOWER BOUND for the
+    # state model: the PA optimum is 0.8-1.0, and base-out adds signal WITHOUT
+    # worsening the level bias that forced alpha down (2025 +0.1220 -> +0.1047,
+    # 2026 unchanged). alpha is applied at inference in logit space, so this is
+    # the same models — no retrain. If the ladder is flat here too, game state
+    # is a genuine null at the price rather than a weight artifact.
+    "hier100state": {"RATE_MODEL": "blend", "ML_HIER_NODES": "all",
+                     "ML_BLEND_ALPHA": 1.0, "ML_STATE_COLS": "baseout"},
 }
 
 # Which fold's model prices which season. The rule is that a season may only
@@ -16695,6 +17256,16 @@ AB_REFERENCE: Dict[str, str] = {
         "leak-free."),
 }
 
+
+# Arms that override NOTHING on purpose. `armrake` is a named SNAPSHOT of the
+# shipped configuration, not a variant: it exists so a fresh run of today's
+# code does not overwrite `bt*_base_2000.json`, which predates
+# `TEAM_QUALITY_GAIN` and is the only surviving reference for that change
+# (never `--fresh` an arm that is somebody else's reference). A snapshot is
+# listed here rather than silently exempted from
+# `test_ab_base_arm_IS_the_shipped_model`, which is otherwise right that an
+# empty arm is base under another name.
+AB_SNAPSHOT_ARMS: frozenset = frozenset({"armrake"})
 
 _AB_SHIPPED: Dict[str, object] = {}
 

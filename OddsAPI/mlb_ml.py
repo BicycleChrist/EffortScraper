@@ -1684,8 +1684,10 @@ class GameAdjuster:
                 f"mlb_ml: model {tag}/{fold} reads per-PA state "
                 f"({sorted(STATE_NAMES)}) and cannot be served through the "
                 f"memoised adjuster. It is a PA-level diagnostic only.")
-        self.mask = _feature_mask(self.meta["keep_base"],
-                                  self.meta.get("keep_state", False))
+        self.state_cols = active_state_cols()
+        self.mask = (_state_mask() if (m.ML_HIER_NODES or "") else
+                     _feature_mask(self.meta["keep_base"],
+                                   self.meta.get("keep_state", False)))
         self.centre = (applied_centre(tag, fold, season, as_of, save_dir)
                        if m.ML_SELF_CENTRE else self.meta.get("centre"))
         # The HIERARCHY path. `alpha` is applied INSIDE `hier_proba`, in logit
@@ -1730,9 +1732,23 @@ class GameAdjuster:
     # replacement-level callup, a position player mopping up — so an unseen
     # matchup is still priced rather than silently left uncorrected.
 
+    # The served STATE grid. Empty subset -> one cell, i.e. the incumbent key.
+    # `baseout` -> 8 base states x 3 out states = 24, so a game's ~270 distinct
+    # matchups become ~6,500 rows — still ONE batched predict, which is the
+    # whole reason the memo exists.
+    def _state_grid(self):
+        if not self.state_cols:
+            return [(0, 0)]
+        return [(b, o) for b in range(8) for o in range(3)]
+
+    def _key(self, bat, pit, is_home, bases, outs):
+        k = (bat.player_id, pit.player_id, bool(is_home), pit.is_starter)
+        return k + ((int(bases), int(outs)) if self.state_cols else ())
+
     def _prime(self, home, away) -> None:
         np = self.np
-        keys, rows, bases = [], [], []
+        keys, rows, vecs = [], [], []
+        grid = self._state_grid()
         for is_home_batting in (True, False):
             bat_side = home if is_home_batting else away
             pit_side = away if is_home_batting else home
@@ -1741,15 +1757,21 @@ class GameAdjuster:
                 for pit in arms:
                     if pit is None:
                         continue
-                    key = (bat.player_id, pit.player_id, is_home_batting,
-                           pit.is_starter)
-                    if key in self._memo:
-                        continue
-                    base = self.base_vector(bat, pit, is_home_batting)
-                    keys.append((key, base))
-                    rows.append(self._row(bat, pit, is_home_batting, base))
-                    self._memo[key] = None          # claim it
-                    bases.append(base)
+                    # the baseline does NOT depend on base-out state, so it is
+                    # computed once per matchup and shared across the grid
+                    base = None
+                    for bs, ou in grid:
+                        key = self._key(bat, pit, is_home_batting, bs, ou)
+                        if key in self._memo:
+                            continue
+                        if base is None:
+                            base = self.base_vector(bat, pit, is_home_batting)
+                        keys.append((key, base))
+                        rows.append(self._row(bat, pit, is_home_batting, base,
+                                              bs, ou))
+                        self._memo[key] = None          # claim it
+                        vecs.append(base)
+        bases = vecs
         if not rows:
             return
         Xf = np.vstack(rows)
@@ -1774,7 +1796,8 @@ class GameAdjuster:
         return {i: float(P[i] / max(base[i], 1e-9))
                 for i in range(m.N_OUTCOMES)}
 
-    def _row(self, bat, pit, is_home_batting: bool, base):
+    def _row(self, bat, pit, is_home_batting: bool, base,
+             bs: int = 0, ou: int = 0):
         np = self.np
         bid, pid = bat.player_id, pit.player_id
         bfeat = self._bf.get(bid)
@@ -1792,7 +1815,7 @@ class GameAdjuster:
             _matchup_features(self.bat_board.get(bid), self.pit_board.get(pid),
                               bat.bats, pit.throws),
             context_features(self.gc, pit_side, is_home_batting,
-                             pit.is_starter, state=None),
+                             pit.is_starter, state=self._state_tuple(bs, ou)),
             np.log(np.maximum(base, 1e-9)),
             np.log(np.maximum(np.asarray(bat.rates, dtype="float32"), 1e-9)),
             np.log(np.maximum(np.asarray(pit.rates, dtype="float32"), 1e-9)),
@@ -1810,12 +1833,22 @@ class GameAdjuster:
                   + self.gc["park"]["home" if is_home_batting else "away"])),
             dtype="float32")
 
-    def __call__(self, bat, pit, is_home: bool) -> Dict[int, float]:
-        key = (bat.player_id, pit.player_id, bool(is_home), pit.is_starter)
+    def _state_tuple(self, bs: int, ou: int):
+        """`context_features` wants (inning, outs, bases, pit_bf, tto, slot).
+        Only the served columns are filled; the rest stay NaN and are MASKED
+        OUT, so a NaN here never reaches a model."""
+        nan = float("nan")
+        if not self.state_cols:
+            return None
+        return (nan, float(ou), float(bs), nan, nan, nan)
+
+    def __call__(self, bat, pit, is_home: bool,
+                 bases: int = 0, outs: int = 0) -> Dict[int, float]:
+        key = self._key(bat, pit, is_home, bases, outs)
         got = self._memo.get(key)
         if got is None:
             base = self.base_vector(bat, pit, is_home)
-            Xf = self._row(bat, pit, is_home, base)[None, :]
+            Xf = self._row(bat, pit, is_home, base, bases, outs)[None, :]
             self.n_predict += 1
             if self.hier:
                 P = hier_proba(self.fold, Xf, base[None, :], self.hier,
@@ -1918,6 +1951,33 @@ NODES_RUN = ("K", "BB", "HR")
 # This is part of the FINGERPRINT (see `node_model_path`), so models fitted
 # with and without it coexist on disk and can be A/B'd — trap 2 of section 4c.
 NODE_CATEGORICALS: Tuple[str, ...] = ("venue_id", "hand_code")
+
+# Named per-PA STATE subsets the residual may be trained on AND served with.
+# The two must be the same set or the model reads columns the adjuster cannot
+# supply, so both go through `active_state_cols()` and it is fingerprinted.
+STATE_SUBSETS: Dict[str, Tuple[str, ...]] = {
+    "": (),
+    "baseout": ("bases_before", "outs_before"),
+}
+
+
+def active_state_cols() -> Tuple[str, ...]:
+    """The served state subset, read from `mlb_sim.ML_STATE_COLS`.
+
+    On `mlb_sim` rather than here because `_slate_overrides` carries that
+    module's globals into a forkserver worker and this module's are re-imported
+    back to their defaults (trap 6) — an arm would otherwise train one subset
+    and serve another with no error."""
+    spec = (getattr(m, "ML_STATE_COLS", "") or "").strip()
+    if spec not in STATE_SUBSETS:
+        raise ValueError(f"mlb_ml: ML_STATE_COLS must be one of "
+                         f"{sorted(STATE_SUBSETS)}, got {spec!r}")
+    return STATE_SUBSETS[spec]
+
+
+def _state_mask():
+    cols = active_state_cols()
+    return _feature_mask(keep_base=False, keep_state=set(cols) if cols else False)
 
 LGB_NODE_PARAMS: Dict[str, object] = {
     "objective": "binary",
@@ -2060,7 +2120,7 @@ def node_arrays(fold: str, save_dir: Path = m.SAVE_DIR) -> dict:
     # The hierarchy never sees the flat model's `base_` columns: its prior
     # enters as `init_score` at each node, which is the same argument section 3
     # made for model C and the reason C beat B.
-    mask = _feature_mask(keep_base=False, keep_state=False)
+    mask = _state_mask()
     got = {"fold": fold, "train_seasons": tuple(tr_seasons),
            "valid_season": va_season,
            "names": [n for n, k in zip(FEATURE_NAMES, mask) if k],
@@ -2262,7 +2322,7 @@ def hier_proba(fold: str, X, base, nodes: Sequence[str] = NODE_NAMES,
     """
     import numpy as np
     got = load_nodes(fold, nodes, save_dir)
-    mask = _feature_mask(keep_base=False, keep_state=False)
+    mask = _state_mask()
     Xm = X[:, mask]
     q = node_probs(base)
     for j, name in enumerate(NODE_NAMES):
@@ -2430,7 +2490,8 @@ def node_fingerprint(params: dict, rounds: int, patience: int) -> str:
     """
     return params_fingerprint({**params, "_rounds": int(rounds),
                                "_patience": int(patience),
-                               "_cats": list(NODE_CATEGORICALS)})
+                               "_cats": list(NODE_CATEGORICALS),
+                               "_state": list(active_state_cols())})
 
 
 def params_fingerprint(params: dict) -> str:
