@@ -253,7 +253,10 @@ def pa_rows_from_plays(plays: Sequence[dict], game_pk: int) -> List[dict]:
         # EVERY complete play including the ones rejected above, because a
         # caught stealing changes the outs and the bases just as much.
         outs_before = int((p.get("count") or {}).get("outs") or 0)
-        bases_before = sum(v for v, k in zip((1, 2, 4), _BASE_KEYS)
+        # `m.BASE_STATE_BITS`, not a local `(1, 2, 4)`: this column is what the
+        # residual is TRAINED on and `simulate_game` is what SERVES it, so the
+        # two must be one definition rather than two that agree today.
+        bases_before = sum(v for v, k in zip(m.BASE_STATE_BITS, _BASE_KEYS)
                            if mu.get(k))
     return out
 
@@ -499,9 +502,21 @@ if _PAIRS_MODE not in ("full", "core", "dense"):
 DATASET_VERSION = {"core": "v2core", "full": "v2", "dense": "v3"}[_PAIRS_MODE]
 
 
+def _feature_set_dir(save_dir: Path = m.SAVE_DIR) -> Path:
+    """The directory for ONE feature set. Everything derived from a dataset —
+    the `.npz`, every model, every search table — hangs off `DATASET_VERSION`,
+    because a 228-column file read as 231 misaligns every column after the
+    matchup block (trap 9). One function so a new artifact cannot be filed
+    outside the versioning by accident."""
+    return Path(save_dir) / "mlml" / DATASET_VERSION
+
+
+def _model_dir(save_dir: Path = m.SAVE_DIR) -> Path:
+    return _feature_set_dir(save_dir) / "models"
+
+
 def dataset_path(season: int, save_dir: Path = m.SAVE_DIR) -> Path:
-    return (Path(save_dir) / "mlml" / DATASET_VERSION
-            / f"pa_features_{season}.npz")
+    return _feature_set_dir(save_dir) / f"pa_features_{season}.npz"
 
 
 def _f(row: Optional[dict], key: str) -> float:
@@ -1172,7 +1187,7 @@ def dataset_report(season: int = 2026, save_dir: Path = m.SAVE_DIR) -> dict:
 # the literal objective LightGBM optimises, rather than something approximated
 # by feeding the baseline in as nine more columns and hoping.
 
-MODEL_DIR = m.SAVE_DIR / "mlml" / DATASET_VERSION / "models"
+MODEL_DIR = _model_dir()
 
 LGB_PARAMS: Dict[str, object] = {
     "objective": "multiclass",
@@ -1267,8 +1282,7 @@ def _stack(seasons: Sequence[int], save_dir: Path = m.SAVE_DIR):
 
 
 def model_path(tag: str, fold: str, save_dir: Path = m.SAVE_DIR) -> Path:
-    return (Path(save_dir) / "mlml" / DATASET_VERSION / "models"
-            / f"{tag}_{fold}.txt")
+    return _model_dir(save_dir) / f"{tag}_{fold}.txt"
 
 
 def train_model(tag: str, fold: str, save_dir: Path = m.SAVE_DIR,
@@ -1672,6 +1686,26 @@ class GameAdjuster:
                  save_dir: Path = m.SAVE_DIR):
         import numpy as np
         self.np = np
+        # **Checked BEFORE anything is loaded from disk.** A configuration
+        # error must not surface as a missing-file error about some other
+        # artifact — the message would send you off to train a model that was
+        # never the problem.
+        #
+        # **A FLAT model cannot serve state, and asking it to is loud.** Its
+        # mask comes from the trained model's own `keep_state`, which is False
+        # for every deployable flat tag — so with `ML_STATE_COLS` set the
+        # adjuster would walk the 24-cell grid, build 24 rows that differ only
+        # in columns the mask drops, and return 24 IDENTICAL predictions. The
+        # answer is right and the cost is 24x, which is the worst shape of
+        # failure this file has: a variant that looks configured and is not.
+        self.state_cols = active_state_cols()
+        if self.state_cols and not (m.ML_HIER_NODES or ""):
+            raise ValueError(
+                f"mlb_ml: ML_STATE_COLS={m.ML_STATE_COLS!r} but this is the "
+                f"FLAT model path (tag {tag!r}, no ML_HIER_NODES). Flat models "
+                f"are fitted with the state columns masked out, so the state "
+                f"would be enumerated and then discarded. Set ML_HIER_NODES, "
+                f"or clear ML_STATE_COLS.")
         if (m.ML_HIER_NODES or ""):
             self.bst, self.meta = None, {"keep_base": False,
                                          "keep_state": False,
@@ -1684,7 +1718,6 @@ class GameAdjuster:
                 f"mlb_ml: model {tag}/{fold} reads per-PA state "
                 f"({sorted(STATE_NAMES)}) and cannot be served through the "
                 f"memoised adjuster. It is a PA-level diagnostic only.")
-        self.state_cols = active_state_cols()
         self.mask = (_state_mask() if (m.ML_HIER_NODES or "") else
                      _feature_mask(self.meta["keep_base"],
                                    self.meta.get("keep_state", False)))
@@ -2091,8 +2124,7 @@ def node_model_path(node: str, fold: str,
     if fp is None:
         r, pat = active_node_fit(save_dir)
         fp = node_fingerprint(active_node_params(save_dir), r, pat)
-    return (Path(save_dir) / "mlml" / DATASET_VERSION / "models"
-            / f"node_{node}_{fold}_{fp}.txt")
+    return _model_dir(save_dir) / f"node_{node}_{fold}_{fp}.txt"
 
 
 # --- the fit, once, so the trainer and the tuner cannot drift --------------
@@ -2110,7 +2142,16 @@ def node_arrays(fold: str, save_dir: Path = m.SAVE_DIR) -> dict:
     Memoised because the stack is ~275 MB and a search refits six nodes
     dozens of times; loading it per trial is most of the wall clock.
     """
-    key = (fold, str(save_dir))
+    # **The STATE subset is in the key because it changes the array WIDTH.**
+    # `_state_mask()` keeps 213 columns at `ML_STATE_COLS = ""` and 215 at
+    # "baseout", and the two node sets are meant to coexist — so training both
+    # in one process is the normal path, not an edge case. Keyed on the fold
+    # alone, the second `train_nodes` would fit the FIRST subset's arrays and
+    # file the model under the SECOND subset's fingerprint. Serving raises on
+    # the width mismatch, but `train_nodes`' own `params_fp == fp` check then
+    # reports the poisoned file as `cached` and never refits it — the failure
+    # outlives the process that caused it and only `--refresh` clears it.
+    key = (fold, active_state_cols(), str(save_dir))
     got = _NODE_ARRAYS.get(key)
     if got is not None:
         return got
@@ -2273,12 +2314,18 @@ _NODE_BOOSTERS: Dict[tuple, object] = {}
 def load_nodes(fold: str, nodes: Sequence[str] = NODE_NAMES,
                save_dir: Path = m.SAVE_DIR):
     import lightgbm as lgb
-    key = (fold, tuple(sorted(nodes)), str(save_dir))
+    _r, _pat = active_node_fit(save_dir)
+    want = node_fingerprint(active_node_params(save_dir), _r, _pat)
+    # **The CONFIGURATION is in the key, not just checked after the lookup.**
+    # The fingerprint check below is what refuses a stale model on DISK; it
+    # cannot see a stale one already in this dict. Two arms in one process —
+    # `hier25v2` then `hier25state`, which is what an A/B run does — would
+    # otherwise hand the second arm the first arm's boosters, and `hier_proba`
+    # would feed them a matrix two columns wider than they were fitted on.
+    key = (fold, tuple(sorted(nodes)), want, str(save_dir))
     got = _NODE_BOOSTERS.get(key)
     if got is None:
         out = {}
-        _r, _pat = active_node_fit(save_dir)
-        want = node_fingerprint(active_node_params(save_dir), _r, _pat)
         for node in nodes:
             path = node_model_path(node, fold, save_dir, want)
             if not path.exists():
@@ -2511,8 +2558,21 @@ def params_fingerprint(params: dict) -> str:
 
 def node_tune_path(fold: str = NODE_TUNE_FOLD,
                    save_dir: Path = m.SAVE_DIR) -> Path:
-    return (Path(save_dir) / "mlml" / DATASET_VERSION / "models"
-            / f"node_tune_{fold}.json")
+    """Where one fold's SEARCH WINNER lives.
+
+    **The state subset is in the filename for the same reason the fit budget
+    is in `node_fingerprint`:** a search under a different feature set is a
+    different search. Without it a `--state baseout` run overwrites the
+    no-state winner in place and `active_node_params` then serves
+    baseout-searched parameters to the no-state models — one configuration
+    silently becoming another, which is §4c trap 2 on a new axis.
+
+    The empty subset keeps the ORIGINAL name so the searched table already on
+    disk is still found; only a non-empty subset takes a suffix.
+    """
+    cols = active_state_cols()
+    tag = f"_{'-'.join(cols)}" if cols else ""
+    return _model_dir(save_dir) / f"node_tune_{fold}{tag}.json"
 
 
 # **The fit BUDGET is part of the configuration, not a call-site default.**
@@ -2692,8 +2752,13 @@ def tune_nodes(fold: str = NODE_TUNE_FOLD, trials: int = 48, seed: int = 17,
     # --- pick up an interrupted run ---------------------------------------
     table: List[dict] = []
     part = None
+    # The STATE subset is part of the search space: it changes which columns
+    # the trees may split on, so a resumed table whose rows were drawn under a
+    # different subset is a table whose rows are not comparable — the same
+    # objection `_machine()` records for thread count.
     space_fp = params_fingerprint(
-        {k: list(v) for k, v in NODE_TUNE_SPACE.items()})
+        {**{k: list(v) for k, v in NODE_TUNE_SPACE.items()},
+         "_state": list(active_state_cols())})
     if part_path.exists() and resume and not refresh:
         with open(part_path) as fh:
             part = json.load(fh)
@@ -2923,10 +2988,18 @@ def main(argv=None) -> int:
                         help="which node configuration to fit under; the "
                              "default is whatever mlb_sim.ML_NODE_PARAMS "
                              "already says")
+        ap.add_argument("--state", default=None,
+                        choices=sorted(STATE_SUBSETS),
+                        help="which per-PA STATE subset to fit against; the "
+                             "default is whatever mlb_sim.ML_STATE_COLS says. "
+                             "The subset is part of the fingerprint, so the "
+                             "state and no-state node sets coexist on disk.")
         ap.add_argument("--refresh", action="store_true")
         a = ap.parse_args(argv[1:])
         if a.config:
             m.ML_NODE_PARAMS = a.config
+        if a.state is not None:
+            m.ML_STATE_COLS = a.state
         folds = sorted(FOLDS) if a.fold == "all" else [a.fold]
         ns = [x for x in a.nodes.split(",") if x]
         bad = [x for x in ns if x not in NODE_NAMES]
@@ -2943,7 +3016,8 @@ def main(argv=None) -> int:
                  if k not in LGB_NODE_PARAMS or LGB_NODE_PARAMS[k] != v}
         print(f"[nodes] configuration {_fp} "
               f"({'TUNED' if _diff else 'shipped default'}, "
-              f"rounds {_r} patience {_pat}) "
+              f"rounds {_r} patience {_pat}, "
+              f"state {list(active_state_cols()) or 'none'}) "
               f"{json.dumps(_diff, default=str)}", flush=True)
         for f in folds:
             train_nodes(f, ns, refresh=a.refresh)
@@ -2961,8 +3035,15 @@ def main(argv=None) -> int:
         ap.add_argument("--patience", type=int, default=400)
         ap.add_argument("--alpha", type=float, default=1.0)
         ap.add_argument("--no-refine", action="store_true")
+        ap.add_argument("--state", default=None,
+                        choices=sorted(STATE_SUBSETS),
+                        help="the per-PA STATE subset to search under. A "
+                             "search is only valid for the subset it ran on — "
+                             "the columns are the search space.")
         ap.add_argument("--refresh", action="store_true")
         a = ap.parse_args(argv[1:])
+        if a.state is not None:
+            m.ML_STATE_COLS = a.state
         if a.fold != NODE_TUNE_FOLD:
             print(f"[tune] WARNING: selecting on fold {a.fold}, whose "
                   f"validation season is {FOLDS[a.fold][1]}. Only "
@@ -2987,13 +3068,21 @@ def main(argv=None) -> int:
         ap.add_argument("--alpha", default="0.25,0.5,1.0")
         ap.add_argument("--config", default=None,
                         choices=["shipped", "tuned"])
+        ap.add_argument("--state", default=None,
+                        choices=sorted(STATE_SUBSETS),
+                        help="the per-PA STATE subset to score; must match "
+                             "what the models were fitted under or load_nodes "
+                             "refuses them")
         a = ap.parse_args(argv[1:])
         if a.config:
             m.ML_NODE_PARAMS = a.config
+        if a.state is not None:
+            m.ML_STATE_COLS = a.state
         _r, _pat = active_node_fit()
         _fp = node_fingerprint(active_node_params(), _r, _pat)
         print(f"[hier] node configuration: {m.ML_NODE_PARAMS} "
-              f"({_fp}, rounds {_r} patience {_pat})")
+              f"({_fp}, rounds {_r} patience {_pat}, "
+              f"state {list(active_state_cols()) or 'none'})")
         folds = sorted(FOLDS) if a.fold == "all" else [a.fold]
         al = [float(x) for x in a.alpha.split(",") if x]
         for f in folds:

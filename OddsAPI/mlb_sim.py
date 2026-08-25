@@ -2309,52 +2309,22 @@ def simulate_many(home: TeamSide, away: TeamSide, n: int = 20000,
             for _ in range(n)]
 
 
-def _slate_worker(job):
-    """Simulate one game in a worker process and return a COMPACT summary.
-
-    MUST stay at module level and free of pandas — `multiprocessing` pickles
-    the callable by qualified name, the same constraint `_bank_worker` and
-    `homerunwidget`'s offline tools carry.
-
-    The worker returns numbers, never the `GameResult` list: 25,000 simulated
-    games is tens of megabytes to pickle back, which costs more than the
-    simulation it was meant to parallelise. Ask the worker every question you
-    need answered while the distribution is still in its own memory.
-    """
-    (label, home, away, n, seed, alpha, hfa, totals, handicaps) = job
-    global LOG5_TAIL_ALPHA, HFA
-    LOG5_TAIL_ALPHA, HFA = alpha, hfa      # fork inherits, spawn does not
-    res = simulate_many(home, away, n=n, seed=seed)
-    gt = game_totals(res)
-    return {
-        "label": label,
-        "implied_line": implied_line(res),
-        "mean_total": sum(gt) / len(gt),
-        "p_home_win": p_home_win(res),
-        "p_over": {L: price_over(gt, L) for L in (totals or ())},
-        "p_home_cover": {H: p_home_covers(res, H) for H in (handicaps or ())},
-    }
-
-
-def simulate_slate(jobs: Sequence[tuple], n_sims: int = 20000,
-                   seed: int = 17, workers: Optional[int] = None
-                   ) -> List[dict]:
-    """Simulate a whole slate across processes.
-
-    `jobs` is [(label, home_side, away_side, totals, handicaps), ...] where the
-    last two are the market lines to price. Games are independent and the sim
-    is pure-Python CPU work, so this is processes rather than threads — the
-    GIL makes threads worthless here.
-    """
-    if not jobs:
-        return []
-    full = [(lbl, h, a, n_sims, seed + i, LOG5_TAIL_ALPHA, HFA, t, hc)
-            for i, (lbl, h, a, t, hc) in enumerate(jobs)]
-    workers = workers or max(1, min(len(full), (os.cpu_count() or 4) - 2))
-    if workers == 1:
-        return [_slate_worker(j) for j in full]
-    with multiprocessing.Pool(workers) as pool:
-        return list(pool.imap(_slate_worker, full))
+# **`_slate_worker` / `simulate_slate` REMOVED 2026-08-24 — dead, and a trap
+# if revived.** Zero callers anywhere in the tree. `simulate_slate` hand-packed
+# exactly two constants into the job tuple (`LOG5_TAIL_ALPHA`, `HFA`) for the
+# worker to rebind, but the worker called `simulate_many`, which reads the
+# in-game constants — `P_GIDP`, `P_SAC_FLY`, `P_GB_ADVANCE`, `P_STEAL_SUCCESS`,
+# `GAME_FORM_SD`, `HOOK_FRAILTY_SD`, `FATIGUE_DECLINE_PER_BF` — and NONE of
+# those travelled. On Python 3.14 the Linux start method is `forkserver`, so a
+# worker re-imports this module and gets the shipped values back: any
+# calibration that rebound one of them would have been silently compared
+# against the shipped model. That is the exact failure `_slate_val_worker`'s
+# docstring records the hand-enumerated tuple already causing once
+# (`STABILIZE_PA_PIT`), which is why the live paths ship state as a NAME->VALUE
+# dict via `_slate_overrides()`. Parallel slate work goes through `backtest`
+# (`_slate_val_worker`) or `_backtest_worker`; both capture, never enumerate.
+# Removed rather than repaired, on this file's precedent for `ENTRY_*`: dead
+# code modelling a discredited pattern is an invitation to copy it.
 
 
 def prop_distribution(results: Sequence[GameResult], player: str,
@@ -3265,12 +3235,48 @@ USE_STUFF_PRIOR = True
 # Batters faced a pitcher needs on the board before his stuff columns are used
 # at all. Stuff+ over a handful of starts is itself an estimate; below this the
 # feature noise swamps the signal it is meant to add.
-STUFF_MIN_TBF = 40.0
-# and the count at which the stuff delta is trusted half against nothing. A
+# **20, not 40 — MEASURED 2026-08-24.** 40 TBF is ~160 pitches, and a pitch
+# characteristic average is reliable well before that: FanGraphs' own primer
+# puts Stuff+ at usable by ~80 pitches (~20 TBF) against Location+ at ~400, and
+# public models report stability at ~60. At 40 an arm four starts into a season
+# had NO stuff term at all — Connor Gillispie cleared it by three batters in
+# April 2025 and the model graded him better than league on a 43-TBF hot start,
+# backing Miami as a +249/+228/+188 dog four times off it.
+#
+# Worth ~nothing on its own (2025 +1.72% -> +1.76%, 2026 +2.05% -> +2.04%), and
+# lowered anyway: it is the difference between an arm having a stuff term and
+# having none, the literature says 20 is enough, and it is centred so it cannot
+# move the league level.
+STUFF_MIN_TBF = 20.0
+# The count at which the stuff delta is trusted half against nothing. A
 # pitch-characteristic average stabilises far faster than any outcome — every
 # pitch contributes to it, not every plate appearance — which is why this is a
 # small number next to STABILIZE_PA_PIT.
-STUFF_SHRINK_TBF = 100.0
+#
+# **It was 100, and that argument did not survive its own value.**
+# `STABILIZE_PA_PIT[K]` is 93, so the stuff half-trust point sat ABOVE the
+# strikeout stabiliser it claims to be small against. A 43-TBF arm had his
+# stuff shrunk to 43/(43+100) = 0.30 — the signal was being discounted hardest
+# exactly where the results line is worth least. (Measured: a pitcher's own
+# unshrunk line predicts his future WORSE than assuming he is league average,
+# rv_rmse 0.0516 against 0.0399 on 3,802 arm-cutoffs.)
+#
+# Swept on the thin population (min_pre 30), predicting each arm's FUTURE run
+# value, both seasons — stuff's gain over the shipped incumbent:
+#
+#     SHRINK      2025              2026
+#        100   +1.76%  corr .3289   +2.04%  corr .2688
+#         50   +1.87%  corr .3310   +2.24%  corr .2786
+#         25   +1.80%  corr .3306   +2.30%  corr .2846
+#
+# **50, not 25, and deliberately not the two-season minimum.** 2025 peaks at 50
+# and 2026 at 25, they differ by 0.06pp, and the curve is flat between them —
+# picking the argmin of two seasons is fitting the noise between them. 50 is
+# the conservative end of the flat region and still halves the shipped value.
+# The move is worth ~0.15-0.20pp of the stuff prior's contribution, which is
+# small; it is made because it is consistent in sign across both seasons and
+# because the shipped value contradicted its own stated rationale.
+STUFF_SHRINK_TBF = 50.0
 
 
 # --- ROLLING arsenal: the same columns, over a trailing window -------------
@@ -3517,7 +3523,14 @@ def stuff_model_for(season: int, save_dir: Path = SAVE_DIR) -> Optional[dict]:
     been had before the season started, and fitting it on the season being
     scored is the same leak as a season-final board.
     """
-    key = (int(season), str(save_dir))
+    # **`STUFF_USE_ARSENAL` is in the key because it changes the model's feature
+    # WIDTH.** `ab_configure` clears this cache per arm for exactly that reason
+    # ("its feature WIDTH changes with STUFF_USE_ARSENAL, so a model carried
+    # across arms would mis-index or raise") — but that guard covers only the
+    # A/B path, and anything else rebinding the flag was served a stale model
+    # of the wrong shape. A cache key coarser than the configuration is a guard
+    # that cannot fire: trap 23.
+    key = (int(season), bool(STUFF_USE_ARSENAL), str(save_dir))
     if key in _STUFF_MODEL:
         return _STUFF_MODEL[key]
     use = [s for s in available_seasons("pit", save_dir) if s < season]
@@ -11929,11 +11942,20 @@ def fetch_itp_bullpen(abbr: str, session=None,
     return {"pen": pen, "workload": workload, "days": days} if pen else {}
 
 
-# Pitch-count thresholds for next-day availability. `back to back days` on an
-# arm's own insidethepen page says whether he is USED that way at all; these
-# gate on what he actually threw.
+# Pitch-count threshold for next-day availability. `back to back days` on an
+# arm's own insidethepen page says whether he is USED that way at all; this
+# gates on what he actually threw.
+#
+# **`ITP_BACK_TO_BACK_PITCHES = 15` was REMOVED 2026-08-24.** It read as the
+# second half of a live rule — "a light one -> he can go again" — and reached
+# nothing: `itp_availability` makes a TWO-way split (pitched yesterday AND the
+# day before, or pitched yesterday heavy, else available), so a 15-pitch outing
+# and a 24-pitch outing are already treated identically. The constant described
+# a three-way distinction the code does not make, under a comment saying
+# "these gate", plural, of a pair only one of which existed. Same family as
+# `ENTRY_INNING_SCALE`/`ENTRY_DIFF_SCALE` (4j), same precedent: a neutralised
+# knob is dead code with a switch on it.
 ITP_HEAVY_PITCHES = 25          # a heavy outing yesterday -> very likely rest
-ITP_BACK_TO_BACK_PITCHES = 15   # a light one -> he can go again
 
 
 def itp_availability(state: dict, skip_today: bool = True) -> Dict[str, str]:
@@ -14673,7 +14695,7 @@ def _slate_val_worker(job):
     """Simulate one chunk of the real slate. MUST stay at module level.
 
     `multiprocessing` pickles the callable by qualified name — the same
-    constraint `_slate_worker` and `_bank_worker` carry.
+    constraint `_bank_worker` carries.
 
     Returns the raw 8-inning vectors rather than a finished report, because
     the covariance decomposition has to be taken over the POOLED set: summing
@@ -17027,6 +17049,11 @@ AB_ARMS: Dict[str, Dict[str, object]] = {
     #   python mlb_sim.py ab --arm armrake --fresh
     #   python mlb_sim.py diff --arm teamq --arm armrake
     "armrake": {},
+    # A named SNAPSHOT of the shipped configuration as of 2026-08-24, after the
+    # park/weather/start-length repairs of 4j. Overrides NOTHING — it exists so
+    # today's code can be priced against `armrake`, which is the same snapshot
+    # taken BEFORE those repairs. Never `--fresh` either of them once scored.
+    "parkfix": {},
     "teamq2": {"TEAM_QUALITY_GAIN": 0.18},
     # The matchup-function gain (4e). Targeted at mismatches by construction —
     # see `LOG5_GAIN`. Probed at three sizes because nothing derives the
@@ -17265,7 +17292,7 @@ AB_REFERENCE: Dict[str, str] = {
 # listed here rather than silently exempted from
 # `test_ab_base_arm_IS_the_shipped_model`, which is otherwise right that an
 # empty arm is base under another name.
-AB_SNAPSHOT_ARMS: frozenset = frozenset({"armrake"})
+AB_SNAPSHOT_ARMS: frozenset = frozenset({"armrake", "parkfix"})
 
 _AB_SHIPPED: Dict[str, object] = {}
 
