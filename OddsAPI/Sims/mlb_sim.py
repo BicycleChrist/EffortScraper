@@ -28,6 +28,7 @@ Command line:
     python mlb_sim.py clvopen                  model vs the OPENING line (CLV)
     python mlb_sim.py forecastwx               PERIOD-CORRECT weather (5b.2)
     python mlb_sim.py boards 2024 2025         fetch FULL-SEASON boards
+    python mlb_sim.py pbp [seasons] [--check]  ONE-TIME play-by-play backfill
     python mlb_sim.py stints [--refresh]       relief-appearance shape
     python mlb_sim.py baserunning [--refresh]  measured advancement rates
     python mlb_sim.py milb 2024 2025 2026      minor league lines + AAA arsenal (9c)
@@ -42,6 +43,21 @@ Command line:
     python mlb_sim.py eventodds                OPENING odds + TOTALS per event
     python mlb_sim.py stuff                    pitch-model REPEATABILITY (3d.8)
     python mlb_sim.py recency                  within-season recency (3d.9)
+
+On disk:
+
+    OddsAPI/Sims/          this file, mlb_ml.py, their suites, sim_state.md
+    OddsAPI/Sims/savedata/ SAVE_DIR — everything only the sim reads or writes:
+                           asof/ ab/ MLBclv/ mlml/ pa/ bmielke/ itp/ plus the
+                           park, reliever, baserunning and slate tables
+    OddsAPI/savedata/      SHARED_DIR — the caches co-owned with EffortMLB and
+                           written by BOTH: fg_{bat,pit}_<season>.json,
+                           mlb_roster_<season>.json, pbp/, itp_cookies.json
+    OddsAPI/model_data/    DATA_DIR — shared with homerunwidget/weatherman
+    OddsAPI/               the flat modules imported below, and the Savant CSVs
+
+Reach the co-owned set through `_shared()` and never by hardcoding; §9's note
+on `SHARED_DIR` says why two stores rather than one.
 
 Everything lives here on purpose. The only outside dependencies are
 `weatherman` (park geometry, wind rotation) and `homerunwidget`
@@ -107,9 +123,25 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import requests
+# ---------------------------------------------------------------------------
+# **This package lives in `OddsAPI/Sims/`, its collaborators one level up.**
+#
+# `weatherman`, `homerunwidget`, `OddsPortalClient`, `GUIMLBlineups`,
+# `Creds` and `live_scores_widget` are all flat modules in `OddsAPI/`, and
+# nothing here is a package — so an interpreter started from
+# anywhere but `OddsAPI/` would not find them. Both directories go on the path
+# rather than only the parent, because `mlb_ml` imports `mlb_sim` by bare name
+# and a pool worker re-imports the main module the same way.
+_SIM_ROOT = Path(__file__).resolve().parent           # OddsAPI/Sims
+_APP_ROOT = _SIM_ROOT.parent                          # OddsAPI
+for _p in (str(_SIM_ROOT), str(_APP_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# ---------------------------------------------------------------------------
+
+import requests   # noqa: E402 - must follow the sys.path bootstrap above
 
 # ---------------------------------------------------------------------------
 # **This module must be ONE object however it is entered.**
@@ -137,7 +169,9 @@ if __name__ in ("__main__", "__mp_main__"):
     sys.modules.setdefault("mlb_sim", sys.modules[__name__])
 # ---------------------------------------------------------------------------
 
-import bmielke_core
+import bmielke_core   # noqa: E402 - beside this file in Sims/, but the
+                      # bootstrap above is what puts Sims/ on the path
+                      # when mlb_sim is imported from another directory.
 
 # **These stay LAZY on purpose, and the module docstring depends on it.**
 # `weatherman` imports PyQt6 at module scope and `homerunwidget` pulls scipy
@@ -159,6 +193,284 @@ def _wm():
         import weatherman
         _WEATHERMAN = weatherman
     return _WEATHERMAN
+
+# ===========================================================================
+# 0. QUERY LAYER — every outbound request this module makes
+# ===========================================================================
+# **The endpoints used to be scattered across 21 call sites and 14,000 lines**,
+# which is how the same play-by-play came to be downloaded three separate
+# times. This section owns the transport; the callers keep their names and
+# their parsing.
+#
+# Two caching rules, and the distinction is the whole point:
+#
+#   * SAME-RUN MEMO for anything that can still change — tonight's schedule,
+#     a forecast, a live game. `run_clv` asked StatsAPI for the WHOLE day's
+#     schedule once per game and threw away 14/15 of every response; the memo
+#     collapses that to one request without ever serving a stale forecast
+#     across runs, because the memo dies with the process.
+#
+#   * PERMANENT DISK CACHE, gzipped, only for data that CANNOT change. A
+#     completed game's play-by-play is final. `collect_reliever_entries`,
+#     `collect_reliever_stints` and `collect_baserunning` each walked the same
+#     1,968 gamePks independently — 5,904 requests and 3.35 GB for 1.12 GB of
+#     distinct data. One cache serves all three.
+#
+# **The full response is stored, never a `fields=` projection.** A whitelist
+# would cut ~80% off the wire, but the three consumers each read a different
+# slice, and a consumer that later reads a key the whitelist omits gets an
+# empty result rather than an error. That failure is silent and it has already
+# cost this project once — see the `fields=` note in EffortMLB.
+class Query:
+    """Shared transport for every outbound request in this module."""
+
+    _MEMO: Dict[str, object] = {}
+
+    @staticmethod
+    def memo(key: str, build):
+        """`build()`, once per process, per key. For data that can still move."""
+        if key not in Query._MEMO:
+            Query._MEMO[key] = build()
+        return Query._MEMO[key]
+
+    @staticmethod
+    def _pbp_path(game_pk: int) -> Path:
+        # Sharded two deep: one flat directory of ~2,000 files per season is
+        # workable, ten seasons of it is not.
+        pk = str(int(game_pk))
+        d = SHARED_DIR / "pbp" / "games" / pk[-2:]
+        return d / f"{pk}.json.gz"
+
+    @staticmethod
+    def have_play_by_play(game_pk: int) -> bool:
+        """Is this game's play-by-play already on disk?"""
+        return Query._pbp_path(game_pk).exists()
+
+    @staticmethod
+    def missing_play_by_play(pks: Sequence[int]) -> List[int]:
+        """The subset of `pks` NOT yet cached — what a backfill would fetch."""
+        return [int(pk) for pk in pks if not Query.have_play_by_play(pk)]
+
+    @staticmethod
+    def play_by_play(game_pk: int, timeout: float = 20.0, *,
+                     final: bool = False) -> List[dict]:
+        """`allPlays` for one game — from disk if we have it, else fetched.
+
+        **`final` is a promise, and getting it wrong poisons the cache
+        permanently.** The response carries NO game state: its `currentPlay` is
+        simply the last play so far, so a game in the 3rd inning is
+        indistinguishable from a finished one. Caching a live game would serve
+        three innings as the whole game forever after. So the write happens
+        ONLY when the caller asserts the game is over.
+
+        Everything reaching this from `season_game_pks` is Final by
+        construction — that list is either the PBP accumulator's own `games`
+        or `season_slate` filtered on `abstractGameState == "Final"`. Tonight's
+        slate is not, and must be read with `final=False`.
+
+        Raises on a network failure exactly as the bare `requests.get` did, so
+        each caller keeps its own `except` and its own fallback value.
+        """
+        path = Query._pbp_path(game_pk)
+        if path.exists():
+            try:
+                with gzip.open(path, "rt", encoding="utf-8") as fh:
+                    return json.load(fh).get("allPlays") or []
+            except (OSError, ValueError, EOFError):
+                pass                      # corrupt entry — refetch over it
+        r = requests.get(f"{STATSAPI}/game/{int(game_pk)}/playByPlay",
+                         timeout=timeout)
+        r.raise_for_status()
+        payload = r.json()
+        if final:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                tmp.replace(path)         # atomic: a killed job leaves no
+            except OSError:               # half-written entry to be read back
+                pass                      # the cache is a nicety, not a need
+        return payload.get("allPlays") or []
+
+    @staticmethod
+    def backfill_play_by_play(pks: Sequence[int], workers: int = 12,
+                              timeout: float = 20.0) -> dict:
+        """Fetch every game in `pks` that is not already on disk. Once.
+
+        The point of the whole cache: after this runs, no consumer ever issues
+        a play-by-play request again. It is resumable by construction — each
+        game is written atomically, so an interrupted run simply leaves fewer
+        games missing and the next run picks up exactly there.
+
+        `pks` MUST be completed games; see `play_by_play`.
+        """
+        pks = [int(x) for x in pks]
+        todo = Query.missing_play_by_play(pks)
+        have = len(pks) - len(todo)
+        Archive._progress(f"[pbp] {len(pks)} games, {have} cached, "
+                          f"{len(todo)} to fetch")
+        if not todo:
+            return {"asked": len(pks), "had": have, "fetched": 0, "failed": 0}
+        done = failed = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            def one(pk):
+                try:
+                    Query.play_by_play(pk, timeout, final=True)
+                    return True
+                except Exception:                          # noqa: BLE001
+                    return False                           # leave it missing
+            for ok in ex.map(one, todo):
+                done += 1
+                failed += (not ok)
+                if done % 200 == 0 or done == len(todo):
+                    Archive._progress(f"[pbp] {done}/{len(todo)} fetched, "
+                                      f"{failed} failed")
+        return {"asked": len(pks), "had": have,
+                "fetched": done - failed, "failed": failed}
+
+
+# ---------------------------------------------------------------------------
+# The upstreams, one class each
+# ---------------------------------------------------------------------------
+# Every endpoint this module talks to, in one place. They used to be scattered
+# from line 4375 to line 18867, which is how `game_weather` and
+# `fetch_probables` came to build the same schedule URL 200 lines apart with
+# no idea the other existed.
+#
+# Timeouts live here too. There were five unexplained literals (10/20/40/60/90)
+# passed straight to `requests.get`; per-source is a defensible reason for them
+# to differ, five bare numbers is not.
+
+
+class StatsApi:
+    """MLB StatsAPI — schedules, stats splits, play-by-play, live feed."""
+
+    BASE = "https://statsapi.mlb.com/api/v1"
+    TIMEOUT = 20.0
+    SLOW_TIMEOUT = 90.0          # season-length schedule spans
+
+    @staticmethod
+    def schedule_url(*, date: Optional[str] = None,
+                     start: Optional[str] = None, end: Optional[str] = None,
+                     hydrate: Optional[str] = None,
+                     game_type: Optional[str] = None) -> str:
+        """A /schedule URL. Omitted arguments are omitted from the query.
+
+        `game_type` is OPTIONAL on purpose: `fetch_probables` deliberately does
+        not send it, because tonight's card includes games a `gameType=R`
+        filter would drop. Defaulting it here would silently narrow that call.
+        """
+        q = ["sportId=1"]
+        if game_type:
+            q.append(f"gameType={game_type}")
+        if date:
+            q.append(f"date={date}")
+        if start:
+            q.append(f"startDate={start}")
+        if end:
+            q.append(f"endDate={end}")
+        if hydrate:
+            q.append(f"hydrate={hydrate}")
+        return f"{StatsApi.BASE}/schedule?" + "&".join(q)
+
+
+class Savant:
+    """Baseball Savant — the CSV search endpoint and the leaderboards."""
+
+    CSV = "https://baseballsavant.mlb.com/statcast_search/csv"
+    LEADERBOARD = "https://baseballsavant.mlb.com/leaderboard"
+    OAA_URL = LEADERBOARD + "/outs_above_average"
+    ARM_URL = LEADERBOARD + "/arm-strength"
+    FRAMING_URL = LEADERBOARD + "/catcher-framing"
+    TIMEOUT = 40.0
+    # One hitter's batted-ball detail. `{season}` and `{pid}` are filled by the
+    # caller; `scrape_framing` binds this by name, so the module-level alias
+    # below is part of the contract, not a convenience.
+    DETAIL_URL = (
+        "https://baseballsavant.mlb.com/statcast_search/csv"
+        "?hfPT=&hfAB=&hfGT=R%7C&hfPR=&hfZ=&hfStadium=&hfBBL=&hfNewZones=&hfPull="
+        "&hfC=&hfSea={season}%7C&hfSit=&player_type=batter"
+        "&hfOuts=&hfOpponent=&pitcher_throws=&batter_stands=&hfSA=&min_pitches=0"
+        "&min_results=0&group_by=name&sort_col=pitches"
+        "&player_event_sort=api_p_release_speed&sort_order=desc&min_abs=0"
+        "&type=details&player_id={pid}"
+    )
+
+
+class FanGraphs:
+    """FanGraphs leaderboards. The board paths are appended to the site root
+    by `_fg_rows`, which drives a browser — FanGraphs does not serve these to
+    a bare `requests` session."""
+
+    SPLITS_URL = "https://www.fangraphs.com/api/leaders/splits/splits-leaders"
+    TIMEOUT = 40.0
+    SPLIT_VS_LHP = 1
+    SPLIT_VS_RHP = 2
+    SPLIT_STANDARD = "1"     # G PA AB H 1B 2B 3B HR R RBI BB IBB SO HBP SB..
+    SPLIT_BATTED = "3"       # PA GB/FB LD% GB% FB% IFFB% HR/FB Pull% ...
+    ASOF_PATH = ("/api/leaders/major-league/data?age=&pos=all&stats={stats}"
+                 "&lg=all&qual=0&season={season}&season1={season}&ind=0&type=8"
+                 "&pageitems=5000&pagenum=1"
+                 "&month=1000&startdate={start}&enddate={end}")
+    # The same board WITHOUT a date window. `month=0` is the full season, which
+    # is what `fg_{bat,pit}_<season>.json` on disk are.
+    SEASON_PATH = ("/api/leaders/major-league/data?age=&pos=all&stats={stats}"
+                   "&lg=all&qual=0&season={season}&season1={season}&ind=0"
+                   "&type=8&pageitems=5000&pagenum=1&month=0")
+
+
+class OddsPortal:
+    """oddsportal.com. The REQUESTS go through `OddsPortalClient` one level
+    up — an imported module, not ours to change — so what lives here is only
+    what this file constructs: the league paths and the token pattern.
+
+    `AJAX_URL_RE` was defined 13 lines BELOW its first use; that worked only
+    because the use is inside a function body. Here it is defined before
+    anything reads it.
+    """
+
+    LEAGUE_PATH = {"baseball": "/baseball/usa/mlb/"}
+    RESULTS_PATH = {"baseball": "/baseball/usa/mlb/results/"}
+    AJAX_URL_RE = re.compile(r'"ajaxUrl"\s*:\s*"([^"]+)"')
+
+
+class InsideThePen:
+    """insidethepen.com — the real per-team bullpen state. Needs a login."""
+
+    BASE = "https://insidethepen.com"
+    TEAM_URL = BASE + "/team/{abbr}-bullpen.html"
+    TIMEOUT = 25.0
+
+
+class Rotowire:
+    """Rotowire's expected lineups, for the hours before the real ones post."""
+
+    LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+    TIMEOUT = 20.0
+
+
+class OpenMeteo:
+    """Open-Meteo. NOTE the FORWARD forecast is `weatherman`'s, not ours —
+    this module only reaches the PREVIOUS-RUNS archive, which answers "what
+    did the forecast say N days before a game that has already been played"
+    and is a look-ahead control for the backtest."""
+
+    PREVIOUS_RUNS = "https://previous-runs-api.open-meteo.com/v1/forecast"
+    TIMEOUT = 90.0
+
+
+# **Kept at module level because other files bind them BY NAME.**
+# `mlb_ml` builds a play-by-play URL off `m.STATSAPI`, and `scrape_framing`
+# uses both. Neither is ours to edit, so these two spellings are part of the
+# contract rather than a convenience. Everything else moved onto the classes.
+STATSAPI = StatsApi.BASE
+SAVANT_DETAIL_URL = Savant.DETAIL_URL
+# and this one is asserted BY NAME in the suite —
+# `test_the_live_board_can_see_a_game_that_has_ALREADY_FINISHED` reads
+# `m._OP_RESULTS_PATH` to prove the results page is still consulted.
+_OP_RESULTS_PATH = OddsPortal.RESULTS_PATH
+
 
 # ---------------------------------------------------------------------------
 # 1. Outcome space
@@ -219,6 +531,22 @@ LEAGUE_BASELINE: Tuple[float, ...] = (
 #   python mlb_sim.py baserunning               # measured against shipped
 
 
+# **The season the engine defaults to, in ONE place.**
+#
+# It used to be written directly into 64 function signatures as
+# `season: int = 2026`. Rolling a year meant 64 edits and missing one did not
+# raise — it silently answered for the previous season.
+#
+# Every one of those now takes `season: Optional[int] = None` and resolves it
+# in the BODY. That is not a style choice: a default argument is bound at
+# IMPORT, so `season: int = CURRENT_SEASON` would freeze the year and a
+# rebinding — which is how `_slate_overrides` ships state to a pool worker and
+# how every calibration works — would silently not reach it. That failure mode
+# already cost this project a clean-null A/B on `STUFF_MIN_TBF`; see
+# `test_no_tunable_constant_is_captured_as_a_DEFAULT_ARGUMENT`.
+CURRENT_SEASON = 2026
+
+
 # Which season's base-running the constants below are read from. Like
 # `DEPLOY_SEASON`, this exists so a backtest of an earlier year is not run on a
 # later year's league — though unlike deployment these rates are close to flat
@@ -228,8 +556,8 @@ LEAGUE_BASELINE: Tuple[float, ...] = (
 BASERUN_SEASON = 2026
 
 
-def _measured_baserunning(season: int = BASERUN_SEASON) -> Dict[str, float]:
-    """The `rates` block of `savedata/baserunning_<season>.json`, or {}.
+def _measured_baserunning(season: Optional[int] = None) -> Dict[str, float]:
+    """The `rates` block of `Sims/savedata/baserunning_<season>.json`, or {}.
 
     Defined HERE, 1,800 lines above `SAVE_DIR`, and building its path the same
     way `SAVE_DIR` does rather than waiting for it. These constants are read on
@@ -237,8 +565,9 @@ def _measured_baserunning(season: int = BASERUN_SEASON) -> Dict[str, float]:
     anything downstream can capture a shipped one as a default argument — the
     frozen-default trap section 8 records twice.
     """
+    season = BASERUN_SEASON if season is None else int(season)
     try:
-        with open(Path(__file__).resolve().parent / "savedata"
+        with open(_SIM_ROOT / "savedata"
                   / f"baserunning_{season}.json") as fh:
             got = (json.load(fh) or {}).get("rates") or {}
         return {str(k): float(v) for k, v in got.items()}
@@ -285,8 +614,8 @@ P_REACH_ON_ERROR = 0.038
 # the most outs remaining, while bases-empty and two-out states matched
 # exactly — which is the signature that says the PA model is fine and the
 # BASE-RUNNING is not. Both constants are calibrated against our own measured
-# RE24 (`savedata/pbp/season_2026_v2.json`); re-fit them before trusting a
-# changed advancement model.
+# RE24 (`OddsAPI/savedata/pbp/season_2026_v2.json`); re-fit them before
+# trusting a changed advancement model.
 # Steals are modelled as an ATTEMPT with a success rate, not as free bases.
 # Modelling only successful steals is the tempting shortcut and it is wrong in
 # a way that flatters the model: it hands out the extra base and never charges
@@ -355,71 +684,39 @@ P_WILD_ADVANCE = 0.022
 STABILIZE_MAX = 3000.0    # a measured 31,732 is "no skill"; the cap says so
                           # without pretending to that precision
 
-# **MEASURED, and NOT SHIPPED — the numbers below are right and using them made
-# the model predict WORSE.** Recorded in full because the finding is the point,
-# not the constants.
+# **The MEASURED stabilisation tables. They SHIP — see STABILIZE_PA_BAT below —
+# but they did not at first, and why is the useful part.**
 #
-#   pitchers      A       B     shipped   (A within-season, B cross-season)
-#     K          84      89      60
-#     BB        238     230     120
-#     GB_OUT    140     111      80
-#     AIR_OUT   159     144      80
-#     HR        566     668     170
-#     1B       1338     524     290
-#     2B        inf    1888     350
-#     3B        inf   31732     380
+#   pitchers    A      B    old        bat      within cross MERGED  old
+#     K        84     89     60          K          52    59     55   60
+#     BB      238    230    120          BB        115   135    125  120
+#     GB_OUT  140    111     80          HBP       237   263    250  240
+#     AIR_OUT 159    144     80          GB_OUT    105   117    111   80
+#     HR      566    668    170          AIR_OUT   131   133    132   80
+#     1B     1338    524    290          1B        297   263    279  290
+#     2B      inf   1888    350          2B       2565  2125   2335  350  <- 6.7x
+#     3B      inf  31732    380          3B        686   464    564  380
+#                                        HR        239   249    244  170  <- 1.4x
 #
-# Scored on the real slate at 60 sims/game across three seeds, paired:
+# A/within is within-season (UNDERstates: its cohort is selected on playing
+# time), B/cross is cross-season (OVERstates: talent moves between years); the
+# two bracket the truth and the shipped figure is their geometric mean, capped
+# at STABILIZE_MAX. The cross figure is itself the mean of two season pairs that
+# agree closely (batter K 63/55, BB 132/137, HR 241/256), so it is three
+# converging estimates rather than one.
 #
-#                        game total    RMSE      corr
-#     shared table         8.8538     4.3786    +0.2847
-#     split by side        8.9010     4.3904    +0.2756
+# **Put in during August they made the model predict WORSE** — corr +0.2847 ->
+# +0.2756 on the real slate, same direction on all three paired seeds — while
+# HALVING the level error (-0.100 -> -0.053).
 #
-# The split HALVES the level error (-0.100 -> -0.053) and costs 0.0091 of
-# correlation — and the correlation cost is real, not noise: all three paired
-# seeds move the same way, t ~ 4. Applying only the hitter table was pure cost,
-# moving nothing and losing the same accuracy.
-#
-# **Why a better talent estimate predicts worse, which is the useful part.** The
-# decomposition measures TRUE TALENT. Prediction wants talent PLUS whatever
-# else in a pitcher's season line will still be true tonight — his park, the
-# defence behind him, his catcher, his role. Those recur, so they are
-# legitimately predictive, and regressing to pure talent throws them away.
-#
-# That makes this a SEQUENCING problem, not a wrong measurement. The persistent
-# context has to be modelled explicitly before the rates can be regressed to
-# talent: the park term is gone (section 6), defence is in via OAA (section
-# 19), and **catcher framing is not modelled at all yet**. Revisit these tables
-# once framing lands — at that point the split should cost less and may cost
-# nothing.
-#
-# Do NOT reach for stabilisation as a level knob in the meantime. It is an
-# estimator; the residual level gap is the talent-versus-realised-outcome
-# question in section 5.9, and it wants the missing MECHANISM.
-# **Both estimators, merged — 2026-08-16.** The hitter column used to be
-# within-season only, because `fg_bat_2024/2025.json` were not on disk; they
-# are now, so the cross-season estimator runs for BOTH sides and the two
-# bracket the truth from opposite directions (within UNDERstates, its cohort
-# being selected on playing time; cross OVERstates, talent moving between
-# years). Geometric mean of the pair, capped at STABILIZE_MAX.
-#
-# The cross-season figure is itself the mean of TWO independent season pairs
-# (2024-25 and 2025-26) which agree closely — batter K 63/55, BB 132/137,
-# HR 241/256, AIR_OUT 134/132 — so this is three converging estimates, not one.
-#
-#   bat        within  cross  MERGED  shipped
-#     K            52     59      55       60
-#     BB          115    135     125      120
-#     HBP         237    263     250      240
-#     GB_OUT      105    117     111       80
-#     AIR_OUT     131    133     132       80
-#     1B          297    263     279      290
-#     2B         2565   2125    2335      350   <- 6.7x
-#     3B          686    464     564      380
-#     HR          239    249     244      170   <- 1.4x
-#
-# K, BB, HBP and 1B ship correctly for hitters. The contact outcomes do not:
-# a hitter's DOUBLES rate is trusted nearly seven times too much.
+# **Why a better talent estimate predicted worse is the reusable lesson.** The
+# decomposition measures TRUE TALENT; prediction wants talent PLUS the context
+# that recurs — park, defence, catcher, role. Regressing to pure talent throws
+# that away unless the context is modelled first. So it was a SEQUENCING
+# problem, not a wrong measurement, and once framing, park run factors and team
+# defence all landed the split HELPED and shipped. Do not reach for
+# stabilisation as a level knob: it is an estimator, and the residual level gap
+# in §5.9 wants a mechanism.
 STABILIZE_PA_MEASURED_BAT: Tuple[float, ...] = (
     55.0, 125.0, 250.0, 111.0, 132.0, 279.0, 2335.0, 564.0, 244.0)
 STABILIZE_PA_MEASURED_PIT: Tuple[float, ...] = (
@@ -504,8 +801,8 @@ def weighted_counts(outcomes: Sequence[int],
 
 
 def shrink_rates(counts: Sequence[float],
-                 league: Sequence[float] = LEAGUE_BASELINE,
-                 stabilize: Sequence[float] = STABILIZE_PA) -> List[float]:
+                 league: Optional[Sequence[float]] = None,
+                 stabilize: Optional[Sequence[float]] = None) -> List[float]:
     """Empirical-Bayes shrink an outcome-count vector toward the league.
 
     Each outcome is shrunk with its OWN stabilisation weight, so a hitter with
@@ -513,6 +810,8 @@ def shrink_rates(counts: Sequence[float],
     triples. Shrinking the whole vector by one factor — the usual shortcut —
     gets both ends wrong at once.
     """
+    league = LEAGUE_BASELINE if league is None else league
+    stabilize = STABILIZE_PA if stabilize is None else stabilize
     n = sum(counts)
     out = []
     for i in range(N_OUTCOMES):
@@ -520,13 +819,6 @@ def shrink_rates(counts: Sequence[float],
         w = n / (n + stabilize[i]) if n > 0 else 0.0
         out.append(w * obs + (1.0 - w) * league[i])
     return _normalize(out)
-
-
-def league_baseline_from_counts(counts: Sequence[float]) -> List[float]:
-    """League baseline from raw leaguewide outcome counts. Use this to refresh
-    LEAGUE_BASELINE off our own play-by-play rather than trusting the constant.
-    """
-    return _normalize(list(counts))
 
 
 def _normalize(v: Sequence[float]) -> List[float]:
@@ -592,7 +884,7 @@ LOG5_GAIN = 1.0
 
 
 def log5(batter: Sequence[float], pitcher: Sequence[float],
-         league: Sequence[float] = LEAGUE_BASELINE,
+         league: Optional[Sequence[float]] = None,
          tail_correction: bool = True) -> List[float]:
     """Combine a batter and pitcher outcome vector against the league.
 
@@ -605,6 +897,7 @@ def log5(batter: Sequence[float], pitcher: Sequence[float],
     The correction is a shrink of the log-space DEVIATION, not of the result,
     so it cannot reorder two hitters; it only stops the tails running away.
     """
+    league = LEAGUE_BASELINE if league is None else league
     out = []
     for i in range(N_OUTCOMES):
         b, p, l = batter[i], pitcher[i], league[i]
@@ -698,7 +991,7 @@ _FATIGUE_FORCE = False
 
 
 def fatigue_multipliers(bf: int, decline_per_bf: Optional[float] = None,
-                        ref_bf: float = FATIGUE_REF_BF) -> Dict[int, float]:
+                        ref_bf: Optional[float] = None) -> Dict[int, float]:
     """Continuous within-game decline, as a multiplier bundle.
 
     Deliberately smooth in batters faced. Brill/Deshpande/Wyner show the
@@ -719,6 +1012,7 @@ def fatigue_multipliers(bf: int, decline_per_bf: Optional[float] = None,
     returns a flat bundle unless a caller passes its own slope, which is what
     the calibration probe does.
     """
+    ref_bf = FATIGUE_REF_BF if ref_bf is None else float(ref_bf)
     d = 1.0 + (FATIGUE_DECLINE_PER_BF if decline_per_bf is None
                else decline_per_bf) * (bf - ref_bf)
     d = max(d, 0.5)
@@ -811,29 +1105,69 @@ OPENER_BF_MAX = 10
 PITCH_HOOK_BUCKET = 5
 
 
-def hook_hazard_pitches(pitch_distribution: Sequence[float],
-                        bucket: int = PITCH_HOOK_BUCKET) -> List[float]:
-    """Discrete-time hazard of being pulled, indexed by PITCHES thrown.
+class Fatigue:
+    """Pitcher fatigue and the hook — smooth in pitches/BF, never a TTO step."""
 
-    Same construction as `hook_hazard` one variable over, so the two cannot
-    drift apart on a definition: h[k] = P(pulled in bucket k | still in).
-    """
-    if not pitch_distribution:
-        return []
-    idx = [int(x) // bucket for x in pitch_distribution]
-    hi = max(idx)
-    pulled = [0] * (hi + 2)
-    for k in idx:
-        pulled[k] += 1
-    hazard, at_risk = [], len(idx)
-    for k in range(hi + 1):
-        if at_risk <= 0:
-            hazard.append(1.0)
-            continue
-        hazard.append(pulled[k] / at_risk)
-        at_risk -= pulled[k]
-    hazard.append(1.0)
-    return hazard
+    @staticmethod
+    def hook_hazard_pitches(pitch_distribution: Sequence[float],
+                            bucket: Optional[int] = None) -> List[float]:
+        """Discrete-time hazard of being pulled, indexed by PITCHES thrown.
+
+        Same construction as `hook_hazard` one variable over, so the two cannot
+        drift apart on a definition: h[k] = P(pulled in bucket k | still in).
+        """
+        bucket = PITCH_HOOK_BUCKET if bucket is None else int(bucket)
+        if not pitch_distribution:
+            return []
+        idx = [int(x) // bucket for x in pitch_distribution]
+        hi = max(idx)
+        pulled = [0] * (hi + 2)
+        for k in idx:
+            pulled[k] += 1
+        hazard, at_risk = [], len(idx)
+        for k in range(hi + 1):
+            if at_risk <= 0:
+                hazard.append(1.0)
+                continue
+            hazard.append(pulled[k] / at_risk)
+            at_risk -= pulled[k]
+        hazard.append(1.0)
+        return hazard
+
+    @staticmethod
+    def real_starter_pitch_hazard() -> Optional[List[float]]:
+        """The league's pitch-indexed starter hook curve, off real stints.
+
+        No `save_dir` default on purpose: `STINT_CACHE` is defined further down the
+        module, and a module constant captured as a default argument is bound at
+        IMPORT — the frozen-default trap this file records twice (section 8).
+        Resolved in the body, where a rebind reaches it.
+        """
+        try:
+            with open(STINT_CACHE) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        got = [s["pitches"] for s in st if s.get("starter") and s.get("pitches")]
+        return Fatigue.hook_hazard_pitches(got) if len(got) >= 500 else None
+
+    @staticmethod
+    def pa_pitches(outcome: int,
+                   rng: Optional[random.Random] = None) -> float:
+        """Pitches for one plate appearance. Stochastic when given an `rng`.
+
+        Floored at 1 — every plate appearance costs at least one pitch — and at 3
+        for a strikeout, which cannot happen in fewer.
+        """
+        if outcome == K:
+            mu, lo = PITCHES_PER_K, 3.0
+        elif outcome == BB:
+            mu, lo = PITCHES_PER_BB, 4.0
+        else:
+            mu, lo = PITCHES_PER_BIP, 1.0
+        if rng is None or PITCH_PA_SD <= 0:
+            return mu
+        return max(lo, mu + rng.gauss(0.0, PITCH_PA_SD))
 
 
 _SP_HAZ: List[List[float]] = []
@@ -881,23 +1215,6 @@ def real_starter_bf_hazard() -> Optional[List[float]]:
     return hook_hazard(got) if len(got) >= 500 else None
 
 
-def real_starter_pitch_hazard() -> Optional[List[float]]:
-    """The league's pitch-indexed starter hook curve, off real stints.
-
-    No `save_dir` default on purpose: `STINT_CACHE` is defined further down the
-    module, and a module constant captured as a default argument is bound at
-    IMPORT — the frozen-default trap this file records twice (section 8).
-    Resolved in the body, where a rebind reaches it.
-    """
-    try:
-        with open(STINT_CACHE) as fh:
-            st = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    got = [s["pitches"] for s in st if s.get("starter") and s.get("pitches")]
-    return hook_hazard_pitches(got) if len(got) >= 500 else None
-
-
 # **Per-PA pitch counts must be STOCHASTIC, and this is the whole reason the
 # deep-start tail exists.** A deterministic cost per outcome makes a start's
 # pitch count a fixed function of its outcome mix, which carries almost none of
@@ -912,24 +1229,6 @@ def real_starter_pitch_hazard() -> Optional[List[float]]:
 # is why the sim produced HALF the real complete games (0.190% against 0.349%)
 # and half the 8-inning starts even with a correctly-shaped marginal curve.
 PITCH_PA_SD = 1.96
-
-
-def pa_pitches(outcome: int,
-               rng: Optional[random.Random] = None) -> float:
-    """Pitches for one plate appearance. Stochastic when given an `rng`.
-
-    Floored at 1 — every plate appearance costs at least one pitch — and at 3
-    for a strikeout, which cannot happen in fewer.
-    """
-    if outcome == K:
-        mu, lo = PITCHES_PER_K, 3.0
-    elif outcome == BB:
-        mu, lo = PITCHES_PER_BB, 4.0
-    else:
-        mu, lo = PITCHES_PER_BIP, 1.0
-    if rng is None or PITCH_PA_SD <= 0:
-        return mu
-    return max(lo, mu + rng.gauss(0.0, PITCH_PA_SD))
 
 
 def hook_hazard(bf_distribution: Sequence[int]) -> List[float]:
@@ -1091,7 +1390,7 @@ def advance(state: HalfInningState, outcome: int, batter: int,
         if b[1] is not None:
             scorers.append(b[1])
         if b[0] is not None:
-            _r0 = _runner(lineup, b[0])
+            _r0 = Markov._runner(lineup, b[0])
             if rng.random() < scale_odds((_r0.adv or {}).get("first_scores_2b")
                                if _r0 and _r0.adv else
                                scale_odds(P_FIRST_SCORES_ON_2B,
@@ -1110,7 +1409,7 @@ def advance(state: HalfInningState, outcome: int, batter: int,
         third = None
         second = None
         if b[1] is not None:
-            _r1 = _runner(lineup, b[1])
+            _r1 = Markov._runner(lineup, b[1])
             if rng.random() < scale_odds((_r1.adv or {}).get("second_scores")
                                if _r1 and _r1.adv else
                                scale_odds(P_SECOND_SCORES_ON_1B,
@@ -1119,7 +1418,7 @@ def advance(state: HalfInningState, outcome: int, batter: int,
             else:
                 third = b[1]
         if b[0] is not None:
-            _r2 = _runner(lineup, b[0])
+            _r2 = Markov._runner(lineup, b[0])
             _p2 = scale_odds((_r2.adv or {}).get("first_to_third")
                              if _r2 and _r2.adv else
                              scale_odds(P_FIRST_TO_THIRD_ON_1B,
@@ -1217,15 +1516,56 @@ def scale_odds(p: float, factor: float) -> float:
     return o / (1.0 + o)
 
 
-def _runner(lineup: Optional[List["Batter"]], slot: Optional[int]
-            ) -> Optional["Batter"]:
-    if lineup is None or slot is None:
-        return None
-    return lineup[slot % len(lineup)]
+class Markov:
+    """Helpers for the base/out Markov: who is running, and booking a PA."""
+
+    @staticmethod
+    def _runner(lineup: Optional[List["Batter"]], slot: Optional[int]
+                ) -> Optional["Batter"]:
+        if lineup is None or slot is None:
+            return None
+        return lineup[slot % len(lineup)]
+
+    @staticmethod
+    def _record(line: PlayerLine, outcome: int, rbi: int, sac_fly: bool) -> None:
+        line.pa += 1
+        line.rbi += rbi
+        if outcome not in _NOT_AB and not sac_fly:
+            line.ab += 1
+        if sac_fly:
+            line.sf += 1
+        if outcome == K:
+            line.k += 1
+        elif outcome == BB:
+            line.bb += 1
+        elif outcome == HBP:
+            line.hbp += 1
+        elif outcome == S1B:
+            line.h += 1
+            line.b1 += 1
+        elif outcome == S2B:
+            line.h += 1
+            line.b2 += 1
+        elif outcome == S3B:
+            line.h += 1
+            line.b3 += 1
+        elif outcome == HR:
+            line.h += 1
+            line.hr += 1
+
+    @staticmethod
+    def draw_outcome(rates: Sequence[float], rng: random.Random) -> int:
+        u = rng.random()
+        acc = 0.0
+        for i, p in enumerate(rates):
+            acc += p
+            if u < acc:
+                return i
+        return AIR_OUT
 
 
 def _speed(lineup: Optional[List["Batter"]], slot: Optional[int]) -> float:
-    r = _runner(lineup, slot)
+    r = Markov._runner(lineup, slot)
     return r.speed if r is not None else 1.0
 
 
@@ -1263,7 +1603,7 @@ def running_game(state: HalfInningState, rng: random.Random,
                        "scored": ([b[2]] if b[2] is not None else [])})
     elif b[0] is not None and b[1] is None:
         # The man ON FIRST decides whether to go, and how often he makes it.
-        runner = _runner(lineup, b[0])
+        runner = Markov._runner(lineup, b[0])
         attempt = runner.steal_attempt if runner else P_STEAL_ATTEMPT
         success = runner.steal_success if runner else P_STEAL_SUCCESS
         if rng.random() < attempt:
@@ -1275,43 +1615,6 @@ def running_game(state: HalfInningState, rng: random.Random,
                 state.outs += 1
                 events.append({"kind": "CS", "runner": b[0]})
     return scorers, events
-
-
-def _record(line: PlayerLine, outcome: int, rbi: int, sac_fly: bool) -> None:
-    line.pa += 1
-    line.rbi += rbi
-    if outcome not in _NOT_AB and not sac_fly:
-        line.ab += 1
-    if sac_fly:
-        line.sf += 1
-    if outcome == K:
-        line.k += 1
-    elif outcome == BB:
-        line.bb += 1
-    elif outcome == HBP:
-        line.hbp += 1
-    elif outcome == S1B:
-        line.h += 1
-        line.b1 += 1
-    elif outcome == S2B:
-        line.h += 1
-        line.b2 += 1
-    elif outcome == S3B:
-        line.h += 1
-        line.b3 += 1
-    elif outcome == HR:
-        line.h += 1
-        line.hr += 1
-
-
-def draw_outcome(rates: Sequence[float], rng: random.Random) -> int:
-    u = rng.random()
-    acc = 0.0
-    for i, p in enumerate(rates):
-        acc += p
-        if u < acc:
-            return i
-    return AIR_OUT
 
 
 # ---------------------------------------------------------------------------
@@ -1330,7 +1633,9 @@ class Batter:
     # runner Salvador Perez at the same time, which is wrong in both
     # directions at once and worst exactly where it is most bettable: steals,
     # runs scored, and first-to-third on a single.
-    bats: str = ""                         # "L", "R" or "S"
+    # The RAW board value, so "B" for a switch hitter, not "S" — see
+    # `_bat_hand`, and do not normalise it here (mlb_ml reads this field).
+    bats: str = ""                         # "L", "R" or "B"
     steal_attempt: float = P_STEAL_ATTEMPT
     steal_success: float = P_STEAL_SUCCESS
     speed: float = 1.0                     # odds multiplier on taking a base
@@ -1437,7 +1742,7 @@ class GameResult:
 
 # --- Leverage, MEASURED from our own play-by-play ------------------------
 # Nothing here is a chosen number. The leverage of a game state is read from
-# `savedata/pbp/season_2026_v2.json` — the same win-expectancy accumulator
+# `OddsAPI/savedata/pbp/season_2026_v2.json` — the same win-expectancy accumulator
 # EffortMLB builds its LI from — and the thresholds that decide which arm a
 # manager reaches for are QUANTILES of that table's own distribution rather
 # than invented cut-offs.
@@ -1451,78 +1756,98 @@ _LI_QUANTILES: Optional[Tuple[float, float]] = None
 MIN_STATE_N = 30          # transitions before a state's leverage is believed
 
 
-def load_leverage_table(path: Optional[Path] = None
-                        ) -> Tuple[Dict[tuple, float], Tuple[float, float]]:
-    """Leverage per game state, derived from the season's real transitions.
+class Leverage:
+    """Leverage index and the platoon weight that rides on it."""
 
-    LI(s) = E|WE(s') - WE(s)| over the transitions actually observed out of
-    s, normalised to a league mean of 1. Returns the table and its own
-    (median, p75), which is what the bullpen logic thresholds on — so the
-    cut-offs move with the data instead of being chosen.
-    """
-    global _LI_TABLE, _LI_QUANTILES
-    if _LI_TABLE is not None:
+    @staticmethod
+    def load_leverage_table(path: Optional[Path] = None
+                            ) -> Tuple[Dict[tuple, float], Tuple[float, float]]:
+        """Leverage per game state, derived from the season's real transitions.
+
+        LI(s) = E|WE(s') - WE(s)| over the transitions actually observed out of
+        s, normalised to a league mean of 1. Returns the table and its own
+        (median, p75), which is what the bullpen logic thresholds on — so the
+        cut-offs move with the data instead of being chosen.
+        """
+        global _LI_TABLE, _LI_QUANTILES
+        if _LI_TABLE is not None:
+            return _LI_TABLE, _LI_QUANTILES
+        path = path or (SHARED_DIR / "pbp" / "season_2026_v2.json")
+        table: Dict[tuple, float] = {}
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            we = {tuple(k): v[0] / v[1] for k, v in d["we_acc"] if v[1] >= 20}
+            trans: Dict[tuple, list] = {}
+            for a, b, n in d["we_trans"]:
+                trans.setdefault(tuple(a), []).append((tuple(b), n))
+            raw = {}
+            for st, outs in trans.items():
+                if st not in we:
+                    continue
+                tot = sum(n for _, n in outs)
+                if tot < MIN_STATE_N:
+                    continue
+                raw[st] = sum(n * abs(we.get(t, we[st]) - we[st])
+                              for t, n in outs) / tot
+            if raw:
+                mean = sum(raw.values()) / len(raw)
+                table = {k: v / mean for k, v in raw.items()}
+        except (OSError, KeyError, ValueError, ZeroDivisionError):
+            table = {}
+        vals = sorted(table.values())
+        _LI_TABLE = table
+        _LI_QUANTILES = ((vals[len(vals) // 2], vals[3 * len(vals) // 4])
+                         if vals else (0.85, 1.45))
         return _LI_TABLE, _LI_QUANTILES
-    path = path or (SAVE_DIR / "pbp" / "season_2026_v2.json")
-    table: Dict[tuple, float] = {}
-    try:
-        with open(path) as fh:
-            d = json.load(fh)
-        we = {tuple(k): v[0] / v[1] for k, v in d["we_acc"] if v[1] >= 20}
-        trans: Dict[tuple, list] = {}
-        for a, b, n in d["we_trans"]:
-            trans.setdefault(tuple(a), []).append((tuple(b), n))
-        raw = {}
-        for st, outs in trans.items():
-            if st not in we:
-                continue
-            tot = sum(n for _, n in outs)
-            if tot < MIN_STATE_N:
-                continue
-            raw[st] = sum(n * abs(we.get(t, we[st]) - we[st])
-                          for t, n in outs) / tot
-        if raw:
-            mean = sum(raw.values()) / len(raw)
-            table = {k: v / mean for k, v in raw.items()}
-    except (OSError, KeyError, ValueError, ZeroDivisionError):
-        table = {}
-    vals = sorted(table.values())
-    _LI_TABLE = table
-    _LI_QUANTILES = ((vals[len(vals) // 2], vals[3 * len(vals) // 4])
-                     if vals else (0.85, 1.45))
-    return _LI_TABLE, _LI_QUANTILES
 
+    @staticmethod
+    def game_leverage(inning: int, is_top: bool, lead: int, on_base: int,
+                      outs: int) -> float:
+        """Leverage of the current state, looked up in the measured table.
 
-def game_leverage(inning: int, is_top: bool, lead: int, on_base: int,
-                  outs: int) -> float:
-    """Leverage of the current state, looked up in the measured table.
+        `lead` is from the PITCHING side's perspective. Falls back along the axes
+        the table is thinnest on — blowouts and deep extras — before giving up and
+        returning the league mean.
+        """
+        table, (med, _) = Leverage.load_leverage_table()
+        if not table:
+            return 1.0
+        inn = min(int(inning), 10)
+        ld = max(-4, min(4, int(lead)))
+        for key in ((inn, bool(is_top), ld, int(on_base), int(outs)),
+                    (inn, bool(is_top), ld, int(on_base), 1),
+                    (inn, bool(is_top), ld, 0, int(outs)),
+                    (min(inn, 9), bool(is_top), ld, 0, 1)):
+            if key in table:
+                return table[key]
+        # Blowout and deep-extra states are the thinnest cells and often missing.
+        # Falling back to the league MEDIAN there is wrong in the direction that
+        # matters most: it would tell the manager a 9-run game is an average
+        # situation and burn the closer in it. Walk out to the nearest lead the
+        # table does hold, keeping the sign, so a blowout stays a blowout.
+        same = [(abs(k[2] - ld), k) for k in table
+                if k[0] == inn and k[1] == bool(is_top)
+                and (k[2] >= 0) == (ld >= 0)]
+        if same:
+            return table[min(same)[1]]
+        return med
 
-    `lead` is from the PITCHING side's perspective. Falls back along the axes
-    the table is thinnest on — blowouts and deep extras — before giving up and
-    returning the league mean.
-    """
-    table, (med, _) = load_leverage_table()
-    if not table:
-        return 1.0
-    inn = min(int(inning), 10)
-    ld = max(-4, min(4, int(lead)))
-    for key in ((inn, bool(is_top), ld, int(on_base), int(outs)),
-                (inn, bool(is_top), ld, int(on_base), 1),
-                (inn, bool(is_top), ld, 0, int(outs)),
-                (min(inn, 9), bool(is_top), ld, 0, 1)):
-        if key in table:
-            return table[key]
-    # Blowout and deep-extra states are the thinnest cells and often missing.
-    # Falling back to the league MEDIAN there is wrong in the direction that
-    # matters most: it would tell the manager a 9-run game is an average
-    # situation and burn the closer in it. Walk out to the nearest lead the
-    # table does hold, keeping the sign, so a blowout stays a blowout.
-    same = [(abs(k[2] - ld), k) for k in table
-            if k[0] == inn and k[1] == bool(is_top)
-            and (k[2] >= 0) == (ld >= 0)]
-    if same:
-        return table[min(same)[1]]
-    return med
+    @staticmethod
+    def platoon_weight(avg_inning: Optional[float]) -> float:
+        """Interpolated platoon-seeking strength for an arm, 0 when unknown."""
+        if not avg_inning:
+            return 0.0
+        xs = PLATOON_LIFT
+        if avg_inning <= xs[0][0]:
+            return xs[0][1]
+        if avg_inning >= xs[-1][0]:
+            return xs[-1][1]
+        for (x0, y0), (x1, y1) in zip(xs, xs[1:]):
+            if x0 <= avg_inning <= x1:
+                f = (avg_inning - x0) / (x1 - x0)
+                return y0 + f * (y1 - y0)
+        return 0.0
 
 
 # How hard a manager chases the platoon, as a function of the arm's measured
@@ -1537,22 +1862,6 @@ def game_leverage(inning: int, is_top: bool, lead: int, on_base: int,
 # A flat platoon rule would have a manager passing over his closer to bring in
 # a lefty specialist for one at-bat in the ninth, which is not what happens.
 PLATOON_LIFT = ((6.0, 0.202), (7.0, 0.145), (8.0, -0.030), (9.0, -0.195))
-
-
-def platoon_weight(avg_inning: Optional[float]) -> float:
-    """Interpolated platoon-seeking strength for an arm, 0 when unknown."""
-    if not avg_inning:
-        return 0.0
-    xs = PLATOON_LIFT
-    if avg_inning <= xs[0][0]:
-        return xs[0][1]
-    if avg_inning >= xs[-1][0]:
-        return xs[-1][1]
-    for (x0, y0), (x1, y1) in zip(xs, xs[1:]):
-        if x0 <= avg_inning <= x1:
-            f = (avg_inning - x0) / (x1 - x0)
-            return y0 + f * (y1 - y0)
-    return 0.0
 
 
 def _choose_reliever(side: TeamSide, used: set, lev: float,
@@ -1612,7 +1921,7 @@ def _choose_reliever(side: TeamSide, used: set, lev: float,
         # `platoon_weight` is negative for a closer, so a closer is not
         # passed over for a specialist in the ninth.
         if bat_hand and p.throws:
-            pw = platoon_weight(p.avg_inning)
+            pw = Leverage.platoon_weight(p.avg_inning)
             if pw > 0:
                 same = (p.throws == bat_hand)
                 sc *= (1.0 + pw) if same else max(1.0 - pw, 0.05)
@@ -1812,7 +2121,7 @@ def _mound(side: TeamSide, state: "MoundState", bf_by_pitcher: Dict[str, int],
     # real 30.0%. Fitted against the measured shape (§5.6).
     if (inning_start and bf_by_pitcher.get(cur.name, 0)
             >= cur.bf_per_outing - RELIEF_HANDOVER_SLACK):
-        if not (cur.multi_inning and lev < load_leverage_table()[1][0]):
+        if not (cur.multi_inning and lev < Leverage.load_leverage_table()[1][0]):
             nxt = _choose_reliever(side, state.used, lev, rng,
                                    state.available, state.inning,
                                    state.run_diff, state.bat_hand,
@@ -2050,9 +2359,9 @@ def simulate_game(home: TeamSide, away: TeamSide,
     pk = {"home": park_run_tilt(venue, True),
           "away": park_run_tilt(venue, False)}
     form = {"away": (draw_form(rng) + wx + pk["away"]
-                     + team_quality_tilt(away.team_quality)),
+                     + TeamQuality.team_quality_tilt(away.team_quality)),
             "home": (draw_form(rng) + wx + pk["home"]
-                     + team_quality_tilt(home.team_quality))}
+                     + TeamQuality.team_quality_tilt(home.team_quality))}
     last_pit = {"away": "", "home": ""}
 
     def play_half(half: str, inning: int, walk_off: bool) -> None:
@@ -2080,7 +2389,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
             # Leverage from the PITCHING side's perspective, read off the
             # measured table rather than a formula.
             pit_half = "home" if half == "away" else "away"
-            lev = game_leverage(inning, half == "away",
+            lev = Leverage.game_leverage(inning, half == "away",
                                 runs[pit_half] - runs[half],
                                 sum(1 for b in state.bases if b is not None),
                                 state.outs)
@@ -2164,10 +2473,10 @@ def simulate_game(home: TeamSide, away: TeamSide,
 
             outs_before = state.outs
             before_bases = list(state.bases)
-            outcome = draw_outcome(rates, rng)
+            outcome = Markov.draw_outcome(rates, rng)
             scorers, rbi, sac_fly = advance(state, outcome, slot, rng,
                                             bat_side.lineup,
-                                            arm_factor(pit_side.of_arm))
+                                            BallFlight.arm_factor(pit_side.of_arm))
             if log is not None:
                 log.append({
                     "inning": inning, "half": half, "outs_before": outs_before,
@@ -2191,7 +2500,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
                 last_pit[pit_half] = pit.name
 
             bline = res.batters.setdefault(bat.name, PlayerLine())
-            _record(bline, outcome, rbi, sac_fly)
+            Markov._record(bline, outcome, rbi, sac_fly)
             for s in scorers:
                 res.batters.setdefault(
                     bat_side.lineup[s].name, PlayerLine()).r += 1
@@ -2223,7 +2532,7 @@ def simulate_game(home: TeamSide, away: TeamSide,
             if USE_PITCH_HOOK:
                 pitch_by_pitcher[pit.name] = (
                     pitch_by_pitcher.get(pit.name, 0.0)
-                    + pa_pitches(outcome, rng))
+                    + Fatigue.pa_pitches(outcome, rng))
             order[half] += 1
 
             if walk_off and runs["home"] > runs["away"]:
@@ -2384,12 +2693,285 @@ def summarize_prop(results: Sequence[GameResult], player: str, market: str,
 # ===========================================================================
 
 
-SAVE_DIR = Path(__file__).resolve().parent / "savedata"
+SAVE_DIR = _SIM_ROOT / "savedata"
 
-# Weight of a season relative to the most recent one, halving each year back.
-# One season is ~600 PA, so this is the season-level analogue of the ~500-PA
-# half-life in arXiv:2511.17733.
+# **Two roots, because two applications own this data between them.**
+#
+# `SAVE_DIR` is the sim's own store: everything only this module and `mlb_ml`
+# read or write — the as-of boards, the PA corpus, the ML datasets and models,
+# the A/B ledgers, the CLV odds, the park/reliever/baserunning tables.
+#
+# `SHARED_DIR` is the app-wide `OddsAPI/savedata`, and holds the handful of
+# caches `EffortMLB` both READS AND WRITES alongside us: the full-season
+# FanGraphs boards, the season roster, the PBP checkpoint, the InsideThePen
+# cookie jar. Those must stay one file, not two — a second copy would go stale
+# in whichever process refreshed it last, and neither side would know.
+#
+# Reach for them through `_shared()`, never by hardcoding, so that a caller
+# passing an explicit `save_dir` (a test fixture, an alternate store) still
+# gets one self-consistent directory instead of half its files elsewhere.
+SHARED_DIR = _APP_ROOT / "savedata"
+
+
+# Weight of a season relative to the most recent one, halving each year back:
+# `w(s) = 0.5 ** ((newest - s) / SEASON_HALF_LIFE)`. It drives BOTH the blended
+# counts and the blended effective PA, so it also moves how hard `shrink_rates`
+# regresses a player — not a pure bias/variance knob on the blend.
+#
+# **MEASURED 2026-08-24: the value survives, its old justification did not.**
+# That justification was "one season is ~600 PA, so this is the season-level
+# analogue of the ~500-PA half-life in arXiv:2511.17733", and it fails three
+# ways: no hitter on the 2026 board reaches 600 PA (max 587, median 197);
+# taken literally the analogy gives 1.3-2.5 seasons, not 1.0; and it is an
+# analogy to a term THIS FILE measured and switched off (`USE_RECENCY = False`,
+# and that section says its own half-life is unfitted). Marcel's 5/4/3 implies
+# 3.11, so 1.0 is ~3x more aggressive than the standard systems.
+#
+# Out of sample — project season T from seasons < T, six bat/pit x 2024-26
+# folds, multinomial log-loss per PA relative to hl=1.0:
+#
+#     half_life   0.25    0.50    0.75    1.00    1.50    2.00    3.00    flat
+#     bat, worst +.0016  +.0006  +.0002     0    -.0000  +.0001  +.0002  +.0007
+#     pit, worst +.0011  +.0004  +.0001     0    +.0001  +.0002  +.0004  +.0010
+#
+# The optimum is a BROAD BASIN from 0.75 to 2.0 with 1.0 inside it in every
+# fold; the best fold beats shipped by 0.000089, which is nothing. The ENDS are
+# discriminated: 0.25 costs up to +0.0016, a flat blend up to +0.00099. A
+# run-value scoring agrees (wMAE optima 0.75/1.0/2.0/2.0).
+#
+# **The test withholds season T entirely, i.e. is biased TOWARD a long
+# half-life, and still lands here.** The shipped path also carries
+# season-to-date, which pushes the optimum shorter. Safe from both sides.
+#
+# **Not the compression lever.** Projected player spread is 0.56-0.72 of actual
+# in every fold and the half-life moves it ~0.05 across its whole range.
 SEASON_HALF_LIFE = 1.0
+class RateIngest:
+    """FanGraphs board rows -> shrunk per-PA outcome vectors, and the playing-time prior."""
+
+    @staticmethod
+    def _shared(save_dir=None) -> Path:
+        """Where the caches co-owned with `EffortMLB` live.
+
+        The DEFAULT store splits — sim data under `Sims/savedata`, co-owned
+        caches under `OddsAPI/savedata`. Any explicit override is honoured as
+        given, so a caller pointing at a scratch directory keeps everything in it.
+        """
+        p = Path(save_dir) if save_dir is not None else SAVE_DIR
+        return SHARED_DIR if p == SAVE_DIR else p
+
+    @staticmethod
+    def rate_seasons(side: str) -> Tuple[int, ...]:
+        return RATE_SEASONS_BAT if side == "bat" else RATE_SEASONS_PIT
+
+    @staticmethod
+    def use_season_blend(side: str) -> bool:
+        return USE_SEASON_BLEND_PIT if side == "pit" else USE_SEASON_BLEND_BAT
+
+    @staticmethod
+    def projected_league_baseline(board: Sequence[dict], side: str,
+                                  prior_board: Optional[Sequence[dict]]
+                                  ) -> List[float]:
+        """The FULL-season league environment, projected from a partial board.
+
+        **Season-to-date is the wrong target, and on an as-of board it is wrong by
+        a lot.** Measured over 2026's weekly cutoffs, the board's on-base is
+        accurate throughout (-0.4% to +1.1% of the full season) but its HOME-RUN
+        rate reads **-15.4% at 7 April**, -13.2% a week later, converging only by
+        July. That is the real cold-weather effect — and the engine already prices
+        temperature in `weather_tilt`, centred on each park's own mean. Feeding it
+        an April-depressed baseline as well charges the cold TWICE, which is the
+        same double-count as uncentred fatigue and the uncentred park term.
+
+        It also does far more damage than one term's worth, because
+        `rebase_to_season` maps every player's 2024 and 2025 evidence onto this
+        baseline: the estimator's error is multiplied across the whole rate layer.
+
+        So the quantity wanted is the full season's environment. Having observed a
+        fraction `f` of it, the rest is unobserved and its best leakage-free
+        estimate is the season before:
+
+            baseline = f * observed + (1 - f) * prior season
+
+        `f` is measured as playing time per club against the prior season's, so it
+        needs no calendar and no free parameter, and at f = 1 it reduces exactly to
+        the season-to-date behaviour.
+
+        Chasing season-to-date is not merely noisy, it is worse than a constant:
+        over the same 20 cutoffs, corr(season-to-date, the runs actually scored in
+        the week each cutoff priced) is **-0.43**, and a flat season constant beats
+        it on MAE (0.505 against 0.561).
+        """
+        observed = league_baseline(board, side)
+        if not prior_board:
+            return observed
+        now, before = (board_pa_per_club(board, side),
+                       board_pa_per_club(prior_board, side))
+        if before <= 0:
+            return observed
+        f = min(1.0, now / before)
+        if f >= 1.0:
+            return observed
+        prior = league_baseline(prior_board, side)
+        return _normalize([f * o + (1.0 - f) * p
+                           for o, p in zip(observed, prior)])
+
+    @staticmethod
+    def season_weights(seasons: Sequence[int],
+                       half_life: Optional[float] = None) -> Dict[int, float]:
+        """Recency weight per season, 1.0 on the most recent."""
+        half_life = SEASON_HALF_LIFE if half_life is None else float(half_life)
+        if not seasons:
+            return {}
+        newest = max(seasons)
+        decay = math.log(2.0) / half_life
+        return {s: math.exp(-decay * (newest - s)) for s in seasons}
+
+    @staticmethod
+    def _curve_from_board(board: Sequence[dict], side: str
+                          ) -> List[Tuple[float, List[float]]]:
+        """[(playing-time SHARE, outcome vector)] per equal-count bin."""
+        per_club = board_pa_per_club(board, side)
+        if per_club <= 0:
+            return []
+        rows = []
+        for row in board or []:
+            counts, pa = outcome_counts(row, side)
+            if pa > 0:
+                rows.append((pa / per_club, counts))
+        return RateIngest._prior_bins(rows)
+
+    @staticmethod
+    def _prior_bins(rows: List[Tuple[float, List[float]]]
+                    ) -> List[Tuple[float, List[float]]]:
+        """Equal-count playing-time bins over [(share, counts)]."""
+        if not rows:
+            return []
+        rows = sorted(rows, key=lambda r: r[0])
+        step = max(1, len(rows) // PRIOR_BINS)
+        out: List[Tuple[float, List[float]]] = []
+        for i in range(0, len(rows), step):
+            chunk = rows[i:i + step]
+            if len(chunk) < step // 2 and out:      # fold a short tail back in
+                break
+            acc = [0.0] * N_OUTCOMES
+            for _, counts in chunk:
+                for j in range(N_OUTCOMES):
+                    acc[j] += counts[j]
+            out.append((statistics.mean(pa for pa, _ in chunk), _normalize(acc)))
+        return out
+
+    @staticmethod
+    def solve_bat_prior_tilt(pop: Sequence[Tuple[float, Sequence[float]]],
+                             curve: Sequence[Tuple[float, List[float]]],
+                             league: Sequence[float],
+                             stab: Sequence[float]) -> float:
+        """The tilt that stops the hitter prior from moving the league's run level.
+
+        **Centre on the population you actually apply it to** — trap 7, and this
+        one took three wrong answers to get right, each of which measured as a
+        clean success on the quantity it was solved for:
+
+        1. The curve's own bins are PA-weighted, so its across-bin mean equals
+           league. That is the wrong invariant: what reaches a rate is
+           `shrink_rates(counts, prior)`, and the weight on the prior is
+           `1 - n/(n+stab)` — largest exactly for the fringe hitters whose target
+           sits furthest below league.
+        2. Centring per OUTCOME is over-determined. Nine weighted means each using
+           their own stabiliser do not form a probability vector and cannot all be
+           matched to a league vector summing to one; the additive form DIVERGES
+           under the renormalisation it forces, and the multiplicative one leaves a
+           uniform ~0.5% scale. The defect is a LEVEL shift, the level is one
+           dimension, and `offence_tilt` is the axis HFA, the form draw, weather
+           and the park term all already move along.
+        3. Centring ON-BASE is not centring RUNS. `offence_tilt` moves mass between
+           hits and outs proportionally and so preserves the hit MIX, but the curve
+           makes a fringe hitter weaker in slugging too. On-base came out exactly
+           neutral while run value was still -0.066 runs a game.
+
+        And the population itself is the fourth: `pop` must carry the BLENDED
+        multi-season counts the engine really shrinks against, not the newest
+        board's. On an April as-of board a regular has ~50 PA there and ~700
+        blended, so a solver reading the board alone thinks the prior carries 0.8
+        of the weight for everyone when it really carries 0.22 for the established
+        and 0.8 for the callups — the asymmetry it exists to cancel. Solved off the
+        board it cost **-0.79 runs a game** on the April cutoffs and -0.25 in
+        August, and NONE of it was visible on the full-season board, where the two
+        populations nearly agree.
+
+        `pop` is [(playing-time share, blended counts)].
+        """
+        if not pop or not curve:
+            return 0.0
+        rv = lambda v: sum(w * x for w, x in zip(PRIOR_CENTRE_LW, v))
+        rows = []
+        for share, counts in pop:
+            n = sum(counts)
+            if n <= 0:
+                continue
+            rows.append((counts, n, _curve_at(curve, share),
+                         rv(shrink_rates(counts, league, stab))))
+        if not rows:
+            return 0.0
+
+        def imbalance(t: float) -> float:
+            num = den = 0.0
+            for counts, n, tgt, base_rv in rows:
+                got = shrink_rates(counts, offence_tilt(tgt, t) if t else tgt, stab)
+                # weight by playing time: a row counts for as many lineup slots as
+                # it really fills
+                num += n * (rv(got) - base_rv)
+                den += n
+            return num / den if den else 0.0
+
+        lo, hi = 0.0, 0.35
+        if imbalance(lo) > 0:                     # prior already lifts: tilt DOWN
+            lo, hi = -0.35, 0.0
+        if imbalance(lo) * imbalance(hi) > 0:     # not bracketed — refuse, do not clamp
+            return 0.0
+        for _ in range(BAT_PRIOR_CENTRE_ITERS):
+            mid = 0.5 * (lo + hi)
+            if imbalance(mid) < 0:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    @staticmethod
+    def blend_seasons(by_season: Dict[int, Tuple[List[float], float]],
+                      half_life: Optional[float] = None,
+                      newest: Optional[int] = None
+                      ) -> Tuple[List[float], float]:
+        """Recency-weighted combination of one player's per-season counts.
+
+        Returns (blended counts, effective PA). The effective PA is weighted too,
+        so a player whose only recent sample is small stays properly shrunk —
+        crediting him the raw multi-season total would treat three-year-old
+        evidence as though it were current.
+
+        **`newest` must be the newest season on the BOARD, not the newest this
+        player has.** Without it `season_weights` anchors on his own last season,
+        so a player absent from the current board has his older years re-weighted
+        as though they were current — a 2025 line counted at 1.0 instead of 0.5.
+        It inflated the effective PA of everyone who did not play this year, and
+        it is worse on an as-of board, where "not on the board yet" is the normal
+        state in April rather than a retirement.
+        """
+        half_life = SEASON_HALF_LIFE if half_life is None else float(half_life)
+        seasons = list(by_season)
+        if newest is not None and newest not in by_season:
+            seasons.append(newest)
+        w = RateIngest.season_weights(seasons, half_life)
+        counts = [0.0] * N_OUTCOMES
+        pa = 0.0
+        for season, (c, p) in by_season.items():
+            wt = w[season]
+            for i in range(N_OUTCOMES):
+                counts[i] += c[i] * wt
+            pa += p * wt
+        return counts, pa
+
+
 
 # Which seasons feed each side's blend. Empty means "every board on disk",
 # which is the shipped behaviour. These exist so a board ADDITION can be
@@ -2397,10 +2979,6 @@ SEASON_HALF_LIFE = 1.0
 # harness captures every uppercase constant, so they travel to the pool.
 RATE_SEASONS_BAT: Tuple[int, ...] = ()
 RATE_SEASONS_PIT: Tuple[int, ...] = ()
-
-
-def rate_seasons(side: str) -> Tuple[int, ...]:
-    return RATE_SEASONS_BAT if side == "bat" else RATE_SEASONS_PIT
 
 
 # Whether each side blends OLDER seasons at all. `RATE_SEASONS_*` cannot
@@ -2416,10 +2994,6 @@ def rate_seasons(side: str) -> Tuple[int, ...]:
 # and nobody has asked what having them is worth.
 USE_SEASON_BLEND_BAT = True
 USE_SEASON_BLEND_PIT = True
-
-
-def use_season_blend(side: str) -> bool:
-    return USE_SEASON_BLEND_PIT if side == "pit" else USE_SEASON_BLEND_BAT
 
 
 # League BABIP by batted-ball type, used ONLY to split outs in play into
@@ -2481,7 +3055,6 @@ def _split_outs_in_play(outs: float, gb: float, fb: float, ld: float,
     That keeps the identity exact while respecting that a grounder retires the
     batter far more often than a line drive does.
     """
-    air_bip = max(fb - hr, 0.0) + ld
     w_gb = gb * (1.0 - BABIP_GB)
     w_air = max(fb - hr, 0.0) * (1.0 - BABIP_FB) + ld * (1.0 - BABIP_LD)
     if w_gb + w_air <= 0 or outs <= 0:
@@ -2558,64 +3131,6 @@ def league_baseline(rows: Sequence[dict], side: str) -> List[float]:
         for i in range(N_OUTCOMES):
             total[i] += counts[i]
     return _normalize(total)
-
-
-def projected_league_baseline(board: Sequence[dict], side: str,
-                              prior_board: Optional[Sequence[dict]]
-                              ) -> List[float]:
-    """The FULL-season league environment, projected from a partial board.
-
-    **Season-to-date is the wrong target, and on an as-of board it is wrong by
-    a lot.** Measured over 2026's weekly cutoffs, the board's on-base is
-    accurate throughout (-0.4% to +1.1% of the full season) but its HOME-RUN
-    rate reads **-15.4% at 7 April**, -13.2% a week later, converging only by
-    July. That is the real cold-weather effect — and the engine already prices
-    temperature in `weather_tilt`, centred on each park's own mean. Feeding it
-    an April-depressed baseline as well charges the cold TWICE, which is the
-    same double-count as uncentred fatigue and the uncentred park term.
-
-    It also does far more damage than one term's worth, because
-    `rebase_to_season` maps every player's 2024 and 2025 evidence onto this
-    baseline: the estimator's error is multiplied across the whole rate layer.
-
-    So the quantity wanted is the full season's environment. Having observed a
-    fraction `f` of it, the rest is unobserved and its best leakage-free
-    estimate is the season before:
-
-        baseline = f * observed + (1 - f) * prior season
-
-    `f` is measured as playing time per club against the prior season's, so it
-    needs no calendar and no free parameter, and at f = 1 it reduces exactly to
-    the season-to-date behaviour.
-
-    Chasing season-to-date is not merely noisy, it is worse than a constant:
-    over the same 20 cutoffs, corr(season-to-date, the runs actually scored in
-    the week each cutoff priced) is **-0.43**, and a flat season constant beats
-    it on MAE (0.505 against 0.561).
-    """
-    observed = league_baseline(board, side)
-    if not prior_board:
-        return observed
-    now, before = (board_pa_per_club(board, side),
-                   board_pa_per_club(prior_board, side))
-    if before <= 0:
-        return observed
-    f = min(1.0, now / before)
-    if f >= 1.0:
-        return observed
-    prior = league_baseline(prior_board, side)
-    return _normalize([f * o + (1.0 - f) * p
-                       for o, p in zip(observed, prior)])
-
-
-def season_weights(seasons: Sequence[int],
-                   half_life: float = SEASON_HALF_LIFE) -> Dict[int, float]:
-    """Recency weight per season, 1.0 on the most recent."""
-    if not seasons:
-        return {}
-    newest = max(seasons)
-    decay = math.log(2.0) / half_life
-    return {s: math.exp(-decay * (newest - s)) for s in seasons}
 
 
 # ---------------------------------------------------------------------------
@@ -2741,21 +3256,7 @@ def board_pa_per_club(rows: Sequence[dict], side: str) -> float:
     return (tot / N_CLUBS) if tot > 0 else 0.0
 
 
-def _curve_from_board(board: Sequence[dict], side: str
-                      ) -> List[Tuple[float, List[float]]]:
-    """[(playing-time SHARE, outcome vector)] per equal-count bin."""
-    per_club = board_pa_per_club(board, side)
-    if per_club <= 0:
-        return []
-    rows = []
-    for row in board or []:
-        counts, pa = outcome_counts(row, side)
-        if pa > 0:
-            rows.append((pa / per_club, counts))
-    return _prior_bins(rows)
-
-
-def prior_curve(side: str, season: int = 2026, save_dir: Path = SAVE_DIR,
+def prior_curve(side: str, season: Optional[int] = None, save_dir: Path = SAVE_DIR,
                 rows_override: Optional[List[dict]] = None
                 ) -> List[Tuple[float, List[float]]]:
     """The playing-time prior's SHAPE, taken from a COMPLETED prior season.
@@ -2786,6 +3287,7 @@ def prior_curve(side: str, season: int = 2026, save_dir: Path = SAVE_DIR,
 
     Falls back to the board itself when no earlier season is on disk.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     board = (rows_override if rows_override is not None
              else load_board(side, season, save_dir) or [])
     earlier = [s for s in available_seasons(side, save_dir) if s < season]
@@ -2794,7 +3296,7 @@ def prior_curve(side: str, season: int = 2026, save_dir: Path = SAVE_DIR,
     shape = _PRIOR_CURVE.get(key)
     if shape is None:
         src = (load_board(side, max(earlier), save_dir) if earlier else board)
-        shape = _curve_from_board(src or [], side)
+        shape = RateIngest._curve_from_board(src or [], side)
         src_league = league_baseline(src, side) if src else None
         _PRIOR_CURVE[key] = shape
         _PRIOR_LEAGUE[key] = src_league
@@ -2807,28 +3309,8 @@ def prior_curve(side: str, season: int = 2026, save_dir: Path = SAVE_DIR,
             for pt, v in shape]
 
 
-def _prior_bins(rows: List[Tuple[float, List[float]]]
-                ) -> List[Tuple[float, List[float]]]:
-    """Equal-count playing-time bins over [(share, counts)]."""
-    if not rows:
-        return []
-    rows = sorted(rows, key=lambda r: r[0])
-    step = max(1, len(rows) // PRIOR_BINS)
-    out: List[Tuple[float, List[float]]] = []
-    for i in range(0, len(rows), step):
-        chunk = rows[i:i + step]
-        if len(chunk) < step // 2 and out:      # fold a short tail back in
-            break
-        acc = [0.0] * N_OUTCOMES
-        for _, counts in chunk:
-            for j in range(N_OUTCOMES):
-                acc[j] += counts[j]
-        out.append((statistics.mean(pa for pa, _ in chunk), _normalize(acc)))
-    return out
-
-
 def playing_time_prior(share: float, side: str, league: Sequence[float],
-                       season: int = 2026, save_dir: Path = SAVE_DIR,
+                       season: Optional[int] = None, save_dir: Path = SAVE_DIR,
                        rows_override: Optional[List[dict]] = None,
                        centre_tilt: Optional[float] = None
                        ) -> List[float]:
@@ -2844,6 +3326,7 @@ def playing_time_prior(share: float, side: str, league: Sequence[float],
     runs on synthetic sides, and for any side the prior does not apply to
     (`PRIOR_SIDES`, plus "bat" when `USE_BAT_PRIOR` is on).
     """
+    season = CURRENT_SEASON if season is None else int(season)
     if side not in _prior_sides():
         return list(league)
     curve = prior_curve(side, season, save_dir, rows_override)
@@ -2887,82 +3370,6 @@ def _curve_at(curve: Sequence[Tuple[float, List[float]]],
     return list(curve[-1][1])
 
 
-def solve_bat_prior_tilt(pop: Sequence[Tuple[float, Sequence[float]]],
-                         curve: Sequence[Tuple[float, List[float]]],
-                         league: Sequence[float],
-                         stab: Sequence[float]) -> float:
-    """The tilt that stops the hitter prior from moving the league's run level.
-
-    **Centre on the population you actually apply it to** — trap 7, and this
-    one took three wrong answers to get right, each of which measured as a
-    clean success on the quantity it was solved for:
-
-    1. The curve's own bins are PA-weighted, so its across-bin mean equals
-       league. That is the wrong invariant: what reaches a rate is
-       `shrink_rates(counts, prior)`, and the weight on the prior is
-       `1 - n/(n+stab)` — largest exactly for the fringe hitters whose target
-       sits furthest below league.
-    2. Centring per OUTCOME is over-determined. Nine weighted means each using
-       their own stabiliser do not form a probability vector and cannot all be
-       matched to a league vector summing to one; the additive form DIVERGES
-       under the renormalisation it forces, and the multiplicative one leaves a
-       uniform ~0.5% scale. The defect is a LEVEL shift, the level is one
-       dimension, and `offence_tilt` is the axis HFA, the form draw, weather
-       and the park term all already move along.
-    3. Centring ON-BASE is not centring RUNS. `offence_tilt` moves mass between
-       hits and outs proportionally and so preserves the hit MIX, but the curve
-       makes a fringe hitter weaker in slugging too. On-base came out exactly
-       neutral while run value was still -0.066 runs a game.
-
-    And the population itself is the fourth: `pop` must carry the BLENDED
-    multi-season counts the engine really shrinks against, not the newest
-    board's. On an April as-of board a regular has ~50 PA there and ~700
-    blended, so a solver reading the board alone thinks the prior carries 0.8
-    of the weight for everyone when it really carries 0.22 for the established
-    and 0.8 for the callups — the asymmetry it exists to cancel. Solved off the
-    board it cost **-0.79 runs a game** on the April cutoffs and -0.25 in
-    August, and NONE of it was visible on the full-season board, where the two
-    populations nearly agree.
-
-    `pop` is [(playing-time share, blended counts)].
-    """
-    if not pop or not curve:
-        return 0.0
-    rv = lambda v: sum(w * x for w, x in zip(PRIOR_CENTRE_LW, v))
-    rows = []
-    for share, counts in pop:
-        n = sum(counts)
-        if n <= 0:
-            continue
-        rows.append((counts, n, _curve_at(curve, share),
-                     rv(shrink_rates(counts, league, stab))))
-    if not rows:
-        return 0.0
-
-    def imbalance(t: float) -> float:
-        num = den = 0.0
-        for counts, n, tgt, base_rv in rows:
-            got = shrink_rates(counts, offence_tilt(tgt, t) if t else tgt, stab)
-            # weight by playing time: a row counts for as many lineup slots as
-            # it really fills
-            num += n * (rv(got) - base_rv)
-            den += n
-        return num / den if den else 0.0
-
-    lo, hi = 0.0, 0.35
-    if imbalance(lo) > 0:                     # prior already lifts: tilt DOWN
-        lo, hi = -0.35, 0.0
-    if imbalance(lo) * imbalance(hi) > 0:     # not bracketed — refuse, do not clamp
-        return 0.0
-    for _ in range(BAT_PRIOR_CENTRE_ITERS):
-        mid = 0.5 * (lo + hi)
-        if imbalance(mid) < 0:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
-
-
 def rebase_to_season(counts: Sequence[float], season_league: Sequence[float],
                   target_league: Sequence[float]) -> List[float]:
     """Re-express one season's outcome counts in ANOTHER season's environment.
@@ -2993,39 +3400,6 @@ def rebase_to_season(counts: Sequence[float], season_league: Sequence[float],
            for i in range(N_OUTCOMES)]
     scale = n / sum(out) if sum(out) > 0 else 1.0
     return [c * scale for c in out]
-
-
-def blend_seasons(by_season: Dict[int, Tuple[List[float], float]],
-                  half_life: float = SEASON_HALF_LIFE,
-                  newest: Optional[int] = None
-                  ) -> Tuple[List[float], float]:
-    """Recency-weighted combination of one player's per-season counts.
-
-    Returns (blended counts, effective PA). The effective PA is weighted too,
-    so a player whose only recent sample is small stays properly shrunk —
-    crediting him the raw multi-season total would treat three-year-old
-    evidence as though it were current.
-
-    **`newest` must be the newest season on the BOARD, not the newest this
-    player has.** Without it `season_weights` anchors on his own last season,
-    so a player absent from the current board has his older years re-weighted
-    as though they were current — a 2025 line counted at 1.0 instead of 0.5.
-    It inflated the effective PA of everyone who did not play this year, and
-    it is worse on an as-of board, where "not on the board yet" is the normal
-    state in April rather than a retirement.
-    """
-    seasons = list(by_season)
-    if newest is not None and newest not in by_season:
-        seasons.append(newest)
-    w = season_weights(seasons, half_life)
-    counts = [0.0] * N_OUTCOMES
-    pa = 0.0
-    for season, (c, p) in by_season.items():
-        wt = w[season]
-        for i in range(N_OUTCOMES):
-            counts[i] += c[i] * wt
-        pa += p * wt
-    return counts, pa
 
 
 # ---------------------------------------------------------------------------
@@ -3129,7 +3503,7 @@ def _arsenal_block(row: dict) -> Optional[List[float]]:
     reliever and a six-pitch starter produce comparable numbers.
     """
     use: Dict[str, float] = {}
-    for fam, types in PITCH_FAMILIES.items():
+    for _fam, types in PITCH_FAMILIES.items():
         for pt in types:
             u = row.get(f"pfx{pt}%")
             sp = row.get(f"pfxsp{pt}")
@@ -3230,7 +3604,13 @@ STUFF_RELIABILITY: Tuple[float, ...] = (
 # is consistent, cheap and directionally right on every metric at once.
 #
 # The five-column version is worth only t +0.25 — see STUFF_USE_ARSENAL.
-USE_STUFF_PRIOR = True
+# **OFF because CHED SUPERSEDES it, not because it failed.** Both read pitch
+# characteristics into the same prior and `build_rates` refuses to run them
+# together (double count). CHED is the newer instrument: fitted on 2M pitches
+# against per-pitch run value, it scores a Triple-A arm the same way it scores
+# a major-league one, and it adds over a pitcher's own results at every sample
+# size. Flip the two to compare — `AB_ARMS["stuffprior"]`.
+USE_STUFF_PRIOR = False
 
 # Batters faced a pitcher needs on the board before his stuff columns are used
 # at all. Stuff+ over a handful of starts is itself an estimate; below this the
@@ -3304,14 +3684,416 @@ STUFF_ROLLING_PITCHES = 0.0     # 0 = season to date; else the trailing window
 STUFF_ROLLING_MIN_TYPE = 25.0
 
 
-def _type_pitches(row: dict, pt: str) -> Optional[float]:
-    """How many pitches of one type this cumulative board row was taken over."""
-    total = row.get("Pitches")
-    share = row.get(f"pfx{pt}%")
-    if not isinstance(total, (int, float)) or not isinstance(
-            share, (int, float)):
-        return None
-    return float(total) * float(share)
+class Stuff:
+    """Pitch-characteristic repeatability, and within-season recency."""
+
+    @staticmethod
+    def _type_pitches(row: dict, pt: str) -> Optional[float]:
+        """How many pitches of one type this cumulative board row was taken over."""
+        total = row.get("Pitches")
+        share = row.get(f"pfx{pt}%")
+        if not isinstance(total, (int, float)) or not isinstance(
+                share, (int, float)):
+            return None
+        return float(total) * float(share)
+
+    @staticmethod
+    def rolling_board(side: str, season: int, terminal: Sequence[dict],
+                      window: float, as_of: Optional[str] = None,
+                      save_dir: Path = SAVE_DIR) -> List[dict]:
+        """`terminal` with each arm's arsenal taken over his last `window` pitches.
+
+        The reference snapshot is chosen PER PITCHER — the cached cutoff whose
+        cumulative pitch count is closest to `now - window` — because a starter
+        and a reliever cover the same window in very different amounts of calendar
+        and a single date would give one of them a tenth of the sample.
+        """
+        if window <= 0:
+            return list(terminal)
+        cuts = [c for c in available_asof_cutoffs(season, save_dir)
+                if as_of is None or c < as_of]
+        if not cuts:
+            return list(terminal)
+        snaps = []
+        for c in cuts:
+            rows = load_board_asof(side, season, c, save_dir) or []
+            snaps.append({pid: r for r in rows
+                          if (pid := _row_id(r)) is not None})
+        out = []
+        for row in terminal:
+            pid = _row_id(row)
+            now_n = row.get("Pitches")
+            if pid is None or not isinstance(now_n, (int, float)):
+                out.append(row)
+                continue
+            target = float(now_n) - window
+            best, best_gap = None, None
+            for snap in snaps:
+                prev = snap.get(pid)
+                n = prev.get("Pitches") if prev else None
+                if not isinstance(n, (int, float)) or n >= now_n:
+                    continue
+                gap = abs(float(n) - target)
+                if best_gap is None or gap < best_gap:
+                    best, best_gap = prev, gap
+            out.append(rolling_arsenal_row(row, best))
+        return out
+
+    @staticmethod
+    def _lstsq(A: Sequence[Sequence[float]],
+               targets: Sequence[Sequence[float]],
+               ridge: float = 1e-6) -> List[List[float]]:
+        """Least squares via normal equations, for SEVERAL targets at once.
+
+        The nine outcomes share one design matrix, so `A^T A` is factorised once
+        and every right-hand side rides along — the alternative rebuilds an
+        identical p x p system nine times, in a function every pool worker runs.
+
+        The ridge term is for conditioning only: the features are collinear
+        (Stuff+ and PitchingBot stuff measure the same thing two ways) and an
+        exactly singular system is otherwise reachable on a thin board.
+        """
+        p = len(A[0])
+        k = len(targets)
+        ata = [[sum(r[i] * r[j] for r in A) for j in range(p)] for i in range(p)]
+        atb = [[sum(r[i] * y for r, y in zip(A, t)) for t in targets]
+               for i in range(p)]
+        for i in range(p):
+            ata[i][i] += ridge
+        for i in range(p):
+            piv = max(range(i, p), key=lambda r: abs(ata[r][i]))
+            ata[i], ata[piv] = ata[piv], ata[i]
+            atb[i], atb[piv] = atb[piv], atb[i]
+            d = ata[i][i]
+            if abs(d) < 1e-12:
+                continue
+            for r in range(p):
+                if r == i:
+                    continue
+                f = ata[r][i] / d
+                for c in range(i, p):
+                    ata[r][c] -= f * ata[i][c]
+                for c in range(k):
+                    atb[r][c] -= f * atb[i][c]
+        return [[atb[i][c] / ata[i][i] if abs(ata[i][i]) > 1e-12 else 0.0
+                 for i in range(p)] for c in range(k)]
+
+    @staticmethod
+    def stuff_source_board(season: int, board: Sequence[dict],
+                           as_of: Optional[str] = None,
+                           save_dir: Path = SAVE_DIR) -> List[dict]:
+        """The board the stuff features are read from — rolling, if configured.
+
+        One place, so the rate layer and every measurement harness cannot end up
+        reading different windows. The MODEL is still fit on season-to-date
+        features, because the fit seasons have no as-of boards to roll; the
+        features are on the same scale either way and the per-population centring
+        absorbs any offset between them.
+        """
+        if STUFF_ROLLING_PITCHES <= 0:
+            return list(board)
+        return Stuff.rolling_board("pit", season, board, STUFF_ROLLING_PITCHES,
+                             as_of, save_dir)
+
+    @staticmethod
+    def stuff_future_rows(season: int, save_dir: Path = SAVE_DIR,
+                          min_pre: float = 100.0, min_post: float = 100.0,
+                          trim: int = 4) -> List[dict]:
+        """Every (as-of line, what he did AFTER it) pair the season can supply.
+
+        Differencing the season-final board against an as-of one gives the rest of
+        that pitcher's season, which is the only honest target for "does this
+        predict him". `trim` drops the first and last few cutoffs: the earliest
+        have no sample to estimate from and the latest have no future to score
+        against.
+        """
+        full = {pid: r for r in load_board("pit", season, save_dir)
+                if (pid := _row_id(r)) is not None}
+        cuts = available_asof_cutoffs(season, save_dir)
+        use = cuts[trim:len(cuts) - trim] if len(cuts) > 2 * trim else cuts
+        out: List[dict] = []
+        for cut in use:
+            board = load_board_asof("pit", season, cut, save_dir)
+            for row in board:
+                pid = _row_id(row)
+                if pid is None or pid not in full:
+                    continue
+                pre, n_pre = outcome_counts(row, "pit")
+                if n_pre < min_pre:
+                    continue
+                post, n_all = outcome_counts(full[pid], "pit")
+                n_post = n_all - n_pre
+                if n_post < min_post:
+                    continue
+                out.append({
+                    "pid": pid, "cutoff": cut, "row": row,
+                    "pre": [c / n_pre for c in pre], "n_pre": n_pre,
+                    "post": [max(a - b, 0.0) / n_post
+                             for a, b in zip(post, pre)], "n_post": n_post,
+                })
+        return out
+
+    @staticmethod
+    def measure_stuff_reliability(season: Optional[int] = None, save_dir: Path = SAVE_DIR,
+                                  min_pre: float = 100.0, min_post: float = 100.0
+                                  ) -> dict:
+        """How much of a pitcher's PREDICTABLE variance his stuff explains.
+
+        Two covariances, both against what he did AFTER the cutoff, so neither
+        shares a sampling error with its predictor:
+
+            var_pred = cov(rate before, rate after)     -- what is predictable at
+                       all, talent plus whatever recurs (park, defence, catcher,
+                       role). Section 5.10's own argument for why pure talent is
+                       the wrong target.
+            rho2     = cov(delta, rate after)^2 / (var(delta) * var_pred)
+
+        `rho2` is the share of that predictable variance the stuff delta accounts
+        for, which is exactly what `stuff_stabilize` needs. It is capped at 0 from
+        below: a negative covariance means the model has nothing for that outcome,
+        and the honest encoding of that is zero rather than a sign flip.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        rows = Stuff.stuff_future_rows(season, save_dir, min_pre, min_post)
+        model = stuff_model_for(season, save_dir)
+        if not rows or model is None:
+            return {"n": 0, "season": season}
+        # deltas are centred PER CUTOFF, exactly as the rate layer does it
+        by_cut: Dict[str, List[dict]] = {}
+        for r in rows:
+            by_cut.setdefault(r["cutoff"], []).append(r)
+        recs: List[dict] = []
+        for cut, group in by_cut.items():
+            d = stuff_deltas(
+                Stuff.stuff_source_board(
+                    season, load_board_asof("pit", season, cut, save_dir) or [],
+                    cut, save_dir), model)
+            for r in group:
+                got = d.get(r["pid"])
+                if got is not None:
+                    recs.append({**r, "delta": got})
+        if len(recs) < 30:
+            return {"n": len(recs), "season": season}
+
+        out = {"n": len(recs), "season": season,
+               "cutoffs": sorted(by_cut), "fit_seasons": model["seasons"]}
+        rho2, corr_d, corr_o, var_pred = [], [], [], []
+        for i in range(N_OUTCOMES):
+            pre = [r["pre"][i] for r in recs]
+            post = [r["post"][i] for r in recs]
+            dl = [r["delta"][i] for r in recs]
+            vp = Stuff._cov(pre, post)
+            vd = statistics.pvariance(dl)
+            cdp = Stuff._cov(dl, post)
+            var_pred.append(vp)
+            corr_d.append(_corr(dl, post))
+            corr_o.append(_corr(pre, post))
+            rho2.append(min(max((cdp * cdp) / (vd * vp), 0.0), 0.95)
+                        if vd > 0 and vp > 0 else 0.0)
+        out["rho2"] = rho2
+        out["corr_delta"] = corr_d
+        out["corr_own"] = corr_o
+        out["var_pred"] = var_pred
+        return out
+
+    @staticmethod
+    def measure_recency(side: str = "pit", season: Optional[int] = None,
+                        half_lives: Sequence[float] = (250.0, 500.0, 1000.0),
+                        save_dir: Path = SAVE_DIR,
+                        min_pre: float = 100.0, min_post: float = 100.0,
+                        trim: int = 4) -> dict:
+        """Does weighting a player's season by recency predict his FUTURE better?
+
+        **The residual, measured before anything is built** — §0.1's own
+        instruction, because part of what recency would capture is lineup turnover
+        and bullpen state, which a plate-appearance simulator already carries
+        structurally.
+
+        Scored on the run-value summary against what he actually did after the
+        cutoff, weighted by the batters he faced, and reported BOTH ways:
+
+        * `raw` — the unshrunk rate. This is the comparison that shows the
+          mechanism, and it is unfair to recency by construction: a weighted
+          estimate has genuinely seen less (the effective sample is ~60% of the
+          raw one at a 150-PA half-life), so some of any RMSE loss is just noise.
+        * `shrunk` — each variant regressed toward the same league prior at ITS
+          OWN effective sample size, which is what the rate layer would actually
+          run and which prices that noise instead of ignoring it. **This is the
+          one to read.** If recency is a real improvement it has to survive
+          paying for its own smaller sample.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        full = {pid: r for r in (load_board(side, season, save_dir) or [])
+                if (pid := _row_id(r)) is not None}
+        cuts = available_asof_cutoffs(season, save_dir)
+        use = cuts[trim:len(cuts) - trim] if len(cuts) > 2 * trim else cuts
+        names = ["season"] + [f"hl{hl:.0f}" for hl in half_lives]
+        series: Dict[str, List[float]] = {k: [] for k in names}
+        shrunk: Dict[str, List[float]] = {k: [] for k in names}
+        actual: List[float] = []
+        weights: List[float] = []
+        eff_share: List[float] = []
+        owners: List[int] = []
+        stab = stabilize_for(side)
+        for cut in use:
+            rows = load_board_asof(side, season, cut, save_dir) or []
+            win = board_windows(side, season, rows, cut, save_dir)
+            league = league_baseline(rows, side)
+            for pid, seq in win.items():
+                row = full.get(pid)
+                if row is None:
+                    continue
+                pre = [0.0] * N_OUTCOMES
+                n_pre = 0.0
+                for c, pa in seq:
+                    for i in range(N_OUTCOMES):
+                        pre[i] += c[i]
+                    n_pre += pa
+                if n_pre < min_pre:
+                    continue
+                post, n_all = outcome_counts(row, side)
+                n_post = n_all - n_pre
+                if n_post < min_post:
+                    continue
+                actual.append(rate_run_value([max(a - b, 0.0) / n_post
+                                              for a, b in zip(post, pre)]))
+                weights.append(n_post)
+                owners.append(pid)
+                series["season"].append(rate_run_value([c / n_pre for c in pre]))
+                shrunk["season"].append(
+                    rate_run_value(shrink_rates(pre, league, stab)))
+                for hl in half_lives:
+                    c, eff = recency_counts(seq, hl)
+                    series[f"hl{hl:.0f}"].append(
+                        rate_run_value([x / eff for x in c]) if eff > 0
+                        else series["season"][-1])
+                    # `shrink_rates` reads the sample size off the COUNTS, so
+                    # passing the weighted ones prices the smaller effective
+                    # sample automatically — no second argument to keep in step.
+                    shrunk[f"hl{hl:.0f}"].append(
+                        rate_run_value(shrink_rates(c, league, stab))
+                        if eff > 0 else shrunk["season"][-1])
+                    if hl == half_lives[0]:
+                        eff_share.append(eff / n_pre if n_pre else 1.0)
+        n = len(actual)
+        out = {"n": n, "side": side, "season": season, "cutoffs": list(use),
+               "names": names,
+               "eff_share": statistics.mean(eff_share) if eff_share else 1.0}
+        if n < 30:
+            return out
+        tot = sum(weights)
+        for label, block in (("raw", series), ("shrunk", shrunk)):
+            out[label] = {
+                name: {
+                    "rmse": (sum(w * (p - a) ** 2
+                                 for p, a, w in zip(vals, actual, weights))
+                             / tot) ** 0.5,
+                    "corr": _corr(vals, actual),
+                } for name, vals in block.items()}
+        # **The error bar has to be CLUSTERED BY PLAYER.** One arm contributes a
+        # row at every cutoff and those rows share his talent, his park and most of
+        # his future window, so treating 3,315 of them as independent would put a
+        # standard error on this roughly sqrt(cutoffs) too small and turn a
+        # coin-flip into a finding.
+        out["paired"] = {}
+        for name in names[1:]:
+            by_pid: Dict[int, List[float]] = {}
+            for pid, a, w, base, alt in zip(owners, actual, weights,
+                                            shrunk["season"], shrunk[name]):
+                by_pid.setdefault(pid, []).append(
+                    w * ((base - a) ** 2 - (alt - a) ** 2))
+            per = [statistics.mean(v) for v in by_pid.values()]
+            mu = statistics.mean(per)
+            se = statistics.pstdev(per) / len(per) ** 0.5 if len(per) > 1 else 0.0
+            out["paired"][name] = {
+                "players": len(per), "mean": mu, "se": se,
+                "t": (mu / se) if se else 0.0}
+        return out
+
+    @staticmethod
+    def _cov(a: Sequence[float], b: Sequence[float]) -> float:
+        if len(a) < 2:
+            return 0.0
+        ma, mb = statistics.mean(a), statistics.mean(b)
+        return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / len(a)
+
+    @staticmethod
+    def score_stuff_prior(season: Optional[int] = None, save_dir: Path = SAVE_DIR,
+                          rho2: Optional[Sequence[float]] = None,
+                          min_pre: float = 100.0, min_post: float = 100.0
+                          ) -> dict:
+        """Predict each pitcher's FUTURE rates. Incumbent named, then beaten or not.
+
+        **The incumbent is `build_rates_asof` as it ships** — the shrunk blend at
+        the measured `STABILIZE_PA_PIT`, with the playing-time prior and the
+        season rebasing. Not league, not the raw observed line. Section 3d.6
+        measured against both of those first and the win shrank from 28% to 16%
+        when the real incumbent was named, so it is named here up front.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        rows = Stuff.stuff_future_rows(season, save_dir, min_pre, min_post)
+        if not rows:
+            return {"n": 0, "season": season}
+        by_cut: Dict[str, List[dict]] = {}
+        for r in rows:
+            by_cut.setdefault(r["cutoff"], []).append(r)
+
+        # **CHED has to be held OFF for the duration.** This function turns
+        # `USE_STUFF_PRIOR` on to build its "stuff" arm, and `build_rates`
+        # refuses to run both pitch-characteristic priors at once. Without
+        # this the harness raises the moment CHED ships on — and the harness
+        # is how the stuff prior gets scored, so it must keep working.
+        global USE_STUFF_PRIOR, STUFF_RELIABILITY, USE_CHED_PRIOR
+        was_use, was_rho, was_ched = (USE_STUFF_PRIOR, STUFF_RELIABILITY,
+                                      USE_CHED_PRIOR)
+        USE_CHED_PRIOR = False
+        preds: Dict[str, List[List[float]]] = {k: [] for k in
+                                               ("league", "own", "incumbent",
+                                                "stuff")}
+        actual: List[List[float]] = []
+        weights: List[float] = []
+        try:
+            for cut, group in sorted(by_cut.items()):
+                USE_STUFF_PRIOR, STUFF_RELIABILITY = False, was_rho
+                base, lg = build_rates_asof("pit", season, cut, save_dir=save_dir)
+                USE_STUFF_PRIOR = True
+                STUFF_RELIABILITY = tuple(rho2) if rho2 is not None else was_rho
+                new, _ = build_rates_asof("pit", season, cut, save_dir=save_dir)
+                for r in group:
+                    pid = r["pid"]
+                    if pid not in base or pid not in new:
+                        continue
+                    preds["league"].append(list(lg))
+                    preds["own"].append(r["pre"])
+                    preds["incumbent"].append(base[pid]["rates"])
+                    preds["stuff"].append(new[pid]["rates"])
+                    actual.append(r["post"])
+                    weights.append(r["n_post"])
+        finally:
+            USE_STUFF_PRIOR, STUFF_RELIABILITY = was_use, was_rho
+            USE_CHED_PRIOR = was_ched
+
+        n = len(actual)
+        out = {"n": n, "season": season, "cutoffs": sorted(by_cut)}
+        if n < 30:
+            return out
+        tot = sum(weights)
+        for name, series in preds.items():
+            rmse = []
+            for i in range(N_OUTCOMES):
+                e = sum(w * (p[i] - a[i]) ** 2
+                        for p, a, w in zip(series, actual, weights))
+                rmse.append((e / tot) ** 0.5)
+            rv_p = [rate_run_value(p) for p in series]
+            rv_a = [rate_run_value(a) for a in actual]
+            out[name] = {
+                "rmse": rmse,
+                "rv_rmse": (sum(w * (p - a) ** 2
+                                for p, a, w in zip(rv_p, rv_a, weights))
+                            / tot) ** 0.5,
+                "rv_corr": _corr(rv_p, rv_a),
+            }
+        return out
 
 
 def rolling_arsenal_row(now: dict, earlier: Optional[dict]) -> dict:
@@ -3328,7 +4110,7 @@ def rolling_arsenal_row(now: dict, earlier: Optional[dict]) -> dict:
     types = [pt for fam in PITCH_FAMILIES.values() for pt in fam]
     n_win_total = 0.0
     for pt in types:
-        n2, n1 = _type_pitches(now, pt), _type_pitches(earlier, pt)
+        n2, n1 = Stuff._type_pitches(now, pt), Stuff._type_pitches(earlier, pt)
         if n2 is None or n1 is None:
             continue
         dn = n2 - n1
@@ -3344,53 +4126,11 @@ def rolling_arsenal_row(now: dict, earlier: Optional[dict]) -> dict:
     # usage shares are re-expressed over the window too, so the weighting
     # reflects what he has been throwing lately rather than in April
     for pt in types:
-        n2, n1 = _type_pitches(now, pt), _type_pitches(earlier, pt)
+        n2, n1 = Stuff._type_pitches(now, pt), Stuff._type_pitches(earlier, pt)
         if n2 is None or n1 is None:
             continue
         out[f"pfx{pt}%"] = max(n2 - n1, 0.0) / n_win_total
     out["Pitches"] = n_win_total
-    return out
-
-
-def rolling_board(side: str, season: int, terminal: Sequence[dict],
-                  window: float, as_of: Optional[str] = None,
-                  save_dir: Path = SAVE_DIR) -> List[dict]:
-    """`terminal` with each arm's arsenal taken over his last `window` pitches.
-
-    The reference snapshot is chosen PER PITCHER — the cached cutoff whose
-    cumulative pitch count is closest to `now - window` — because a starter
-    and a reliever cover the same window in very different amounts of calendar
-    and a single date would give one of them a tenth of the sample.
-    """
-    if window <= 0:
-        return list(terminal)
-    cuts = [c for c in available_asof_cutoffs(season, save_dir)
-            if as_of is None or c < as_of]
-    if not cuts:
-        return list(terminal)
-    snaps = []
-    for c in cuts:
-        rows = load_board_asof(side, season, c, save_dir) or []
-        snaps.append({pid: r for r in rows
-                      if (pid := _row_id(r)) is not None})
-    out = []
-    for row in terminal:
-        pid = _row_id(row)
-        now_n = row.get("Pitches")
-        if pid is None or not isinstance(now_n, (int, float)):
-            out.append(row)
-            continue
-        target = float(now_n) - window
-        best, best_gap = None, None
-        for snap in snaps:
-            prev = snap.get(pid)
-            n = prev.get("Pitches") if prev else None
-            if not isinstance(n, (int, float)) or n >= now_n:
-                continue
-            gap = abs(float(n) - target)
-            if best_gap is None or gap < best_gap:
-                best, best_gap = prev, gap
-        out.append(rolling_arsenal_row(row, best))
     return out
 
 
@@ -3413,45 +4153,6 @@ def _stuff_feats(row: dict) -> Optional[List[float]]:
             return None
         out += block
     return out
-
-
-def _lstsq(A: Sequence[Sequence[float]],
-           targets: Sequence[Sequence[float]],
-           ridge: float = 1e-6) -> List[List[float]]:
-    """Least squares via normal equations, for SEVERAL targets at once.
-
-    The nine outcomes share one design matrix, so `A^T A` is factorised once
-    and every right-hand side rides along — the alternative rebuilds an
-    identical p x p system nine times, in a function every pool worker runs.
-
-    The ridge term is for conditioning only: the features are collinear
-    (Stuff+ and PitchingBot stuff measure the same thing two ways) and an
-    exactly singular system is otherwise reachable on a thin board.
-    """
-    p = len(A[0])
-    k = len(targets)
-    ata = [[sum(r[i] * r[j] for r in A) for j in range(p)] for i in range(p)]
-    atb = [[sum(r[i] * y for r, y in zip(A, t)) for t in targets]
-           for i in range(p)]
-    for i in range(p):
-        ata[i][i] += ridge
-    for i in range(p):
-        piv = max(range(i, p), key=lambda r: abs(ata[r][i]))
-        ata[i], ata[piv] = ata[piv], ata[i]
-        atb[i], atb[piv] = atb[piv], atb[i]
-        d = ata[i][i]
-        if abs(d) < 1e-12:
-            continue
-        for r in range(p):
-            if r == i:
-                continue
-            f = ata[r][i] / d
-            for c in range(i, p):
-                ata[r][c] -= f * ata[i][c]
-            for c in range(k):
-                atb[r][c] -= f * atb[i][c]
-    return [[atb[i][c] / ata[i][i] if abs(ata[i][i]) > 1e-12 else 0.0
-             for i in range(p)] for c in range(k)]
 
 
 def fit_stuff_model(seasons: Sequence[int], save_dir: Path = SAVE_DIR,
@@ -3501,7 +4202,7 @@ def fit_stuff_model(seasons: Sequence[int], save_dir: Path = SAVE_DIR,
               for r in rows]
     w = [math.sqrt(r[2]) for r in rows]
     aw = [[x * ww for x in a] for a, ww in zip(design, w)]
-    fits = _lstsq(aw, [[r[1][i] * ww for r, ww in zip(rows, w)]
+    fits = Stuff._lstsq(aw, [[r[1][i] * ww for r, ww in zip(rows, w)]
                        for i in range(N_OUTCOMES)])
     coef = {str(i): fits[i] for i in range(N_OUTCOMES)}
     return {"features": (list(STUFF_FEATURES) +
@@ -3562,23 +4263,6 @@ def stuff_predict(model: dict, row: dict) -> Optional[List[float]]:
             for i in range(N_OUTCOMES)]
 
 
-def stuff_source_board(season: int, board: Sequence[dict],
-                       as_of: Optional[str] = None,
-                       save_dir: Path = SAVE_DIR) -> List[dict]:
-    """The board the stuff features are read from — rolling, if configured.
-
-    One place, so the rate layer and every measurement harness cannot end up
-    reading different windows. The MODEL is still fit on season-to-date
-    features, because the fit seasons have no as-of boards to roll; the
-    features are on the same scale either way and the per-population centring
-    absorbs any offset between them.
-    """
-    if STUFF_ROLLING_PITCHES <= 0:
-        return list(board)
-    return rolling_board("pit", season, board, STUFF_ROLLING_PITCHES,
-                         as_of, save_dir)
-
-
 def stuff_deltas(board: Sequence[dict], model: Optional[dict],
                  min_tbf: Optional[float] = None) -> Dict[int, List[float]]:
     """{pid: centred, sample-shrunk rate delta} for every arm the model can see.
@@ -3627,6 +4311,70 @@ def stuff_deltas(board: Sequence[dict], model: Optional[dict],
               for i in range(N_OUTCOMES)]
     return {pid: [d[i] - centre[i] for i in range(N_OUTCOMES)]
             for pid, (d, _) in raw.items()}
+
+
+# ---------------------------------------------------------------------------
+# CHED — the pitch model from `ched_core`, as a shrinkage-target shift.
+# ---------------------------------------------------------------------------
+# **MUTUALLY EXCLUSIVE WITH `USE_STUFF_PRIOR`, and the guard below enforces
+# it.** Both read PITCH CHARACTERISTICS and both move the same prior, so
+# running them together counts a pitcher's stuff twice — the exact double
+# count section 5.4 exists to forbid, and it would look like a working
+# improvement because both terms are individually real.
+USE_CHED_PRIOR = True
+# Ships ON at the measured persistence rather than at 1.0. A pitcher's CHED is
+# DESCRIPTIVE of the pitches he has thrown; the prior wants the forecast, and
+# CHED's own year-over-year r is 0.787, so that fraction is what carries. 1.0
+# would hand next season his current-season number in full.
+CHED_PRIOR_SCALE = 0.787
+# **REMOVED, deliberately: there is no minimum.** CHED used to require 80
+# pitches HERE and again in the export, the same threshold applied twice, so a
+# pitcher at 79 got nothing and at 80 got full strength. The reliability
+# carried on each row (`rel`) replaces both — see `ched_core` section 2c. The
+# constant survives only so `_slate_overrides` keeps shipping a name the A/B
+# arms may still reference; nothing reads it in the apply path.
+CHED_MIN_PITCHES = 0
+# Pitches per plate appearance, league. Converts CHED's per-PITCH run value
+# into the per-PA units the tilt works in.
+CHED_PITCHES_PER_PA = 3.9
+_CHED: Dict[int, dict] = {}
+
+
+def load_ched(season: int, save_dir: Path = SAVE_DIR) -> Dict[int, dict]:
+    """{pid: {ched, rv_delta, n}} for one season, or {} when not exported.
+
+    Written by `ched_train.export`. Returns EMPTY rather than raising when the
+    file is absent, because a store without it must still simulate — but see
+    `ched_delta` for why a silent empty is dangerous on its own.
+    """
+    if season in _CHED:
+        return _CHED[season]
+    try:
+        with open(Path(save_dir) / f"ched_{season}.json") as fh:
+            raw = json.load(fh)
+        _CHED[season] = {int(k): v for k, v in (raw.get("pitchers") or {}).items()}
+    except (OSError, ValueError):
+        _CHED[season] = {}
+    return _CHED[season]
+
+
+def ched_delta(prior: Sequence[float], rv_delta: float) -> List[float]:
+    """A CHED run-value differential as an additive nine-outcome delta.
+
+    CHED predicts ONE number — run value per pitch — and the prior is a rate
+    vector, so the scalar is spread across the outcomes by `offence_tilt`, the
+    same primitive home-field advantage and the game-level form draw use. That
+    keeps the conversion in one place instead of inventing a second mapping
+    from runs to rates.
+
+    **Sign.** `rv_delta` is negative for a pitcher who SUPPRESSES runs, and the
+    vector being tilted is what he ALLOWS, so a negative delta must tilt the
+    allowed rates down. `offence_tilt` does that with a negative `s`, which is
+    what the arithmetic below produces without a flip.
+    """
+    per_pa = float(rv_delta) * CHED_PITCHES_PER_PA * CHED_PRIOR_SCALE
+    tilt = per_pa / (RUNS_PER_TILT / 38.0)
+    return [a - b for a, b in zip(offence_tilt(prior, tilt), prior)]
 
 
 def stuff_prior(prior: Sequence[float], delta: Sequence[float]
@@ -3685,155 +4433,24 @@ def rate_run_value(rates: Sequence[float]) -> float:
     return sum(r * w for r, w in zip(rates, RUN_VALUE_PER_PA))
 
 
-def stuff_future_rows(season: int, save_dir: Path = SAVE_DIR,
-                      min_pre: float = 100.0, min_post: float = 100.0,
-                      trim: int = 4) -> List[dict]:
-    """Every (as-of line, what he did AFTER it) pair the season can supply.
-
-    Differencing the season-final board against an as-of one gives the rest of
-    that pitcher's season, which is the only honest target for "does this
-    predict him". `trim` drops the first and last few cutoffs: the earliest
-    have no sample to estimate from and the latest have no future to score
-    against.
-    """
-    full = {pid: r for r in load_board("pit", season, save_dir)
-            if (pid := _row_id(r)) is not None}
-    cuts = available_asof_cutoffs(season, save_dir)
-    use = cuts[trim:len(cuts) - trim] if len(cuts) > 2 * trim else cuts
-    out: List[dict] = []
-    for cut in use:
-        board = load_board_asof("pit", season, cut, save_dir)
-        for row in board:
-            pid = _row_id(row)
-            if pid is None or pid not in full:
-                continue
-            pre, n_pre = outcome_counts(row, "pit")
-            if n_pre < min_pre:
-                continue
-            post, n_all = outcome_counts(full[pid], "pit")
-            n_post = n_all - n_pre
-            if n_post < min_post:
-                continue
-            out.append({
-                "pid": pid, "cutoff": cut, "row": row,
-                "pre": [c / n_pre for c in pre], "n_pre": n_pre,
-                "post": [max(a - b, 0.0) / n_post
-                         for a, b in zip(post, pre)], "n_post": n_post,
-            })
-    return out
-
-
-def measure_stuff_reliability(season: int = 2026, save_dir: Path = SAVE_DIR,
-                              min_pre: float = 100.0, min_post: float = 100.0
-                              ) -> dict:
-    """How much of a pitcher's PREDICTABLE variance his stuff explains.
-
-    Two covariances, both against what he did AFTER the cutoff, so neither
-    shares a sampling error with its predictor:
-
-        var_pred = cov(rate before, rate after)     -- what is predictable at
-                   all, talent plus whatever recurs (park, defence, catcher,
-                   role). Section 5.10's own argument for why pure talent is
-                   the wrong target.
-        rho2     = cov(delta, rate after)^2 / (var(delta) * var_pred)
-
-    `rho2` is the share of that predictable variance the stuff delta accounts
-    for, which is exactly what `stuff_stabilize` needs. It is capped at 0 from
-    below: a negative covariance means the model has nothing for that outcome,
-    and the honest encoding of that is zero rather than a sign flip.
-    """
-    rows = stuff_future_rows(season, save_dir, min_pre, min_post)
-    model = stuff_model_for(season, save_dir)
-    if not rows or model is None:
-        return {"n": 0, "season": season}
-    # deltas are centred PER CUTOFF, exactly as the rate layer does it
-    by_cut: Dict[str, List[dict]] = {}
-    for r in rows:
-        by_cut.setdefault(r["cutoff"], []).append(r)
-    recs: List[dict] = []
-    for cut, group in by_cut.items():
-        d = stuff_deltas(
-            stuff_source_board(
-                season, load_board_asof("pit", season, cut, save_dir) or [],
-                cut, save_dir), model)
-        for r in group:
-            got = d.get(r["pid"])
-            if got is not None:
-                recs.append({**r, "delta": got})
-    if len(recs) < 30:
-        return {"n": len(recs), "season": season}
-
-    out = {"n": len(recs), "season": season,
-           "cutoffs": sorted(by_cut), "fit_seasons": model["seasons"]}
-    rho2, corr_d, corr_o, var_pred = [], [], [], []
-    for i in range(N_OUTCOMES):
-        pre = [r["pre"][i] for r in recs]
-        post = [r["post"][i] for r in recs]
-        dl = [r["delta"][i] for r in recs]
-        vp = _cov(pre, post)
-        vd = statistics.pvariance(dl)
-        cdp = _cov(dl, post)
-        var_pred.append(vp)
-        corr_d.append(_corr(dl, post))
-        corr_o.append(_corr(pre, post))
-        rho2.append(min(max((cdp * cdp) / (vd * vp), 0.0), 0.95)
-                    if vd > 0 and vp > 0 else 0.0)
-    out["rho2"] = rho2
-    out["corr_delta"] = corr_d
-    out["corr_own"] = corr_o
-    out["var_pred"] = var_pred
-    return out
-
-
 # ---------------------------------------------------------------------------
 # WITHIN-SEASON RECENCY — sim_state.md 0.1 Objective 2
 # ---------------------------------------------------------------------------
-# `recency_weights` and `weighted_counts` have been in section 3 since the
-# module was written, and the docstring cites arXiv:2511.17733 for using them
-# "rather than season totals" — **but nothing called `weighted_counts`.** The
-# rate layer ran `outcome_counts` over FanGraphs season totals, which carry no
-# ordering at all, so the only recency in the engine was `SEASON_HALF_LIFE`
-# ACROSS seasons. A documented capability the code does not have is worse than
-# an absent one.
+# `recency_weights` and `weighted_counts` shipped with the module and the
+# docstring cited arXiv:2511.17733 for using them "rather than season totals" —
+# **but nothing called `weighted_counts`.** The rate layer ran `outcome_counts`
+# over FanGraphs season totals, which carry no ordering, so the only recency in
+# the engine was `SEASON_HALF_LIFE` ACROSS seasons.
 #
-# The ordering the board will not give up is recoverable from the AS-OF boards
-# already on disk: they are cumulative, so DIFFERENCING consecutive cutoffs
-# yields the counts inside each window. That is the same sequence
-# `weighted_counts` wants, at weekly rather than per-PA granularity, and it
-# costs no new fetch.
+# The ordering is recoverable from the AS-OF boards already on disk: they are
+# cumulative, so DIFFERENCING consecutive cutoffs yields per-window counts —
+# the sequence `weighted_counts` wants, weekly rather than per-PA, at no new
+# fetch. Ages are in PLATE APPEARANCES, not days: a reliever's April is much
+# less stale than a starter's by the calendar, and the calendar is the wrong
+# clock.
 #
-# Ages are measured in PLATE APPEARANCES, not days, so the half-life means the
-# same thing here as in `recency_weights` — a reliever's April is much less
-# stale than a starter's by the calendar, and the calendar is the wrong clock.
-#
-# **The residual was measured before any of this was wired, per section 0.1's
-# own instruction, and it does NOT apply to both sides.** Predicting the rest
-# of a player's season from an as-of cutoff, each variant shrunk at its OWN
-# effective sample size (a recency-weighted estimate has genuinely seen less
-# and shrinkage has to be told so), paired and CLUSTERED BY PLAYER — one arm
-# contributes a row at every cutoff and those rows share his talent, his park
-# and most of his future window, so treating them as independent would shrink
-# the standard error by roughly sqrt(cutoffs) and turn a coin flip into a
-# finding:
-#
-#   pooled improvement in weighted squared error, + = recency better
-#     half-life      150       250       500      1000
-#     PITCHERS     -0.18     +0.12     +0.39     +0.54     <- and the two
-#                                                             seasons have
-#                                                             OPPOSITE signs
-#     HITTERS      +1.92     +2.53     +3.09     +3.40     <- same sign both
-#
-# So recency ships for HITTERS ONLY. For pitchers 2025 says -0.84 and 2026
-# says +1.66 at the same half-life, which is what noise looks like, and the
-# reason is not mysterious: a pitcher's line is a smaller sample to begin with
-# (`STABILIZE_PA_PIT` is 2-6x the hitter table), so discarding a third of its
-# effective weight costs more than the staleness it removes.
-#
-# **The half-life is NOT fitted here.** The pooled t rises monotonically as the
-# half-life lengthens while the effect SIZE falls, so picking either end off
-# this data would be fitting it. 500 PA is the value already in
-# `recency_weights` from arXiv:2511.17733 — chosen before the measurement, and
-# it sits in the middle of the range where both seasons agree in sign.
+# **Measured before any of it was wired, and it does NOT apply to both
+# sides.** Predicting the rest
 RECENCY_HALF_LIFE_BAT = 500.0
 RECENCY_HALF_LIFE_PIT = 0.0        # 0 = off; measured null, seasons disagree
 USE_RECENCY = False                # ships off until the closing-line A/B says
@@ -3940,195 +4557,6 @@ def recency_counts(windows: Sequence[tuple],
     return counts, eff
 
 
-def measure_recency(side: str = "pit", season: int = 2026,
-                    half_lives: Sequence[float] = (250.0, 500.0, 1000.0),
-                    save_dir: Path = SAVE_DIR,
-                    min_pre: float = 100.0, min_post: float = 100.0,
-                    trim: int = 4) -> dict:
-    """Does weighting a player's season by recency predict his FUTURE better?
-
-    **The residual, measured before anything is built** — §0.1's own
-    instruction, because part of what recency would capture is lineup turnover
-    and bullpen state, which a plate-appearance simulator already carries
-    structurally.
-
-    Scored on the run-value summary against what he actually did after the
-    cutoff, weighted by the batters he faced, and reported BOTH ways:
-
-    * `raw` — the unshrunk rate. This is the comparison that shows the
-      mechanism, and it is unfair to recency by construction: a weighted
-      estimate has genuinely seen less (the effective sample is ~60% of the
-      raw one at a 150-PA half-life), so some of any RMSE loss is just noise.
-    * `shrunk` — each variant regressed toward the same league prior at ITS
-      OWN effective sample size, which is what the rate layer would actually
-      run and which prices that noise instead of ignoring it. **This is the
-      one to read.** If recency is a real improvement it has to survive
-      paying for its own smaller sample.
-    """
-    full = {pid: r for r in (load_board(side, season, save_dir) or [])
-            if (pid := _row_id(r)) is not None}
-    cuts = available_asof_cutoffs(season, save_dir)
-    use = cuts[trim:len(cuts) - trim] if len(cuts) > 2 * trim else cuts
-    names = ["season"] + [f"hl{hl:.0f}" for hl in half_lives]
-    series: Dict[str, List[float]] = {k: [] for k in names}
-    shrunk: Dict[str, List[float]] = {k: [] for k in names}
-    actual: List[float] = []
-    weights: List[float] = []
-    eff_share: List[float] = []
-    owners: List[int] = []
-    stab = stabilize_for(side)
-    for cut in use:
-        rows = load_board_asof(side, season, cut, save_dir) or []
-        win = board_windows(side, season, rows, cut, save_dir)
-        league = league_baseline(rows, side)
-        for pid, seq in win.items():
-            row = full.get(pid)
-            if row is None:
-                continue
-            pre = [0.0] * N_OUTCOMES
-            n_pre = 0.0
-            for c, pa in seq:
-                for i in range(N_OUTCOMES):
-                    pre[i] += c[i]
-                n_pre += pa
-            if n_pre < min_pre:
-                continue
-            post, n_all = outcome_counts(row, side)
-            n_post = n_all - n_pre
-            if n_post < min_post:
-                continue
-            actual.append(rate_run_value([max(a - b, 0.0) / n_post
-                                          for a, b in zip(post, pre)]))
-            weights.append(n_post)
-            owners.append(pid)
-            series["season"].append(rate_run_value([c / n_pre for c in pre]))
-            shrunk["season"].append(
-                rate_run_value(shrink_rates(pre, league, stab)))
-            for hl in half_lives:
-                c, eff = recency_counts(seq, hl)
-                series[f"hl{hl:.0f}"].append(
-                    rate_run_value([x / eff for x in c]) if eff > 0
-                    else series["season"][-1])
-                # `shrink_rates` reads the sample size off the COUNTS, so
-                # passing the weighted ones prices the smaller effective
-                # sample automatically — no second argument to keep in step.
-                shrunk[f"hl{hl:.0f}"].append(
-                    rate_run_value(shrink_rates(c, league, stab))
-                    if eff > 0 else shrunk["season"][-1])
-                if hl == half_lives[0]:
-                    eff_share.append(eff / n_pre if n_pre else 1.0)
-    n = len(actual)
-    out = {"n": n, "side": side, "season": season, "cutoffs": list(use),
-           "names": names,
-           "eff_share": statistics.mean(eff_share) if eff_share else 1.0}
-    if n < 30:
-        return out
-    tot = sum(weights)
-    for label, block in (("raw", series), ("shrunk", shrunk)):
-        out[label] = {
-            name: {
-                "rmse": (sum(w * (p - a) ** 2
-                             for p, a, w in zip(vals, actual, weights))
-                         / tot) ** 0.5,
-                "corr": _corr(vals, actual),
-            } for name, vals in block.items()}
-    # **The error bar has to be CLUSTERED BY PLAYER.** One arm contributes a
-    # row at every cutoff and those rows share his talent, his park and most of
-    # his future window, so treating 3,315 of them as independent would put a
-    # standard error on this roughly sqrt(cutoffs) too small and turn a
-    # coin-flip into a finding.
-    out["paired"] = {}
-    for name in names[1:]:
-        by_pid: Dict[int, List[float]] = {}
-        for pid, a, w, base, alt in zip(owners, actual, weights,
-                                        shrunk["season"], shrunk[name]):
-            by_pid.setdefault(pid, []).append(
-                w * ((base - a) ** 2 - (alt - a) ** 2))
-        per = [statistics.mean(v) for v in by_pid.values()]
-        mu = statistics.mean(per)
-        se = statistics.pstdev(per) / len(per) ** 0.5 if len(per) > 1 else 0.0
-        out["paired"][name] = {
-            "players": len(per), "mean": mu, "se": se,
-            "t": (mu / se) if se else 0.0}
-    return out
-
-
-def _cov(a: Sequence[float], b: Sequence[float]) -> float:
-    if len(a) < 2:
-        return 0.0
-    ma, mb = statistics.mean(a), statistics.mean(b)
-    return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / len(a)
-
-
-def score_stuff_prior(season: int = 2026, save_dir: Path = SAVE_DIR,
-                      rho2: Optional[Sequence[float]] = None,
-                      min_pre: float = 100.0, min_post: float = 100.0
-                      ) -> dict:
-    """Predict each pitcher's FUTURE rates. Incumbent named, then beaten or not.
-
-    **The incumbent is `build_rates_asof` as it ships** — the shrunk blend at
-    the measured `STABILIZE_PA_PIT`, with the playing-time prior and the
-    season rebasing. Not league, not the raw observed line. Section 3d.6
-    measured against both of those first and the win shrank from 28% to 16%
-    when the real incumbent was named, so it is named here up front.
-    """
-    rows = stuff_future_rows(season, save_dir, min_pre, min_post)
-    if not rows:
-        return {"n": 0, "season": season}
-    by_cut: Dict[str, List[dict]] = {}
-    for r in rows:
-        by_cut.setdefault(r["cutoff"], []).append(r)
-
-    global USE_STUFF_PRIOR, STUFF_RELIABILITY
-    was_use, was_rho = USE_STUFF_PRIOR, STUFF_RELIABILITY
-    preds: Dict[str, List[List[float]]] = {k: [] for k in
-                                           ("league", "own", "incumbent",
-                                            "stuff")}
-    actual: List[List[float]] = []
-    weights: List[float] = []
-    try:
-        for cut, group in sorted(by_cut.items()):
-            USE_STUFF_PRIOR, STUFF_RELIABILITY = False, was_rho
-            base, lg = build_rates_asof("pit", season, cut, save_dir=save_dir)
-            USE_STUFF_PRIOR = True
-            STUFF_RELIABILITY = tuple(rho2) if rho2 is not None else was_rho
-            new, _ = build_rates_asof("pit", season, cut, save_dir=save_dir)
-            for r in group:
-                pid = r["pid"]
-                if pid not in base or pid not in new:
-                    continue
-                preds["league"].append(list(lg))
-                preds["own"].append(r["pre"])
-                preds["incumbent"].append(base[pid]["rates"])
-                preds["stuff"].append(new[pid]["rates"])
-                actual.append(r["post"])
-                weights.append(r["n_post"])
-    finally:
-        USE_STUFF_PRIOR, STUFF_RELIABILITY = was_use, was_rho
-
-    n = len(actual)
-    out = {"n": n, "season": season, "cutoffs": sorted(by_cut)}
-    if n < 30:
-        return out
-    tot = sum(weights)
-    for name, series in preds.items():
-        rmse = []
-        for i in range(N_OUTCOMES):
-            e = sum(w * (p[i] - a[i]) ** 2
-                    for p, a, w in zip(series, actual, weights))
-            rmse.append((e / tot) ** 0.5)
-        rv_p = [rate_run_value(p) for p in series]
-        rv_a = [rate_run_value(a) for a in actual]
-        out[name] = {
-            "rmse": rmse,
-            "rv_rmse": (sum(w * (p - a) ** 2
-                            for p, a, w in zip(rv_p, rv_a, weights))
-                        / tot) ** 0.5,
-            "rv_corr": _corr(rv_p, rv_a),
-        }
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Board loading
 # ---------------------------------------------------------------------------
@@ -4161,10 +4589,6 @@ def score_stuff_prior(season: int = 2026, save_dir: Path = SAVE_DIR,
 # so the module stays importable without it.
 ASOF_DIR = SAVE_DIR / "asof"
 
-FG_ASOF_PATH = ("/api/leaders/major-league/data?age=&pos=all&stats={stats}"
-                "&lg=all&qual=0&season={season}&season1={season}&ind=0&type=8"
-                "&pageitems=5000&pagenum=1"
-                "&month=1000&startdate={start}&enddate={end}")
 
 
 def asof_board_path(side: str, season: int, as_of: str,
@@ -4174,136 +4598,25 @@ def asof_board_path(side: str, season: int, as_of: str,
 
 # The same board WITHOUT a date window. `month=0` is the full season, which is
 # what `fg_{bat,pit}_<season>.json` on disk are.
-FG_SEASON_PATH = ("/api/leaders/major-league/data?age=&pos=all&stats={stats}"
-                  "&lg=all&qual=0&season={season}&season1={season}&ind=0"
-                  "&type=8&pageitems=5000&pagenum=1&month=0")
-
-
-@contextlib.contextmanager
-def _fg_driver():
-    """ONE headless Firefox for a whole batch of board fetches.
-
-    Starting it costs several seconds, so a per-fetch browser would dominate a
-    weekly cutoff grid. Selenium is imported lazily so the module stays
-    importable without it.
-    """
-    from selenium import webdriver                      # lazy: heavy, optional
-    from selenium.webdriver.firefox.options import Options
-
-    opts = Options()
-    opts.add_argument("-headless")
-    driver = webdriver.Firefox(options=opts)
-    driver.set_page_load_timeout(60)
-    try:
-        driver.get("https://www.fangraphs.com/robots.txt")
-        yield driver
-    finally:
-        driver.quit()
-
-
-def _fg_rows(driver, path: str, label: str, verbose: bool = True,
-             wait_s: int = 90) -> Optional[List[dict]]:
-    """Run one `/api/leaders` fetch INSIDE the page and return its `data`.
-
-    The request has to originate from a fangraphs.com document — a plain
-    request 403s at Cloudflare — so it goes through `fetch()` in the page and
-    the result is polled off `window`.
-    """
-    driver.execute_script(
-        "window.__fgasof=null;"
-        f"fetch('{path}').then(r=>r.text())"
-        ".then(t=>{window.__fgasof=t}).catch(e=>{window.__fgasof='ERR:'+e});")
-    out = None
-    for _ in range(wait_s):
-        time.sleep(1)
-        out = driver.execute_script("return window.__fgasof")
-        if out:
-            break
-    if not out or str(out).startswith("ERR:"):
-        if verbose:
-            print(f"[fg] {label}: FAILED {str(out)[:60]}")
-        return None
-    try:
-        return json.loads(out).get("data", [])
-    except ValueError:
-        # An HTML challenge page parses as "Expecting value: line 1 column 1",
-        # which says nothing about the cause. Say what it is.
-        if verbose:
-            print(f"[fg] {label}: non-JSON ({len(out)}B), "
-                  f"likely a Cloudflare challenge")
-        return None
-
-
-def fetch_boards_asof(dates: Sequence[str], season: int = 2026,
-                      sides: Sequence[str] = ("bat", "pit"),
-                      save_dir: Path = SAVE_DIR,
-                      force: bool = False, verbose: bool = True
-                      ) -> Dict[tuple, int]:
-    """Fetch and cache season-to-date boards for each cutoff in `dates`."""
-    todo = [(side, d) for d in dates for side in sides
-            if force or not asof_board_path(side, season, d, save_dir).exists()]
-    got: Dict[tuple, int] = {}
-    if not todo:
-        if verbose:
-            print("[asof] all cutoffs already cached")
-        return got
-
-    with _fg_driver() as driver:
-        for side, as_of in todo:
-            path = FG_ASOF_PATH.format(stats=side, season=season,
-                                       start=f"{season}-01-01", end=as_of)
-            rows = _fg_rows(driver, path, f"{side} {as_of}", verbose)
-            if rows is None:
-                continue
-            dest = asof_board_path(side, season, as_of, save_dir)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "w") as fh:
-                json.dump(rows, fh)
-            got[(side, as_of)] = len(rows)
-            if verbose:
-                print(f"[asof] {side} {as_of}: {len(rows)} rows")
-    return got
-
-
-def fetch_season_boards(seasons: Sequence[int],
-                        sides: Sequence[str] = ("bat", "pit"),
-                        save_dir: Path = SAVE_DIR,
-                        force: bool = False, verbose: bool = True
-                        ) -> Dict[tuple, int]:
-    """Fetch and cache FULL-SEASON boards — `savedata/fg_<side>_<season>.json`.
-
-    Hitters carried 2026 only while pitchers carried 2024-26, so every matchup
-    blended three years of arm against one year of bat. `build_rates` picks up
-    whatever seasons are on disk, so this is a data fetch and not a model
-    change — but it moves every hitter's effective sample, so A/B it on the
-    slate rather than assuming it helps.
-    """
-    todo = [(side, s) for s in seasons for side in sides
-            if force or not (Path(save_dir) / f"fg_{side}_{s}.json").exists()]
-    got: Dict[tuple, int] = {}
-    if not todo:
-        if verbose:
-            print("[boards] all seasons already cached")
-        return got
-
-    with _fg_driver() as driver:
-        for side, season in todo:
-            path = FG_SEASON_PATH.format(stats=side, season=season)
-            rows = _fg_rows(driver, path, f"{side} {season}", verbose)
-            if rows is None:
-                continue
-            dest = Path(save_dir) / f"fg_{side}_{season}.json"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "w") as fh:
-                json.dump(rows, fh)
-            got[(side, season)] = len(rows)
-            _BOARDS.pop((side, int(season), str(save_dir)), None)
-            if verbose:
-                print(f"[boards] {side} {season}: {len(rows)} rows")
-    return got
 
 
 _ASOF_BOARDS: Dict[tuple, Optional[List[dict]]] = {}
+
+
+def _read_json_list(path: Path) -> Optional[List[dict]]:
+    """A JSON file expected to hold a list of rows, or None if it is absent or
+    holds something else.
+
+    Only the READ is shared with `load_board`, deliberately not the memo
+    check: `load_board` is reached per-PLAYER (3,700 times on a full slate),
+    and folding the lookup in here would make every cache HIT pay a path
+    construction it does not pay today.
+    """
+    if not path.exists():
+        return None
+    with open(path) as fh:
+        got = json.load(fh)
+    return got if isinstance(got, list) else None
 
 
 def load_board_asof(side: str, season: int, as_of: str,
@@ -4318,18 +4631,13 @@ def load_board_asof(side: str, season: int, as_of: str,
     key = (side, int(season), str(as_of), str(save_dir))
     if key in _ASOF_BOARDS:
         return _ASOF_BOARDS[key]
-    path = asof_board_path(side, season, as_of, save_dir)
-    data = None
-    if path.exists():
-        with open(path) as fh:
-            got = json.load(fh)
-        data = got if isinstance(got, list) else None
+    data = _read_json_list(asof_board_path(side, season, as_of, save_dir))
     _ASOF_BOARDS[key] = data
     return data
 
 
 def build_rates_asof(side: str, season: int, as_of: str,
-                     half_life: float = SEASON_HALF_LIFE,
+                     half_life: Optional[float] = None,
                      save_dir: Path = SAVE_DIR
                      ) -> Tuple[Dict[int, dict], List[float]]:
     """`build_rates` with the newest season TRUNCATED at `as_of`.
@@ -4339,13 +4647,14 @@ def build_rates_asof(side: str, season: int, as_of: str,
     environment, because the target league baseline is computed from the
     truncated board like everything else.
     """
+    half_life = SEASON_HALF_LIFE if half_life is None else float(half_life)
     rows = load_board_asof(side, season, as_of, save_dir)
     if rows is None:
         raise FileNotFoundError(
             f"mlb_sim: no cached as-of board for {side} {season} {as_of}. "
             f"Run fetch_boards_asof([...]) first — it needs headless Firefox.")
-    older = ((list(rate_seasons(side)) or available_seasons(side, save_dir))
-             if use_season_blend(side) else [])
+    older = ((list(RateIngest.rate_seasons(side)) or available_seasons(side, save_dir))
+             if RateIngest.use_season_blend(side) else [])
     boards = {s: load_board(side, s, save_dir) for s in older if s < season}
     boards[season] = rows
     # The contact prior is as-of too: pitches strictly before the cutoff, with
@@ -4353,7 +4662,9 @@ def build_rates_asof(side: str, season: int, as_of: str,
     # priced, so it leaks nothing).
     return build_rates(side, half_life=half_life, save_dir=save_dir,
                        boards=boards,
-                       bmielke_season=(season if USE_CONTACT_PRIOR else None),
+                       # Passed unconditionally now: this names WHICH season's
+                       # profiles to read, and `build_rates` owns the on/off.
+                       bmielke_season=season,
                        bmielke_asof_date=as_of,
                        # Within-season recency reads the SAME cutoff rule: only
                        # boards strictly before this one may contribute a
@@ -4378,19 +4689,15 @@ def load_board(side: str, season: int,
     key = (side, int(season), str(save_dir))
     if key in _BOARDS:
         return _BOARDS[key]
-    path = save_dir / f"fg_{side}_{season}.json"
-    data = None
-    if path.exists():
-        with open(path) as fh:
-            raw = json.load(fh)
-        data = raw if isinstance(raw, list) else None
+    data = _read_json_list(RateIngest._shared(save_dir)
+                           / f"fg_{side}_{season}.json")
     _BOARDS[key] = data
     return data
 
 
 def available_seasons(side: str, save_dir: Path = SAVE_DIR) -> List[int]:
     out = []
-    for p in save_dir.glob(f"fg_{side}_*.json"):
+    for p in RateIngest._shared(save_dir).glob(f"fg_{side}_*.json"):
         try:
             out.append(int(p.stem.rsplit("_", 1)[1]))
         except (ValueError, IndexError):
@@ -4404,6 +4711,37 @@ def _row_id(row: dict) -> Optional[int]:
 
 
 # --- platoon splits --------------------------------------------------------
+
+def _bat_hand(code: object) -> str:
+    """Canonical batting hand: "L", "R", or "B" for a switch hitter.
+
+    **FanGraphs spells a switch hitter "B", not "S", and this cost the platoon
+    term a tenth of the league.** `league_platoon_gaps` built its table under
+    the keys ("L", "R", "S"), so the switch-hitter row was never written — the
+    key simply never matched — and `platoon_rates` then looked up "B", missed,
+    and returned those hitters' rates untouched. Silent in both directions: the
+    builder emitted a two-row table that looked deliberate, and the consumer's
+    miss is indistinguishable from "handedness unknown", which it legitimately
+    no-ops on.
+
+    Measured on the 2026 board before the fix: 133 of 1,650 hitters in the rate
+    table and 14,870 of 139,125 league PA (10.7%) carried a "B" that nothing
+    could match, against a real switch-hitter gap of -0.0060 RV/PA.
+
+    Both spellings normalise here so the lookup cannot miss again if a source
+    uses the other one, and the canonical key is the one the DATA uses.
+
+    **Not applied at the source.** `Batter.bats` deliberately keeps the raw
+    board value: `mlb_ml._HAND_CODE` also keys switch hitters on "S" and so
+    also NaNs them, but its models were TRAINED through that same encoding and
+    are self-consistent with it. Normalising upstream would change a feature
+    under models fitted on the old one. That twin needs a fix and a retrain
+    together — see refactor_notes.md.
+    """
+    c = str(code or "").strip().upper()[:1]
+    return "B" if c == "S" else c
+
+
 # FanGraphs' splits API. One POST returns the WHOLE LEAGUE for one split, so
 # vs-LHP and vs-RHP cost two requests each for hitters and pitchers.
 #
@@ -4418,70 +4756,536 @@ def _row_id(row: dict) -> Optional[int]:
 # Rows key on FanGraphs' `playerId`, not MLBAM. The leaders board carries both
 # (`playerid` and `xMLBAMID`), which is the only reason this joins at all — no
 # separate id map is needed here because `load_board` already has the row.
-FG_SPLITS_URL = "https://www.fangraphs.com/api/leaders/splits/splits-leaders"
-FG_SPLIT_VS_LHP = 1
-FG_SPLIT_VS_RHP = 2
-FG_SPLIT_STANDARD = "1"      # G PA AB H 1B 2B 3B HR R RBI BB IBB SO HBP SB..
-FG_SPLIT_BATTED = "3"        # PA GB/FB LD% GB% FB% IFFB% HR/FB Pull% ...
+class Boards:
+    """Fetching and loading the boards themselves — season, as-of, and splits."""
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _fg_driver():
+        """ONE headless Firefox for a whole batch of board fetches.
 
-def fetch_fg_split(split_id: int, stat_type: str = FG_SPLIT_STANDARD,
-                   position: str = "B", season: int = 2026,
-                   save_dir: Path = SAVE_DIR, refresh: bool = False,
-                   timeout: float = 45.0) -> Dict[int, dict]:
-    """One split for the whole league, keyed by FanGraphs playerId.
+        Starting it costs several seconds, so a per-fetch browser would dominate a
+        weekly cutoff grid. Selenium is imported lazily so the module stays
+        importable without it.
+        """
+        from selenium import webdriver                      # lazy: heavy, optional
+        from selenium.webdriver.firefox.options import Options
 
-    Cached to disk — splits move once a day at most. Returns {} on failure,
-    which callers must treat as "unavailable", never as "zero PA".
-    """
-    path = save_dir / f"fg_split_{position}_{stat_type}_{split_id}_{season}.json"
-    if path.exists() and not refresh:
+        opts = Options()
+        opts.add_argument("-headless")
+        driver = webdriver.Firefox(options=opts)
+        driver.set_page_load_timeout(60)
         try:
-            with open(path) as fh:
-                return {int(k): v for k, v in json.load(fh).items()}
+            driver.get("https://www.fangraphs.com/robots.txt")
+            yield driver
+        finally:
+            driver.quit()
+
+    @staticmethod
+    def _fg_rows(driver, path: str, label: str, verbose: bool = True,
+                 wait_s: int = 90) -> Optional[List[dict]]:
+        """Run one `/api/leaders` fetch INSIDE the page and return its `data`.
+
+        The request has to originate from a fangraphs.com document — a plain
+        request 403s at Cloudflare — so it goes through `fetch()` in the page and
+        the result is polled off `window`.
+        """
+        driver.execute_script(
+            "window.__fgasof=null;"
+            f"fetch('{path}').then(r=>r.text())"
+            ".then(t=>{window.__fgasof=t}).catch(e=>{window.__fgasof='ERR:'+e});")
+        out = None
+        for _ in range(wait_s):
+            time.sleep(1)
+            out = driver.execute_script("return window.__fgasof")
+            if out:
+                break
+        if not out or str(out).startswith("ERR:"):
+            if verbose:
+                print(f"[fg] {label}: FAILED {str(out)[:60]}")
+            return None
+        try:
+            return json.loads(out).get("data", [])
+        except ValueError:
+            # An HTML challenge page parses as "Expecting value: line 1 column 1",
+            # which says nothing about the cause. Say what it is.
+            if verbose:
+                print(f"[fg] {label}: non-JSON ({len(out)}B), "
+                      f"likely a Cloudflare challenge")
+            return None
+
+    @staticmethod
+    def fetch_boards_asof(dates: Sequence[str], season: Optional[int] = None,
+                          sides: Sequence[str] = ("bat", "pit"),
+                          save_dir: Path = SAVE_DIR,
+                          force: bool = False, verbose: bool = True
+                          ) -> Dict[tuple, int]:
+        """Fetch and cache season-to-date boards for each cutoff in `dates`."""
+        season = CURRENT_SEASON if season is None else int(season)
+        todo = [(side, d) for d in dates for side in sides
+                if force or not asof_board_path(side, season, d, save_dir).exists()]
+        got: Dict[tuple, int] = {}
+        if not todo:
+            if verbose:
+                print("[asof] all cutoffs already cached")
+            return got
+
+        with Boards._fg_driver() as driver:
+            for side, as_of in todo:
+                path = FanGraphs.ASOF_PATH.format(stats=side, season=season,
+                                           start=f"{season}-01-01", end=as_of)
+                rows = Boards._fg_rows(driver, path, f"{side} {as_of}", verbose)
+                if rows is None:
+                    continue
+                dest = asof_board_path(side, season, as_of, save_dir)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "w") as fh:
+                    json.dump(rows, fh)
+                got[(side, as_of)] = len(rows)
+                if verbose:
+                    print(f"[asof] {side} {as_of}: {len(rows)} rows")
+        return got
+
+    @staticmethod
+    def fetch_season_boards(seasons: Sequence[int],
+                            sides: Sequence[str] = ("bat", "pit"),
+                            save_dir: Path = SAVE_DIR,
+                            force: bool = False, verbose: bool = True
+                            ) -> Dict[tuple, int]:
+        """Fetch and cache FULL-SEASON boards — `OddsAPI/savedata/fg_<side>_<season>.json`.
+
+        Hitters carried 2026 only while pitchers carried 2024-26, so every matchup
+        blended three years of arm against one year of bat. `build_rates` picks up
+        whatever seasons are on disk, so this is a data fetch and not a model
+        change — but it moves every hitter's effective sample, so A/B it on the
+        slate rather than assuming it helps.
+        """
+        todo = [(side, s) for s in seasons for side in sides
+                if force or not (RateIngest._shared(save_dir) / f"fg_{side}_{s}.json").exists()]
+        got: Dict[tuple, int] = {}
+        if not todo:
+            if verbose:
+                print("[boards] all seasons already cached")
+            return got
+
+        with Boards._fg_driver() as driver:
+            for side, season in todo:
+                path = FanGraphs.SEASON_PATH.format(stats=side, season=season)
+                rows = Boards._fg_rows(driver, path, f"{side} {season}", verbose)
+                if rows is None:
+                    continue
+                dest = RateIngest._shared(save_dir) / f"fg_{side}_{season}.json"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "w") as fh:
+                    json.dump(rows, fh)
+                got[(side, season)] = len(rows)
+                _BOARDS.pop((side, int(season), str(save_dir)), None)
+                if verbose:
+                    print(f"[boards] {side} {season}: {len(rows)} rows")
+        return got
+
+    @staticmethod
+    def fetch_fg_split(split_id: int, stat_type: str = FanGraphs.SPLIT_STANDARD,
+                       position: str = "B", season: Optional[int] = None,
+                       save_dir: Path = SAVE_DIR, refresh: bool = False,
+                       timeout: float = 45.0) -> Dict[int, dict]:
+        """One split for the whole league, keyed by FanGraphs playerId.
+
+        Cached to disk — splits move once a day at most. Returns {} on failure,
+        which callers must treat as "unavailable", never as "zero PA".
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        path = save_dir / f"fg_split_{position}_{stat_type}_{split_id}_{season}.json"
+        if path.exists() and not refresh:
+            try:
+                with open(path) as fh:
+                    return {int(k): v for k, v in json.load(fh).items()}
+            except (OSError, ValueError):
+                pass
+        body = {
+            "strPlayerId": "all", "strSplitArr": [split_id],
+            "strGroup": "season", "strPosition": position, "strType": stat_type,
+            "strStartDate": f"{season}-03-01", "strEndDate": f"{season}-11-01",
+            "strSplitTeams": False, "dctFilters": [], "strStatType": "player",
+            "strAutoPt": "false", "arrPlayerId": [], "strSplitArrPitch": [],
+            "arrWxTemperature": None, "arrWxPressure": None,
+            "arrWxAirDensity": None, "arrWxElevation": None,
+            "arrWxWindSpeed": None,
+        }
+        try:
+            r = requests.post(FanGraphs.SPLITS_URL, json=body, timeout=timeout)
+            if r.status_code != 200:
+                print(f"mlb_sim: FG split {split_id} HTTP {r.status_code}")
+                return {}
+            payload = r.json()
+        except Exception as e:
+            print(f"mlb_sim: FG split {split_id} failed: {e}")
+            return {}
+
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, dict) and "k" in data and "v" in data:
+            cols, rows = data["k"], data["v"]
+            recs = [dict(zip(cols, row)) for row in rows]
+        elif isinstance(data, list):
+            recs = data
+        else:
+            return {}
+        out: Dict[int, dict] = {}
+        for rec in recs:
+            pid = rec.get("playerId", rec.get("playerid"))
+            if pid is None:
+                continue
+            out[int(pid)] = rec
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump({str(k): v for k, v in out.items()}, fh)
+        except OSError:
+            pass
+        return out
+
+    @staticmethod
+    def league_platoon_gaps(season: Optional[int] = None, save_dir: Path = SAVE_DIR,
+                            refresh: bool = False) -> Dict[str, List[float]]:
+        """{bats: 9-vector of (vs LHP - vs RHP) rate gaps}, PA-weighted.
+
+        Derived from the splits boards rather than hardcoded, so it tracks the
+        league. Switch hitters get their own row — they turn around to face the
+        opposite side, so their gap is small and must not inherit either pure
+        row. They are keyed "B", which is FanGraphs' spelling and the thing this
+        was getting wrong; everything goes through `_bat_hand`, which is where
+        that is written up.
+
+        **The cache filename is VERSIONED.** A `platoon_gaps_<season>.json`
+        written before the fix holds a two-row table that loads without error
+        and silently reinstates the bug, and there is nothing in the file to
+        distinguish it from a season that genuinely had no switch hitters.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        path = save_dir / f"platoon_gaps_v2_{season}.json"
+        if path.exists() and not refresh:
+            try:
+                with open(path) as fh:
+                    return {k: list(v) for k, v in json.load(fh).items()}
+            except (OSError, ValueError):
+                pass
+
+        board = load_board("bat", season, save_dir)
+        bats = {int(r["playerid"]): str(r.get("Bats") or "")
+                for r in board if r.get("playerid") is not None}
+        vs = {"L": Boards.fetch_fg_split(FanGraphs.SPLIT_VS_LHP, FanGraphs.SPLIT_STANDARD, "B",
+                                  season, save_dir),
+              "R": Boards.fetch_fg_split(FanGraphs.SPLIT_VS_RHP, FanGraphs.SPLIT_STANDARD, "B",
+                                  season, save_dir)}
+        if not vs["L"] or not vs["R"]:
+            return {}
+
+        # PA-weighted league rate vector per (batter hand, pitcher hand)
+        acc: Dict[tuple, List[float]] = {}
+        tot: Dict[tuple, float] = {}
+        for hand, table in vs.items():
+            for pid, rec in table.items():
+                b = _bat_hand(bats.get(pid))
+                if not b:
+                    continue
+                counts, pa = outcome_counts(rec, "bat")
+                if pa <= 0:
+                    continue
+                key = (b, hand)
+                cur = acc.setdefault(key, [0.0] * N_OUTCOMES)
+                for i, c in enumerate(counts):
+                    cur[i] += c
+                tot[key] = tot.get(key, 0.0) + pa
+
+        out: Dict[str, List[float]] = {}
+        for b in ("L", "R", "B"):
+            kl, kr = (b, "L"), (b, "R")
+            # Both sides need enough PA for a rate to mean anything. Switch
+            # hitters clear this comfortably (4,552 vs LHP / 10,318 vs RHP in
+            # 2026), so the missing row was never this gate firing.
+            if tot.get(kl, 0) < 500 or tot.get(kr, 0) < 500:
+                continue
+            rl = [c / tot[kl] for c in acc[kl]]
+            rr = [c / tot[kr] for c in acc[kr]]
+            out[b] = [a - c for a, c in zip(rl, rr)]
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump(out, fh, indent=1)
+        except OSError:
+            pass
+        return out
+
+    @staticmethod
+    def gmli_stabilizer(season: Optional[int] = None, save_dir: Path = SAVE_DIR) -> float:
+        """Relief appearances at which a pitcher's gmLI is half-believed.
+
+        MEASURED, not chosen: the league median relief-appearance count, so a
+        typical arm is trusted about halfway and a one-game callup is not. Writing
+        a number here by hand was the original version and it disagreed with its
+        own comment by 2x.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        global _GMLI_STABILIZER
+        if _GMLI_STABILIZER is not None:
+            return _GMLI_STABILIZER
+        rows = load_board("pit", season, save_dir) or []
+        apps = [_num(r, "G") for r in rows
+                if _num(r, "G") and _num(r, "GS") / max(_num(r, "G"), 1.0) < 0.5]
+        apps.sort()
+        _GMLI_STABILIZER = float(apps[len(apps) // 2]) if apps else 15.0
+        return _GMLI_STABILIZER
+
+    @staticmethod
+    def runner_profile(row: dict) -> dict:
+        """Per-player running game from a FanGraphs batting row.
+
+        Returns {steal_attempt, steal_success, speed}. Both steal terms are shrunk
+        toward the league — a man with three attempts who made them all is not a
+        100% base stealer — and `speed` is an ODDS multiplier on every "does he
+        take the extra base" roll, not a probability.
+
+        Verified against the 270 everyday regulars: the attempt-weighted mean of
+        the derived success values is 0.778 against their real 0.769, so the
+        per-player numbers are right.
+
+        **The "known residual" here was a COUNTING BUG, and it is fixed
+        (2026-08-20).** This note used to record simulated steal success landing
+        near 0.86 against a real 0.769, and blamed the missing BATTERY term —
+        catcher pop time, pitcher time to the plate — calling it "a wiring job,
+        not a research one". It was neither. `simulate_game` inferred a stolen
+        base from the state change "man was on first, is now on second, no out
+        made", and the WILD PITCH branch produces exactly that signature, so every
+        wild pitch with a runner on first was booked as a steal.
+
+        Measured on 3,000 league-average clone games after crediting the steal
+        from the EVENT instead:
+
+            steals            1.427 / game   (real ~1.4)
+            caught            0.423 / game   (real ~0.4)
+            success rate      0.7714         (real 0.769)
+            the same games counted the OLD way:  0.8379   <- the "near 0.86"
+
+        So the discrepancy was the miscount in full, and the battery term is not
+        needed to close it. `batter_stolen_bases` is no longer provisional on that
+        account. A wild pitch is the battery losing the ball and a steal is the
+        runner beating a throw — on most wild pitches the catcher never throws at
+        all — so nothing about the two should ever have shared an inference.
+        """
+        sb, cs = _num(row, "SB"), _num(row, "CS")
+        on_first = _num(row, "1B") + _num(row, "BB") + _num(row, "HBP")
+        opp = max(on_first * OPP_PER_TIME_ON_FIRST, 0.0)
+        att = sb + cs
+
+        if opp > 0:
+            w = opp / (opp + STABILIZE_STEAL_ATTEMPT)
+            attempt = w * (att / opp) + (1.0 - w) * LG_STEAL_ATTEMPT
+        else:
+            attempt = LG_STEAL_ATTEMPT
+
+        if att > 0:
+            w = att / (att + STABILIZE_STEAL_SUCCESS)
+            success = w * (sb / att) + (1.0 - w) * LG_STEAL_SUCCESS
+        else:
+            success = LG_STEAL_SUCCESS
+
+        spd = _num(row, "Spd", LG_SPD)
+        speed = math.exp(SPD_TO_ODDS * (spd - LG_SPD)) if spd > 0 else 1.0
+
+        return {
+            "steal_attempt": min(max(attempt, 0.0), 0.85),
+            "steal_success": min(max(success, 0.30), 0.95),
+            "speed": min(max(speed, 0.50), 2.00),
+        }
+
+    @staticmethod
+    def _board_index(side: str, season: int,
+                     save_dir: Path) -> Dict[int, dict]:
+        """{player id: board row} for one side, built once per season+store.
+
+        `_bat_row` and `_pit_row` were the same eleven lines with the side and
+        the memo swapped.
+        """
+        memo = _BAT_ROWS if side == "bat" else _PIT_ROWS
+        key = (int(season), str(save_dir))
+        tab = memo.get(key)
+        if tab is None:
+            tab = {}
+            for row in load_board(side, season, save_dir) or []:
+                rid = _row_id(row)
+                if rid:
+                    tab[rid] = row
+            memo[key] = tab
+        return tab
+
+    @staticmethod
+    def _bat_row(pid: int, season: Optional[int] = None,
+                 save_dir: Path = SAVE_DIR) -> Optional[dict]:
+        """One hitter's board row, by id. Indexed, not scanned."""
+        season = CURRENT_SEASON if season is None else int(season)
+        return Boards._board_index("bat", season, save_dir).get(int(pid))
+
+    @staticmethod
+    def starter_pitch_hazard() -> List[float]:
+        """League pitch-indexed hook curve, memoised. [] when unavailable."""
+        if not _PITCH_HAZ:
+            _PITCH_HAZ.append(Fatigue.real_starter_pitch_hazard() or [])
+        return _PITCH_HAZ[0]
+
+    @staticmethod
+    def milb_only_pitcher(pid: int, season: Optional[int] = None,
+                          save_dir: Path = SAVE_DIR, *,
+                          is_starter: bool = False,
+                          hazard: Optional[List[float]] = None
+                          ) -> Optional[Pitcher]:
+        """A pitcher with NO major-league board row, built from the minors.
+
+        Returns None when the ladder has nothing on him, in which case the caller
+        keeps its existing fallback — this can only ever improve on "price the
+        debut as the club's ace", never make it worse by inventing a line.
+
+        His translated minor-league rate is the shrinkage TARGET and his own
+        translated counts are the evidence, with the per-outcome credit deciding
+        how much a minor-league batter faced is worth. A 333-batter Double-A line
+        is real information; it is not 333 major-league batters, and `credit` is
+        what encodes the difference.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        if not USE_MILB_PRIOR:
+            return None
+        tr = load_milb_translation(save_dir)
+        lvf = (tr.get("factor_by_level") or {}).get("pit")
+        if not lvf:
+            fac = (tr.get("factor") or {}).get("pit")
+            if not fac:
+                return None
+            lvf = {"AAA": list(fac)}
+        ck = "credit_applied" if MILB_CREDIT_SPEC == "applied" else "credit"
+        cred = list((tr.get(ck) or {}).get("pit") or [])
+        lv = (load_milb(season, save_dir).get("pit") or {}).get(str(int(pid)))
+        rates, n = MiLB.milb_evidence(lv, lvf)
+        if rates is None or n <= 0:
+            return None
+        league = league_baseline(load_board("pit", season, save_dir) or [], "pit")
+
+        # **CHED, on the path where it matters most.** This function is the
+        # DEBUT case — a pitcher with no major-league board row at all — and it
+        # builds a `Pitcher` directly, bypassing `build_rates` and therefore
+        # bypassing every prior applied there. So the one arm whose entire
+        # record is Triple-A was the one arm CHED could not reach, which is
+        # backwards: the export now scores 647 Triple-A-only pitchers who have
+        # never thrown a major-league pitch.
+        #
+        # It shifts the SHRINKAGE TARGET, the same seam and the same helpers as
+        # `build_rates`, so the two paths cannot drift apart on what CHED means.
+        if USE_CHED_PRIOR:
+            ch_rec = load_ched(season, save_dir).get(int(pid))
+            if ch_rec:
+                rel = float(ch_rec.get("rel", 0.0))
+                if rel > 0.0:
+                    league = stuff_prior(
+                        league, ched_delta(league, ch_rec["rv_delta"] * rel))
+
+        stab = stabilize_for("pit")
+        if cred and any(cred):
+            eff = [cred[i] * n for i in range(N_OUTCOMES)]
+            got = [(eff[i] / (eff[i] + stab[i])) * rates[i]
+                   + (stab[i] / (eff[i] + stab[i])) * league[i]
+                   for i in range(N_OUTCOMES)]
+        else:
+            got = list(rates)
+        name = f"{Boards._milb_name(pid, season, save_dir) or ('#' + str(pid))} [MiLB]"
+        # **`throws` used to be the empty string here, which is a second
+        # silent null on the same path.** `platoon_rates` no-ops when either
+        # hand is unknown — the honest default when it IS unknown — so every
+        # batter faced a debut with no handedness term at all. It is not
+        # unknown: the raw Triple-A cache carries `p_throws` on every pitch.
+        return Pitcher(name=name, rates=_normalize(got), player_id=int(pid),
+                       is_starter=is_starter, hazard=list(hazard or []),
+                       pitch_hazard=(Boards.starter_pitch_hazard() if is_starter
+                                     and USE_PITCH_HOOK else []),
+                       throws=Boards.milb_throws(pid, season, save_dir) or "")
+
+    @staticmethod
+    def milb_throws(pid: int, season: int,
+                    save_dir: Path = SAVE_DIR) -> Optional[str]:
+        """"L"/"R" for a minor leaguer, off the raw Triple-A pitch cache.
+
+        Memoised: the debut path is reached per game side, and this would
+        otherwise re-open a gzip for a one-character answer.
+        """
+        key = (int(season), int(pid))
+        if key in _MILB_THROWS:
+            return _MILB_THROWS[key]
+        out = None
+        try:
+            path = (Path(save_dir) / "milb_pitches" / MILB_ARSENAL_VERSION
+                    / str(season) / f"{int(pid)}.json.gz")
+            if path.exists():
+                with gzip.open(path, "rt") as fh:
+                    for row in json.load(fh):
+                        h = (row.get("p_throws") or "").upper()[:1]
+                        if h in ("L", "R"):
+                            out = h
+                            break
+        except (OSError, ValueError):
+            out = None
+        _MILB_THROWS[key] = out
+        return out
+
+    @staticmethod
+    def _milb_name(pid: int, season: int, save_dir: Path) -> Optional[str]:
+        """A minor leaguer's name.
+
+        The MiLB snapshot stores counts only, so this reads the roster cache —
+        without it the banner prints `#807739 [MiLB]`, and a starter you cannot
+        NAME is one nobody will sanity-check.
+        """
+        if not _MILB_NAMES:
+            try:
+                with open(RateIngest._shared(save_dir) / f"mlb_roster_{season}.json") as fh:
+                    for p in (json.load(fh).get("players") or []):
+                        if p.get("id") and p.get("fullName"):
+                            _MILB_NAMES[int(p["id"])] = str(p["fullName"])
+            except (OSError, ValueError, KeyError):
+                _MILB_NAMES[-1] = ""
+        got = _MILB_NAMES.get(int(pid))
+        if got:
+            return got
+        # **The roster snapshot is stale for exactly the players this matters
+        # for.** A debut is called up after the snapshot was taken, so the man the
+        # ladder exists to price is the one it cannot name. One cheap lookup,
+        # cached to disk, rather than printing an id.
+        cache = Path(save_dir) / "milb_names.json"
+        disk: Dict[str, str] = {}
+        try:
+            with open(cache) as fh:
+                disk = json.load(fh)
         except (OSError, ValueError):
             pass
-    body = {
-        "strPlayerId": "all", "strSplitArr": [split_id],
-        "strGroup": "season", "strPosition": position, "strType": stat_type,
-        "strStartDate": f"{season}-03-01", "strEndDate": f"{season}-11-01",
-        "strSplitTeams": False, "dctFilters": [], "strStatType": "player",
-        "strAutoPt": "false", "arrPlayerId": [], "strSplitArrPitch": [],
-        "arrWxTemperature": None, "arrWxPressure": None,
-        "arrWxAirDensity": None, "arrWxElevation": None,
-        "arrWxWindSpeed": None,
-    }
-    try:
-        r = requests.post(FG_SPLITS_URL, json=body, timeout=timeout)
-        if r.status_code != 200:
-            print(f"mlb_sim: FG split {split_id} HTTP {r.status_code}")
-            return {}
-        payload = r.json()
-    except Exception as e:
-        print(f"mlb_sim: FG split {split_id} failed: {e}")
-        return {}
+        if str(pid) in disk:
+            _MILB_NAMES[int(pid)] = disk[str(pid)]
+            return disk[str(pid)]
+        try:
+            import requests
+            r = requests.get(f"{STATSAPI}/people/{int(pid)}",
+                             params={"fields": "people,id,fullName"},
+                             timeout=StatsApi.TIMEOUT)
+            r.raise_for_status()
+            nm = ((r.json().get("people") or [{}])[0] or {}).get("fullName")
+        except Exception:                                    # noqa: BLE001
+            nm = None
+        if nm:
+            disk[str(pid)] = str(nm)
+            _MILB_NAMES[int(pid)] = str(nm)
+            try:
+                with open(cache, "w") as fh:
+                    json.dump(disk, fh)
+            except OSError:
+                pass
+        return nm
 
-    data = payload.get("data") if isinstance(payload, dict) else payload
-    if isinstance(data, dict) and "k" in data and "v" in data:
-        cols, rows = data["k"], data["v"]
-        recs = [dict(zip(cols, row)) for row in rows]
-    elif isinstance(data, list):
-        recs = data
-    else:
-        return {}
-    out: Dict[int, dict] = {}
-    for rec in recs:
-        pid = rec.get("playerId", rec.get("playerid"))
-        if pid is None:
-            continue
-        out[int(pid)] = rec
-    try:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump({str(k): v for k, v in out.items()}, fh)
-    except OSError:
-        pass
-    return out
+
 
 
 # Share of a hitter's plate appearances taken against a LEFT-handed pitcher.
@@ -4524,89 +5328,41 @@ PLATOON_PA_SHARE_VS_LHP = 0.290
 PLATOON_OWN_RELIABILITY = 0.25
 
 
-def league_platoon_gaps(season: int = 2026, save_dir: Path = SAVE_DIR,
-                        refresh: bool = False) -> Dict[str, List[float]]:
-    """{bats: 9-vector of (vs LHP - vs RHP) rate gaps}, PA-weighted.
-
-    Derived from the splits boards rather than hardcoded, so it tracks the
-    league. Switch-hitters ("S") get their own row: they bat from the opposite
-    side, so their gap is small and must not inherit either pure row.
-    """
-    path = save_dir / f"platoon_gaps_{season}.json"
-    if path.exists() and not refresh:
-        try:
-            with open(path) as fh:
-                return {k: list(v) for k, v in json.load(fh).items()}
-        except (OSError, ValueError):
-            pass
-
-    board = load_board("bat", season, save_dir)
-    bats = {int(r["playerid"]): str(r.get("Bats") or "")
-            for r in board if r.get("playerid") is not None}
-    vs = {"L": fetch_fg_split(FG_SPLIT_VS_LHP, FG_SPLIT_STANDARD, "B",
-                              season, save_dir),
-          "R": fetch_fg_split(FG_SPLIT_VS_RHP, FG_SPLIT_STANDARD, "B",
-                              season, save_dir)}
-    if not vs["L"] or not vs["R"]:
-        return {}
-
-    # PA-weighted league rate vector per (batter hand, pitcher hand)
-    acc: Dict[tuple, List[float]] = {}
-    tot: Dict[tuple, float] = {}
-    for hand, table in vs.items():
-        for pid, rec in table.items():
-            b = bats.get(pid)
-            if not b:
-                continue
-            counts, pa = outcome_counts(rec, "bat")
-            if pa <= 0:
-                continue
-            key = (b, hand)
-            cur = acc.setdefault(key, [0.0] * N_OUTCOMES)
-            for i, c in enumerate(counts):
-                cur[i] += c
-            tot[key] = tot.get(key, 0.0) + pa
-
-    out: Dict[str, List[float]] = {}
-    for b in ("L", "R", "S"):
-        kl, kr = (b, "L"), (b, "R")
-        if tot.get(kl, 0) < 500 or tot.get(kr, 0) < 500:
-            continue
-        rl = [c / tot[kl] for c in acc[kl]]
-        rr = [c / tot[kr] for c in acc[kr]]
-        out[b] = [a - c for a, c in zip(rl, rr)]
-    try:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump(out, fh, indent=1)
-    except OSError:
-        pass
-    return out
-
-
-_PLATOON_GAPS: Optional[Dict[str, List[float]]] = None
+# **Keyed by season, like every other cache in this module.** It was a single
+# Optional slot keyed on NOTHING: the first call loaded one season's table and
+# every later call reused it whatever season it asked for, so
+# `platoon_rates(..., season=2024)` returned the 2026 answer byte-for-byte. It
+# was also the one board cache missing from both pool workers' clear lists, and
+# workers are reused across jobs — so a multi-season backtest priced every
+# season with whichever loaded first.
+_PLATOON_GAPS: Dict[int, Dict[str, List[float]]] = {}
 
 
 def platoon_rates(rates: Sequence[float], bats: str, throws: str,
-                  season: int = 2026,
-                  w_l: float = PLATOON_PA_SHARE_VS_LHP) -> List[float]:
+                  season: Optional[int] = None,
+                  w_l: Optional[float] = None) -> List[float]:
     """A hitter's rates against THIS pitcher's hand, centred on his own mix.
 
     No-ops when either hand is unknown, which is the honest default — the
     alternative is to guess a handedness and apply a real effect off it.
     """
-    global _PLATOON_GAPS
+    w_l = PLATOON_PA_SHARE_VS_LHP if w_l is None else float(w_l)
+    season = CURRENT_SEASON if season is None else int(season)
     if not bats or not throws:
         return list(rates)
     t = throws.upper()[:1]
     if t not in ("L", "R"):
         return list(rates)
-    if _PLATOON_GAPS is None:
+    gaps = _PLATOON_GAPS.get(season)
+    if gaps is None:
         try:
-            _PLATOON_GAPS = league_platoon_gaps(season)
+            gaps = Boards.league_platoon_gaps(season)
         except Exception:
-            _PLATOON_GAPS = {}
-    gap = _PLATOON_GAPS.get(bats.upper()[:1])
+            gaps = {}
+        # cached even when empty, so a season with no splits on disk does not
+        # re-attempt the load on every one of the ~3,000 PA in a game
+        _PLATOON_GAPS[season] = gaps
+    gap = gaps.get(_bat_hand(bats))
     if not gap:
         return list(rates)
     # Centred: the season rate already contains his real opponent mix.
@@ -4617,7 +5373,7 @@ def platoon_rates(rates: Sequence[float], bats: str, throws: str,
 
 
 def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
-                half_life: float = SEASON_HALF_LIFE,
+                half_life: Optional[float] = None,
                 save_dir: Path = SAVE_DIR,
                 boards: Optional[Dict[int, List[dict]]] = None,
                 bmielke_season: Optional[int] = None,
@@ -4640,6 +5396,16 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     the recency path from having a second, differently-frozen view of the
     season.
     """
+    half_life = SEASON_HALF_LIFE if half_life is None else float(half_life)
+    # **Two pitch-characteristic priors on the same rate vector is a DOUBLE
+    # COUNT.** Loud rather than silent: both terms are individually real, so
+    # the combination would read as an improvement while charging a pitcher's
+    # stuff twice.
+    if USE_STUFF_PRIOR and USE_CHED_PRIOR:
+        raise ValueError(
+            "mlb_sim: USE_STUFF_PRIOR and USE_CHED_PRIOR are both on. They "
+            "read the same pitch characteristics and move the same prior — "
+            "pick one.")
     if boards is None:
         # An explicit `seasons` is an INSTRUCTION and is honoured whole; the
         # flag only decides what the default is. Tested on `seasons` itself
@@ -4648,9 +5414,9 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
         # what the comment above it claimed.
         asked = bool(seasons)
         seasons = (list(seasons) if seasons
-                   else list(rate_seasons(side))
+                   else list(RateIngest.rate_seasons(side))
                    or available_seasons(side, save_dir))
-        if seasons and not asked and not use_season_blend(side):
+        if seasons and not asked and not RateIngest.use_season_blend(side):
             seasons = [max(seasons)]
         # `boards` is not gated here at all: the as-of path builds it and has
         # already applied the gate.
@@ -4658,14 +5424,15 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     boards = {s: b for s, b in boards.items() if b}
     if not boards:
         raise FileNotFoundError(
-            f"mlb_sim: no cached fg_{side}_*.json boards in {save_dir}")
+            f"mlb_sim: no cached fg_{side}_*.json boards in "
+            f"{RateIngest._shared(save_dir)}")
 
     newest = max(boards)
     older = [s for s in boards if s < newest]
     # A PARTIAL newest board is not the season's environment — it is the
     # environment of the weeks played so far, and in April that is 15% short
     # on home runs while the weather term charges the same cold again.
-    league = projected_league_baseline(
+    league = RateIngest.projected_league_baseline(
         boards[newest], side, boards[max(older)] if older else None)
     newest_rows = {pid: row for row in boards[newest]
                    if (pid := _row_id(row)) is not None}
@@ -4690,10 +5457,20 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     st_stab: Tuple[float, ...] = ()
     if side == "pit" and USE_STUFF_PRIOR:
         st_delta = stuff_deltas(
-            stuff_source_board(newest, boards[newest], as_of, save_dir),
+            Stuff.stuff_source_board(newest, boards[newest], as_of, save_dir),
             stuff_model_for(newest, save_dir))
         if st_delta:
             st_stab = stuff_stabilize(stabilize_for(side))
+
+    ched_tab: Dict[int, dict] = {}
+    if side == "pit" and USE_CHED_PRIOR:
+        ched_tab = load_ched(newest, save_dir)
+        if not ched_tab:
+            # A silent empty here would run the baseline under CHED's name,
+            # which is the failure `_ml_adjuster` records for hierarchy arms.
+            print(f"mlb_sim: USE_CHED_PRIOR is on but ched_{newest}.json is "
+                  f"missing or empty — no CHED applied. Run "
+                  f"`ched_train.export({newest})`.")
 
     # Triple-A lines and their fitted translation. The rule is DATE-AWARE and
     # not season-aware — count what was played before the game being priced,
@@ -4718,6 +5495,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     milb_tabs: Dict[int, dict] = {}
     milb_sw: Dict[int, float] = {}
     milb_fac: List[float] = []
+    _lvf: Dict[str, List[float]] = {}
     milb_cred: List[float] = []
     if USE_MILB_PRIOR:
         _tr = load_milb_translation(save_dir)
@@ -4742,7 +5520,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
                     _t = (load_milb(_s, save_dir).get(side) or {})
                 if _t:
                     milb_tabs[_s] = _t
-            milb_sw = season_weights(sorted(milb_tabs), half_life)
+            milb_sw = RateIngest.season_weights(sorted(milb_tabs), half_life)
 
     # WITHIN-SEASON recency, on the newest board only — the older seasons are
     # already decayed by `SEASON_HALF_LIFE` and no as-of boards exist for them.
@@ -4792,7 +5570,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
             # only makes sense together with the matching change to
             # `park_run_tilt`, so the two are gated on the same flag.
             if USE_PARK_DECONTAM:
-                counts = decontaminate_counts(
+                counts = ParkFactors.decontaminate_counts(
                     counts, pa, pid, side, season, save_dir=save_dir)
             per_player.setdefault(pid, {})[season] = (counts, pa)
             names.setdefault(pid, row.get("PlayerName") or str(pid))
@@ -4803,15 +5581,27 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
                 hands[pid] = str(h)
 
     bm_lg: List[float] = []
-    if side == "bat" and bmielke_season is not None:
-        bm_rel, bm_lg = contact_profiles(list(per_player), bmielke_season,
+    # **The gate lives HERE and nowhere else, and that is the fix.** It used to
+    # be applied only by `build_rates_asof`, which passed
+    # `bmielke_season=(season if USE_CONTACT_PRIOR else None)` — so the flag
+    # reached the AS-OF path and the LIVE path never saw it. Measured with the
+    # flag on: 430 of 1,608 hitters moved on the as-of path and 0 of 1,650 on
+    # the live one. Turning it on would have scored a backtest against a model
+    # the slate does not run, silently, which is what "wiring not earned" in
+    # sim_state's lever table was pointing at.
+    #
+    # `bmielke_season` is now a DATA argument: it says which season's contact
+    # profiles to read, not whether to read any. The flag decides that, once.
+    if side == "bat" and USE_CONTACT_PRIOR:
+        bm_season = newest if bmielke_season is None else int(bmielke_season)
+        bm_rel, bm_lg = Contact.contact_profiles(list(per_player), bm_season,
                                          bmielke_asof_date, save_dir)
 
     # Blend ONCE. The Triple-A centring below needs every player's MLB sample
     # before the per-player loop can start, and blending twice is the same
     # work done twice on the hot path of the backtest.
     blended: Dict[int, Tuple[List[float], float]] = {
-        pid: blend_seasons(by_season, half_life, newest)
+        pid: RateIngest.blend_seasons(by_season, half_life, newest)
         for pid, by_season in per_player.items()}
 
     # --- the Triple-A evidence, and the population it is centred on --------
@@ -4828,7 +5618,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
             ac = [0.0] * N_OUTCOMES
             an = 0.0
             for _s, _tab in milb_tabs.items():
-                _c, _n = _milb_level_evidence(_tab.get(str(pid)), _lvf, milb_fac)
+                _c, _n = MiLB._milb_level_evidence(_tab.get(str(pid)), _lvf, milb_fac)
                 if _c is None or _n <= 0:
                     continue
                 _w = milb_sw.get(_s, 0.0)
@@ -4866,7 +5656,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     def _share(pid, by_season) -> float:
         # Recency-weighted MEAN share, not a sum: three seasons of 200 PA is a
         # part-timer with plenty of evidence, not a regular.
-        sw = season_weights(list(by_season) + ([newest] if newest not in
+        sw = RateIngest.season_weights(list(by_season) + ([newest] if newest not in
                                                by_season else []), half_life)
         wsum = sum(sw[s] for s in by_season) or 1.0
         # RAW playing time here, never the recency-weighted count: the curve
@@ -4883,7 +5673,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
     if side == "bat" and "bat" in _prior_sides() and BAT_PRIOR_CENTRED:
         _curve = prior_curve(side, newest, save_dir, boards[newest])
         if _curve:
-            centre_tilt = solve_bat_prior_tilt(
+            centre_tilt = RateIngest.solve_bat_prior_tilt(
                 [(_share(pid, bs), blended[pid][0])
                  for pid, bs in per_player.items()],
                 _curve, league, stabilize_for(side))
@@ -4933,7 +5723,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
                               stabilize_for(side), center=milb_center)
         got = bm_rel.get(pid)
         if got is not None:
-            prior = contact_prior(prior, got[0], got[1], bm_lg)
+            prior = Contact.contact_prior(prior, got[0], got[1], bm_lg)
         # An arm whose PITCHES say something his results have not had time to.
         # The weight moves with the prior: a prior that explains part of his
         # talent leaves less for his own line to resolve, so `stab` grows.
@@ -4942,6 +5732,22 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
         if delta is not None:
             prior = stuff_prior(prior, delta)
             stab = st_stab or stab
+        # CHED occupies the same seam and is gated on the same argument: the
+        # prior now knows something his own line has not had time to say, so
+        # the observed rates are trusted LESS, not more.
+        ch_rec = ched_tab.get(pid)
+        if ch_rec is not None:
+            # **No gate. The weight IS the gate.** `rel` is
+            # n_eff/(n_eff+80) with Triple-A pitches counted at their
+            # measured worth, so a thin arm is trusted a little and an
+            # unsampled one approaches zero smoothly. The old hard cut at 80
+            # pitches bought nothing at 79 and everything at 80, which is the
+            # discontinuity this file objects to for fatigue at batter 19.
+            rel = float(ch_rec.get("rel", 1.0))
+            if rel > 0.0:
+                prior = stuff_prior(
+                    prior, ched_delta(prior, ch_rec["rv_delta"] * rel))
+                stab = stuff_stabilize(stabilize_for(side))
         rec = {
             "name": names[pid],
             # Stabilisation is PER SIDE — a pitcher's own home-run and contact
@@ -4957,7 +5763,7 @@ def build_rates(side: str, seasons: Optional[Sequence[int]] = None,
         if side == "bat":
             latest = newest_rows.get(pid)
             if latest is not None:
-                rec["run"] = runner_profile(latest)
+                rec["run"] = Boards.runner_profile(latest)
         out[pid] = rec
     return out, league
 
@@ -5008,7 +5814,7 @@ PEN_DEPTH = 14   # raising it changes nothing: the board yields ~14 per club
 
 
 def build_side(abbr: str, bat_table: Dict[int, dict],
-               pit_table: Dict[int, dict], season: int = 2026,
+               pit_table: Dict[int, dict], season: Optional[int] = None,
                hazard: Optional[List[float]] = None,
                save_dir: Path = SAVE_DIR):
     """A ready-to-simulate TeamSide for one club, straight off the boards.
@@ -5018,6 +5824,7 @@ def build_side(abbr: str, bat_table: Dict[int, dict],
     a posted lineup and a named probable — good enough to validate the engine,
     and the seam where the live `EffortMLB` lineup/probable path plugs in.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     bats = team_roster("bat", season, save_dir).get(abbr, [])
     pits = team_roster("pit", season, save_dir).get(abbr, [])
     if len(bats) < 9 or not pits:
@@ -5082,7 +5889,7 @@ def build_side(abbr: str, bat_table: Dict[int, dict],
             arm = Pitcher(name=r.get("PlayerName") or str(pid),
                           rates=replacement_pitcher_rates(), player_id=pid)
         g = _num(r, "G")
-        tr = load_reliever_traits(season).get(arm.player_id or -1) or {}
+        tr = RelieverTraits.load_reliever_traits(season).get(arm.player_id or -1) or {}
         # **Do NOT default a missing traits row to league-average usage.**
         # It fed BOTH the old availability gate and the selection score, so a
         # league-average default made an arm we know NOTHING about a workhorse
@@ -5105,7 +5912,7 @@ def build_side(abbr: str, bat_table: Dict[int, dict],
         # chosen minimum: a one-game callup can post a 2.39 gmLI off a single
         # high-leverage cameo, and that is one appearance, not a closer. Same
         # empirical-Bayes treatment every other rate in this module gets.
-        w = g / (g + gmli_stabilizer(season, save_dir))
+        w = g / (g + Boards.gmli_stabilizer(season, save_dir))
         arm.gm_li = w * raw_li + (1.0 - w) * 1.0
         # A long man is inferred from innings per appearance, not labelled.
         arm.multi_inning = float(tr.get("ip_per_outing", 1.0)) >= 1.25
@@ -5148,23 +5955,6 @@ OPP_PER_TIME_ON_FIRST = 1.65
 _GMLI_STABILIZER: Optional[float] = None
 
 
-def gmli_stabilizer(season: int = 2026, save_dir: Path = SAVE_DIR) -> float:
-    """Relief appearances at which a pitcher's gmLI is half-believed.
-
-    MEASURED, not chosen: the league median relief-appearance count, so a
-    typical arm is trusted about halfway and a one-game callup is not. Writing
-    a number here by hand was the original version and it disagreed with its
-    own comment by 2x.
-    """
-    global _GMLI_STABILIZER
-    if _GMLI_STABILIZER is not None:
-        return _GMLI_STABILIZER
-    rows = load_board("pit", season, save_dir) or []
-    apps = [_num(r, "G") for r in rows
-            if _num(r, "G") and _num(r, "GS") / max(_num(r, "G"), 1.0) < 0.5]
-    apps.sort()
-    _GMLI_STABILIZER = float(apps[len(apps) // 2]) if apps else 15.0
-    return _GMLI_STABILIZER
 LG_STEAL_ATTEMPT = 0.096
 LG_STEAL_SUCCESS = 0.78
 STABILIZE_STEAL_ATTEMPT = 60.0   # opportunities
@@ -5173,88 +5963,12 @@ LG_SPD = 4.5                     # league mean Bill James speed score
 SPD_TO_ODDS = 0.188              # Spd 7.0 -> ~1.6x odds of taking a base
 
 
-def runner_profile(row: dict) -> dict:
-    """Per-player running game from a FanGraphs batting row.
-
-    Returns {steal_attempt, steal_success, speed}. Both steal terms are shrunk
-    toward the league — a man with three attempts who made them all is not a
-    100% base stealer — and `speed` is an ODDS multiplier on every "does he
-    take the extra base" roll, not a probability.
-
-    Verified against the 270 everyday regulars: the attempt-weighted mean of
-    the derived success values is 0.778 against their real 0.769, so the
-    per-player numbers are right.
-
-    **The "known residual" here was a COUNTING BUG, and it is fixed
-    (2026-08-20).** This note used to record simulated steal success landing
-    near 0.86 against a real 0.769, and blamed the missing BATTERY term —
-    catcher pop time, pitcher time to the plate — calling it "a wiring job,
-    not a research one". It was neither. `simulate_game` inferred a stolen
-    base from the state change "man was on first, is now on second, no out
-    made", and the WILD PITCH branch produces exactly that signature, so every
-    wild pitch with a runner on first was booked as a steal.
-
-    Measured on 3,000 league-average clone games after crediting the steal
-    from the EVENT instead:
-
-        steals            1.427 / game   (real ~1.4)
-        caught            0.423 / game   (real ~0.4)
-        success rate      0.7714         (real 0.769)
-        the same games counted the OLD way:  0.8379   <- the "near 0.86"
-
-    So the discrepancy was the miscount in full, and the battery term is not
-    needed to close it. `batter_stolen_bases` is no longer provisional on that
-    account. A wild pitch is the battery losing the ball and a steal is the
-    runner beating a throw — on most wild pitches the catcher never throws at
-    all — so nothing about the two should ever have shared an inference.
-    """
-    sb, cs = _num(row, "SB"), _num(row, "CS")
-    on_first = _num(row, "1B") + _num(row, "BB") + _num(row, "HBP")
-    opp = max(on_first * OPP_PER_TIME_ON_FIRST, 0.0)
-    att = sb + cs
-
-    if opp > 0:
-        w = opp / (opp + STABILIZE_STEAL_ATTEMPT)
-        attempt = w * (att / opp) + (1.0 - w) * LG_STEAL_ATTEMPT
-    else:
-        attempt = LG_STEAL_ATTEMPT
-
-    if att > 0:
-        w = att / (att + STABILIZE_STEAL_SUCCESS)
-        success = w * (sb / att) + (1.0 - w) * LG_STEAL_SUCCESS
-    else:
-        success = LG_STEAL_SUCCESS
-
-    spd = _num(row, "Spd", LG_SPD)
-    speed = math.exp(SPD_TO_ODDS * (spd - LG_SPD)) if spd > 0 else 1.0
-
-    return {
-        "steal_attempt": min(max(attempt, 0.0), 0.85),
-        "steal_success": min(max(success, 0.30), 0.95),
-        "speed": min(max(speed, 0.50), 2.00),
-    }
-
-
 _BAT_ROWS: Dict[tuple, Dict[int, dict]] = {}
 
 
-def _bat_row(pid: int, season: int = 2026,
-             save_dir: Path = SAVE_DIR) -> Optional[dict]:
-    """One hitter's board row, by id. Indexed, not scanned."""
-    key = (int(season), str(save_dir))
-    tab = _BAT_ROWS.get(key)
-    if tab is None:
-        tab = {}
-        for row in load_board("bat", season, save_dir) or []:
-            rid = _row_id(row)
-            if rid:
-                tab[rid] = row
-        _BAT_ROWS[key] = tab
-    return tab.get(int(pid))
-
-
-def make_batter(pid: int, table: Dict[int, dict], season: int = 2026,
+def make_batter(pid: int, table: Dict[int, dict], season: Optional[int] = None,
                 save_dir: Path = SAVE_DIR) -> Optional[Batter]:
+    season = CURRENT_SEASON if season is None else int(season)
     rec = table.get(pid)
     if rec is None:
         return None
@@ -5263,9 +5977,9 @@ def make_batter(pid: int, table: Dict[int, dict], season: int = 2026,
     # attached in `build_side` only, so every hitter arriving through a POSTED
     # LINEUP ran on the league constants while the board-built lineup ran on
     # his own rates. Same silent-fallback shape as the `bats` bug in 5b.1.
-    brow = _bat_row(pid, season, save_dir)
-    adv = (runner_advance_rates(pid, _num(brow, "XBR"), _num(brow, "Spd"))
-           if brow is not None else runner_advance_rates(pid))
+    brow = Boards._bat_row(pid, season, save_dir)
+    adv = (RunnerAdvance.runner_advance_rates(pid, _num(brow, "XBR"), _num(brow, "Spd"))
+           if brow is not None else RunnerAdvance.runner_advance_rates(pid))
     # `bats` must be set HERE, not only in `build_side`. The live path
     # (`build_side_live`, posted lineups) builds hitters through this function
     # and never touched handedness, so the platoon term would have silently
@@ -5280,114 +5994,7 @@ def make_batter(pid: int, table: Dict[int, dict], season: int = 2026,
 _PITCH_HAZ: List[List[float]] = []
 
 
-def starter_pitch_hazard() -> List[float]:
-    """League pitch-indexed hook curve, memoised. [] when unavailable."""
-    if not _PITCH_HAZ:
-        _PITCH_HAZ.append(real_starter_pitch_hazard() or [])
-    return _PITCH_HAZ[0]
-
-
-def milb_only_pitcher(pid: int, season: int = 2026,
-                      save_dir: Path = SAVE_DIR, *,
-                      is_starter: bool = False,
-                      hazard: Optional[List[float]] = None
-                      ) -> Optional[Pitcher]:
-    """A pitcher with NO major-league board row, built from the minors.
-
-    Returns None when the ladder has nothing on him, in which case the caller
-    keeps its existing fallback — this can only ever improve on "price the
-    debut as the club's ace", never make it worse by inventing a line.
-
-    His translated minor-league rate is the shrinkage TARGET and his own
-    translated counts are the evidence, with the per-outcome credit deciding
-    how much a minor-league batter faced is worth. A 333-batter Double-A line
-    is real information; it is not 333 major-league batters, and `credit` is
-    what encodes the difference.
-    """
-    if not USE_MILB_PRIOR:
-        return None
-    tr = load_milb_translation(save_dir)
-    lvf = (tr.get("factor_by_level") or {}).get("pit")
-    if not lvf:
-        fac = (tr.get("factor") or {}).get("pit")
-        if not fac:
-            return None
-        lvf = {"AAA": list(fac)}
-    ck = "credit_applied" if MILB_CREDIT_SPEC == "applied" else "credit"
-    cred = list((tr.get(ck) or {}).get("pit") or [])
-    lv = (load_milb(season, save_dir).get("pit") or {}).get(str(int(pid)))
-    rates, n = milb_evidence(lv, lvf)
-    if rates is None or n <= 0:
-        return None
-    league = league_baseline(load_board("pit", season, save_dir) or [], "pit")
-    stab = stabilize_for("pit")
-    if cred and any(cred):
-        eff = [cred[i] * n for i in range(N_OUTCOMES)]
-        got = [(eff[i] / (eff[i] + stab[i])) * rates[i]
-               + (stab[i] / (eff[i] + stab[i])) * league[i]
-               for i in range(N_OUTCOMES)]
-    else:
-        got = list(rates)
-    name = f"{_milb_name(pid, season, save_dir) or ('#' + str(pid))} [MiLB]"
-    return Pitcher(name=name, rates=_normalize(got), player_id=int(pid),
-                   is_starter=is_starter, hazard=list(hazard or []),
-                   pitch_hazard=(starter_pitch_hazard() if is_starter
-                                 and USE_PITCH_HOOK else []),
-                   throws="")
-
-
 _MILB_NAMES: Dict[int, str] = {}
-
-
-def _milb_name(pid: int, season: int, save_dir: Path) -> Optional[str]:
-    """A minor leaguer's name.
-
-    The MiLB snapshot stores counts only, so this reads the roster cache —
-    without it the banner prints `#807739 [MiLB]`, and a starter you cannot
-    NAME is one nobody will sanity-check.
-    """
-    if not _MILB_NAMES:
-        try:
-            with open(Path(save_dir) / f"mlb_roster_{season}.json") as fh:
-                for p in (json.load(fh).get("players") or []):
-                    if p.get("id") and p.get("fullName"):
-                        _MILB_NAMES[int(p["id"])] = str(p["fullName"])
-        except (OSError, ValueError, KeyError):
-            _MILB_NAMES[-1] = ""
-    got = _MILB_NAMES.get(int(pid))
-    if got:
-        return got
-    # **The roster snapshot is stale for exactly the players this matters
-    # for.** A debut is called up after the snapshot was taken, so the man the
-    # ladder exists to price is the one it cannot name. One cheap lookup,
-    # cached to disk, rather than printing an id.
-    cache = Path(save_dir) / "milb_names.json"
-    disk: Dict[str, str] = {}
-    try:
-        with open(cache) as fh:
-            disk = json.load(fh)
-    except (OSError, ValueError):
-        pass
-    if str(pid) in disk:
-        _MILB_NAMES[int(pid)] = disk[str(pid)]
-        return disk[str(pid)]
-    try:
-        import requests
-        r = requests.get(f"{STATSAPI}/people/{int(pid)}",
-                         params={"fields": "people,id,fullName"}, timeout=10)
-        r.raise_for_status()
-        nm = ((r.json().get("people") or [{}])[0] or {}).get("fullName")
-    except Exception:                                    # noqa: BLE001
-        nm = None
-    if nm:
-        disk[str(pid)] = str(nm)
-        _MILB_NAMES[int(pid)] = str(nm)
-        try:
-            with open(cache, "w") as fh:
-                json.dump(disk, fh)
-        except OSError:
-            pass
-    return nm
 
 
 def make_pitcher(pid: int, table: Dict[int, dict], is_starter: bool = False,
@@ -5397,7 +6004,7 @@ def make_pitcher(pid: int, table: Dict[int, dict], is_starter: bool = False,
         return None
     return Pitcher(name=rec["name"], rates=rec["rates"], player_id=pid,
                    is_starter=is_starter, hazard=list(hazard or []),
-                   pitch_hazard=(starter_pitch_hazard() if is_starter
+                   pitch_hazard=(Boards.starter_pitch_hazard() if is_starter
                                  and USE_PITCH_HOOK else []),
                    throws=rec.get("hand", ""))
 
@@ -5451,37 +6058,6 @@ MILB_LEVELS: Dict[int, str] = {11: "AAA", 12: "AA", 13: "A+", 14: "A",
 MILB_CACHE_FMT = "milb_{season}.json"
 
 
-def milb_cache_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
-    return Path(save_dir) / MILB_CACHE_FMT.format(season=season)
-
-
-def fetch_milb_split(season: int, sport_id: int, group: str,
-                     timeout: float = 90.0) -> List[dict]:
-    """One level, one side, one season — every player in the pool.
-
-    `playerPool=ALL` is required: the default returns only qualified players,
-    which would drop exactly the thin-sample arms this whole section exists
-    for. The limit is set past the largest level (Rookie ball, ~2,100 rows) so
-    a silent truncation cannot happen; `totalSplits` is checked against what
-    came back rather than trusted.
-    """
-    r = requests.get(f"{STATSAPI}/stats",
-                     params={"stats": "season", "group": group,
-                             "sportId": sport_id, "season": season,
-                             "playerPool": "ALL", "limit": 5000},
-                     timeout=timeout)
-    r.raise_for_status()
-    blk = (r.json().get("stats") or [{}])[0]
-    rows = blk.get("splits") or []
-    want = blk.get("totalSplits")
-    if want and len(rows) < want:
-        raise RuntimeError(
-            f"mlb_sim: MiLB {season} sport {sport_id} {group} returned "
-            f"{len(rows)} of {want} rows — raise the limit rather than "
-            f"shipping a silently truncated level.")
-    return rows
-
-
 # The StatsAPI keys that carry the counts `outcome_counts` needs. Stored under
 # the SOURCE's names, not remapped on the way in: a cache that has already been
 # interpreted cannot be re-interpreted when the interpretation turns out to be
@@ -5498,89 +6074,6 @@ _MILB_BAT_KEYS = ("plateAppearances", "atBats", "strikeOuts", "baseOnBalls",
                   "gamesPlayed")
 
 
-def _milb_team(sp: dict) -> Dict[str, object]:
-    """The affiliate on a StatsAPI split.
-
-    **This used to read `abbreviation` and always got nothing.** The nested
-    team object at the league-wide `/stats` endpoint carries `{id, name,
-    link}` — there is no `abbreviation` on it — so `or ""` swallowed the miss
-    and `team` was empty in 100% of records: 22,684 season rows across five
-    levels, and every as-of snapshot. The park item in 5.11.1 was blocked on
-    that, not on missing data.
-
-    `id` is stored as the key rather than a name because affiliates rename and
-    relocate (the same club is Reno/RNO/2310 depending on who is asking) and
-    the id is the only stable join to `/teams?sportId=11`.
-    """
-    t = sp.get("team") or {}
-    out: Dict[str, object] = {}
-    if t.get("id") is not None:
-        out["team_id"] = int(t["id"])
-    if t.get("name"):
-        out["team"] = str(t["name"])
-    return out
-
-
-def collect_milb(seasons: Sequence[int] = (2026,), refresh: bool = False,
-                 save_dir: Path = SAVE_DIR, verbose: bool = True) -> dict:
-    """Every affiliated minor league line, per season, cached to disk.
-
-    Shape: {"pit": {pid: {level: {...counts}}}, "bat": {...}}. A player who
-    moved up mid-season appears under EVERY level he threw at, because the
-    levels have to stay separable — averaging a man's Double-A and Triple-A
-    lines before the level factors are known destroys the thing that makes
-    them measurable.
-    """
-    out: Dict[str, Dict[str, Dict[str, dict]]] = {}
-    for season in seasons:
-        path = milb_cache_path(season, save_dir)
-        if path.exists() and not refresh:
-            try:
-                with open(path) as fh:
-                    got = json.load(fh)
-                if got.get("pit"):
-                    out[str(season)] = got
-                    if verbose:
-                        print(f"[milb] {season}: cached "
-                              f"({len(got['pit'])} pitchers, "
-                              f"{len(got.get('bat', {}))} hitters)")
-                    continue
-            except (OSError, ValueError):
-                pass
-        acc: Dict[str, Dict[str, Dict[str, dict]]] = {"pit": {}, "bat": {}}
-        for sid, level in MILB_LEVELS.items():
-            for side, group, keys in (("pit", "pitching", _MILB_PIT_KEYS),
-                                      ("bat", "hitting", _MILB_BAT_KEYS)):
-                try:
-                    rows = fetch_milb_split(season, sid, group)
-                except Exception as e:
-                    print(f"[milb] {season} {level} {group} FAILED: {e}")
-                    continue
-                for sp in rows:
-                    pid = ((sp.get("player") or {}).get("id"))
-                    st = sp.get("stat") or {}
-                    if pid is None:
-                        continue
-                    rec = {k: st.get(k) for k in keys if st.get(k) is not None}
-                    if not rec:
-                        continue
-                    rec.update(_milb_team(sp))
-                    acc[side].setdefault(str(int(pid)), {})[level] = rec
-                if verbose:
-                    print(f"[milb] {season} {level:>3s} {group:<8s} "
-                          f"{len(rows):>5d} rows", flush=True)
-        payload = {"season": season, "levels": list(MILB_LEVELS.values()),
-                   **acc}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump(payload, fh)
-        out[str(season)] = payload
-        if verbose:
-            print(f"[milb] {season}: {len(acc['pit'])} pitchers, "
-                  f"{len(acc['bat'])} hitters -> {path.name}")
-    return out
-
-
 _MILB: Dict[int, dict] = {}
 
 
@@ -5589,18 +6082,11 @@ def load_milb(season: int, save_dir: Path = SAVE_DIR) -> dict:
     if season in _MILB:
         return _MILB[season]
     try:
-        with open(milb_cache_path(season, save_dir)) as fh:
+        with open(MiLB.milb_cache_path(season, save_dir)) as fh:
             _MILB[season] = json.load(fh)
     except (OSError, ValueError):
         _MILB[season] = {}
     return _MILB[season]
-
-
-def milb_line(pid: int, season: int, side: str = "pit",
-              save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
-    """{level: counts} for one player in one season. Empty when he has none."""
-    got = load_milb(season, save_dir).get(side) or {}
-    return got.get(str(int(pid))) or {}
 
 
 # --- Triple-A PARK FACTORS, per outcome (5.11.1) --------------------------
@@ -5632,60 +6118,8 @@ def milb_line(pid: int, season: int, side: str = "pit",
 MILB_PARK_FMT = "milb_park_{season}.json"
 # One season of park factor is mostly noise and averaging is an arithmetic
 # improvement rather than a fitted one — the same argument as §8's three-season
-# major league window, and the reason `AB_ARMS["window3"]` exists.
+# major league window, and the reason `PARK_RUN_WINDOW` ships at 3.
 MILB_PARK_WINDOW = 3
-
-
-def milb_park_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
-    return Path(save_dir) / MILB_PARK_FMT.format(season=season)
-
-
-def _split_counts(st: dict, side: str) -> Tuple[Optional[List[float]], float]:
-    """One home/away split as the engine's nine outcomes.
-
-    Mirrors `_milb_counts` exactly — same singles-by-subtraction, same
-    ground/air split off the feed's own ratio. Kept as its own function
-    because the split rows are shaped like a `stat` block rather than like the
-    level records `collect_milb` stores.
-    """
-    n = float(st.get("battersFaced") or st.get("plateAppearances") or 0.0)
-    if n <= 0:
-        return None, 0.0
-    h = float(st.get("hits", 0) or 0); d = float(st.get("doubles", 0) or 0)
-    t = float(st.get("triples", 0) or 0); hr = float(st.get("homeRuns", 0) or 0)
-    k = float(st.get("strikeOuts", 0) or 0)
-    bb = float(st.get("baseOnBalls", 0) or 0)
-    hbp = float(st.get("hitByPitch", 0) or 0)
-    go = float(st.get("groundOuts", 0) or 0)
-    ao = float(st.get("airOuts", 0) or 0)
-    outs = max(n - k - bb - hbp - h, 0.0)
-    gshare = go / (go + ao) if (go + ao) > 0 else 0.5
-    c = [0.0] * N_OUTCOMES
-    c[K], c[BB], c[HBP] = k, bb, hbp
-    c[GB_OUT], c[AIR_OUT] = outs * gshare, outs * (1.0 - gshare)
-    c[S1B], c[S2B], c[S3B], c[HR] = max(h - d - t - hr, 0.0), d, t, hr
-    return c, n
-
-
-def fetch_milb_park_splits(season: int, group: str,
-                           timeout: float = 180.0) -> List[dict]:
-    """Every player's HOME and AWAY line at Triple-A, one request."""
-    r = requests.get(f"{STATSAPI}/stats",
-                     params={"stats": "statSplits", "group": group,
-                             "sportId": MILB_ASOF_SPORT, "season": season,
-                             "sitCodes": "h,a", "playerPool": "ALL",
-                             "limit": 10000},
-                     timeout=timeout)
-    r.raise_for_status()
-    blk = (r.json().get("stats") or [{}])[0]
-    rows = blk.get("splits") or []
-    want = blk.get("totalSplits")
-    if want and len(rows) < want:
-        raise RuntimeError(
-            f"mlb_sim: Triple-A {season} {group} home/away returned "
-            f"{len(rows)} of {want} splits — raise the limit rather than "
-            f"shipping a silently truncated park factor.")
-    return rows
 
 
 # --- MINOR-LEAGUE STATCAST -------------------------------------------------
@@ -5718,49 +6152,33 @@ def fetch_milb_park_splits(season: int, group: str,
 # reads a minor-league row without modification.
 MILB_STATCAST_LEVELS: Tuple[str, ...] = ("AAA",)
 MILB_STATCAST_CHUNK_DAYS = 3
+# Bumped when the arsenal aggregate GAINS a column. v1 carried shape only
+# (usage/spin/velo/X/Z per type); v2 adds the DELIVERY — arm angle, extension,
+# release position and its spread — without which the CHED slot regression has
+# no right-hand side.
+MILB_ARSENAL_VERSION = "v2"
+_MILB_THROWS: Dict[tuple, Optional[str]] = {}
+# Chunk fetches run in parallel. The major-league scrape did 2,516
+# pitcher-seasons at 5 workers with 0 failures; the windows here are
+# independent and every one that lands is cached, so a rate-limited window
+# costs exactly itself and is picked up by the next run. That is what makes a
+# high worker count cheap to try rather than a gamble.
+MILB_STATCAST_WORKERS = 22
+# What the raw minor-league pitch cache keeps. Mirrors `scrape_pitches.KEEP`
+# so a Triple-A pitch and a major-league one are the same record.
+MILB_RAW_KEEP = (
+    "game_pk", "game_date", "pitcher", "batter", "pitch_type",
+    "p_throws", "stand",
+    "release_speed", "release_spin_rate", "spin_axis",
+    "release_pos_x", "release_pos_y", "release_pos_z",
+    "release_extension", "arm_angle",
+    "vx0", "vy0", "vz0", "ax", "ay", "az", "pfx_x", "pfx_z",
+    "plate_x", "plate_z", "sz_top", "sz_bot",
+    "description", "events", "balls", "strikes",
+)
 _MILB_SPORT_LEVEL = {11: "AAA", 12: "AA", 13: "A+", 14: "A", 16: "ROK",
                      17: "ROK"}
 _MILB_GAME_LEVEL: Dict[int, str] = {}
-
-
-def _milb_game_level(pk: int, timeout: float = 15.0) -> Optional[str]:
-    """The level a minor-league game was played at, via StatsAPI."""
-    pk = int(pk)
-    if pk in _MILB_GAME_LEVEL:
-        return _MILB_GAME_LEVEL[pk]
-    try:
-        import requests
-        r = requests.get(f"{STATSAPI}.1/game/{pk}/feed/live",
-                         params={"fields": "gameData,teams,home,sport,id"},
-                         timeout=timeout)
-        r.raise_for_status()
-        sid = (((r.json().get("gameData") or {}).get("teams") or {})
-               .get("home") or {}).get("sport", {}).get("id")
-        lvl = _MILB_SPORT_LEVEL.get(sid)
-    except Exception:                                     # noqa: BLE001
-        lvl = None
-    _MILB_GAME_LEVEL[pk] = lvl
-    return lvl
-
-
-def _milb_statcast_chunk(start: str, end: str, timeout: float = 120.0
-                         ) -> List[dict]:
-    """One date window of minor-league Statcast, as dict rows."""
-    import csv as _csv
-    import io
-    import requests
-    r = requests.get("https://baseballsavant.mlb.com/statcast_search/csv",
-                     params={"all": "true", "hfSea": f"{start[:4]}|",
-                             "game_date_gt": start, "game_date_lt": end,
-                             "type": "details", "minors": "true"},
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
-    r.raise_for_status()
-    text = r.text.lstrip("\ufeff")          # the BOM, see the header note
-    rows = list(_csv.DictReader(io.StringIO(text)))
-    if len(rows) >= 25000:
-        _progress(f"milb-statcast: {start}..{end} hit the 25,000-row cap — "
-                  f"NARROW THE WINDOW, this window is truncated")
-    return rows
 
 
 # Savant's pitch codes are the MODERN Statcast set; the board's `pfx` columns
@@ -5808,266 +6226,7 @@ _SAVANT_TO_PFX: Dict[str, str] = {
 _SAVANT_DROP = {"PO", "IN", "AB", "UN", ""}
 
 
-def milb_arsenal_row(pitches: Sequence[dict]) -> Dict[str, float]:
-    """Per-pitch-type aggregates under the FANGRAPHS board's column names.
-
-    Emitting the board's own names is the point: `_arsenal_block` then reads a
-    Triple-A arm exactly as it reads a major-league one, with no branch.
-
-    **SPIN and VELOCITY come out on the board's scale; MOVEMENT DOES NOT.**
-    Checked against 455 major-league arms with 100+ TBF:
-
-        spin_fb   MLB 2284  AAA 2247   (-37, sd 143 vs 142)
-        spin_bb   MLB 2501  AAA 2418   (-83)
-        spin_off  MLB 1756  AAA 1699   (-57)
-        velo_sep  MLB 6.23  AAA 6.06   (-0.16)
-        mov_h     MLB 2.31  AAA 4.14   (+1.82)   <- NOT comparable
-        mov_v     MLB 3.14  AAA 6.97   (+3.83)   <- NOT comparable
-
-    The spin figures land on the league fastball number (the board's own
-    `pfxspFA` averages 2,290) with matching dispersion, and Triple-A sitting
-    slightly below is the right direction. Movement does not: Triple-A arms do
-    not have twice the break, so the `x12` feet-to-inches conversion here is
-    the wrong transform for the board's convention — MLB's 3.14 cannot be
-    inches of induced vertical break, a four-seam alone carries ~15. The two
-    axes are off by different ratios (1.79 and 2.22), so it is not one scale
-    factor either; sign convention and signed averaging across handedness are
-    both in play.
-
-    **So use the spin and velocity columns; calibrate the movement ones against
-    major-league arms before trusting them.** The fit is available for free —
-    the same pitcher has a Statcast line and a board row in the same season,
-    which is exactly how the level ladder was fitted.
-    """
-    by: Dict[str, List[dict]] = {}
-    for p in pitches:
-        pt = (p.get("pitch_type") or "").strip().upper()
-        if pt in _SAVANT_DROP:
-            continue
-        pt = _SAVANT_TO_PFX.get(pt, pt)
-        by.setdefault(pt, []).append(p)
-    n_tot = sum(len(v) for v in by.values())
-    if not n_tot:
-        return {}
-    out: Dict[str, float] = {}
-
-    def _mean(rows, key, scale=1.0):
-        vals = []
-        for r in rows:
-            v = r.get(key)
-            try:
-                if v not in (None, "", "null"):
-                    vals.append(float(v) * scale)
-            except (TypeError, ValueError):
-                continue
-        return sum(vals) / len(vals) if vals else None
-
-    for pt, rows in by.items():
-        out[f"pfx{pt}%"] = 100.0 * len(rows) / n_tot
-        for key, col, sc in (("pfxsp{pt}", "release_spin_rate", 1.0),
-                             ("pfxv{pt}", "release_speed", 1.0),
-                             ("pfx{pt}-X", "pfx_x",
-                              12.0 * MILB_PFX_BREAK_TO_BOARD),
-                             ("pfx{pt}-Z", "pfx_z",
-                              12.0 * MILB_PFX_BREAK_TO_BOARD)):
-            v = _mean(rows, col, sc)
-            if v is not None:
-                out[key.format(pt=pt)] = v
-    out["milb_pitches"] = float(n_tot)
-    return out
-
-
-def collect_milb_statcast(seasons: Sequence[int] = (2026,),
-                          refresh: bool = False,
-                          save_dir: Path = SAVE_DIR,
-                          levels: Sequence[str] = MILB_STATCAST_LEVELS,
-                          start: str = "-03-15", end: str = "-10-05",
-                          verbose: bool = True) -> dict:
-    """Minor-league Statcast, aggregated per pitcher and stored ALONGSIDE the
-    existing minor-league lines in `milb_<season>.json` under `"arsenal"`.
-
-    Deliberately not a separate artifact: it is the same players, the same
-    season and the same cache, and a second file would drift out of step with
-    the first the moment one of them is refreshed.
-    """
-    out: Dict[str, dict] = {}
-    for season in seasons:
-        path = milb_cache_path(season, save_dir)
-        got = {}
-        if path.exists():
-            try:
-                with open(path) as fh:
-                    got = json.load(fh)
-            except (OSError, ValueError):
-                got = {}
-        if got.get("arsenal") and not refresh:
-            if verbose:
-                print(f"[milb-statcast] {season}: cached "
-                      f"({len(got['arsenal'])} pitchers)")
-            out[str(season)] = got
-            continue
-        by_pitcher: Dict[str, List[dict]] = {}
-        d0 = datetime.date.fromisoformat(f"{season}{start}")
-        d1 = datetime.date.fromisoformat(f"{season}{end}")
-        today = datetime.date.today()
-        if d1 > today:
-            d1 = today
-        cur = d0
-        kept = seen = 0
-        while cur <= d1:
-            hi = min(cur + datetime.timedelta(days=MILB_STATCAST_CHUNK_DAYS - 1),
-                     d1)
-            try:
-                rows = _milb_statcast_chunk(cur.isoformat(), hi.isoformat())
-            except Exception as e:                        # noqa: BLE001
-                _progress(f"milb-statcast {cur}..{hi}: {type(e).__name__} {e}")
-                rows = []
-            seen += len(rows)
-            for r in rows:
-                pk = r.get("game_pk")
-                if not pk:
-                    continue
-                lvl = _milb_game_level(pk)
-                if lvl not in levels:
-                    continue
-                pid = r.get("pitcher")
-                if not pid:
-                    continue
-                by_pitcher.setdefault(str(int(float(pid))), []).append(r)
-                kept += 1
-            if verbose:
-                print(f"[milb-statcast] {season} {cur}..{hi}  "
-                      f"{len(rows):6d} rows, kept {kept}", flush=True)
-            cur = hi + datetime.timedelta(days=1)
-        arsenal = {pid: milb_arsenal_row(v) for pid, v in by_pitcher.items()}
-        arsenal = {k: v for k, v in arsenal.items() if v}
-        got["arsenal"] = arsenal
-        got["arsenal_levels"] = list(levels)
-        got.setdefault("season", season)
-        with open(path, "w") as fh:
-            json.dump(got, fh)
-        if verbose:
-            print(f"[milb-statcast] {season}: {seen} pitches seen, {kept} at "
-                  f"{'/'.join(levels)}, {len(arsenal)} pitchers -> {path}")
-        out[str(season)] = got
-    return out
-
-
-def collect_milb_park(seasons: Sequence[int] = (2026,), refresh: bool = False,
-                      save_dir: Path = SAVE_DIR, verbose: bool = True) -> dict:
-    """Per-club, per-outcome Triple-A park factors, cached per season.
-
-    Shape: {"pit": {team_id: [factor x 9]}, "bat": {...}, "n": {...}}.
-
-    The factor is a club's HOME rate over its own ROAD rate, which is the
-    standard construction: it holds the roster fixed, so it cannot be read as
-    "this park scores a lot" when what is really true is "the two clubs who
-    play here are good". Raw runs at a venue is NOT a park factor (§6.1).
-    """
-    out: Dict[str, dict] = {}
-    for season in seasons:
-        path = milb_park_path(season, save_dir)
-        if path.exists() and not refresh:
-            try:
-                with open(path) as fh:
-                    got = json.load(fh)
-                if got.get("bat"):
-                    out[str(season)] = got
-                    if verbose:
-                        print(f"[milbpark] {season}: cached "
-                              f"({len(got['bat'])} clubs)")
-                    continue
-            except (OSError, ValueError):
-                pass
-        acc: Dict[str, dict] = {}
-        cnt: Dict[str, dict] = {}
-        for side, group in (("bat", "hitting"), ("pit", "pitching")):
-            try:
-                rows = fetch_milb_park_splits(season, group)
-            except Exception as e:
-                print(f"[milbpark] {season} {group} FAILED: {e}")
-                continue
-            tot: Dict[int, Dict[str, List[float]]] = {}
-            for sp in rows:
-                tid = ((sp.get("team") or {}).get("id"))
-                code = ((sp.get("split") or {}).get("code"))
-                if tid is None or code not in ("h", "a"):
-                    continue
-                c, n = _split_counts(sp.get("stat") or {}, side)
-                if c is None:
-                    continue
-                rec = tot.setdefault(int(tid), {"h": [0.0] * (N_OUTCOMES + 1),
-                                                "a": [0.0] * (N_OUTCOMES + 1)})
-                for i in range(N_OUTCOMES):
-                    rec[code][i] += c[i]
-                rec[code][N_OUTCOMES] += n
-            fac: Dict[str, List[float]] = {}
-            nn: Dict[str, List[float]] = {}
-            for tid, rec in tot.items():
-                hn, an = rec["h"][N_OUTCOMES], rec["a"][N_OUTCOMES]
-                if hn < 500 or an < 500:
-                    continue
-                f = []
-                for i in range(N_OUTCOMES):
-                    hr_, ar_ = rec["h"][i] / hn, rec["a"][i] / an
-                    # A club with zero of an outcome at home is a sample
-                    # problem, not a park that forbids triples. Leave it at 1.
-                    f.append((hr_ / ar_) if (hr_ > 0 and ar_ > 0) else 1.0)
-                fac[str(tid)] = f
-                nn[str(tid)] = [hn, an]
-            acc[side] = fac
-            cnt[side] = nn
-            if verbose:
-                print(f"[milbpark] {season} {group:<9s} {len(fac)} clubs "
-                      f"from {len(rows)} splits", flush=True)
-        payload = {"season": season, "n": cnt, **acc}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump(payload, fh)
-        out[str(season)] = payload
-    return out
-
-
 _MILB_PARK: Dict[int, dict] = {}
-
-
-def load_milb_park(season: int, save_dir: Path = SAVE_DIR) -> dict:
-    if season in _MILB_PARK:
-        return _MILB_PARK[season]
-    try:
-        with open(milb_park_path(season, save_dir)) as fh:
-            _MILB_PARK[season] = json.load(fh)
-    except (OSError, ValueError):
-        _MILB_PARK[season] = {}
-    return _MILB_PARK[season]
-
-
-def milb_park_factor(team_id: Optional[int], season: int, side: str = "bat",
-                     window: int = MILB_PARK_WINDOW,
-                     save_dir: Path = SAVE_DIR) -> Optional[List[float]]:
-    """A club's per-outcome park factor, averaged over `window` seasons.
-
-    Averaged rather than taken from the target season alone for §8's reason:
-    the noise falls as sqrt(n) while the true park effect survives, so the
-    window is an arithmetic improvement and not a fitted one. Returns None
-    when the club has no usable season, which means "do not adjust" — never a
-    default factor of 1.0 dressed up as a measurement.
-    """
-    if team_id is None:
-        return None
-    acc = [0.0] * N_OUTCOMES
-    got = 0
-    for s in range(season - window + 1, season + 1):
-        f = ((load_milb_park(s, save_dir).get(side) or {})
-             .get(str(int(team_id))))
-        if not f:
-            continue
-        for i in range(N_OUTCOMES):
-            acc[i] += f[i]
-        got += 1
-    if not got:
-        return None
-    return [acc[i] / got for i in range(N_OUTCOMES)]
 
 
 # --- AS-OF minor league snapshots — the date-aware rule (5.11.1) ----------
@@ -6108,138 +6267,6 @@ MILB_ASOF_SPORT = 11                                  # AAA — see 5.11's table
 MILB_ASOF_FMT = "milb_{season}_{as_of}.json"
 
 
-def milb_park_report(season: int = 2026, save_dir: Path = SAVE_DIR) -> None:
-    """The spread and the persistence — the two things that decide whether a
-    park factor is real or a season of noise (§8)."""
-    got = load_milb_park(season, save_dir)
-    if not got:
-        raise SystemExit(f"mlb_sim: no Triple-A park factors for {season}. "
-                         f"Run `python mlb_sim.py milbpark --refresh` first.")
-    print(f"\nTriple-A PARK FACTORS — {season}, home rate over own road rate\n")
-    for side in ("bat", "pit"):
-        fac = got.get(side) or {}
-        if not fac:
-            continue
-        print(f"  {side.upper()}  ({len(fac)} clubs)")
-        print(f"    {'outcome':<9s}{'min':>8s}{'median':>9s}{'max':>8s}"
-              f"{'sd':>8s}")
-        for i, nm in enumerate(OUTCOME_NAMES):
-            v = sorted(f[i] for f in fac.values())
-            if not v:
-                continue
-            print(f"    {nm:<9s}{v[0]:>8.3f}{statistics.median(v):>9.3f}"
-                  f"{v[-1]:>8.3f}{statistics.pstdev(v):>8.3f}")
-        print()
-    # persistence, which is what separates a factor from a season of noise
-    prev = load_milb_park(season - 1, save_dir)
-    if prev.get("bat"):
-        for side in ("bat", "pit"):
-            a_, b_ = (prev.get(side) or {}), (got.get(side) or {})
-            keys = sorted(set(a_) & set(b_))
-            if len(keys) < 10:
-                continue
-            print(f"  {side.upper()} year-over-year correlation "
-                  f"{season-1} -> {season}  (n={len(keys)})")
-            for i, nm in enumerate(OUTCOME_NAMES):
-                x = [a_[k][i] for k in keys]
-                y = [b_[k][i] for k in keys]
-                mx, my = statistics.mean(x), statistics.mean(y)
-                num = sum((p - mx) * (q - my) for p, q in zip(x, y))
-                den = (sum((p - mx) ** 2 for p in x)
-                       * sum((q - my) ** 2 for q in y)) ** 0.5
-                if den > 0:
-                    print(f"    {nm:<9s}{num/den:>+8.3f}")
-            print()
-
-
-def milb_asof_path(season: int, as_of: str,
-                   save_dir: Path = SAVE_DIR) -> Path:
-    return Path(save_dir) / "asof" / MILB_ASOF_FMT.format(season=season,
-                                                          as_of=as_of)
-
-
-def fetch_milb_asof_split(season: int, sport_id: int, group: str, as_of: str,
-                          timeout: float = 120.0) -> List[dict]:
-    """One level, one side, season-to-date through `as_of`.
-
-    Same contract as `fetch_milb_split` — `playerPool=ALL` so the thin arms
-    this exists for are not dropped as unqualified, and `totalSplits` checked
-    rather than trusted so a silent truncation cannot ship.
-    """
-    r = requests.get(f"{STATSAPI}/stats",
-                     params={"stats": "byDateRange", "group": group,
-                             "sportId": sport_id, "season": season,
-                             "playerPool": "ALL", "limit": 5000,
-                             "startDate": f"{season}-01-01",
-                             "endDate": as_of},
-                     timeout=timeout)
-    r.raise_for_status()
-    blk = (r.json().get("stats") or [{}])[0]
-    rows = blk.get("splits") or []
-    want = blk.get("totalSplits")
-    if want and len(rows) < want:
-        raise RuntimeError(
-            f"mlb_sim: MiLB as-of {season} {as_of} sport {sport_id} {group} "
-            f"returned {len(rows)} of {want} rows — raise the limit rather "
-            f"than shipping a silently truncated level.")
-    return rows
-
-
-def collect_milb_asof(cutoffs: Sequence[str], season: int = 2026,
-                      save_dir: Path = SAVE_DIR, force: bool = False,
-                      verbose: bool = True) -> Dict[str, int]:
-    """Cache a Triple-A snapshot per cutoff, in `collect_milb`'s shape.
-
-    Stored under the same `{level: counts}` nesting the season cache uses so
-    `_milb_counts` reads either one unchanged, and under the SOURCE's key names
-    for the reason recorded on `_MILB_PIT_KEYS`: a cache that has already been
-    interpreted cannot be re-interpreted when the interpretation moves.
-    """
-    got: Dict[str, int] = {}
-    level = MILB_LEVELS[MILB_ASOF_SPORT]
-    for as_of in cutoffs:
-        dest = milb_asof_path(season, as_of, save_dir)
-        if dest.exists() and not force:
-            if verbose:
-                print(f"[milb-asof] {season} {as_of}: cached")
-            continue
-        acc: Dict[str, Dict[str, Dict[str, dict]]] = {"pit": {}, "bat": {}}
-        ok = True
-        for side, group, keys in (("pit", "pitching", _MILB_PIT_KEYS),
-                                  ("bat", "hitting", _MILB_BAT_KEYS)):
-            try:
-                rows = fetch_milb_asof_split(season, MILB_ASOF_SPORT, group,
-                                             as_of)
-            except Exception as e:
-                print(f"[milb-asof] {season} {as_of} {group} FAILED: {e}")
-                ok = False
-                continue
-            for sp in rows:
-                pid = ((sp.get("player") or {}).get("id"))
-                st = sp.get("stat") or {}
-                if pid is None:
-                    continue
-                rec = {k: st.get(k) for k in keys if st.get(k) is not None}
-                if not rec:
-                    continue
-                rec.update(_milb_team(sp))
-                acc[side].setdefault(str(int(pid)), {})[level] = rec
-        if not ok:
-            # A half-written snapshot would read as "this player had no
-            # Triple-A record", which is the one thing the file must never
-            # say by accident. Skip the cutoff instead.
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(dest, "w") as fh:
-            json.dump({"season": season, "as_of": as_of, "levels": [level],
-                       **acc}, fh)
-        got[as_of] = len(acc["pit"]) + len(acc["bat"])
-        if verbose:
-            print(f"[milb-asof] {season} {as_of}: {len(acc['pit'])} pitchers, "
-                  f"{len(acc['bat'])} hitters -> {dest.name}", flush=True)
-    return got
-
-
 _MILB_ASOF: Dict[tuple, dict] = {}
 
 
@@ -6254,59 +6281,22 @@ def load_milb_asof(season: int, as_of: str,
     if key in _MILB_ASOF:
         return _MILB_ASOF[key]
     try:
-        with open(milb_asof_path(season, as_of, save_dir)) as fh:
+        with open(MiLB.milb_asof_path(season, as_of, save_dir)) as fh:
             _MILB_ASOF[key] = json.load(fh)
     except (OSError, ValueError):
         _MILB_ASOF[key] = {}
     return _MILB_ASOF[key]
 
 
-def available_milb_asof(season: int = 2026,
+def available_milb_asof(season: Optional[int] = None,
                         save_dir: Path = SAVE_DIR) -> List[str]:
     """Cutoffs with a cached Triple-A snapshot, ascending."""
+    season = CURRENT_SEASON if season is None else int(season)
     d = Path(save_dir) / "asof"
     if not d.is_dir():
         return []
     pre = f"milb_{season}_"
     return sorted(f.name[len(pre):-len(".json")] for f in d.glob(f"{pre}*.json"))
-
-
-def milb_report(season: int = 2026, save_dir: Path = SAVE_DIR) -> None:
-    """How much minor league evidence exists for the arms the model is
-    thinnest on — the check that this is worth wiring, before it is wired."""
-    milb = load_milb(season, save_dir)
-    if not milb:
-        raise SystemExit(f"mlb_sim: no MiLB cache for {season}. "
-                         f"Run `python mlb_sim.py milb --refresh` first.")
-    board = {_row_id(r): r for r in (load_board("pit", season, save_dir) or [])
-             if _row_id(r)}
-    thin = sorted(((pid, _num(r, "TBF")) for pid, r in board.items()
-                   if 0 < _num(r, "TBF") < 150), key=lambda x: x[1])
-    covered = [(p, t) for p, t in thin if milb_line(p, season, "pit", save_dir)]
-    extra = []
-    for pid, tbf in covered:
-        m_tbf = sum(v.get("battersFaced", 0)
-                    for v in milb_line(pid, season, "pit", save_dir).values())
-        extra.append((pid, tbf, m_tbf))
-    print(f"\nMiLB coverage for THIN major league arms — {season}\n")
-    print(f"  pitchers on the board under 150 TBF   {len(thin)}")
-    print(f"  of those with a minor league line     {len(covered)} "
-          f"({len(covered)/max(len(thin),1):.0%})")
-    if extra:
-        gain = [m / t for _, t, m in extra if t > 0]
-        print(f"  median MiLB batters faced             "
-              f"{sorted(m for _, _, m in extra)[len(extra)//2]:.0f}")
-        print(f"  median SAMPLE MULTIPLE from MiLB      "
-              f"{sorted(gain)[len(gain)//2]:.1f}x")
-    print(f"\n  {'pitcher':<24s}{'MLB TBF':>9s}{'MiLB TBF':>10s}{'x':>6s}  levels")
-    for pid, tbf, m_tbf in sorted(extra, key=lambda x: -x[2])[:12]:
-        lv = milb_line(pid, season, "pit", save_dir)
-        nm = (board[pid].get("PlayerName") or str(pid))[:23]
-        print(f"  {nm:<24s}{tbf:>9.0f}{m_tbf:>10.0f}"
-              f"{(m_tbf/tbf if tbf else 0):>6.1f}  "
-              f"{'+'.join(sorted(lv))}")
-
-
 
 
 # --- AAA -> MLB translation, MEASURED -------------------------------------
@@ -6353,6 +6343,1080 @@ MILB_TRANSLATION_PATH = SAVE_DIR / "milb_translation.json"
 # Minimum sample on each side of a matched pair. Low enough to keep the pairs,
 # high enough that a logit is meaningful.
 MILB_PAIR_MIN = 50
+class MiLB:
+    """Minor-league lines, park factors and the AAA->MLB translation (9c)."""
+
+    @staticmethod
+    def _accumulate(acc: dict, side: str, level: str,
+                    rows: Sequence[dict], keys: Sequence[str]) -> None:
+        """Fold one split response into `acc[side][pid][level]`, in place.
+
+        A player with no usable stat in `keys` is skipped rather than stored
+        empty — an empty record reads downstream as "he played and did
+        nothing", which is not the same as "he has no line at this level".
+        `collect_milb` and `collect_milb_asof` had this identical loop.
+        """
+        for sp in rows:
+            pid = ((sp.get("player") or {}).get("id"))
+            st = sp.get("stat") or {}
+            if pid is None:
+                continue
+            rec = {k: st.get(k) for k in keys if st.get(k) is not None}
+            if not rec:
+                continue
+            rec.update(MiLB._milb_team(sp))
+            acc[side].setdefault(str(int(pid)), {})[level] = rec
+
+    @staticmethod
+    def milb_cache_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
+        return Path(save_dir) / MILB_CACHE_FMT.format(season=season)
+
+    @staticmethod
+    def fetch_milb_split(season: int, sport_id: int, group: str,
+                         timeout: float = 90.0) -> List[dict]:
+        """One level, one side, one season — every player in the pool.
+
+        `playerPool=ALL` is required: the default returns only qualified players,
+        which would drop exactly the thin-sample arms this whole section exists
+        for. The limit is set past the largest level (Rookie ball, ~2,100 rows) so
+        a silent truncation cannot happen; `totalSplits` is checked against what
+        came back rather than trusted.
+        """
+        r = requests.get(f"{STATSAPI}/stats",
+                         params={"stats": "season", "group": group,
+                                 "sportId": sport_id, "season": season,
+                                 "playerPool": "ALL", "limit": 5000},
+                         timeout=timeout)
+        r.raise_for_status()
+        blk = (r.json().get("stats") or [{}])[0]
+        rows = blk.get("splits") or []
+        want = blk.get("totalSplits")
+        if want and len(rows) < want:
+            raise RuntimeError(
+                f"mlb_sim: MiLB {season} sport {sport_id} {group} returned "
+                f"{len(rows)} of {want} rows — raise the limit rather than "
+                f"shipping a silently truncated level.")
+        return rows
+
+    @staticmethod
+    def _milb_team(sp: dict) -> Dict[str, object]:
+        """The affiliate on a StatsAPI split.
+
+        **This used to read `abbreviation` and always got nothing.** The nested
+        team object at the league-wide `/stats` endpoint carries `{id, name,
+        link}` — there is no `abbreviation` on it — so `or ""` swallowed the miss
+        and `team` was empty in 100% of records: 22,684 season rows across five
+        levels, and every as-of snapshot. The park item in 5.11.1 was blocked on
+        that, not on missing data.
+
+        `id` is stored as the key rather than a name because affiliates rename and
+        relocate (the same club is Reno/RNO/2310 depending on who is asking) and
+        the id is the only stable join to `/teams?sportId=11`.
+        """
+        t = sp.get("team") or {}
+        out: Dict[str, object] = {}
+        if t.get("id") is not None:
+            out["team_id"] = int(t["id"])
+        if t.get("name"):
+            out["team"] = str(t["name"])
+        return out
+
+    @staticmethod
+    def collect_milb(seasons: Sequence[int] = (2026,), refresh: bool = False,
+                     save_dir: Path = SAVE_DIR, verbose: bool = True) -> dict:
+        """Every affiliated minor league line, per season, cached to disk.
+
+        Shape: {"pit": {pid: {level: {...counts}}}, "bat": {...}}. A player who
+        moved up mid-season appears under EVERY level he threw at, because the
+        levels have to stay separable — averaging a man's Double-A and Triple-A
+        lines before the level factors are known destroys the thing that makes
+        them measurable.
+        """
+        out: Dict[str, Dict[str, Dict[str, dict]]] = {}
+        for season in seasons:
+            path = MiLB.milb_cache_path(season, save_dir)
+            if path.exists() and not refresh:
+                try:
+                    with open(path) as fh:
+                        got = json.load(fh)
+                    if got.get("pit"):
+                        out[str(season)] = got
+                        if verbose:
+                            print(f"[milb] {season}: cached "
+                                  f"({len(got['pit'])} pitchers, "
+                                  f"{len(got.get('bat', {}))} hitters)")
+                        continue
+                except (OSError, ValueError):
+                    pass
+            acc: Dict[str, Dict[str, Dict[str, dict]]] = {"pit": {}, "bat": {}}
+            for sid, level in MILB_LEVELS.items():
+                for side, group, keys in (("pit", "pitching", _MILB_PIT_KEYS),
+                                          ("bat", "hitting", _MILB_BAT_KEYS)):
+                    try:
+                        rows = MiLB.fetch_milb_split(season, sid, group)
+                    except Exception as e:
+                        print(f"[milb] {season} {level} {group} FAILED: {e}")
+                        continue
+                    MiLB._accumulate(acc, side, level, rows, keys)
+                    if verbose:
+                        print(f"[milb] {season} {level:>3s} {group:<8s} "
+                              f"{len(rows):>5d} rows", flush=True)
+            payload = {"season": season, "levels": list(MILB_LEVELS.values()),
+                       **acc}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump(payload, fh)
+            out[str(season)] = payload
+            if verbose:
+                print(f"[milb] {season}: {len(acc['pit'])} pitchers, "
+                      f"{len(acc['bat'])} hitters -> {path.name}")
+        return out
+
+    @staticmethod
+    def milb_line(pid: int, season: int, side: str = "pit",
+                  save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
+        """{level: counts} for one player in one season. Empty when he has none."""
+        got = load_milb(season, save_dir).get(side) or {}
+        return got.get(str(int(pid))) or {}
+
+    @staticmethod
+    def milb_park_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
+        return Path(save_dir) / MILB_PARK_FMT.format(season=season)
+
+    @staticmethod
+    def _split_counts(st: dict, side: str) -> Tuple[Optional[List[float]], float]:
+        """One home/away split as the engine's nine outcomes.
+
+        Mirrors `_milb_counts` exactly — same singles-by-subtraction, same
+        ground/air split off the feed's own ratio. Kept as its own function
+        because the split rows are shaped like a `stat` block rather than like the
+        level records `collect_milb` stores.
+        """
+        n = float(st.get("battersFaced") or st.get("plateAppearances") or 0.0)
+        if n <= 0:
+            return None, 0.0
+        h = float(st.get("hits", 0) or 0); d = float(st.get("doubles", 0) or 0)
+        t = float(st.get("triples", 0) or 0); hr = float(st.get("homeRuns", 0) or 0)
+        k = float(st.get("strikeOuts", 0) or 0)
+        bb = float(st.get("baseOnBalls", 0) or 0)
+        hbp = float(st.get("hitByPitch", 0) or 0)
+        go = float(st.get("groundOuts", 0) or 0)
+        ao = float(st.get("airOuts", 0) or 0)
+        outs = max(n - k - bb - hbp - h, 0.0)
+        gshare = go / (go + ao) if (go + ao) > 0 else 0.5
+        c = [0.0] * N_OUTCOMES
+        c[K], c[BB], c[HBP] = k, bb, hbp
+        c[GB_OUT], c[AIR_OUT] = outs * gshare, outs * (1.0 - gshare)
+        c[S1B], c[S2B], c[S3B], c[HR] = max(h - d - t - hr, 0.0), d, t, hr
+        return c, n
+
+    @staticmethod
+    def fetch_milb_park_splits(season: int, group: str,
+                               timeout: float = 180.0) -> List[dict]:
+        """Every player's HOME and AWAY line at Triple-A, one request."""
+        r = requests.get(f"{STATSAPI}/stats",
+                         params={"stats": "statSplits", "group": group,
+                                 "sportId": MILB_ASOF_SPORT, "season": season,
+                                 "sitCodes": "h,a", "playerPool": "ALL",
+                                 "limit": 10000},
+                         timeout=timeout)
+        r.raise_for_status()
+        blk = (r.json().get("stats") or [{}])[0]
+        rows = blk.get("splits") or []
+        want = blk.get("totalSplits")
+        if want and len(rows) < want:
+            raise RuntimeError(
+                f"mlb_sim: Triple-A {season} {group} home/away returned "
+                f"{len(rows)} of {want} splits — raise the limit rather than "
+                f"shipping a silently truncated park factor.")
+        return rows
+
+    @staticmethod
+    def _milb_game_level(pk: int, timeout: float = 15.0) -> Optional[str]:
+        """The level a minor-league game was played at, via StatsAPI."""
+        pk = int(pk)
+        if pk in _MILB_GAME_LEVEL:
+            return _MILB_GAME_LEVEL[pk]
+        try:
+            import requests
+            r = requests.get(f"{STATSAPI}.1/game/{pk}/feed/live",
+                             params={"fields": "gameData,teams,home,sport,id"},
+                             timeout=timeout)
+            r.raise_for_status()
+            sid = (((r.json().get("gameData") or {}).get("teams") or {})
+                   .get("home") or {}).get("sport", {}).get("id")
+            lvl = _MILB_SPORT_LEVEL.get(sid)
+        except Exception:                                     # noqa: BLE001
+            lvl = None
+        _MILB_GAME_LEVEL[pk] = lvl
+        return lvl
+
+    @staticmethod
+    def _milb_chunk_path(start: str, end: str, save_dir: Path = None) -> Path:
+        root = Path(save_dir or SAVE_DIR) / "milb_chunks" / start[:4]
+        return root / f"{start}_{end}.json.gz"
+
+    @staticmethod
+    def _milb_statcast_chunk(start: str, end: str, timeout: float = 120.0,
+                             save_dir: Path = None) -> List[dict]:
+        """One date window of minor-league Statcast, as dict rows.
+
+        **CACHED PER WINDOW, because the collector could not resume.** It
+        accumulated `by_pitcher` in memory and wrote only at the END of a
+        season, so an interrupt 45 chunks deep — which is exactly what happened
+        on 2026-08-25 — threw away every request. A finished date window in a
+        finished season can never change, so this is a permanent cache on the
+        same argument as the play-by-play store: the point is being able to
+        change what you EXTRACT without going back over the wire.
+
+        Trimmed to `MILB_RAW_KEEP` on write. The full Savant row is ~90%
+        columns nothing reads.
+        """
+        import csv as _csv
+        import io
+        import requests
+        dest = MiLB._milb_chunk_path(start, end, save_dir)
+        if dest.exists():
+            try:
+                with gzip.open(dest, "rt") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                pass                      # corrupt: fall through and refetch
+        r = requests.get("https://baseballsavant.mlb.com/statcast_search/csv",
+                         params={"all": "true", "hfSea": f"{start[:4]}|",
+                                 "game_date_gt": start, "game_date_lt": end,
+                                 "type": "details", "minors": "true"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+        r.raise_for_status()
+        text = r.text.lstrip("\ufeff")          # the BOM, see the header note
+        rows = [{k: x.get(k) for k in MILB_RAW_KEEP + ("game_pk",)}
+                for x in _csv.DictReader(io.StringIO(text))]
+        truncated = len(rows) >= 25000
+        if truncated:
+            Archive._progress(f"milb-statcast: {start}..{end} hit the 25,000-row cap — "
+                      f"NARROW THE WINDOW, this window is truncated")
+        # **A truncated window is NOT cached.** Caching it would make the
+        # 25,000-row cap permanent and silent: every later run would read the
+        # short file back and never learn the window was clipped.
+        if not truncated:
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_suffix(".tmp")
+                with gzip.open(tmp, "wt") as fh:
+                    json.dump(rows, fh)
+                tmp.replace(dest)                 # atomic
+            except OSError:
+                pass
+        return rows
+
+    @staticmethod
+    def milb_arsenal_row(pitches: Sequence[dict]) -> Dict[str, float]:
+        """Per-pitch-type aggregates under the FANGRAPHS board's column names.
+
+        Emitting the board's own names is the point: `_arsenal_block` then reads a
+        Triple-A arm exactly as it reads a major-league one, with no branch.
+
+        **SPIN and VELOCITY come out on the board's scale; MOVEMENT DOES NOT.**
+        Checked against 455 major-league arms with 100+ TBF:
+
+            spin_fb   MLB 2284  AAA 2247   (-37, sd 143 vs 142)
+            spin_bb   MLB 2501  AAA 2418   (-83)
+            spin_off  MLB 1756  AAA 1699   (-57)
+            velo_sep  MLB 6.23  AAA 6.06   (-0.16)
+            mov_h     MLB 2.31  AAA 4.14   (+1.82)   <- NOT comparable
+            mov_v     MLB 3.14  AAA 6.97   (+3.83)   <- NOT comparable
+
+        The spin figures land on the league fastball number (the board's own
+        `pfxspFA` averages 2,290) with matching dispersion, and Triple-A sitting
+        slightly below is the right direction. Movement does not: Triple-A arms do
+        not have twice the break, so the `x12` feet-to-inches conversion here is
+        the wrong transform for the board's convention — MLB's 3.14 cannot be
+        inches of induced vertical break, a four-seam alone carries ~15. The two
+        axes are off by different ratios (1.79 and 2.22), so it is not one scale
+        factor either; sign convention and signed averaging across handedness are
+        both in play.
+
+        **RESOLVED 2026-08-25 — the movement conclusion above was an ARTIFACT.**
+        The suspicion in the last paragraph was the right one: horizontal break
+        is signed and flips with handedness, so an unconditional mean over all
+        arms and all pitch types is mostly cancellation and its residue is not a
+        scale factor. Fit PER PITCH TYPE on the same pitcher in the same season
+        (522 arms in both the 2026 arsenal and the board, 238 over 100 TBF) and
+        it is close to linear, horizontal essentially 1:1 — median slope X
+        +1.034, Z +0.867, r from 0.85 to 0.996. Triple-A movement IS usable.
+        The constants live in `ched_core.MOVEMENT_CAL`; use
+        `ched_core.calibrate_arsenal_row`, do not re-derive them here.
+
+        **And a units trap the name-matching hid.** `pfx<TYPE>%` is a PERCENT in
+        this row and a FRACTION on the board — 32.78 against 0.3965 for the same
+        quantity. Emitting the board's names to avoid a branch is what concealed
+        it: a `usage >= 5` gate matched 0 of 238 eligible board rows and the
+        first calibration returned an EMPTY fit rather than a wrong one, which
+        is the only reason it surfaced. Normalise on read via
+        `ched_core.usage_pct`; changing the collector would break EffortMLB,
+        which reads these same board rows.
+
+        The fit was available for free —
+        the same pitcher has a Statcast line and a board row in the same season,
+        which is exactly how the level ladder was fitted.
+        """
+        by: Dict[str, List[dict]] = {}
+        for p in pitches:
+            pt = (p.get("pitch_type") or "").strip().upper()
+            if pt in _SAVANT_DROP:
+                continue
+            pt = _SAVANT_TO_PFX.get(pt, pt)
+            by.setdefault(pt, []).append(p)
+        n_tot = sum(len(v) for v in by.values())
+        if not n_tot:
+            return {}
+        out: Dict[str, float] = {}
+
+        def _mean(rows, key, scale=1.0):
+            vals = []
+            for r in rows:
+                v = r.get(key)
+                try:
+                    if v not in (None, "", "null"):
+                        vals.append(float(v) * scale)
+                except (TypeError, ValueError):
+                    continue
+            return sum(vals) / len(vals) if vals else None
+
+        for pt, rows in by.items():
+            out[f"pfx{pt}%"] = 100.0 * len(rows) / n_tot
+            for key, col, sc in (("pfxsp{pt}", "release_spin_rate", 1.0),
+                                 ("pfxv{pt}", "release_speed", 1.0),
+                                 ("pfx{pt}-X", "pfx_x",
+                                  12.0 * MILB_PFX_BREAK_TO_BOARD),
+                                 ("pfx{pt}-Z", "pfx_z",
+                                  12.0 * MILB_PFX_BREAK_TO_BOARD)):
+                v = _mean(rows, col, sc)
+                if v is not None:
+                    out[key.format(pt=pt)] = v
+        out["milb_pitches"] = float(n_tot)
+
+        # **THE DELIVERY, which this used to throw away.** Everything above is
+        # the pitch's SHAPE; CHED's whole thesis is that shape only means
+        # something relative to the arm it came from, so the slot regression
+        # needs velocity, ARM ANGLE, extension and release position on the
+        # right-hand side. The raw Savant rows carry all four and the
+        # aggregation simply did not emit them, which left the Triple-A arsenal
+        # unable to answer the one question it was collected for. See
+        # `ched_core.CHED_SLOT_REGRESSORS`.
+        #
+        # Pitcher-level, not per-type: a pitcher has ONE slot, and per-type
+        # release means mostly measure classification noise. `_sd` is carried
+        # because release CONSISTENCY is a real property and free to compute
+        # here — a pitcher who releases from the same point every time is
+        # exactly the one whose deviations should count.
+        for key, col in (("milb_arm_angle", "arm_angle"),
+                         ("milb_extension", "release_extension"),
+                         ("milb_rel_x", "release_pos_x"),
+                         ("milb_rel_z", "release_pos_z"),
+                         ("milb_plate_z", "plate_z")):
+            v = _mean(pitches, col)
+            if v is not None:
+                out[key] = v
+        for key, col in (("milb_rel_x_sd", "release_pos_x"),
+                         ("milb_rel_z_sd", "release_pos_z")):
+            vals = []
+            for r in pitches:
+                x = r.get(col)
+                try:
+                    if x not in (None, "", "null"):
+                        vals.append(float(x))
+                except (TypeError, ValueError):
+                    continue
+            if len(vals) >= 20:
+                mu = sum(vals) / len(vals)
+                out[key] = (sum((x - mu) ** 2 for x in vals) / len(vals)) ** 0.5
+        return out
+
+    @staticmethod
+    def _write_milb_raw(season: int, by_pitcher: Dict[str, List[dict]],
+                        save_dir: Path, verbose: bool = True) -> None:
+        """Raw minor-league pitches, one gzip per pitcher, keyed by season.
+
+        Trimmed to `MILB_RAW_KEEP` — the full Savant row is ~90% columns we
+        never read, and the difference is ~60 MB against ~1.5 GB a season, the
+        same trade `framing_pitches` makes.
+        """
+        root = Path(save_dir) / "milb_pitches" / MILB_ARSENAL_VERSION / str(season)
+        root.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for pid, rows in by_pitcher.items():
+            trimmed = [{k: r.get(k) for k in MILB_RAW_KEEP} for r in rows]
+            tmp = root / f"{pid}.json.gz.tmp"
+            try:
+                with gzip.open(tmp, "wt") as fh:
+                    json.dump(trimmed, fh)
+                tmp.replace(root / f"{pid}.json.gz")   # atomic
+                n += 1
+            except OSError:
+                continue
+        if verbose:
+            print(f"[milb-statcast] {season}: raw kept for {n} pitchers -> {root}")
+
+    @staticmethod
+    def collect_milb_statcast(seasons: Sequence[int] = (2026,),
+                              refresh: bool = False,
+                              save_dir: Path = SAVE_DIR,
+                              levels: Optional[Sequence[str]] = None,
+                              start: str = "-03-15", end: str = "-10-05",
+                              verbose: bool = True) -> dict:
+        """Minor-league Statcast, aggregated per pitcher and stored ALONGSIDE the
+        existing minor-league lines in `milb_<season>.json` under `"arsenal"`.
+
+        Deliberately not a separate artifact: it is the same players, the same
+        season and the same cache, and a second file would drift out of step with
+        the first the moment one of them is refreshed.
+        """
+        levels = MILB_STATCAST_LEVELS if levels is None else levels
+        out: Dict[str, dict] = {}
+        for season in seasons:
+            path = MiLB.milb_cache_path(season, save_dir)
+            got = {}
+            if path.exists():
+                try:
+                    with open(path) as fh:
+                        got = json.load(fh)
+                except (OSError, ValueError):
+                    got = {}
+            if got.get("arsenal") and not refresh:
+                if verbose:
+                    print(f"[milb-statcast] {season}: cached "
+                          f"({len(got['arsenal'])} pitchers)")
+                out[str(season)] = got
+                continue
+            by_pitcher: Dict[str, List[dict]] = {}
+            d0 = datetime.date.fromisoformat(f"{season}{start}")
+            d1 = datetime.date.fromisoformat(f"{season}{end}")
+            today = datetime.date.today()
+            if d1 > today:
+                d1 = today
+            cur = d0
+            kept = seen = 0
+            windows = []
+            while cur <= d1:
+                hi = min(cur + datetime.timedelta(days=MILB_STATCAST_CHUNK_DAYS - 1),
+                         d1)
+                windows.append((cur.isoformat(), hi.isoformat()))
+                cur = hi + datetime.timedelta(days=1)
+
+            # **Fetched in parallel, consumed in order.** The windows are
+            # independent date ranges, so the sequential loop this replaced was
+            # spending ~50 seconds of wall clock per chunk waiting on one
+            # socket. The LEVEL JOIN stays single-threaded below:
+            # `_milb_game_level` memoises into a shared dict and is not worth
+            # making thread-safe for a join that costs nothing.
+            def _grab(w):
+                try:
+                    return w, MiLB._milb_statcast_chunk(w[0], w[1],
+                                                        save_dir=save_dir)
+                except Exception as e:                        # noqa: BLE001
+                    Archive._progress(f"milb-statcast {w[0]}..{w[1]}: "
+                                      f"{type(e).__name__} {e}")
+                    return w, []
+
+            done = 0
+            with ThreadPoolExecutor(max_workers=MILB_STATCAST_WORKERS) as ex:
+                for (lo_s, hi_s), rows in ex.map(_grab, windows):
+                    seen += len(rows)
+                    for r in rows:
+                        pk = r.get("game_pk")
+                        if not pk:
+                            continue
+                        lvl = MiLB._milb_game_level(pk)
+                        if lvl not in levels:
+                            continue
+                        pid = r.get("pitcher")
+                        if not pid:
+                            continue
+                        by_pitcher.setdefault(str(int(float(pid))), []).append(r)
+                        kept += 1
+                    done += 1
+                    if verbose:
+                        print(f"[milb-statcast] {season} {lo_s}..{hi_s}  "
+                              f"[{done}/{len(windows)}] {len(rows):6d} rows, "
+                              f"kept {kept}", flush=True)
+            arsenal = {pid: MiLB.milb_arsenal_row(v) for pid, v in by_pitcher.items()}
+            arsenal = {k: v for k, v in arsenal.items() if v}
+            got["arsenal"] = arsenal
+            got["arsenal_levels"] = list(levels)
+            # **Version the aggregate.** v1 had no delivery columns, and a v1
+            # file loads without error while every slot regressor reads None —
+            # the silent-corruption shape `framing_pitches` is versioned
+            # against. A consumer that needs the delivery must check this.
+            got["arsenal_version"] = MILB_ARSENAL_VERSION
+            # **Keep the RAW pitches.** They were fetched, aggregated and
+            # dropped, so changing what we extract meant re-scraping the whole
+            # minor-league season — which is what this cost the first time.
+            # Same argument the play-by-play cache records: the win is being
+            # able to change the extraction without going back over the wire.
+            MiLB._write_milb_raw(season, by_pitcher, save_dir, verbose)
+            got.setdefault("season", season)
+            with open(path, "w") as fh:
+                json.dump(got, fh)
+            if verbose:
+                print(f"[milb-statcast] {season}: {seen} pitches seen, {kept} at "
+                      f"{'/'.join(levels)}, {len(arsenal)} pitchers -> {path}")
+            out[str(season)] = got
+        return out
+
+    @staticmethod
+    def collect_milb_park(seasons: Sequence[int] = (2026,), refresh: bool = False,
+                          save_dir: Path = SAVE_DIR, verbose: bool = True) -> dict:
+        """Per-club, per-outcome Triple-A park factors, cached per season.
+
+        Shape: {"pit": {team_id: [factor x 9]}, "bat": {...}, "n": {...}}.
+
+        The factor is a club's HOME rate over its own ROAD rate, which is the
+        standard construction: it holds the roster fixed, so it cannot be read as
+        "this park scores a lot" when what is really true is "the two clubs who
+        play here are good". Raw runs at a venue is NOT a park factor (§6.1).
+        """
+        out: Dict[str, dict] = {}
+        for season in seasons:
+            path = MiLB.milb_park_path(season, save_dir)
+            if path.exists() and not refresh:
+                try:
+                    with open(path) as fh:
+                        got = json.load(fh)
+                    if got.get("bat"):
+                        out[str(season)] = got
+                        if verbose:
+                            print(f"[milbpark] {season}: cached "
+                                  f"({len(got['bat'])} clubs)")
+                        continue
+                except (OSError, ValueError):
+                    pass
+            acc: Dict[str, dict] = {}
+            cnt: Dict[str, dict] = {}
+            for side, group in (("bat", "hitting"), ("pit", "pitching")):
+                try:
+                    rows = MiLB.fetch_milb_park_splits(season, group)
+                except Exception as e:
+                    print(f"[milbpark] {season} {group} FAILED: {e}")
+                    continue
+                tot: Dict[int, Dict[str, List[float]]] = {}
+                for sp in rows:
+                    tid = ((sp.get("team") or {}).get("id"))
+                    code = ((sp.get("split") or {}).get("code"))
+                    if tid is None or code not in ("h", "a"):
+                        continue
+                    c, n = MiLB._split_counts(sp.get("stat") or {}, side)
+                    if c is None:
+                        continue
+                    rec = tot.setdefault(int(tid), {"h": [0.0] * (N_OUTCOMES + 1),
+                                                    "a": [0.0] * (N_OUTCOMES + 1)})
+                    for i in range(N_OUTCOMES):
+                        rec[code][i] += c[i]
+                    rec[code][N_OUTCOMES] += n
+                fac: Dict[str, List[float]] = {}
+                nn: Dict[str, List[float]] = {}
+                for tid, rec in tot.items():
+                    hn, an = rec["h"][N_OUTCOMES], rec["a"][N_OUTCOMES]
+                    if hn < 500 or an < 500:
+                        continue
+                    f = []
+                    for i in range(N_OUTCOMES):
+                        hr_, ar_ = rec["h"][i] / hn, rec["a"][i] / an
+                        # A club with zero of an outcome at home is a sample
+                        # problem, not a park that forbids triples. Leave it at 1.
+                        f.append((hr_ / ar_) if (hr_ > 0 and ar_ > 0) else 1.0)
+                    fac[str(tid)] = f
+                    nn[str(tid)] = [hn, an]
+                acc[side] = fac
+                cnt[side] = nn
+                if verbose:
+                    print(f"[milbpark] {season} {group:<9s} {len(fac)} clubs "
+                          f"from {len(rows)} splits", flush=True)
+            payload = {"season": season, "n": cnt, **acc}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump(payload, fh)
+            out[str(season)] = payload
+        return out
+
+    @staticmethod
+    def load_milb_park(season: int, save_dir: Path = SAVE_DIR) -> dict:
+        if season in _MILB_PARK:
+            return _MILB_PARK[season]
+        try:
+            with open(MiLB.milb_park_path(season, save_dir)) as fh:
+                _MILB_PARK[season] = json.load(fh)
+        except (OSError, ValueError):
+            _MILB_PARK[season] = {}
+        return _MILB_PARK[season]
+
+    @staticmethod
+    def milb_park_factor(team_id: Optional[int], season: int, side: str = "bat",
+                         window: Optional[int] = None,
+                         save_dir: Path = SAVE_DIR) -> Optional[List[float]]:
+        """A club's per-outcome park factor, averaged over `window` seasons.
+
+        Averaged rather than taken from the target season alone for §8's reason:
+        the noise falls as sqrt(n) while the true park effect survives, so the
+        window is an arithmetic improvement and not a fitted one. Returns None
+        when the club has no usable season, which means "do not adjust" — never a
+        default factor of 1.0 dressed up as a measurement.
+        """
+        window = MILB_PARK_WINDOW if window is None else int(window)
+        if team_id is None:
+            return None
+        acc = [0.0] * N_OUTCOMES
+        got = 0
+        for s in range(season - window + 1, season + 1):
+            f = ((MiLB.load_milb_park(s, save_dir).get(side) or {})
+                 .get(str(int(team_id))))
+            if not f:
+                continue
+            for i in range(N_OUTCOMES):
+                acc[i] += f[i]
+            got += 1
+        if not got:
+            return None
+        return [acc[i] / got for i in range(N_OUTCOMES)]
+
+    @staticmethod
+    def milb_park_report(season: Optional[int] = None, save_dir: Path = SAVE_DIR) -> None:
+        """The spread and the persistence — the two things that decide whether a
+        park factor is real or a season of noise (§8)."""
+        season = CURRENT_SEASON if season is None else int(season)
+        got = MiLB.load_milb_park(season, save_dir)
+        if not got:
+            raise SystemExit(f"mlb_sim: no Triple-A park factors for {season}. "
+                             f"Run `python mlb_sim.py milbpark --refresh` first.")
+        print(f"\nTriple-A PARK FACTORS — {season}, home rate over own road rate\n")
+        for side in ("bat", "pit"):
+            fac = got.get(side) or {}
+            if not fac:
+                continue
+            print(f"  {side.upper()}  ({len(fac)} clubs)")
+            print(f"    {'outcome':<9s}{'min':>8s}{'median':>9s}{'max':>8s}"
+                  f"{'sd':>8s}")
+            for i, nm in enumerate(OUTCOME_NAMES):
+                v = sorted(f[i] for f in fac.values())
+                if not v:
+                    continue
+                print(f"    {nm:<9s}{v[0]:>8.3f}{statistics.median(v):>9.3f}"
+                      f"{v[-1]:>8.3f}{statistics.pstdev(v):>8.3f}")
+            print()
+        # persistence, which is what separates a factor from a season of noise
+        prev = MiLB.load_milb_park(season - 1, save_dir)
+        if prev.get("bat"):
+            for side in ("bat", "pit"):
+                a_, b_ = (prev.get(side) or {}), (got.get(side) or {})
+                keys = sorted(set(a_) & set(b_))
+                if len(keys) < 10:
+                    continue
+                print(f"  {side.upper()} year-over-year correlation "
+                      f"{season-1} -> {season}  (n={len(keys)})")
+                for i, nm in enumerate(OUTCOME_NAMES):
+                    x = [a_[k][i] for k in keys]
+                    y = [b_[k][i] for k in keys]
+                    mx, my = statistics.mean(x), statistics.mean(y)
+                    num = sum((p - mx) * (q - my) for p, q in zip(x, y))
+                    den = (sum((p - mx) ** 2 for p in x)
+                           * sum((q - my) ** 2 for q in y)) ** 0.5
+                    if den > 0:
+                        print(f"    {nm:<9s}{num/den:>+8.3f}")
+                print()
+
+    @staticmethod
+    def milb_asof_path(season: int, as_of: str,
+                       save_dir: Path = SAVE_DIR) -> Path:
+        return Path(save_dir) / "asof" / MILB_ASOF_FMT.format(season=season,
+                                                              as_of=as_of)
+
+    @staticmethod
+    def fetch_milb_asof_split(season: int, sport_id: int, group: str, as_of: str,
+                              timeout: float = 120.0) -> List[dict]:
+        """One level, one side, season-to-date through `as_of`.
+
+        Same contract as `fetch_milb_split` — `playerPool=ALL` so the thin arms
+        this exists for are not dropped as unqualified, and `totalSplits` checked
+        rather than trusted so a silent truncation cannot ship.
+        """
+        r = requests.get(f"{STATSAPI}/stats",
+                         params={"stats": "byDateRange", "group": group,
+                                 "sportId": sport_id, "season": season,
+                                 "playerPool": "ALL", "limit": 5000,
+                                 "startDate": f"{season}-01-01",
+                                 "endDate": as_of},
+                         timeout=timeout)
+        r.raise_for_status()
+        blk = (r.json().get("stats") or [{}])[0]
+        rows = blk.get("splits") or []
+        want = blk.get("totalSplits")
+        if want and len(rows) < want:
+            raise RuntimeError(
+                f"mlb_sim: MiLB as-of {season} {as_of} sport {sport_id} {group} "
+                f"returned {len(rows)} of {want} rows — raise the limit rather "
+                f"than shipping a silently truncated level.")
+        return rows
+
+    @staticmethod
+    def collect_milb_asof(cutoffs: Sequence[str], season: Optional[int] = None,
+                          save_dir: Path = SAVE_DIR, force: bool = False,
+                          verbose: bool = True) -> Dict[str, int]:
+        """Cache a Triple-A snapshot per cutoff, in `collect_milb`'s shape.
+
+        Stored under the same `{level: counts}` nesting the season cache uses so
+        `_milb_counts` reads either one unchanged, and under the SOURCE's key names
+        for the reason recorded on `_MILB_PIT_KEYS`: a cache that has already been
+        interpreted cannot be re-interpreted when the interpretation moves.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        got: Dict[str, int] = {}
+        level = MILB_LEVELS[MILB_ASOF_SPORT]
+        for as_of in cutoffs:
+            dest = MiLB.milb_asof_path(season, as_of, save_dir)
+            if dest.exists() and not force:
+                if verbose:
+                    print(f"[milb-asof] {season} {as_of}: cached")
+                continue
+            acc: Dict[str, Dict[str, Dict[str, dict]]] = {"pit": {}, "bat": {}}
+            ok = True
+            for side, group, keys in (("pit", "pitching", _MILB_PIT_KEYS),
+                                      ("bat", "hitting", _MILB_BAT_KEYS)):
+                try:
+                    rows = MiLB.fetch_milb_asof_split(season, MILB_ASOF_SPORT, group,
+                                                 as_of)
+                except Exception as e:
+                    print(f"[milb-asof] {season} {as_of} {group} FAILED: {e}")
+                    ok = False
+                    continue
+                MiLB._accumulate(acc, side, level, rows, keys)
+            if not ok:
+                # A half-written snapshot would read as "this player had no
+                # Triple-A record", which is the one thing the file must never
+                # say by accident. Skip the cutoff instead.
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "w") as fh:
+                json.dump({"season": season, "as_of": as_of, "levels": [level],
+                           **acc}, fh)
+            got[as_of] = len(acc["pit"]) + len(acc["bat"])
+            if verbose:
+                print(f"[milb-asof] {season} {as_of}: {len(acc['pit'])} pitchers, "
+                      f"{len(acc['bat'])} hitters -> {dest.name}", flush=True)
+        return got
+
+    @staticmethod
+    def milb_report(season: Optional[int] = None, save_dir: Path = SAVE_DIR) -> None:
+        """How much minor league evidence exists for the arms the model is
+        thinnest on — the check that this is worth wiring, before it is wired."""
+        season = CURRENT_SEASON if season is None else int(season)
+        milb = load_milb(season, save_dir)
+        if not milb:
+            raise SystemExit(f"mlb_sim: no MiLB cache for {season}. "
+                             f"Run `python mlb_sim.py milb --refresh` first.")
+        board = {_row_id(r): r for r in (load_board("pit", season, save_dir) or [])
+                 if _row_id(r)}
+        thin = sorted(((pid, _num(r, "TBF")) for pid, r in board.items()
+                       if 0 < _num(r, "TBF") < 150), key=lambda x: x[1])
+        covered = [(p, t) for p, t in thin if MiLB.milb_line(p, season, "pit", save_dir)]
+        extra = []
+        for pid, tbf in covered:
+            m_tbf = sum(v.get("battersFaced", 0)
+                        for v in MiLB.milb_line(pid, season, "pit", save_dir).values())
+            extra.append((pid, tbf, m_tbf))
+        print(f"\nMiLB coverage for THIN major league arms — {season}\n")
+        print(f"  pitchers on the board under 150 TBF   {len(thin)}")
+        print(f"  of those with a minor league line     {len(covered)} "
+              f"({len(covered)/max(len(thin),1):.0%})")
+        if extra:
+            gain = [m / t for _, t, m in extra if t > 0]
+            print(f"  median MiLB batters faced             "
+                  f"{sorted(m for _, _, m in extra)[len(extra)//2]:.0f}")
+            print(f"  median SAMPLE MULTIPLE from MiLB      "
+                  f"{sorted(gain)[len(gain)//2]:.1f}x")
+        print(f"\n  {'pitcher':<24s}{'MLB TBF':>9s}{'MiLB TBF':>10s}{'x':>6s}  levels")
+        for pid, tbf, m_tbf in sorted(extra, key=lambda x: -x[2])[:12]:
+            lv = MiLB.milb_line(pid, season, "pit", save_dir)
+            nm = (board[pid].get("PlayerName") or str(pid))[:23]
+            print(f"  {nm:<24s}{tbf:>9.0f}{m_tbf:>10.0f}"
+                  f"{(m_tbf/tbf if tbf else 0):>6.1f}  "
+                  f"{'+'.join(sorted(lv))}")
+
+    @staticmethod
+    def _side_counts(row: dict, side: str) -> Tuple[Optional[List[float]], float]:
+        got = outcome_counts(row, side)
+        return (list(got[0]) if got[0] else None), float(got[1] or 0.0)
+
+    @staticmethod
+    def _milb_counts(lv: dict, level: str = "AAA"
+                     ) -> Tuple[Optional[List[float]], float]:
+        """A player's line AT ONE LEVEL as the engine's nine outcomes.
+
+        Built from the StatsAPI counts stored raw by `collect_milb`, mirroring
+        `outcome_counts`: singles are hits minus the extra-base hits, and the
+        balls in play are split by the feed's own ground/air out ratio rather than
+        by a league constant.
+        """
+        r = (lv or {}).get(level)
+        if not r:
+            return None, 0.0
+        n = float(r.get("battersFaced") or r.get("plateAppearances") or 0.0)
+        if n <= 0:
+            return None, 0.0
+        h = float(r.get("hits", 0)); d = float(r.get("doubles", 0))
+        t = float(r.get("triples", 0)); hr = float(r.get("homeRuns", 0))
+        k = float(r.get("strikeOuts", 0)); bb = float(r.get("baseOnBalls", 0))
+        hbp = float(r.get("hitByPitch", 0))
+        b1 = max(h - d - t - hr, 0.0)
+        go, ao = float(r.get("groundOuts", 0)), float(r.get("airOuts", 0))
+        outs = max(n - k - bb - hbp - h, 0.0)
+        gshare = go / (go + ao) if (go + ao) > 0 else 0.5
+        c = [0.0] * N_OUTCOMES
+        c[K], c[BB], c[HBP] = k, bb, hbp
+        c[GB_OUT], c[AIR_OUT] = outs * gshare, outs * (1.0 - gshare)
+        c[S1B], c[S2B], c[S3B], c[HR] = b1, d, t, hr
+        return c, n
+
+    @staticmethod
+    def milb_step_factor(side: str, lo: str, hi: str,
+                         seasons: Sequence[int] = (2024, 2025, 2026),
+                         save_dir: Path = SAVE_DIR,
+                         n_min: Optional[float] = None
+                         ) -> Tuple[List[float], int]:
+        """One rung: `logit(rate at hi) - logit(rate at lo)` for same-season movers.
+
+        Fitted exactly the way the AAA->MLB factor is — matched within-season, both
+        directions pooled, weighted by the smaller of the two samples — so the
+        rungs compose on the same scale.
+        """
+        n_min = MILB_PAIR_MIN if n_min is None else float(n_min)
+        num = [0.0] * N_OUTCOMES
+        den = [0.0] * N_OUTCOMES
+        pairs = 0
+        for season in seasons:
+            milb = (load_milb(season, save_dir).get(side) or {})
+            for lv in milb.values():
+                cl, nl = MiLB._milb_counts(lv, lo)
+                ch, nh = MiLB._milb_counts(lv, hi)
+                if cl is None or ch is None or nl < n_min or nh < n_min:
+                    continue
+                pairs += 1
+                w = min(nl, nh)
+                for i in range(N_OUTCOMES):
+                    pl, ph = cl[i] / nl, ch[i] / nh
+                    if pl <= 0 or ph <= 0:
+                        continue
+                    num[i] += w * (_logit(ph) - _logit(pl))
+                    den[i] += w
+        return ([(num[i] / den[i]) if den[i] > 0 else 0.0
+                 for i in range(N_OUTCOMES)], pairs)
+
+    @staticmethod
+    def milb_level_factors(side: str, aaa_to_mlb: Sequence[float],
+                           seasons: Sequence[int] = (2024, 2025, 2026),
+                           save_dir: Path = SAVE_DIR
+                           ) -> Tuple[Dict[str, List[float]], Dict[str, int]]:
+        """{level: factor onto MLB} by composing the rungs onto `aaa_to_mlb`."""
+        out = {"AAA": list(aaa_to_mlb)}
+        counts: Dict[str, int] = {}
+        acc = list(aaa_to_mlb)
+        for lo, hi in zip(MILB_CHAIN[1:], MILB_CHAIN[:-1]):
+            step, n = MiLB.milb_step_factor(side, lo, hi, seasons, save_dir)
+            acc = [acc[i] + step[i] for i in range(N_OUTCOMES)]
+            out[lo] = list(acc)
+            counts[lo] = n
+        return out, counts
+
+    @staticmethod
+    def _milb_level_evidence(lv, factors, fallback):
+        """`milb_evidence` returning COUNTS, for `build_rates`'s accumulator."""
+        if not lv:
+            return None, 0.0
+        rates, n = MiLB.milb_evidence(lv, factors or {"AAA": list(fallback)})
+        if rates is None:
+            return None, 0.0
+        return [r * n for r in rates], n
+
+    @staticmethod
+    def milb_evidence(lv: dict, factors: Dict[str, List[float]]
+                      ) -> Tuple[Optional[List[float]], float]:
+        """A player's WHOLE minor-league season as one MLB-equivalent rate + n.
+
+        Every level he played at is translated onto the MLB scale and the counts
+        are POOLED, rather than taking only his highest level. Once translated the
+        levels are on one scale, so pooling is the right operation and throwing
+        away the 300 batters he faced at Double-A because he also threw 18 innings
+        at Triple-A is not.
+        """
+        tot = [0.0] * N_OUTCOMES
+        n_tot = 0.0
+        for level in MILB_CHAIN:
+            fac = factors.get(level)
+            if not fac:
+                continue
+            c, n = MiLB._milb_counts(lv, level)
+            if c is None or n < MILB_MIN_LEVEL_N:
+                continue
+            rates = MiLB.translate_milb([c[i] / n for i in range(N_OUTCOMES)], fac)
+            for i in range(N_OUTCOMES):
+                tot[i] += rates[i] * n
+            n_tot += n
+        if n_tot <= 0:
+            return None, 0.0
+        return [tot[i] / n_tot for i in range(N_OUTCOMES)], n_tot
+
+    @staticmethod
+    def measure_milb_translation(seasons: Sequence[int] = (2024, 2025, 2026),
+                                save_dir: Path = SAVE_DIR,
+                                verbose: bool = True) -> dict:
+        """Fit the AAA level factors and per-outcome credit, and cache them."""
+        out: Dict[str, dict] = {"seasons": list(seasons), "factor": {},
+                                "credit": {}, "pairs": {}, "fit_n": {}}
+        for side in ("bat", "pit"):
+            # --- FACTOR: matched within-season movers, both directions pooled
+            num = [0.0] * N_OUTCOMES
+            den = [0.0] * N_OUTCOMES
+            pairs = 0
+            for season in seasons:
+                milb = (load_milb(season, save_dir).get(side) or {})
+                for row in (load_board(side, season, save_dir) or []):
+                    pid = _row_id(row)
+                    if pid is None:
+                        continue
+                    mc, mn = MiLB._side_counts(row, side)
+                    ac, an = MiLB._milb_counts(milb.get(str(pid)))
+                    if mc is None or ac is None:
+                        continue
+                    if mn < MILB_PAIR_MIN or an < MILB_PAIR_MIN:
+                        continue
+                    pairs += 1
+                    w = min(mn, an)
+                    for i in range(N_OUTCOMES):
+                        pm, pa_ = mc[i] / mn, ac[i] / an
+                        if pm <= 0 or pa_ <= 0:
+                            continue
+                        num[i] += w * (_logit(pm) - _logit(pa_))
+                        den[i] += w
+            factor = [(num[i] / den[i]) if den[i] > 0 else 0.0
+                      for i in range(N_OUTCOMES)]
+            out["factor"][side] = factor
+            out["pairs"][side] = pairs
+            # The rest of the ladder, composed onto the Triple-A step.
+            lvf, lvn = MiLB.milb_level_factors(side, factor, seasons, save_dir)
+            out.setdefault("factor_by_level", {})[side] = lvf
+            out.setdefault("level_pairs", {})[side] = lvn
+
+            # --- CREDIT: season t AAA against season t+1 MLB, fitted out of sample
+            stab = stabilize_for(side)
+            lg = league_baseline(load_board(side, max(seasons), save_dir), side)
+            rows = []
+            for a_season in seasons:
+                b_season = a_season + 1
+                if b_season not in seasons:
+                    continue
+                milb = (load_milb(a_season, save_dir).get(side) or {})
+                own: Dict[int, tuple] = {}
+                for _r in (load_board(side, a_season, save_dir) or []):
+                    _p = _row_id(_r)
+                    if _p is not None:
+                        own[_p] = MiLB._side_counts(_r, side)
+                for row in (load_board(side, b_season, save_dir) or []):
+                    pid = _row_id(row)
+                    if pid is None:
+                        continue
+                    tc, tn = MiLB._side_counts(row, side)
+                    ac, an = MiLB._milb_counts(milb.get(str(pid)))
+                    if tc is None or ac is None or tn < MILB_TARGET_MIN:
+                        continue
+                    tr = MiLB.translate_milb([ac[i] / an for i in range(N_OUTCOMES)],
+                                       factor)
+                    # His OWN MLB line in the SAME season as the Triple-A one —
+                    # needed by the "applied" specification below.
+                    oc, on = own.get(pid, (None, 0.0))
+                    orates = ([oc[i] / on for i in range(N_OUTCOMES)]
+                              if oc and on > 0 else None)
+                    rows.append(([tc[i] / tn for i in range(N_OUTCOMES)], tr, an,
+                                 orates, on))
+
+            # **TWO specifications, and the difference is not cosmetic.**
+            #
+            #   "twoway"  — AAA against LEAGUE. What the credit was originally
+            #               fitted under, and a contest the Triple-A line wins
+            #               easily because league average is a very weak opponent.
+            #   "applied" — AAA against league AND his own MLB record, which is
+            #               how `build_rates` actually uses it. 5.11.1 flagged this
+            #               as a mis-specification and it is one: fitted the first
+            #               way, the credits come out 1.3-2.7x too high, because
+            #               the fit charges the Triple-A line for information the
+            #               player's own MLB line was going to supply anyway.
+            #
+            # Measured 2026-08-20: under "applied" the out-of-fold gain halves
+            # (bat +24.7% -> +8.9%, pit +15.8% -> +7.4%) but stays positive on all
+            # 18 outcome-sides, and the credits fall (bat K 0.40 -> 0.15, GB_OUT
+            # 1.00 -> 0.50; pit K 0.40 -> 0.30, 1B 1.00 -> 0.70).
+            #
+            # BOTH are stored. The shipped one is chosen by `MILB_CREDIT_SPEC` so
+            # the change is an A/B arm rather than a silent re-fit of a constant
+            # every downstream number already depends on.
+            grid = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0,
+                    1.4, 2.0, 3.0]
+
+            def _fit(spec: str) -> List[float]:
+                got = [0.0] * N_OUTCOMES
+                if not rows:
+                    return got
+                for i in range(N_OUTCOMES):
+                    best, best_c = None, 0.0
+                    for c in grid:
+                        sse = 0.0
+                        for tgt, tr, an, orates, on in rows:
+                            w = (c * an) / (c * an + stab[i]) if c > 0 else 0.0
+                            pred = w * tr[i] + (1.0 - w) * lg[i]
+                            if spec == "applied" and orates is not None and on > 0:
+                                w_o = on / (on + stab[i])
+                                pred = w_o * orates[i] + (1.0 - w_o) * pred
+                            sse += (pred - tgt[i]) ** 2
+                        if best is None or sse < best:
+                            best, best_c = sse, c
+                    got[i] = best_c
+                return got
+
+            out["credit"][side] = _fit("twoway")
+            out.setdefault("credit_applied", {})[side] = _fit("applied")
+            out["fit_n"][side] = len(rows)
+            if verbose:
+                print(f"[aaa] {side}: {pairs} matched pairs, {len(rows)} fit rows")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(MILB_TRANSLATION_PATH, "w") as fh:
+            json.dump(out, fh, indent=1)
+        return out
+
+    @staticmethod
+    def translate_milb(rates: Sequence[float],
+                      factor: Sequence[float]) -> List[float]:
+        """A AAA rate vector expressed on the MLB scale."""
+        return _normalize([_expit(_logit(rates[i]) + factor[i])
+                           for i in range(N_OUTCOMES)])
+
+    @staticmethod
+    def aaa_translation_report(save_dir: Path = SAVE_DIR) -> None:
+        got = load_milb_translation(save_dir)
+        if not got:
+            raise SystemExit("mlb_sim: no AAA translation on disk — run "
+                             "`python mlb_sim.py aaa --refresh`")
+        print(f"\nAAA -> MLB translation, fitted on {got['seasons']}\n")
+        for side in ("bat", "pit"):
+            f, c = got["factor"][side], got["credit"][side]
+            print(f"  {side.upper()}  ({got['pairs'][side]} matched pairs, "
+                  f"{got['fit_n'][side]} fit rows)")
+            print(f"    {'outcome':<9s}{'log-odds shift':>15s}{'rate x':>9s}"
+                  f"{'credit':>9s}{'AAA PA worth':>14s}")
+            for i, nm in enumerate(OUTCOME_NAMES):
+                mult = math.exp(f[i])
+                print(f"    {nm:<9s}{f[i]:>+15.3f}{mult:>9.3f}{c[i]:>9.2f}"
+                      f"{(f'{c[i]:.2f} MLB PA' if c[i] else 'not used'):>14s}")
+            print()
+
+
 # Target sample for the credit fit — the season t+1 line has to be reliable
 # enough to be worth fitting against.
 MILB_TARGET_MIN = 150
@@ -6442,11 +7506,6 @@ def _expit(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def _side_counts(row: dict, side: str) -> Tuple[Optional[List[float]], float]:
-    got = outcome_counts(row, side)
-    return (list(got[0]) if got[0] else None), float(got[1] or 0.0)
-
-
 # The rungs, best level first. A player is translated from EVERY level he
 # played at, not just the top one — see `milb_evidence`.
 #
@@ -6470,256 +7529,6 @@ MILB_CHAIN: Tuple[str, ...] = ("AAA", "AA", "A+", "A")
 # record is Low-A is not someone the engine can say anything useful about, and
 # the translation error compounds multiplicatively along the chain.
 MILB_MIN_LEVEL_N = 40.0
-
-
-def _milb_counts(lv: dict, level: str = "AAA"
-                 ) -> Tuple[Optional[List[float]], float]:
-    """A player's line AT ONE LEVEL as the engine's nine outcomes.
-
-    Built from the StatsAPI counts stored raw by `collect_milb`, mirroring
-    `outcome_counts`: singles are hits minus the extra-base hits, and the
-    balls in play are split by the feed's own ground/air out ratio rather than
-    by a league constant.
-    """
-    r = (lv or {}).get(level)
-    if not r:
-        return None, 0.0
-    n = float(r.get("battersFaced") or r.get("plateAppearances") or 0.0)
-    if n <= 0:
-        return None, 0.0
-    h = float(r.get("hits", 0)); d = float(r.get("doubles", 0))
-    t = float(r.get("triples", 0)); hr = float(r.get("homeRuns", 0))
-    k = float(r.get("strikeOuts", 0)); bb = float(r.get("baseOnBalls", 0))
-    hbp = float(r.get("hitByPitch", 0))
-    b1 = max(h - d - t - hr, 0.0)
-    go, ao = float(r.get("groundOuts", 0)), float(r.get("airOuts", 0))
-    outs = max(n - k - bb - hbp - h, 0.0)
-    gshare = go / (go + ao) if (go + ao) > 0 else 0.5
-    c = [0.0] * N_OUTCOMES
-    c[K], c[BB], c[HBP] = k, bb, hbp
-    c[GB_OUT], c[AIR_OUT] = outs * gshare, outs * (1.0 - gshare)
-    c[S1B], c[S2B], c[S3B], c[HR] = b1, d, t, hr
-    return c, n
-
-
-def milb_step_factor(side: str, lo: str, hi: str,
-                     seasons: Sequence[int] = (2024, 2025, 2026),
-                     save_dir: Path = SAVE_DIR,
-                     n_min: float = MILB_PAIR_MIN
-                     ) -> Tuple[List[float], int]:
-    """One rung: `logit(rate at hi) - logit(rate at lo)` for same-season movers.
-
-    Fitted exactly the way the AAA->MLB factor is — matched within-season, both
-    directions pooled, weighted by the smaller of the two samples — so the
-    rungs compose on the same scale.
-    """
-    num = [0.0] * N_OUTCOMES
-    den = [0.0] * N_OUTCOMES
-    pairs = 0
-    for season in seasons:
-        milb = (load_milb(season, save_dir).get(side) or {})
-        for lv in milb.values():
-            cl, nl = _milb_counts(lv, lo)
-            ch, nh = _milb_counts(lv, hi)
-            if cl is None or ch is None or nl < n_min or nh < n_min:
-                continue
-            pairs += 1
-            w = min(nl, nh)
-            for i in range(N_OUTCOMES):
-                pl, ph = cl[i] / nl, ch[i] / nh
-                if pl <= 0 or ph <= 0:
-                    continue
-                num[i] += w * (_logit(ph) - _logit(pl))
-                den[i] += w
-    return ([(num[i] / den[i]) if den[i] > 0 else 0.0
-             for i in range(N_OUTCOMES)], pairs)
-
-
-def milb_level_factors(side: str, aaa_to_mlb: Sequence[float],
-                       seasons: Sequence[int] = (2024, 2025, 2026),
-                       save_dir: Path = SAVE_DIR
-                       ) -> Tuple[Dict[str, List[float]], Dict[str, int]]:
-    """{level: factor onto MLB} by composing the rungs onto `aaa_to_mlb`."""
-    out = {"AAA": list(aaa_to_mlb)}
-    counts: Dict[str, int] = {}
-    acc = list(aaa_to_mlb)
-    for lo, hi in zip(MILB_CHAIN[1:], MILB_CHAIN[:-1]):
-        step, n = milb_step_factor(side, lo, hi, seasons, save_dir)
-        acc = [acc[i] + step[i] for i in range(N_OUTCOMES)]
-        out[lo] = list(acc)
-        counts[lo] = n
-    return out, counts
-
-
-def _milb_level_evidence(lv, factors, fallback):
-    """`milb_evidence` returning COUNTS, for `build_rates`'s accumulator."""
-    if not lv:
-        return None, 0.0
-    rates, n = milb_evidence(lv, factors or {"AAA": list(fallback)})
-    if rates is None:
-        return None, 0.0
-    return [r * n for r in rates], n
-
-
-def milb_evidence(lv: dict, factors: Dict[str, List[float]]
-                  ) -> Tuple[Optional[List[float]], float]:
-    """A player's WHOLE minor-league season as one MLB-equivalent rate + n.
-
-    Every level he played at is translated onto the MLB scale and the counts
-    are POOLED, rather than taking only his highest level. Once translated the
-    levels are on one scale, so pooling is the right operation and throwing
-    away the 300 batters he faced at Double-A because he also threw 18 innings
-    at Triple-A is not.
-    """
-    tot = [0.0] * N_OUTCOMES
-    n_tot = 0.0
-    for level in MILB_CHAIN:
-        fac = factors.get(level)
-        if not fac:
-            continue
-        c, n = _milb_counts(lv, level)
-        if c is None or n < MILB_MIN_LEVEL_N:
-            continue
-        rates = translate_milb([c[i] / n for i in range(N_OUTCOMES)], fac)
-        for i in range(N_OUTCOMES):
-            tot[i] += rates[i] * n
-        n_tot += n
-    if n_tot <= 0:
-        return None, 0.0
-    return [tot[i] / n_tot for i in range(N_OUTCOMES)], n_tot
-
-
-def measure_milb_translation(seasons: Sequence[int] = (2024, 2025, 2026),
-                            save_dir: Path = SAVE_DIR,
-                            verbose: bool = True) -> dict:
-    """Fit the AAA level factors and per-outcome credit, and cache them."""
-    out: Dict[str, dict] = {"seasons": list(seasons), "factor": {},
-                            "credit": {}, "pairs": {}, "fit_n": {}}
-    for side in ("bat", "pit"):
-        # --- FACTOR: matched within-season movers, both directions pooled
-        num = [0.0] * N_OUTCOMES
-        den = [0.0] * N_OUTCOMES
-        pairs = 0
-        for season in seasons:
-            milb = (load_milb(season, save_dir).get(side) or {})
-            for row in (load_board(side, season, save_dir) or []):
-                pid = _row_id(row)
-                if pid is None:
-                    continue
-                mc, mn = _side_counts(row, side)
-                ac, an = _milb_counts(milb.get(str(pid)))
-                if mc is None or ac is None:
-                    continue
-                if mn < MILB_PAIR_MIN or an < MILB_PAIR_MIN:
-                    continue
-                pairs += 1
-                w = min(mn, an)
-                for i in range(N_OUTCOMES):
-                    pm, pa_ = mc[i] / mn, ac[i] / an
-                    if pm <= 0 or pa_ <= 0:
-                        continue
-                    num[i] += w * (_logit(pm) - _logit(pa_))
-                    den[i] += w
-        factor = [(num[i] / den[i]) if den[i] > 0 else 0.0
-                  for i in range(N_OUTCOMES)]
-        out["factor"][side] = factor
-        out["pairs"][side] = pairs
-        # The rest of the ladder, composed onto the Triple-A step.
-        lvf, lvn = milb_level_factors(side, factor, seasons, save_dir)
-        out.setdefault("factor_by_level", {})[side] = lvf
-        out.setdefault("level_pairs", {})[side] = lvn
-
-        # --- CREDIT: season t AAA against season t+1 MLB, fitted out of sample
-        stab = stabilize_for(side)
-        lg = league_baseline(load_board(side, max(seasons), save_dir), side)
-        rows = []
-        for a_season in seasons:
-            b_season = a_season + 1
-            if b_season not in seasons:
-                continue
-            milb = (load_milb(a_season, save_dir).get(side) or {})
-            own: Dict[int, tuple] = {}
-            for _r in (load_board(side, a_season, save_dir) or []):
-                _p = _row_id(_r)
-                if _p is not None:
-                    own[_p] = _side_counts(_r, side)
-            for row in (load_board(side, b_season, save_dir) or []):
-                pid = _row_id(row)
-                if pid is None:
-                    continue
-                tc, tn = _side_counts(row, side)
-                ac, an = _milb_counts(milb.get(str(pid)))
-                if tc is None or ac is None or tn < MILB_TARGET_MIN:
-                    continue
-                tr = translate_milb([ac[i] / an for i in range(N_OUTCOMES)],
-                                   factor)
-                # His OWN MLB line in the SAME season as the Triple-A one —
-                # needed by the "applied" specification below.
-                oc, on = own.get(pid, (None, 0.0))
-                orates = ([oc[i] / on for i in range(N_OUTCOMES)]
-                          if oc and on > 0 else None)
-                rows.append(([tc[i] / tn for i in range(N_OUTCOMES)], tr, an,
-                             orates, on))
-
-        # **TWO specifications, and the difference is not cosmetic.**
-        #
-        #   "twoway"  — AAA against LEAGUE. What the credit was originally
-        #               fitted under, and a contest the Triple-A line wins
-        #               easily because league average is a very weak opponent.
-        #   "applied" — AAA against league AND his own MLB record, which is
-        #               how `build_rates` actually uses it. 5.11.1 flagged this
-        #               as a mis-specification and it is one: fitted the first
-        #               way, the credits come out 1.3-2.7x too high, because
-        #               the fit charges the Triple-A line for information the
-        #               player's own MLB line was going to supply anyway.
-        #
-        # Measured 2026-08-20: under "applied" the out-of-fold gain halves
-        # (bat +24.7% -> +8.9%, pit +15.8% -> +7.4%) but stays positive on all
-        # 18 outcome-sides, and the credits fall (bat K 0.40 -> 0.15, GB_OUT
-        # 1.00 -> 0.50; pit K 0.40 -> 0.30, 1B 1.00 -> 0.70).
-        #
-        # BOTH are stored. The shipped one is chosen by `MILB_CREDIT_SPEC` so
-        # the change is an A/B arm rather than a silent re-fit of a constant
-        # every downstream number already depends on.
-        grid = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0,
-                1.4, 2.0, 3.0]
-
-        def _fit(spec: str) -> List[float]:
-            got = [0.0] * N_OUTCOMES
-            if not rows:
-                return got
-            for i in range(N_OUTCOMES):
-                best, best_c = None, 0.0
-                for c in grid:
-                    sse = 0.0
-                    for tgt, tr, an, orates, on in rows:
-                        w = (c * an) / (c * an + stab[i]) if c > 0 else 0.0
-                        pred = w * tr[i] + (1.0 - w) * lg[i]
-                        if spec == "applied" and orates is not None and on > 0:
-                            w_o = on / (on + stab[i])
-                            pred = w_o * orates[i] + (1.0 - w_o) * pred
-                        sse += (pred - tgt[i]) ** 2
-                    if best is None or sse < best:
-                        best, best_c = sse, c
-                got[i] = best_c
-            return got
-
-        out["credit"][side] = _fit("twoway")
-        out.setdefault("credit_applied", {})[side] = _fit("applied")
-        out["fit_n"][side] = len(rows)
-        if verbose:
-            print(f"[aaa] {side}: {pairs} matched pairs, {len(rows)} fit rows")
-    save_dir.mkdir(parents=True, exist_ok=True)
-    with open(MILB_TRANSLATION_PATH, "w") as fh:
-        json.dump(out, fh, indent=1)
-    return out
-
-
-def translate_milb(rates: Sequence[float],
-                  factor: Sequence[float]) -> List[float]:
-    """A AAA rate vector expressed on the MLB scale."""
-    return _normalize([_expit(_logit(rates[i]) + factor[i])
-                       for i in range(N_OUTCOMES)])
 
 
 _AAA: Optional[dict] = None
@@ -6789,25 +7598,6 @@ def milb_prior(prior: Sequence[float], aaa_rates: Sequence[float],
     return _normalize(out)
 
 
-def aaa_translation_report(save_dir: Path = SAVE_DIR) -> None:
-    got = load_milb_translation(save_dir)
-    if not got:
-        raise SystemExit("mlb_sim: no AAA translation on disk — run "
-                         "`python mlb_sim.py aaa --refresh`")
-    print(f"\nAAA -> MLB translation, fitted on {got['seasons']}\n")
-    for side in ("bat", "pit"):
-        f, c = got["factor"][side], got["credit"][side]
-        print(f"  {side.upper()}  ({got['pairs'][side]} matched pairs, "
-              f"{got['fit_n'][side]} fit rows)")
-        print(f"    {'outcome':<9s}{'log-odds shift':>15s}{'rate x':>9s}"
-              f"{'credit':>9s}{'AAA PA worth':>14s}")
-        for i, nm in enumerate(OUTCOME_NAMES):
-            mult = math.exp(f[i])
-            print(f"    {nm:<9s}{f[i]:>+15.3f}{mult:>9.3f}{c[i]:>9.2f}"
-                  f"{(f'{c[i]:.2f} MLB PA' if c[i] else 'not used'):>14s}")
-        print()
-
-
 # ===========================================================================
 # 10. BALL FLIGHT, FENCE GEOMETRY AND THE DISTANCE CALIBRATION
 #
@@ -6835,7 +7625,9 @@ def aaa_translation_report(save_dir: Path = SAVE_DIR) -> None:
 # ===========================================================================
 
 
-DATA_DIR = Path(__file__).resolve().parent / "model_data"
+# Shared with `homerunwidget` and `weatherman`, which anchor the same
+# directory off `OddsAPI/` — so this one reaches UP out of `Sims/`.
+DATA_DIR = _APP_ROOT / "model_data"
 CALIB_PATH = DATA_DIR / "hr_distance_calibration.json"
 
 # Neutral reference conditions. The multiplier is always a ratio against
@@ -6854,22 +7646,183 @@ EV_MIN = 85.0
 _SIM = None
 
 
-def _sim():
-    """The ball-flight simulator, imported lazily.
+class BallFlight:
+    """Ball flight, fence geometry and the cached trajectory banks."""
 
-    `homerunwidget` pulls in scipy and pywavefront, so importing it at module
-    load would put both on the GUI's import path for no reason.
-    """
-    global _SIM
-    if _SIM is None:
-        from homerunwidget import BallFlightSimulator
-        _SIM = BallFlightSimulator()
-    return _SIM
+    @staticmethod
+    def _sim():
+        """The ball-flight simulator, imported lazily.
 
+        `homerunwidget` pulls in scipy and pywavefront, so importing it at module
+        load would put both on the GUI's import path for no reason.
+        """
+        global _SIM
+        if _SIM is None:
+            from homerunwidget import BallFlightSimulator
+            _SIM = BallFlightSimulator()
+        return _SIM
 
-def _cd_neutral() -> float:
-    from homerunwidget import CD_NEUTRAL
-    return CD_NEUTRAL
+    @staticmethod
+    def _cd_neutral() -> float:
+        from homerunwidget import CD_NEUTRAL
+        return CD_NEUTRAL
+
+    @staticmethod
+    def _bank_key(weather: Optional[dict], venue: Optional[str]) -> str:
+        """Cache key for a bank. Rounded, because the bank does not meaningfully
+        move on a half-degree of temperature or a degree of wind bearing, and a
+        key that never repeats is a cache that never hits."""
+        w = weather or {}
+        parts = [
+            venue or "_neutral",
+            f"t{round(float(w.get('temp_f', NEUTRAL_TEMP_F)))}",
+            f"h{round(float(w.get('humidity', NEUTRAL_HUMIDITY)) / 10) * 10}",
+            f"w{round(float(w.get('wind_mph', NEUTRAL_WIND_MPH)))}",
+            f"d{round(float(w.get('wind_dir_deg', 0.0)) / 10) * 10}",
+            f"f{w.get('wind_frame', 'field')}",
+        ]
+        p = w.get("pressure_pa")
+        if p:
+            parts.append(f"p{round(float(p) / 100)}"
+                         f"{'s' if w.get('pressure_is_station') else ''}")
+        return "_".join(str(x).replace(" ", "-").replace("/", "-") for x in parts)
+
+    @staticmethod
+    def prebuild_banks(venues: Sequence[str], weather: Optional[dict] = None,
+                       workers: Optional[int] = None) -> None:
+        """Fill the bank cache for many parks at once, across processes.
+
+        Bank building is embarrassingly parallel — each park is an independent
+        couple of thousand ODE solves with no shared state — and it is the entire
+        cost of a calibration. Serially that is ~15 minutes for 30 parks; across
+        a real core count it is about a minute.
+
+        Already-cached parks are skipped before the pool is created, so this is
+        RESUMABLE: kill it at any point and the completed parks stay on disk,
+        because each bank is written atomically by `cached_trajectory_bank`.
+        """
+
+        todo = [v for v in venues
+                if not (BANK_DIR / f"{BallFlight._bank_key(weather, v)}.pkl.gz").exists()]
+        have = len(venues) - len(todo)
+        if not todo:
+            print(f"[banks] all {len(venues)} cached")
+            return
+        workers = workers or max(1, min(len(todo), (os.cpu_count() or 4) - 2))
+        print(f"[banks] {have} cached, building {len(todo)} on {workers} workers")
+        with multiprocessing.Pool(workers) as pool:
+            for i, venue in enumerate(
+                    pool.imap_unordered(_bank_worker,
+                                        [(v, weather) for v in todo]), 1):
+                print(f"[banks]   {i}/{len(todo)} {venue}", flush=True)
+
+    @staticmethod
+    def cached_trajectory_bank(weather: Optional[dict] = None,
+                               venue: Optional[str] = None,
+                               cd: Optional[float] = None) -> Dict[tuple, list]:
+        """`trajectory_bank`, persisted to disk.
+
+        Building a bank is ~2,300 ODE solves — about 30 seconds a park, and 17
+        minutes for a full 30-park calibration. Nothing in a bank depends on the
+        park's fences or on `distance_scale`, only on the launch conditions and
+        the air, so a bank stays valid until the weather actually moves. Without
+        this the module is fine for a one-off fit and useless on a live slate.
+        """
+
+        BANK_DIR.mkdir(parents=True, exist_ok=True)
+        path = BANK_DIR / f"{BallFlight._bank_key(weather, venue)}.pkl.gz"
+        if path.exists():
+            try:
+                with gzip.open(path, "rb") as fh:
+                    return pickle.load(fh)
+            except Exception:
+                path.unlink(missing_ok=True)      # corrupt cache, rebuild
+        with _quiet_solves():
+            bank = BallFlight.trajectory_bank(weather, venue, cd)
+        tmp = path.with_suffix(".tmp")
+        with gzip.open(tmp, "wb") as fh:
+            pickle.dump(bank, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)                          # atomic: no half-written bank
+        return bank
+
+    @staticmethod
+    def trajectory_bank(weather: Optional[dict] = None,
+                        venue: Optional[str] = None,
+                        cd: Optional[float] = None) -> Dict[tuple, list]:
+        """{(hla, la, ev): [(horizontal_ft, height_ft), ...]} for one weather.
+
+        The expensive object, and the reason this module is usable at all. A
+        trajectory depends on the launch conditions and the AIR — not on the park
+        and not on the distance calibration. So one bank of ~2,300 solves serves
+        every park at once, and re-fitting `distance_scale` costs nothing rather
+        than re-solving the whole grid per candidate. Building the fence grid the
+        naive way (solve per park per scale) is ~176,000 solves and half an hour.
+
+        Altitude is the exception — it changes the air, so it belongs to the
+        bank. Pass `venue` to bake the park's own altitude in.
+        """
+        weather = weather or {}
+        sim = BallFlight._sim()
+        cd = BallFlight._cd_neutral() if cd is None else cd
+
+        temp = float(weather.get("temp_f", NEUTRAL_TEMP_F))
+        hum = float(weather.get("humidity", NEUTRAL_HUMIDITY))
+        wind = float(weather.get("wind_mph", NEUTRAL_WIND_MPH))
+        wdir = float(weather.get("wind_dir_deg", 0.0))
+        alt = float(weather.get("altitude_ft",
+                                (_park(venue) or {}).get("altitude", 0.0)
+                                if venue else NEUTRAL_ALTITUDE_FT))
+        press = weather.get("pressure_pa")
+        station = bool(weather.get("pressure_is_station", False))
+        azimuth = (park_azimuth(venue)
+                   if venue and weather.get("wind_frame") == "compass" else None)
+
+        bank: Dict[tuple, list] = {}
+        for hla in GRID_HLA:
+            for la in GRID_LA:
+                for ev in GRID_EV:
+                    t = sim.calculate_trajectory(
+                        ev, la, hla, wind, wdir, temp, hum, alt,
+                        pressure_pa=press, cd_override=cd,
+                        park_azimuth=azimuth, pressure_is_station=station)
+                    bank[(hla, la, ev)] = [
+                        (math.hypot(float(x), float(z)), float(y))
+                        for x, y, z in zip(t["x"], t["y"], t["z"])]
+        return bank
+
+    @staticmethod
+    def fence_grid_from_bank(bank: Dict[tuple, list], venue: Optional[str],
+                             scale: float = 1.0
+                             ) -> Dict[Tuple[int, int], float]:
+        """Minimum clearing EV per cell, read off a prebuilt bank. No ODE solves."""
+        grid: Dict[Tuple[int, int], float] = {}
+        for hla in GRID_HLA:
+            polar = hla_to_polar(hla)
+            if venue:
+                wall_d, wall_h = wall_at(venue, polar)
+            else:
+                wall_d, wall_h = NEUTRAL_WALL_DIST(polar), NEUTRAL_WALL_HEIGHT
+            for la in GRID_LA:
+                thresh = float("inf")
+                for ev in GRID_EV:
+                    if _clears_profile(bank[(hla, la, ev)], wall_d, wall_h, scale):
+                        thresh = float(ev)
+                        break
+                grid[(hla, la)] = thresh
+        return grid
+
+    @staticmethod
+    def _lookup(grid: Dict[Tuple[int, int], float], hla: float, la: float) -> float:
+        h = min(GRID_HLA, key=lambda g: abs(g - hla))
+        l = min(GRID_LA, key=lambda g: abs(g - la))
+        return grid.get((h, l), float("inf"))
+
+    @staticmethod
+    def arm_factor(of_arm: Optional[float]) -> float:
+        """Odds multiplier on a runner taking the extra base, from OF arm."""
+        if not of_arm:
+            return 1.0
+        return math.exp(-ARM_ODDS_PER_MPH * (of_arm - ARM_MEAN_MPH))
 
 
 # ---------------------------------------------------------------------------
@@ -6895,30 +7848,6 @@ def spray_to_hla(hc_x: float, hc_y: float) -> Optional[float]:
     if dy <= 0:
         return None
     return math.degrees(math.atan2(dx, dy))
-
-
-def clears_fence(traj: dict, wall_dist_ft: float, wall_h_ft: float,
-                 scale: float = 1.0) -> bool:
-    """Does this trajectory clear the wall at the point it reaches it?
-
-    Walks the trajectory to the wall's horizontal distance and interpolates
-    the height there. Comparing peak height, or total distance against the
-    wall distance, both get the wall-scrapers wrong — and the wall-scrapers
-    are the entire margin between one park and another.
-    """
-    xs, ys, zs = traj["x"], traj["y"], traj["z"]
-    prev_r = prev_y = None
-    for i in range(len(xs)):
-        r = math.hypot(float(xs[i]), float(zs[i])) * scale
-        y = float(ys[i])
-        if prev_r is not None and prev_r <= wall_dist_ft <= r:
-            span = r - prev_r
-            f = (wall_dist_ft - prev_r) / span if span > 0 else 0.0
-            return (prev_y + f * (y - prev_y)) > wall_h_ft
-        if y <= 0 and prev_r is not None:
-            return False
-        prev_r, prev_y = r, y
-    return False
 
 
 def _park(venue: str) -> Optional[dict]:
@@ -6979,26 +7908,6 @@ GRID_EV = tuple(range(84, 123, 2))       # mph, ascending
 BANK_DIR = DATA_DIR / "trajectory_banks"
 
 
-def _bank_key(weather: Optional[dict], venue: Optional[str]) -> str:
-    """Cache key for a bank. Rounded, because the bank does not meaningfully
-    move on a half-degree of temperature or a degree of wind bearing, and a
-    key that never repeats is a cache that never hits."""
-    w = weather or {}
-    parts = [
-        venue or "_neutral",
-        f"t{round(float(w.get('temp_f', NEUTRAL_TEMP_F)))}",
-        f"h{round(float(w.get('humidity', NEUTRAL_HUMIDITY)) / 10) * 10}",
-        f"w{round(float(w.get('wind_mph', NEUTRAL_WIND_MPH)))}",
-        f"d{round(float(w.get('wind_dir_deg', 0.0)) / 10) * 10}",
-        f"f{w.get('wind_frame', 'field')}",
-    ]
-    p = w.get("pressure_pa")
-    if p:
-        parts.append(f"p{round(float(p) / 100)}"
-                     f"{'s' if w.get('pressure_is_station') else ''}")
-    return "_".join(str(x).replace(" ", "-").replace("/", "-") for x in parts)
-
-
 class _quiet_solves:
     """Swallow stdout from the flight simulator while solving a bank.
 
@@ -7039,111 +7948,8 @@ def _bank_worker(args) -> str:
     """
     venue, weather = args
     with _quiet_solves():
-        cached_trajectory_bank(weather, venue=venue)
+        BallFlight.cached_trajectory_bank(weather, venue=venue)
     return venue
-
-
-def prebuild_banks(venues: Sequence[str], weather: Optional[dict] = None,
-                   workers: Optional[int] = None) -> None:
-    """Fill the bank cache for many parks at once, across processes.
-
-    Bank building is embarrassingly parallel — each park is an independent
-    couple of thousand ODE solves with no shared state — and it is the entire
-    cost of a calibration. Serially that is ~15 minutes for 30 parks; across
-    a real core count it is about a minute.
-
-    Already-cached parks are skipped before the pool is created, so this is
-    RESUMABLE: kill it at any point and the completed parks stay on disk,
-    because each bank is written atomically by `cached_trajectory_bank`.
-    """
-
-    todo = [v for v in venues
-            if not (BANK_DIR / f"{_bank_key(weather, v)}.pkl.gz").exists()]
-    have = len(venues) - len(todo)
-    if not todo:
-        print(f"[banks] all {len(venues)} cached")
-        return
-    workers = workers or max(1, min(len(todo), (os.cpu_count() or 4) - 2))
-    print(f"[banks] {have} cached, building {len(todo)} on {workers} workers")
-    with multiprocessing.Pool(workers) as pool:
-        for i, venue in enumerate(
-                pool.imap_unordered(_bank_worker,
-                                    [(v, weather) for v in todo]), 1):
-            print(f"[banks]   {i}/{len(todo)} {venue}", flush=True)
-
-
-def cached_trajectory_bank(weather: Optional[dict] = None,
-                           venue: Optional[str] = None,
-                           cd: Optional[float] = None) -> Dict[tuple, list]:
-    """`trajectory_bank`, persisted to disk.
-
-    Building a bank is ~2,300 ODE solves — about 30 seconds a park, and 17
-    minutes for a full 30-park calibration. Nothing in a bank depends on the
-    park's fences or on `distance_scale`, only on the launch conditions and
-    the air, so a bank stays valid until the weather actually moves. Without
-    this the module is fine for a one-off fit and useless on a live slate.
-    """
-
-    BANK_DIR.mkdir(parents=True, exist_ok=True)
-    path = BANK_DIR / f"{_bank_key(weather, venue)}.pkl.gz"
-    if path.exists():
-        try:
-            with gzip.open(path, "rb") as fh:
-                return pickle.load(fh)
-        except Exception:
-            path.unlink(missing_ok=True)      # corrupt cache, rebuild
-    with _quiet_solves():
-        bank = trajectory_bank(weather, venue, cd)
-    tmp = path.with_suffix(".tmp")
-    with gzip.open(tmp, "wb") as fh:
-        pickle.dump(bank, fh, protocol=pickle.HIGHEST_PROTOCOL)
-    tmp.replace(path)                          # atomic: no half-written bank
-    return bank
-
-
-def trajectory_bank(weather: Optional[dict] = None,
-                    venue: Optional[str] = None,
-                    cd: Optional[float] = None) -> Dict[tuple, list]:
-    """{(hla, la, ev): [(horizontal_ft, height_ft), ...]} for one weather.
-
-    The expensive object, and the reason this module is usable at all. A
-    trajectory depends on the launch conditions and the AIR — not on the park
-    and not on the distance calibration. So one bank of ~2,300 solves serves
-    every park at once, and re-fitting `distance_scale` costs nothing rather
-    than re-solving the whole grid per candidate. Building the fence grid the
-    naive way (solve per park per scale) is ~176,000 solves and half an hour.
-
-    Altitude is the exception — it changes the air, so it belongs to the
-    bank. Pass `venue` to bake the park's own altitude in.
-    """
-    weather = weather or {}
-    sim = _sim()
-    cd = _cd_neutral() if cd is None else cd
-
-    temp = float(weather.get("temp_f", NEUTRAL_TEMP_F))
-    hum = float(weather.get("humidity", NEUTRAL_HUMIDITY))
-    wind = float(weather.get("wind_mph", NEUTRAL_WIND_MPH))
-    wdir = float(weather.get("wind_dir_deg", 0.0))
-    alt = float(weather.get("altitude_ft",
-                            (_park(venue) or {}).get("altitude", 0.0)
-                            if venue else NEUTRAL_ALTITUDE_FT))
-    press = weather.get("pressure_pa")
-    station = bool(weather.get("pressure_is_station", False))
-    azimuth = (park_azimuth(venue)
-               if venue and weather.get("wind_frame") == "compass" else None)
-
-    bank: Dict[tuple, list] = {}
-    for hla in GRID_HLA:
-        for la in GRID_LA:
-            for ev in GRID_EV:
-                t = sim.calculate_trajectory(
-                    ev, la, hla, wind, wdir, temp, hum, alt,
-                    pressure_pa=press, cd_override=cd,
-                    park_azimuth=azimuth, pressure_is_station=station)
-                bank[(hla, la, ev)] = [
-                    (math.hypot(float(x), float(z)), float(y))
-                    for x, y, z in zip(t["x"], t["y"], t["z"])]
-    return bank
 
 
 def _clears_profile(profile, wall_d: float, wall_h: float,
@@ -7159,87 +7965,6 @@ def _clears_profile(profile, wall_d: float, wall_h: float,
             return False
         prev_r, prev_y = r, y
     return False
-
-
-def fence_grid_from_bank(bank: Dict[tuple, list], venue: Optional[str],
-                         scale: float = 1.0
-                         ) -> Dict[Tuple[int, int], float]:
-    """Minimum clearing EV per cell, read off a prebuilt bank. No ODE solves."""
-    grid: Dict[Tuple[int, int], float] = {}
-    for hla in GRID_HLA:
-        polar = hla_to_polar(hla)
-        if venue:
-            wall_d, wall_h = wall_at(venue, polar)
-        else:
-            wall_d, wall_h = NEUTRAL_WALL_DIST(polar), NEUTRAL_WALL_HEIGHT
-        for la in GRID_LA:
-            thresh = float("inf")
-            for ev in GRID_EV:
-                if _clears_profile(bank[(hla, la, ev)], wall_d, wall_h, scale):
-                    thresh = float(ev)
-                    break
-            grid[(hla, la)] = thresh
-    return grid
-
-
-def fence_grid(venue: Optional[str], weather: Optional[dict] = None,
-               scale: float = 1.0, cd: Optional[float] = None
-               ) -> Dict[Tuple[int, int], float]:
-    """{(hla, la): minimum EV in mph that clears the wall}.
-
-    ~120 cells, bisected in 7 steps each — about 850 trajectories, a few
-    seconds. Cache it per park and rounded weather; it does not move within a
-    game.
-    """
-    weather = weather or {}
-    sim = _sim()
-    cd = _cd_neutral() if cd is None else cd
-
-    temp = float(weather.get("temp_f", NEUTRAL_TEMP_F))
-    hum = float(weather.get("humidity", NEUTRAL_HUMIDITY))
-    wind = float(weather.get("wind_mph", NEUTRAL_WIND_MPH))
-    wdir = float(weather.get("wind_dir_deg", 0.0))
-    alt = float(weather.get("altitude_ft",
-                            (_park(venue) or {}).get("altitude", 0.0)
-                            if venue else NEUTRAL_ALTITUDE_FT))
-    press = weather.get("pressure_pa")
-    station = bool(weather.get("pressure_is_station", False))
-    # A compass bearing must be rotated into the park frame; a dial reading
-    # from the drawer is already field-relative. The caller tags which.
-    azimuth = (park_azimuth(venue)
-               if venue and weather.get("wind_frame") == "compass" else None)
-
-    grid: Dict[Tuple[int, int], float] = {}
-    for hla in GRID_HLA:
-        polar = hla_to_polar(hla)
-        if venue:
-            wall_d, wall_h = wall_at(venue, polar)
-        else:
-            wall_d, wall_h = NEUTRAL_WALL_DIST(polar), NEUTRAL_WALL_HEIGHT
-        for la in GRID_LA:
-            lo, hi = 80.0, 125.0
-
-            def clears(ev: float) -> bool:
-                t = sim.calculate_trajectory(
-                    ev, la, hla, wind, wdir, temp, hum, alt,
-                    pressure_pa=press, cd_override=cd,
-                    park_azimuth=azimuth, pressure_is_station=station)
-                return clears_fence(t, wall_d, wall_h, scale)
-
-            if not clears(hi):
-                grid[(hla, la)] = float("inf")
-                continue
-            if clears(lo):
-                grid[(hla, la)] = lo
-                continue
-            for _ in range(7):
-                mid = 0.5 * (lo + hi)
-                if clears(mid):
-                    hi = mid
-                else:
-                    lo = mid
-            grid[(hla, la)] = hi
-    return grid
 
 
 # A neutral reference park: symmetric, league-median dimensions. Used as the
@@ -7263,12 +7988,6 @@ def NEUTRAL_WALL_DIST(polar_deg: float) -> float:
     return 400.0 - 70.0 * (x ** 1.22)
 
 
-def _lookup(grid: Dict[Tuple[int, int], float], hla: float, la: float) -> float:
-    h = min(GRID_HLA, key=lambda g: abs(g - hla))
-    l = min(GRID_LA, key=lambda g: abs(g - la))
-    return grid.get((h, l), float("inf"))
-
-
 def hr_rate(bbe: Sequence[dict], grid: Dict[Tuple[int, int], float]) -> float:
     """Fraction of a hitter's batted balls that clear, given a fence grid.
 
@@ -7284,7 +8003,7 @@ def hr_rate(bbe: Sequence[dict], grid: Dict[Tuple[int, int], float]) -> float:
             continue
         if not (LA_MIN <= la <= LA_MAX) or ev < EV_MIN:
             continue
-        if ev >= _lookup(grid, hla, la):
+        if ev >= BallFlight._lookup(grid, hla, la):
             hits += 1
     return hits / len(bbe)
 
@@ -7411,13 +8130,6 @@ def framing_multipliers(runs_per_game: float) -> Dict[int, float]:
             BB: 1.0 - u * (1.0 - FRAMING_K_SHARE)}
 
 
-def arm_factor(of_arm: Optional[float]) -> float:
-    """Odds multiplier on a runner taking the extra base, from OF arm."""
-    if not of_arm:
-        return 1.0
-    return math.exp(-ARM_ODDS_PER_MPH * (of_arm - ARM_MEAN_MPH))
-
-
 # Home-field advantage, as a symmetric tilt on offence: the home side's rates
 # scale up by HFA, the away side's down by the same amount.
 #
@@ -7477,56 +8189,22 @@ def apply_hfa(rates: Sequence[float], home: bool,
 # Game-level form — the per-team-game noise the engine was missing
 # ---------------------------------------------------------------------------
 # Season rates are FLAT: every appearance is the player's mean self, so nothing
-# varies within a game that is not already in the matchup. Real baseball has a
-# large per-team-game shared factor that no forecast can see, and its absence
-# is the bulk of the run-distribution deficit (section 5.1/5.2 of sim_state.md).
+# varies within a game beyond the matchup. Real baseball has a large
+# per-team-game shared factor no forecast can see, and its absence is the bulk
+# of the run-distribution deficit (§5.1/5.2).
 #
-# **Shape, all measured — this is not a free choice:**
+# **Shape, all measured — not a free choice:**
 #
-#   * It attaches to the TEAM-GAME, not the game. The two sides' 8-inning
-#     totals correlate -0.053, so it is not a shared environment (umpire,
-#     wind) and must not be drawn once for both sides.
-#   * It is OFFENCE-side and game-long, not per-pitcher. Decomposing the real
-#     covariance by inning-pair window:
-#         spanning pairs (different pitchers)  V_o          = 0.0204
-#         starter-window pairs (same starter)  V_o + V_sp   = 0.0135
-#         bullpen pairs                        V_o + V_pen  = 0.0316
-#     gives V_sp = -0.007 and V_pen = +0.011. **The starter's own window is
-#     NEGATIVELY correlated beyond the game factor** — that is lineup turnover,
-#     which the sim already reproduces — so a per-starter form draw is argued
-#     against by the data, not merely unsupported.
+#   * TEAM-GAME, not game. The two sides' 8-inning totals correlate -0.053, so
+#     it is not a shared environment (umpire, wind) and must not be drawn once
+#     for both sides.
+#   * OFFENCE-side and game-long, not per-pitcher. Real covariance by
+#     inning-pair window: spanning (different pitchers) V_o = 0.0204;
+#     starter-window V_o+V_sp = 0.0135; bullpen V_o+V_pen = 0.0316 — so
+#     V_sp = -0.007, V_pen = +0.011. **The starter's own window is NEGATIVELY
+#     correlated beyond the game factor**, which is lineup turnover the sim
+#     already reproduces, so a per-starter draw is argued AGAINST by the data.
 #   * Size: the sim already supplies ~0.0045 per inning from matchup spread,
-#     so the noise to ADD is ~0.0159 per inning of run variance.
-#
-# **It adds no handicapping edge.** 81% of the real shared factor is
-# unpredictable before first pitch, which is exactly why it belongs here as
-# noise rather than in the projection. It widens the distribution correctly,
-# which is what totals, run lines and every threshold prop are priced off.
-#
-# `GAME_FORM_SD` is in offence_tilt units and is CALIBRATED against the
-# measured per-inning covariance, not chosen.
-#
-# **Re-fitted 2026-08-15 on the REAL SLATE** (`calibrate-form --slate`), which
-# replaced two things the clone fit had to assume:
-#
-#   * the clone version targets "real 0.0192 minus ~0.0045 of matchup spread".
-#     Matchup, weather and park actually supply **0.00687** — 53% more — so the
-#     noise term was over-supplying by the difference, which is why the slate
-#     covariance ran 11-23% above real while the clone harness looked calibrated;
-#   * removing the fatigue slope (FATIGUE_DECLINE_PER_BF) raised the run level,
-#     and a shared MULTIPLICATIVE factor produces covariance in proportion to
-#     it. This constant sits on the same axis as weather and park, and must be
-#     re-fitted whenever ANY of them moves.
-#
-# **Re-fitted again 2026-08-15** after the pitcher-rate fixes (section 5.9)
-# raised the run level and the pitcher spread. Both matter here: a shared
-# multiplicative factor produces covariance in proportion to the level, and
-# real matchup spread now supplies **0.00909** of pair-cov on its own against
-# 0.00687 before — the fringe arms are properly bad, so more of the covariance
-# is EARNED by the matchups and less has to be injected as noise. That is why
-# the fitted sd falls even though nothing about the noise model changed.
-#
-# Fitted 0.1134: pair-cov 0.0186 against a real 0.0189, cov term 1.044 vs 1.060.
 GAME_FORM_SD = 0.1134
 
 # Runs are a CONVEX function of offensive rate, so a symmetric tilt does not
@@ -7635,19 +8313,24 @@ TEAM_QUALITY_GAIN = 0.089
 TEAM_QUALITY_SHRINK_G = 30.0
 
 
-def team_quality_tilt(rd_per_game: float) -> float:
-    """Club run differential per game -> `offence_tilt` units."""
-    if not TEAM_QUALITY_GAIN or not rd_per_game:
-        return 0.0
-    per_team = RUNS_PER_TILT / 2.0
-    return TEAM_QUALITY_GAIN * rd_per_game / per_team
+class TeamQuality:
+    """The one thing a bottom-up engine cannot say: club quality."""
 
+    @staticmethod
+    def team_quality_tilt(rd_per_game: float) -> float:
+        """Club run differential per game -> `offence_tilt` units."""
+        if not TEAM_QUALITY_GAIN or not rd_per_game:
+            return 0.0
+        per_team = RUNS_PER_TILT / 2.0
+        return TEAM_QUALITY_GAIN * rd_per_game / per_team
 
-def shrink_team_quality(run_diff: float, games: int) -> float:
-    """Season-to-date run differential per game, shrunk toward league (zero)."""
-    if games <= 0:
-        return 0.0
-    return (run_diff / games) * (games / (games + TEAM_QUALITY_SHRINK_G))
+    @staticmethod
+    def shrink_team_quality(run_diff: float, games: int) -> float:
+        """Season-to-date run differential per game, shrunk toward league (zero)."""
+        if games <= 0:
+            return 0.0
+        return (run_diff / games) * (games / (games + TEAM_QUALITY_SHRINK_G))
+
 
 # Roof-closed games are a different regime: no wind at all, and the reported
 # temperature is a thermostat rather than the weather.
@@ -7838,7 +8521,7 @@ PARK_RUN_CLAMP = (0.80, 1.40)
 _PARK_RUN: Dict[tuple, Dict[str, float]] = {}     # keyed on (season, reliability)
 
 
-def build_park_run_factors(season: int = 2026, save_dir: Path = SAVE_DIR,
+def build_park_run_factors(season: Optional[int] = None, save_dir: Path = SAVE_DIR,
                            refresh: bool = False) -> Path:
     """Home/road runs-per-game factor per park, off that season's linescores.
 
@@ -7851,6 +8534,7 @@ def build_park_run_factors(season: int = 2026, save_dir: Path = SAVE_DIR,
     the league's most pitcher-friendly yards. The home/ROAD ratio controls for
     the club, which is why it is the quantity stored.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     path = Path(save_dir) / PARK_RUN_PATH_FMT.format(season=season)
     if path.exists() and not refresh:
         return path
@@ -7891,85 +8575,53 @@ def build_park_run_factors(season: int = 2026, save_dir: Path = SAVE_DIR,
     return path
 
 
-# **A shrinkage weight is only valid for the PREDICTOR it was solved on**, and
-# `PARK_RUN_RELIABILITY = 0.699` was solved leave-one-game-out WITHIN a season
-# — i.e. for a CONTEMPORANEOUS park factor. The leak-free backtest reads the
-# PRIOR season's factor instead (`PARK_RUN_SEASON - TEAM_CONTEXT_LAG`), and a
-# lagged predictor is attenuated by however well a park persists year to year.
-# Measured on the raw factors on disk:
+# **A shrinkage weight is only valid for the PREDICTOR it was solved on.**
+# `PARK_RUN_RELIABILITY = 0.699` was solved leave-one-game-out WITHIN a season,
+# i.e. for a CONTEMPORANEOUS factor. The leak-free backtest reads the PRIOR
+# season's (`PARK_RUN_SEASON - TEAM_CONTEXT_LAG`), which is attenuated by how
+# well a park persists: corr/slope +0.260/+0.265 (24->25) and +0.389/+0.469
+# (25->26). So the lagged factor carries ~a third of the weight, and 0.699 made
+# the park term 2-4x too strong in every section-3d backtest number. Two routes
+# agree on the right value: persistence implies 0.186/0.328, regressing the
+# actual total on the model's own park contribution implies 0.162/0.533.
+# **The LIVE path was always fine** — lag 0 on the current season, which is what
+# 0.699 was solved for. Only the backtest was wrong, and in the direction of
+# making the model look worse. Also 46% (2025) / 19% (2026) of the measured
+# totals over-dispersion.
 #
-#     2024 -> 2025   corr +0.260   slope +0.265
-#     2025 -> 2026   corr +0.389   slope +0.469
-#
-# so the lagged factor carries roughly a THIRD of the contemporaneous one's
-# weight, and applying 0.699 to it made the park term 2-4x too strong in every
-# backtest number in section 3d. Two independent routes agree: this persistence
-# arithmetic implies 0.186 / 0.328 for the two season pairs, and regressing the
-# actual game total on the model's own park contribution implies 0.162 / 0.533.
-#
-# The consequence is worth stating plainly because it is easy to get backwards:
-# **the LIVE path was always fine** — it runs at lag 0 on the current season's
-# factor, which is what 0.699 was solved for. Only the backtest was wrong, and
-# it was wrong in the direction of making the model look WORSE.
-#
-# This is also 46% (2025) and 19% (2026) of the measured totals over-dispersion
-# (slope 0.68 / 0.64 against a calibrated 1.0), so it is a real part of that
-# defect but not the whole of it.
-# **ONE SEASON of park factor is mostly noise, so AVERAGE SEVERAL.** §8 already
-# recorded that a single season's run park factor is ~50% sampling noise. That
-# is why the lagged predictor is so weak, and averaging fixes it arithmetically
-# rather than by fitting anything: the noise falls as sqrt(n) while the true park
-# effect survives. Measured on the 28 parks present in all three seasons on
-# disk, predicting the 2026 factor:
+# **ONE SEASON of park factor is ~50% sampling noise (§8), so AVERAGE.** This is
+# arithmetic, not a fit: noise falls as sqrt(n), the true effect survives.
+# Predicting 2026 on the 28 parks present in all three seasons:
 #
 #   predictor                 corr    slope     sd
 #   2025 alone (was shipped) +0.385   +0.342   0.1158
 #   2024 alone               +0.265   +0.240   0.1136
 #   2024+2025 mean           +0.410   +0.463   0.0910   <- 35% more signal
-#   2024+2025 weighted 1:2   +0.421   +0.459   0.0944
 #
-# The SLOPE is the operative number — it is how much park signal survives into
-# the model — and it goes 0.342 -> 0.463. The mechanism is visible in the last
-# column: two seasons averaged drop the sd from 0.1158 to 0.0910, which is the
-# sqrt(2) reduction in the NOISE component. On 28 parks the correlation
-# difference alone would not be significant (se ~0.19); the variance reduction
-# is arithmetic, which is why this is believable and a fitted improvement would
-# not be.
+# SLOPE is the operative number — how much park signal survives — and the sd
+# drop is the sqrt(2) noise reduction that makes it believable. On 28 parks the
+# correlation difference alone would not be significant (se ~0.19). Plain mean,
+# not recency-weighted: indistinguishable (0.463 vs 0.459) and no knob.
 #
-# Plain mean rather than recency-weighted: the two are indistinguishable
-# (slope 0.463 vs 0.459) and the mean has no knob.
-# **SHIPPED at 3 — the clearest win of 2026-08-17, and the only change that
-# moved every metric the right way in BOTH seasons.** Scored against the
-# closing total, which is ~7x the instrument scoring against results is:
+# **SHIPPED at 3, scored against the CLOSING TOTAL** (~7x the instrument that
+# scoring against results is):
 #
 #                          2025                    2026
 #   corr with the line   +0.6457 -> +0.7396     +0.6919 -> +0.7169
-#                         (+0.094, ~7 se)        (+0.025, ~2 se)
 #   disagreement sd       0.836  -> 0.703        0.854  -> 0.771
-#   corr with ACTUAL     +0.1582 -> +0.1798     +0.1535 -> +0.1603
 #   calibration slope     0.713  -> 0.839        0.631  -> 0.764
-#   (the market itself)   corr +0.1997, 0.953    corr +0.2213, 0.925
 #
-# On 2025 that takes us from 79% to 90% of the market's own correlation with
-# the actual total. The pooled MONEYLINE improved too (log-loss 0.68140 ->
-# 0.68086, paired +0.89, and t +0.11 against the close) — unexpected, since
-# park largely cancels in a difference, so treat it as a bonus not the finding.
-#
-# **Why it works is arithmetic, not a fit**, which is why it transferred to the
-# sim when nothing else this session did: one season of park factor is ~50%
-# sampling noise (§8), so averaging drops the noise as sqrt(n) while the true
-# park effect survives. Individual parks swing 0.25-0.43 year to year while the
-# true spread ACROSS parks is only ~0.11 sd — the noise is 2-4x the signal in a
-# single season.
-#
-# w=2 was measured too and is roughly half the gain (+0.068 on 2025, flat on
-# 2026); w=4 splits between targets. 3 is where both agree.
+# 2025 goes from 79% to 90% of the market's own correlation with the actual
+# total. The moneyline improved too (log-loss 0.68140 -> 0.68086) — park largely
+# cancels in a difference, so treat that as a bonus, not the finding. w=2 is
+# about half the gain; w=4 splits between targets; 3 is where both agree.
 #
 # **Known limitation:** a park that stayed in the data and physically CHANGED is
 # averaged across the change. Sutter Health Park (1.103 in 2025 -> 1.513 in
-# 2026) is the real case. Camden's 2025 wall move is NOT visible in the run
-# factor (0.877 / 0.961 / 1.058 / 0.953 across 2023-26) — §8's Camden note is
-# about HR geometry and batted-ball data, where it does matter.
+# 2026, and only two seasons exist) is the live case — averaging is right for
+# noise and wrong for a real change, and two seasons cannot tell you which.
+# Camden's 2025 wall move is NOT visible here (0.877/0.961/1.058/0.953 across
+# 2023-26); §8's Camden note is about HR geometry, where it does matter.
 PARK_RUN_WINDOW = 3           # SHIPPED 2026-08-17. Savant publishes 3-year
                               # rolling for the same reason. Needs park factors
                               # back to `season - lag - 2`.
@@ -8065,9 +8717,10 @@ def park_run_window() -> int:
     return max(1, PARK_RUN_WINDOW)
 
 
-def park_run_factor(venue: Optional[str], season: int = 2026,
+def park_run_factor(venue: Optional[str], season: Optional[int] = None,
                     save_dir: Path = SAVE_DIR) -> float:
     """Regressed home/road run factor for a park. 1.0 when unknown."""
+    season = CURRENT_SEASON if season is None else int(season)
     # Keyed on SEASON **and the applied reliability**, so a lagged build does
     # not get served the contemporaneous numbers out of a stale memo. Keying on
     # season alone was enough while the reliability was a single constant; now
@@ -8216,21 +8869,275 @@ def _park_outcome_table(season: int,
     return got
 
 
-def club_home_park(club: str, season: int,
-                   save_dir: Path = SAVE_DIR) -> Optional[str]:
-    """Which park a club calls home that season."""
-    got = _CLUB_PARK.get(season)
-    if got is None:
-        p = Path(save_dir) / f"park_run_factors_{season}.json"
-        got = {}
-        if p.exists():
-            with open(p) as fh:
-                for venue, row in json.load(fh).items():
-                    c = row.get("club")
-                    if c:
-                        got[normalize_club(c)] = venue
-        _CLUB_PARK[season] = got
-    return got.get(normalize_club(club)) if club else None
+class ParkFactors:
+    """Per-outcome park factors, player exposure, and de-contamination."""
+
+    @staticmethod
+    def club_home_park(club: str, season: int,
+                       save_dir: Path = SAVE_DIR) -> Optional[str]:
+        """Which park a club calls home that season."""
+        got = _CLUB_PARK.get(season)
+        if got is None:
+            p = Path(save_dir) / f"park_run_factors_{season}.json"
+            got = {}
+            if p.exists():
+                with open(p) as fh:
+                    for venue, row in json.load(fh).items():
+                        c = row.get("club")
+                        if c:
+                            got[normalize_club(c)] = venue
+            _CLUB_PARK[season] = got
+        return got.get(normalize_club(club)) if club else None
+
+    @staticmethod
+    def build_park_outcome_factors(season: int, reliability: float = 0.70,
+                                   save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
+        """Per-OUTCOME park factors. `park_run_factor` is a RUN factor.
+
+        Park affects home runs far more than strikeouts, so de-contaminating a
+        nine-outcome vector with one run number injects error into every column it
+        does not fit — Citizens Bank reads 1.181 on runs and 1.049 on home runs.
+
+        Standard home/road ratio, but on the SAME SET OF CLUBS both ways: for park
+        P take every PA played there and compare each outcome against the rate
+        those same clubs produced in all their OTHER games that season. That
+        controls for club quality — a park shared by a good offence would
+        otherwise read hot.
+
+        Regressed toward 1.0 by games played, because one season of ~2,400 PA is
+        noisy and the shipped run factor is shrunk the same way.
+        """
+        import gzip
+        import numpy as np                      # lazy: the GUI path never needs it
+        slate = season_slate(season, save_dir=save_dir)
+        venue, clubs = {}, {}
+        for g in slate:
+            pk = g.get("pk") or g.get("game_pk")
+            if pk is None or not g.get("venue"):
+                continue
+            venue[pk] = g["venue"]
+            clubs[pk] = (g.get("home"), g.get("away"))
+        with gzip.open(Path(save_dir) / "pa" / "v2" / f"pa_{season}.json.gz") as fh:
+            rows = json.load(fh)
+        N = N_OUTCOMES
+        at = collections.defaultdict(lambda: np.zeros(N))
+        at_n: collections.Counter = collections.Counter()
+        club_all = collections.defaultdict(lambda: np.zeros(N))
+        club_n: collections.Counter = collections.Counter()
+        pa_by_venue_club = collections.defaultdict(lambda: np.zeros(N))
+        pav_n: collections.Counter = collections.Counter()
+        for r in rows:
+            v = venue.get(r["pk"])
+            if v is None:
+                continue
+            o = r["o"]
+            at[v][o] += 1
+            at_n[v] += 1
+            for c in clubs[r["pk"]]:
+                if c is None:
+                    continue
+                club_all[c][o] += 1
+                club_n[c] += 1
+                pa_by_venue_club[(v, c)][o] += 1
+                pav_n[(v, c)] += 1
+        out: Dict[str, dict] = {}
+        for v, cnt in at.items():
+            if at_n[v] < 3000:
+                continue
+            here = cnt / at_n[v]
+            elsew = np.zeros(N)
+            elsen = 0
+            for (vv, c), cc in pa_by_venue_club.items():
+                if vv != v:
+                    continue
+                elsew += club_all[c] - cc
+                elsen += club_n[c] - pav_n[(v, c)]
+            if elsen < 3000:
+                continue
+            ref = elsew / elsen
+            raw = np.where(ref > 0, here / np.maximum(ref, 1e-9), 1.0)
+            games = at_n[v] / 76.0                       # ~76 PA a game
+            w = games / (games + (1 - reliability) / reliability * 81.0)
+            out[v] = {"raw": raw.tolist(), "factor": (1.0 + w * (raw - 1.0)).tolist(),
+                      "pa": int(at_n[v]), "games": round(games, 1),
+                      "w": round(float(w), 3)}
+        return out
+
+    @staticmethod
+    def build_player_park_exposure(season: int,
+                                   save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
+        """Each player's ACTUAL park exposure, from his own plate appearances.
+
+        The first version assumed every player took `PARK_HOME_GAME_SHARE` of his
+        PAs at his club's home field, read off the board's `Team` tag. That fails
+        exactly where it matters: ~9% of rows are `- - -`, traded mid-season, with
+        no single home park — and those are the players whose exposure is least
+        like the assumption. It is a poor assumption for everyone else too; players
+        miss games, sit against same-handed starters, come up in July, and the
+        schedule is unbalanced.
+
+        None of it is needed. `savedata/pa/v2/` carries every plate appearance with
+        its gamePk and the slate maps gamePk -> venue, so exposure is directly
+        observable, per player, per season, both sides.
+
+        **Stores the SHARES, not a baked exposure.** The shares are a fact about
+        the schedule; the factors are an estimate with a window on them. Baking
+        them together froze a single-season factor into a cache that
+        `park_outcome_factor` reads over a 3-season window — two numbers for one
+        quantity, which is the shape of every silent-cache defect here.
+        """
+        import gzip
+        slate = season_slate(season, save_dir=save_dir)
+        venue = {}
+        for g in slate:
+            pk = g.get("pk") or g.get("game_pk")
+            if pk is not None and g.get("venue"):
+                venue[pk] = g["venue"]
+        with gzip.open(Path(save_dir) / "pa" / "v2" / f"pa_{season}.json.gz") as fh:
+            rows = json.load(fh)
+        tally = {"bat": collections.defaultdict(collections.Counter),
+                 "pit": collections.defaultdict(collections.Counter)}
+        missing = 0
+        for r in rows:
+            v = venue.get(r["pk"])
+            if v is None:
+                missing += 1
+                continue
+            tally["bat"][r["bat"]][v] += 1
+            tally["pit"][r["pit"]][v] += 1
+        out: Dict[str, dict] = {}
+        for side in ("bat", "pit"):
+            per = {}
+            for pid, parks in tally[side].items():
+                tot = sum(parks.values())
+                if tot < 25:                     # too few PAs to characterise
+                    continue
+                per[str(pid)] = {"pa": tot,
+                                 "shares": {v: round(n / tot, 6)
+                                            for v, n in parks.items()}}
+            out[side] = per
+        out["_meta"] = {"season": season, "pa_without_venue": missing,
+                        "n_bat": len(out["bat"]), "n_pit": len(out["pit"])}
+        return out
+
+    @staticmethod
+    def park_outcome_factor(club: Optional[str], season: int,
+                            window: Optional[int] = None,
+                            save_dir: Path = SAVE_DIR) -> List[float]:
+        """A club's home-park factor per outcome, averaged over `window` seasons.
+
+        Returns all-ones when the club is unknown — which is the RIGHT answer for
+        the ~9% of board rows tagged `- - -`, a player who split the season
+        between clubs and therefore has no single home park. That placeholder is
+        the same one that corrupted `export_defense` (it normalises to "" and is a
+        substring of every club), so it is handled by NAME here and never allowed
+        to resolve to a park.
+        """
+        n = PARK_OUTCOME_WINDOW if window is None else window
+        if not club or str(club).strip(" -") == "":
+            return [1.0] * N_OUTCOMES
+        acc = [0.0] * N_OUTCOMES
+        hits = 0
+        for s in range(season - n + 1, season + 1):
+            venue = ParkFactors.club_home_park(club, s, save_dir)
+            tab = _park_outcome_table(s, save_dir)
+            f = tab.get(venue) if venue else None
+            if not f:
+                continue
+            for i in range(N_OUTCOMES):
+                acc[i] += f[i]
+            hits += 1
+        if not hits:
+            return [1.0] * N_OUTCOMES
+        return [a / hits for a in acc]
+
+    @staticmethod
+    def player_park_shares(pid: int, side: str, season: int,
+                           save_dir: Path = SAVE_DIR) -> Optional[Dict[str, float]]:
+        """Where this player's plate appearances were actually TAKEN, by park.
+
+        Measured from `savedata/pa/v2/`, not assumed. The first version of this
+        guessed `PARK_HOME_GAME_SHARE` of his PAs at the club named on his board
+        row, which fails hardest exactly where it matters: ~9% of rows are tagged
+        `- - -` for a player traded mid-season, and those are the players whose
+        park mix is least like the assumption. It is also wrong for everyone else
+        — players miss games, sit against same-handed starters, arrive in July,
+        and the schedule is unbalanced.
+        """
+        key = (season, str(save_dir))
+        got = _PARK_EXPO.get(key)
+        if got is None:
+            p = Path(save_dir) / f"player_park_exposure_{season}.json"
+            got = json.load(open(p)) if p.exists() else {}
+            _PARK_EXPO[key] = got
+        return ((got.get(side) or {}).get(str(pid)) or {}).get("shares")
+
+    @staticmethod
+    def decontaminate_counts(counts: Sequence[float], pa: float,
+                             pid: int, side: str, season: int,
+                             save_dir: Path = SAVE_DIR) -> List[float]:
+        """Strip a player's OWN park out of his counts, preserving PA.
+
+        The multiplier his line carries is his MEASURED exposure — the parks he
+        actually hit or pitched in, weighted by how many plate appearances he took
+        there. Dividing it out leaves a park-NEUTRAL line, which is what the
+        stabilisers were measured to shrink: they estimate talent (three
+        converging measurements), and this is the step that makes the input
+        talent-shaped.
+
+        The vector is renormalised to the original PA so nothing downstream sees a
+        changed sample size — the shrinkage weight must keep meaning what it meant.
+        """
+        f = measured_park_exposure(pid, side, season, save_dir)
+        if all(abs(x - 1.0) < 1e-12 for x in f):
+            return list(counts)
+        out = []
+        for i, c in enumerate(counts):
+            out.append(c / f[i] if f[i] > 1e-6 else c)
+        tot = sum(out)
+        if tot <= 0:
+            return list(counts)
+        scale = (pa if pa > 0 else sum(counts)) / tot
+        return [x * scale for x in out]
+
+    @staticmethod
+    def build_park_weather_ref_om(season: Optional[int] = None, lag: int = 0,
+                                  save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
+        """Each park's mean conditions AS OPEN-METEO SEES THEM -> a matched
+        reference for the forecast arms. See `park_weather_reference`."""
+        season = CURRENT_SEASON if season is None else int(season)
+        fc = load_forecast_weather(season, lag, save_dir)
+        acc: Dict[str, List[Tuple[float, float]]] = {}
+        for row in season_slate(season, save_dir=save_dir):
+            venue = resolve_venue(row.get("venue") or "")
+            w = fc.get(int(row["pk"]))
+            if not venue or not w:
+                continue
+            az = park_azimuth(venue)
+            mph, deg = w.get("wind_mph"), w.get("wind_dir_deg")
+            out = None
+            if mph is not None and deg is not None and az is not None:
+                field = (float(deg) - float(az)) % 360.0
+                out = -float(mph) * math.cos(math.radians(field))
+            if w.get("temp_f") is None or out is None:
+                continue
+            acc.setdefault(venue, []).append(
+                (float(w["temp_f"]), out,
+                 air_density(w.get("temp_f"), w.get("pressure_hpa"),
+                             w.get("humidity_pct"))))
+        ref = {v: {"temp_f": statistics.mean(t for t, _, _ in rows),
+                   "out_component": statistics.mean(o for _, o, _ in rows),
+                   # the park's own mean DENSITY, so the density term is centred on
+                   # the population it is applied to (the recurring trap)
+                   "density": (statistics.mean(d for _, _, d in rows if d is not None)
+                               if any(d is not None for _, _, d in rows) else None),
+                   "n": len(rows)}
+               for v, rows in acc.items() if len(rows) >= 20}
+        path = Path(save_dir) / f"park_weather_ref_om_{season}.json"
+        with open(path, "w") as fh:
+            json.dump(ref, fh, indent=1)
+        print(f"[forecastwx] park reference for {len(ref)} parks -> {path}")
+        return ref
 
 
 # ---------------------------------------------------------------------------
@@ -8245,207 +9152,7 @@ def club_home_park(club: str, season: int,
 # owns the data, and its heavy imports are lazy so the GUI path is unchanged.
 
 
-def build_park_outcome_factors(season: int, reliability: float = 0.70,
-                               save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
-    """Per-OUTCOME park factors. `park_run_factor` is a RUN factor.
-
-    Park affects home runs far more than strikeouts, so de-contaminating a
-    nine-outcome vector with one run number injects error into every column it
-    does not fit — Citizens Bank reads 1.181 on runs and 1.049 on home runs.
-
-    Standard home/road ratio, but on the SAME SET OF CLUBS both ways: for park
-    P take every PA played there and compare each outcome against the rate
-    those same clubs produced in all their OTHER games that season. That
-    controls for club quality — a park shared by a good offence would
-    otherwise read hot.
-
-    Regressed toward 1.0 by games played, because one season of ~2,400 PA is
-    noisy and the shipped run factor is shrunk the same way.
-    """
-    import gzip
-    import numpy as np                      # lazy: the GUI path never needs it
-    slate = season_slate(season, save_dir=save_dir)
-    venue, clubs = {}, {}
-    for g in slate:
-        pk = g.get("pk") or g.get("game_pk")
-        if pk is None or not g.get("venue"):
-            continue
-        venue[pk] = g["venue"]
-        clubs[pk] = (g.get("home"), g.get("away"))
-    with gzip.open(Path(save_dir) / "pa" / "v2" / f"pa_{season}.json.gz") as fh:
-        rows = json.load(fh)
-    N = N_OUTCOMES
-    at = collections.defaultdict(lambda: np.zeros(N))
-    at_n: collections.Counter = collections.Counter()
-    club_all = collections.defaultdict(lambda: np.zeros(N))
-    club_n: collections.Counter = collections.Counter()
-    pa_by_venue_club = collections.defaultdict(lambda: np.zeros(N))
-    pav_n: collections.Counter = collections.Counter()
-    for r in rows:
-        v = venue.get(r["pk"])
-        if v is None:
-            continue
-        o = r["o"]
-        at[v][o] += 1
-        at_n[v] += 1
-        for c in clubs[r["pk"]]:
-            if c is None:
-                continue
-            club_all[c][o] += 1
-            club_n[c] += 1
-            pa_by_venue_club[(v, c)][o] += 1
-            pav_n[(v, c)] += 1
-    out: Dict[str, dict] = {}
-    for v, cnt in at.items():
-        if at_n[v] < 3000:
-            continue
-        here = cnt / at_n[v]
-        elsew = np.zeros(N)
-        elsen = 0
-        for (vv, c), cc in pa_by_venue_club.items():
-            if vv != v:
-                continue
-            elsew += club_all[c] - cc
-            elsen += club_n[c] - pav_n[(v, c)]
-        if elsen < 3000:
-            continue
-        ref = elsew / elsen
-        raw = np.where(ref > 0, here / np.maximum(ref, 1e-9), 1.0)
-        games = at_n[v] / 76.0                       # ~76 PA a game
-        w = games / (games + (1 - reliability) / reliability * 81.0)
-        out[v] = {"raw": raw.tolist(), "factor": (1.0 + w * (raw - 1.0)).tolist(),
-                  "pa": int(at_n[v]), "games": round(games, 1),
-                  "w": round(float(w), 3)}
-    return out
-
-
-def build_player_park_exposure(season: int,
-                               save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
-    """Each player's ACTUAL park exposure, from his own plate appearances.
-
-    The first version assumed every player took `PARK_HOME_GAME_SHARE` of his
-    PAs at his club's home field, read off the board's `Team` tag. That fails
-    exactly where it matters: ~9% of rows are `- - -`, traded mid-season, with
-    no single home park — and those are the players whose exposure is least
-    like the assumption. It is a poor assumption for everyone else too; players
-    miss games, sit against same-handed starters, come up in July, and the
-    schedule is unbalanced.
-
-    None of it is needed. `savedata/pa/v2/` carries every plate appearance with
-    its gamePk and the slate maps gamePk -> venue, so exposure is directly
-    observable, per player, per season, both sides.
-
-    **Stores the SHARES, not a baked exposure.** The shares are a fact about
-    the schedule; the factors are an estimate with a window on them. Baking
-    them together froze a single-season factor into a cache that
-    `park_outcome_factor` reads over a 3-season window — two numbers for one
-    quantity, which is the shape of every silent-cache defect here.
-    """
-    import gzip
-    slate = season_slate(season, save_dir=save_dir)
-    venue = {}
-    for g in slate:
-        pk = g.get("pk") or g.get("game_pk")
-        if pk is not None and g.get("venue"):
-            venue[pk] = g["venue"]
-    with gzip.open(Path(save_dir) / "pa" / "v2" / f"pa_{season}.json.gz") as fh:
-        rows = json.load(fh)
-    tally = {"bat": collections.defaultdict(collections.Counter),
-             "pit": collections.defaultdict(collections.Counter)}
-    missing = 0
-    for r in rows:
-        v = venue.get(r["pk"])
-        if v is None:
-            missing += 1
-            continue
-        tally["bat"][r["bat"]][v] += 1
-        tally["pit"][r["pit"]][v] += 1
-    out: Dict[str, dict] = {}
-    for side in ("bat", "pit"):
-        per = {}
-        for pid, parks in tally[side].items():
-            tot = sum(parks.values())
-            if tot < 25:                     # too few PAs to characterise
-                continue
-            per[str(pid)] = {"pa": tot,
-                             "shares": {v: round(n / tot, 6)
-                                        for v, n in parks.items()}}
-        out[side] = per
-    out["_meta"] = {"season": season, "pa_without_venue": missing,
-                    "n_bat": len(out["bat"]), "n_pit": len(out["pit"])}
-    return out
-
-
-def park_outcome_factor(club: Optional[str], season: int,
-                        window: Optional[int] = None,
-                        save_dir: Path = SAVE_DIR) -> List[float]:
-    """A club's home-park factor per outcome, averaged over `window` seasons.
-
-    Returns all-ones when the club is unknown — which is the RIGHT answer for
-    the ~9% of board rows tagged `- - -`, a player who split the season
-    between clubs and therefore has no single home park. That placeholder is
-    the same one that corrupted `export_defense` (it normalises to "" and is a
-    substring of every club), so it is handled by NAME here and never allowed
-    to resolve to a park.
-    """
-    n = PARK_OUTCOME_WINDOW if window is None else window
-    if not club or str(club).strip(" -") == "":
-        return [1.0] * N_OUTCOMES
-    acc = [0.0] * N_OUTCOMES
-    hits = 0
-    for s in range(season - n + 1, season + 1):
-        venue = club_home_park(club, s, save_dir)
-        tab = _park_outcome_table(s, save_dir)
-        f = tab.get(venue) if venue else None
-        if not f:
-            continue
-        for i in range(N_OUTCOMES):
-            acc[i] += f[i]
-        hits += 1
-    if not hits:
-        return [1.0] * N_OUTCOMES
-    return [a / hits for a in acc]
-
-
-def _board_club(row: dict) -> Optional[str]:
-    """The club tag off a board row.
-
-    FanGraphs wraps it in an anchor, and a player who changed clubs mid-season
-    is tagged `- - -`. That placeholder must reach `park_outcome_factor` AS
-    ITSELF so it can return a neutral factor — normalising it to "" would make
-    it a substring of every club, which is precisely how `export_defense` put
-    Cincinnati's whole OAA onto Boston.
-    """
-    t = str(row.get("Team") or "")
-    hit = re.search(r">([A-Za-z]{2,3})<", t)
-    if hit:
-        return hit.group(1)
-    t = t.strip()
-    return t or None
-
-
 _PARK_EXPO: Dict[tuple, dict] = {}          # keyed on (season,) — never bare
-
-
-def player_park_shares(pid: int, side: str, season: int,
-                       save_dir: Path = SAVE_DIR) -> Optional[Dict[str, float]]:
-    """Where this player's plate appearances were actually TAKEN, by park.
-
-    Measured from `savedata/pa/v2/`, not assumed. The first version of this
-    guessed `PARK_HOME_GAME_SHARE` of his PAs at the club named on his board
-    row, which fails hardest exactly where it matters: ~9% of rows are tagged
-    `- - -` for a player traded mid-season, and those are the players whose
-    park mix is least like the assumption. It is also wrong for everyone else
-    — players miss games, sit against same-handed starters, arrive in July,
-    and the schedule is unbalanced.
-    """
-    key = (season, str(save_dir))
-    got = _PARK_EXPO.get(key)
-    if got is None:
-        p = Path(save_dir) / f"player_park_exposure_{season}.json"
-        got = json.load(open(p)) if p.exists() else {}
-        _PARK_EXPO[key] = got
-    return ((got.get(side) or {}).get(str(pid)) or {}).get("shares")
 
 
 def measured_park_exposure(pid: int, side: str, season: int,
@@ -8456,7 +9163,7 @@ def measured_park_exposure(pid: int, side: str, season: int,
     neutral only when he has no measured PAs at all — a callup with fewer than
     25, or a season with no PA file.
     """
-    shares = player_park_shares(pid, side, season, save_dir)
+    shares = ParkFactors.player_park_shares(pid, side, season, save_dir)
     if not shares:
         return [1.0] * N_OUTCOMES
     n = PARK_OUTCOME_WINDOW
@@ -8475,34 +9182,6 @@ def measured_park_exposure(pid: int, side: str, season: int,
         for i in range(N_OUTCOMES):
             expo[i] += w * (acc[i] / hits if hits else 1.0)
     return expo
-
-
-def decontaminate_counts(counts: Sequence[float], pa: float,
-                         pid: int, side: str, season: int,
-                         save_dir: Path = SAVE_DIR) -> List[float]:
-    """Strip a player's OWN park out of his counts, preserving PA.
-
-    The multiplier his line carries is his MEASURED exposure — the parks he
-    actually hit or pitched in, weighted by how many plate appearances he took
-    there. Dividing it out leaves a park-NEUTRAL line, which is what the
-    stabilisers were measured to shrink: they estimate talent (three
-    converging measurements), and this is the step that makes the input
-    talent-shaped.
-
-    The vector is renormalised to the original PA so nothing downstream sees a
-    changed sample size — the shrinkage weight must keep meaning what it meant.
-    """
-    f = measured_park_exposure(pid, side, season, save_dir)
-    if all(abs(x - 1.0) < 1e-12 for x in f):
-        return list(counts)
-    out = []
-    for i, c in enumerate(counts):
-        out.append(c / f[i] if f[i] > 1e-6 else c)
-    tot = sum(out)
-    if tot <= 0:
-        return list(counts)
-    scale = (pa if pa > 0 else sum(counts)) / tot
-    return [x * scale for x in out]
 
 
 PARK_RUN_SEASON = 2026      # which season's park factors; lagged by
@@ -8544,7 +9223,7 @@ _PARK_WX_REF_OM: Dict[int, Dict[str, dict]] = {}
 _PARK_WX_WARNED: set = set()
 
 
-def park_weather_reference(season: int = 2026, save_dir: Path = SAVE_DIR
+def park_weather_reference(season: Optional[int] = None, save_dir: Path = SAVE_DIR
                            ) -> Dict[str, dict]:
     """{venue: {temp_f, out_component}} — each park's own typical conditions.
 
@@ -8561,6 +9240,7 @@ def park_weather_reference(season: int = 2026, save_dir: Path = SAVE_DIR
     climatology, not information, so using day 0 for the day-1 arm centres it
     without leaking tomorrow's forecast into it.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     # **KEYED ON SEASON.** These were bare globals, so the FIRST season loaded
     # was served for every later request — and because a missing file caches
     # `{}`, one call for a season with no reference file switched weather off
@@ -8620,44 +9300,6 @@ def park_weather_reference(season: int = 2026, save_dir: Path = SAVE_DIR
     except (OSError, ValueError):
         cache[key] = {}
     return cache[key]
-
-
-def build_park_weather_ref_om(season: int = 2026, lag: int = 0,
-                              save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
-    """Each park's mean conditions AS OPEN-METEO SEES THEM -> a matched
-    reference for the forecast arms. See `park_weather_reference`."""
-    fc = load_forecast_weather(season, lag, save_dir)
-    acc: Dict[str, List[Tuple[float, float]]] = {}
-    for row in season_slate(season, save_dir=save_dir):
-        venue = resolve_venue(row.get("venue") or "")
-        w = fc.get(int(row["pk"]))
-        if not venue or not w:
-            continue
-        az = park_azimuth(venue)
-        mph, deg = w.get("wind_mph"), w.get("wind_dir_deg")
-        out = None
-        if mph is not None and deg is not None and az is not None:
-            field = (float(deg) - float(az)) % 360.0
-            out = -float(mph) * math.cos(math.radians(field))
-        if w.get("temp_f") is None or out is None:
-            continue
-        acc.setdefault(venue, []).append(
-            (float(w["temp_f"]), out,
-             air_density(w.get("temp_f"), w.get("pressure_hpa"),
-                         w.get("humidity_pct"))))
-    ref = {v: {"temp_f": statistics.mean(t for t, _, _ in rows),
-               "out_component": statistics.mean(o for _, o, _ in rows),
-               # the park's own mean DENSITY, so the density term is centred on
-               # the population it is applied to (the recurring trap)
-               "density": (statistics.mean(d for _, _, d in rows if d is not None)
-                           if any(d is not None for _, _, d in rows) else None),
-               "n": len(rows)}
-           for v, rows in acc.items() if len(rows) >= 20}
-    path = Path(save_dir) / f"park_weather_ref_om_{season}.json"
-    with open(path, "w") as fh:
-        json.dump(ref, fh, indent=1)
-    print(f"[forecastwx] park reference for {len(ref)} parks -> {path}")
-    return ref
 
 
 def air_density(temp_f: Optional[float], pressure_hpa: Optional[float],
@@ -8784,126 +9426,133 @@ def weather_tilt(weather: Optional[dict], venue: Optional[str] = None,
 # Calibration
 # ---------------------------------------------------------------------------
 
-def load_scale(default: float = 1.0) -> float:
-    """The fitted distance scale. 1.0 until `calibrate_distance()` has run."""
-    try:
-        with open(CALIB_PATH) as fh:
-            return float(json.load(fh)["distance_scale"])
-    except (OSError, KeyError, ValueError, TypeError):
-        return default
+class DistanceCalibration:
+    """Fitting `distance_scale` so predicted home runs match real ones."""
 
+    @staticmethod
+    def load_scale(default: float = 1.0) -> float:
+        """The fitted distance scale. 1.0 until `calibrate_distance()` has run."""
+        try:
+            with open(CALIB_PATH) as fh:
+                return float(json.load(fh)["distance_scale"])
+        except (OSError, KeyError, ValueError, TypeError):
+            return default
 
-def save_scale(scale: float, note: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(CALIB_PATH, "w") as fh:
-        json.dump({"distance_scale": scale, **note}, fh, indent=2)
+    @staticmethod
+    def save_scale(scale: float, note: dict) -> None:
+        DATA_DIR.mkdir(exist_ok=True)
+        with open(CALIB_PATH, "w") as fh:
+            json.dump({"distance_scale": scale, **note}, fh, indent=2)
 
+    @staticmethod
+    def load_bbe_frame(season: Optional[int] = None, path: Optional[Path] = None):
+        """Real batted balls with the columns this module needs, park-labelled."""
+        season = CURRENT_SEASON if season is None else int(season)
+        import pandas as pd
+        TEAM_TO_PARK, STADIUM_DATA = _wm().TEAM_TO_PARK, _wm().STADIUM_DATA
 
-def load_bbe_frame(season: int = 2026, path: Optional[Path] = None):
-    """Real batted balls with the columns this module needs, park-labelled."""
-    import pandas as pd
-    TEAM_TO_PARK, STADIUM_DATA = _wm().TEAM_TO_PARK, _wm().STADIUM_DATA
+        # The Savant CSVs are shared with `savant_bbe_fetch` / `homerunwidget`
+        # and stay at the app root.
+        path = path or (_APP_ROOT / f"savant_bbe_{season}.csv")
+        df = pd.read_csv(path, usecols=[
+            "events", "launch_speed", "launch_angle", "hc_x", "hc_y",
+            "home_team", "batter"], low_memory=False)
+        df = df.dropna(subset=["launch_speed", "launch_angle", "hc_x", "hc_y"])
+        df["park"] = df["home_team"].map(TEAM_TO_PARK)
+        df = df[df["park"].isin(STADIUM_DATA.keys())]
 
-    path = path or (Path(__file__).resolve().parent
-                    / f"savant_bbe_{season}.csv")
-    df = pd.read_csv(path, usecols=[
-        "events", "launch_speed", "launch_angle", "hc_x", "hc_y",
-        "home_team", "batter"], low_memory=False)
-    df = df.dropna(subset=["launch_speed", "launch_angle", "hc_x", "hc_y"])
-    df["park"] = df["home_team"].map(TEAM_TO_PARK)
-    df = df[df["park"].isin(STADIUM_DATA.keys())]
+        dx = df["hc_x"] - 125.42
+        dy = 198.27 - df["hc_y"]
+        df = df[dy > 0]
+        import numpy as np
+        df["hla"] = np.degrees(np.arctan2(dx[dy > 0], dy[dy > 0]))
+        df["is_hr"] = (df["events"] == "home_run").astype(int)
+        return df
 
-    dx = df["hc_x"] - 125.42
-    dy = 198.27 - df["hc_y"]
-    df = df[dy > 0]
-    import numpy as np
-    df["hla"] = np.degrees(np.arctan2(dx[dy > 0], dy[dy > 0]))
-    df["is_hr"] = (df["events"] == "home_run").astype(int)
-    return df
+    @staticmethod
+    def calibrate_distance(season: Optional[int] = None, sample: int = 60000,
+                           seed: int = 7, workers: Optional[int] = None) -> dict:
+        """Fit `distance_scale` so predicted home runs match REAL ones.
 
+        The raw physics runs ~45 ft short, and a home run is a hard threshold
+        against a fence, so that bias does NOT cancel in a ratio — left alone,
+        almost nothing clears and the multiplier becomes tail noise. One scalar on
+        the trajectory's horizontal distance is fitted here against actual
+        `events == "home_run"` at real parks, which is ground truth we already
+        have on disk.
 
-def calibrate_distance(season: int = 2026, sample: int = 60000,
-                       seed: int = 7, workers: Optional[int] = None) -> dict:
-    """Fit `distance_scale` so predicted home runs match REAL ones.
+        Fitting the COUNT rather than per-ball accuracy is deliberate: the
+        multiplier is a ratio of rates, so what has to be right is where the
+        fence sits in the distance distribution, not which individual ball went
+        out.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        df = DistanceCalibration.load_bbe_frame(season)
+        if sample and len(df) > sample:
+            df = df.sample(sample, random_state=seed)
+        air = df[(df["launch_angle"].between(LA_MIN, LA_MAX))
+                 & (df["launch_speed"] >= EV_MIN)]
+        actual = int(df["is_hr"].sum())
+        parks = sorted(air["park"].unique())
+        print(f"[calib] {len(df)} batted balls, {len(air)} air balls, "
+              f"{actual} real home runs, {len(parks)} parks")
 
-    The raw physics runs ~45 ft short, and a home run is a hard threshold
-    against a fence, so that bias does NOT cancel in a ratio — left alone,
-    almost nothing clears and the multiplier becomes tail noise. One scalar on
-    the trajectory's horizontal distance is fitted here against actual
-    `events == "home_run"` at real parks, which is ground truth we already
-    have on disk.
+        # One bank per PARK, because altitude changes the air. Everything else
+        # about the fit is a lookup against these.
+        # Build every missing bank in parallel first, then read them back in.
+        # Resumable: already-cached parks are skipped, so an interrupted run
+        # picks up where it stopped rather than starting over.
+        BallFlight.prebuild_banks(parks, {}, workers=workers)
+        banks = {}
+        for i, park in enumerate(parks, 1):
+            banks[park] = BallFlight.cached_trajectory_bank({}, venue=park)
+            print(f"[calib]   loaded {i}/{len(parks)} {park}", flush=True)
 
-    Fitting the COUNT rather than per-ball accuracy is deliberate: the
-    multiplier is a ratio of rates, so what has to be right is where the
-    fence sits in the distance distribution, not which individual ball went
-    out.
-    """
-    df = load_bbe_frame(season)
-    if sample and len(df) > sample:
-        df = df.sample(sample, random_state=seed)
-    air = df[(df["launch_angle"].between(LA_MIN, LA_MAX))
-             & (df["launch_speed"] >= EV_MIN)]
-    actual = int(df["is_hr"].sum())
-    parks = sorted(air["park"].unique())
-    print(f"[calib] {len(df)} batted balls, {len(air)} air balls, "
-          f"{actual} real home runs, {len(parks)} parks")
+        by_park = {park: air[air["park"] == park] for park in parks}
 
-    # One bank per PARK, because altitude changes the air. Everything else
-    # about the fit is a lookup against these.
-    # Build every missing bank in parallel first, then read them back in.
-    # Resumable: already-cached parks are skipped, so an interrupted run
-    # picks up where it stopped rather than starting over.
-    prebuild_banks(parks, {}, workers=workers)
-    banks = {}
-    for i, park in enumerate(parks, 1):
-        banks[park] = cached_trajectory_bank({}, venue=park)
-        print(f"[calib]   loaded {i}/{len(parks)} {park}", flush=True)
+        def predicted(scale: float) -> int:
+            total = 0
+            for park in parks:
+                grid = BallFlight.fence_grid_from_bank(banks[park], park, scale)
+                sub = by_park[park]
+                for ev, la, hla in zip(sub["launch_speed"], sub["launch_angle"],
+                                       sub["hla"]):
+                    if ev >= BallFlight._lookup(grid, hla, la):
+                        total += 1
+            return total
 
-    by_park = {park: air[air["park"] == park] for park in parks}
+        lo, hi = 0.90, 1.45
+        seen: List[Tuple[float, int]] = []
+        for _ in range(7):
+            mid = 0.5 * (lo + hi)
+            pred = predicted(mid)
+            print(f"[calib] scale {mid:.4f} -> {pred} predicted vs {actual} actual")
+            seen.append((mid, pred))
+            if pred < actual:
+                lo = mid
+            else:
+                hi = mid
 
-    def predicted(scale: float) -> int:
-        total = 0
-        for park in parks:
-            grid = fence_grid_from_bank(banks[park], park, scale)
-            sub = by_park[park]
-            for ev, la, hla in zip(sub["launch_speed"], sub["launch_angle"],
-                                   sub["hla"]):
-                if ev >= _lookup(grid, hla, la):
-                    total += 1
-        return total
-
-    lo, hi = 0.90, 1.45
-    seen: List[Tuple[float, int]] = []
-    for _ in range(7):
-        mid = 0.5 * (lo + hi)
-        pred = predicted(mid)
-        print(f"[calib] scale {mid:.4f} -> {pred} predicted vs {actual} actual")
-        seen.append((mid, pred))
-        if pred < actual:
-            lo = mid
-        else:
-            hi = mid
-
-    # Take the CLOSEST candidate, not the last one bisection happened to try.
-    # The final midpoint is not the best estimate — here it landed on 1106
-    # against a real 1055 while an earlier probe at 1041 was twice as close.
-    scale, pred = min(seen, key=lambda sp: abs(sp[1] - actual))
-    # Then interpolate between the two probes that bracket the target, which
-    # this curve supports because it is steep and locally straight.
-    below = [sp for sp in seen if sp[1] <= actual]
-    above = [sp for sp in seen if sp[1] > actual]
-    if below and above:
-        lo_s, lo_p = max(below, key=lambda sp: sp[1])
-        hi_s, hi_p = min(above, key=lambda sp: sp[1])
-        if hi_p > lo_p:
-            scale = lo_s + (actual - lo_p) / (hi_p - lo_p) * (hi_s - lo_s)
-            pred = predicted(scale)
-            print(f"[calib] interpolated {scale:.4f} -> {pred} vs {actual}")
-    note = {"season": season, "sample": len(df), "actual_hr": actual,
-            "predicted_hr": pred, "parks": len(parks)}
-    save_scale(scale, note)
-    print(f"[calib] wrote distance_scale={scale:.4f} to {CALIB_PATH}")
-    return {"distance_scale": scale, **note}
+        # Take the CLOSEST candidate, not the last one bisection happened to try.
+        # The final midpoint is not the best estimate — here it landed on 1106
+        # against a real 1055 while an earlier probe at 1041 was twice as close.
+        scale, pred = min(seen, key=lambda sp: abs(sp[1] - actual))
+        # Then interpolate between the two probes that bracket the target, which
+        # this curve supports because it is steep and locally straight.
+        below = [sp for sp in seen if sp[1] <= actual]
+        above = [sp for sp in seen if sp[1] > actual]
+        if below and above:
+            lo_s, lo_p = max(below, key=lambda sp: sp[1])
+            hi_s, hi_p = min(above, key=lambda sp: sp[1])
+            if hi_p > lo_p:
+                scale = lo_s + (actual - lo_p) / (hi_p - lo_p) * (hi_s - lo_s)
+                pred = predicted(scale)
+                print(f"[calib] interpolated {scale:.4f} -> {pred} vs {actual}")
+        note = {"season": season, "sample": len(df), "actual_hr": actual,
+                "predicted_hr": pred, "parks": len(parks)}
+        DistanceCalibration.save_scale(scale, note)
+        print(f"[calib] wrote distance_scale={scale:.4f} to {CALIB_PATH}")
+        return {"distance_scale": scale, **note}
 
 
 # ===========================================================================
@@ -8918,9 +9567,43 @@ DEFAULT_SIMS = 20000
 # Projection
 # ---------------------------------------------------------------------------
 
+def describe_wind(weather: Optional[dict], venue: Optional[str] = None) -> str:
+    """A human, FIELD-RELATIVE description of a weather dict's wind.
+
+    StatsAPI observations arrive already field-relative and carry `wind_label`;
+    a FORECAST carries a compass bearing and no label at all, which is why the
+    verbose line used to read "wind 4.604763008578949 mph None". The number was
+    never wrong — `wind_frame` is tagged "compass" and the engine rotates it —
+    but a bearing is unreadable next to a park and the bare `None` looks like a
+    failure rather than an absent field.
+
+    Falls back to the raw bearing when the park is unknown, because guessing an
+    orientation would put a real wind on the wrong axis.
+    """
+    if not weather:
+        return ""
+    label = weather.get("wind_label")
+    if label:
+        return str(label)
+    deg = weather.get("wind_dir_deg")
+    if deg is None:
+        return ""
+    if str(weather.get("wind_frame")) == "compass":
+        try:
+            import weatherman
+            field = weatherman.wind_to_field_frame(float(deg), venue)
+            if field is not None:
+                best = min(weatherman.MLB_WIND_LABELS.items(),
+                           key=lambda kv: abs((float(field) - kv[1] + 180) % 360 - 180))
+                return f"{best[0]} ({float(field):.0f}deg field)"
+        except Exception:                                          # noqa: BLE001
+            pass
+    return f"from {float(deg):.0f}deg"
+
+
 def project_game(home_abbr: str, away_abbr: str, venue: Optional[str] = None,
-                 weather: Optional[dict] = None, n_sims: int = DEFAULT_SIMS,
-                 season: int = 2026, seed: Optional[int] = 1,
+                 weather: Optional[dict] = None, n_sims: Optional[int] = None,
+                 season: Optional[int] = None, seed: Optional[int] = 1,
                  hazard: Optional[List[float]] = None,
                  verbose: bool = False, with_pen: bool = True,
                  date: Optional[str] = None, live: bool = True,
@@ -8939,6 +9622,8 @@ def project_game(home_abbr: str, away_abbr: str, venue: Optional[str] = None,
     live game at a neutral park with no weather, costing 1.7 runs on
     CLE @ COL, and the LIVE path is not covered by the A/B harness.
     """
+    n_sims = DEFAULT_SIMS if n_sims is None else int(n_sims)
+    season = CURRENT_SEASON if season is None else int(season)
     home_abbr = normalize_club(home_abbr)
     away_abbr = normalize_club(away_abbr)
     bat_table, _ = build_rates("bat")
@@ -8975,8 +9660,9 @@ def project_game(home_abbr: str, away_abbr: str, venue: Optional[str] = None,
                     card.get("start"))
             if weather and verbose:
                 print(f"  weather: {weather.get('condition')}, "
-                      f"{weather.get('temp_f')}F, wind {weather.get('wind_mph')} "
-                      f"mph {weather.get('wind_label')}"
+                      f"{weather.get('temp_f', 0):.0f}F, wind "
+                      f"{weather.get('wind_mph', 0):.1f} mph "
+                      f"{describe_wind(weather, venue)}"
                       f"   -> {weather_tilt(weather, venue) * RUNS_PER_TILT:+.2f} "
                       f"runs")
         except Exception as e:
@@ -9055,26 +9741,30 @@ PITCHER_BOARD = (
 )
 
 
-def price_board(proj: dict) -> List[dict]:
-    """Every mapped market for every player in the game, fairly priced."""
-    res = proj["results"]
-    rows = []
-    for side in ("away", "home"):
-        team = proj[side]
-        for b in team.lineup:
-            for market, line in BATTER_BOARD:
-                if market not in BATTER_MARKETS:
-                    continue
+class Projection:
+    """Turning a projection into a priced board."""
+
+    @staticmethod
+    def price_board(proj: dict) -> List[dict]:
+        """Every mapped market for every player in the game, fairly priced."""
+        res = proj["results"]
+        rows = []
+        for side in ("away", "home"):
+            team = proj[side]
+            for b in team.lineup:
+                for market, line in BATTER_BOARD:
+                    if market not in BATTER_MARKETS:
+                        continue
+                    rows.append({"side": side, **summarize_prop(
+                        res, b.name, market, line)})
+            for market, line in PITCHER_BOARD:
                 rows.append({"side": side, **summarize_prop(
-                    res, b.name, market, line)})
-        for market, line in PITCHER_BOARD:
-            rows.append({"side": side, **summarize_prop(
-                res, team.starter.name, market, line)})
-    return rows
+                    res, team.starter.name, market, line)})
+        return rows
 
-
-def _fmt(v):
-    return f"{v:+d}" if isinstance(v, int) else "  --"
+    @staticmethod
+    def _fmt(v):
+        return f"{v:+d}" if isinstance(v, int) else "  --"
 
 
 # ===========================================================================
@@ -9122,143 +9812,163 @@ def _demo_side(name: str, quality: float = 1.0) -> TeamSide:
     return TeamSide(lineup=lineup, starter=sp, bullpen=pen)
 
 
-def smoke_test() -> None:
-    home = _demo_side("HOME", quality=1.10)
-    away = _demo_side("AWAY", quality=0.95)
-    n = 5000
-    res = simulate_many(home, away, n=n, seed=7)
+class Reports:
+    """The human-readable reports behind `rates`, `project` and `smoke`."""
 
-    rh = sum(r.runs_home for r in res) / n
-    ra = sum(r.runs_away for r in res) / n
-    print(f"{n} sims — mean runs: home {rh:.2f}, away {ra:.2f}")
-    print(f"home win% {sum(1 for r in res if r.runs_home > r.runs_away)/n:.3f}")
+    @staticmethod
+    def smoke_test() -> None:
+        home = _demo_side("HOME", quality=1.10)
+        away = _demo_side("AWAY", quality=0.95)
+        n = 5000
+        res = simulate_many(home, away, n=n, seed=7)
 
-    for mkt, line in (("batter_hits", 0.5), ("batter_total_bases", 1.5),
-                      ("batter_home_runs", 0.5)):
-        s = summarize_prop(res, "HOME-bat3", mkt, line)
-        print(f"  HOME-bat3 {mkt:24s} {line}  mean {s['mean']:.2f}  "
+        rh = sum(r.runs_home for r in res) / n
+        ra = sum(r.runs_away for r in res) / n
+        print(f"{n} sims — mean runs: home {rh:.2f}, away {ra:.2f}")
+        print(f"home win% {sum(1 for r in res if r.runs_home > r.runs_away)/n:.3f}")
+
+        for mkt, line in (("batter_hits", 0.5), ("batter_total_bases", 1.5),
+                          ("batter_home_runs", 0.5)):
+            s = summarize_prop(res, "HOME-bat3", mkt, line)
+            print(f"  HOME-bat3 {mkt:24s} {line}  mean {s['mean']:.2f}  "
+                  f"P(over) {s['p_over']:.3f}  fair {s['fair_over']:+d}")
+
+        s = summarize_prop(res, "AWAY-SP", "pitcher_strikeouts", 5.5)
+        print(f"  AWAY-SP  pitcher_strikeouts     5.5  mean {s['mean']:.2f}  "
+              f"P(over) {s['p_over']:.3f}  fair {s['fair_over']:+d}")
+        s = summarize_prop(res, "AWAY-SP", "pitcher_outs", 15.5)
+        print(f"  AWAY-SP  pitcher_outs          15.5  mean {s['mean']:.2f}  "
               f"P(over) {s['p_over']:.3f}  fair {s['fair_over']:+d}")
 
-    s = summarize_prop(res, "AWAY-SP", "pitcher_strikeouts", 5.5)
-    print(f"  AWAY-SP  pitcher_strikeouts     5.5  mean {s['mean']:.2f}  "
-          f"P(over) {s['p_over']:.3f}  fair {s['fair_over']:+d}")
-    s = summarize_prop(res, "AWAY-SP", "pitcher_outs", 15.5)
-    print(f"  AWAY-SP  pitcher_outs          15.5  mean {s['mean']:.2f}  "
-          f"P(over) {s['p_over']:.3f}  fair {s['fair_over']:+d}")
+    @staticmethod
+    def rates_report() -> None:
+        for side, label in (("bat", "BATTING"), ("pit", "PITCHING")):
+            seasons = available_seasons(side)
+            table, league = build_rates(side)
+            print(f"\n=== {label}  seasons {seasons}  players {len(table)} ===")
+            print("league baseline per PA:")
+            print("   " + "  ".join(f"{n} {league[i]:.4f}"
+                                    for i, n in enumerate(OUTCOME_NAMES)))
+            print(f"   sum {sum(league):.6f}")
+
+            ranked = sorted(table.items(), key=lambda kv: -kv[1]["pa"])[:3]
+            for _pid, rec in ranked:
+                r = rec["rates"]
+                print(f"  {rec['name']:<24s} PA {rec['pa']:6.0f}  "
+                      f"K {r[K]:.3f} BB {r[BB]:.3f} HR {r[HR]:.3f} "
+                      f"1B {r[S1B]:.3f} GB {r[GB_OUT]:.3f} AIR {r[AIR_OUT]:.3f}")
+
+    @staticmethod
+    def project_cli(argv=None) -> None:
+        ap = argparse.ArgumentParser(prog='mlb_sim.py project')
+        ap.add_argument("home")
+        ap.add_argument("away")
+        ap.add_argument("--venue", default=None)
+        ap.add_argument("--sims", type=int, default=DEFAULT_SIMS)
+        ap.add_argument("--temp", type=float, default=None)
+        ap.add_argument("--wind", type=float, default=None)
+        ap.add_argument("--wind-dir", type=float, default=None,
+                        help="compass bearing the wind blows FROM")
+        ap.add_argument("--wind-label", default=None,
+                        help='field-relative label instead of a bearing, '
+                             'StatsAPI style: "Out To CF", "In From LF", ...')
+        args = ap.parse_args(argv)
+
+        weather = None
+        if args.temp is not None or args.wind is not None:
+            weather = {"temp_f": args.temp if args.temp is not None else 70.0,
+                       "wind_mph": args.wind or 0.0}
+            if args.wind_label:
+                weather["wind_label"] = args.wind_label
+            else:
+                weather["wind_dir_deg"] = args.wind_dir or 0.0
+                weather["wind_frame"] = "compass"
+
+        print(f"\n{args.away} @ {args.home}"
+              + (f"  —  {args.venue}" if args.venue else "")
+              + (f"  —  {weather['temp_f']:.0f}F, wind {weather['wind_mph']:.0f} mph "
+                 + (f"{weather['wind_label']}" if weather.get("wind_label")
+                    else f"from {weather.get('wind_dir_deg', 0):.0f}deg")
+                 if weather else ""))
+        print(f"  {args.sims} simulations\n")
+
+        proj = project_game(args.home, args.away, args.venue, weather,
+                            args.sims, verbose=True)
+        res = proj["results"]
+        n = len(res)
+        rh = sum(r.runs_home for r in res) / n
+        ra = sum(r.runs_away for r in res) / n
+        wins = sum(1 for r in res if r.runs_home > r.runs_away) / n
+        # **The MEAN and the MEDIAN are different numbers and only one of them is
+        # comparable to a book's line.** Game runs are right-skewed, so the line a
+        # book hangs — the one whose over and under sit closest to even money — is
+        # the MEDIAN of its predictive distribution, measured 0.40-0.47 BELOW the
+        # mean total. Printing only the mean invites differencing it against the
+        # market and reading the skew as a half-run disagreement; that trap is
+        # recorded three times in sim_state.md and was walked into again on
+        # 2026-08-20. Both are printed, and which is which is named.
+        #
+        # **Not the sample median** — a game total is a whole number, so its median
+        # is quantised to integers and jumps in steps of a full run. What a book
+        # hangs is a HALF-POINT line, so the comparable quantity is the same one
+        # `market_total` reads out of the book: the half-point line whose over and
+        # under sit closest to even money.
+        totals = [r.runs_home + r.runs_away for r in res]
+        t_mean = (ra + rh)
+        lines = [x + 0.5 for x in range(0, 30)]
+        fair_line = min(lines, key=lambda L: abs(price_over(totals, L) - 0.5))
+        p_over = price_over(totals, fair_line)
+        print(f"\n  projected score   {args.away} {ra:.2f} — {rh:.2f} {args.home}")
+        print(f"  total             {t_mean:.2f} MEAN   |   fair line "
+              f"{fair_line:.1f}  (P over {p_over:.3f})"
+              f"   <- compare the LINE to a book's, never the mean")
+        print("                     a book's number is the even-money point, and "
+              "runs are right-skewed, so it sits ~0.4 under the mean")
+        print(f"  home win prob     {wins:.1%}   fair {Projection._fmt(to_american(wins))}")
+
+        print(f"\n  {'player':<24s} {'market':<22s} {'line':>5s} "
+              f"{'mean':>6s} {'P(o)':>6s} {'over':>6s} {'under':>6s}")
+        for row in Projection.price_board(proj):
+            if row["mean"] < 0.02:
+                continue
+            print(f"  {row['player']:<24s} {row['market']:<22s} "
+                  f"{row['line']:>5.1f} {row['mean']:>6.2f} "
+                  f"{row['p_over']:>6.3f} {Projection._fmt(row['fair_over']):>6s} "
+                  f"{Projection._fmt(row['fair_under']):>6s}")
 
 
-def rates_report() -> None:
-    for side, label in (("bat", "BATTING"), ("pit", "PITCHING")):
-        seasons = available_seasons(side)
-        table, league = build_rates(side)
-        print(f"\n=== {label}  seasons {seasons}  players {len(table)} ===")
-        print("league baseline per PA:")
-        print("   " + "  ".join(f"{n} {league[i]:.4f}"
-                                for i, n in enumerate(OUTCOME_NAMES)))
-        print(f"   sum {sum(league):.6f}")
+class Cli:
+    """The `python mlb_sim.py <command>` surface — one method per command.
 
-        ranked = sorted(table.items(), key=lambda kv: -kv[1]["pa"])[:3]
-        for pid, rec in ranked:
-            r = rec["rates"]
-            print(f"  {rec['name']:<24s} PA {rec['pa']:6.0f}  "
-                  f"K {r[K]:.3f} BB {r[BB]:.3f} HR {r[HR]:.3f} "
-                  f"1B {r[S1B]:.3f} GB {r[GB_OUT]:.3f} AIR {r[AIR_OUT]:.3f}")
+    Each method takes the FULL argv (so every body still parses
+    `argv[1:]` exactly as it did inline) and is dispatched through
+    `Cli.COMMANDS`. `main()` stays a module-level function because that
+    is what `python mlb_sim.py` and the suites reach for.
+    """
 
+    @staticmethod
+    def cmd_rates(argv) -> None:
+        """ingest report off the boards"""
+        Reports.rates_report()
 
-def project_cli(argv=None) -> None:
-    ap = argparse.ArgumentParser(prog='mlb_sim.py project')
-    ap.add_argument("home")
-    ap.add_argument("away")
-    ap.add_argument("--venue", default=None)
-    ap.add_argument("--sims", type=int, default=DEFAULT_SIMS)
-    ap.add_argument("--temp", type=float, default=None)
-    ap.add_argument("--wind", type=float, default=None)
-    ap.add_argument("--wind-dir", type=float, default=None,
-                    help="compass bearing the wind blows FROM")
-    ap.add_argument("--wind-label", default=None,
-                    help='field-relative label instead of a bearing, '
-                         'StatsAPI style: "Out To CF", "In From LF", ...')
-    args = ap.parse_args(argv)
-
-    weather = None
-    if args.temp is not None or args.wind is not None:
-        weather = {"temp_f": args.temp if args.temp is not None else 70.0,
-                   "wind_mph": args.wind or 0.0}
-        if args.wind_label:
-            weather["wind_label"] = args.wind_label
-        else:
-            weather["wind_dir_deg"] = args.wind_dir or 0.0
-            weather["wind_frame"] = "compass"
-
-    print(f"\n{args.away} @ {args.home}"
-          + (f"  —  {args.venue}" if args.venue else "")
-          + (f"  —  {weather['temp_f']:.0f}F, wind {weather['wind_mph']:.0f} mph "
-             + (f"{weather['wind_label']}" if weather.get("wind_label")
-                else f"from {weather.get('wind_dir_deg', 0):.0f}deg")
-             if weather else ""))
-    print(f"  {args.sims} simulations\n")
-
-    proj = project_game(args.home, args.away, args.venue, weather,
-                        args.sims, verbose=True)
-    res = proj["results"]
-    n = len(res)
-    rh = sum(r.runs_home for r in res) / n
-    ra = sum(r.runs_away for r in res) / n
-    wins = sum(1 for r in res if r.runs_home > r.runs_away) / n
-    # **The MEAN and the MEDIAN are different numbers and only one of them is
-    # comparable to a book's line.** Game runs are right-skewed, so the line a
-    # book hangs — the one whose over and under sit closest to even money — is
-    # the MEDIAN of its predictive distribution, measured 0.40-0.47 BELOW the
-    # mean total. Printing only the mean invites differencing it against the
-    # market and reading the skew as a half-run disagreement; that trap is
-    # recorded three times in sim_state.md and was walked into again on
-    # 2026-08-20. Both are printed, and which is which is named.
-    #
-    # **Not the sample median** — a game total is a whole number, so its median
-    # is quantised to integers and jumps in steps of a full run. What a book
-    # hangs is a HALF-POINT line, so the comparable quantity is the same one
-    # `market_total` reads out of the book: the half-point line whose over and
-    # under sit closest to even money.
-    totals = [r.runs_home + r.runs_away for r in res]
-    t_mean = (ra + rh)
-    lines = [x + 0.5 for x in range(0, 30)]
-    fair_line = min(lines, key=lambda L: abs(price_over(totals, L) - 0.5))
-    p_over = price_over(totals, fair_line)
-    print(f"\n  projected score   {args.away} {ra:.2f} — {rh:.2f} {args.home}")
-    print(f"  total             {t_mean:.2f} MEAN   |   fair line "
-          f"{fair_line:.1f}  (P over {p_over:.3f})"
-          f"   <- compare the LINE to a book's, never the mean")
-    print(f"                     a book's number is the even-money point, and "
-          f"runs are right-skewed, so it sits ~0.4 under the mean")
-    print(f"  home win prob     {wins:.1%}   fair {_fmt(to_american(wins))}")
-
-    print(f"\n  {'player':<24s} {'market':<22s} {'line':>5s} "
-          f"{'mean':>6s} {'P(o)':>6s} {'over':>6s} {'under':>6s}")
-    for row in price_board(proj):
-        if row["mean"] < 0.02:
-            continue
-        print(f"  {row['player']:<24s} {row['market']:<22s} "
-              f"{row['line']:>5.1f} {row['mean']:>6.2f} "
-              f"{row['p_over']:>6.3f} {_fmt(row['fair_over']):>6s} "
-              f"{_fmt(row['fair_under']):>6s}")
-
-
-def main(argv=None) -> None:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    cmd = argv[0] if argv else ""
-    if cmd == "rates":
-        rates_report()
-    elif cmd == "calibrate":
+    @staticmethod
+    def cmd_calibrate(argv) -> None:
+        """fit the HR distance scale"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py calibrate")
         ap.add_argument("--workers", type=int, default=None,
                         help="parallel bank builders (default: cores - 2)")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--sample", type=int, default=60000)
         a = ap.parse_args(argv[1:])
-        calibrate_distance(a.season, a.sample, workers=a.workers)
-    elif cmd == "project":
-        project_cli(argv[1:])
-    elif cmd == "clv":
+        DistanceCalibration.calibrate_distance(a.season, a.sample, workers=a.workers)
+
+    @staticmethod
+    def cmd_project(argv) -> None:
+        Reports.project_cli(argv[1:])
+
+    @staticmethod
+    def cmd_clv(argv) -> None:
+        """score against market movement"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py clv")
         ap.add_argument("--sport", default="baseball")
         ap.add_argument("--sims", type=int, default=8000)
@@ -9298,7 +10008,7 @@ def main(argv=None) -> None:
                              ML_BLEND_ALPHA=ML_BLEND_ALPHA,
                              ML_MODEL_FOLD=ML_MODEL_FOLD)
             print(f"[clv] ML rate layer ON — nodes {a.ml!r}, alpha {a.alpha}, "
-                  f"fold {fold} (trained {ml_fold_span(fold)})")
+                  f"fold {fold} (trained {AbHarness.ml_fold_span(fold)})")
         picks, summary = run_clv(a.sport, a.sims, limit=a.limit,
                                  live_lineups=not a.no_live, date=a.date)
         if not picks:
@@ -9315,7 +10025,7 @@ def main(argv=None) -> None:
             if abs(b["mean_diff"]) > 0.25:
                 print("  ** A standing bias this size IS the CLV number below. "
                       "Fix it before reading anything into the edge buckets. **")
-        summary = summarize_clv(picks, a.edge)
+        summary = Clv.summarize_clv(picks, a.edge)
         fade = summary.get("fade")
         if fade is not None:
             print()
@@ -9341,7 +10051,10 @@ def main(argv=None) -> None:
         print("NOTE: rates are season-to-date, so scoring games already played "
               "carries\n      look-ahead bias. Treat this as a plumbing check, "
               "not an edge estimate.")
-    elif cmd == "calibrate-form":
+
+    @staticmethod
+    def cmd_calibrate_form(argv) -> None:
+        """fit the game-level form draw"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py calibrate-form")
         ap.add_argument("--sims", type=int, default=8000)
         ap.add_argument("--target", type=float, default=0.0147,
@@ -9358,18 +10071,21 @@ def main(argv=None) -> None:
         ap.add_argument("--workers", type=int, default=None,
                         help="slate mode: processes (default cores - 2)")
         a = ap.parse_args(argv[1:])
-        r = (calibrate_form_on_slate(a.season, reps=a.reps,
+        r = (SlateCalibration.calibrate_form_on_slate(a.season, reps=a.reps,
                                      workers=a.workers) if a.slate
-             else calibrate_form(a.target, a.sims))
-        print(f"\n  paste into mlb_sim.py:")
+             else Validation.calibrate_form(a.target, a.sims))
+        print("\n  paste into mlb_sim.py:")
         print(f"    GAME_FORM_SD = {r['GAME_FORM_SD']:.4f}")
         print(f"    GAME_FORM_MEAN_SHIFT = {r['GAME_FORM_MEAN_SHIFT']:.4f}")
-    elif cmd == "marks":
+
+    @staticmethod
+    def cmd_marks(argv) -> None:
+        """re-measure the reference marks"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py marks")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--refresh", action="store_true")
         a = ap.parse_args(argv[1:])
-        m = measure_real_marks(a.season, refresh=a.refresh)
+        m = Validation.measure_real_marks(a.season, refresh=a.refresh)
         print(f"reference marks, {a.season}  ({m.get('_games')} games, "
               f"{m.get('_range')})")
         for k, v in m.items():
@@ -9382,12 +10098,15 @@ def main(argv=None) -> None:
             drift = (f"  frozen {frozen:.4f}"
                      if isinstance(frozen, (int, float)) else "")
             print(f"  {k:32s} {v:9.4f}{drift}")
-    elif cmd == "dispersion":
+
+    @staticmethod
+    def cmd_dispersion(argv) -> None:
+        """run DISPERSION on clone sides"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py dispersion")
         ap.add_argument("--sims", type=int, default=6000)
         ap.add_argument("--season", type=int, default=2026)
         a = ap.parse_args(argv[1:])
-        r = validate_dispersion(a.sims, season=a.season)
+        r = Validation.validate_dispersion(a.sims, season=a.season)
         real = r["real"]
         print(f"innings 1-8, {r['team_games']} sim team-games "
               f"(league-average CLONES — no matchup spread by construction)")
@@ -9400,23 +10119,29 @@ def main(argv=None) -> None:
         print(f"\n  covariance share of variance: sim {r['cov_share']:+.1%}"
               f"   real {real['cov']/real['var']:+.1%}"
               if real.get("var") else "")
-        print(f"\n  by lag (flat => shared per-game factor; "
-              f"decaying => momentum):")
+        print("\n  by lag (flat => shared per-game factor; "
+              "decaying => momentum):")
         for lag, c in sorted(r["by_lag"].items()):
             print(f"    lag {lag}  {c:+.5f}")
-        print(f"\n  by window   (real: starter 1-5 +0.0135, "
-              f"bullpen 6-8 +0.0316, spanning +0.0204)")
+        print("\n  by window   (real: starter 1-5 +0.0135, "
+              "bullpen 6-8 +0.0316, spanning +0.0204)")
         for k, v in r["window"].items():
             print(f"    {k:12s} {v:+.5f}" if v is not None else
                   f"    {k:12s}      -")
-    elif cmd == "calibrate-fatigue":
+
+    @staticmethod
+    def cmd_calibrate_fatigue(argv) -> None:
+        """fit the opening penalty"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py calibrate-fatigue")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--reps", type=int, default=12)
         ap.add_argument("--workers", type=int, default=None)
         a = ap.parse_args(argv[1:])
-        calibrate_fatigue(a.season, reps=a.reps, workers=a.workers)
-    elif cmd == "asof":
+        SlateCalibration.calibrate_fatigue(a.season, reps=a.reps, workers=a.workers)
+
+    @staticmethod
+    def cmd_asof(argv) -> None:
+        """cache AS-OF boards, leak-free"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py asof")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--every", type=int, default=7,
@@ -9436,9 +10161,12 @@ def main(argv=None) -> None:
             cur += datetime.timedelta(days=a.every)
         print(f"as-of boards: {len(dates)} cutoffs, {dates[0]}..{dates[-1]} "
               f"(needs headless Firefox; /api/leaders 403s a plain request)")
-        got = fetch_boards_asof(dates, a.season, force=a.force)
+        got = Boards.fetch_boards_asof(dates, a.season, force=a.force)
         print(f"\nfetched {len(got)}; cached under {ASOF_DIR}")
-    elif cmd == "backtest":
+
+    @staticmethod
+    def cmd_backtest(argv) -> None:
+        """replay a season on frozen rates"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py backtest")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--reps", type=int, default=60)
@@ -9472,7 +10200,10 @@ def main(argv=None) -> None:
               "insidethepen pen, and the\n  fitted constants (GAME_FORM_SD, "
               "FRAMING_TILT_SCALE, PARK_RUN_RELIABILITY,\n  the playing-time "
               "prior's shape).")
-    elif cmd == "closing":
+
+    @staticmethod
+    def cmd_closing(argv) -> None:
+        """model vs the DE-VIGGED close"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py closing")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--reps", type=int, default=60)
@@ -9483,7 +10214,7 @@ def main(argv=None) -> None:
         a = ap.parse_args(argv[1:])
         bt = backtest(a.season, reps=a.reps, seed=a.seed, workers=a.workers)
         sc = score_backtest(bt)
-        r = clv_vs_closing(bt, a.season, edge=a.edge, price=a.price)
+        r = ClosingScore.clv_vs_closing(bt, a.season, edge=a.edge, price=a.price)
         print(f"\nMODEL vs the DE-VIGGED CLOSING LINE — {a.season}")
         print(f"  {r['matched']} of {r['n_games']} backtested games matched to "
               f"a closing moneyline ({a.price} of book)"
@@ -9515,14 +10246,17 @@ def main(argv=None) -> None:
         print()
         show("ALL games", r["all"])
         show(f"edge > {a.edge:.0%}", r["filtered"])
-        print(f"\n  by disagreement with the close — a real edge GROWS with it;"
-              f"\n  a flat profile with one good bucket is what noise looks like")
+        print("\n  by disagreement with the close — a real edge GROWS with it;"
+              "\n  a flat profile with one good bucket is what noise looks like")
         for b in r["buckets"]:
             print(f"    {b['lo']:.0%}-{b['hi']:.0%}  n {b['n']:5d}   "
                   f"hit {b['hit']:.4f}   mkt fair {b['mkt_fair']:.4f}   "
                   f"model {b['model_implied']:.4f}   "
                   f"ROI {b['roi']:+.4f} +/- {b['roi_se']:.4f}")
-    elif cmd == "forecastwx":
+
+    @staticmethod
+    def cmd_forecastwx(argv) -> None:
+        """PERIOD-CORRECT weather (5b.2)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py forecastwx")
         ap.add_argument("--season", action="append", type=int, default=None)
         ap.add_argument("--lag", type=int, default=WEATHER_FORECAST_LAG_DAYS,
@@ -9534,8 +10268,11 @@ def main(argv=None) -> None:
             # the matched reference is always built off DAY 0 — climatology,
             # not information — so it centres the day-1 arm without leaking
             if load_forecast_weather(season, 0):
-                build_park_weather_ref_om(season, 0)
-    elif cmd == "clvopen":
+                ParkFactors.build_park_weather_ref_om(season, 0)
+
+    @staticmethod
+    def cmd_clvopen(argv) -> None:
+        """model vs the OPENING line (CLV)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py clvopen")
         ap.add_argument("--season", action="append", type=int, default=None,
                         help="repeatable; default is both 2025 and 2026")
@@ -9589,12 +10326,12 @@ def main(argv=None) -> None:
                       f"CLV {s['clv']:+.5f} {u:4s} +/- {s['se']:.5f}  "
                       f"(t {s['t']:+.2f})   moved our way {s['hit']:.4f}")
 
-            print(f"\n  MONEYLINE — CLV in de-vigged probability")
-            show("all picks", _clv_summary(ml))
-            print(f"\n  TOTALS — CLV in probability at the opening line, "
-                  f"and in RUNS")
-            show("all picks", _clv_summary([t for t in tot if t["priced"]]))
-            show("line move", _clv_summary(tot, "clv_runs"), unit="runs")
+            print("\n  MONEYLINE — CLV in de-vigged probability")
+            show("all picks", OpeningClv._clv_summary(ml))
+            print("\n  TOTALS — CLV in probability at the opening line, "
+                  "and in RUNS")
+            show("all picks", OpeningClv._clv_summary([t for t in tot if t["priced"]]))
+            show("line move", OpeningClv._clv_summary(tot, "clv_runs"), unit="runs")
 
           if len(seasons) > 1 and pooled_ml:
             print(f"\n  {arm_name.upper()} POOLED  n {len(pooled_ml)} "
@@ -9607,14 +10344,14 @@ def main(argv=None) -> None:
                 print(f"    {label:26s} n {s['n']:5d}   "
                       f"CLV {s['clv']:+.5f} {u:4s} +/- {s['se']:.5f}  "
                       f"(t {s['t']:+.2f})   moved our way {s['hit']:.4f}")
-            show2("MONEYLINE", _clv_summary(pooled_ml))
-            show2("TOTALS", _clv_summary([t for t in pooled_tot if t["priced"]]))
+            show2("MONEYLINE", OpeningClv._clv_summary(pooled_ml))
+            show2("TOTALS", OpeningClv._clv_summary([t for t in pooled_tot if t["priced"]]))
             show2("TOTALS line move",
-                  _clv_summary(pooled_tot, "clv_runs"), unit="runs")
+                  OpeningClv._clv_summary(pooled_tot, "clv_runs"), unit="runs")
 
             # What the de-vig is worth, shown rather than claimed. The raw row
             # is what this test would have reported without it.
-            vr = vig_report(pooled_ml)
+            vr = OpeningClv.vig_report(pooled_ml)
             if vr.get("n"):
                 print(f"\n  the DE-VIG, demonstrated on the same {vr['n']} "
                       f"moneyline picks:")
@@ -9628,12 +10365,12 @@ def main(argv=None) -> None:
                 print(f"    CLV de-vigged                    "
                       f"{vr['devigged']['clv']:+.5f}  "
                       f"(t {vr['devigged']['t']:+.2f})  <- the honest number")
-            print(f"\n  by disagreement with the OPEN — a real edge GROWS with "
-                  f"it. A flat profile\n  with one good bucket is noise, "
-                  f"however good that bucket looks (3d.1).")
+            print("\n  by disagreement with the OPEN — a real edge GROWS with "
+                  "it. A flat profile\n  with one good bucket is noise, "
+                  "however good that bucket looks (3d.1).")
             print(f"    {'moneyline':14s} {'n':>6s} {'CLV':>10s} {'se':>9s} "
                   f"{'t':>7s} {'our way':>9s}")
-            for b in clv_open_buckets(pooled_ml):
+            for b in OpeningClv.clv_open_buckets(pooled_ml):
                 if not b["n"]:
                     continue
                 print(f"    {b['lo']:.0%}-{b['hi']:.0%}".ljust(18)
@@ -9642,18 +10379,18 @@ def main(argv=None) -> None:
 
         # --- the ablation table: every arm through the SAME harness --------
         if len(by_arm) > 1:
-            print(f"\n\n  THE LOOK-AHEAD ABLATION — same games, same seeds, "
-                  f"same scorer.\n  `base` holds the posted lineup and the "
-                  f"OBSERVED game-time weather; the opening\n  price had "
-                  f"neither. What survives in `nolook` is the part of the CLV "
-                  f"a\n  pre-lineup, pre-weather projection actually earned.")
+            print("\n\n  THE LOOK-AHEAD ABLATION — same games, same seeds, "
+                  "same scorer.\n  `base` holds the posted lineup and the "
+                  "OBSERVED game-time weather; the opening\n  price had "
+                  "neither. What survives in `nolook` is the part of the CLV "
+                  "a\n  pre-lineup, pre-weather projection actually earned.")
             print(f"\n    {'arm':10s} {'ML CLV':>10s} {'t':>7s} "
                   f"{'TOT CLV':>10s} {'t':>7s} {'line runs':>10s} {'t':>7s}")
             ref = None
             for k, (mrows, trows) in by_arm.items():
-                a1 = _clv_summary(mrows)
-                a2 = _clv_summary([t for t in trows if t["priced"]])
-                a3 = _clv_summary(trows, "clv_runs")
+                a1 = OpeningClv._clv_summary(mrows)
+                a2 = OpeningClv._clv_summary([t for t in trows if t["priced"]])
+                a3 = OpeningClv._clv_summary(trows, "clv_runs")
                 if not a1.get("n"):
                     continue
                 print(f"    {k:10s} {a1['clv']:+10.5f} {a1['t']:+7.2f} "
@@ -9664,8 +10401,8 @@ def main(argv=None) -> None:
             if ref and "nolook" in by_arm:
                 nl = by_arm["nolook"][0]
                 nt = [t for t in by_arm["nolook"][1] if t["priced"]]
-                s1 = _clv_summary(nl)["clv"] / ref[0] if ref[0] else float("nan")
-                s2 = _clv_summary(nt)["clv"] / ref[1] if ref[1] else float("nan")
+                s1 = OpeningClv._clv_summary(nl)["clv"] / ref[0] if ref[0] else float("nan")
+                s2 = OpeningClv._clv_summary(nt)["clv"] / ref[1] if ref[1] else float("nan")
                 print(f"\n    share of the CLV that SURVIVES the ablation: "
                       f"moneyline {s1:.1%}, totals {s2:.1%}")
 
@@ -9682,10 +10419,13 @@ def main(argv=None) -> None:
                     print(f"    ** {k} is IDENTICAL to {arms[0]} on every "
                           f"game. The ablation did not run. **")
 
-        print(f"\n  CLV needs no game result, so its error bar is the one "
-              f"quoted — but it is NOT\n  an edge on its own: a market can "
-              f"move toward a model and still be right.")
-    elif cmd == "stuff":
+        print("\n  CLV needs no game result, so its error bar is the one "
+              "quoted — but it is NOT\n  an edge on its own: a market can "
+              "move toward a model and still be right.")
+
+    @staticmethod
+    def cmd_stuff(argv) -> None:
+        """pitch-model REPEATABILITY (3d.8)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py stuff")
         ap.add_argument("--season", action="append", type=int, default=None)
         ap.add_argument("--no-score", action="store_true",
@@ -9695,7 +10435,7 @@ def main(argv=None) -> None:
         seasons = a.season or [2025, 2026]
         names = ("K", "BB", "HBP", "GB_OUT", "AIR_OUT", "1B", "2B", "3B", "HR")
         for season in seasons:
-            r = measure_stuff_reliability(season)
+            r = Stuff.measure_stuff_reliability(season)
             print(f"\nSTUFF REPEATABILITY — {season}: {r['n']} pitcher-cutoff "
                   f"pairs" + (f", model fit on {r.get('fit_seasons')}"
                               if r.get("fit_seasons") else ""))
@@ -9716,7 +10456,7 @@ def main(argv=None) -> None:
                   "mean — over-trusting is this file's failure mode.")
             if a.no_score:
                 continue
-            s = score_stuff_prior(season)
+            s = Stuff.score_stuff_prior(season)
             if s["n"] < 30:
                 continue
             print(f"\n  predicting the REST of his season, n {s['n']} "
@@ -9730,7 +10470,10 @@ def main(argv=None) -> None:
                   "".join(f"{s[k]['rv_rmse']:12.5f}" for k in keys))
             print(f"  {'RV corr':9s}" +
                   "".join(f"{s[k]['rv_corr'] or 0.0:+12.4f}" for k in keys))
-    elif cmd == "diff":
+
+    @staticmethod
+    def cmd_diff(argv) -> None:
+        """score on the RUN DIFFERENTIAL (4f)"""
         ap = argparse.ArgumentParser(
             prog="mlb_sim.py diff",
             description="Score an arm on the RUN DIFFERENTIAL against the "
@@ -9761,15 +10504,17 @@ def main(argv=None) -> None:
             for season in seasons:
                 bt = ab_run_arm(season, arm_name, a.reps, fresh=a.fresh,
                                 workers=a.workers)
-                rows = differential_rows(bt, season)
-                print_differential(score_differential(rows),
+                rows = Differential.differential_rows(bt, season)
+                Differential.print_differential(Differential.score_differential(rows),
                                    f"{arm_name} {season}")
                 pooled += rows
             if len(seasons) > 1:
-                print_differential(score_differential(pooled),
+                Differential.print_differential(Differential.score_differential(pooled),
                                    f"{arm_name} POOLED")
 
-    elif cmd == "ab":
+    @staticmethod
+    def cmd_ab(argv) -> None:
+        """A/B a change vs the CLOSE (3d)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py ab")
         ap.add_argument("--season", action="append", type=int, default=None)
         ap.add_argument("--reps", type=int, default=2000,
@@ -9822,7 +10567,10 @@ def main(argv=None) -> None:
                                            workers=a.workers)
             by_season[season] = got
         ab_score(by_season)
-    elif cmd == "eventodds":
+
+    @staticmethod
+    def cmd_eventodds(argv) -> None:
+        """OPENING odds + TOTALS per event"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py eventodds")
         ap.add_argument("--season", action="append", type=int, default=None,
                         help="repeatable; runs them in order in ONE process, "
@@ -9833,32 +10581,35 @@ def main(argv=None) -> None:
         ap.add_argument("--workers", type=int, default=8)
         ap.add_argument("--timeout", type=float, default=25.0)
         a = ap.parse_args(argv[1:])
-        print(f"per-event OPENING + CLOSING odds: moneyline, totals, run line, "
-              f"and the first-five-innings scopes.\n"
-              f"  ~17s/event per worker; resumable by event id, so an "
-              f"interrupted run costs nothing.\n"
-              f"  needs a non-US egress IP — a US one returns zero outcomes "
-              f"while the event page still resolves.")
+        print("per-event OPENING + CLOSING odds: moneyline, totals, run line, "
+              "and the first-five-innings scopes.\n"
+              "  ~17s/event per worker; resumable by event id, so an "
+              "interrupted run costs nothing.\n"
+              "  needs a non-US egress IP — a US one returns zero outcomes "
+              "while the event page still resolves.")
         seasons = a.season or [2026]
         got = {}
         for season in seasons:
-            got = fetch_event_odds(season, limit=a.limit, workers=a.workers,
+            got = EventOdds.fetch_event_odds(season, limit=a.limit, workers=a.workers,
                                    timeout=a.timeout)
         # what did we actually get? A count of games is not a count of markets.
         # Reported for the LAST season fetched; each season prints its own
         # cached-vs-expected line as it finishes.
         n_tot = n_f5 = n_ml = 0
         for e in got.values():
-            if event_totals(e, 1):
+            if EventOdds.event_totals(e, 1):
                 n_tot += 1
-            if event_totals(e, 2):
+            if EventOdds.event_totals(e, 2):
                 n_f5 += 1
             if any(l.get("bt") == 3 and l.get("sc", 1) == 1
                    for l in e.get("lines", [])):
                 n_ml += 1
         print(f"\n  of {len(got)} cached events: {n_ml} with a moneyline, "
               f"{n_tot} with whole-game totals, {n_f5} with F5 totals")
-    elif cmd == "recency":
+
+    @staticmethod
+    def cmd_recency(argv) -> None:
+        """within-season recency (3d.9)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py recency")
         ap.add_argument("--season", action="append", type=int, default=None)
         ap.add_argument("--side", action="append", choices=("bat", "pit"),
@@ -9867,7 +10618,7 @@ def main(argv=None) -> None:
         hl = (150.0, 250.0, 500.0, 1000.0)
         for side in (a.side or ["pit", "bat"]):
             for season in (a.season or [2025, 2026]):
-                r = measure_recency(side, season, hl)
+                r = Stuff.measure_recency(side, season, hl)
                 print(f"\nWITHIN-SEASON RECENCY — {side} {season}: "
                       f"n {r['n']} player-cutoff pairs, effective sample "
                       f"{r['eff_share']:.0%} of raw at hl={hl[0]:.0f}")
@@ -9890,14 +10641,17 @@ def main(argv=None) -> None:
                     print(f"    {k:8s} {p['players']:4d} players  "
                           f"{p['mean']:+.6f} +/- {p['se']:.6f}  "
                           f"(t {p['t']:+.2f})")
-    elif cmd == "stints":
+
+    @staticmethod
+    def cmd_stints(argv) -> None:
+        """relief-appearance shape"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py stints")
         ap.add_argument("--games", type=int, default=400)
         ap.add_argument("--refresh", action="store_true",
                         help="re-scrape the play-by-play (1,850 games)")
         a = ap.parse_args(argv[1:])
         if a.refresh:
-            collect_reliever_stints(refresh=True)
+            RelieverUsage.collect_reliever_stints(refresh=True)
         r = validate_stint_shape(a.games)
         print(f"relief-appearance shape — {r['games']} simulated games "
               f"against {r['real']['n']} real appearances\n")
@@ -9913,14 +10667,20 @@ def main(argv=None) -> None:
         for k in ("sim", "real"):
             print(f"  {k:10s}" + "".join(
                 f"{r[k]['by_innings'].get(i, 0.0):8.3f}" for i in range(1, 5)))
-    elif cmd == "aaa":
+
+    @staticmethod
+    def cmd_aaa(argv) -> None:
+        """AAA->MLB translation, fitted"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py aaa")
         ap.add_argument("--refresh", action="store_true")
         a = ap.parse_args(argv[1:])
         if a.refresh:
-            measure_milb_translation()
-        aaa_translation_report()
-    elif cmd == "parkbuild":
+            MiLB.measure_milb_translation()
+        MiLB.aaa_translation_report()
+
+    @staticmethod
+    def cmd_parkbuild(argv) -> None:
+        """per-outcome park factors + exposure"""
         ap = argparse.ArgumentParser(
             prog="mlb_sim.py parkbuild",
             description="Per-outcome park factors and each player's measured "
@@ -9930,11 +10690,11 @@ def main(argv=None) -> None:
         ap.add_argument("--reliability", type=float, default=0.70)
         a = ap.parse_args(argv[1:])
         for season in (a.seasons or [2023, 2024, 2025, 2026]):
-            fac = build_park_outcome_factors(season, a.reliability)
+            fac = ParkFactors.build_park_outcome_factors(season, a.reliability)
             fp = park_outcome_path(season)
             with open(fp, "w") as fh:
                 json.dump(fac, fh, indent=1)
-            exp = build_player_park_exposure(season)
+            exp = ParkFactors.build_player_park_exposure(season)
             xp = Path(SAVE_DIR) / f"player_park_exposure_{season}.json"
             with open(xp, "w") as fh:
                 json.dump(exp, fh)
@@ -9948,7 +10708,10 @@ def main(argv=None) -> None:
                 for v in hot + cold:
                     print(f"    {v:26s} HR {fac[v]['factor'][HR]:.3f}  "
                           f"3B {fac[v]['factor'][S3B]:.3f}")
-    elif cmd == "milb":
+
+    @staticmethod
+    def cmd_milb(argv) -> None:
+        """minor league lines + AAA arsenal (9c)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py milb")
         ap.add_argument("seasons", nargs="*", type=int, default=None)
         ap.add_argument("--refresh", action="store_true")
@@ -9959,14 +10722,17 @@ def main(argv=None) -> None:
         a = ap.parse_args(argv[1:])
         seasons = a.seasons or [2026]
         if not a.statcast_only:
-            collect_milb(seasons, refresh=a.refresh)
+            MiLB.collect_milb(seasons, refresh=a.refresh)
         # Same players, same season, same cache file — see
         # `collect_milb_statcast`. Hawk-Eye is Triple-A and FSL only; a
         # Double-A arm is untouched by this and stays on the level ladder.
         if not a.no_statcast:
-            collect_milb_statcast(seasons, refresh=a.refresh or a.statcast_only)
-        milb_report(max(seasons))
-    elif cmd == "framing":
+            MiLB.collect_milb_statcast(seasons, refresh=a.refresh or a.statcast_only)
+        MiLB.milb_report(max(seasons))
+
+    @staticmethod
+    def cmd_framing(argv) -> None:
+        """rebuild framing from PITCH level (9d)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py framing")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--upto", default=None,
@@ -9981,21 +10747,27 @@ def main(argv=None) -> None:
                         help="score against MLBAnalytics/team_framing_<season>.csv")
         ap.add_argument("--out", default=None)
         a = ap.parse_args(argv[1:])
-        measure_framing(a.season, a.upto, with_pitcher=not a.no_pitcher,
+        Framing.measure_framing(a.season, a.upto, with_pitcher=not a.no_pitcher,
                         with_umpire=not a.no_umpire, out_path=a.out)
         if a.validate:
-            framing_validate_report(a.season, a.out)
+            Framing.framing_validate_report(a.season, a.out)
         if a.repeatability:
-            framing_repeatability_report(a.season, a.split)
-    elif cmd == "milbpark":
+            Framing.framing_repeatability_report(a.season, a.split)
+
+    @staticmethod
+    def cmd_milbpark(argv) -> None:
+        """AAA PARK factors, per outcome"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py milbpark")
         ap.add_argument("seasons", nargs="*", type=int, default=None)
         ap.add_argument("--refresh", action="store_true")
         a = ap.parse_args(argv[1:])
         seasons = a.seasons or [2024, 2025, 2026]
-        collect_milb_park(seasons, refresh=a.refresh)
-        milb_park_report(max(seasons))
-    elif cmd == "milbasof":
+        MiLB.collect_milb_park(seasons, refresh=a.refresh)
+        MiLB.milb_park_report(max(seasons))
+
+    @staticmethod
+    def cmd_milbasof(argv) -> None:
+        """AS-OF AAA snapshots (5.11.1)"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py milbasof")
         ap.add_argument("seasons", nargs="*", type=int, default=None)
         ap.add_argument("--force", action="store_true")
@@ -10011,8 +10783,11 @@ def main(argv=None) -> None:
                 continue
             print(f"[milb-asof] {season}: {len(cuts)} cutoffs, "
                   f"{cuts[0]}..{cuts[-1]}")
-            collect_milb_asof(cuts, season, force=a.force)
-    elif cmd == "baserunning":
+            MiLB.collect_milb_asof(cuts, season, force=a.force)
+
+    @staticmethod
+    def cmd_baserunning(argv) -> None:
+        """measured advancement rates"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py baserunning")
         ap.add_argument("--season", type=int, default=BASERUN_SEASON)
         ap.add_argument("--refresh", action="store_true",
@@ -10024,14 +10799,20 @@ def main(argv=None) -> None:
         if a.refresh:
             collect_baserunning(a.season, workers=a.workers, refresh=True,
                                 n_games=a.games)
-        baserunning_report(a.season, workers=a.workers)
-    elif cmd == "re24":
+        BaseRunningPbp.baserunning_report(a.season, workers=a.workers)
+
+    @staticmethod
+    def cmd_re24(argv) -> None:
+        """run expectancy vs measured"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py re24")
         ap.add_argument("--season", type=int, default=BASERUN_SEASON)
         ap.add_argument("--games", type=int, default=6000)
         a = ap.parse_args(argv[1:])
-        re24_report(a.games, season=a.season)
-    elif cmd == "boards":
+        BaseRunningPbp.re24_report(a.games, season=a.season)
+
+    @staticmethod
+    def cmd_boards(argv) -> None:
+        """fetch FULL-SEASON boards"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py boards")
         ap.add_argument("seasons", nargs="+", type=int)
         ap.add_argument("--side", action="append", choices=("bat", "pit"),
@@ -10041,9 +10822,12 @@ def main(argv=None) -> None:
         sides = tuple(a.side) if a.side else ("bat", "pit")
         print(f"full-season boards: {sides} x {a.seasons} "
               f"(needs headless Firefox)")
-        got = fetch_season_boards(a.seasons, sides, force=a.force)
+        got = Boards.fetch_season_boards(a.seasons, sides, force=a.force)
         print(f"\nfetched {len(got)}; cached under {SAVE_DIR}")
-    elif cmd == "slate":
+
+    @staticmethod
+    def cmd_slate(argv) -> None:
+        """the REAL slate, scored on itself"""
         ap = argparse.ArgumentParser(prog="mlb_sim.py slate")
         ap.add_argument("--season", type=int, default=2026)
         ap.add_argument("--reps", type=int, default=15,
@@ -10079,13 +10863,13 @@ def main(argv=None) -> None:
         print(f"\n  {'':10s} {'sim':>10s} {'real':>10s}")
         for k in ("mean", "sd", "var", "indep", "cov", "pair_cov"):
             print(f"  {k:10s} {sim[k]:10.4f} {real[k]:10.4f}")
-        print(f"\n  per-inning mean   (real inning 1 is the HIGHEST — 5.4)")
+        print("\n  per-inning mean   (real inning 1 is the HIGHEST — 5.4)")
         print(f"    {'inning':8s}" + "".join(f"{i:>8d}" for i in range(1, 9)))
         print(f"    {'sim':8s}" + "".join(f"{x:8.3f}" for x in sim["by_inning"]))
         print(f"    {'real':8s}" + "".join(f"{x:8.3f}" for x in real["by_inning"]))
         print(f"    {'diff':8s}" + "".join(
             f"{s - t:+8.3f}" for s, t in zip(sim["by_inning"], real["by_inning"])))
-        print(f"\n  by window   (real: starter 1-5, bullpen 6-8, spanning)")
+        print("\n  by window   (real: starter 1-5, bullpen 6-8, spanning)")
         for k in ("starter_1_5", "bullpen_6_8", "spanning"):
             s, t = sim["window"].get(k), real["window"].get(k)
             print(f"    {k:12s} {s:+.5f}   real {t:+.5f}"
@@ -10104,11 +10888,83 @@ def main(argv=None) -> None:
             print("    ** Monte Carlo noise dominates the model spread at "
                   f"reps={a.reps}. Neither correlation is readable; "
                   "raise --reps. **")
-    elif cmd in ("", "smoke"):
-        smoke_test()
-    else:
+
+    @staticmethod
+    def cmd_pbp(argv) -> None:
+        """one-time play-by-play backfill; every consumer reads it"""
+        ap = argparse.ArgumentParser(prog="mlb_sim.py pbp")
+        ap.add_argument("seasons", nargs="*", type=int, default=[2026])
+        ap.add_argument("--workers", type=int, default=12)
+        ap.add_argument("--check", action="store_true",
+                        help="report what is missing, fetch nothing")
+        a = ap.parse_args(argv[1:])
+        for season in (a.seasons or [2026]):
+            pks = RelieverUsage.season_game_pks(season)
+            if not pks:
+                print(f"[pbp] {season}: no completed games on disk — run "
+                      f"`slate --refresh` first")
+                continue
+            if a.check:
+                miss = Query.missing_play_by_play(pks)
+                print(f"[pbp] {season}: {len(pks)} games, "
+                      f"{len(pks)-len(miss)} cached, {len(miss)} missing")
+                continue
+            r = Query.backfill_play_by_play(pks, workers=a.workers)
+            print(f"[pbp] {season}: {r['asked']} games — {r['had']} already "
+                  f"cached, {r['fetched']} fetched, {r['failed']} failed")
+            if r["failed"]:
+                print("      failed games stay missing and will be retried "
+                      "on the next run; nothing partial is cached.")
+
+    @staticmethod
+    def cmd_smoke(argv) -> None:
+        Reports.smoke_test()
+
+    # -- dispatch ----------------------------------------------------------
+    COMMANDS = {
+        'rates': cmd_rates,
+        'calibrate': cmd_calibrate,
+        'project': cmd_project,
+        'clv': cmd_clv,
+        'calibrate-form': cmd_calibrate_form,
+        'marks': cmd_marks,
+        'dispersion': cmd_dispersion,
+        'calibrate-fatigue': cmd_calibrate_fatigue,
+        'asof': cmd_asof,
+        'backtest': cmd_backtest,
+        'closing': cmd_closing,
+        'forecastwx': cmd_forecastwx,
+        'clvopen': cmd_clvopen,
+        'stuff': cmd_stuff,
+        'diff': cmd_diff,
+        'ab': cmd_ab,
+        'eventodds': cmd_eventodds,
+        'recency': cmd_recency,
+        'stints': cmd_stints,
+        'aaa': cmd_aaa,
+        'parkbuild': cmd_parkbuild,
+        'milb': cmd_milb,
+        'framing': cmd_framing,
+        'milbpark': cmd_milbpark,
+        'milbasof': cmd_milbasof,
+        'baserunning': cmd_baserunning,
+        're24': cmd_re24,
+        'boards': cmd_boards,
+        'slate': cmd_slate,
+        'pbp': cmd_pbp,
+        '': cmd_smoke,
+        'smoke': cmd_smoke,
+    }
+
+
+def main(argv=None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = argv[0] if argv else ""
+    handler = Cli.COMMANDS.get(cmd)
+    if handler is None:
         print(__doc__)
         raise SystemExit(f"mlb_sim: unknown command {cmd!r}")
+    handler(argv)
 
 
 
@@ -10149,7 +11005,7 @@ def _team_index() -> Dict[str, dict]:
     clubs (AZ/ARI, CWS/CHW, KC/KCR, SD/SDP, SF/SFG, TB/TBR, WSH/WSN), which
     is what `_FG_ALIAS` reconciles.
     """
-    path = SAVE_DIR / "mlb_roster_2026.json"
+    path = SHARED_DIR / "mlb_roster_2026.json"
     with open(path) as fh:
         teams = json.load(fh)["teams"]
     out = {}
@@ -10240,28 +11096,144 @@ def implied(dec: Optional[float]) -> Optional[float]:
     return 1.0 / dec
 
 
-def devig(decs: Sequence[Optional[float]]) -> List[Optional[float]]:
-    """Strip the overround from one market's prices, proportionally.
+class Pricing:
+    """Pricing maths, and model prices for the whole-game markets."""
 
-    Proportional (multiplicative) de-vigging is used deliberately over
-    something like Shin: it needs no extra parameter, and on the near-even
-    two-way markets we score (totals, run lines) the difference between
-    methods is far smaller than the book-to-book spread we are averaging over
-    anyway. On a heavy favourite it would matter, which is why the moneyline
-    result is reported separately rather than pooled with the totals.
-    """
-    raw = [implied(d) for d in decs]
-    live = [p for p in raw if p]
-    if len(live) < 2:
-        return [None] * len(decs)
-    tot = sum(live)
-    return [(p / tot if p else None) for p in raw]
+    @staticmethod
+    def devig(decs: Sequence[Optional[float]]) -> List[Optional[float]]:
+        """Strip the overround from one market's prices, proportionally.
 
+        Proportional (multiplicative) de-vigging is used deliberately over
+        something like Shin: it needs no extra parameter, and on the near-even
+        two-way markets we score (totals, run lines) the difference between
+        methods is far smaller than the book-to-book spread we are averaging over
+        anyway. On a heavy favourite it would matter, which is why the moneyline
+        result is reported separately rather than pooled with the totals.
+        """
+        raw = [implied(d) for d in decs]
+        live = [p for p in raw if p]
+        if len(live) < 2:
+            return [None] * len(decs)
+        tot = sum(live)
+        return [(p / tot if p else None) for p in raw]
 
-def american(dec: Optional[float]) -> Optional[int]:
-    if not dec or dec <= 1.0:
-        return None
-    return round((dec - 1.0) * 100) if dec >= 2.0 else round(-100.0 / (dec - 1.0))
+    @staticmethod
+    def p_total_over(results: Sequence[GameResult], line: float) -> float:
+        return price_over(game_totals(results), line)
+
+    @staticmethod
+    def _half_inning_hist(results: Sequence[GameResult], side: str) -> Dict[str, int]:
+        """{runs in a half-inning: count} pooled over a set of simulated games."""
+        out: Dict[str, int] = {}
+        for r in results:
+            for v in (r.half_runs_home if side == "home" else r.half_runs_away):
+                k = str(v)
+                out[k] = out.get(k, 0) + 1
+        return out
+
+    @staticmethod
+    def club_quality_asof(season: int, save_dir: Path = SAVE_DIR,
+                          cutoffs: Optional[Sequence[str]] = None
+                          ) -> Dict[tuple, float]:
+        """{(date, club): shrunk run differential per game} from PRIOR games only.
+
+        **Two ways to be wrong here, and the first one bit.**
+
+        *Leakage.* The entry is keyed by DATE but the loop runs per GAME, so on a
+        doubleheader the second game's write includes the first game's result and
+        overwrites the shared key — pricing game one with its own outcome partly
+        baked in. 128 team-games in 2025, 76 in 2026, ~2%. `seen` freezes the
+        entry at a club's FIRST game of a date.
+
+        *Freshness.* Strictly-prior is legal but it is not automatically a fair
+        A/B: every other input is frozen at the weekly as-of board cutoff, and a
+        feature that updates DAILY is being handed fresher information than the
+        model it is being added to. Pass `cutoffs` and the differential is frozen
+        at the same cutoff the boards are, which is the only version that isolates
+        what the FEATURE is worth from what its RECENCY is worth.
+
+        Live, `cutoffs=None` is right — you really do know yesterday's score.
+        """
+        out: Dict[tuple, float] = {}
+        acc: Dict[str, List[float]] = {}
+        seen: set = set()
+        cuts = sorted(cutoffs) if cutoffs else None
+        # {(cutoff, club): value} when freezing, so every game inside a cutoff
+        # window reads the same number the boards were built from
+        frozen: Dict[tuple, float] = {}
+        for g in sorted(season_slate(season, save_dir=save_dir),
+                        key=lambda r: r["date"]):
+            hr = sum(g.get("home_innings") or [])
+            ar = sum(g.get("away_innings") or [])
+            cut = None
+            if cuts:
+                cut = None
+                for c in cuts:
+                    if c < g["date"]:
+                        cut = c
+                    else:
+                        break
+            for club, diff in ((g["home"], hr - ar), (g["away"], ar - hr)):
+                got = acc.get(club) or [0.0, 0.0]
+                key = (g["date"], club)
+                if key not in seen:
+                    seen.add(key)
+                    if cuts:
+                        fk = (cut, club)
+                        if fk not in frozen:
+                            frozen[fk] = TeamQuality.shrink_team_quality(got[0], int(got[1]))
+                        out[key] = frozen[fk]
+                    else:
+                        out[key] = TeamQuality.shrink_team_quality(got[0], int(got[1]))
+                acc[club] = [got[0] + diff, got[1] + 1]
+        return out
+
+    @staticmethod
+    def _staff_split(results: Sequence[GameResult], home: "TeamSide",
+                     away: "TeamSide") -> Dict[str, float]:
+        """Mean runs / BF / outs charged to the STARTER vs the RELIEVERS, per side.
+
+        `PitcherLine.r` charges a run to whoever was ON THE MOUND when it crossed,
+        so an inherited runner is charged to the reliever rather than to the man
+        who put him on. **That is the opposite of box-score convention and it
+        biases exactly this split** — it flatters the starter and blames the pen.
+        Anything read off `rp_r` is therefore an UPPER bound on relief runs and
+        `sp_r` a lower bound on the starter's; only compare it to a real series
+        built the same way (on-mound attribution), never to box-score ER.
+        """
+        out: Dict[str, float] = {}
+        n = len(results) or 1
+        for tag, side in (("h", home), ("a", away)):
+            nm = side.starter.name
+            # **`res.pitchers` is keyed by NAME across BOTH clubs**, so "everyone
+            # who is not the starter" sweeps in the opposing staff. Read the
+            # relief total off THIS side's bullpen by name instead; a first cut
+            # that took the complement reported 6.4 relief runs a game against a
+            # real 1.7 and would have made any relief comparison meaningless.
+            pen = {p.name for p in side.bullpen}
+            sp_r = sp_bf = sp_o = rp_r = rp_bf = 0.0
+            for res in results:
+                for who, line in res.pitchers.items():
+                    if who == nm:
+                        sp_r += line.r; sp_bf += line.bf; sp_o += line.outs
+                    elif who in pen:
+                        rp_r += line.r; rp_bf += line.bf
+            out[f"sp_r_{tag}"] = sp_r / n
+            out[f"sp_bf_{tag}"] = sp_bf / n
+            out[f"sp_outs_{tag}"] = sp_o / n
+            out[f"rp_r_{tag}"] = rp_r / n
+            out[f"rp_bf_{tag}"] = rp_bf / n
+        return out
+
+    @staticmethod
+    def p_home_covers(results: Sequence[GameResult], handicap: float) -> float:
+        """P(home + handicap > away). OddsPortal signs the handicap from the HOME
+        side, so `-1.5` is the home side laying a run and a half."""
+        margins = [(r.runs_home + handicap) - r.runs_away for r in results]
+        live = [m for m in margins if m != 0]
+        if not live:
+            return 0.5
+        return sum(1 for m in live if m > 0) / len(live)
 
 
 # ---------------------------------------------------------------------------
@@ -10270,10 +11242,6 @@ def american(dec: Optional[float]) -> Optional[int]:
 
 def game_totals(results: Sequence[GameResult]) -> List[float]:
     return [float(r.runs_home + r.runs_away) for r in results]
-
-
-def p_total_over(results: Sequence[GameResult], line: float) -> float:
-    return price_over(game_totals(results), line)
 
 
 def implied_line(results: Sequence[GameResult], lo: float = 3.5,
@@ -10315,110 +11283,6 @@ def _joint_runs(results: Sequence[GameResult]) -> Dict[str, int]:
     return out
 
 
-def _half_inning_hist(results: Sequence[GameResult], side: str) -> Dict[str, int]:
-    """{runs in a half-inning: count} pooled over a set of simulated games."""
-    out: Dict[str, int] = {}
-    for r in results:
-        for v in (r.half_runs_home if side == "home" else r.half_runs_away):
-            k = str(v)
-            out[k] = out.get(k, 0) + 1
-    return out
-
-
-def club_quality_asof(season: int, save_dir: Path = SAVE_DIR,
-                      cutoffs: Optional[Sequence[str]] = None
-                      ) -> Dict[tuple, float]:
-    """{(date, club): shrunk run differential per game} from PRIOR games only.
-
-    **Two ways to be wrong here, and the first one bit.**
-
-    *Leakage.* The entry is keyed by DATE but the loop runs per GAME, so on a
-    doubleheader the second game's write includes the first game's result and
-    overwrites the shared key — pricing game one with its own outcome partly
-    baked in. 128 team-games in 2025, 76 in 2026, ~2%. `seen` freezes the
-    entry at a club's FIRST game of a date.
-
-    *Freshness.* Strictly-prior is legal but it is not automatically a fair
-    A/B: every other input is frozen at the weekly as-of board cutoff, and a
-    feature that updates DAILY is being handed fresher information than the
-    model it is being added to. Pass `cutoffs` and the differential is frozen
-    at the same cutoff the boards are, which is the only version that isolates
-    what the FEATURE is worth from what its RECENCY is worth.
-
-    Live, `cutoffs=None` is right — you really do know yesterday's score.
-    """
-    out: Dict[tuple, float] = {}
-    acc: Dict[str, List[float]] = {}
-    seen: set = set()
-    cuts = sorted(cutoffs) if cutoffs else None
-    # {(cutoff, club): value} when freezing, so every game inside a cutoff
-    # window reads the same number the boards were built from
-    frozen: Dict[tuple, float] = {}
-    for g in sorted(season_slate(season, save_dir=save_dir),
-                    key=lambda r: r["date"]):
-        hr = sum(g.get("home_innings") or [])
-        ar = sum(g.get("away_innings") or [])
-        cut = None
-        if cuts:
-            cut = None
-            for c in cuts:
-                if c < g["date"]:
-                    cut = c
-                else:
-                    break
-        for club, diff in ((g["home"], hr - ar), (g["away"], ar - hr)):
-            got = acc.get(club) or [0.0, 0.0]
-            key = (g["date"], club)
-            if key not in seen:
-                seen.add(key)
-                if cuts:
-                    fk = (cut, club)
-                    if fk not in frozen:
-                        frozen[fk] = shrink_team_quality(got[0], int(got[1]))
-                    out[key] = frozen[fk]
-                else:
-                    out[key] = shrink_team_quality(got[0], int(got[1]))
-            acc[club] = [got[0] + diff, got[1] + 1]
-    return out
-
-
-def _staff_split(results: Sequence[GameResult], home: "TeamSide",
-                 away: "TeamSide") -> Dict[str, float]:
-    """Mean runs / BF / outs charged to the STARTER vs the RELIEVERS, per side.
-
-    `PitcherLine.r` charges a run to whoever was ON THE MOUND when it crossed,
-    so an inherited runner is charged to the reliever rather than to the man
-    who put him on. **That is the opposite of box-score convention and it
-    biases exactly this split** — it flatters the starter and blames the pen.
-    Anything read off `rp_r` is therefore an UPPER bound on relief runs and
-    `sp_r` a lower bound on the starter's; only compare it to a real series
-    built the same way (on-mound attribution), never to box-score ER.
-    """
-    out: Dict[str, float] = {}
-    n = len(results) or 1
-    for tag, side in (("h", home), ("a", away)):
-        nm = side.starter.name
-        # **`res.pitchers` is keyed by NAME across BOTH clubs**, so "everyone
-        # who is not the starter" sweeps in the opposing staff. Read the
-        # relief total off THIS side's bullpen by name instead; a first cut
-        # that took the complement reported 6.4 relief runs a game against a
-        # real 1.7 and would have made any relief comparison meaningless.
-        pen = {p.name for p in side.bullpen}
-        sp_r = sp_bf = sp_o = rp_r = rp_bf = 0.0
-        for res in results:
-            for who, line in res.pitchers.items():
-                if who == nm:
-                    sp_r += line.r; sp_bf += line.bf; sp_o += line.outs
-                elif who in pen:
-                    rp_r += line.r; rp_bf += line.bf
-        out[f"sp_r_{tag}"] = sp_r / n
-        out[f"sp_bf_{tag}"] = sp_bf / n
-        out[f"sp_outs_{tag}"] = sp_o / n
-        out[f"rp_r_{tag}"] = rp_r / n
-        out[f"rp_bf_{tag}"] = rp_bf / n
-    return out
-
-
 def joint_margins(game: dict) -> collections.Counter:
     """{margin: count} for one backtest game row.
 
@@ -10437,16 +11301,6 @@ def joint_margins(game: dict) -> collections.Counter:
         h, a = k.split(",")
         out[int(h) - int(a)] += c
     return out
-
-
-def p_home_covers(results: Sequence[GameResult], handicap: float) -> float:
-    """P(home + handicap > away). OddsPortal signs the handicap from the HOME
-    side, so `-1.5` is the home side laying a run and a half."""
-    margins = [(r.runs_home + handicap) - r.runs_away for r in results]
-    live = [m for m in margins if m != 0]
-    if not live:
-        return 0.5
-    return sum(1 for m in live if m > 0) / len(live)
 
 
 # ---------------------------------------------------------------------------
@@ -10484,61 +11338,177 @@ class ClvPick:
         return self.close_p - self.open_p
 
 
-def _pair_probs(line) -> Optional[tuple]:
-    """(labels, open_probs, close_probs, open_decs, close_decs) for a 2-way
-    line, de-vigged on both sides. None when either side is unpriced."""
-    outs = line.outcomes
-    if len(outs) != 2:
-        return None
-    close_dec = [o.avg_odds for o in outs]
-    open_dec = [o.opening_avg for o in outs]
-    if not all(close_dec) or not all(open_dec):
-        return None
-    op = devig(open_dec)
-    cp = devig(close_dec)
-    if not all(op) or not all(cp):
-        return None
-    return ([o.name for o in outs], op, cp, open_dec, close_dec)
+class Clv:
+    """Scoring one game against the market, and running a slate."""
 
+    @staticmethod
+    def _pair_probs(line) -> Optional[tuple]:
+        """(labels, open_probs, close_probs, open_decs, close_decs) for a 2-way
+        line, de-vigged on both sides. None when either side is unpriced."""
+        outs = line.outcomes
+        if len(outs) != 2:
+            return None
+        close_dec = [o.avg_odds for o in outs]
+        open_dec = [o.opening_avg for o in outs]
+        if not all(close_dec) or not all(open_dec):
+            return None
+        op = Pricing.devig(open_dec)
+        cp = Pricing.devig(close_dec)
+        if not all(op) or not all(cp):
+            return None
+        return ([o.name for o in outs], op, cp, open_dec, close_dec)
 
-def clv_picks_for_game(results: Sequence[GameResult], eo,
-                       label: str = "") -> List[ClvPick]:
-    """Every market where the model disagreed with the OPENING line.
+    @staticmethod
+    def clv_picks_for_game(results: Sequence[GameResult], eo,
+                           label: str = "") -> List[ClvPick]:
+        """Every market where the model disagreed with the OPENING line.
 
-    The model is priced AT THE MARKET'S OWN LINE — the sim carries a full
-    distribution, so it can answer any total or handicap, and comparing our
-    8.5 against the book's 8.0 would measure nothing but the line difference.
-    """
-    picks: List[ClvPick] = []
-    game = label or f"{eo.away} @ {eo.home}"
+        The model is priced AT THE MARKET'S OWN LINE — the sim carries a full
+        distribution, so it can answer any total or handicap, and comparing our
+        8.5 against the book's 8.0 would measure nothing but the line difference.
+        """
+        picks: List[ClvPick] = []
+        game = label or f"{eo.away} @ {eo.home}"
 
-    def add(line, model_p_of_first: float):
-        pr = _pair_probs(line)
-        if not pr or line.n_books < MIN_BOOKS_FOR_CLV:
-            return
-        labels, op, cp, od, cd = pr
-        # Back whichever side the model thinks is underpriced at the open.
-        i = 0 if model_p_of_first > op[0] else 1
-        model_p = model_p_of_first if i == 0 else 1.0 - model_p_of_first
-        picks.append(ClvPick(
-            game=game, market=line.market, scope=line.scope,
-            line=line.handicap, side=labels[i], model_p=model_p,
-            open_p=op[i], close_p=cp[i], n_books=line.n_books,
-            open_dec=od[i], close_dec=cd[i]))
+        def add(line, model_p_of_first: float):
+            pr = Clv._pair_probs(line)
+            if not pr or line.n_books < MIN_BOOKS_FOR_CLV:
+                return
+            labels, op, cp, od, cd = pr
+            # Back whichever side the model thinks is underpriced at the open.
+            i = 0 if model_p_of_first > op[0] else 1
+            model_p = model_p_of_first if i == 0 else 1.0 - model_p_of_first
+            picks.append(ClvPick(
+                game=game, market=line.market, scope=line.scope,
+                line=line.handicap, side=labels[i], model_p=model_p,
+                open_p=op[i], close_p=cp[i], n_books=line.n_books,
+                open_dec=od[i], close_dec=cd[i]))
 
-    tot = eo.main_line("over-under")
-    if tot and tot.handicap is not None:
-        add(tot, p_total_over(results, tot.handicap))
+        tot = eo.main_line("over-under")
+        if tot and tot.handicap is not None:
+            add(tot, Pricing.p_total_over(results, tot.handicap))
 
-    ml = eo.main_line("home-away")
-    if ml:
-        add(ml, p_home_win(results))
+        ml = eo.main_line("home-away")
+        if ml:
+            add(ml, p_home_win(results))
 
-    rl = eo.main_line("asian-handicap")
-    if rl and rl.handicap is not None:
-        add(rl, p_home_covers(results, rl.handicap))
+        rl = eo.main_line("asian-handicap")
+        if rl and rl.handicap is not None:
+            add(rl, Pricing.p_home_covers(results, rl.handicap))
 
-    return picks
+        return picks
+
+    @staticmethod
+    def summarize_bias(rows: Sequence[TotalsBias]) -> dict:
+        if not rows:
+            return {"n": 0}
+        d = [r.diff for r in rows]
+        d_sorted = sorted(d)
+        return {
+            "n": len(d),
+            "mean_model": sum(r.model_total for r in rows) / len(rows),
+            "mean_market": sum(r.market_total for r in rows) / len(rows),
+            "mean_diff": sum(d) / len(d),
+            "median_diff": d_sorted[len(d) // 2],
+            "over_share": sum(1 for x in d if x > 0) / len(d),
+        }
+
+    @staticmethod
+    def fade_correlation(picks: Sequence[ClvPick]) -> Optional[float]:
+        """Is the model finding edges, or just fading whatever the market says?
+
+        Correlates each pick's claimed edge against how far the market's own price
+        sits from the middle. A model with game-specific insight shows ~0 here: its
+        disagreements land wherever the information is. A model whose outputs are
+        COMPRESSED shows a strongly negative number, because it reverts everything
+        to the league mean and therefore takes the under on every high total, the
+        over on every low one, and every underdog on the moneyline.
+
+        **Check this before reading an edge board.** Measured on one real slate:
+        totals -0.650, moneyline -0.887, run line +0.703 — every market dominated
+        by a systematic fade, i.e. the edge list was a readout of the model's own
+        narrow spread rather than of market error. An "edge" that big and that
+        correlated is a defect, not a bet.
+        """
+        xs = [p.open_p - 0.5 for p in picks]
+        ys = [p.edge for p in picks]
+        n = len(xs)
+        if n < 4:
+            return None
+        mx, my = sum(xs) / n, sum(ys) / n
+        sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
+        sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
+        if not sx or not sy:
+            return None
+        return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n / (sx * sy)
+
+    @staticmethod
+    def summarize_clv(picks: Sequence[ClvPick],
+                      edge_floor: float = 0.02) -> dict:
+        """Pooled CLV overall and among the picks the model was most confident in.
+
+        The edge-filtered number is the one that matters: if the model has signal,
+        the picks where it disagreed MOST with the open should be the ones the
+        market moved furthest toward. A model with no signal shows ~0 in both, and
+        — importantly — no gap between them.
+        """
+        def agg(rows):
+            if not rows:
+                return {"n": 0, "clv": None, "hit": None}
+            cl = [p.clv for p in rows]
+            return {"n": len(rows),
+                    "clv": sum(cl) / len(cl),
+                    "hit": sum(1 for c in cl if c > 0) / len(cl)}
+
+        out = {"all": agg(list(picks)),
+               "edge": agg([p for p in picks if p.edge >= edge_floor]),
+               "fade": Clv.fade_correlation(picks)}
+        by_market = {}
+        for p in picks:
+            by_market.setdefault(p.market, []).append(p)
+        out["by_market"] = {k: agg(v) for k, v in by_market.items()}
+        return out
+
+    @staticmethod
+    def _op_client(proxy: Optional[str] = None):
+        from OddsPortalClient import OddsPortalClient
+        return OddsPortalClient(proxy=proxy)
+
+    @staticmethod
+    def slate_games(sport: str = "baseball", proxy: Optional[str] = None,
+                    date: Optional[str] = None) -> List[dict]:
+        """Today's board from OddsPortal, joined to our club abbreviations.
+
+        Rows whose clubs do not resolve are dropped with a count rather than
+        silently skipped — an unresolved club is usually a name-map drift, and a
+        harness that quietly scores 12 of 15 games looks identical to one that
+        scored all 15.
+        """
+        c = Clv._op_client(proxy)
+        idx = _team_index()
+        out, unresolved = [], []
+        for r in _op_listing(c, sport):
+            if date:
+                ts = r.get("date-start-timestamp")
+                if not ts:
+                    continue
+                if datetime.datetime.fromtimestamp(int(ts)).date().isoformat() != date:
+                    continue
+            h = idx.get(_norm_club(r.get("home-name")))
+            a = idx.get(_norm_club(r.get("away-name")))
+            if not h or not a:
+                unresolved.append(f"{r.get('away-name')} @ {r.get('home-name')}")
+                continue
+            out.append({
+                "url": r.get("url"), "home": h["abbr"], "away": a["abbr"],
+                "venue": resolve_venue(h["venue"]) or "",
+                "start_ts": r.get("date-start-timestamp"),
+                "label": f"{r.get('away-name')} @ {r.get('home-name')}",
+            })
+        if unresolved:
+            print(f"[clv] {len(unresolved)} game(s) unresolved: "
+                  f"{', '.join(unresolved[:3])}")
+        return out
 
 
 @dataclass
@@ -10572,85 +11542,9 @@ class TotalsBias:
         return self.model_total - self.market_total
 
 
-def summarize_bias(rows: Sequence[TotalsBias]) -> dict:
-    if not rows:
-        return {"n": 0}
-    d = [r.diff for r in rows]
-    d_sorted = sorted(d)
-    return {
-        "n": len(d),
-        "mean_model": sum(r.model_total for r in rows) / len(rows),
-        "mean_market": sum(r.market_total for r in rows) / len(rows),
-        "mean_diff": sum(d) / len(d),
-        "median_diff": d_sorted[len(d) // 2],
-        "over_share": sum(1 for x in d if x > 0) / len(d),
-    }
-
-
-def fade_correlation(picks: Sequence[ClvPick]) -> Optional[float]:
-    """Is the model finding edges, or just fading whatever the market says?
-
-    Correlates each pick's claimed edge against how far the market's own price
-    sits from the middle. A model with game-specific insight shows ~0 here: its
-    disagreements land wherever the information is. A model whose outputs are
-    COMPRESSED shows a strongly negative number, because it reverts everything
-    to the league mean and therefore takes the under on every high total, the
-    over on every low one, and every underdog on the moneyline.
-
-    **Check this before reading an edge board.** Measured on one real slate:
-    totals -0.650, moneyline -0.887, run line +0.703 — every market dominated
-    by a systematic fade, i.e. the edge list was a readout of the model's own
-    narrow spread rather than of market error. An "edge" that big and that
-    correlated is a defect, not a bet.
-    """
-    xs = [p.open_p - 0.5 for p in picks]
-    ys = [p.edge for p in picks]
-    n = len(xs)
-    if n < 4:
-        return None
-    mx, my = sum(xs) / n, sum(ys) / n
-    sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
-    sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
-    if not sx or not sy:
-        return None
-    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n / (sx * sy)
-
-
-def summarize_clv(picks: Sequence[ClvPick],
-                  edge_floor: float = 0.02) -> dict:
-    """Pooled CLV overall and among the picks the model was most confident in.
-
-    The edge-filtered number is the one that matters: if the model has signal,
-    the picks where it disagreed MOST with the open should be the ones the
-    market moved furthest toward. A model with no signal shows ~0 in both, and
-    — importantly — no gap between them.
-    """
-    def agg(rows):
-        if not rows:
-            return {"n": 0, "clv": None, "hit": None}
-        cl = [p.clv for p in rows]
-        return {"n": len(rows),
-                "clv": sum(cl) / len(cl),
-                "hit": sum(1 for c in cl if c > 0) / len(cl)}
-
-    out = {"all": agg(list(picks)),
-           "edge": agg([p for p in picks if p.edge >= edge_floor]),
-           "fade": fade_correlation(picks)}
-    by_market = {}
-    for p in picks:
-        by_market.setdefault(p.market, []).append(p)
-    out["by_market"] = {k: agg(v) for k, v in by_market.items()}
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Running a slate
 # ---------------------------------------------------------------------------
-
-def _op_client(proxy: Optional[str] = None):
-    from OddsPortalClient import OddsPortalClient
-    return OddsPortalClient(proxy=proxy)
-
 
 # **`/matches/baseball/` is the wrong page for an MLB slate.** It is the
 # sport-wide "today and upcoming" listing: at 02:00 local it carried seventeen
@@ -10677,8 +11571,6 @@ def _op_client(proxy: Optional[str] = None):
 # the 7:05 games are still fixtures, and either page alone is a partial board
 # that looks complete. `date-start-timestamp` is what actually selects the
 # slate, and it is on rows from both.
-_OP_LEAGUE_PATH = {"baseball": "/baseball/usa/mlb/"}
-_OP_RESULTS_PATH = {"baseball": "/baseball/usa/mlb/results/"}
 
 
 def _op_page_rows(client, path: str) -> List[dict]:
@@ -10699,8 +11591,8 @@ def _op_listing(client, sport: str, finished: bool = True) -> List[dict]:
     concluded game appears. Deduped on `url`, which is the row identity — a
     game can legitimately be on both pages while a slate is in progress.
     """
-    paths = [p for p in (_OP_LEAGUE_PATH.get(sport),
-                         _OP_RESULTS_PATH.get(sport) if finished else None)
+    paths = [p for p in (OddsPortal.LEAGUE_PATH.get(sport),
+                         OddsPortal.RESULTS_PATH.get(sport) if finished else None)
              if p]
     if not paths:
         return client._listing_rows(sport)
@@ -10717,42 +11609,6 @@ def _op_listing(client, sport: str, finished: bool = True) -> List[dict]:
         return out
     print(f"[clv] no league rows; falling back to /matches/{sport}/")
     return client._listing_rows(sport)
-
-
-def slate_games(sport: str = "baseball", proxy: Optional[str] = None,
-                date: Optional[str] = None) -> List[dict]:
-    """Today's board from OddsPortal, joined to our club abbreviations.
-
-    Rows whose clubs do not resolve are dropped with a count rather than
-    silently skipped — an unresolved club is usually a name-map drift, and a
-    harness that quietly scores 12 of 15 games looks identical to one that
-    scored all 15.
-    """
-    c = _op_client(proxy)
-    idx = _team_index()
-    out, unresolved = [], []
-    for r in _op_listing(c, sport):
-        if date:
-            ts = r.get("date-start-timestamp")
-            if not ts:
-                continue
-            if datetime.datetime.fromtimestamp(int(ts)).date().isoformat() != date:
-                continue
-        h = idx.get(_norm_club(r.get("home-name")))
-        a = idx.get(_norm_club(r.get("away-name")))
-        if not h or not a:
-            unresolved.append(f"{r.get('away-name')} @ {r.get('home-name')}")
-            continue
-        out.append({
-            "url": r.get("url"), "home": h["abbr"], "away": a["abbr"],
-            "venue": resolve_venue(h["venue"]) or "",
-            "start_ts": r.get("date-start-timestamp"),
-            "label": f"{r.get('away-name')} @ {r.get('home-name')}",
-        })
-    if unresolved:
-        print(f"[clv] {len(unresolved)} game(s) unresolved: "
-              f"{', '.join(unresolved[:3])}")
-    return out
 
 
 def run_clv(sport: str = "baseball", n_sims: int = 8000,
@@ -10779,7 +11635,7 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
     #
     # One date, passed to both.
     date = date or datetime.date.today().isoformat()
-    games = slate_games(sport, proxy, date=date)
+    games = Clv.slate_games(sport, proxy, date=date)
     if limit:
         games = games[:limit]
     if not games:
@@ -10790,7 +11646,7 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
     bat_table, _ = build_rates("bat")
     pit_table, _ = build_rates("pit")
     hz = starter_hazard()
-    c = _op_client(proxy)
+    c = Clv._op_client(proxy)
 
     probables: Dict[tuple, dict] = {}
     if live_lineups:
@@ -10863,7 +11719,7 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
                 "home_sp": pr.get("home_sp") or -1,
                 "away_sp": pr.get("away_sp") or -1,
             }, home, away))
-        got = clv_picks_for_game(res, eo, g["label"])
+        got = Clv.clv_picks_for_game(res, eo, g["label"])
         picks.extend(got)
         tot = eo.main_line("over-under")
         gt = game_totals(res)
@@ -10878,7 +11734,7 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
     if verbose and subs["games"]:
         print(f"[clv] real starters used on {subs['sp']}/{2*subs['games']} sides, "
               f"posted lineups on {subs['lineup']}/{2*subs['games']}")
-    return picks, {"clv": summarize_clv(picks), "bias": summarize_bias(bias),
+    return picks, {"clv": Clv.summarize_clv(picks), "bias": Clv.summarize_bias(bias),
                    "subs": subs}
 
 
@@ -10893,23 +11749,222 @@ def run_clv(sport: str = "baseball", n_sims: int = 8000,
 # priced SD @ CLE at 8.41 against a market of 7.0 — a game the market had low
 # precisely because of who was starting.
 
-STATSAPI = "https://statsapi.mlb.com/api/v1"
 
 
-def _lineup_catcher(players: Optional[Sequence[dict]]) -> Optional[int]:
-    """The posted catcher's MLBAM id, or None when the lineup has no C.
+class LiveSlate:
+    """Tonight's probables, posted and projected lineups."""
 
-    A posted nine can legitimately lack a catcher — a DH-only card, or a
-    partial lineup — so this returns None rather than guessing, and the caller
-    falls back to the club figure.
-    """
-    for pl in (players or []):
-        if ((pl.get("primaryPosition") or {}).get("abbreviation") or "") == "C":
-            try:
-                return int(pl["id"])
-            except (KeyError, TypeError, ValueError):
+    @staticmethod
+    def _lineup_catcher(players: Optional[Sequence[dict]]) -> Optional[int]:
+        """The posted catcher's MLBAM id, or None when the lineup has no C.
+
+        A posted nine can legitimately lack a catcher — a DH-only card, or a
+        partial lineup — so this returns None rather than guessing, and the caller
+        falls back to the club figure.
+        """
+        for pl in (players or []):
+            if ((pl.get("primaryPosition") or {}).get("abbreviation") or "") == "C":
+                try:
+                    return int(pl["id"])
+                except (KeyError, TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
+    @staticmethod
+    def rotowire_url(date: Optional[str] = None) -> Optional[str]:
+        """The Rotowire lineups URL that serves `date`, or None if it cannot.
+
+        **Rotowire takes a RELATIVE selector, and the ISO form fails SILENTLY.**
+        Probed 2026-08-24: `?date=tomorrow` returns a page printing 2026-08-25
+        with 16 lineup blocks, while `?date=2026-08-25` returns 200 and the
+        2026-08-24 page with 11 — the wrong slate, no error, which is precisely
+        the failure `rotowire_lineup_date` exists to catch. So the offset is
+        translated to the keyword here, and only today and tomorrow are
+        expressible; anything else returns None and the caller refuses rather
+        than quietly pricing off the wrong day.
+        """
+        if not date:
+            return Rotowire.LINEUPS_URL
+        try:
+            want = datetime.date.fromisoformat(date)
+        except ValueError:
+            return None
+        delta = (want - datetime.date.today()).days
+        if delta == 0:
+            return Rotowire.LINEUPS_URL
+        if delta == 1:
+            return f"{Rotowire.LINEUPS_URL}?date=tomorrow"
+        return None
+
+    @staticmethod
+    def rotowire_lineup_date(timeout: float = 20.0,
+                             url: Optional[str] = None) -> Optional[str]:
+        """The date the Rotowire lineups page is actually showing, ISO, or None.
+
+        **Which slate the page describes is a fact about what came back, not
+        about what was asked for.** On 2026-08-21 the club pairings for the 21st
+        and the 22nd were IDENTICAL — a series — so the matchup set cannot
+        disambiguate, and a projection silently applied to the wrong day of a
+        series is a whole lineup's worth of wrong data with nothing to notice it
+        by. The page prints its own date; this reads it.
+
+        `url` must be the SAME url the lineups will be scraped from, or this
+        verifies one page and trusts another.
+        """
+        try:
+            r = requests.get(url or Rotowire.LINEUPS_URL, timeout=timeout,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            mm = _ROTO_DATE.search(r.text)
+            if not mm:
                 return None
-    return None
+            return (f"{mm.group(3)}-{_MONTHS.index(mm.group(1)) + 1:02d}"
+                    f"-{int(mm.group(2)):02d}")
+        except Exception:                                          # noqa: BLE001
+            return None
+
+    @staticmethod
+    def projected_lineups(date: Optional[str] = None,
+                          timeout: float = 20.0) -> Dict[str, List[tuple]]:
+        """{club abbr: [(name, pos, bats), ...]} in batting order, or {}.
+
+        `date` is REQUESTED via `rotowire_url` and then CHECKED: the page prints
+        its own date, and if that is not the day asked for the projection is
+        refused rather than served for the wrong slate. Both halves are needed —
+        requesting without checking trusts a parameter that fails silently, and
+        checking without requesting means tomorrow is never available at all,
+        which is what used to happen every evening before the site rolled over.
+
+        Club codes are normalised onto the FanGraphs board's spelling on WRITE,
+        not on query — the seven-club disagreement (SF/SFG, TB/TBR, ...) is the
+        silent-key-miss trap recorded in §7.2.
+        """
+        url = LiveSlate.rotowire_url(date)
+        if url is None:
+            print(f"mlb_sim: Rotowire only serves today and tomorrow — "
+                  f"no projected lineups for {date}")
+            return {}
+        if date:
+            shown = LiveSlate.rotowire_lineup_date(timeout, url)
+            if shown and shown != date:
+                print(f"mlb_sim: Rotowire is showing {shown}, not {date} — "
+                      f"no projected lineups for this slate")
+                return {}
+        try:
+            from GUIMLBlineups import fetch_daily_lineups
+            matchups = fetch_daily_lineups(url) or []
+        except Exception as e:                                    # noqa: BLE001
+            print(f"mlb_sim: projected lineups unavailable ({e})")
+            return {}
+        out: Dict[str, List[tuple]] = {}
+        for mu in matchups:
+            for abbr, players in (mu.get("Team_Lineups") or {}).items():
+                good = [p for p in players if p and p[0]]
+                if abbr and len(good) >= 9:
+                    out[normalize_club(_FG_ALIAS.get(abbr, abbr))] = good[:9]
+        return out
+
+    @staticmethod
+    def _name_key(name: str) -> Tuple[str, str]:
+        """(surname, first token) with accents stripped and suffixes dropped.
+
+        The suffix is dropped from position 1 ONWARD only: 'V. Guerrero' against
+        'Vladimir Guerrero Jr.' matches nothing if the last token is taken blind,
+        and 'V.' is itself a Roman numeral, so stripping it from position 0 would
+        leave no first name at all.
+        """
+        txt = unicodedata.normalize("NFKD", name or "")
+        txt = "".join(c for c in txt if not unicodedata.combining(c))
+        parts = [w.strip(".,'") for w in txt.replace("-", " ").split() if w.strip(".,'")]
+        while len(parts) > 1 and parts[-1].lower().strip(".") in (
+                "jr", "sr", "ii", "iii", "iv", "v"):
+            parts.pop()
+        if not parts:
+            return "", ""
+        return parts[-1].lower(), parts[0].lower()
+
+    @staticmethod
+    def resolve_projected_lineup(abbr: str, players: Sequence[tuple],
+                                 season: Optional[int] = None,
+                                 save_dir: Path = SAVE_DIR,
+                                 min_resolved: int = 7) -> List[int]:
+        """Rotowire display names -> MLBAM ids, in batting order.
+
+        Rotowire abbreviates most first names ('C. DeLauter'), so this matches on
+        SURNAME plus first INITIAL inside that club's board rows, then narrows a
+        tie by bat side, then by position, then by playing time. A name that
+        survives all three ambiguous returns `UNRESOLVED_BATTER` rather than a
+        guess — `_game_side` turns that into a replacement-level hitter, which is
+        the honest answer for a man the board has never seen.
+
+        Returns [] when fewer than `min_resolved` of the nine resolve, because at
+        that point the projection is worse than the board's own best nine.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        pool = team_roster("bat", season, save_dir).get(abbr) or []
+        wide = load_board("bat", season, save_dir) or []
+        idx: Dict[Tuple[str, str], List[dict]] = {}
+        for row in pool:
+            idx.setdefault(LiveSlate._name_key(row.get("PlayerName") or ""), []).append(row)
+
+        def hits(rows, last, first):
+            out = []
+            for r in rows:
+                l, f = LiveSlate._name_key(r.get("PlayerName") or "")
+                if l != last:
+                    continue
+                if f[:1] == first[:1] if len(first) <= 1 else f == first:
+                    out.append(r)
+            return out
+
+        ids: List[int] = []
+        for name, pos, bats in players[:9]:
+            last, first = LiveSlate._name_key(name)
+            initial = len(first) <= 1 or "." in str(name).split()[0]
+            cands = hits(pool, last, first if initial else first)
+            if not cands:
+                # A call-up or a deadline pickup whose board row still says his old
+                # club. Only usable when the name is unique LEAGUE-wide — 'Luis
+                # Garcia' is not, and stays unresolved.
+                league = hits(wide, last, first)
+                cands = league if len(league) == 1 else []
+            if len(cands) > 1:
+                for key, want in (("Bats", bats), ("Pos", pos)):
+                    narrowed = [r for r in cands
+                                if str(r.get(key) or "").upper()[:len(str(want))]
+                                == str(want or "").upper()]
+                    if len(narrowed) == 1:
+                        cands = narrowed
+                        break
+                    if narrowed:
+                        cands = narrowed
+            if len(cands) > 1:
+                cands = sorted(cands, key=lambda r: -_num(r, "PA"))[:1]
+            rid = _row_id(cands[0]) if cands else None
+            ids.append(int(rid) if rid else UNRESOLVED_BATTER)
+        got = sum(1 for i in ids if i != UNRESOLVED_BATTER)
+        return ids if got >= min_resolved else []
+
+    @staticmethod
+    def _opener_bf_shape() -> Sequence[int]:
+        """Real opener-length starts when cached, the hand-drawn shape otherwise."""
+        if not _OPENER_SHAPE:
+            got = []
+            try:
+                with open(STINT_CACHE) as fh:
+                    got = [s["bf"] for s in json.load(fh)
+                           if s.get("starter") and 0 < (s.get("bf") or 0) <= OPENER_BF_MAX]
+            except (OSError, ValueError):
+                got = []
+            _OPENER_SHAPE.append(tuple(got) if len(got) >= 100
+                                 else _OPENER_BF_SHAPE)
+        return _OPENER_SHAPE[0]
+
+    @staticmethod
+    def _pit_row(pid: int, season: int, save_dir: Path) -> Optional[dict]:
+        """One pitcher's board row, by id. Indexed, not scanned."""
+        return Boards._board_index("pit", season, save_dir).get(int(pid))
 
 
 # --- PROJECTED lineups, for the hours before the real ones are posted ------
@@ -10932,7 +11987,6 @@ def _lineup_catcher(players: Optional[Sequence[dict]]) -> Optional[int]:
 USE_PROJECTED_LINEUP = True
 
 
-ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 _ROTO_DATE = re.compile(
     r"(January|February|March|April|May|June|July|August|September|October|"
     r"November|December)\s+(\d{1,2}),?\s+(20\d\d)")
@@ -10940,143 +11994,7 @@ _MONTHS = ("January", "February", "March", "April", "May", "June", "July",
            "August", "September", "October", "November", "December")
 
 
-def rotowire_lineup_date(timeout: float = 20.0) -> Optional[str]:
-    """The date the Rotowire lineups page is actually showing, ISO, or None.
-
-    **The page is day-of and carries no date parameter**, so which slate it
-    describes is a fact about when it was fetched, not about what was asked
-    for. On 2026-08-21 the club pairings for the 21st and the 22nd were
-    IDENTICAL — a series — so the matchup set cannot disambiguate, and a
-    projection silently applied to the wrong day of a series is a whole
-    lineup's worth of wrong data with nothing to notice it by. The page
-    prints its own date; this reads it.
-    """
-    try:
-        r = requests.get(ROTOWIRE_LINEUPS_URL, timeout=timeout,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        mm = _ROTO_DATE.search(r.text)
-        if not mm:
-            return None
-        return (f"{mm.group(3)}-{_MONTHS.index(mm.group(1)) + 1:02d}"
-                f"-{int(mm.group(2)):02d}")
-    except Exception:                                          # noqa: BLE001
-        return None
-
-
-def projected_lineups(date: Optional[str] = None,
-                      timeout: float = 20.0) -> Dict[str, List[tuple]]:
-    """{club abbr: [(name, pos, bats), ...]} in batting order, or {}.
-
-    `date` is CHECKED, not requested: if the page is showing a different day
-    the projection is refused rather than served for the wrong slate.
-
-    Club codes are normalised onto the FanGraphs board's spelling on WRITE,
-    not on query — the seven-club disagreement (SF/SFG, TB/TBR, ...) is the
-    silent-key-miss trap recorded in §7.2.
-    """
-    if date:
-        shown = rotowire_lineup_date(timeout)
-        if shown and shown != date:
-            print(f"mlb_sim: Rotowire is showing {shown}, not {date} — "
-                  f"no projected lineups for this slate")
-            return {}
-    try:
-        from GUIMLBlineups import fetch_daily_lineups
-        matchups = fetch_daily_lineups() or []
-    except Exception as e:                                    # noqa: BLE001
-        print(f"mlb_sim: projected lineups unavailable ({e})")
-        return {}
-    out: Dict[str, List[tuple]] = {}
-    for mu in matchups:
-        for abbr, players in (mu.get("Team_Lineups") or {}).items():
-            good = [p for p in players if p and p[0]]
-            if abbr and len(good) >= 9:
-                out[normalize_club(_FG_ALIAS.get(abbr, abbr))] = good[:9]
-    return out
-
-
-def _name_key(name: str) -> Tuple[str, str]:
-    """(surname, first token) with accents stripped and suffixes dropped.
-
-    The suffix is dropped from position 1 ONWARD only: 'V. Guerrero' against
-    'Vladimir Guerrero Jr.' matches nothing if the last token is taken blind,
-    and 'V.' is itself a Roman numeral, so stripping it from position 0 would
-    leave no first name at all.
-    """
-    txt = unicodedata.normalize("NFKD", name or "")
-    txt = "".join(c for c in txt if not unicodedata.combining(c))
-    parts = [w.strip(".,'") for w in txt.replace("-", " ").split() if w.strip(".,'")]
-    while len(parts) > 1 and parts[-1].lower().strip(".") in (
-            "jr", "sr", "ii", "iii", "iv", "v"):
-        parts.pop()
-    if not parts:
-        return "", ""
-    return parts[-1].lower(), parts[0].lower()
-
-
 UNRESOLVED_BATTER = -1
-
-
-def resolve_projected_lineup(abbr: str, players: Sequence[tuple],
-                             season: int = 2026,
-                             save_dir: Path = SAVE_DIR,
-                             min_resolved: int = 7) -> List[int]:
-    """Rotowire display names -> MLBAM ids, in batting order.
-
-    Rotowire abbreviates most first names ('C. DeLauter'), so this matches on
-    SURNAME plus first INITIAL inside that club's board rows, then narrows a
-    tie by bat side, then by position, then by playing time. A name that
-    survives all three ambiguous returns `UNRESOLVED_BATTER` rather than a
-    guess — `_game_side` turns that into a replacement-level hitter, which is
-    the honest answer for a man the board has never seen.
-
-    Returns [] when fewer than `min_resolved` of the nine resolve, because at
-    that point the projection is worse than the board's own best nine.
-    """
-    pool = team_roster("bat", season, save_dir).get(abbr) or []
-    wide = load_board("bat", season, save_dir) or []
-    idx: Dict[Tuple[str, str], List[dict]] = {}
-    for row in pool:
-        idx.setdefault(_name_key(row.get("PlayerName") or ""), []).append(row)
-
-    def hits(rows, last, first):
-        out = []
-        for r in rows:
-            l, f = _name_key(r.get("PlayerName") or "")
-            if l != last:
-                continue
-            if f[:1] == first[:1] if len(first) <= 1 else f == first:
-                out.append(r)
-        return out
-
-    ids: List[int] = []
-    for name, pos, bats in players[:9]:
-        last, first = _name_key(name)
-        initial = len(first) <= 1 or "." in str(name).split()[0]
-        cands = hits(pool, last, first if initial else first)
-        if not cands:
-            # A call-up or a deadline pickup whose board row still says his old
-            # club. Only usable when the name is unique LEAGUE-wide — 'Luis
-            # Garcia' is not, and stays unresolved.
-            league = hits(wide, last, first)
-            cands = league if len(league) == 1 else []
-        if len(cands) > 1:
-            for key, want in (("Bats", bats), ("Pos", pos)):
-                narrowed = [r for r in cands
-                            if str(r.get(key) or "").upper()[:len(str(want))]
-                            == str(want or "").upper()]
-                if len(narrowed) == 1:
-                    cands = narrowed
-                    break
-                if narrowed:
-                    cands = narrowed
-        if len(cands) > 1:
-            cands = sorted(cands, key=lambda r: -_num(r, "PA"))[:1]
-        rid = _row_id(cands[0]) if cands else None
-        ids.append(int(rid) if rid else UNRESOLVED_BATTER)
-    got = sum(1 for i in ids if i != UNRESOLVED_BATTER)
-    return ids if got >= min_resolved else []
 
 
 def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
@@ -11088,11 +12006,18 @@ def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
     """
     if date is None:
         date = datetime.date.today().isoformat()
-    url = (f"{STATSAPI}/schedule?sportId=1&date={date}"
-           f"&hydrate=probablePitcher,lineups,team")
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
+    url = StatsApi.schedule_url(date=date,
+                                hydrate="probablePitcher,lineups,team")
+
+    def _fetch():
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    # Memo the RAW payload, never the parsed card: callers own their dict and
+    # a shared one would let a mutation leak into the next call. Parsing again
+    # is free next to the request.
+    data = Query.memo(f"schedule|probables|{date}", _fetch)
 
     def abbr(side_team: dict) -> str:
         a = (side_team.get("team") or {}).get("abbreviation") or ""
@@ -11105,9 +12030,10 @@ def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
     # (away, home) lookup resolves to game 1 via `probable_for()` so existing
     # callers keep working and get the EARLIER game rather than an arbitrary one.
     #
-    # Note `odds_by_game` already handles this collision, by DROPPING ambiguous
-    # keys — one place in this module knew about doubleheaders and the other
-    # did not.
+    # Note `odds_by_game` handles this collision by DROPPING ambiguous keys,
+    # and `odds_by_pk` resolves them on the final score — the archive DOES
+    # distinguish the two games, it is the (date, home, away) triple that
+    # cannot.
     out: Dict[tuple, dict] = {}
     for day in data.get("dates", []):
         for g in day.get("games", []):
@@ -11136,8 +12062,8 @@ def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
                 # is a player skill, so the club aggregate is the wrong object
                 # to lag — the hydrate carries `primaryPosition`, so the man
                 # actually behind the plate is free to identify.
-                "home_catcher": _lineup_catcher(lu.get("homePlayers")),
-                "away_catcher": _lineup_catcher(lu.get("awayPlayers")),
+                "home_catcher": LiveSlate._lineup_catcher(lu.get("homePlayers")),
+                "away_catcher": LiveSlate._lineup_catcher(lu.get("awayPlayers")),
             }
     # **The projection fills only what StatsAPI left EMPTY**, and only when
     # the club has not filed. A posted nine is always preferred: it is the
@@ -11146,7 +12072,7 @@ def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
     if USE_PROJECTED_LINEUP and any(
             len(r.get(f"{s}_lineup") or []) < 9
             for r in out.values() for s in ("home", "away")):
-        proj = projected_lineups(date)
+        proj = LiveSlate.projected_lineups(date)
         if proj:
             season = int(date[:4])
             cache: Dict[str, List[int]] = {}
@@ -11156,7 +12082,7 @@ def fetch_probables(date: Optional[str] = None, timeout: float = 20.0
                     if len(row.get(f"{side}_lineup") or []) >= 9:
                         continue
                     if abbr not in cache:
-                        cache[abbr] = resolve_projected_lineup(
+                        cache[abbr] = LiveSlate.resolve_projected_lineup(
                             abbr, proj.get(abbr) or [], season)
                     ids = cache[abbr]
                     if ids:
@@ -11195,9 +12121,12 @@ def game_weather(game_pk: int, date: Optional[str] = None,
     carries `wind_label` rather than `wind_dir_deg`.
     """
     date = date or datetime.date.today().isoformat()
-    url = (f"{STATSAPI}/schedule?sportId=1&date={date}"
-           f"&hydrate=weather&gameType=R")
-    data = requests.get(url, timeout=timeout).json()
+    url = StatsApi.schedule_url(date=date, hydrate="weather", game_type="R")
+    # **This is a WHOLE-DAY payload scanned for ONE gamePk**, and `run_clv`
+    # calls it inside its per-game loop — 15 downloads of the same response on
+    # a 15-game slate, 14 of them discarded. Memo the raw payload per date.
+    data = Query.memo(f"schedule|weather|{date}",
+                      lambda: requests.get(url, timeout=timeout).json())
     for day in data.get("dates", []):
         for g in day.get("games", []):
             if int(g.get("gamePk", -1)) != int(game_pk):
@@ -11238,41 +12167,14 @@ _OPENER_BF_SHAPE = (3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 7, 8)
 _OPENER_SHAPE: List[Sequence[int]] = []
 
 
-def _opener_bf_shape() -> Sequence[int]:
-    """Real opener-length starts when cached, the hand-drawn shape otherwise."""
-    if not _OPENER_SHAPE:
-        got = []
-        try:
-            with open(STINT_CACHE) as fh:
-                got = [s["bf"] for s in json.load(fh)
-                       if s.get("starter") and 0 < (s.get("bf") or 0) <= OPENER_BF_MAX]
-        except (OSError, ValueError):
-            got = []
-        _OPENER_SHAPE.append(tuple(got) if len(got) >= 100
-                             else _OPENER_BF_SHAPE)
-    return _OPENER_SHAPE[0]
-
 _GS_SHARE: Dict[int, Dict[int, float]] = {}
 _PIT_ROWS: Dict[tuple, Dict[int, dict]] = {}
 
 
-def _pit_row(pid: int, season: int, save_dir: Path) -> Optional[dict]:
-    """One pitcher's board row, by id. Indexed, not scanned."""
-    key = (int(season), str(save_dir))
-    tab = _PIT_ROWS.get(key)
-    if tab is None:
-        tab = {}
-        for row in load_board("pit", season, save_dir) or []:
-            rid = _row_id(row)
-            if rid:
-                tab[rid] = row
-        _PIT_ROWS[key] = tab
-    return tab.get(int(pid))
-
-
-def starter_gs_share(pid: Optional[int], season: int = 2026,
+def starter_gs_share(pid: Optional[int], season: Optional[int] = None,
                      save_dir: Path = SAVE_DIR) -> Optional[float]:
     """GS / G off the pitching board. None when the arm is not on it."""
+    season = CURRENT_SEASON if season is None else int(season)
     if pid is None:
         return None
     tab = _GS_SHARE.get(season)
@@ -11326,7 +12228,7 @@ START_BF_BY_GS_SHARE: Tuple[Tuple[float, float], ...] = (
     (0.15, 6.0), (0.75, 21.0), (2.0, 23.0))
 
 
-def population_start_bf(pid: Optional[int], season: int = 2026,
+def population_start_bf(pid: Optional[int], season: Optional[int] = None,
                         save_dir: Path = SAVE_DIR) -> float:
     """What an arm with THIS GS share throws in a start, measured.
 
@@ -11336,6 +12238,7 @@ def population_start_bf(pid: Optional[int], season: int = 2026,
     used it as the fallback anyway — which is how a man with four real starts
     was handed a one-inning target.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     share = starter_gs_share(pid, season, save_dir)
     if share is None:
         return START_BF_BY_GS_SHARE[-1][1]
@@ -11345,7 +12248,7 @@ def population_start_bf(pid: Optional[int], season: int = 2026,
     return START_BF_BY_GS_SHARE[-1][1]
 
 
-def start_bf_estimate(pid: Optional[int], season: int = 2026,
+def start_bf_estimate(pid: Optional[int], season: Optional[int] = None,
                       save_dir: Path = SAVE_DIR) -> Optional[float]:
     """Batters this arm faces in a START, from his own IP/GS on the board.
 
@@ -11368,16 +12271,17 @@ def start_bf_estimate(pid: Optional[int], season: int = 2026,
     wrong answer with nothing attached to say so — `sim_state.md` trap 11. The
     caller falls back to `population_start_bf`, which is measured.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     if pid is None:
         return None
-    row = _pit_row(int(pid), season, save_dir)
+    row = LiveSlate._pit_row(int(pid), season, save_dir)
     if row is None:
         return None
     gs, g, ip = _num(row, "GS"), _num(row, "G"), _innings(row, "IP")
     if gs < 1 or ip <= 0:
         return None
     relief = max(0.0, g - gs)
-    tr = load_reliever_traits(season).get(int(pid)) or {}
+    tr = RelieverTraits.load_reliever_traits(season).get(int(pid)) or {}
     measured = tr.get("ip_per_outing")
     # **Refuse when the netting is underdetermined.** With no measured relief
     # length we are guessing, and the guess is amplified by the leverage.
@@ -11393,7 +12297,7 @@ def start_bf_estimate(pid: Optional[int], season: int = 2026,
 
 def opener_hazard(bf_target: float) -> List[float]:
     """A hook curve centred on a measured batters-faced target."""
-    shape = _opener_bf_shape()
+    shape = LiveSlate._opener_bf_shape()
     base = statistics.mean(shape) if shape else 5.0
     scale = max(0.4, float(bf_target or 4.5)) / base
     return hook_hazard([max(1, round(b * scale)) for b in shape])
@@ -11404,7 +12308,7 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
                     sp_id: Optional[int] = None,
                     lineup_ids: Optional[Sequence[int]] = None,
                     catcher_id: Optional[int] = None,
-                    season: int = 2026,
+                    season: Optional[int] = None,
                     hazard: Optional[List[float]] = None,
                     save_dir: Path = SAVE_DIR,
                     use_itp_pen: bool = True):
@@ -11421,6 +12325,7 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
     list the sim had been using. Arms resting on real recent workload are
     dropped here, which is the point — see `build_pen_from_itp`.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     side = build_side(abbr, bat_table, pit_table, season, hazard, save_dir)
     used = {"sp": False, "lineup": False, "pen": "board", "framing": "club"}
 
@@ -11432,7 +12337,7 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
     if catcher_id is not None:
         side.catcher_id = int(catcher_id)
         if USE_PITCH_FRAMING:
-            v = catcher_framing_per_game(int(catcher_id),
+            v = Framing.catcher_framing_per_game(int(catcher_id),
                                          season - TEAM_CONTEXT_LAG, save_dir)
             if v is not None:
                 side.framing = v
@@ -11453,7 +12358,6 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
     if sp_id:
         # An OPENER gets his OWN hook, not a starter's — see OPENER_GS_SHARE.
         share = starter_gs_share(sp_id, season, save_dir)
-        traits = load_reliever_traits(season).get(int(sp_id)) or {}
         is_opener = share is not None and share < OPENER_GS_SHARE
         # His own start length where his line can resolve one, else what arms
         # with HIS GS SHARE actually throw — measured, not his relief outing.
@@ -11474,7 +12378,7 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
             # worth 4.1 points of win probability on that game. The minor
             # league ladder can say something about him where the board cannot,
             # so it is asked before the fallback is accepted.
-            sp = milb_only_pitcher(int(sp_id), season, save_dir,
+            sp = Boards.milb_only_pitcher(int(sp_id), season, save_dir,
                                    is_starter=True, hazard=hz)
         if sp is not None:
             side.starter = sp
@@ -11514,14 +12418,15 @@ def build_side_live(abbr: str, bat_table: Dict[int, dict],
 # Real league marks for sanity: appearance rate median 10.8%, p90 41.2%,
 # **max 53.4%**. Any simulated arm above ~50% is wrong by construction.
 
-MLBA_DIR = Path(__file__).resolve().parent.parent / "MLBAnalytics"
+MLBA_DIR = _APP_ROOT.parent / "MLBAnalytics"
 RELIEVER_TRAIT_COLS = ("player_name", "player_id", "team", "season",
                        "g", "team_games", "app_rate", "bf_per_outing",
                        "ip_per_outing", "gm_li", "sv", "hld", "siera")
 
 
-def _team_games(season: int = 2026, save_dir: Path = SAVE_DIR) -> Dict[str, float]:
+def _team_games(season: Optional[int] = None, save_dir: Path = SAVE_DIR) -> Dict[str, float]:
     """Games played per club, taken as the max G on the batting board."""
+    season = CURRENT_SEASON if season is None else int(season)
     out: Dict[str, float] = {}
     for r in load_board("bat", season, save_dir) or []:
         t = r.get("TeamNameAbb")
@@ -11530,104 +12435,358 @@ def _team_games(season: int = 2026, save_dir: Path = SAVE_DIR) -> Dict[str, floa
     return out
 
 
-def export_reliever_traits(season: int = 2026,
-                           save_dir: Path = SAVE_DIR,
-                           with_itp: bool = False,
-                           min_app_rate: float = 0.0,
-                           workers: int = 8) -> Path:
-    """Write per-reliever usage traits to MLBAnalytics as a flat CSV.
+class RelieverTraits:
+    """Per-arm usage traits, and the real bullpen state from insidethepen."""
 
-    `with_itp` additionally fetches each arm's insidethepen deployment traits
-    (when he enters, the score he is trusted in, whether he goes back-to-back).
-    That is one HTTP request per pitcher, so it is threaded and off by default —
-    the FanGraphs-derived columns need no network at all.
-    """
-    rows = load_board("pit", season, save_dir) or []
-    tg = _team_games(season, save_dir)
-    MLBA_DIR.mkdir(exist_ok=True)
-    path = MLBA_DIR / f"reliever_traits_{season}.csv"
+    @staticmethod
+    def export_reliever_traits(season: Optional[int] = None,
+                               save_dir: Path = SAVE_DIR,
+                               with_itp: bool = False,
+                               min_app_rate: float = 0.0,
+                               workers: int = 8) -> Path:
+        """Write per-reliever usage traits to MLBAnalytics as a flat CSV.
 
-    keep = []
-    for r in rows:
-        team, g = r.get("TeamNameAbb"), _num(r, "G")
-        if not team or "Tms" in str(team) or g <= 0:
-            continue
-        if _num(r, "GS") / g >= 0.5:
-            continue
-        games = tg.get(team, 0.0)
-        if games <= 0 or (g / games) < min_app_rate:
-            continue
-        keep.append(r)
+        `with_itp` additionally fetches each arm's insidethepen deployment traits
+        (when he enters, the score he is trusted in, whether he goes back-to-back).
+        That is one HTTP request per pitcher, so it is threaded and off by default —
+        the FanGraphs-derived columns need no network at all.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        rows = load_board("pit", season, save_dir) or []
+        tg = _team_games(season, save_dir)
+        MLBA_DIR.mkdir(exist_ok=True)
+        path = MLBA_DIR / f"reliever_traits_{season}.csv"
 
-    itp: Dict[int, dict] = {}
-    if with_itp:
-        sess = _itp_session()
-        ids = [pid for pid in (_row_id(r) for r in keep) if pid]
-        print(f"[traits] fetching insidethepen for {len(ids)} arms...")
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for pid, tr in zip(ids, ex.map(
-                    lambda i: fetch_itp_traits(i, sess), ids)):
-                if tr:
-                    itp[pid] = tr
-
-    cols = list(RELIEVER_TRAIT_COLS) + list(ITP_TRAIT_COLS)
-    n = 0
-    with open(path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols)
-        w.writeheader()
-        for r in keep:
+        keep = []
+        for r in rows:
             team, g = r.get("TeamNameAbb"), _num(r, "G")
+            if not team or "Tms" in str(team) or g <= 0:
+                continue
+            if _num(r, "GS") / g >= 0.5:
+                continue
             games = tg.get(team, 0.0)
-            pid = _row_id(r)
-            w.writerow({**(itp.get(pid) or {}), **{
-                "player_name": r.get("PlayerName"),
-                "player_id": _row_id(r) or "",
-                "team": team, "season": season,
-                "g": int(g), "team_games": int(games),
-                "app_rate": round(g / games, 4),
-                "bf_per_outing": round(_num(r, "TBF") / g, 3),
-                "ip_per_outing": round(_num(r, "IP") / g, 3),
-                "gm_li": round(_num(r, "gmLI", 1.0), 3),
-                "sv": int(_num(r, "SV")), "hld": int(_num(r, "HLD")),
-                "siera": round(_num(r, "SIERA"), 3),
-            }})
-            n += 1
-    print(f"[traits] wrote {n} relievers to {path}")
-    return path
+            if games <= 0 or (g / games) < min_app_rate:
+                continue
+            keep.append(r)
+
+        itp: Dict[int, dict] = {}
+        if with_itp:
+            sess = _itp_session()
+            ids = [pid for pid in (_row_id(r) for r in keep) if pid]
+            print(f"[traits] fetching insidethepen for {len(ids)} arms...")
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for pid, tr in zip(ids, ex.map(
+                        lambda i: RelieverTraits.fetch_itp_traits(i, sess), ids)):
+                    if tr:
+                        itp[pid] = tr
+
+        cols = list(RELIEVER_TRAIT_COLS) + list(ITP_TRAIT_COLS)
+        n = 0
+        with open(path, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            for r in keep:
+                team, g = r.get("TeamNameAbb"), _num(r, "G")
+                games = tg.get(team, 0.0)
+                pid = _row_id(r)
+                w.writerow({**(itp.get(pid) or {}), **{
+                    "player_name": r.get("PlayerName"),
+                    "player_id": _row_id(r) or "",
+                    "team": team, "season": season,
+                    "g": int(g), "team_games": int(games),
+                    "app_rate": round(g / games, 4),
+                    "bf_per_outing": round(_num(r, "TBF") / g, 3),
+                    "ip_per_outing": round(_num(r, "IP") / g, 3),
+                    "gm_li": round(_num(r, "gmLI", 1.0), 3),
+                    "sv": int(_num(r, "SV")), "hld": int(_num(r, "HLD")),
+                    "siera": round(_num(r, "SIERA"), 3),
+                }})
+                n += 1
+        print(f"[traits] wrote {n} relievers to {path}")
+        return path
+
+    @staticmethod
+    def load_reliever_traits(season: Optional[int] = None) -> Dict[int, dict]:
+        """{mlbam_id: traits} from the CSV, generated on first use if absent."""
+        season = CURRENT_SEASON if season is None else int(season)
+        if season in _TRAITS:
+            return _TRAITS[season]
+        path = MLBA_DIR / f"reliever_traits_{season}.csv"
+        if not path.exists():
+            RelieverTraits.export_reliever_traits(season)
+        out: Dict[int, dict] = {}
+        try:
+            with open(path) as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        pid = int(row["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    rec = {}
+                    for k, v in row.items():
+                        if v in (None, ""):
+                            continue
+                        try:                       # numeric where possible
+                            rec[k] = float(v)
+                        except (TypeError, ValueError):
+                            rec[k] = v             # names, teams, role labels
+                    out[pid] = rec
+        except OSError:
+            pass
+        _TRAITS[season] = out
+        return out
+
+    @staticmethod
+    def _itp_login_into(s) -> bool:
+        """Log `s` in and persist the cookie jar. False on any failure."""
+        try:
+            import Creds
+            email = getattr(Creds, "INSIDETHEPEN_EMAIL", None)
+            pw = getattr(Creds, "INSIDETHEPEN_PASSWORD", None)
+        except Exception:
+            email = pw = None
+        if email and pw:
+            try:
+                # The form needs a CSRF token from the login page, and the password
+                # field is `pass2` — not `password`. Posting the obvious field
+                # names returns 200 and simply leaves you logged out, so the traits
+                # come back empty rather than erroring.
+                from bs4 import BeautifulSoup
+                r = s.get(f"{InsideThePen.BASE}/login.html", timeout=20)
+                tok = BeautifulSoup(r.content, "lxml").find(
+                    "input", {"name": "csrf_token"})
+                r2 = s.post(f"{InsideThePen.BASE}/login.html", timeout=20, data={
+                    "csrf_token": tok.get("value") if tok else "",
+                    "email": email, "pass2": pw, "stayin": "1"})
+                ok = "logout" in r2.text.lower() or "login.html" not in r2.url
+                if ok:
+                    try:
+                        ITP_COOKIES_FILE.write_text(json.dumps(dict(s.cookies)))
+                    except Exception:
+                        pass
+                else:
+                    print("[itp] login FAILED — gated traits will be missing")
+                return ok
+            except Exception as e:
+                print(f"[itp] login error: {e}")
+        return False
+
+    @staticmethod
+    def _yn(v: Optional[str]) -> Optional[float]:
+        if v is None:
+            return None
+        t = str(v).strip().lower()
+        return 1.0 if t.startswith("y") else (0.0 if t.startswith("n") else None)
+
+    @staticmethod
+    def fetch_itp_traits(pid: int, session=None) -> dict:
+        """One reliever's deployment traits from insidethepen. {} on any failure."""
+        s = session or _itp_session()
+        out: dict = {}
+        try:
+            r = s.get(f"{InsideThePen.BASE}/pitcher/x-{pid}.html", timeout=20)
+            if r.status_code != 200:
+                return out
+            from bs4 import BeautifulSoup
+            flat = BeautifulSoup(r.content, "lxml").get_text("\n", strip=True)
+            traits = {}
+            for label in ITP_TRAIT_LABELS:
+                mm = re.search(re.escape(label) + r":?\s*\n?([^\n]+)", flat)
+                if mm:
+                    traits[label] = mm.group(1).strip()
+            mm = re.search(r"Primary Role\(s\):\s*\n?([^\n]+)", flat)
+            if mm:
+                out["itp_role"] = mm.group(1).strip()
+            mm = re.search(r"IP \(last 7 games\):\s*\n?([\d.]+)", flat)
+            if mm:
+                out["itp_ip7"] = float(mm.group(1))
+            def num(lbl):
+                v = traits.get(lbl)
+                try:
+                    return float(str(v).strip())
+                except (TypeError, ValueError):
+                    return None
+            out["itp_avg_inning"] = num("Avg Inning when called")
+            out["itp_avg_run_diff"] = num("Avg Run Diff when called")
+            out["itp_back_to_back"] = RelieverTraits._yn(traits.get("back to back days"))
+            out["itp_over_30"] = RelieverTraits._yn(traits.get("over 30 pitches"))
+            out["itp_before_8th"] = RelieverTraits._yn(traits.get("before the 8th"))
+            out["itp_vs_lh"] = RelieverTraits._yn(traits.get("versus LH batters"))
+            out["itp_vs_rh"] = RelieverTraits._yn(traits.get("versus RH batters"))
+        except Exception as e:
+            print(f"[itp] {pid}: {e}")
+        return {k: v for k, v in out.items() if v is not None}
+
+    @staticmethod
+    def itp_bullpen_cache_path(abbr: str, date: Optional[str] = None,
+                               save_dir: Path = SAVE_DIR) -> Path:
+        d = date or datetime.date.today().isoformat()
+        return Path(save_dir) / "itp" / d / f"{normalize_club(abbr)}.json"
+
+    @staticmethod
+    def load_itp_bullpen(abbr: str, date: Optional[str] = None,
+                         save_dir: Path = SAVE_DIR,
+                         session=None, timeout: float = 25.0,
+                         refresh: bool = False) -> dict:
+        """One club's bullpen, fetched at most ONCE PER DAY.
+
+        A bullpen page changes when the club plays, so the natural cache key is
+        the DATE — anything finer is re-fetching the same page. Without this every
+        `build_side_live(use_itp_pen=True)` hit the site live, so pricing a slate
+        twice was 60 fetches and a day of sweeps ran to four figures, which is
+        what produced the read timeouts.
+
+        **A timeout is written to the cache as a MISS, not as an empty pen.**
+        `fetch_itp_bullpen` returns {} on failure and its docstring is explicit
+        that callers must read that as "unknown", never "everyone is available" —
+        so a failed fetch must not be cached as though it were an answer.
+        """
+        path = RelieverTraits.itp_bullpen_cache_path(abbr, date, save_dir)
+        if path.exists() and not refresh:
+            try:
+                got = json.loads(path.read_text())
+                if got.get("pen"):
+                    return got
+            except Exception:
+                pass
+        got = RelieverTraits.fetch_itp_bullpen(abbr, session=session, timeout=timeout)
+        if got.get("pen"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(got))
+            tmp.replace(path)              # atomic: a killed write cannot leave a
+                                           # half-parsed bullpen behind
+        return got
+
+    @staticmethod
+    def fetch_itp_bullpen(abbr: str, session=None,
+                          timeout: float = 25.0) -> dict:
+        """One club's CURRENT bullpen and its seven-day workload.
+
+        Returns {"pen": [{name, hand, eff, ftg, ip, g, era, fip}],
+                 "workload": {name: {date_label: {ip, bf, pitches, strikes}}},
+                 "days": [date labels, most recent first]}
+        and {} on any failure — callers must treat that as "unknown", never as
+        "everyone is available".
+        """
+        from bs4 import BeautifulSoup
+        s = session or _itp_session()
+        ab = _ITP_ALIAS.get(abbr, abbr)
+        try:
+            r = s.get(InsideThePen.TEAM_URL.format(abbr=ab), timeout=timeout)
+            if r.status_code != 200:
+                return {}
+            soup = BeautifulSoup(r.content, "lxml")
+        except Exception as e:
+            print(f"[itp] {abbr} bullpen: {e}")
+            return {}
+
+        pen, workload, days = [], {}, []
+        for t in soup.find_all("table"):
+            rows = t.find_all("tr")
+            if not rows:
+                continue
+            hdr = [c.get_text(" ", strip=True) for c in rows[0].find_all(["th", "td"])]
+            if hdr[:2] == ["HND", "Pitcher"]:
+                for tr in rows[1:]:
+                    c = [x.get_text(" ", strip=True) for x in tr.find_all(["th", "td"])]
+                    if len(c) < 2 or not c[1]:
+                        continue
+                    def num(i):
+                        try:
+                            return float(c[i])
+                        except (ValueError, IndexError):
+                            return None
+                    pen.append({"name": c[1], "hand": c[0], "eff": num(2),
+                                "ftg": num(3), "ip": num(4), "g": num(5),
+                                "era": num(6), "fip": num(7)})
+            elif hdr[:1] == ["Player"]:
+                # Date columns look like "Aug-14". The grid also has IP / NP-S /
+                # ERA summary columns, and "NP-S" contains a hyphen too — letting
+                # it through made days[0] a non-date, so every arm read as rested
+                # yesterday and therefore available.
+                days = [h for h in hdr[1:] if _RE_ITP_DAY.match(h)]
+                for tr in rows[1:]:
+                    c = [x.get_text(" ", strip=True) for x in tr.find_all(["th", "td"])]
+                    if len(c) < 2 or not c[0]:
+                        continue
+                    per = {}
+                    for lab, cell in zip(hdr[1:], c[1:]):
+                        if lab in days:
+                            w = _itp_cell_workload(cell)
+                            if w:
+                                per[lab] = w
+                    # **Key on the NORMALISED name.** The pen table tags roles
+                    # onto the name ("Edwin Díaz CL") and the workload grid does
+                    # not ("Edwin Díaz"), so a raw-string lookup silently missed
+                    # every tagged arm — which is to say every CLOSER, the most
+                    # important pitcher in the pen. Díaz threw 26 pitches on one
+                    # day and 24 the next and still read "available".
+                    workload[_norm_name(_itp_clean_name(c[0]))] = per
+        return {"pen": pen, "workload": workload, "days": days} if pen else {}
+
+    @staticmethod
+    def copy_pitcher(p: "Pitcher") -> "Pitcher":
+        """A fresh Pitcher with the same inputs — the sim mutates per-game state."""
+        import copy as _copy
+        return _copy.copy(p)
+
+    @staticmethod
+    def validate_bullpen_usage(teams: Sequence[str] = (), n: int = 3000,
+                               season: Optional[int] = None, seed: int = 11) -> List[dict]:
+        """Does the sim REPRODUCE each reliever's measured usage?
+
+        A trait that is loaded but not reproduced is not modelled. For every arm
+        this compares what the traits file says he does against what the simulated
+        games actually do:
+
+            app_rate       how often he pitches at all
+            avg_inning     the inning he enters
+            bf_per_outing  how long he stays
+
+        The league marks worth checking against: appearance rate median 10.8%,
+        p90 41.2%, **max 53.4%** — any simulated arm above ~50% is wrong by
+        construction, which is exactly what happens with no availability model.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        bat_table, _ = build_rates("bat")
+        pit_table, _ = build_rates("pit")
+        traits = RelieverTraits.load_reliever_traits(season)
+        hz = starter_hazard()
+        clubs = list(teams) or sorted(team_roster("bat", season))[:8]
+        out: List[dict] = []
+        for club in clubs:
+            try:
+                side = build_side(club, bat_table, pit_table, season, hz)
+                opp = build_side(
+                    [c for c in sorted(team_roster("bat", season)) if c != club][0],
+                    bat_table, pit_table, season, hz)
+            except ValueError:
+                continue
+            res = simulate_many(opp, side, n=n, seed=seed)   # `side` is away
+            app = {p.name: 0 for p in side.bullpen}
+            outs = {p.name: 0 for p in side.bullpen}
+            for r in res:
+                for nm in app:
+                    line = r.pitchers.get(nm)
+                    if line and line.bf:
+                        app[nm] += 1
+                        outs[nm] += line.outs
+            for p in side.bullpen:
+                tr = traits.get(p.player_id or -1) or {}
+                a = app[p.name]
+                out.append({
+                    "team": club, "name": p.name,
+                    "app_actual": float(tr.get("app_rate", float("nan"))),
+                    "app_sim": a / len(res),
+                    "ip_actual": float(tr.get("ip_per_outing", float("nan"))),
+                    "ip_sim": (outs[p.name] / a / 3.0) if a else 0.0,
+                    "avg_inning": tr.get("itp_avg_inning"),
+                })
+        return out
 
 
 _TRAITS: Dict[int, Dict[int, dict]] = {}
-
-
-def load_reliever_traits(season: int = 2026) -> Dict[int, dict]:
-    """{mlbam_id: traits} from the CSV, generated on first use if absent."""
-    if season in _TRAITS:
-        return _TRAITS[season]
-    path = MLBA_DIR / f"reliever_traits_{season}.csv"
-    if not path.exists():
-        export_reliever_traits(season)
-    out: Dict[int, dict] = {}
-    try:
-        with open(path) as fh:
-            for row in csv.DictReader(fh):
-                try:
-                    pid = int(row["player_id"])
-                except (ValueError, KeyError, TypeError):
-                    continue
-                rec = {}
-                for k, v in row.items():
-                    if v in (None, ""):
-                        continue
-                    try:                       # numeric where possible
-                        rec[k] = float(v)
-                    except (TypeError, ValueError):
-                        rec[k] = v             # names, teams, role labels
-                out[pid] = rec
-    except OSError:
-        pass
-    _TRAITS[season] = out
-    return out
-
 
 
 # --- InsideThePen deployment traits ----------------------------------------
@@ -11650,7 +12809,6 @@ def load_reliever_traits(season: int = 2026) -> Dict[int, dict]:
 # `MLBAnalytics/MLBstats/BPdata/` holds an earlier snapshot of the same traits
 # (per pitcher, per date, 2025) scraped by `MLBAnalytics/penski.py`.
 
-ITP_BASE = "https://insidethepen.com"
 ITP_TRAIT_LABELS = (
     "Games Pitched this Season", "Games Started this Season",
     "versus LH batters", "versus RH batters",
@@ -11662,7 +12820,7 @@ ITP_TRAIT_COLS = ("itp_role", "itp_ip7", "itp_avg_inning", "itp_avg_run_diff",
                   "itp_vs_lh", "itp_vs_rh")
 
 
-ITP_COOKIES_FILE = SAVE_DIR / "itp_cookies.json"
+ITP_COOKIES_FILE = SHARED_DIR / "itp_cookies.json"
 _ITP_SESSION = []          # at most one; a list so it survives re-import
 _ITP_LOCK = __import__("threading").Lock()
 
@@ -11696,91 +12854,9 @@ def _itp_session():
                                               # login on every call
             except Exception:
                 pass
-        _itp_login_into(s)
+        RelieverTraits._itp_login_into(s)
         _ITP_SESSION.append(s)
         return s
-
-
-def _itp_login_into(s) -> bool:
-    """Log `s` in and persist the cookie jar. False on any failure."""
-    try:
-        import Creds
-        email = getattr(Creds, "INSIDETHEPEN_EMAIL", None)
-        pw = getattr(Creds, "INSIDETHEPEN_PASSWORD", None)
-    except Exception:
-        email = pw = None
-    if email and pw:
-        try:
-            # The form needs a CSRF token from the login page, and the password
-            # field is `pass2` — not `password`. Posting the obvious field
-            # names returns 200 and simply leaves you logged out, so the traits
-            # come back empty rather than erroring.
-            from bs4 import BeautifulSoup
-            r = s.get(f"{ITP_BASE}/login.html", timeout=20)
-            tok = BeautifulSoup(r.content, "lxml").find(
-                "input", {"name": "csrf_token"})
-            r2 = s.post(f"{ITP_BASE}/login.html", timeout=20, data={
-                "csrf_token": tok.get("value") if tok else "",
-                "email": email, "pass2": pw, "stayin": "1"})
-            ok = "logout" in r2.text.lower() or "login.html" not in r2.url
-            if ok:
-                try:
-                    ITP_COOKIES_FILE.write_text(json.dumps(dict(s.cookies)))
-                except Exception:
-                    pass
-            else:
-                print("[itp] login FAILED — gated traits will be missing")
-            return ok
-        except Exception as e:
-            print(f"[itp] login error: {e}")
-    return False
-
-
-def _yn(v: Optional[str]) -> Optional[float]:
-    if v is None:
-        return None
-    t = str(v).strip().lower()
-    return 1.0 if t.startswith("y") else (0.0 if t.startswith("n") else None)
-
-
-def fetch_itp_traits(pid: int, session=None) -> dict:
-    """One reliever's deployment traits from insidethepen. {} on any failure."""
-    s = session or _itp_session()
-    out: dict = {}
-    try:
-        r = s.get(f"{ITP_BASE}/pitcher/x-{pid}.html", timeout=20)
-        if r.status_code != 200:
-            return out
-        from bs4 import BeautifulSoup
-        flat = BeautifulSoup(r.content, "lxml").get_text("\n", strip=True)
-        traits = {}
-        for label in ITP_TRAIT_LABELS:
-            mm = re.search(re.escape(label) + r":?\s*\n?([^\n]+)", flat)
-            if mm:
-                traits[label] = mm.group(1).strip()
-        mm = re.search(r"Primary Role\(s\):\s*\n?([^\n]+)", flat)
-        if mm:
-            out["itp_role"] = mm.group(1).strip()
-        mm = re.search(r"IP \(last 7 games\):\s*\n?([\d.]+)", flat)
-        if mm:
-            out["itp_ip7"] = float(mm.group(1))
-        def num(lbl):
-            v = traits.get(lbl)
-            try:
-                return float(str(v).strip())
-            except (TypeError, ValueError):
-                return None
-        out["itp_avg_inning"] = num("Avg Inning when called")
-        out["itp_avg_run_diff"] = num("Avg Run Diff when called")
-        out["itp_back_to_back"] = _yn(traits.get("back to back days"))
-        out["itp_over_30"] = _yn(traits.get("over 30 pitches"))
-        out["itp_before_8th"] = _yn(traits.get("before the 8th"))
-        out["itp_vs_lh"] = _yn(traits.get("versus LH batters"))
-        out["itp_vs_rh"] = _yn(traits.get("versus RH batters"))
-    except Exception as e:
-        print(f"[itp] {pid}: {e}")
-    return {k: v for k, v in out.items() if v is not None}
-
 
 
 # ---------------------------------------------------------------------------
@@ -11806,7 +12882,6 @@ def fetch_itp_traits(pid: int, session=None) -> dict:
 # Note the scope: this is TODAY's state, so it serves live projections. A
 # BACKTEST over past dates still needs the `appearance_dates` reconstruction,
 # which is why both paths exist.
-ITP_TEAM_URL = ITP_BASE + "/team/{abbr}-bullpen.html"
 _RE_ITP_DAY = re.compile(
     r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{1,2}$")
 
@@ -11832,114 +12907,6 @@ def _itp_cell_workload(txt: str) -> Optional[dict]:
     except (ValueError, IndexError):
         return None
     return out or None
-
-
-def itp_bullpen_cache_path(abbr: str, date: Optional[str] = None,
-                           save_dir: Path = SAVE_DIR) -> Path:
-    d = date or datetime.date.today().isoformat()
-    return Path(save_dir) / "itp" / d / f"{normalize_club(abbr)}.json"
-
-
-def load_itp_bullpen(abbr: str, date: Optional[str] = None,
-                     save_dir: Path = SAVE_DIR,
-                     session=None, timeout: float = 25.0,
-                     refresh: bool = False) -> dict:
-    """One club's bullpen, fetched at most ONCE PER DAY.
-
-    A bullpen page changes when the club plays, so the natural cache key is
-    the DATE — anything finer is re-fetching the same page. Without this every
-    `build_side_live(use_itp_pen=True)` hit the site live, so pricing a slate
-    twice was 60 fetches and a day of sweeps ran to four figures, which is
-    what produced the read timeouts.
-
-    **A timeout is written to the cache as a MISS, not as an empty pen.**
-    `fetch_itp_bullpen` returns {} on failure and its docstring is explicit
-    that callers must read that as "unknown", never "everyone is available" —
-    so a failed fetch must not be cached as though it were an answer.
-    """
-    path = itp_bullpen_cache_path(abbr, date, save_dir)
-    if path.exists() and not refresh:
-        try:
-            got = json.loads(path.read_text())
-            if got.get("pen"):
-                return got
-        except Exception:
-            pass
-    got = fetch_itp_bullpen(abbr, session=session, timeout=timeout)
-    if got.get("pen"):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(got))
-        tmp.replace(path)              # atomic: a killed write cannot leave a
-                                       # half-parsed bullpen behind
-    return got
-
-
-def fetch_itp_bullpen(abbr: str, session=None,
-                      timeout: float = 25.0) -> dict:
-    """One club's CURRENT bullpen and its seven-day workload.
-
-    Returns {"pen": [{name, hand, eff, ftg, ip, g, era, fip}],
-             "workload": {name: {date_label: {ip, bf, pitches, strikes}}},
-             "days": [date labels, most recent first]}
-    and {} on any failure — callers must treat that as "unknown", never as
-    "everyone is available".
-    """
-    from bs4 import BeautifulSoup
-    s = session or _itp_session()
-    ab = _ITP_ALIAS.get(abbr, abbr)
-    try:
-        r = s.get(ITP_TEAM_URL.format(abbr=ab), timeout=timeout)
-        if r.status_code != 200:
-            return {}
-        soup = BeautifulSoup(r.content, "lxml")
-    except Exception as e:
-        print(f"[itp] {abbr} bullpen: {e}")
-        return {}
-
-    pen, workload, days = [], {}, []
-    for t in soup.find_all("table"):
-        rows = t.find_all("tr")
-        if not rows:
-            continue
-        hdr = [c.get_text(" ", strip=True) for c in rows[0].find_all(["th", "td"])]
-        if hdr[:2] == ["HND", "Pitcher"]:
-            for tr in rows[1:]:
-                c = [x.get_text(" ", strip=True) for x in tr.find_all(["th", "td"])]
-                if len(c) < 2 or not c[1]:
-                    continue
-                def num(i):
-                    try:
-                        return float(c[i])
-                    except (ValueError, IndexError):
-                        return None
-                pen.append({"name": c[1], "hand": c[0], "eff": num(2),
-                            "ftg": num(3), "ip": num(4), "g": num(5),
-                            "era": num(6), "fip": num(7)})
-        elif hdr[:1] == ["Player"]:
-            # Date columns look like "Aug-14". The grid also has IP / NP-S /
-            # ERA summary columns, and "NP-S" contains a hyphen too — letting
-            # it through made days[0] a non-date, so every arm read as rested
-            # yesterday and therefore available.
-            days = [h for h in hdr[1:] if _RE_ITP_DAY.match(h)]
-            for tr in rows[1:]:
-                c = [x.get_text(" ", strip=True) for x in tr.find_all(["th", "td"])]
-                if len(c) < 2 or not c[0]:
-                    continue
-                per = {}
-                for lab, cell in zip(hdr[1:], c[1:]):
-                    if lab in days:
-                        w = _itp_cell_workload(cell)
-                        if w:
-                            per[lab] = w
-                # **Key on the NORMALISED name.** The pen table tags roles
-                # onto the name ("Edwin Díaz CL") and the workload grid does
-                # not ("Edwin Díaz"), so a raw-string lookup silently missed
-                # every tagged arm — which is to say every CLOSER, the most
-                # important pitcher in the pen. Díaz threw 26 pitches on one
-                # day and 24 the next and still read "available".
-                workload[_norm_name(_itp_clean_name(c[0]))] = per
-    return {"pen": pen, "workload": workload, "days": days} if pen else {}
 
 
 # Pitch-count threshold for next-day availability. `back to back days` on an
@@ -11982,9 +12949,7 @@ def itp_availability(state: dict, skip_today: bool = True) -> Dict[str, str]:
         per = work.get(_norm_name(_itp_clean_name(nm))) or {}
         y = per.get(days[0]) if len(days) > 0 else None
         d2 = per.get(days[1]) if len(days) > 1 else None
-        if y and d2:
-            out[nm] = "likely_rest"
-        elif y and (y.get("pitches") or 0) >= ITP_HEAVY_PITCHES:
+        if y and (d2 or (y.get("pitches") or 0) >= ITP_HEAVY_PITCHES):
             out[nm] = "likely_rest"
         else:
             out[nm] = "available"
@@ -12005,7 +12970,7 @@ def replacement_pitcher_rates() -> List[float]:
     return offence_tilt(list(LEAGUE_BASELINE), -REPLACEMENT_TILT)
 
 
-def replacement_batter(season: int = 2026,
+def replacement_batter(season: Optional[int] = None,
                        save_dir: Path = SAVE_DIR) -> "Batter":
     """A hitter the rate layer has never seen — a callup with no board row.
 
@@ -12059,11 +13024,11 @@ def build_pen_from_itp(abbr: str, pit_table: Dict[int, dict],
     key = (abbr, drop_resting)
     if cache and key in _ITP_PEN_CACHE:
         pen, rep = _ITP_PEN_CACHE[key]
-        return [copy_pitcher(p) for p in pen], dict(rep)
+        return [RelieverTraits.copy_pitcher(p) for p in pen], dict(rep)
     # `_ITP_PEN_CACHE` above is in-PROCESS and dies with the interpreter, so a
     # day of separate A/B scripts re-fetched every club every time. The disk
     # cache is keyed on the DATE, which is when the page actually changes.
-    state = load_itp_bullpen(abbr, session=session)
+    state = RelieverTraits.load_itp_bullpen(abbr, session=session)
     if not state:
         return [], {"ok": False, "reason": "itp fetch failed"}
     by_name = {}
@@ -12072,7 +13037,7 @@ def build_pen_from_itp(abbr: str, pit_table: Dict[int, dict],
     avail = itp_availability(state)
 
     pen, missing, rested = [], [], []
-    traits = load_reliever_traits(2026)
+    traits = RelieverTraits.load_reliever_traits(2026)
     for row in state["pen"]:
         raw = row["name"]
         nm = _itp_clean_name(raw)
@@ -12130,67 +13095,7 @@ def build_pen_from_itp(abbr: str, pit_table: Dict[int, dict],
            "days": state.get("days", [])}
     if cache:
         _ITP_PEN_CACHE[key] = (pen, rep)
-    return [copy_pitcher(p) for p in pen], dict(rep)
-
-
-def copy_pitcher(p: "Pitcher") -> "Pitcher":
-    """A fresh Pitcher with the same inputs — the sim mutates per-game state."""
-    import copy as _copy
-    return _copy.copy(p)
-
-
-def validate_bullpen_usage(teams: Sequence[str] = (), n: int = 3000,
-                           season: int = 2026, seed: int = 11) -> List[dict]:
-    """Does the sim REPRODUCE each reliever's measured usage?
-
-    A trait that is loaded but not reproduced is not modelled. For every arm
-    this compares what the traits file says he does against what the simulated
-    games actually do:
-
-        app_rate       how often he pitches at all
-        avg_inning     the inning he enters
-        bf_per_outing  how long he stays
-
-    The league marks worth checking against: appearance rate median 10.8%,
-    p90 41.2%, **max 53.4%** — any simulated arm above ~50% is wrong by
-    construction, which is exactly what happens with no availability model.
-    """
-    bat_table, _ = build_rates("bat")
-    pit_table, _ = build_rates("pit")
-    traits = load_reliever_traits(season)
-    hz = starter_hazard()
-    clubs = list(teams) or sorted(team_roster("bat", season))[:8]
-    out: List[dict] = []
-    for club in clubs:
-        try:
-            side = build_side(club, bat_table, pit_table, season, hz)
-            opp = build_side(
-                [c for c in sorted(team_roster("bat", season)) if c != club][0],
-                bat_table, pit_table, season, hz)
-        except ValueError:
-            continue
-        res = simulate_many(opp, side, n=n, seed=seed)   # `side` is away
-        app = {p.name: 0 for p in side.bullpen}
-        outs = {p.name: 0 for p in side.bullpen}
-        for r in res:
-            for nm in app:
-                line = r.pitchers.get(nm)
-                if line and line.bf:
-                    app[nm] += 1
-                    outs[nm] += line.outs
-        for p in side.bullpen:
-            tr = traits.get(p.player_id or -1) or {}
-            a = app[p.name]
-            out.append({
-                "team": club, "name": p.name,
-                "app_actual": float(tr.get("app_rate", float("nan"))),
-                "app_sim": a / len(res),
-                "ip_actual": float(tr.get("ip_per_outing", float("nan"))),
-                "ip_sim": (outs[p.name] / a / 3.0) if a else 0.0,
-                "avg_inning": tr.get("itp_avg_inning"),
-            })
-    return out
-
+    return [RelieverTraits.copy_pitcher(p) for p in pen], dict(rep)
 
 
 # ===========================================================================
@@ -12223,58 +13128,219 @@ def entry_cache_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
     return p
 
 
-def fetch_pbp_entries(game_pk: int, timeout: float = 20.0) -> List[dict]:
-    """Every pitching change in one game, with the state at the change.
+class RelieverUsage:
+    """Observed entries, rest and appearance shape — ground truth for deployment."""
 
-    A change is detected by the pitcher id differing from the previous plate
-    appearance. The STARTER's first appearance is skipped — he did not enter,
-    he began.
-    """
-    out: List[dict] = []
-    try:
-        r = requests.get(
-            f"{STATSAPI}/game/{game_pk}/playByPlay", timeout=timeout)
-        r.raise_for_status()
-        plays = r.json().get("allPlays") or []
-    except Exception:
+    @staticmethod
+    def fetch_pbp_entries(game_pk: int, timeout: float = 20.0) -> List[dict]:
+        """Every pitching change in one game, with the state at the change.
+
+        A change is detected by the pitcher id differing from the previous plate
+        appearance. The STARTER's first appearance is skipped — he did not enter,
+        he began.
+        """
+        out: List[dict] = []
+        try:
+            plays = Query.play_by_play(game_pk, timeout, final=True)
+        except Exception:
+            return out
+
+        prev = {"top": None, "bot": None}
+        for p in plays:
+            about, mu, res = p.get("about") or {}, p.get("matchup") or {}, p.get("result") or {}
+            is_top = bool(about.get("isTopInning"))
+            side = "top" if is_top else "bot"          # side that is BATTING
+            pid = (mu.get("pitcher") or {}).get("id")
+            if pid is None:
+                continue
+            if prev[side] is None:                      # the starter
+                prev[side] = pid
+                continue
+            if pid == prev[side]:
+                continue
+            prev[side] = pid
+            away, home = res.get("awayScore", 0), res.get("homeScore", 0)
+            # margin from the PITCHING side: a top-inning pitcher is the home club
+            margin = (home - away) if is_top else (away - home)
+            runners = p.get("runners") or []
+            on = len({(rn.get("movement") or {}).get("start")
+                      for rn in runners
+                      if (rn.get("movement") or {}).get("start") in
+                      ("1B", "2B", "3B")})
+            out.append({
+                "game_pk": game_pk,
+                "pitcher": pid,
+                # The pitching side is HOME when the top of the inning is batting.
+                "p_home": bool(is_top),
+                "p_hand": (mu.get("pitchHand") or {}).get("code"),
+                "batter": (mu.get("batter") or {}).get("id"),
+                "b_hand": (mu.get("batSide") or {}).get("code"),
+                "inning": about.get("inning"),
+                "margin": margin,
+                "outs": (p.get("count") or {}).get("outs", 0),
+                "on_base": on,
+            })
         return out
 
-    prev = {"top": None, "bot": None}
-    for p in plays:
-        about, mu, res = p.get("about") or {}, p.get("matchup") or {}, p.get("result") or {}
-        is_top = bool(about.get("isTopInning"))
-        side = "top" if is_top else "bot"          # side that is BATTING
-        pid = (mu.get("pitcher") or {}).get("id")
-        if pid is None:
-            continue
-        if prev[side] is None:                      # the starter
-            prev[side] = pid
-            continue
-        if pid == prev[side]:
-            continue
-        prev[side] = pid
-        away, home = res.get("awayScore", 0), res.get("homeScore", 0)
-        # margin from the PITCHING side: a top-inning pitcher is the home club
-        margin = (home - away) if is_top else (away - home)
-        runners = p.get("runners") or []
-        on = len({(rn.get("movement") or {}).get("start")
-                  for rn in runners
-                  if (rn.get("movement") or {}).get("start") in
-                  ("1B", "2B", "3B")})
-        out.append({
-            "game_pk": game_pk,
-            "pitcher": pid,
-            # The pitching side is HOME when the top of the inning is batting.
-            "p_home": bool(is_top),
-            "p_hand": (mu.get("pitchHand") or {}).get("code"),
-            "batter": (mu.get("batter") or {}).get("id"),
-            "b_hand": (mu.get("batSide") or {}).get("code"),
-            "inning": about.get("inning"),
-            "margin": margin,
-            "outs": (p.get("count") or {}).get("outs", 0),
-            "on_base": on,
-        })
-    return out
+    @staticmethod
+    def appearance_dates(season: Optional[int] = None) -> Dict[int, List[str]]:
+        """{pitcher id: sorted ISO dates he appeared in relief}."""
+        season = CURRENT_SEASON if season is None else int(season)
+        if season in _APPEARANCES:
+            return _APPEARANCES[season]
+        dates = game_dates(season)
+        out: Dict[int, set] = {}
+        try:
+            with open(entry_cache_path(season)) as fh:
+                entries = json.load(fh)
+        except (OSError, ValueError):
+            entries = []
+        for e in entries:
+            d = dates.get(e.get("game_pk"))
+            pid = e.get("pitcher")
+            if d and pid:
+                out.setdefault(int(pid), set()).add(d)
+        _APPEARANCES[season] = {k: sorted(v) for k, v in out.items()}
+        return _APPEARANCES[season]
+
+    @staticmethod
+    def _days_before(iso: str, n: int) -> str:
+        y, m, d = (int(x) for x in iso.split("-"))
+        return (datetime.date(y, m, d)
+                - datetime.timedelta(days=n)).isoformat()
+
+    @staticmethod
+    def season_game_pks(season: Optional[int] = None, save_dir: Path = SAVE_DIR) -> List[int]:
+        """Every completed game id for a season.
+
+        Prefers the PBP accumulator when it exists (2026 only), and otherwise falls
+        back to the SLATE, which is cached for any season the backtest can reach.
+        Without the fallback there was no way to collect 2025 entries at all.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        path = RateIngest._shared(save_dir) / "pbp" / f"season_{season}_v2.json"
+        if path.exists():
+            try:
+                with open(path) as fh:
+                    return json.load(fh)["games"]
+            except (OSError, ValueError, KeyError):
+                pass
+        return [r["pk"] for r in season_slate(season, save_dir=save_dir) if r.get("pk")]
+
+    @staticmethod
+    def collect_reliever_entries(n_games: int = 0, workers: int = 12,
+                                 refresh: bool = False, season: Optional[int] = None,
+                                 save_dir: Path = SAVE_DIR) -> List[dict]:
+        """Pitching changes across a season, cached to disk PER SEASON."""
+        season = CURRENT_SEASON if season is None else int(season)
+        path = entry_cache_path(season, save_dir)
+        if path.exists() and not refresh:
+            try:
+                with open(path) as fh:
+                    cached = json.load(fh)
+                if len(cached) > 0:
+                    return cached
+            except (OSError, ValueError):
+                pass
+        pks = RelieverUsage.season_game_pks(season, save_dir)
+        pks = pks[-n_games:] if n_games else pks
+        print(f"[entries] {season}: fetching play-by-play for {len(pks)} games...")
+        out: List[dict] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for rows in ex.map(RelieverUsage.fetch_pbp_entries, pks):
+                out.extend(rows)
+        dest = Path(save_dir) / ENTRY_CACHE_FMT.format(season=season)
+        with open(dest, "w") as fh:
+            json.dump(out, fh)
+        print(f"[entries] {season}: {len(out)} changes from {len(pks)} games")
+        return out
+
+    @staticmethod
+    def fetch_pbp_stints(game_pk: int, timeout: float = 20.0) -> List[dict]:
+        """Every pitcher's STINT in one game — batters faced, outs, innings.
+
+        A stint is a maximal run of consecutive plate appearances by the same
+        pitcher for one side. `mid_entry` is True when his first batter was not
+        the first batter of a half-inning, which is the inherited-runner rescue.
+        """
+        try:
+            plays = Query.play_by_play(game_pk, timeout, final=True)
+        except Exception:
+            return []
+
+        stints: Dict[str, List[dict]] = {"top": [], "bot": []}
+        prev_outs = {"top": 0, "bot": 0}
+        prev_half = {"top": None, "bot": None}
+        for p in plays:
+            about, mu = p.get("about") or {}, p.get("matchup") or {}
+            side = "top" if about.get("isTopInning") else "bot"
+            pid = (mu.get("pitcher") or {}).get("id")
+            if pid is None:
+                continue
+            inning = about.get("inning")
+            half_key = (inning, side)
+            first_of_half = prev_half[side] != half_key
+            if first_of_half:
+                prev_half[side] = half_key
+                prev_outs[side] = 0
+            outs_after = (p.get("count") or {}).get("outs", 0)
+            got = max(outs_after - prev_outs[side], 0)
+            prev_outs[side] = outs_after
+
+            cur = stints[side][-1] if stints[side] else None
+            if cur is None or cur["pitcher"] != pid:
+                stints[side].append({
+                    "game_pk": game_pk, "pitcher": pid, "side": side,
+                    "starter": cur is None,
+                    "mid_entry": (not first_of_half) and cur is not None,
+                    "entry_inning": inning,
+                    "bf": 0, "outs": 0, "innings": set(), "pitches": 0,
+                })
+                cur = stints[side][-1]
+            cur["bf"] += 1
+            cur["outs"] += got
+            cur["innings"].add(inning)
+            # **Pitches per STINT, from the same response.** A manager hooks on the
+            # pitch count and this engine hooks on BATTERS FACED, which cannot tell
+            # 75 pitches through six from 105 through four. Whether that is what
+            # under-disperses simulated starter length (BF sd 4.63 against a real
+            # 5.13) is measurable only with this column. Counted off `playEvents`
+            # rather than the boxscore because the boxscore is per PITCHER and a
+            # pitcher can have two stints.
+            cur["pitches"] += sum(1 for e in (p.get("playEvents") or [])
+                                  if e.get("isPitch"))
+
+        out: List[dict] = []
+        for side in ("top", "bot"):
+            for s in stints[side]:
+                s["innings"] = len(s["innings"])
+                out.append(s)
+        return out
+
+    @staticmethod
+    def collect_reliever_stints(n_games: int = 0, workers: int = 12,
+                                refresh: bool = False) -> List[dict]:
+        """Every pitcher stint over the season's play-by-play, cached to disk."""
+        if STINT_CACHE.exists() and not refresh:
+            try:
+                with open(STINT_CACHE) as fh:
+                    cached = json.load(fh)
+                if cached:
+                    return cached
+            except (OSError, ValueError):
+                pass
+        with open(SHARED_DIR / "pbp" / "season_2026_v2.json") as fh:
+            pks = json.load(fh)["games"]
+        pks = pks[-n_games:] if n_games else pks
+        print(f"[stints] fetching play-by-play for {len(pks)} games...")
+        out: List[dict] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for rows in ex.map(RelieverUsage.fetch_pbp_stints, pks):
+                out.extend(rows)
+        with open(STINT_CACHE, "w") as fh:
+            json.dump(out, fh)
+        print(f"[stints] {len(out)} stints from {len(pks)} games")
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -12305,9 +13371,10 @@ _GAME_DATES: Dict[int, Dict[int, str]] = {}
 _APPEARANCES: Dict[int, Dict[int, List[str]]] = {}
 
 
-def game_dates(season: int = 2026, save_dir: Path = SAVE_DIR,
+def game_dates(season: Optional[int] = None, save_dir: Path = SAVE_DIR,
                refresh: bool = False) -> Dict[int, str]:
     """{game_pk: 'YYYY-MM-DD'} for the season, cached."""
+    season = CURRENT_SEASON if season is None else int(season)
     if season in _GAME_DATES and not refresh:
         return _GAME_DATES[season]
     path = save_dir / f"game_dates_{season}.json"
@@ -12320,10 +13387,10 @@ def game_dates(season: int = 2026, save_dir: Path = SAVE_DIR,
         except (OSError, ValueError):
             pass
     out: Dict[int, str] = {}
-    url = (f"{STATSAPI}/schedule?sportId=1&gameType=R"
-           f"&startDate={season}-03-01&endDate={season}-11-15")
+    url = StatsApi.schedule_url(start=f"{season}-03-01",
+                                end=f"{season}-11-15", game_type="R")
     try:
-        data = requests.get(url, timeout=90).json()
+        data = requests.get(url, timeout=StatsApi.SLOW_TIMEOUT).json()
         for day in data.get("dates", []):
             for g in day.get("games", []):
                 out[int(g["gamePk"])] = day["date"]
@@ -12340,49 +13407,6 @@ def game_dates(season: int = 2026, save_dir: Path = SAVE_DIR,
     return out
 
 
-def appearance_dates(season: int = 2026) -> Dict[int, List[str]]:
-    """{pitcher id: sorted ISO dates he appeared in relief}."""
-    if season in _APPEARANCES:
-        return _APPEARANCES[season]
-    dates = game_dates(season)
-    out: Dict[int, set] = {}
-    try:
-        with open(entry_cache_path(season)) as fh:
-            entries = json.load(fh)
-    except (OSError, ValueError):
-        entries = []
-    for e in entries:
-        d = dates.get(e.get("game_pk"))
-        pid = e.get("pitcher")
-        if d and pid:
-            out.setdefault(int(pid), set()).add(d)
-    _APPEARANCES[season] = {k: sorted(v) for k, v in out.items()}
-    return _APPEARANCES[season]
-
-
-def _days_before(iso: str, n: int) -> str:
-    y, m, d = (int(x) for x in iso.split("-"))
-    return (datetime.date(y, m, d)
-            - datetime.timedelta(days=n)).isoformat()
-
-
-def rest_days(pid: Optional[int], on_date: str,
-              season: int = 2026) -> Optional[int]:
-    """Days since this arm last pitched, or None if he has no history."""
-    if pid is None or not on_date:
-        return None
-    ds = appearance_dates(season).get(int(pid))
-    if not ds:
-        return None
-    y, m, d = (int(x) for x in on_date.split("-"))
-    today = datetime.date(y, m, d)
-    prev = [x for x in ds if x < on_date]
-    if not prev:
-        return None
-    yy, mm, dd = (int(x) for x in prev[-1].split("-"))
-    return (today - datetime.date(yy, mm, dd)).days
-
-
 # A club uses 24.2 relievers across a season but carries only ~8 at a time —
 # the season list is a UNION of many different pens, not one pen. Carrying all
 # of them into every game lets a July call-up pitch in April and flattens the
@@ -12392,8 +13416,8 @@ PEN_ROSTER_WINDOW_DAYS = 14
 
 
 def available_bullpen(bullpen: Sequence["Pitcher"], on_date: Optional[str],
-                      rng: random.Random, season: int = 2026,
-                      window: int = PEN_ROSTER_WINDOW_DAYS,
+                      rng: random.Random, season: Optional[int] = None,
+                      window: Optional[int] = None,
                       future: bool = False) -> List["Pitcher"]:
     """Filter a pen to the arms that could realistically pitch on `on_date`.
 
@@ -12412,13 +13436,15 @@ def available_bullpen(bullpen: Sequence["Pitcher"], on_date: Optional[str],
     With no date, or for an arm with no history, this is a no-op — the honest
     default, since the alternative is to invent a rest state.
     """
+    window = PEN_ROSTER_WINDOW_DAYS if window is None else int(window)
+    season = CURRENT_SEASON if season is None else int(season)
     if not on_date:
         return list(bullpen)
-    app = appearance_dates(season)
-    prior = [_days_before(on_date, k)
+    app = RelieverUsage.appearance_dates(season)
+    prior = [RelieverUsage._days_before(on_date, k)
              for k in range(1, MAX_CONSECUTIVE_DAYS + 1)]
-    lo = _days_before(on_date, window)
-    hi = _days_before(on_date, -window) if not future else on_date
+    lo = RelieverUsage._days_before(on_date, window)
+    hi = RelieverUsage._days_before(on_date, -window) if not future else on_date
     out = []
     for p in bullpen:
         ds = app.get(int(p.player_id)) if p.player_id else None
@@ -12436,50 +13462,6 @@ def available_bullpen(bullpen: Sequence["Pitcher"], on_date: Optional[str],
     return out
 
 
-def season_game_pks(season: int = 2026, save_dir: Path = SAVE_DIR) -> List[int]:
-    """Every completed game id for a season.
-
-    Prefers the PBP accumulator when it exists (2026 only), and otherwise falls
-    back to the SLATE, which is cached for any season the backtest can reach.
-    Without the fallback there was no way to collect 2025 entries at all.
-    """
-    path = Path(save_dir) / "pbp" / f"season_{season}_v2.json"
-    if path.exists():
-        try:
-            with open(path) as fh:
-                return json.load(fh)["games"]
-        except (OSError, ValueError, KeyError):
-            pass
-    return [r["pk"] for r in season_slate(season, save_dir=save_dir) if r.get("pk")]
-
-
-def collect_reliever_entries(n_games: int = 0, workers: int = 12,
-                             refresh: bool = False, season: int = 2026,
-                             save_dir: Path = SAVE_DIR) -> List[dict]:
-    """Pitching changes across a season, cached to disk PER SEASON."""
-    path = entry_cache_path(season, save_dir)
-    if path.exists() and not refresh:
-        try:
-            with open(path) as fh:
-                cached = json.load(fh)
-            if len(cached) > 0:
-                return cached
-        except (OSError, ValueError):
-            pass
-    pks = season_game_pks(season, save_dir)
-    pks = pks[-n_games:] if n_games else pks
-    print(f"[entries] {season}: fetching play-by-play for {len(pks)} games...")
-    out: List[dict] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for rows in ex.map(fetch_pbp_entries, pks):
-            out.extend(rows)
-    dest = Path(save_dir) / ENTRY_CACHE_FMT.format(season=season)
-    with open(dest, "w") as fh:
-        json.dump(out, fh)
-    print(f"[entries] {season}: {len(out)} changes from {len(pks)} games")
-    return out
-
-
 # ---------------------------------------------------------------------------
 # How LONG a relief appearance is — ground truth for sim_state.md 5.6
 # ---------------------------------------------------------------------------
@@ -12493,96 +13475,6 @@ def collect_reliever_entries(n_games: int = 0, workers: int = 12,
 STINT_CACHE = SAVE_DIR / "reliever_stints.json"
 
 
-def fetch_pbp_stints(game_pk: int, timeout: float = 20.0) -> List[dict]:
-    """Every pitcher's STINT in one game — batters faced, outs, innings.
-
-    A stint is a maximal run of consecutive plate appearances by the same
-    pitcher for one side. `mid_entry` is True when his first batter was not
-    the first batter of a half-inning, which is the inherited-runner rescue.
-    """
-    try:
-        r = requests.get(
-            f"{STATSAPI}/game/{game_pk}/playByPlay", timeout=timeout)
-        r.raise_for_status()
-        plays = r.json().get("allPlays") or []
-    except Exception:
-        return []
-
-    stints: Dict[str, List[dict]] = {"top": [], "bot": []}
-    prev_outs = {"top": 0, "bot": 0}
-    prev_half = {"top": None, "bot": None}
-    for p in plays:
-        about, mu = p.get("about") or {}, p.get("matchup") or {}
-        side = "top" if about.get("isTopInning") else "bot"
-        pid = (mu.get("pitcher") or {}).get("id")
-        if pid is None:
-            continue
-        inning = about.get("inning")
-        half_key = (inning, side)
-        first_of_half = prev_half[side] != half_key
-        if first_of_half:
-            prev_half[side] = half_key
-            prev_outs[side] = 0
-        outs_after = (p.get("count") or {}).get("outs", 0)
-        got = max(outs_after - prev_outs[side], 0)
-        prev_outs[side] = outs_after
-
-        cur = stints[side][-1] if stints[side] else None
-        if cur is None or cur["pitcher"] != pid:
-            stints[side].append({
-                "game_pk": game_pk, "pitcher": pid, "side": side,
-                "starter": cur is None,
-                "mid_entry": (not first_of_half) and cur is not None,
-                "entry_inning": inning,
-                "bf": 0, "outs": 0, "innings": set(), "pitches": 0,
-            })
-            cur = stints[side][-1]
-        cur["bf"] += 1
-        cur["outs"] += got
-        cur["innings"].add(inning)
-        # **Pitches per STINT, from the same response.** A manager hooks on the
-        # pitch count and this engine hooks on BATTERS FACED, which cannot tell
-        # 75 pitches through six from 105 through four. Whether that is what
-        # under-disperses simulated starter length (BF sd 4.63 against a real
-        # 5.13) is measurable only with this column. Counted off `playEvents`
-        # rather than the boxscore because the boxscore is per PITCHER and a
-        # pitcher can have two stints.
-        cur["pitches"] += sum(1 for e in (p.get("playEvents") or [])
-                              if e.get("isPitch"))
-
-    out: List[dict] = []
-    for side in ("top", "bot"):
-        for s in stints[side]:
-            s["innings"] = len(s["innings"])
-            out.append(s)
-    return out
-
-
-def collect_reliever_stints(n_games: int = 0, workers: int = 12,
-                            refresh: bool = False) -> List[dict]:
-    """Every pitcher stint over the season's play-by-play, cached to disk."""
-    if STINT_CACHE.exists() and not refresh:
-        try:
-            with open(STINT_CACHE) as fh:
-                cached = json.load(fh)
-            if cached:
-                return cached
-        except (OSError, ValueError):
-            pass
-    with open(SAVE_DIR / "pbp" / "season_2026_v2.json") as fh:
-        pks = json.load(fh)["games"]
-    pks = pks[-n_games:] if n_games else pks
-    print(f"[stints] fetching play-by-play for {len(pks)} games...")
-    out: List[dict] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for rows in ex.map(fetch_pbp_stints, pks):
-            out.extend(rows)
-    with open(STINT_CACHE, "w") as fh:
-        json.dump(out, fh)
-    print(f"[stints] {len(out)} stints from {len(pks)} games")
-    return out
-
-
 def stint_profile(stints: Optional[Sequence[dict]] = None,
                   team_games: Optional[int] = None) -> dict:
     """Relief-appearance shape: BF, outs and innings touched.
@@ -12592,7 +13484,7 @@ def stint_profile(stints: Optional[Sequence[dict]] = None,
     apart on a definition.
     """
     rows = [s for s in (stints if stints is not None
-                        else collect_reliever_stints()) if not s["starter"]]
+                        else RelieverUsage.collect_reliever_stints()) if not s["starter"]]
     if not rows:
         return {}
     n = len(rows)
@@ -12642,7 +13534,7 @@ def sim_stints(log: Sequence[dict], game_pk: int = 0) -> List[dict]:
     return out
 
 
-def validate_stint_shape(n_games: int = 400, season: int = 2026,
+def validate_stint_shape(n_games: int = 400, season: Optional[int] = None,
                          seed: int = 7, save_dir: Path = SAVE_DIR) -> dict:
     """Simulated relief-appearance shape against the real one — 5.6.
 
@@ -12651,6 +13543,7 @@ def validate_stint_shape(n_games: int = 400, season: int = 2026,
     too many innings means the sim is letting arms roll over inning
     boundaries instead of rescuing mid-inning.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     slate = season_slate(season, save_dir=save_dir)[:n_games]
     bat, _ = build_rates("bat", save_dir=save_dir)
     pit, _ = build_rates("pit", save_dir=save_dir)
@@ -12684,16 +13577,13 @@ def validate_stint_shape(n_games: int = 400, season: int = 2026,
 # ===========================================================================
 # 15b. BASE-RUNNING AND FRAMING, MEASURED — one play-by-play pass
 # ===========================================================================
-# Section 5.6c of sim_state.md catalogued the constants that were still
-# hand-set stand-ins, after two hook curves turned out to be hand-drawn
-# sequences sitting next to a file that had held the real distribution for
-# weeks. The pattern it named is *a plausible stand-in, written when the real
-# data did not exist, surviving after it did* — and it never fails a test,
-# because the MEAN is usually right and only the SHAPE is wrong.
+# §5.6c catalogued the constants that were still hand-set stand-ins. The
+# pattern it named: *a plausible stand-in, written when the real data did not
+# exist, surviving after it did* — and it never fails a test, because the MEAN
+# is usually right and only the SHAPE is wrong.
 #
-# These are the rest of that list. Every one of them is an OUTCOME question —
-# take the base-out state before the play and ask what happened — so all of
-# them fall out of a single traversal:
+# All of these are OUTCOME questions off the base-out state before the play, so
+# one traversal answers them:
 #
 #   P_SAC_FLY       air out, runner on 3rd, <2 out       -> did he score
 #   P_GIDP          ground out, runner on 1st, <2 out    -> were there two
@@ -12702,40 +13592,8 @@ def validate_stint_shape(n_games: int = 400, season: int = 2026,
 #   P_STEAL_SUCCESS steal of second                      -> safe or out
 #   FRAMING_K_SHARE the count table (below)
 #
-# **Section 2's claim that the first four "cannot be measured" is true only of
-# the MOVEMENT-RECORD method.** A runner who holds generates no record, so he
-# cannot be counted that way — which is exactly why the three advancement
-# rates above them were measured and these four were not. Counted as outcomes
-# the holders are simply the denominator minus the numerator, and nothing has
-# to be inferred from an absence.
-#
-# The traversal has three seams worth stating, each of which silently
-# corrupts a rate if it is got wrong:
-#
-#   * **The base state at CONTACT is not the state the PA started with.** A
-#     runner can steal, or be picked off, or move on a wild pitch, during the
-#     plate appearance and before the ball is put in play. Counting a man who
-#     stole second as still standing on first turns a routine ground out into
-#     a double-play opportunity that never existed. The running game is
-#     therefore resolved FIRST, from the runner records, and only then is the
-#     batted ball classified.
-#   * **`count.outs` is the count AFTER the play**, and it includes outs made
-#     on that running game. Differencing it against the previous play charges
-#     a caught stealing to the batted ball, which reads as a double play.
-#   * **`matchup.postOnFirst/Second/Third` is authoritative for the state
-#     after the play** and is used instead of applying the movements
-#     ourselves, so a missed movement cannot accumulate down an inning.
-#
-# Ground/air comes from `hitData.trajectory`, which is the same split the rate
-# model uses (GB_OUT against AIR_OUT), so popups and line-drive outs are in
-# the sac-fly denominator exactly as they are in the engine's AIR_OUT. That
-# makes the measured P_SAC_FLY lower than a fly-ball-only reading, and the
-# lower number is the one the engine needs.
-#
-# The pass also carries the COUNT TABLE, because it is free once the pitches
-# are already in hand and it is what settles FRAMING_K_SHARE — see
-# `framing_k_share` below.
-
+# **§2's claim that the first four "cannot be measured" holds only for the
+# MOVEMENT-RECORD method.** A runner who holds generates no record, so he
 BASERUN_CACHE_FMT = "baserunning_{season}.json"
 # `BASERUN_SEASON` is declared with the constants it feeds, in section 2.
 
@@ -12767,243 +13625,413 @@ def _is_running_event(name: str) -> bool:
                          "defensive indifference"))
 
 
-def fetch_pbp_baserunning(game_pk: int, timeout: float = 30.0) -> Dict[str, int]:
-    """Every base-running outcome and every count in one game, as counters.
+class BaseRunningPbp:
+    """Base-running and run expectancy, measured in one play-by-play pass."""
 
-    Returns a flat {name: count} dict so the season merge is a `Counter`
-    update and the cache is plain JSON. Empty on any failure — a missing game
-    is a smaller error than a half-parsed one.
-    """
-    c: Dict[str, int] = collections.Counter()
-    try:
-        r = requests.get(
-            f"{STATSAPI}/game/{game_pk}/playByPlay", timeout=timeout)
-        r.raise_for_status()
-        plays = r.json().get("allPlays") or []
-    except Exception:
-        return dict(c)
-    c["games"] = 1
+    @staticmethod
+    def fetch_pbp_baserunning(game_pk: int, timeout: float = 30.0) -> Dict[str, int]:
+        """Every base-running outcome and every count in one game, as counters.
 
-    state = {"1B": None, "2B": None, "3B": None}
-    prev_half, prev_outs = None, 0
-    # (bases bitmask, outs, runs on the play) for the half-inning in progress.
-    # RE24 is banked a half-inning at a time because a half that did not end
-    # in three outs — a walk-off, a called game — has to be dropped whole.
-    half_rows: List[Tuple[int, int, int]] = []
+        Returns a flat {name: count} dict so the season merge is a `Counter`
+        update and the cache is plain JSON. Empty on any failure — a missing game
+        is a smaller error than a half-parsed one.
+        """
+        c: Dict[str, int] = collections.Counter()
+        try:
+            plays = Query.play_by_play(game_pk, timeout, final=True)
+        except Exception:
+            return dict(c)
+        c["games"] = 1
 
-    def _bank_re24() -> None:
-        if not half_rows or prev_outs != 3:
-            return
-        tail = 0
-        for base, outs, runs in reversed(half_rows):
-            tail += runs
-            if outs < 3:
-                c[f"re_{base}_{outs}_runs"] += tail
-                c[f"re_{base}_{outs}_n"] += 1
+        state = {"1B": None, "2B": None, "3B": None}
+        prev_half, prev_outs = None, 0
+        # (bases bitmask, outs, runs on the play) for the half-inning in progress.
+        # RE24 is banked a half-inning at a time because a half that did not end
+        # in three outs — a walk-off, a called game — has to be dropped whole.
+        half_rows: List[Tuple[int, int, int]] = []
 
-    for p in plays:
-        about = p.get("about") or {}
-        half = (about.get("inning"), about.get("isTopInning"))
-        if half != prev_half:
-            _bank_re24()
-            half_rows = []
-            prev_half, prev_outs = half, 0
-            state = {"1B": None, "2B": None, "3B": None}
-        res = p.get("result") or {}
-        ev = res.get("eventType") or ""
-        outs_after = (p.get("count") or {}).get("outs", 0)
-        runners = p.get("runners") or []
-        c["pa"] += 1
-        # **Runs are counted off the SCORING MOVEMENTS, not off a score
-        # difference.** `walk_half_innings` in EffortMLB.py — which produced
-        # the RE24 table this is compared against — seeds its running score
-        # from the FIRST play of the half and so scores that play at zero. A
-        # leadoff home run is silently free, and because the tail is cumulative
-        # the loss lands on the (empty, 0 out) cell, biasing exactly the cell
-        # every run-expectancy calibration keys off.
-        base_before = ((1 if state["1B"] else 0) | (2 if state["2B"] else 0)
-                       | (4 if state["3B"] else 0))
-        half_rows.append((base_before, prev_outs, sum(
-            1 for rn in runners
-            if ((rn.get("movement") or {}).get("end")) == "score")))
+        def _bank_re24() -> None:
+            if not half_rows or prev_outs != 3:
+                return
+            tail = 0
+            for base, outs, runs in reversed(half_rows):
+                tail += runs
+                if outs < 3:
+                    c[f"re_{base}_{outs}_runs"] += tail
+                    c[f"re_{base}_{outs}_n"] += 1
 
-        # --- opportunity is measured on the state the PA STARTED with, which
-        # is where `running_game` is called from in the engine.
-        if any(state.values()):
-            c["runner_on_pa"] += 1
-        if state["1B"] is not None and state["2B"] is None:
-            c["steal_opp"] += 1
+        for p in plays:
+            about = p.get("about") or {}
+            half = (about.get("inning"), about.get("isTopInning"))
+            if half != prev_half:
+                _bank_re24()
+                half_rows = []
+                prev_half, prev_outs = half, 0
+                state = {"1B": None, "2B": None, "3B": None}
+            res = p.get("result") or {}
+            ev = res.get("eventType") or ""
+            outs_after = (p.get("count") or {}).get("outs", 0)
+            runners = p.get("runners") or []
+            c["pa"] += 1
+            # **Runs are counted off the SCORING MOVEMENTS, not off a score
+            # difference.** `walk_half_innings` in EffortMLB.py — which produced
+            # the RE24 table this is compared against — seeds its running score
+            # from the FIRST play of the half and so scores that play at zero. A
+            # leadoff home run is silently free, and because the tail is cumulative
+            # the loss lands on the (empty, 0 out) cell, biasing exactly the cell
+            # every run-expectancy calibration keys off.
+            base_before = ((1 if state["1B"] else 0) | (2 if state["2B"] else 0)
+                           | (4 if state["3B"] else 0))
+            half_rows.append((base_before, prev_outs, sum(
+                1 for rn in runners
+                if ((rn.get("movement") or {}).get("end")) == "score")))
 
-        # --- the running game resolves first, and it moves both the bases and
-        # the out count before the ball is ever put in play.
-        pre_outs = prev_outs
-        at_contact = dict(state)
-        wild = False
-        for rn in runners:
-            det, mv = rn.get("details") or {}, rn.get("movement") or {}
-            evn = det.get("event") or ""
-            if not _is_running_event(evn):
-                continue
-            if evn.startswith("Stolen Base 2B"):
-                c["sb2"] += 1
-            elif evn.startswith("Pickoff Caught Stealing 2B"):
-                c["pocs2"] += 1
-            elif evn.startswith("Caught Stealing 2B"):
-                c["cs2"] += 1
-            elif evn.startswith("Stolen Base 3B"):
-                c["sb3"] += 1
-            elif evn.startswith("Caught Stealing 3B"):
-                c["cs3"] += 1
-            if evn.startswith(("Wild Pitch", "Passed Ball", "Balk")):
-                wild = True
-            if mv.get("isOut"):
-                pre_outs += 1
-            rid = (det.get("runner") or {}).get("id")
-            st = mv.get("originBase") or mv.get("start")
-            end_ = mv.get("end")
-            if st in at_contact and at_contact.get(st) == rid:
-                at_contact[st] = None
-            if end_ in ("1B", "2B", "3B"):
-                at_contact[end_] = rid
-        if wild:
-            c["wild_play"] += 1
-        # A runner who MOVED on the batted ball tells us where he stood when
-        # it was hit; this corrects any drift the block above left behind.
-        for rn in runners:
-            det, mv = rn.get("details") or {}, rn.get("movement") or {}
-            if _is_running_event(det.get("event") or ""):
-                continue
-            st = mv.get("originBase") or mv.get("start")
-            if st in ("1B", "2B", "3B"):
-                at_contact[st] = (det.get("runner") or {}).get("id")
-        outs_bb = max(outs_after - pre_outs, 0)
+            # --- opportunity is measured on the state the PA STARTED with, which
+            # is where `running_game` is called from in the engine.
+            if any(state.values()):
+                c["runner_on_pa"] += 1
+            if state["1B"] is not None and state["2B"] is None:
+                c["steal_opp"] += 1
 
-        traj = None
-        for e in reversed(p.get("playEvents") or []):
-            hd = e.get("hitData")
-            if hd and hd.get("trajectory"):
-                traj = hd["trajectory"]
-                break
+            # --- the running game resolves first, and it moves both the bases and
+            # the out count before the ball is ever put in play.
+            pre_outs = prev_outs
+            at_contact = dict(state)
+            wild = False
+            for rn in runners:
+                det, mv = rn.get("details") or {}, rn.get("movement") or {}
+                evn = det.get("event") or ""
+                if not _is_running_event(evn):
+                    continue
+                if evn.startswith("Stolen Base 2B"):
+                    c["sb2"] += 1
+                elif evn.startswith("Pickoff Caught Stealing 2B"):
+                    c["pocs2"] += 1
+                elif evn.startswith("Caught Stealing 2B"):
+                    c["cs2"] += 1
+                elif evn.startswith("Stolen Base 3B"):
+                    c["sb3"] += 1
+                elif evn.startswith("Caught Stealing 3B"):
+                    c["cs3"] += 1
+                if evn.startswith(("Wild Pitch", "Passed Ball", "Balk")):
+                    wild = True
+                if mv.get("isOut"):
+                    pre_outs += 1
+                rid = (det.get("runner") or {}).get("id")
+                st = mv.get("originBase") or mv.get("start")
+                end_ = mv.get("end")
+                if st in at_contact and at_contact.get(st) == rid:
+                    at_contact[st] = None
+                if end_ in ("1B", "2B", "3B"):
+                    at_contact[end_] = rid
+            if wild:
+                c["wild_play"] += 1
+            # A runner who MOVED on the batted ball tells us where he stood when
+            # it was hit; this corrects any drift the block above left behind.
+            for rn in runners:
+                det, mv = rn.get("details") or {}, rn.get("movement") or {}
+                if _is_running_event(det.get("event") or ""):
+                    continue
+                st = mv.get("originBase") or mv.get("start")
+                if st in ("1B", "2B", "3B"):
+                    at_contact[st] = (det.get("runner") or {}).get("id")
+            outs_bb = max(outs_after - pre_outs, 0)
 
-        end: Dict[int, str] = {}
-        for rn in runners:
-            det, mv = rn.get("details") or {}, rn.get("movement") or {}
-            if _is_running_event(det.get("event") or ""):
-                continue
-            rid = (det.get("runner") or {}).get("id")
-            if rid is None:
-                continue
-            end[rid] = "out" if mv.get("isOut") else (mv.get("end") or "")
+            traj = None
+            for e in reversed(p.get("playEvents") or []):
+                hd = e.get("hitData")
+                if hd and hd.get("trajectory"):
+                    traj = hd["trajectory"]
+                    break
 
-        on1, on2, on3 = at_contact["1B"], at_contact["2B"], at_contact["3B"]
-        # Bunts are counted under their own prefix. They belong in the rates —
-        # the engine's GB_OUT rate includes them, and dropping them would lose
-        # the advancement a sacrifice buys — but they are a different intent
-        # from a swing, so the split is kept on disk rather than assumed away.
-        pre = ("b" if traj in _TRAJ_BUNT_GB + _TRAJ_BUNT_AIR else "")
-        live = ev not in _HIT_EVENTS and outs_bb >= 1 and pre_outs < 2
-        if live and traj in _TRAJ_GB + _TRAJ_BUNT_GB:
-            c[pre + "gb_out"] += 1
-            if on1 is not None:
-                c[pre + "gidp_den"] += 1
-                if outs_bb >= 2:
-                    c[pre + "gidp_num"] += 1
-            if outs_bb == 1:                       # the productive-out branch
-                if on3 is not None:
-                    c[pre + "gbscore_den"] += 1
-                    if end.get(on3) == "score":
-                        c[pre + "gbscore_num"] += 1
-                if on2 is not None and on3 is None:
-                    c[pre + "gbadv_den"] += 1
-                    adv = end.get(on2) in ("3B", "score")
-                    c[pre + "gbadv_num"] += int(adv)
-                    # Split on whether first was occupied. The engine applies
-                    # one rate to both, and the two are not close: with a man
-                    # on first the play goes to the batter and the runner
-                    # walks to third, without one he can be the play.
-                    if on1 is not None:
-                        c[pre + "gbadv_f1_den"] += 1
-                        c[pre + "gbadv_f1_num"] += int(adv)
-        if live and traj in _TRAJ_AIR + _TRAJ_BUNT_AIR:
-            c[pre + "air_out"] += 1
-            if on3 is not None:
-                c[pre + "sf_den"] += 1
-                scored = end.get(on3) == "score"
-                c[pre + "sf_num"] += int(scored)
-                if traj == "fly_ball":
-                    c["sf_fly_den"] += 1
-                    c["sf_fly_num"] += int(scored)
-        if ev == "sac_fly":
-            c["sac_fly_ev"] += 1
-        if ev == "field_error":
-            c["roe"] += 1
-            if traj in _TRAJ_GB + _TRAJ_BUNT_GB:
-                c["roe_gb"] += 1
+            end: Dict[int, str] = {}
+            for rn in runners:
+                det, mv = rn.get("details") or {}, rn.get("movement") or {}
+                if _is_running_event(det.get("event") or ""):
+                    continue
+                rid = (det.get("runner") or {}).get("id")
+                if rid is None:
+                    continue
+                end[rid] = "out" if mv.get("isOut") else (mv.get("end") or "")
 
-        # --- the three advancement rates that ARE already measured, recounted
-        # as outcomes. They are not read by anything; they are the check that
-        # this traversal agrees with the movement-record pass that produced
-        # `runner_advance.json`, and a traversal that disagreed with a known
-        # answer would not be trusted for the four that have no known answer.
-        if outs_bb == 0:
-            if ev == "single":
+            on1, on2, on3 = at_contact["1B"], at_contact["2B"], at_contact["3B"]
+            # Bunts are counted under their own prefix. They belong in the rates —
+            # the engine's GB_OUT rate includes them, and dropping them would lose
+            # the advancement a sacrifice buys — but they are a different intent
+            # from a swing, so the split is kept on disk rather than assumed away.
+            pre = ("b" if traj in _TRAJ_BUNT_GB + _TRAJ_BUNT_AIR else "")
+            live = ev not in _HIT_EVENTS and outs_bb >= 1 and pre_outs < 2
+            if live and traj in _TRAJ_GB + _TRAJ_BUNT_GB:
+                c[pre + "gb_out"] += 1
                 if on1 is not None:
-                    c["adv_1b_on1_den"] += 1
-                    c["adv_1b_on1_num"] += int(end.get(on1) in ("3B", "score"))
-                if on2 is not None:
-                    c["adv_1b_on2_den"] += 1
-                    c["adv_1b_on2_num"] += int(end.get(on2) == "score")
-            elif ev == "double" and on1 is not None:
-                c["adv_2b_on1_den"] += 1
-                c["adv_2b_on1_num"] += int(end.get(on1) == "score")
+                    c[pre + "gidp_den"] += 1
+                    if outs_bb >= 2:
+                        c[pre + "gidp_num"] += 1
+                if outs_bb == 1:                       # the productive-out branch
+                    if on3 is not None:
+                        c[pre + "gbscore_den"] += 1
+                        if end.get(on3) == "score":
+                            c[pre + "gbscore_num"] += 1
+                    if on2 is not None and on3 is None:
+                        c[pre + "gbadv_den"] += 1
+                        adv = end.get(on2) in ("3B", "score")
+                        c[pre + "gbadv_num"] += int(adv)
+                        # Split on whether first was occupied. The engine applies
+                        # one rate to both, and the two are not close: with a man
+                        # on first the play goes to the batter and the runner
+                        # walks to third, without one he can be the play.
+                        if on1 is not None:
+                            c[pre + "gbadv_f1_den"] += 1
+                            c[pre + "gbadv_f1_num"] += int(adv)
+            if live and traj in _TRAJ_AIR + _TRAJ_BUNT_AIR:
+                c[pre + "air_out"] += 1
+                if on3 is not None:
+                    c[pre + "sf_den"] += 1
+                    scored = end.get(on3) == "score"
+                    c[pre + "sf_num"] += int(scored)
+                    if traj == "fly_ball":
+                        c["sf_fly_den"] += 1
+                        c["sf_fly_num"] += int(scored)
+            if ev == "sac_fly":
+                c["sac_fly_ev"] += 1
+            if ev == "field_error":
+                c["roe"] += 1
+                if traj in _TRAJ_GB + _TRAJ_BUNT_GB:
+                    c["roe_gb"] += 1
 
-        # --- the count table, for FRAMING_K_SHARE
-        isk = ev.startswith("strikeout")
-        isbb = ev == "walk"
-        b = s = 0
-        seen = set()
-        for e in p.get("playEvents") or []:
-            if not e.get("isPitch"):
+            # --- the three advancement rates that ARE already measured, recounted
+            # as outcomes. They are not read by anything; they are the check that
+            # this traversal agrees with the movement-record pass that produced
+            # `runner_advance.json`, and a traversal that disagreed with a known
+            # answer would not be trusted for the four that have no known answer.
+            if outs_bb == 0:
+                if ev == "single":
+                    if on1 is not None:
+                        c["adv_1b_on1_den"] += 1
+                        c["adv_1b_on1_num"] += int(end.get(on1) in ("3B", "score"))
+                    if on2 is not None:
+                        c["adv_1b_on2_den"] += 1
+                        c["adv_1b_on2_num"] += int(end.get(on2) == "score")
+                elif ev == "double" and on1 is not None:
+                    c["adv_2b_on1_den"] += 1
+                    c["adv_2b_on1_num"] += int(end.get(on1) == "score")
+
+            # --- the count table, for FRAMING_K_SHARE
+            isk = ev.startswith("strikeout")
+            isbb = ev == "walk"
+            b = s = 0
+            seen = set()
+            for e in p.get("playEvents") or []:
+                if not e.get("isPitch"):
+                    continue
+                if b > 3 or s > 2:
+                    break                              # the PA is already decided
+                seen.add((b, s))
+                det = e.get("details") or {}
+                code = (det.get("call") or {}).get("code") or ""
+                if code in ("B", "*B", "C"):           # a TAKE, the framing chance
+                    pd = e.get("pitchData") or {}
+                    co = pd.get("coordinates") or {}
+                    px, pz = co.get("pX"), co.get("pZ")
+                    top, bot = pd.get("strikeZoneTop"), pd.get("strikeZoneBottom")
+                    if None not in (px, pz, top, bot):
+                        # Signed distance outside the rulebook zone: positive is a
+                        # ball, negative a strike, and the band around zero is
+                        # where the catcher earns anything.
+                        d = max(abs(px) - _ZONE_HALF_W, pz - top, bot - pz)
+                        if abs(d) <= _SHADOW_FT:
+                            c[f"c{b}{s}_take"] += 1
+                if det.get("isBall"):
+                    b += 1
+                elif det.get("isStrike"):
+                    if not (code in ("F", "T", "L") and s >= 2):
+                        s += 1
+            for (bb_, ss_) in seen:
+                c[f"c{bb_}{ss_}_reach"] += 1
+                if isk:
+                    c[f"c{bb_}{ss_}_k"] += 1
+                if isbb:
+                    c[f"c{bb_}{ss_}_bb"] += 1
+
+            prev_outs = outs_after
+            mu = p.get("matchup") or {}
+            state = {"1B": (mu.get("postOnFirst") or {}).get("id"),
+                     "2B": (mu.get("postOnSecond") or {}).get("id"),
+                     "3B": (mu.get("postOnThird") or {}).get("id")}
+        _bank_re24()
+        return dict(c)
+
+    @staticmethod
+    def baserunning_rates(c: Dict[str, int]) -> Dict[str, float]:
+        """Counters -> the constants, with the shipped fallbacks left to the caller.
+
+        Bunts are INCLUDED in the ground-ball population: the engine's GB_OUT rate
+        counts them, so leaving them out would price a population the engine never
+        simulates. The bunt-only counters stay in the file so the size of that
+        choice is visible rather than argued about.
+        """
+        def tot(name: str) -> int:
+            return int(c.get(name, 0)) + int(c.get("b" + name, 0))
+
+        both = {k: tot(k) for k in
+                ("gidp_num", "gidp_den", "gbscore_num", "gbscore_den",
+                 "gbadv_num", "gbadv_den", "gbadv_f1_num", "gbadv_f1_den",
+                 "sf_num", "sf_den", "gb_out", "air_out")}
+        att = int(c.get("sb2", 0)) + int(c.get("cs2", 0)) + int(c.get("pocs2", 0))
+        out: Dict[str, float] = {}
+        for key, num, den in (("sac_fly", "sf_num", "sf_den"),
+                              ("gidp", "gidp_num", "gidp_den"),
+                              ("gb_scores", "gbscore_num", "gbscore_den"),
+                              ("gb_advance", "gbadv_num", "gbadv_den"),
+                              ("gb_advance_forced", "gbadv_f1_num",
+                               "gbadv_f1_den")):
+            v = _rate(both, num, den)
+            if v is not None:
+                out[key] = round(v, 4)
+        if att >= 200:
+            out["steal_success"] = round(c["sb2"] / att, 4)
+        if c.get("steal_opp", 0) >= 2000:
+            out["steal_attempt"] = round(att / c["steal_opp"], 4)
+        if c.get("runner_on_pa", 0) >= 2000:
+            out["wild_advance"] = round(c.get("wild_play", 0)
+                                        / c["runner_on_pa"], 4)
+        # Read by nothing — the agreement check described above.
+        for key, tag in (("first_to_third", "adv_1b_on1"),
+                         ("second_scores", "adv_1b_on2"),
+                         ("first_scores_2b", "adv_2b_on1")):
+            v = _rate(c, tag + "_num", tag + "_den")
+            if v is not None:
+                out[key] = round(v, 4)
+        v = framing_k_share(c)
+        if v is not None:
+            out["framing_k_share"] = round(v, 4)
+        return out
+
+    @staticmethod
+    def baserunning_report(season: Optional[int] = None, refresh: bool = False,
+                           workers: int = 12) -> dict:
+        """Measured against shipped, for every constant in sim_state.md 5.6c."""
+        season = BASERUN_SEASON if season is None else int(season)
+        counts = collect_baserunning(season, workers=workers, refresh=refresh)
+        rates = BaseRunningPbp.baserunning_rates(counts)
+        def _both(k: str) -> int:
+            return int(counts.get(k, 0)) + int(counts.get("b" + k, 0))
+
+        # Steal attempts are not a stored key — they are SB + CS + pickoff-CS, so
+        # the sample column has to be given the number rather than a key name.
+        # It printed a blank and a "0/33500" until it was.
+        att = (int(counts.get("sb2", 0)) + int(counts.get("cs2", 0))
+               + int(counts.get("pocs2", 0)))
+        rows = [
+            ("P_SAC_FLY", "sac_fly", P_SAC_FLY, _both("sf_num"), _both("sf_den")),
+            ("P_GIDP", "gidp", P_GIDP, _both("gidp_num"), _both("gidp_den")),
+            ("P_GB_ADVANCE", "gb_advance", P_GB_ADVANCE,
+             _both("gbadv_num"), _both("gbadv_den")),
+            ("P_GB_SCORES", "gb_scores", P_GB_SCORES,
+             _both("gbscore_num"), _both("gbscore_den")),
+            ("P_STEAL_SUCCESS", "steal_success", P_STEAL_SUCCESS,
+             int(counts.get("sb2", 0)), att),
+            ("P_STEAL_ATTEMPT", "steal_attempt", P_STEAL_ATTEMPT, att,
+             int(counts.get("steal_opp", 0))),
+            ("P_WILD_ADVANCE", "wild_advance", P_WILD_ADVANCE,
+             int(counts.get("wild_play", 0)), int(counts.get("runner_on_pa", 0))),
+            ("FRAMING_K_SHARE", "framing_k_share", FRAMING_K_SHARE,
+             sum(v for k, v in counts.items() if k.endswith("_take")), 0),
+            ("P_FIRST_TO_THIRD_ON_1B", "first_to_third", P_FIRST_TO_THIRD_ON_1B,
+             int(counts.get("adv_1b_on1_num", 0)),
+             int(counts.get("adv_1b_on1_den", 0))),
+            ("P_SECOND_SCORES_ON_1B", "second_scores", P_SECOND_SCORES_ON_1B,
+             int(counts.get("adv_1b_on2_num", 0)),
+             int(counts.get("adv_1b_on2_den", 0))),
+            ("P_FIRST_SCORES_ON_2B", "first_scores_2b", P_FIRST_SCORES_ON_2B,
+             int(counts.get("adv_2b_on1_num", 0)),
+             int(counts.get("adv_2b_on1_den", 0))),
+        ]
+        print(f"\nbase-running, measured over {counts.get('games', 0)} games / "
+              f"{counts.get('pa', 0)} PA — season {season}\n")
+        print(f"  {'constant':<24s} {'shipped':>8s} {'measured':>9s} "
+              f"{'delta':>8s}   sample")
+        for name, key, shipped, n, d in rows:
+            got = rates.get(key)
+            if got is None:
+                print(f"  {name:<24s} {shipped:8.4f} {'—':>9s}")
                 continue
-            if b > 3 or s > 2:
-                break                              # the PA is already decided
-            seen.add((b, s))
-            det = e.get("details") or {}
-            code = (det.get("call") or {}).get("code") or ""
-            if code in ("B", "*B", "C"):           # a TAKE, the framing chance
-                pd = e.get("pitchData") or {}
-                co = pd.get("coordinates") or {}
-                px, pz = co.get("pX"), co.get("pZ")
-                top, bot = pd.get("strikeZoneTop"), pd.get("strikeZoneBottom")
-                if None not in (px, pz, top, bot):
-                    # Signed distance outside the rulebook zone: positive is a
-                    # ball, negative a strike, and the band around zero is
-                    # where the catcher earns anything.
-                    d = max(abs(px) - _ZONE_HALF_W, pz - top, bot - pz)
-                    if abs(d) <= _SHADOW_FT:
-                        c[f"c{b}{s}_take"] += 1
-            if det.get("isBall"):
-                b += 1
-            elif det.get("isStrike"):
-                if not (code in ("F", "T", "L") and s >= 2):
-                    s += 1
-        for (bb_, ss_) in seen:
-            c[f"c{bb_}{ss_}_reach"] += 1
-            if isk:
-                c[f"c{bb_}{ss_}_k"] += 1
-            if isbb:
-                c[f"c{bb_}{ss_}_bb"] += 1
+            smp = f"{n}/{d}" if d else f"{n} takes"
+            print(f"  {name:<24s} {shipped:8.4f} {got:9.4f} {got - shipped:+8.4f}"
+                  f"   {smp}")
+        fwd = rates.get("gb_advance_forced")
+        if fwd is not None:
+            un_d = _both("gbadv_den") - _both("gbadv_f1_den")
+            un_n = _both("gbadv_num") - _both("gbadv_f1_num")
+            print(f"\n  P_GB_ADVANCE is two populations: {fwd:.3f} with a man "
+                  f"also on first (the play goes to the batter and he walks to "
+                  f"third), {un_n / un_d if un_d else 0.0:.3f} without. The "
+                  f"engine applies one rate to the mix.")
+        print(f"\n  cross-check: {counts.get('sac_fly_ev', 0)} plays the feed "
+              f"calls a sacrifice fly against {counts.get('sf_num', 0) + counts.get('bsf_num', 0)} "
+              f"runners measured home from third on an air out.")
+        return {"counts": counts, "rates": rates}
 
-        prev_outs = outs_after
-        mu = p.get("matchup") or {}
-        state = {"1B": (mu.get("postOnFirst") or {}).get("id"),
-                 "2B": (mu.get("postOnSecond") or {}).get("id"),
-                 "3B": (mu.get("postOnThird") or {}).get("id")}
-    _bank_re24()
-    return dict(c)
+    @staticmethod
+    def real_re24(season: Optional[int] = None, save_dir: Path = SAVE_DIR
+                  ) -> Dict[Tuple[int, int], Tuple[float, int]]:
+        """{(bases bitmask, outs): (runs to end of inning, opportunities)}."""
+        season = BASERUN_SEASON if season is None else int(season)
+        counts = collect_baserunning(season, save_dir=save_dir)
+        out: Dict[Tuple[int, int], Tuple[float, int]] = {}
+        for base in range(8):
+            for outs in range(3):
+                n = int(counts.get(f"re_{base}_{outs}_n", 0))
+                if n:
+                    out[(base, outs)] = (
+                        float(counts.get(f"re_{base}_{outs}_runs", 0)), n)
+        return out
+
+    @staticmethod
+    def re24_report(n: int = 6000, seed: int = 5,
+                    season: Optional[int] = None) -> dict:
+        """Simulated run expectancy against the measured table, cell by cell.
+
+        League-average clones on both sides, so nothing here is about a roster —
+        it is the base-out transition model on its own, which is what the
+        advancement constants are.
+        """
+        season = BASERUN_SEASON if season is None else int(season)
+        side = league_side
+
+        home, away = side("H"), side("A")
+        logs: List[List[dict]] = []
+        for i in range(n):
+            log: List[dict] = []
+            simulate_game(home, away, random.Random(seed * 1_000_003 + i), log=log)
+            logs.append(log)
+        sim, real = sim_re24(logs), BaseRunningPbp.real_re24(season)
+
+        print(f"\nrun expectancy — {n} simulated games against {season} "
+              f"play-by-play\n")
+        print(f"  {'state':>7s} {'sim':>7s} {'real':>7s} {'diff':>7s} "
+              f"{'sim n':>8s} {'real n':>8s}")
+        w_abs = w_n = 0.0
+        rows = []
+        for outs in range(3):
+            for base in range(8):
+                s_ = sim.get((base, outs))
+                r_ = real.get((base, outs))
+                if not s_ or not r_:
+                    continue
+                sv, rv = s_[0] / s_[1], r_[0] / r_[1]
+                rows.append((base, outs, sv, rv, s_[1], r_[1]))
+                w_abs += abs(sv - rv) * r_[1]
+                w_n += r_[1]
+                print(f"  {_BASE_LABEL[base]}/{outs} {sv:7.3f} {rv:7.3f} "
+                      f"{sv - rv:+7.3f} {s_[1]:8d} {r_[1]:8d}")
+        print(f"\n  opportunity-weighted mean |error|  {w_abs / w_n:.4f} runs"
+              if w_n else "")
+        return {"sim": sim, "real": real, "rows": rows,
+                "mean_abs_error": (w_abs / w_n) if w_n else None}
 
 
-def collect_baserunning(season: int = BASERUN_SEASON, workers: int = 12,
+def collect_baserunning(season: Optional[int] = None, workers: int = 12,
                         refresh: bool = False, n_games: int = 0,
                         save_dir: Path = SAVE_DIR) -> Dict[str, int]:
     """Season-wide base-running and count counters, cached to disk.
@@ -13011,6 +14039,7 @@ def collect_baserunning(season: int = BASERUN_SEASON, workers: int = 12,
     Keyed on SEASON from the start, because every cache in this file that was
     not has cost a silent wrong-season run at least once.
     """
+    season = BASERUN_SEASON if season is None else int(season)
     path = Path(save_dir) / BASERUN_CACHE_FMT.format(season=season)
     if path.exists() and not refresh:
         try:
@@ -13020,13 +14049,13 @@ def collect_baserunning(season: int = BASERUN_SEASON, workers: int = 12,
                 return got["counts"]
         except (OSError, ValueError):
             pass
-    pks = season_game_pks(season, save_dir)
+    pks = RelieverUsage.season_game_pks(season, save_dir)
     pks = pks[-n_games:] if n_games else pks
     print(f"[baserunning] {season}: play-by-play for {len(pks)} games...")
     tot: collections.Counter = collections.Counter()
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for got in ex.map(fetch_pbp_baserunning, pks):
+        for got in ex.map(BaseRunningPbp.fetch_pbp_baserunning, pks):
             tot.update(got)
             done += 1
             if done % 200 == 0:
@@ -13035,7 +14064,7 @@ def collect_baserunning(season: int = BASERUN_SEASON, workers: int = 12,
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as fh:
         json.dump({"season": season, "counts": counts,
-                   "rates": baserunning_rates(counts)}, fh, indent=1)
+                   "rates": BaseRunningPbp.baserunning_rates(counts)}, fh, indent=1)
     print(f"[baserunning] {season}: {counts.get('pa', 0)} PA from "
           f"{counts.get('games', 0)} games -> {path.name}")
     return counts
@@ -13107,118 +14136,6 @@ def framing_k_share(c: Dict[str, int]) -> Optional[float]:
     return rk / (rk + rb)
 
 
-def baserunning_rates(c: Dict[str, int]) -> Dict[str, float]:
-    """Counters -> the constants, with the shipped fallbacks left to the caller.
-
-    Bunts are INCLUDED in the ground-ball population: the engine's GB_OUT rate
-    counts them, so leaving them out would price a population the engine never
-    simulates. The bunt-only counters stay in the file so the size of that
-    choice is visible rather than argued about.
-    """
-    def tot(name: str) -> int:
-        return int(c.get(name, 0)) + int(c.get("b" + name, 0))
-
-    both = {k: tot(k) for k in
-            ("gidp_num", "gidp_den", "gbscore_num", "gbscore_den",
-             "gbadv_num", "gbadv_den", "gbadv_f1_num", "gbadv_f1_den",
-             "sf_num", "sf_den", "gb_out", "air_out")}
-    att = int(c.get("sb2", 0)) + int(c.get("cs2", 0)) + int(c.get("pocs2", 0))
-    out: Dict[str, float] = {}
-    for key, num, den in (("sac_fly", "sf_num", "sf_den"),
-                          ("gidp", "gidp_num", "gidp_den"),
-                          ("gb_scores", "gbscore_num", "gbscore_den"),
-                          ("gb_advance", "gbadv_num", "gbadv_den"),
-                          ("gb_advance_forced", "gbadv_f1_num",
-                           "gbadv_f1_den")):
-        v = _rate(both, num, den)
-        if v is not None:
-            out[key] = round(v, 4)
-    if att >= 200:
-        out["steal_success"] = round(c["sb2"] / att, 4)
-    if c.get("steal_opp", 0) >= 2000:
-        out["steal_attempt"] = round(att / c["steal_opp"], 4)
-    if c.get("runner_on_pa", 0) >= 2000:
-        out["wild_advance"] = round(c.get("wild_play", 0)
-                                    / c["runner_on_pa"], 4)
-    # Read by nothing — the agreement check described above.
-    for key, tag in (("first_to_third", "adv_1b_on1"),
-                     ("second_scores", "adv_1b_on2"),
-                     ("first_scores_2b", "adv_2b_on1")):
-        v = _rate(c, tag + "_num", tag + "_den")
-        if v is not None:
-            out[key] = round(v, 4)
-    v = framing_k_share(c)
-    if v is not None:
-        out["framing_k_share"] = round(v, 4)
-    return out
-
-
-def baserunning_report(season: int = BASERUN_SEASON, refresh: bool = False,
-                       workers: int = 12) -> dict:
-    """Measured against shipped, for every constant in sim_state.md 5.6c."""
-    counts = collect_baserunning(season, workers=workers, refresh=refresh)
-    rates = baserunning_rates(counts)
-    def _both(k: str) -> int:
-        return int(counts.get(k, 0)) + int(counts.get("b" + k, 0))
-
-    # Steal attempts are not a stored key — they are SB + CS + pickoff-CS, so
-    # the sample column has to be given the number rather than a key name.
-    # It printed a blank and a "0/33500" until it was.
-    att = (int(counts.get("sb2", 0)) + int(counts.get("cs2", 0))
-           + int(counts.get("pocs2", 0)))
-    rows = [
-        ("P_SAC_FLY", "sac_fly", P_SAC_FLY, _both("sf_num"), _both("sf_den")),
-        ("P_GIDP", "gidp", P_GIDP, _both("gidp_num"), _both("gidp_den")),
-        ("P_GB_ADVANCE", "gb_advance", P_GB_ADVANCE,
-         _both("gbadv_num"), _both("gbadv_den")),
-        ("P_GB_SCORES", "gb_scores", P_GB_SCORES,
-         _both("gbscore_num"), _both("gbscore_den")),
-        ("P_STEAL_SUCCESS", "steal_success", P_STEAL_SUCCESS,
-         int(counts.get("sb2", 0)), att),
-        ("P_STEAL_ATTEMPT", "steal_attempt", P_STEAL_ATTEMPT, att,
-         int(counts.get("steal_opp", 0))),
-        ("P_WILD_ADVANCE", "wild_advance", P_WILD_ADVANCE,
-         int(counts.get("wild_play", 0)), int(counts.get("runner_on_pa", 0))),
-        ("FRAMING_K_SHARE", "framing_k_share", FRAMING_K_SHARE,
-         sum(v for k, v in counts.items() if k.endswith("_take")), 0),
-        ("P_FIRST_TO_THIRD_ON_1B", "first_to_third", P_FIRST_TO_THIRD_ON_1B,
-         int(counts.get("adv_1b_on1_num", 0)),
-         int(counts.get("adv_1b_on1_den", 0))),
-        ("P_SECOND_SCORES_ON_1B", "second_scores", P_SECOND_SCORES_ON_1B,
-         int(counts.get("adv_1b_on2_num", 0)),
-         int(counts.get("adv_1b_on2_den", 0))),
-        ("P_FIRST_SCORES_ON_2B", "first_scores_2b", P_FIRST_SCORES_ON_2B,
-         int(counts.get("adv_2b_on1_num", 0)),
-         int(counts.get("adv_2b_on1_den", 0))),
-    ]
-    print(f"\nbase-running, measured over {counts.get('games', 0)} games / "
-          f"{counts.get('pa', 0)} PA — season {season}\n")
-    print(f"  {'constant':<24s} {'shipped':>8s} {'measured':>9s} "
-          f"{'delta':>8s}   sample")
-    for name, key, shipped, n, d in rows:
-        got = rates.get(key)
-        if got is None:
-            print(f"  {name:<24s} {shipped:8.4f} {'—':>9s}")
-            continue
-        smp = f"{n}/{d}" if d else f"{n} takes"
-        print(f"  {name:<24s} {shipped:8.4f} {got:9.4f} {got - shipped:+8.4f}"
-              f"   {smp}")
-    fwd = rates.get("gb_advance_forced")
-    if fwd is not None:
-        un_d = _both("gbadv_den") - _both("gbadv_f1_den")
-        un_n = _both("gbadv_num") - _both("gbadv_f1_num")
-        print(f"\n  P_GB_ADVANCE is two populations: {fwd:.3f} with a man "
-              f"also on first (the play goes to the batter and he walks to "
-              f"third), {un_n / un_d if un_d else 0.0:.3f} without. The "
-              f"engine applies one rate to the mix.")
-    print(f"\n  cross-check: {counts.get('sac_fly_ev', 0)} plays the feed "
-          f"calls a sacrifice fly against {counts.get('sf_num', 0) + counts.get('bsf_num', 0)} "
-          f"runners measured home from third on an air out.")
-    return {"counts": counts, "rates": rates}
-
-
-
-
 # --- RUN EXPECTANCY, as the instrument for a changed advancement model -----
 # Section 2 says the free-advancement constants are "calibrated against our own
 # measured RE24 ... re-fit them before trusting a changed advancement model."
@@ -13226,7 +14143,7 @@ def baserunning_report(season: int = BASERUN_SEASON, refresh: bool = False,
 # there was no way to ask the question it was written for. This is it.
 #
 # **The table it used to be scored against is biased, and only in one cell.**
-# `walk_half_innings` in EffortMLB.py, which built `savedata/pbp/
+# `walk_half_innings` in EffortMLB.py, which built `OddsAPI/savedata/pbp/
 # season_2026_v2.json`, tracks runs by DIFFERENCING the running score and
 # seeds that difference from the first play of the half — so runs scored ON
 # that first play count as zero. Every later row's tail is cumulative, so the
@@ -13239,20 +14156,6 @@ def baserunning_report(season: int = BASERUN_SEASON, refresh: bool = False,
 # cannot drift, and `re24_report` scores against that.
 
 _BASE_LABEL = ("___", "1__", "_2_", "12_", "__3", "1_3", "_23", "123")
-
-
-def real_re24(season: int = BASERUN_SEASON, save_dir: Path = SAVE_DIR
-              ) -> Dict[Tuple[int, int], Tuple[float, int]]:
-    """{(bases bitmask, outs): (runs to end of inning, opportunities)}."""
-    counts = collect_baserunning(season, save_dir=save_dir)
-    out: Dict[Tuple[int, int], Tuple[float, int]] = {}
-    for base in range(8):
-        for outs in range(3):
-            n = int(counts.get(f"re_{base}_{outs}_n", 0))
-            if n:
-                out[(base, outs)] = (
-                    float(counts.get(f"re_{base}_{outs}_runs", 0)), n)
-    return out
 
 
 def sim_re24(logs: Sequence[Sequence[dict]]
@@ -13283,48 +14186,6 @@ def sim_re24(logs: Sequence[Sequence[dict]]
                 cell[1] += 1
                 tail += ev.get("runs_before", 0)
     return {k: (v[0], int(v[1])) for k, v in acc.items()}
-
-
-def re24_report(n: int = 6000, seed: int = 5,
-                season: int = BASERUN_SEASON) -> dict:
-    """Simulated run expectancy against the measured table, cell by cell.
-
-    League-average clones on both sides, so nothing here is about a roster —
-    it is the base-out transition model on its own, which is what the
-    advancement constants are.
-    """
-    side = league_side
-
-    home, away = side("H"), side("A")
-    logs: List[List[dict]] = []
-    for i in range(n):
-        log: List[dict] = []
-        simulate_game(home, away, random.Random(seed * 1_000_003 + i), log=log)
-        logs.append(log)
-    sim, real = sim_re24(logs), real_re24(season)
-
-    print(f"\nrun expectancy — {n} simulated games against {season} "
-          f"play-by-play\n")
-    print(f"  {'state':>7s} {'sim':>7s} {'real':>7s} {'diff':>7s} "
-          f"{'sim n':>8s} {'real n':>8s}")
-    w_abs = w_n = 0.0
-    rows = []
-    for outs in range(3):
-        for base in range(8):
-            s_ = sim.get((base, outs))
-            r_ = real.get((base, outs))
-            if not s_ or not r_:
-                continue
-            sv, rv = s_[0] / s_[1], r_[0] / r_[1]
-            rows.append((base, outs, sv, rv, s_[1], r_[1]))
-            w_abs += abs(sv - rv) * r_[1]
-            w_n += r_[1]
-            print(f"  {_BASE_LABEL[base]}/{outs} {sv:7.3f} {rv:7.3f} "
-                  f"{sv - rv:+7.3f} {s_[1]:8d} {r_[1]:8d}")
-    print(f"\n  opportunity-weighted mean |error|  {w_abs / w_n:.4f} runs"
-          if w_n else "")
-    return {"sim": sim, "real": real, "rows": rows,
-            "mean_abs_error": (w_abs / w_n) if w_n else None}
 
 
 # ===========================================================================
@@ -13363,16 +14224,138 @@ _DEPLOY: Dict[int, dict] = {}
 DEPLOY_SEASON = 2026
 
 
-def margin_bucket(d: int) -> str:
-    if d >= 4:
-        return "lead4"
-    if d >= 1:
-        return "lead13"
-    if d == 0:
-        return "tied"
-    if d >= -3:
-        return "trail13"
-    return "trail4"
+class Deployment:
+    """Empirical deployment, per pitcher, from what he actually did."""
+
+    @staticmethod
+    def margin_bucket(d: int) -> str:
+        if d >= 4:
+            return "lead4"
+        if d >= 1:
+            return "lead13"
+        if d == 0:
+            return "tied"
+        if d >= -3:
+            return "trail13"
+        return "trail4"
+
+    @staticmethod
+    def build_deployment(season: Optional[int] = None) -> dict:
+        """Per-pitcher entry distributions, shrunk toward role. Cached per season."""
+        season = DEPLOY_SEASON if season is None else season
+        if season in _DEPLOY:
+            return _DEPLOY[season]
+        entries = RelieverUsage.collect_reliever_entries(season=season)
+        traits = RelieverTraits.load_reliever_traits(season)
+
+        by_p: Dict[int, List[dict]] = {}
+        for x in entries:
+            by_p.setdefault(x["pitcher"], []).append(x)
+        depths = sorted(len(v) for v in by_p.values())
+        stabilize = float(depths[len(depths) // 2]) if depths else 10.0
+        # Mean entry inning per arm — the ITP-free route to a role (see `_role_of`).
+        pbp_inn = {pid: statistics.mean(int(r["inning"] or 0) for r in rows)
+                   for pid, rows in by_p.items() if rows}
+
+        def hist(rows, key, buckets):
+            c = {b: 0.0 for b in buckets}
+            for r in rows:
+                c[key(r)] = c.get(key(r), 0.0) + 1.0
+            n = sum(c.values())
+            return {b: (v / n if n else 1.0 / len(buckets)) for b, v in c.items()}
+
+        inn_key = lambda r: min(int(r["inning"] or 1), 10)
+        mar_key = lambda r: Deployment.margin_bucket(int(r["margin"] or 0))
+
+        role_rows: Dict[str, List[dict]] = {}
+        for pid, rows in by_p.items():
+            role_rows.setdefault(_role_of(pid, traits, pbp_inn.get(pid)),
+                                 []).extend(rows)
+        role_inn = {r: hist(v, inn_key, INNING_BUCKETS) for r, v in role_rows.items()}
+        role_mar = {r: hist(v, mar_key, MARGIN_BUCKETS) for r, v in role_rows.items()}
+        # P(margin | inning, role) — the JOINT, which the product of marginals
+        # cannot express. A closer's 9th-inning probability is so dominant that
+        # multiplying it by a low blowout probability still beat every other arm's
+        # 7th-inning-shaped distribution, so he took 30% of his entries in
+        # blowouts against a real 14%. Conditioning on the inning fixes that: in a
+        # 9th-inning blowout the closer's own history says he is not the man.
+        role_joint: Dict[tuple, Dict[str, float]] = {}
+        for r, rows_ in role_rows.items():
+            by_inn: Dict[int, list] = {}
+            for x in rows_:
+                by_inn.setdefault(inn_key(x), []).append(x)
+            for i, rr in by_inn.items():
+                if len(rr) >= 20:
+                    role_joint[(r, i)] = hist(rr, mar_key, MARGIN_BUCKETS)
+
+        # Home/road split on TIE games — the "save him for the 10th on the road"
+        # behaviour, measured rather than assumed.
+        # CLOSERS only — the behaviour is "save him for the 10th on the road", and
+        # averaging every arm's tie-game entries washes it out (1.08 across all
+        # pitchers against 1.52 for closers, which is the real effect).
+        tie = [x for x in entries if int(x["inning"] or 0) == 9
+               and int(x["margin"] or 0) == 0
+               and _role_of(x["pitcher"], traits,
+                            pbp_inn.get(x["pitcher"])) == "closer"]
+        h = sum(1 for x in tie if x.get("p_home"))
+        a = len(tie) - h
+        tie_home_factor = (h / a) if a else 1.0
+
+        out: Dict[int, dict] = {}
+        for pid, rows in by_p.items():
+            role = _role_of(pid, traits, pbp_inn.get(pid))
+            n = len(rows)
+            w = n / (n + stabilize)
+            mine_i = hist(rows, inn_key, INNING_BUCKETS)
+            mine_m = hist(rows, mar_key, MARGIN_BUCKETS)
+            ri = role_inn.get(role) or mine_i
+            rm = role_mar.get(role) or mine_m
+            out[pid] = {
+                "role": role, "n": n,
+                "inning": {b: w * mine_i[b] + (1 - w) * ri.get(b, 0.0)
+                           for b in INNING_BUCKETS},
+                "margin": {b: w * mine_m[b] + (1 - w) * rm.get(b, 0.0)
+                           for b in MARGIN_BUCKETS},
+            }
+        _DEPLOY[season] = {"pitchers": out, "role_inning": role_inn,
+                           "role_margin": role_mar, "role_joint": role_joint,
+                           "tie_home_factor": tie_home_factor,
+                           "stabilize": stabilize}
+        return _DEPLOY[season]
+
+    @staticmethod
+    def render_pbp(log: Sequence[dict], home: str = "HOME",
+                   away: str = "AWAY") -> str:
+        """A simulated game as readable play-by-play.
+
+        Exists to be READ. Aggregate validation says the appearance rates are
+        right; only walking an actual game shows a closer entering the sixth, a
+        long man leaving after four batters of a blowout, or a pitching change
+        that no manager would make.
+        """
+        _EV = {"K": "strikes out", "BB": "walks", "HBP": "hit by pitch",
+               "GB_OUT": "grounds out", "AIR_OUT": "flies out",
+               "1B": "singles", "2B": "doubles", "3B": "triples",
+               "HR": "HOMERS"}
+        out: List[str] = []
+        half_now = None
+        for e in log:
+            key = (e["inning"], e["half"])
+            if key != half_now:
+                half_now = key
+                side = away if e["half"] == "away" else home
+                out.append(f"\n--- {'Top' if e['half'] == 'away' else 'Bot'} "
+                           f"{e['inning']}  ({side} batting)   "
+                           f"{away} {e['score'][0]} - {e['score'][1]} {home}")
+            if e["new_pitcher"]:
+                out.append(f"    >> PITCHING CHANGE: {e['pitcher']} "
+                           f"({e['throws'] or '?'})")
+            on = f" [{e['on_before']} on]" if e["on_before"] else ""
+            rbi = f"  ({e['runs']} run{'s' if e['runs'] != 1 else ''})" if e["runs"] else ""
+            out.append(f"    {e['outs_before']} out{on}  "
+                       f"{e['batter']} ({e['bats'] or '?'}) "
+                       f"{_EV.get(e['outcome'], e['outcome'])}{rbi}")
+        return "\n".join(out)
 
 
 def _role_of(pid: int, traits: dict,
@@ -13406,150 +14389,32 @@ def _role_of(pid: int, traits: dict,
     return "other"
 
 
-def build_deployment(season: Optional[int] = None) -> dict:
-    """Per-pitcher entry distributions, shrunk toward role. Cached per season."""
-    season = DEPLOY_SEASON if season is None else season
-    if season in _DEPLOY:
-        return _DEPLOY[season]
-    entries = collect_reliever_entries(season=season)
-    traits = load_reliever_traits(season)
-
-    by_p: Dict[int, List[dict]] = {}
-    for x in entries:
-        by_p.setdefault(x["pitcher"], []).append(x)
-    depths = sorted(len(v) for v in by_p.values())
-    stabilize = float(depths[len(depths) // 2]) if depths else 10.0
-    # Mean entry inning per arm — the ITP-free route to a role (see `_role_of`).
-    pbp_inn = {pid: statistics.mean(int(r["inning"] or 0) for r in rows)
-               for pid, rows in by_p.items() if rows}
-
-    def hist(rows, key, buckets):
-        c = {b: 0.0 for b in buckets}
-        for r in rows:
-            c[key(r)] = c.get(key(r), 0.0) + 1.0
-        n = sum(c.values())
-        return {b: (v / n if n else 1.0 / len(buckets)) for b, v in c.items()}
-
-    inn_key = lambda r: min(int(r["inning"] or 1), 10)
-    mar_key = lambda r: margin_bucket(int(r["margin"] or 0))
-
-    role_rows: Dict[str, List[dict]] = {}
-    for pid, rows in by_p.items():
-        role_rows.setdefault(_role_of(pid, traits, pbp_inn.get(pid)),
-                             []).extend(rows)
-    role_inn = {r: hist(v, inn_key, INNING_BUCKETS) for r, v in role_rows.items()}
-    role_mar = {r: hist(v, mar_key, MARGIN_BUCKETS) for r, v in role_rows.items()}
-    # P(margin | inning, role) — the JOINT, which the product of marginals
-    # cannot express. A closer's 9th-inning probability is so dominant that
-    # multiplying it by a low blowout probability still beat every other arm's
-    # 7th-inning-shaped distribution, so he took 30% of his entries in
-    # blowouts against a real 14%. Conditioning on the inning fixes that: in a
-    # 9th-inning blowout the closer's own history says he is not the man.
-    role_joint: Dict[tuple, Dict[str, float]] = {}
-    for r, rows_ in role_rows.items():
-        by_inn: Dict[int, list] = {}
-        for x in rows_:
-            by_inn.setdefault(inn_key(x), []).append(x)
-        for i, rr in by_inn.items():
-            if len(rr) >= 20:
-                role_joint[(r, i)] = hist(rr, mar_key, MARGIN_BUCKETS)
-
-    # Home/road split on TIE games — the "save him for the 10th on the road"
-    # behaviour, measured rather than assumed.
-    # CLOSERS only — the behaviour is "save him for the 10th on the road", and
-    # averaging every arm's tie-game entries washes it out (1.08 across all
-    # pitchers against 1.52 for closers, which is the real effect).
-    tie = [x for x in entries if int(x["inning"] or 0) == 9
-           and int(x["margin"] or 0) == 0
-           and _role_of(x["pitcher"], traits,
-                        pbp_inn.get(x["pitcher"])) == "closer"]
-    h = sum(1 for x in tie if x.get("p_home"))
-    a = len(tie) - h
-    tie_home_factor = (h / a) if a else 1.0
-
-    out: Dict[int, dict] = {}
-    for pid, rows in by_p.items():
-        role = _role_of(pid, traits, pbp_inn.get(pid))
-        n = len(rows)
-        w = n / (n + stabilize)
-        mine_i = hist(rows, inn_key, INNING_BUCKETS)
-        mine_m = hist(rows, mar_key, MARGIN_BUCKETS)
-        ri = role_inn.get(role) or mine_i
-        rm = role_mar.get(role) or mine_m
-        out[pid] = {
-            "role": role, "n": n,
-            "inning": {b: w * mine_i[b] + (1 - w) * ri.get(b, 0.0)
-                       for b in INNING_BUCKETS},
-            "margin": {b: w * mine_m[b] + (1 - w) * rm.get(b, 0.0)
-                       for b in MARGIN_BUCKETS},
-        }
-    _DEPLOY[season] = {"pitchers": out, "role_inning": role_inn,
-                       "role_margin": role_mar, "role_joint": role_joint,
-                       "tie_home_factor": tie_home_factor,
-                       "stabilize": stabilize}
-    return _DEPLOY[season]
-
-
 def deployment_score(pid: Optional[int], inning: int, margin: int,
                      is_home: bool) -> float:
     """How likely THIS pitcher is to be the one entering in THIS state."""
-    dep = build_deployment()
+    dep = Deployment.build_deployment()
     rec = dep["pitchers"].get(pid or -1)
     if rec is None:
         ri = dep["role_inning"].get("other") or {}
         rm = dep["role_margin"].get("other") or {}
-        p = ri.get(min(inning, 10), 0.1) * rm.get(margin_bucket(margin), 0.2)
+        p = ri.get(min(inning, 10), 0.1) * rm.get(Deployment.margin_bucket(margin), 0.2)
         return max(p, 1e-6)
     inn = min(inning, 10)
-    mb = margin_bucket(margin)
+    mb = Deployment.margin_bucket(margin)
     # The role's JOINT P(margin | inning), RAKED by this arm's own deviation
     # from his role's margin marginal.
     #
     # **The joint alone cannot separate two arms in the same role, and that was
-    # the whole defect** (section 4i). It is a four-way role label, and in the
-    # bucket that matters the roles agree: P(trail4 | inning 8) reads 0.167
-    # closer / 0.184 middle / 0.111 other / 0.161 setup. Selection is a RATIO
-    # of scores across available arms, so a term that is ~equal for every arm
-    # cancels — the engine's closer was about as likely to enter down six in
-    # the 8th as its mop-up man, and 14 of 30 pens conceded BACKWARDS.
-    #
-    # `rec["margin"]` already measures the thing per arm and correlates +0.455
-    # with pitcher run value (worst-quartile P(trail4) 0.215 against a best-
-    # quartile 0.103), but `role_joint` covered 82% of (pitcher, inning) cells
-    # and overrode it on every one of them. The signal was measured, correct,
-    # and outranked by a fallback.
-    #
-    # The raking keeps BOTH pieces and adds no constant: the joint keeps the
-    # inning conditioning — which fixed a real bug, the closer taking 30% of
-    # his entries in blowouts against a real 14% — while the ratio restores
-    # each arm's own deviation. The regulariser is the shrinkage already inside
-    # `build_deployment` (`w = n/(n+stabilize)`), so a thin arm's histogram
-    # collapses toward his role and the ratio goes to 1 on its own. Nothing is
-    # clamped, because a clamp would be the fitted parameter this deliberately
-    # avoids.
-    #
-    # **NOT behind a flag, deliberately.** A flag is for a modelling choice the
-    # A/B decides; this is a SIGN ERROR — 14 of 30 pens conceded backwards —
-    # and a defect repair does not get a toggle. Same precedent as trap 17's
-    # `make_pitcher` fallback fix, which went in as code with no switch. The
-    # cost is that this change can never be priced in isolation, because no
-    # `noarmratio` reference arm was ever cached; that is accepted.
-    #
-    # It does NOT reintroduce the bug the override was added for. The closer's
-    # blowout-entry share goes 0.298 -> 0.258 (real ~0.14) — the raking IMPROVES
-    # the very metric `role_joint` was protecting, which the override was in
-    # fact failing to protect: 0.298 is the same ~30% the override was
-    # introduced to fix.
-    #
-    # Measured over all 30 pens, innings 6-8, expected mound run value:
-    # concession gap trail4-lead4 goes -0.0003 -> +0.2278 runs/9 against a real
-    # +0.6801 (0% -> 33%), backwards clubs 14/30 -> 1/30, and the real inverted
-    # U at lead-4+ appears where the old path had no notion of it.
-    #
-    # It does NOT close the gap, and the remaining ceiling is `MARGIN_BUCKETS`:
-    # five cells cannot express a gradient that is monotone in every unit of
-    # margin (`trail13` spans +0.139 at -1 to +0.429 at -3). That is a separate
-    # change and wants measuring separately.
+    # the whole defect** (§4i). It is a four-way role label and in the bucket
+    # that matters the roles agree — P(trail4 | inning 8) is 0.167 closer /
+    # 0.184 middle / 0.111 other / 0.161 setup. Selection is a RATIO across
+    # available arms, so a term ~equal for every arm cancels: the engine's
+    # closer was about as likely to enter down six in the 8th as its mop-up
+    # man, and 14 of 30 pens conceded BACKWARDS. `rec["margin"]` measures the
+    # thing per arm (corr +0.455 with pitcher run value; worst-quartile
+    # P(trail4) 0.215 against 0.103) but `role_joint` covered 82% of
+    # (pitcher, inning) cells and overrode it on all of them — a measured,
+    # correct signal outranked by a fallback.
     joint = dep["role_joint"].get((rec["role"], inn))
     if joint:
         role_mar = (dep["role_margin"].get(rec["role"]) or {}).get(mb, 0.0)
@@ -13561,41 +14426,6 @@ def deployment_score(pid: Optional[int], inning: int, margin: int,
     if inning >= 9 and margin == 0 and rec["role"] == "closer":
         p *= dep["tie_home_factor"] if is_home else 1.0
     return max(p, 1e-9)
-
-
-
-def render_pbp(log: Sequence[dict], home: str = "HOME",
-               away: str = "AWAY") -> str:
-    """A simulated game as readable play-by-play.
-
-    Exists to be READ. Aggregate validation says the appearance rates are
-    right; only walking an actual game shows a closer entering the sixth, a
-    long man leaving after four batters of a blowout, or a pitching change
-    that no manager would make.
-    """
-    _EV = {"K": "strikes out", "BB": "walks", "HBP": "hit by pitch",
-           "GB_OUT": "grounds out", "AIR_OUT": "flies out",
-           "1B": "singles", "2B": "doubles", "3B": "triples",
-           "HR": "HOMERS"}
-    out: List[str] = []
-    half_now = None
-    for e in log:
-        key = (e["inning"], e["half"])
-        if key != half_now:
-            half_now = key
-            side = away if e["half"] == "away" else home
-            out.append(f"\n--- {'Top' if e['half'] == 'away' else 'Bot'} "
-                       f"{e['inning']}  ({side} batting)   "
-                       f"{away} {e['score'][0]} - {e['score'][1]} {home}")
-        if e["new_pitcher"]:
-            out.append(f"    >> PITCHING CHANGE: {e['pitcher']} "
-                       f"({e['throws'] or '?'})")
-        on = f" [{e['on_before']} on]" if e["on_before"] else ""
-        rbi = f"  ({e['runs']} run{'s' if e['runs'] != 1 else ''})" if e["runs"] else ""
-        out.append(f"    {e['outs_before']} out{on}  "
-                   f"{e['batter']} ({e['bats'] or '?'}) "
-                   f"{_EV.get(e['outcome'], e['outcome'])}{rbi}")
-    return "\n".join(out)
 
 
 
@@ -13672,99 +14502,363 @@ REAL_MARKS_SOURCE = (
 MARKS_CACHE = SAVE_DIR / "real_marks_{season}.json"
 
 
-def measure_real_marks(season: int = 2026, start: Optional[str] = None,
-                       end: Optional[str] = None, refresh: bool = False,
-                       timeout: float = 90.0) -> dict:
-    """Recompute the reference marks from StatsAPI linescores, and cache them.
+class Validation:
+    """Sim vs reality — validate against baseball, not against the market."""
 
-    Every quantity `validate_vs_reality` scores against, measured off the same
-    pull so the denominators cannot drift apart — which is exactly how the
-    half-inning marks went wrong before: 4.477 runs / 0.520 per half-inning
-    implies 8.61 innings batted per team-game, and a team bats 8.894.
-    """
-    path = Path(str(MARKS_CACHE).format(season=season))
-    if path.exists() and not refresh:
+    @staticmethod
+    def measure_real_marks(season: Optional[int] = None, start: Optional[str] = None,
+                           end: Optional[str] = None, refresh: bool = False,
+                           timeout: float = 90.0) -> dict:
+        """Recompute the reference marks from StatsAPI linescores, and cache them.
+
+        Every quantity `validate_vs_reality` scores against, measured off the same
+        pull so the denominators cannot drift apart — which is exactly how the
+        half-inning marks went wrong before: 4.477 runs / 0.520 per half-inning
+        implies 8.61 innings batted per team-game, and a team bats 8.894.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        path = Path(str(MARKS_CACHE).format(season=season))
+        if path.exists() and not refresh:
+            try:
+                with open(path) as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                pass
+
+        start = start or f"{season}-03-01"
+        end = end or f"{season}-11-01"
+        url = StatsApi.schedule_url(start=start, end=end,
+                                    hydrate="linescore", game_type="R")
+        data = requests.get(url, timeout=timeout).json()
+
+        vectors: List[List[int]] = []          # per team-game inning runs
+        totals: List[int] = []
+        home_wins = decided = extras = 0
+        for day in data.get("dates", []):
+            for g in day.get("games", []):
+                if (g.get("status") or {}).get("abstractGameState") != "Final":
+                    continue
+                inns = (g.get("linescore") or {}).get("innings") or []
+                a = [i["away"]["runs"] for i in inns
+                     if (i.get("away") or {}).get("runs") is not None]
+                h = [i["home"]["runs"] for i in inns
+                     if (i.get("home") or {}).get("runs") is not None]
+                if len(a) < 8 or len(h) < 8:
+                    continue
+                vectors += [a, h]
+                totals.append(sum(a) + sum(h))
+                if sum(h) != sum(a):
+                    decided += 1
+                    home_wins += sum(h) > sum(a)
+                extras += max(len(a), len(h)) > 9
+
+        if not totals:
+            return dict(REAL_MARKS)
+        tg = [sum(v) for v in vectors]
+        halves = [x for v in vectors for x in v]
+        v8 = [v[:8] for v in vectors if len(v) >= 8]
+        var8 = statistics.pstdev([sum(v) for v in v8]) ** 2
+        indep8 = sum(statistics.pstdev(c) ** 2 for c in zip(*v8))
+
+        marks = {
+            "team_game_runs_mean": statistics.mean(tg),
+            "team_game_runs_sd": statistics.pstdev(tg),
+            "game_total_mean": statistics.mean(totals),
+            "game_total_median": statistics.median(totals),
+            "game_total_sd": statistics.pstdev(totals),
+            "home_win_rate": home_wins / decided if decided else 0.5,
+            "half_inning_runs_mean": statistics.mean(halves),
+            "half_inning_runs_sd": statistics.pstdev(halves),
+            "half_inning_scoreless": sum(1 for x in halves if x == 0) / len(halves),
+            "innings_batted_per_team_game": statistics.mean(len(v) for v in vectors),
+            "extra_inning_fraction": extras / len(totals),
+            "inn18_var": var8,
+            "inn18_indep": indep8,
+            "inn18_cov": var8 - indep8,
+            "inn18_pair_cov": (var8 - indep8) / 56.0,
+            # Per-inning mean over 1-8. NOT flat, and the shape is the thing:
+            # inning 1 is the highest-scoring inning in the game (section 5.4).
+            "inn18_mean_by_inning": [statistics.mean(c) for c in zip(*v8)],
+            "_games": len(totals),
+            "_season": season,
+            "_range": f"{start}..{end}",
+        }
         try:
-            with open(path) as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump(marks, fh, indent=1)
+        except OSError:
             pass
+        return marks
 
-    start = start or f"{season}-03-01"
-    end = end or f"{season}-11-01"
-    url = (f"{STATSAPI}/schedule?sportId=1&gameType=R"
-           f"&startDate={start}&endDate={end}&hydrate=linescore")
-    data = requests.get(url, timeout=timeout).json()
-
-    vectors: List[List[int]] = []          # per team-game inning runs
-    totals: List[int] = []
-    home_wins = decided = extras = 0
-    for day in data.get("dates", []):
-        for g in day.get("games", []):
-            if (g.get("status") or {}).get("abstractGameState") != "Final":
-                continue
-            inns = (g.get("linescore") or {}).get("innings") or []
-            a = [i["away"]["runs"] for i in inns
-                 if (i.get("away") or {}).get("runs") is not None]
-            h = [i["home"]["runs"] for i in inns
-                 if (i.get("home") or {}).get("runs") is not None]
-            if len(a) < 8 or len(h) < 8:
-                continue
-            vectors += [a, h]
-            totals.append(sum(a) + sum(h))
-            if sum(h) != sum(a):
-                decided += 1
-                home_wins += sum(h) > sum(a)
-            extras += max(len(a), len(h)) > 9
-
-    if not totals:
+    @staticmethod
+    def real_marks(season: Optional[int] = None, measured: bool = True) -> dict:
+        """Reference marks: measured when they can be, frozen when they cannot."""
+        season = CURRENT_SEASON if season is None else int(season)
+        if measured:
+            try:
+                return Validation.measure_real_marks(season)
+            except Exception:
+                pass
         return dict(REAL_MARKS)
-    tg = [sum(v) for v in vectors]
-    halves = [x for v in vectors for x in v]
-    v8 = [v[:8] for v in vectors if len(v) >= 8]
-    var8 = statistics.pstdev([sum(v) for v in v8]) ** 2
-    indep8 = sum(statistics.pstdev(c) ** 2 for c in zip(*v8))
 
-    marks = {
-        "team_game_runs_mean": statistics.mean(tg),
-        "team_game_runs_sd": statistics.pstdev(tg),
-        "game_total_mean": statistics.mean(totals),
-        "game_total_median": statistics.median(totals),
-        "game_total_sd": statistics.pstdev(totals),
-        "home_win_rate": home_wins / decided if decided else 0.5,
-        "half_inning_runs_mean": statistics.mean(halves),
-        "half_inning_runs_sd": statistics.pstdev(halves),
-        "half_inning_scoreless": sum(1 for x in halves if x == 0) / len(halves),
-        "innings_batted_per_team_game": statistics.mean(len(v) for v in vectors),
-        "extra_inning_fraction": extras / len(totals),
-        "inn18_var": var8,
-        "inn18_indep": indep8,
-        "inn18_cov": var8 - indep8,
-        "inn18_pair_cov": (var8 - indep8) / 56.0,
-        # Per-inning mean over 1-8. NOT flat, and the shape is the thing:
-        # inning 1 is the highest-scoring inning in the game (section 5.4).
-        "inn18_mean_by_inning": [statistics.mean(c) for c in zip(*v8)],
-        "_games": len(totals),
-        "_season": season,
-        "_range": f"{start}..{end}",
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            json.dump(marks, fh, indent=1)
-    except OSError:
-        pass
-    return marks
+    @staticmethod
+    def inning_vectors(results_log: Sequence[Sequence[dict]]
+                       ) -> List[List[int]]:
+        """Per team-game runs-by-inning vectors, off `simulate_game(log=...)`."""
+        out: List[List[int]] = []
+        for log in results_log:
+            acc: Dict[tuple, int] = {}
+            for ev in log:
+                key = (ev["inning"], ev["half"])
+                acc[key] = acc.get(key, 0) + ev["runs"]
+            for half in ("home", "away"):
+                v = [acc[k] for k in acc if k[1] == half]
+                if v:
+                    out.append(v)
+        return out
 
+    @staticmethod
+    def dispersion_report(vectors: Sequence[Sequence[int]], k: int = 8) -> dict:
+        """Split team-game run variance into independent and covariance parts.
 
-def real_marks(season: int = 2026, measured: bool = True) -> dict:
-    """Reference marks: measured when they can be, frozen when they cannot."""
-    if measured:
+        Over innings 1..k ONLY, and k must stay at 8. Innings 9+ are selected on
+        the score — the home half of the 9th is not batted when the home side
+        leads, and extras happen only in tied games and are then inflated by the
+        auto-runner — so including them mixes three negative-covariance selection
+        effects into the number and hides the thing being measured.
+        """
+        v = [list(x[:k]) for x in vectors if len(x) >= k]
+        if not v:
+            return {}
+        tot = [sum(x) for x in v]
+        var = statistics.pstdev(tot) ** 2
+        indep = sum(statistics.pstdev(c) ** 2 for c in zip(*v))
+        n_pairs = k * (k - 1) // 2
+        lags = {}
+        for lag in range(1, k):
+            pts = [(x[i], x[i + lag]) for x in v for i in range(k - lag)]
+            mx = statistics.mean(a for a, _ in pts)
+            my = statistics.mean(b for _, b in pts)
+            lags[lag] = sum((a - mx) * (b - my) for a, b in pts) / len(pts)
+        return {
+            "team_games": len(v),
+            "mean": statistics.mean(tot),
+            "sd": statistics.pstdev(tot),
+            "var": var,
+            "indep": indep,
+            # Per-inning MEAN, which is a different defect from the covariance and
+            # needs its own scoreboard. Real baseball's profile is not flat and its
+            # shape is specific: inning 1 is the HIGHEST-scoring inning of the game
+            # (0.531 against a 1-8 average of 0.500), because the top of the order
+            # bats and the starter has not settled. Section 5.4 of sim_state.md.
+            "by_inning": [statistics.mean(c) for c in zip(*v)],
+            "cov": var - indep,
+            "cov_share": (var - indep) / var if var else 0.0,
+            "pair_cov": (var - indep) / (2 * n_pairs) if n_pairs else 0.0,
+            "by_lag": lags,
+            # Where the covariance sits. Real baseball puts MOST of it in the
+            # bullpen innings (+0.0316) and least inside the starter's own window
+            # (+0.0135) — so it is not a starter's nightly form, and a per-starter
+            # noise draw would reproduce the wrong shape.
+            "window": {
+                "starter_1_5": Validation._window_cov(v, lambda i, j: j <= 4),
+                "bullpen_6_8": Validation._window_cov(v, lambda i, j: i >= 5),
+                "spanning": Validation._window_cov(v, lambda i, j: i <= 4 and j >= 5),
+            },
+        }
+
+    @staticmethod
+    def _window_cov(v: Sequence[Sequence[int]], sel) -> Optional[float]:
+        k = len(v[0])
+        pts = [(x[i], x[j]) for x in v
+               for i in range(k) for j in range(i + 1, k) if sel(i, j)]
+        if not pts:
+            return None
+        mx = statistics.mean(a for a, _ in pts)
+        my = statistics.mean(b for _, b in pts)
+        return sum((a - mx) * (b - my) for a, b in pts) / len(pts)
+
+    @staticmethod
+    def _clone_dispersion(n: int, seed: int) -> dict:
+        """`dispersion_report` over `n` games of LEAGUE-AVERAGE clones.
+
+        Clones on both sides on purpose: with no matchup heterogeneity the
+        covariance term isolates what the game-level form draw contributes.
+        `_form_probe` and `validate_dispersion` ran the identical loop.
+        """
+        rng = random.Random(seed)
+        home, away = league_side("H"), league_side("A")
+        logs = []
+        for _ in range(n):
+            log: List[dict] = []
+            simulate_game(home, away, rng, log=log)
+            logs.append(log)
+        return Validation.dispersion_report(Validation.inning_vectors(logs))
+
+    @staticmethod
+    def _form_probe(sd: float, shift: float, n: int, seed: int) -> dict:
+        """Run league-average clones at a given form draw and report the effect."""
+        global GAME_FORM_SD, GAME_FORM_MEAN_SHIFT
+        old = (GAME_FORM_SD, GAME_FORM_MEAN_SHIFT)
+        GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = sd, shift
         try:
-            return measure_real_marks(season)
-        except Exception:
-            pass
-    return dict(REAL_MARKS)
+            rep = Validation._clone_dispersion(n, seed)
+        finally:
+            GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = old
+        return rep
+
+    @staticmethod
+    def calibrate_form(target_extra_cov: float = 0.0159, n: int = 8000,
+                       seed: int = 23, verbose: bool = True) -> dict:
+        """Fit `GAME_FORM_SD` and `GAME_FORM_MEAN_SHIFT` against measured data.
+
+        Two quantities, fitted in order because they are nearly independent:
+
+        1. `GAME_FORM_SD` — solved so the added per-inning covariance matches
+           `target_extra_cov`. Covariance is quadratic in the tilt, so one probe
+           fixes the scale: sd = probe_sd * sqrt(target / probe_cov).
+        2. `GAME_FORM_MEAN_SHIFT` — runs are CONVEX in offensive rate, so a
+           symmetric tilt RAISES the mean. Measured, then subtracted. Skipping
+           this would ship a variance fix that quietly moves every total.
+
+        Returns the fitted values; it does NOT write them. Paste them into the
+        constants once you have looked at the report.
+        """
+        base = Validation._form_probe(0.0, 0.0, n, seed)
+        # **Fit a GRID, do not iterate.** The covariance estimate carries ~20%
+        # sampling error at this n, so a secant step chases that noise instead of
+        # the signal — successive iterations bounced 0.0111 / 0.0115 / 0.0197 for
+        # monotonically increasing sd. Covariance is very nearly quadratic in the
+        # tilt (the clipping bends it only in the far tail), so probe a spread of
+        # sd values, fit `cov = k * sd^2` by least squares through the origin, and
+        # solve once. That averages the noise instead of following it.
+        grid = [0.06, 0.09, 0.12, 0.15, 0.18]
+        pts = []
+        for g in grid:
+            cov = Validation._form_probe(g, 0.0, n, seed)["pair_cov"] - base["pair_cov"]
+            pts.append((g, cov))
+            if verbose:
+                print(f"    probe sd {g:.3f} -> extra cov {cov:+.5f}")
+        num = sum((g ** 2) * c for g, c in pts)
+        den = sum((g ** 2) ** 2 for g, _ in pts)
+        k = num / den if den else 0.0
+        if k <= 0:
+            raise RuntimeError("mlb_sim: form probe produced no covariance")
+        sd = math.sqrt(target_extra_cov / k)
+        if verbose:
+            print(f"    fitted k = {k:.4f}  ->  sd = {sd:.5f}")
+        at_sd = Validation._form_probe(sd, 0.0, n, seed)
+        # mean shift per team-game, converted back into tilt units by the same
+        # local slope the probe measured
+        d_mean = at_sd["mean"] - base["mean"]
+        shift = 0.0
+        if d_mean > 0:
+            lo = Validation._form_probe(sd, 0.004, n, seed)
+            per_unit = (lo["mean"] - at_sd["mean"]) / 0.004
+            if per_unit < 0:
+                shift = max(0.0, d_mean / -per_unit)
+        final = Validation._form_probe(sd, shift, n, seed)
+
+        out = {"GAME_FORM_SD": sd, "GAME_FORM_MEAN_SHIFT": shift,
+               "base": base, "final": final,
+               "target_extra_cov": target_extra_cov}
+        if verbose:
+            marks = Validation.real_marks()
+            print(f"form calibration ({n} games/probe, innings 1-8)")
+            print(f"  target extra pair-cov      {target_extra_cov:+.5f}")
+            print(f"  GAME_FORM_SD               {sd:.5f}")
+            print(f"  GAME_FORM_MEAN_SHIFT       {shift:.5f}")
+            print(f"\n  {'':12s} {'before':>10s} {'after':>10s} {'real':>10s}")
+            print(f"  {'mean':12s} {base['mean']:10.4f} {final['mean']:10.4f}"
+                  f" {marks.get('team_game_runs_mean', 0)*8/8.894:10.4f}")
+            print(f"  {'sd':12s} {base['sd']:10.4f} {final['sd']:10.4f}"
+                  f" {marks.get('inn18_var', 0)**0.5:10.4f}")
+            print(f"  {'pair_cov':12s} {base['pair_cov']:10.5f}"
+                  f" {final['pair_cov']:10.5f}"
+                  f" {marks.get('inn18_pair_cov', 0):10.5f}")
+            print(f"  {'cov term':12s} {base['cov']:10.4f} {final['cov']:10.4f}"
+                  f" {marks.get('inn18_cov', 0):10.4f}")
+        return out
+
+    @staticmethod
+    def validate_dispersion(n: int = 6000, seed: int = 11,
+                            season: Optional[int] = None) -> dict:
+        """Score the sim's run DISPERSION, not just its level, against reality.
+
+        The level marks pass while the shape does not, and the shape is what
+        prices totals and run lines. Note this runs league-average CLONES, which
+        have no matchup heterogeneity at all: expect the covariance term near
+        zero here, and read it against `inn18_cov` as the size of what real
+        matchups plus an explicit game-level term have to supply.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        rep = Validation._clone_dispersion(n, seed)
+        marks = Validation.real_marks(season)
+        rep["real"] = {"var": marks.get("inn18_var"),
+                       "indep": marks.get("inn18_indep"),
+                       "cov": marks.get("inn18_cov"),
+                       "pair_cov": marks.get("inn18_pair_cov")}
+        return rep
+
+    @staticmethod
+    def _slate_row(g: dict) -> Optional[dict]:
+        """One hydrated schedule game -> the fields the harness needs, or None."""
+        if (g.get("status") or {}).get("abstractGameState") != "Final":
+            return None
+        inns = (g.get("linescore") or {}).get("innings") or []
+        away = [i["away"]["runs"] for i in inns
+                if (i.get("away") or {}).get("runs") is not None]
+        home = [i["home"]["runs"] for i in inns
+                if (i.get("home") or {}).get("runs") is not None]
+        if len(away) < 8 or len(home) < 8:
+            return None
+
+        t = g.get("teams") or {}
+        hs, aws = t.get("home") or {}, t.get("away") or {}
+
+        def abbr(side: dict) -> str:
+            a = (side.get("team") or {}).get("abbreviation") or ""
+            return normalize_club(a)
+
+        ha, aa = abbr(hs), abbr(aws)
+        if not ha or not aa:
+            return None
+
+        lu = g.get("lineups") or {}
+        wx = g.get("weather") or {}
+        m = re.match(r"\s*(\d+(?:\.\d+)?)\s*mph,\s*(.*)", str(wx.get("wind") or ""))
+        temp = wx.get("temp")
+        return {
+            "pk": g.get("gamePk"),
+            "date": g.get("officialDate") or "",
+            # FIRST PITCH, UTC ISO. The slate carried only the DATE, so the engine
+            # could not ask any question involving when a game starts — day/night,
+            # body clock, shadows. §7 records circadian as UNDERPOWERED rather than
+            # absent, and that test had to be run against a different database
+            # entirely because this one has no clock. Cheap to carry, and a
+            # prerequisite for ever revisiting it here.
+            "start": g.get("gameDate") or "",
+            "day_night": g.get("dayNight") or "",
+            "home": ha, "away": aa,
+            "venue": (g.get("venue") or {}).get("name") or "",
+            "home_sp": ((hs.get("probablePitcher") or {}).get("id")),
+            "away_sp": ((aws.get("probablePitcher") or {}).get("id")),
+            "home_lineup": [p.get("id") for p in (lu.get("homePlayers") or [])][:9],
+            "away_lineup": [p.get("id") for p in (lu.get("awayPlayers") or [])][:9],
+            # The posted CATCHER. The hydrate already carries `primaryPosition`;
+            # keeping only ids threw it away, which is why per-catcher framing was
+            # not testable in the backtest. Framing is a PLAYER skill, so a club
+            # aggregate is the wrong object to lag (see `catcher_framing_per_game`).
+            "home_catcher": LiveSlate._lineup_catcher(lu.get("homePlayers")),
+            "away_catcher": LiveSlate._lineup_catcher(lu.get("awayPlayers")),
+            "condition": wx.get("condition"),
+            "temp_f": float(temp) if temp not in (None, "") else None,
+            "wind_mph": float(m.group(1)) if m else None,
+            "wind_label": (m.group(2).strip() if m else ""),
+            "home_innings": home,
+            "away_innings": away,
+        }
 
 
 def validate_vs_reality(n: int = 20000, seed: int = 5) -> dict:
@@ -13783,207 +14877,9 @@ def validate_vs_reality(n: int = 20000, seed: int = 5) -> dict:
         "game_total_sd": statistics.pstdev(tot),
         "home_win_rate": sum(1 for r in dec if r.runs_home > r.runs_away) / len(dec),
     }
-    marks = real_marks()
+    marks = Validation.real_marks()
     return {k: {"sim": v, "real": marks[k], "diff": v - marks[k]}
             for k, v in got.items()}
-
-
-def inning_vectors(results_log: Sequence[Sequence[dict]]
-                   ) -> List[List[int]]:
-    """Per team-game runs-by-inning vectors, off `simulate_game(log=...)`."""
-    out: List[List[int]] = []
-    for log in results_log:
-        acc: Dict[tuple, int] = {}
-        for ev in log:
-            key = (ev["inning"], ev["half"])
-            acc[key] = acc.get(key, 0) + ev["runs"]
-        for half in ("home", "away"):
-            v = [acc[k] for k in acc if k[1] == half]
-            if v:
-                out.append(v)
-    return out
-
-
-def dispersion_report(vectors: Sequence[Sequence[int]], k: int = 8) -> dict:
-    """Split team-game run variance into independent and covariance parts.
-
-    Over innings 1..k ONLY, and k must stay at 8. Innings 9+ are selected on
-    the score — the home half of the 9th is not batted when the home side
-    leads, and extras happen only in tied games and are then inflated by the
-    auto-runner — so including them mixes three negative-covariance selection
-    effects into the number and hides the thing being measured.
-    """
-    v = [list(x[:k]) for x in vectors if len(x) >= k]
-    if not v:
-        return {}
-    tot = [sum(x) for x in v]
-    var = statistics.pstdev(tot) ** 2
-    indep = sum(statistics.pstdev(c) ** 2 for c in zip(*v))
-    n_pairs = k * (k - 1) // 2
-    lags = {}
-    for lag in range(1, k):
-        pts = [(x[i], x[i + lag]) for x in v for i in range(k - lag)]
-        mx = statistics.mean(a for a, _ in pts)
-        my = statistics.mean(b for _, b in pts)
-        lags[lag] = sum((a - mx) * (b - my) for a, b in pts) / len(pts)
-    return {
-        "team_games": len(v),
-        "mean": statistics.mean(tot),
-        "sd": statistics.pstdev(tot),
-        "var": var,
-        "indep": indep,
-        # Per-inning MEAN, which is a different defect from the covariance and
-        # needs its own scoreboard. Real baseball's profile is not flat and its
-        # shape is specific: inning 1 is the HIGHEST-scoring inning of the game
-        # (0.531 against a 1-8 average of 0.500), because the top of the order
-        # bats and the starter has not settled. Section 5.4 of sim_state.md.
-        "by_inning": [statistics.mean(c) for c in zip(*v)],
-        "cov": var - indep,
-        "cov_share": (var - indep) / var if var else 0.0,
-        "pair_cov": (var - indep) / (2 * n_pairs) if n_pairs else 0.0,
-        "by_lag": lags,
-        # Where the covariance sits. Real baseball puts MOST of it in the
-        # bullpen innings (+0.0316) and least inside the starter's own window
-        # (+0.0135) — so it is not a starter's nightly form, and a per-starter
-        # noise draw would reproduce the wrong shape.
-        "window": {
-            "starter_1_5": _window_cov(v, lambda i, j: j <= 4),
-            "bullpen_6_8": _window_cov(v, lambda i, j: i >= 5),
-            "spanning": _window_cov(v, lambda i, j: i <= 4 <= 5 <= j),
-        },
-    }
-
-
-def _window_cov(v: Sequence[Sequence[int]], sel) -> Optional[float]:
-    k = len(v[0])
-    pts = [(x[i], x[j]) for x in v
-           for i in range(k) for j in range(i + 1, k) if sel(i, j)]
-    if not pts:
-        return None
-    mx = statistics.mean(a for a, _ in pts)
-    my = statistics.mean(b for _, b in pts)
-    return sum((a - mx) * (b - my) for a, b in pts) / len(pts)
-
-
-def _form_probe(sd: float, shift: float, n: int, seed: int) -> dict:
-    """Run league-average clones at a given form draw and report the effect."""
-    global GAME_FORM_SD, GAME_FORM_MEAN_SHIFT
-    old = (GAME_FORM_SD, GAME_FORM_MEAN_SHIFT)
-    GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = sd, shift
-    try:
-        side = league_side
-        rng = random.Random(seed)
-        home, away = side("H"), side("A")
-        logs = []
-        for _ in range(n):
-            log: List[dict] = []
-            simulate_game(home, away, rng, log=log)
-            logs.append(log)
-        rep = dispersion_report(inning_vectors(logs))
-    finally:
-        GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = old
-    return rep
-
-
-def calibrate_form(target_extra_cov: float = 0.0159, n: int = 8000,
-                   seed: int = 23, verbose: bool = True) -> dict:
-    """Fit `GAME_FORM_SD` and `GAME_FORM_MEAN_SHIFT` against measured data.
-
-    Two quantities, fitted in order because they are nearly independent:
-
-    1. `GAME_FORM_SD` — solved so the added per-inning covariance matches
-       `target_extra_cov`. Covariance is quadratic in the tilt, so one probe
-       fixes the scale: sd = probe_sd * sqrt(target / probe_cov).
-    2. `GAME_FORM_MEAN_SHIFT` — runs are CONVEX in offensive rate, so a
-       symmetric tilt RAISES the mean. Measured, then subtracted. Skipping
-       this would ship a variance fix that quietly moves every total.
-
-    Returns the fitted values; it does NOT write them. Paste them into the
-    constants once you have looked at the report.
-    """
-    base = _form_probe(0.0, 0.0, n, seed)
-    # **Fit a GRID, do not iterate.** The covariance estimate carries ~20%
-    # sampling error at this n, so a secant step chases that noise instead of
-    # the signal — successive iterations bounced 0.0111 / 0.0115 / 0.0197 for
-    # monotonically increasing sd. Covariance is very nearly quadratic in the
-    # tilt (the clipping bends it only in the far tail), so probe a spread of
-    # sd values, fit `cov = k * sd^2` by least squares through the origin, and
-    # solve once. That averages the noise instead of following it.
-    grid = [0.06, 0.09, 0.12, 0.15, 0.18]
-    pts = []
-    for g in grid:
-        cov = _form_probe(g, 0.0, n, seed)["pair_cov"] - base["pair_cov"]
-        pts.append((g, cov))
-        if verbose:
-            print(f"    probe sd {g:.3f} -> extra cov {cov:+.5f}")
-    num = sum((g ** 2) * c for g, c in pts)
-    den = sum((g ** 2) ** 2 for g, _ in pts)
-    k = num / den if den else 0.0
-    if k <= 0:
-        raise RuntimeError("mlb_sim: form probe produced no covariance")
-    sd = math.sqrt(target_extra_cov / k)
-    if verbose:
-        print(f"    fitted k = {k:.4f}  ->  sd = {sd:.5f}")
-    at_sd = _form_probe(sd, 0.0, n, seed)
-    # mean shift per team-game, converted back into tilt units by the same
-    # local slope the probe measured
-    d_mean = at_sd["mean"] - base["mean"]
-    shift = 0.0
-    if d_mean > 0:
-        lo = _form_probe(sd, 0.004, n, seed)
-        per_unit = (lo["mean"] - at_sd["mean"]) / 0.004
-        if per_unit < 0:
-            shift = max(0.0, d_mean / -per_unit)
-    final = _form_probe(sd, shift, n, seed)
-
-    out = {"GAME_FORM_SD": sd, "GAME_FORM_MEAN_SHIFT": shift,
-           "base": base, "final": final,
-           "target_extra_cov": target_extra_cov}
-    if verbose:
-        marks = real_marks()
-        print(f"form calibration ({n} games/probe, innings 1-8)")
-        print(f"  target extra pair-cov      {target_extra_cov:+.5f}")
-        print(f"  GAME_FORM_SD               {sd:.5f}")
-        print(f"  GAME_FORM_MEAN_SHIFT       {shift:.5f}")
-        print(f"\n  {'':12s} {'before':>10s} {'after':>10s} {'real':>10s}")
-        print(f"  {'mean':12s} {base['mean']:10.4f} {final['mean']:10.4f}"
-              f" {marks.get('team_game_runs_mean', 0)*8/8.894:10.4f}")
-        print(f"  {'sd':12s} {base['sd']:10.4f} {final['sd']:10.4f}"
-              f" {marks.get('inn18_var', 0)**0.5:10.4f}")
-        print(f"  {'pair_cov':12s} {base['pair_cov']:10.5f}"
-              f" {final['pair_cov']:10.5f}"
-              f" {marks.get('inn18_pair_cov', 0):10.5f}")
-        print(f"  {'cov term':12s} {base['cov']:10.4f} {final['cov']:10.4f}"
-              f" {marks.get('inn18_cov', 0):10.4f}")
-    return out
-
-
-def validate_dispersion(n: int = 6000, seed: int = 11,
-                        season: int = 2026) -> dict:
-    """Score the sim's run DISPERSION, not just its level, against reality.
-
-    The level marks pass while the shape does not, and the shape is what
-    prices totals and run lines. Note this runs league-average CLONES, which
-    have no matchup heterogeneity at all: expect the covariance term near
-    zero here, and read it against `inn18_cov` as the size of what real
-    matchups plus an explicit game-level term have to supply.
-    """
-    side = league_side
-
-    rng = random.Random(seed)
-    home, away = side("H"), side("A")
-    logs = []
-    for _ in range(n):
-        log: List[dict] = []
-        simulate_game(home, away, rng, log=log)
-        logs.append(log)
-    rep = dispersion_report(inning_vectors(logs))
-    marks = real_marks(season)
-    rep["real"] = {"var": marks.get("inn18_var"),
-                   "indep": marks.get("inn18_indep"),
-                   "cov": marks.get("inn18_cov"),
-                   "pair_cov": marks.get("inn18_pair_cov")}
-    return rep
 
 
 # ===========================================================================
@@ -14036,7 +14932,7 @@ def _dedupe_slate(rows: List[dict]) -> List[dict]:
     return sorted(seen.values(), key=lambda r: (r["date"], r["pk"]))
 
 
-def season_slate(season: int = 2026, start: Optional[str] = None,
+def season_slate(season: Optional[int] = None, start: Optional[str] = None,
                  end: Optional[str] = None, refresh: bool = False,
                  timeout: float = 90.0,
                  save_dir: Path = SAVE_DIR) -> List[dict]:
@@ -14050,6 +14946,7 @@ def season_slate(season: int = 2026, start: Optional[str] = None,
     FIELD-relative ("12 mph, Out To CF"), so it carries `wind_label` and needs
     no azimuth rotation — see `weather_tilt`.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     path = Path(str(SLATE_CACHE).format(season=season))
     if path.exists() and not refresh:
         try:
@@ -14067,13 +14964,13 @@ def season_slate(season: int = 2026, start: Optional[str] = None,
     cur = d0
     while cur <= d1:
         hi = min(cur + datetime.timedelta(days=SLATE_WINDOW_DAYS - 1), d1)
-        url = (f"{STATSAPI}/schedule?sportId=1&gameType=R"
-               f"&startDate={cur.isoformat()}&endDate={hi.isoformat()}"
-               f"&hydrate=linescore,weather,team,probablePitcher,lineups")
+        url = StatsApi.schedule_url(
+            start=cur.isoformat(), end=hi.isoformat(), game_type="R",
+            hydrate="linescore,weather,team,probablePitcher,lineups")
         data = requests.get(url, timeout=timeout).json()
         for day in data.get("dates", []):
             for g in day.get("games", []):
-                row = _slate_row(g)
+                row = Validation._slate_row(g)
                 if row is not None:
                     out.append(row)
         cur = hi + datetime.timedelta(days=1)
@@ -14102,65 +14999,6 @@ def season_slate(season: int = 2026, start: Optional[str] = None,
     return out
 
 
-def _slate_row(g: dict) -> Optional[dict]:
-    """One hydrated schedule game -> the fields the harness needs, or None."""
-    if (g.get("status") or {}).get("abstractGameState") != "Final":
-        return None
-    inns = (g.get("linescore") or {}).get("innings") or []
-    away = [i["away"]["runs"] for i in inns
-            if (i.get("away") or {}).get("runs") is not None]
-    home = [i["home"]["runs"] for i in inns
-            if (i.get("home") or {}).get("runs") is not None]
-    if len(away) < 8 or len(home) < 8:
-        return None
-
-    t = g.get("teams") or {}
-    hs, aws = t.get("home") or {}, t.get("away") or {}
-
-    def abbr(side: dict) -> str:
-        a = (side.get("team") or {}).get("abbreviation") or ""
-        return normalize_club(a)
-
-    ha, aa = abbr(hs), abbr(aws)
-    if not ha or not aa:
-        return None
-
-    lu = g.get("lineups") or {}
-    wx = g.get("weather") or {}
-    m = re.match(r"\s*(\d+(?:\.\d+)?)\s*mph,\s*(.*)", str(wx.get("wind") or ""))
-    temp = wx.get("temp")
-    return {
-        "pk": g.get("gamePk"),
-        "date": g.get("officialDate") or "",
-        # FIRST PITCH, UTC ISO. The slate carried only the DATE, so the engine
-        # could not ask any question involving when a game starts — day/night,
-        # body clock, shadows. §7 records circadian as UNDERPOWERED rather than
-        # absent, and that test had to be run against a different database
-        # entirely because this one has no clock. Cheap to carry, and a
-        # prerequisite for ever revisiting it here.
-        "start": g.get("gameDate") or "",
-        "day_night": g.get("dayNight") or "",
-        "home": ha, "away": aa,
-        "venue": (g.get("venue") or {}).get("name") or "",
-        "home_sp": ((hs.get("probablePitcher") or {}).get("id")),
-        "away_sp": ((aws.get("probablePitcher") or {}).get("id")),
-        "home_lineup": [p.get("id") for p in (lu.get("homePlayers") or [])][:9],
-        "away_lineup": [p.get("id") for p in (lu.get("awayPlayers") or [])][:9],
-        # The posted CATCHER. The hydrate already carries `primaryPosition`;
-        # keeping only ids threw it away, which is why per-catcher framing was
-        # not testable in the backtest. Framing is a PLAYER skill, so a club
-        # aggregate is the wrong object to lag (see `catcher_framing_per_game`).
-        "home_catcher": _lineup_catcher(lu.get("homePlayers")),
-        "away_catcher": _lineup_catcher(lu.get("awayPlayers")),
-        "condition": wx.get("condition"),
-        "temp_f": float(temp) if temp not in (None, "") else None,
-        "wind_mph": float(m.group(1)) if m else None,
-        "wind_label": (m.group(2).strip() if m else ""),
-        "home_innings": home,
-        "away_innings": away,
-    }
-
-
 # ---------------------------------------------------------------------------
 # PERIOD-CORRECT weather — the forecast the market actually had
 # ---------------------------------------------------------------------------
@@ -14186,7 +15024,6 @@ def _slate_row(g: dict) -> Optional[dict]:
 #
 # One request per park covers a whole season (4,680 hourly rows, ~5 s), so both
 # seasons cost ~60 requests.
-OPEN_METEO_PREVIOUS_RUNS = "https://previous-runs-api.open-meteo.com/v1/forecast"
 FORECAST_WX_PATH_FMT = "weather_forecast_{season}_d{lag}.json"
 
 # Which weather the rate/context layer sees. "observed" is StatsAPI's game-time
@@ -14200,9 +15037,66 @@ WEATHER_FORECAST_LAG_DAYS = 1
 _FCST_WX: Dict[tuple, Dict[int, dict]] = {}
 
 
-def forecast_weather_path(season: int, lag: int = 1,
-                          save_dir: Path = SAVE_DIR) -> Path:
-    return Path(save_dir) / FORECAST_WX_PATH_FMT.format(season=season, lag=lag)
+class SlateWeather:
+    """Period-correct weather — the forecast the market actually had."""
+
+    @staticmethod
+    def forecast_weather_path(season: int, lag: int = 1,
+                              save_dir: Path = SAVE_DIR) -> Path:
+        return Path(save_dir) / FORECAST_WX_PATH_FMT.format(season=season, lag=lag)
+
+    @staticmethod
+    def _slate_context(season: int, save_dir: Path) -> tuple:
+        key = (int(season), str(save_dir))
+        got = _SLATE_TABLES.get(key)
+        if got is None:
+            bat_table, _ = build_rates("bat", save_dir=save_dir)
+            pit_table, _ = build_rates("pit", save_dir=save_dir)
+            hz = starter_hazard()
+            got = (bat_table, pit_table, hz)
+            _SLATE_TABLES[key] = got
+        return got
+
+    @staticmethod
+    def _slate_total_report(sim_tot: Sequence[float], sim_mc: Sequence[float],
+                            real_tot: Sequence[int], reps: int) -> dict:
+        """Game-total agreement, with the harness's OWN noise floor removed.
+
+        **`reps` is not a free knob and a low one silently fakes both numbers.**
+        A per-game mean over `reps` sims is the model's expectation plus Monte
+        Carlo noise of variance `mc/reps`, and at reps=10 that noise is ~1.4 runs
+        against a real model spread near 1.0 — so most of the reported `model_sd`
+        is the harness, and the correlation is attenuated by roughly the same
+        factor. Two fatigue variants once read 0.194 and 0.152 purely on that,
+        which is a conclusion drawn from rep count.
+
+        So the MC component is measured per game (the within-game variance of the
+        reps, which is free) and reported alongside: `model_sd_adj` is the spread
+        with it removed, and `corr_adj` the correlation disattenuated for it.
+        Neither can be trusted when `mc_share` is large — raise `reps` instead.
+        """
+        n = len(sim_tot)
+        if n < 3:
+            return {"n": n}
+        var_obs = statistics.pstdev(sim_tot) ** 2
+        var_mc = (statistics.mean(sim_mc) / reps) if reps > 1 else 0.0
+        var_adj = max(var_obs - var_mc, 0.0)
+        corr = _corr(sim_tot, [float(x) for x in real_tot])
+        corr_adj = None
+        if corr is not None and var_adj > 0:
+            corr_adj = corr * (var_obs / var_adj) ** 0.5
+        return {
+            "n": n, "reps": reps,
+            "sim_mean": statistics.mean(sim_tot),
+            "real_mean": statistics.mean(real_tot),
+            "model_sd": var_obs ** 0.5,
+            "mc_sd": var_mc ** 0.5,
+            "model_sd_adj": var_adj ** 0.5,
+            "mc_share": (var_mc / var_obs) if var_obs else 0.0,
+            "corr": corr, "corr_adj": corr_adj,
+            "rmse": statistics.mean((a - b) ** 2 for a, b
+                                    in zip(sim_tot, real_tot)) ** 0.5,
+        }
 
 
 def weather_source_lag(source: Optional[str] = None) -> Optional[int]:
@@ -14228,7 +15122,7 @@ def load_forecast_weather(season: int, lag: int = 1,
     key = (int(season), int(lag))
     if key in _FCST_WX:
         return _FCST_WX[key]
-    path = forecast_weather_path(season, lag, save_dir)
+    path = SlateWeather.forecast_weather_path(season, lag, save_dir)
     out: Dict[int, dict] = {}
     if path.exists():
         try:
@@ -14241,7 +15135,7 @@ def load_forecast_weather(season: int, lag: int = 1,
     return out
 
 
-def fetch_forecast_weather(season: int = 2026,
+def fetch_forecast_weather(season: Optional[int] = None,
                            lag_days: Optional[int] = None,
                            save_dir: Path = SAVE_DIR,
                            verbose: bool = True) -> Dict[int, dict]:
@@ -14262,6 +15156,7 @@ def fetch_forecast_weather(season: int = 2026,
       knowable in advance and is not the leak being closed here; temperature
       and wind are.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     lag = WEATHER_FORECAST_LAG_DAYS if lag_days is None else lag_days
     wm = _wm()
     slate = season_slate(season, save_dir=save_dir)
@@ -14285,7 +15180,7 @@ def fetch_forecast_weather(season: int = 2026,
             print(f"[forecastwx] {sum(unresolved.values())} games at parks with "
                   f"no coordinates, left WITHOUT weather rather than given the "
                   f"observation: {unresolved}")
-    _progress(f"forecastwx {season}: {len(by_park)} parks to fetch")
+    Archive._progress(f"forecastwx {season}: {len(by_park)} parks to fetch")
 
     for i, (park, rows) in enumerate(sorted(by_park.items()), 1):
         meta = wm.STADIUM_DATA[park]
@@ -14296,8 +15191,8 @@ def fetch_forecast_weather(season: int = 2026,
             "latitude": meta["lat"], "longitude": meta["lon"],
             # a day either side, because first pitch in UTC can land on the
             # neighbouring calendar day for a night game
-            "start_date": _days_before(days[0], 1),
-            "end_date": _days_before(days[-1], -1),
+            "start_date": RelieverUsage._days_before(days[0], 1),
+            "end_date": RelieverUsage._days_before(days[-1], -1),
             # **`surface_pressure`, NOT `pressure_msl`.** The former is at the
             # park's own elevation, which is what air density wants; feeding a
             # sea-level reading into a station-level correction turns Coors'
@@ -14309,7 +15204,8 @@ def fetch_forecast_weather(season: int = 2026,
             "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
             "timezone": "UTC"}
         try:
-            r = requests.get(OPEN_METEO_PREVIOUS_RUNS, params=params, timeout=90)
+            r = requests.get(OpenMeteo.PREVIOUS_RUNS, params=params,
+                             timeout=OpenMeteo.TIMEOUT)
             h = (r.json() or {}).get("hourly") or {}
         except Exception as e:                       # network, JSON, anything
             print(f"[forecastwx] {park}: FAILED ({e}) — its games keep no "
@@ -14346,16 +15242,16 @@ def fetch_forecast_weather(season: int = 2026,
         if verbose:
             print(f"[forecastwx] {i:2d}/{len(by_park)} {park:28s} "
                   f"{hit}/{len(rows)} games", flush=True)
-        _progress(f"forecastwx {season} {i}/{len(by_park)} {park} {hit}")
+        Archive._progress(f"forecastwx {season} {i}/{len(by_park)} {park} {hit}")
 
-    path = forecast_weather_path(season, lag, save_dir)
+    path = SlateWeather.forecast_weather_path(season, lag, save_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as fh:
         json.dump({str(k): v for k, v in out.items()}, fh)
     _FCST_WX.pop((int(season), int(lag)), None)
     if verbose:
         print(f"\n[forecastwx] {season}: {len(out)}/{len(slate)} games -> {path}")
-    _progress(f"forecastwx {season} FINISHED {len(out)}/{len(slate)}")
+    Archive._progress(f"forecastwx {season} FINISHED {len(out)}/{len(slate)}")
     return out
 
 
@@ -14535,7 +15431,7 @@ def _slate_weather(row: dict) -> Optional[dict]:
 
 
 def slate_sides(slate: Sequence[dict], bat_table: Dict[int, dict],
-                pit_table: Dict[int, dict], season: int = 2026,
+                pit_table: Dict[int, dict], season: Optional[int] = None,
                 hazard: Optional[List[float]] = None,
                 save_dir: Path = SAVE_DIR) -> Dict[str, "TeamSide"]:
     """One board-built TeamSide per club appearing on the slate.
@@ -14543,6 +15439,7 @@ def slate_sides(slate: Sequence[dict], bat_table: Dict[int, dict],
     Built once and shared: `simulate_game` never mutates a side, and rebuilding
     30 clubs per game costs more than every simulation put together.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     clubs = sorted({r["home"] for r in slate} | {r["away"] for r in slate})
     out: Dict[str, TeamSide] = {}
     for c in clubs:
@@ -14591,13 +15488,13 @@ def _game_side(base: "TeamSide", sp_id: Optional[int],
     # `TEAM_CONTEXT_LAG` like every other team-context term — and lagging a
     # CATCHER is legitimate where lagging a CLUB is not, because his skill
     # goes with him when he is traded.
-    catcher_framing = (catcher_framing_per_game(
+    catcher_framing = (Framing.catcher_framing_per_game(
         catcher_id, season - TEAM_CONTEXT_LAG, save_dir)
         if (USE_PITCH_FRAMING and catcher_id is not None) else None)
 
     if sp_id:
         share = starter_gs_share(int(sp_id), season, save_dir)
-        traits = load_reliever_traits(season).get(int(sp_id)) or {}
+        traits = RelieverTraits.load_reliever_traits(season).get(int(sp_id)) or {}
         is_opener = share is not None and share < OPENER_GS_SHARE
         bf_target = (start_bf_estimate(int(sp_id), season, save_dir)
                      or traits.get("bf_per_outing") or 4.5)
@@ -14645,18 +15542,6 @@ def _game_side(base: "TeamSide", sp_id: Optional[int],
 # Per-worker caches. Rebuilding the rate tables and the 30 club sides costs
 # ~5 s, so each process pays it once instead of once per chunk.
 _SLATE_TABLES: Dict[tuple, tuple] = {}
-
-
-def _slate_context(season: int, save_dir: Path) -> tuple:
-    key = (int(season), str(save_dir))
-    got = _SLATE_TABLES.get(key)
-    if got is None:
-        bat_table, _ = build_rates("bat", save_dir=save_dir)
-        pit_table, _ = build_rates("pit", save_dir=save_dir)
-        hz = starter_hazard()
-        got = (bat_table, pit_table, hz)
-        _SLATE_TABLES[key] = got
-    return got
 
 
 # **Calibration state must travel to the pool as DATA, and the list of what
@@ -14724,12 +15609,13 @@ def _slate_val_worker(job):
     _PRIOR_CURVE.clear(); _PRIOR_LEAGUE.clear()
     _SLATE_TABLES.clear()
     _PIT_ROWS.clear(); _BAT_ROWS.clear()
+    _PLATOON_GAPS.clear(); _CHED.clear(); _MILB_THROWS.clear()
     if variant is not None:
         # Same reason, one level worse: a monkeypatched FUNCTION cannot be
         # pickled into a fresh interpreter at all, so the fatigue probe sends
         # its parameters and the worker rebuilds the closure here.
-        globals()["fatigue_multipliers"] = _fatigue_variant(*variant)
-    bat_table, pit_table, hz = _slate_context(season, Path(save_dir))
+        globals()["fatigue_multipliers"] = SlateCalibration._fatigue_variant(*variant)
+    bat_table, pit_table, hz = SlateWeather._slate_context(season, Path(save_dir))
     bases = slate_sides([r for _, r in rows], bat_table, pit_table, season,
                         hz, Path(save_dir))
 
@@ -14773,7 +15659,7 @@ def _slate_val_worker(job):
             log: List[dict] = []
             res = simulate_game(home, away, rng, log=log, weather=wx,
                                 venue=venue)
-            vec += [v[:8] for v in inning_vectors([log]) if len(v) >= 8]
+            vec += [v[:8] for v in Validation.inning_vectors([log]) if len(v) >= 8]
             tots.append(res.runs_home + res.runs_away)
         tot.append(statistics.mean(tots))
         mc.append(statistics.variance(tots) if reps > 1 else 0.0)
@@ -14784,7 +15670,7 @@ def _slate_val_worker(job):
             "real_tot": real_tot, "used": used}
 
 
-def validate_slate_vs_reality(season: int = 2026, reps: int = 15,
+def validate_slate_vs_reality(season: Optional[int] = None, reps: int = 15,
                               seed: int = 17, limit: Optional[int] = None,
                               use_weather: bool = True,
                               use_venue: bool = True,
@@ -14803,6 +15689,7 @@ def validate_slate_vs_reality(season: int = 2026, reps: int = 15,
     GIL makes threads worthless here. **The answer does not depend on the
     worker count** — every game carries its own seed.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     slate = season_slate(season, save_dir=save_dir)
     if limit:
         slate = slate[:limit]
@@ -14841,53 +15728,12 @@ def validate_slate_vs_reality(season: int = 2026, reps: int = 15,
         for k in used:
             used[k] += p["used"][k]
 
-    sim = dispersion_report(sim_vec)
-    real = dispersion_report(real_vec)
+    sim = Validation.dispersion_report(sim_vec)
+    real = Validation.dispersion_report(real_vec)
     return {
         "season": season, "reps": reps, "workers": workers, "used": used,
         "sim": sim, "real": real,
-        "game_total": _slate_total_report(sim_tot, sim_mc, real_tot, reps),
-    }
-
-
-def _slate_total_report(sim_tot: Sequence[float], sim_mc: Sequence[float],
-                        real_tot: Sequence[int], reps: int) -> dict:
-    """Game-total agreement, with the harness's OWN noise floor removed.
-
-    **`reps` is not a free knob and a low one silently fakes both numbers.**
-    A per-game mean over `reps` sims is the model's expectation plus Monte
-    Carlo noise of variance `mc/reps`, and at reps=10 that noise is ~1.4 runs
-    against a real model spread near 1.0 — so most of the reported `model_sd`
-    is the harness, and the correlation is attenuated by roughly the same
-    factor. Two fatigue variants once read 0.194 and 0.152 purely on that,
-    which is a conclusion drawn from rep count.
-
-    So the MC component is measured per game (the within-game variance of the
-    reps, which is free) and reported alongside: `model_sd_adj` is the spread
-    with it removed, and `corr_adj` the correlation disattenuated for it.
-    Neither can be trusted when `mc_share` is large — raise `reps` instead.
-    """
-    n = len(sim_tot)
-    if n < 3:
-        return {"n": n}
-    var_obs = statistics.pstdev(sim_tot) ** 2
-    var_mc = (statistics.mean(sim_mc) / reps) if reps > 1 else 0.0
-    var_adj = max(var_obs - var_mc, 0.0)
-    corr = _corr(sim_tot, [float(x) for x in real_tot])
-    corr_adj = None
-    if corr is not None and var_adj > 0:
-        corr_adj = corr * (var_obs / var_adj) ** 0.5
-    return {
-        "n": n, "reps": reps,
-        "sim_mean": statistics.mean(sim_tot),
-        "real_mean": statistics.mean(real_tot),
-        "model_sd": var_obs ** 0.5,
-        "mc_sd": var_mc ** 0.5,
-        "model_sd_adj": var_adj ** 0.5,
-        "mc_share": (var_mc / var_obs) if var_obs else 0.0,
-        "corr": corr, "corr_adj": corr_adj,
-        "rmse": statistics.mean((a - b) ** 2 for a, b
-                                in zip(sim_tot, real_tot)) ** 0.5,
+        "game_total": SlateWeather._slate_total_report(sim_tot, sim_mc, real_tot, reps),
     }
 
 
@@ -14895,44 +15741,314 @@ def _slate_total_report(sim_tot: Sequence[float], sim_mc: Sequence[float],
 # Fatigue, scored on the real slate — sim_state.md 5.4
 # ---------------------------------------------------------------------------
 
-def multiplier_run_value(n: int = 4000, seed: int = 3,
-                         probe: float = 0.04) -> dict:
-    """Runs per PA per unit of the fatigue/HFA multiplier bundle. MEASURED.
+class SlateCalibration:
+    """Fatigue and the form draw, fitted on the REAL slate."""
 
-    The bridge between this engine's units and the RV/PA the play-by-play
-    measurements and the literature are quoted in. Without it the two cannot
-    be compared, and section 5.4 is exactly a comparison of the two: the
-    shipped 0.004/batter had to be turned into RV/batter before anyone could
-    see it was 4.2 standard errors off a measured slope of zero.
+    @staticmethod
+    def multiplier_run_value(n: int = 4000, seed: int = 3,
+                             probe: float = 0.04) -> dict:
+        """Runs per PA per unit of the fatigue/HFA multiplier bundle. MEASURED.
 
-    Run on league-average clones, applying a CONSTANT bundle to every PA
-    through `simulate_game`'s own `context`, so the number comes out of the
-    same code path the term itself uses rather than a linear-weights estimate.
-    """
-    side = league_side
+        The bridge between this engine's units and the RV/PA the play-by-play
+        measurements and the literature are quoted in. Without it the two cannot
+        be compared, and section 5.4 is exactly a comparison of the two: the
+        shipped 0.004/batter had to be turned into RV/batter before anyone could
+        see it was 4.2 standard errors off a measured slope of zero.
 
-    def at(d: float) -> Tuple[float, float]:
-        bundle = {HR: d, S1B: d, S2B: d, BB: d,
-                  K: 1.0 / d, GB_OUT: 1.0 / d, AIR_OUT: 1.0 / d}
-        rng = random.Random(seed)
-        home, away = side("H"), side("A")
-        ctx = {"home": bundle, "away": bundle}
-        runs, pa = [], []
-        for _ in range(n):
-            r = simulate_game(home, away, rng, context=ctx)
-            runs += [r.runs_home, r.runs_away]
-            pa.append(sum(p.bf for p in r.pitchers.values()) / 2.0)
-        return statistics.mean(runs), statistics.mean(pa)
+        Run on league-average clones, applying a CONSTANT bundle to every PA
+        through `simulate_game`'s own `context`, so the number comes out of the
+        same code path the term itself uses rather than a linear-weights estimate.
+        """
+        side = league_side
 
-    lo, _ = at(1.0 - probe)
-    mid, pa = at(1.0)
-    hi, _ = at(1.0 + probe)
-    per_unit = (hi - lo) / (2 * probe)
-    return {"runs_per_team_game_per_unit": per_unit,
-            "pa_per_team_game": pa,
-            "rv_per_pa_per_unit": per_unit / pa if pa else 0.0,
-            "runs_at": {round(1 - probe, 3): lo, 1.0: mid,
-                        round(1 + probe, 3): hi}}
+        def at(d: float) -> Tuple[float, float]:
+            bundle = {HR: d, S1B: d, S2B: d, BB: d,
+                      K: 1.0 / d, GB_OUT: 1.0 / d, AIR_OUT: 1.0 / d}
+            rng = random.Random(seed)
+            home, away = side("H"), side("A")
+            ctx = {"home": bundle, "away": bundle}
+            runs, pa = [], []
+            for _ in range(n):
+                r = simulate_game(home, away, rng, context=ctx)
+                runs += [r.runs_home, r.runs_away]
+                pa.append(sum(p.bf for p in r.pitchers.values()) / 2.0)
+            return statistics.mean(runs), statistics.mean(pa)
+
+        lo, _ = at(1.0 - probe)
+        mid, pa = at(1.0)
+        hi, _ = at(1.0 + probe)
+        per_unit = (hi - lo) / (2 * probe)
+        return {"runs_per_team_game_per_unit": per_unit,
+                "pa_per_team_game": pa,
+                "rv_per_pa_per_unit": per_unit / pa if pa else 0.0,
+                "runs_at": {round(1 - probe, 3): lo, 1.0: mid,
+                            round(1 + probe, 3): hi}}
+
+    @staticmethod
+    def _fatigue_variant(decline: float, opening: float, opening_bf: int):
+        """Build a `fatigue_multipliers` for one candidate curve. Probe only."""
+        def patched(bf, decline_per_bf=None, ref_bf=None):
+            ref_bf = FATIGUE_REF_BF if ref_bf is None else float(ref_bf)
+            d = 1.0 + decline * (bf - ref_bf)
+            if bf < opening_bf:
+                d *= opening
+            d = max(d, 0.5)
+            return {HR: d, S1B: d, S2B: d, BB: d,
+                    K: 1.0 / d, GB_OUT: 1.0 / d, AIR_OUT: 1.0 / d}
+        return patched
+
+    @staticmethod
+    def _fatigue_probe(decline: float, opening: float, opening_bf: int,
+                       season: int, reps: int, seed: int,
+                       workers: Optional[int] = None) -> dict:
+        """One fatigue variant, scored on the real slate."""
+        global FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args
+        old = (FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args)
+        old_fn = globals()["fatigue_multipliers"]
+
+        # The hot loop skips the call entirely at a zero gradient, so any variant
+        # acting at bf 1-2 needs the call forced back on.
+        FATIGUE_DECLINE_PER_BF = decline
+        _FATIGUE_FORCE = decline != 0.0 or opening != 1.0
+        _fatigue_variant_args = (decline, opening, opening_bf)
+        globals()["fatigue_multipliers"] = SlateCalibration._fatigue_variant(*_fatigue_variant_args)
+        try:
+            r = validate_slate_vs_reality(season, reps=reps, seed=seed,
+                                          workers=workers)
+        finally:
+            (FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args) = old
+            globals()["fatigue_multipliers"] = old_fn
+
+        sim, real = r["sim"], r["real"]
+        diff = [s - t for s, t in zip(sim["by_inning"], real["by_inning"])]
+        return {
+            "decline": decline, "opening": opening,
+            "inning1_sim": sim["by_inning"][0], "inning1_real": real["by_inning"][0],
+            "inning1_diff": diff[0],
+            "lift_sim": sim["by_inning"][0] - statistics.mean(sim["by_inning"]),
+            "lift_real": real["by_inning"][0] - statistics.mean(real["by_inning"]),
+            "profile_rmse": statistics.mean(x * x for x in diff) ** 0.5,
+            "mean": sim["mean"], "sd": sim["sd"], "cov": sim["cov"],
+            "report": r,
+        }
+
+    @staticmethod
+    def calibrate_fatigue(season: Optional[int] = None, reps: int = 12, seed: int = 17,
+                          declines: Sequence[float] = (0.0, 0.002, 0.004),
+                          openings: Sequence[float] = (1.0, 1.04, 1.078),
+                          workers: Optional[int] = None,
+                          verbose: bool = True) -> dict:
+        """Score fatigue variants on the real slate's per-inning MEAN profile.
+
+        Two things get re-derived here, and the second is the one that is easy to
+        get wrong.
+
+        **The gradient.** Sweeping `declines` against inning 1 shows directly what
+        the play-by-play measurement said: flat fits, 0.004 does not.
+
+        **The opening penalty, which must NOT be applied.** The same measurement
+        found starters are worse for the first two batters of the game — +0.0265
+        RV/PA against the rest of their own start, t 3.10 — and at 0.3378 runs per
+        PA per unit that is a multiplier of 1.078. Applying it overshoots inning 1
+        by nearly 3x, because **it is mostly the top of the batting order, not the
+        pitcher**: bf 1-2 is always slots 1 and 2, while bf 3-24 averages the whole
+        lineup, and the measurement controlled for pitcher but not for batter. A
+        PA simulator bats the real order, so it already has that lift structurally
+        and adding the measured penalty on top counts lineup quality twice.
+
+        That is the FOURTH instance in this engine of the same trap — after
+        uncentred fatigue, the uncentred park term and the uncentred platoon gap.
+        The sweep is kept so the conclusion is re-derivable rather than asserted:
+        if it ever stops overshooting, the term is worth revisiting.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        rv = SlateCalibration.multiplier_run_value()
+        rows = []
+        for d in declines:
+            rows.append(SlateCalibration._fatigue_probe(d, 1.0, 2, season, reps, seed, workers))
+        for o in openings:
+            if o == 1.0:
+                continue
+            rows.append(SlateCalibration._fatigue_probe(0.0, o, 2, season, reps, seed, workers))
+
+        if verbose:
+            u = rv["rv_per_pa_per_unit"]
+            print(f"fatigue calibration, real slate {season} "
+                  f"({reps} sims/game, innings 1-8)")
+            print(f"  multiplier scale: 1 unit = {u:.4f} runs/PA "
+                  f"({rv['runs_per_team_game_per_unit']:.2f} runs per team-game, "
+                  f"{rv['pa_per_team_game']:.1f} PA)")
+            print(f"  so decline 0.004/bf = {0.004 * u:+.5f} RV/batter "
+                  f"against a MEASURED -0.00019 +- 0.00034")
+            print(f"  and the +0.0265 RV/PA opening penalty = "
+                  f"x{1 + 0.0265 / u:.3f} on bf 1-2\n")
+            print(f"  {'decline':>8s} {'open':>6s} {'inn1':>7s} {'real':>7s}"
+                  f" {'diff':>7s} {'lift':>7s} {'real':>7s} {'rmse':>7s}"
+                  f" {'mean':>7s}")
+            for r in rows:
+                print(f"  {r['decline']:8.4f} {r['opening']:6.3f} "
+                      f"{r['inning1_sim']:7.3f} {r['inning1_real']:7.3f} "
+                      f"{r['inning1_diff']:+7.3f} {r['lift_sim']:+7.4f} "
+                      f"{r['lift_real']:+7.4f} {r['profile_rmse']:7.4f} "
+                      f"{r['mean']:7.3f}")
+            # **Do NOT rank these on `profile_rmse`.** It is taken over all eight
+            # innings and is dominated by the ~0.04 level deficit in innings 4-8,
+            # which no fatigue curve touches — so it separates the variants by
+            # almost nothing (0.0334 vs 0.0335 between "no opening penalty" and a
+            # x1.04 one) and will happily nominate a term that is wrong. The
+            # quantity fatigue actually controls is the inning-1 LIFT, and the
+            # decision rests on the structural argument in this function's
+            # docstring, not on a summary statistic.
+            best = min(rows, key=lambda r: abs(r["lift_sim"] - r["lift_real"]))
+            print(f"\n  closest inning-1 lift: decline {best['decline']:.4f}, "
+                  f"opening x{best['opening']:.3f}")
+            print(f"  shipped: FATIGUE_DECLINE_PER_BF = "
+                  f"{FATIGUE_DECLINE_PER_BF}, NO opening penalty")
+            print("  NOTE: rank on the LIFT column, not on rmse — rmse is taken "
+                  "over all\n        eight innings and is dominated by the level "
+                  "deficit in 4-8, which\n        no fatigue curve touches. It "
+                  "separates these variants by ~0.3%.")
+        return {"rv_scale": rv, "rows": rows}
+
+    @staticmethod
+    def _slate_form_probe(sd: float, shift: float, season: int, reps: int,
+                          seed: int, workers: Optional[int] = None) -> dict:
+        """The real slate at a given form draw."""
+        global GAME_FORM_SD, GAME_FORM_MEAN_SHIFT
+        old = (GAME_FORM_SD, GAME_FORM_MEAN_SHIFT)
+        GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = sd, shift
+        try:
+            return validate_slate_vs_reality(season, reps=reps, seed=seed,
+                                             workers=workers)
+        finally:
+            GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = old
+
+    @staticmethod
+    def calibrate_form_on_slate(season: Optional[int] = None, reps: int = 20,
+                                seed: int = 17,
+                                grid: Sequence[float] = (0.08, 0.12, 0.16),
+                                workers: Optional[int] = None,
+                                verbose: bool = True) -> dict:
+        """Fit `GAME_FORM_SD` against the covariance the REAL SLATE leaves over.
+
+        `calibrate_form` fits on league-average clones, which have no matchup
+        spread at all, so it has to be given a target that already has an
+        ASSUMPTION subtracted from it — "the real total is 0.0192 and matchup
+        spread supplies ~0.0045, so add 0.0147". This fits the same quadratic on
+        the real slate instead, where the matchup contribution is whatever it
+        actually is and the target is simply the real number.
+
+        Same two quantities, same order, and the second is still the trap:
+
+        1. `GAME_FORM_SD` — covariance is quadratic in the tilt, so probe a grid,
+           fit `cov = base + k*sd^2` and solve once. Probing rather than iterating
+           is deliberate: the covariance estimate carries real sampling error and
+           a secant step chases it (see `calibrate_form`).
+
+           **Know this harness's noise floor before reading the verification run.**
+           At reps=20 the grid's own residuals against the fitted quadratic are
+           -7%, -3.5% and +1.5%, and two verification runs of the same fitted sd
+           came back 0.0198 and 0.0176 against a target of 0.0189 — they straddle
+           it. Anything inside ~5% of target at that rep count is the estimator,
+           not the fit, and chasing it produces a different constant every time.
+           Raise `reps` rather than re-fitting.
+        2. `GAME_FORM_MEAN_SHIFT` — runs are CONVEX in offensive rate, so a
+           symmetric tilt RAISES the mean, and it scales with sd^2. It is measured
+           against the sim's OWN form-off mean, never against the real mean: the
+           sim is ~0.17 runs light per team-game for reasons that have nothing to
+           do with this draw (sections 5.4, 5.5), and calibrating the shift
+           against reality would quietly launder that deficit into the noise term.
+
+        **The two are NOT independent, and fitting them in sequence undershoots.**
+        The grid is probed at shift 0, but the shipped configuration runs with the
+        shift, which lowers the run level ~1.6% — and the covariance a shared
+        MULTIPLICATIVE factor produces scales with the level squared. Predicted
+        drop -3.2%, observed -3.9%, and the verification run duly came back 0.0182
+        against a 0.0189 target every time it was run. So the grid is probed a
+        second time WITH each candidate's own matched shift, which is the shape
+        that actually ships, and the quadratic is refitted there.
+
+        The second pass also MEASURES the tilt slope rather than importing
+        `RUNS_PER_TILT`, which was fitted on league-average CLONES: the probe pair
+        gives it on the real slate for free. **It does not reliably transfer** —
+        it read 6.430 against the constant's 6.524 before the pitcher-rate fixes
+        of section 5.9 and 7.494 against 6.513 after, a 15% gap, because the slope
+        depends on the run level and on how much pitcher spread there is. Measure
+        it; do not import it.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        base = SlateCalibration._slate_form_probe(0.0, 0.0, season, reps, seed, workers)
+        base_cov = base["sim"]["pair_cov"]
+        base_mean = base["sim"]["mean"]
+        target = base["real"]["pair_cov"]
+        den = sum((g ** 2) ** 2 for g in grid)
+
+        def fit(pts):
+            k = sum((g ** 2) * c for g, c, _ in pts) / den if den else 0.0
+            if k <= 0:
+                raise RuntimeError("mlb_sim: slate form probe produced no covariance")
+            return k, math.sqrt(max(target - base_cov, 0.0) / k)
+
+        # Pass 1 — shift 0. Fixes the Jensen lift, which must be measured with
+        # nothing cancelling it, and gives a first sd.
+        pts1 = []
+        for g in grid:
+            r = SlateCalibration._slate_form_probe(g, 0.0, season, reps, seed, workers)
+            pts1.append((g, r["sim"]["pair_cov"] - base_cov, r["sim"]["mean"]))
+            if verbose:
+                print(f"    pass 1  sd {g:.3f} shift 0.0000 -> extra pair-cov "
+                      f"{pts1[-1][1]:+.5f}   mean {pts1[-1][2]:.4f}")
+        lift_k = sum((g ** 2) * (mn - base_mean) for g, _, mn in pts1) / den
+
+        # `RUNS_PER_TILT` is a GAME-TOTAL slope (14.9, so 7.45 per team-game) while
+        # everything here is innings 1-8, ~90% of a game. Only used to SEED pass 2;
+        # the slope is then measured.
+        full = (base["game_total"]["sim_mean"] / 2.0) / base_mean if base_mean else 1.0
+        slope = (RUNS_PER_TILT / 2.0) / full
+
+        # Pass 2 — each candidate at its own matched shift.
+        pts2, slopes = [], []
+        for g in grid:
+            s_g = max(0.0, lift_k * g ** 2 / slope) if slope else 0.0
+            r = SlateCalibration._slate_form_probe(g, s_g, season, reps, seed, workers)
+            pts2.append((g, r["sim"]["pair_cov"] - base_cov, r["sim"]["mean"]))
+            if s_g > 0:
+                mean1 = next(mn for gg, _, mn in pts1 if gg == g)
+                slopes.append((mean1 - r["sim"]["mean"]) / s_g)
+            if verbose:
+                print(f"    pass 2  sd {g:.3f} shift {s_g:.4f} -> extra pair-cov "
+                      f"{pts2[-1][1]:+.5f}   mean {pts2[-1][2]:.4f}")
+
+        if slopes:
+            slope = statistics.mean(slopes)
+        k, sd = fit(pts2)
+        lift = lift_k * sd ** 2                       # runs per team-game, inn 1-8
+        shift = max(0.0, lift / slope) if slope else 0.0
+
+        out = {"GAME_FORM_SD": sd, "GAME_FORM_MEAN_SHIFT": shift,
+               "base_pair_cov": base_cov, "target_pair_cov": target,
+               "k": k, "jensen_lift_runs": lift, "probes": pts2,
+               "slope_measured": slope, "slope_from_constant": (RUNS_PER_TILT / 2.0) / full,
+               "inn18_share": 1.0 / full if full else 1.0}
+        if verbose:
+            final = SlateCalibration._slate_form_probe(sd, shift, season, reps, seed, workers)
+            out["final"] = final
+            s, real = final["sim"], final["real"]
+            print(f"\nform calibration on the real slate {season} "
+                  f"({reps} sims/game, innings 1-8)")
+            print(f"  matchup+weather+park supply  {base_cov:+.5f} pair-cov "
+                  f"on their own")
+            print(f"  real                         {target:+.5f}")
+            print(f"  tilt slope, innings 1-8      {slope:.3f} runs/unit measured"
+                  f"   ({out['slope_from_constant']:.3f} from RUNS_PER_TILT)")
+            print(f"  GAME_FORM_SD                 {sd:.5f}")
+            print(f"  GAME_FORM_MEAN_SHIFT         {shift:.5f}  "
+                  f"(cancels a {lift:+.3f}-run Jensen lift)")
+            print(f"\n  {'':10s} {'form off':>10s} {'fitted':>10s} {'real':>10s}")
+            for key in ("mean", "sd", "pair_cov", "cov"):
+                print(f"  {key:10s} {base['sim'][key]:10.4f} {s[key]:10.4f} "
+                      f"{real[key]:10.4f}")
+        return out
 
 
 # The fatigue variant currently under test, as PARAMETERS rather than a
@@ -14941,272 +16057,9 @@ def multiplier_run_value(n: int = 4000, seed: int = 3,
 _fatigue_variant_args: Optional[tuple] = None
 
 
-def _fatigue_variant(decline: float, opening: float, opening_bf: int):
-    """Build a `fatigue_multipliers` for one candidate curve. Probe only."""
-    def patched(bf, decline_per_bf=None, ref_bf=FATIGUE_REF_BF):
-        d = 1.0 + decline * (bf - ref_bf)
-        if bf < opening_bf:
-            d *= opening
-        d = max(d, 0.5)
-        return {HR: d, S1B: d, S2B: d, BB: d,
-                K: 1.0 / d, GB_OUT: 1.0 / d, AIR_OUT: 1.0 / d}
-    return patched
-
-
-def _fatigue_probe(decline: float, opening: float, opening_bf: int,
-                   season: int, reps: int, seed: int,
-                   workers: Optional[int] = None) -> dict:
-    """One fatigue variant, scored on the real slate."""
-    global FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args
-    old = (FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args)
-    old_fn = globals()["fatigue_multipliers"]
-
-    # The hot loop skips the call entirely at a zero gradient, so any variant
-    # acting at bf 1-2 needs the call forced back on.
-    FATIGUE_DECLINE_PER_BF = decline
-    _FATIGUE_FORCE = decline != 0.0 or opening != 1.0
-    _fatigue_variant_args = (decline, opening, opening_bf)
-    globals()["fatigue_multipliers"] = _fatigue_variant(*_fatigue_variant_args)
-    try:
-        r = validate_slate_vs_reality(season, reps=reps, seed=seed,
-                                      workers=workers)
-    finally:
-        (FATIGUE_DECLINE_PER_BF, _FATIGUE_FORCE, _fatigue_variant_args) = old
-        globals()["fatigue_multipliers"] = old_fn
-
-    sim, real = r["sim"], r["real"]
-    diff = [s - t for s, t in zip(sim["by_inning"], real["by_inning"])]
-    return {
-        "decline": decline, "opening": opening,
-        "inning1_sim": sim["by_inning"][0], "inning1_real": real["by_inning"][0],
-        "inning1_diff": diff[0],
-        "lift_sim": sim["by_inning"][0] - statistics.mean(sim["by_inning"]),
-        "lift_real": real["by_inning"][0] - statistics.mean(real["by_inning"]),
-        "profile_rmse": statistics.mean(x * x for x in diff) ** 0.5,
-        "mean": sim["mean"], "sd": sim["sd"], "cov": sim["cov"],
-        "report": r,
-    }
-
-
-def calibrate_fatigue(season: int = 2026, reps: int = 12, seed: int = 17,
-                      declines: Sequence[float] = (0.0, 0.002, 0.004),
-                      openings: Sequence[float] = (1.0, 1.04, 1.078),
-                      workers: Optional[int] = None,
-                      verbose: bool = True) -> dict:
-    """Score fatigue variants on the real slate's per-inning MEAN profile.
-
-    Two things get re-derived here, and the second is the one that is easy to
-    get wrong.
-
-    **The gradient.** Sweeping `declines` against inning 1 shows directly what
-    the play-by-play measurement said: flat fits, 0.004 does not.
-
-    **The opening penalty, which must NOT be applied.** The same measurement
-    found starters are worse for the first two batters of the game — +0.0265
-    RV/PA against the rest of their own start, t 3.10 — and at 0.3378 runs per
-    PA per unit that is a multiplier of 1.078. Applying it overshoots inning 1
-    by nearly 3x, because **it is mostly the top of the batting order, not the
-    pitcher**: bf 1-2 is always slots 1 and 2, while bf 3-24 averages the whole
-    lineup, and the measurement controlled for pitcher but not for batter. A
-    PA simulator bats the real order, so it already has that lift structurally
-    and adding the measured penalty on top counts lineup quality twice.
-
-    That is the FOURTH instance in this engine of the same trap — after
-    uncentred fatigue, the uncentred park term and the uncentred platoon gap.
-    The sweep is kept so the conclusion is re-derivable rather than asserted:
-    if it ever stops overshooting, the term is worth revisiting.
-    """
-    rv = multiplier_run_value()
-    rows = []
-    for d in declines:
-        rows.append(_fatigue_probe(d, 1.0, 2, season, reps, seed, workers))
-    for o in openings:
-        if o == 1.0:
-            continue
-        rows.append(_fatigue_probe(0.0, o, 2, season, reps, seed, workers))
-
-    if verbose:
-        u = rv["rv_per_pa_per_unit"]
-        print(f"fatigue calibration, real slate {season} "
-              f"({reps} sims/game, innings 1-8)")
-        print(f"  multiplier scale: 1 unit = {u:.4f} runs/PA "
-              f"({rv['runs_per_team_game_per_unit']:.2f} runs per team-game, "
-              f"{rv['pa_per_team_game']:.1f} PA)")
-        print(f"  so decline 0.004/bf = {0.004 * u:+.5f} RV/batter "
-              f"against a MEASURED -0.00019 +- 0.00034")
-        print(f"  and the +0.0265 RV/PA opening penalty = "
-              f"x{1 + 0.0265 / u:.3f} on bf 1-2\n")
-        print(f"  {'decline':>8s} {'open':>6s} {'inn1':>7s} {'real':>7s}"
-              f" {'diff':>7s} {'lift':>7s} {'real':>7s} {'rmse':>7s}"
-              f" {'mean':>7s}")
-        for r in rows:
-            print(f"  {r['decline']:8.4f} {r['opening']:6.3f} "
-                  f"{r['inning1_sim']:7.3f} {r['inning1_real']:7.3f} "
-                  f"{r['inning1_diff']:+7.3f} {r['lift_sim']:+7.4f} "
-                  f"{r['lift_real']:+7.4f} {r['profile_rmse']:7.4f} "
-                  f"{r['mean']:7.3f}")
-        # **Do NOT rank these on `profile_rmse`.** It is taken over all eight
-        # innings and is dominated by the ~0.04 level deficit in innings 4-8,
-        # which no fatigue curve touches — so it separates the variants by
-        # almost nothing (0.0334 vs 0.0335 between "no opening penalty" and a
-        # x1.04 one) and will happily nominate a term that is wrong. The
-        # quantity fatigue actually controls is the inning-1 LIFT, and the
-        # decision rests on the structural argument in this function's
-        # docstring, not on a summary statistic.
-        best = min(rows, key=lambda r: abs(r["lift_sim"] - r["lift_real"]))
-        print(f"\n  closest inning-1 lift: decline {best['decline']:.4f}, "
-              f"opening x{best['opening']:.3f}")
-        print(f"  shipped: FATIGUE_DECLINE_PER_BF = "
-              f"{FATIGUE_DECLINE_PER_BF}, NO opening penalty")
-        print("  NOTE: rank on the LIFT column, not on rmse — rmse is taken "
-              "over all\n        eight innings and is dominated by the level "
-              "deficit in 4-8, which\n        no fatigue curve touches. It "
-              "separates these variants by ~0.3%.")
-    return {"rv_scale": rv, "rows": rows}
-
-
 # ---------------------------------------------------------------------------
 # The form draw, fitted on the REAL slate rather than on clones
 # ---------------------------------------------------------------------------
-
-def _slate_form_probe(sd: float, shift: float, season: int, reps: int,
-                      seed: int, workers: Optional[int] = None) -> dict:
-    """The real slate at a given form draw."""
-    global GAME_FORM_SD, GAME_FORM_MEAN_SHIFT
-    old = (GAME_FORM_SD, GAME_FORM_MEAN_SHIFT)
-    GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = sd, shift
-    try:
-        return validate_slate_vs_reality(season, reps=reps, seed=seed,
-                                         workers=workers)
-    finally:
-        GAME_FORM_SD, GAME_FORM_MEAN_SHIFT = old
-
-
-def calibrate_form_on_slate(season: int = 2026, reps: int = 20,
-                            seed: int = 17,
-                            grid: Sequence[float] = (0.08, 0.12, 0.16),
-                            workers: Optional[int] = None,
-                            verbose: bool = True) -> dict:
-    """Fit `GAME_FORM_SD` against the covariance the REAL SLATE leaves over.
-
-    `calibrate_form` fits on league-average clones, which have no matchup
-    spread at all, so it has to be given a target that already has an
-    ASSUMPTION subtracted from it — "the real total is 0.0192 and matchup
-    spread supplies ~0.0045, so add 0.0147". This fits the same quadratic on
-    the real slate instead, where the matchup contribution is whatever it
-    actually is and the target is simply the real number.
-
-    Same two quantities, same order, and the second is still the trap:
-
-    1. `GAME_FORM_SD` — covariance is quadratic in the tilt, so probe a grid,
-       fit `cov = base + k*sd^2` and solve once. Probing rather than iterating
-       is deliberate: the covariance estimate carries real sampling error and
-       a secant step chases it (see `calibrate_form`).
-
-       **Know this harness's noise floor before reading the verification run.**
-       At reps=20 the grid's own residuals against the fitted quadratic are
-       -7%, -3.5% and +1.5%, and two verification runs of the same fitted sd
-       came back 0.0198 and 0.0176 against a target of 0.0189 — they straddle
-       it. Anything inside ~5% of target at that rep count is the estimator,
-       not the fit, and chasing it produces a different constant every time.
-       Raise `reps` rather than re-fitting.
-    2. `GAME_FORM_MEAN_SHIFT` — runs are CONVEX in offensive rate, so a
-       symmetric tilt RAISES the mean, and it scales with sd^2. It is measured
-       against the sim's OWN form-off mean, never against the real mean: the
-       sim is ~0.17 runs light per team-game for reasons that have nothing to
-       do with this draw (sections 5.4, 5.5), and calibrating the shift
-       against reality would quietly launder that deficit into the noise term.
-
-    **The two are NOT independent, and fitting them in sequence undershoots.**
-    The grid is probed at shift 0, but the shipped configuration runs with the
-    shift, which lowers the run level ~1.6% — and the covariance a shared
-    MULTIPLICATIVE factor produces scales with the level squared. Predicted
-    drop -3.2%, observed -3.9%, and the verification run duly came back 0.0182
-    against a 0.0189 target every time it was run. So the grid is probed a
-    second time WITH each candidate's own matched shift, which is the shape
-    that actually ships, and the quadratic is refitted there.
-
-    The second pass also MEASURES the tilt slope rather than importing
-    `RUNS_PER_TILT`, which was fitted on league-average CLONES: the probe pair
-    gives it on the real slate for free. **It does not reliably transfer** —
-    it read 6.430 against the constant's 6.524 before the pitcher-rate fixes
-    of section 5.9 and 7.494 against 6.513 after, a 15% gap, because the slope
-    depends on the run level and on how much pitcher spread there is. Measure
-    it; do not import it.
-    """
-    base = _slate_form_probe(0.0, 0.0, season, reps, seed, workers)
-    base_cov = base["sim"]["pair_cov"]
-    base_mean = base["sim"]["mean"]
-    target = base["real"]["pair_cov"]
-    den = sum((g ** 2) ** 2 for g in grid)
-
-    def fit(pts):
-        k = sum((g ** 2) * c for g, c, _ in pts) / den if den else 0.0
-        if k <= 0:
-            raise RuntimeError("mlb_sim: slate form probe produced no covariance")
-        return k, math.sqrt(max(target - base_cov, 0.0) / k)
-
-    # Pass 1 — shift 0. Fixes the Jensen lift, which must be measured with
-    # nothing cancelling it, and gives a first sd.
-    pts1 = []
-    for g in grid:
-        r = _slate_form_probe(g, 0.0, season, reps, seed, workers)
-        pts1.append((g, r["sim"]["pair_cov"] - base_cov, r["sim"]["mean"]))
-        if verbose:
-            print(f"    pass 1  sd {g:.3f} shift 0.0000 -> extra pair-cov "
-                  f"{pts1[-1][1]:+.5f}   mean {pts1[-1][2]:.4f}")
-    lift_k = sum((g ** 2) * (mn - base_mean) for g, _, mn in pts1) / den
-
-    # `RUNS_PER_TILT` is a GAME-TOTAL slope (14.9, so 7.45 per team-game) while
-    # everything here is innings 1-8, ~90% of a game. Only used to SEED pass 2;
-    # the slope is then measured.
-    full = (base["game_total"]["sim_mean"] / 2.0) / base_mean if base_mean else 1.0
-    slope = (RUNS_PER_TILT / 2.0) / full
-
-    # Pass 2 — each candidate at its own matched shift.
-    pts2, slopes = [], []
-    for g in grid:
-        s_g = max(0.0, lift_k * g ** 2 / slope) if slope else 0.0
-        r = _slate_form_probe(g, s_g, season, reps, seed, workers)
-        pts2.append((g, r["sim"]["pair_cov"] - base_cov, r["sim"]["mean"]))
-        if s_g > 0:
-            mean1 = next(mn for gg, _, mn in pts1 if gg == g)
-            slopes.append((mean1 - r["sim"]["mean"]) / s_g)
-        if verbose:
-            print(f"    pass 2  sd {g:.3f} shift {s_g:.4f} -> extra pair-cov "
-                  f"{pts2[-1][1]:+.5f}   mean {pts2[-1][2]:.4f}")
-
-    if slopes:
-        slope = statistics.mean(slopes)
-    k, sd = fit(pts2)
-    lift = lift_k * sd ** 2                       # runs per team-game, inn 1-8
-    shift = max(0.0, lift / slope) if slope else 0.0
-
-    out = {"GAME_FORM_SD": sd, "GAME_FORM_MEAN_SHIFT": shift,
-           "base_pair_cov": base_cov, "target_pair_cov": target,
-           "k": k, "jensen_lift_runs": lift, "probes": pts2,
-           "slope_measured": slope, "slope_from_constant": (RUNS_PER_TILT / 2.0) / full,
-           "inn18_share": 1.0 / full if full else 1.0}
-    if verbose:
-        final = _slate_form_probe(sd, shift, season, reps, seed, workers)
-        out["final"] = final
-        s, real = final["sim"], final["real"]
-        print(f"\nform calibration on the real slate {season} "
-              f"({reps} sims/game, innings 1-8)")
-        print(f"  matchup+weather+park supply  {base_cov:+.5f} pair-cov "
-              f"on their own")
-        print(f"  real                         {target:+.5f}")
-        print(f"  tilt slope, innings 1-8      {slope:.3f} runs/unit measured"
-              f"   ({out['slope_from_constant']:.3f} from RUNS_PER_TILT)")
-        print(f"  GAME_FORM_SD                 {sd:.5f}")
-        print(f"  GAME_FORM_MEAN_SHIFT         {shift:.5f}  "
-              f"(cancels a {lift:+.3f}-run Jensen lift)")
-        print(f"\n  {'':10s} {'form off':>10s} {'fitted':>10s} {'real':>10s}")
-        for key in ("mean", "sd", "pair_cov", "cov"):
-            print(f"  {key:10s} {base['sim'][key]:10.4f} {s[key]:10.4f} "
-                  f"{real[key]:10.4f}")
-    return out
-
 
 # ---------------------------------------------------------------------------
 # BACKTEST — the slate replayed on AS-OF rates
@@ -15268,16 +16121,69 @@ ODDS_CACHE = CLV_DIR / "historic_odds_{season}.json"
 PROGRESS_LOG = CLV_DIR / "progress.log"
 
 
-def _progress(msg: str, path: Path = PROGRESS_LOG) -> None:
-    """Append one timestamped line to the watchable progress log."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(f"{datetime.datetime.now():%H:%M:%S}  {msg}\n")
-    except OSError:
-        pass
+class Archive:
+    """The historic-odds archive feed and its geo session."""
 
-_AJAX_URL_RE = re.compile(r'"ajaxUrl"\s*:\s*"([^"]+)"')
+    @staticmethod
+    def _progress(msg: str, path: Path = PROGRESS_LOG) -> None:
+        """Append one timestamped line to the watchable progress log."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as fh:
+                fh.write(f"{datetime.datetime.now():%H:%M:%S}  {msg}\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _archive_feed_path(ajax: str, page: int) -> str:
+        """The localized ajax path, page-substituted and PROXY-PREFIXED.
+
+        **Both halves matter.** The path off a localized page looks like
+        `/pl/ajax-sport-country-tournament-archive_/...`, and `OddsPortalClient`'s
+        proxy-prefix rule only matches paths that START with `/ajax-`, so the
+        locale segment hides it and the request comes back as a 187-byte `URL:...`
+        echo — which decodes as "Incorrect padding" and reads like the AES key
+        rotated. It has not; the prefix is simply missing.
+
+        **Pagination is the QUERY parameter `?page=N`, not the path.** The path
+        carries a `/1/0/` pair that looks exactly like page/offset and is silently
+        ignored — every value returns page 1 with `activePage: 1`, so a scrape that
+        trusts it re-downloads the first 50 games fifty times and looks like it
+        worked. The feed reports `total` and `pagination.pageCount`; use them.
+        """
+        base = ajax.split("?")[0].rstrip("/")
+        return "/proxy/" + base.lstrip("/") + f"/?page={page}"
+
+    @staticmethod
+    def _archive_session(season: int, proxy: Optional[str], verbose: bool,
+                         tries: int = 6):
+        """(client, ajaxUrl, page_url) for a geo whose archive returns rows.
+
+        **Every network call in here is guarded.** The first version fetched the
+        results page OUTSIDE the retry loop, so one read timeout on a free proxy —
+        which happens constantly — killed the whole scrape with a traceback after
+        the geo probe had already succeeded.
+        """
+        page_url = season_archive_url(season)
+        for _ in range(tries):
+            c, label = _archive_geo_client(proxy, verbose=verbose, season=season)
+            if c is None:
+                continue
+            try:
+                html = c._get(page_url).text
+                mm = OddsPortal.AJAX_URL_RE.search(
+                    html.replace('\\"', '"').replace("\\/", "/"))
+                if mm:
+                    return c, mm.group(1), page_url, label
+                if verbose:
+                    print(f"[odds] geo {label}: no ajaxUrl for {season}")
+            except Exception as e:
+                if verbose:
+                    print(f"[odds] geo {label}: {type(e).__name__} "
+                          f"fetching the {season} page")
+        return None, None, page_url, None
+
+
 
 
 def season_archive_url(season: int = 2025, sport: str = "baseball",
@@ -15313,7 +16219,7 @@ def _archive_geo_client(proxy: Optional[str] = None, verbose: bool = True,
     cands: List[Tuple[str, Optional[str]]] = [("direct", proxy)] if proxy else []
     if not proxy:
         try:
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            sys.path.insert(0, str(_APP_ROOT))
             from live_scores_widget import _webshare_locations
             cands = [("direct", None)] + sorted(_webshare_locations().items())
         except Exception as e:
@@ -15325,15 +16231,15 @@ def _archive_geo_client(proxy: Optional[str] = None, verbose: bool = True,
     # the one geo that cannot work and reports success.
     for label, px in cands:
         try:
-            c = _op_client(px)
+            c = Clv._op_client(px)
             page = season_archive_url(season)
             html = c._get(page).text
-            mm = _AJAX_URL_RE.search(html.replace('\\"', '"').replace("\\/", "/"))
+            mm = OddsPortal.AJAX_URL_RE.search(html.replace('\\"', '"').replace("\\/", "/"))
             if not mm:
                 if verbose:
                     print(f"[odds] geo {label}: no ajaxUrl ({len(html)}B)")
                 continue
-            r = c._get(_archive_feed_path(mm.group(1), 1), referer=page)
+            r = c._get(Archive._archive_feed_path(mm.group(1), 1), referer=page)
             d = c.decode_feed(r.text)
             dd = d.get("d") if isinstance(d, dict) else d
             n = len((dd or {}).get("rows") or [])
@@ -15345,55 +16251,6 @@ def _archive_geo_client(proxy: Optional[str] = None, verbose: bool = True,
             if verbose:
                 print(f"[odds] geo {label}: {type(e).__name__} {str(e)[:60]}")
     return None, None
-
-
-def _archive_feed_path(ajax: str, page: int) -> str:
-    """The localized ajax path, page-substituted and PROXY-PREFIXED.
-
-    **Both halves matter.** The path off a localized page looks like
-    `/pl/ajax-sport-country-tournament-archive_/...`, and `OddsPortalClient`'s
-    proxy-prefix rule only matches paths that START with `/ajax-`, so the
-    locale segment hides it and the request comes back as a 187-byte `URL:...`
-    echo — which decodes as "Incorrect padding" and reads like the AES key
-    rotated. It has not; the prefix is simply missing.
-
-    **Pagination is the QUERY parameter `?page=N`, not the path.** The path
-    carries a `/1/0/` pair that looks exactly like page/offset and is silently
-    ignored — every value returns page 1 with `activePage: 1`, so a scrape that
-    trusts it re-downloads the first 50 games fifty times and looks like it
-    worked. The feed reports `total` and `pagination.pageCount`; use them.
-    """
-    base = ajax.split("?")[0].rstrip("/")
-    return "/proxy/" + base.lstrip("/") + f"/?page={page}"
-
-
-def _archive_session(season: int, proxy: Optional[str], verbose: bool,
-                     tries: int = 6):
-    """(client, ajaxUrl, page_url) for a geo whose archive returns rows.
-
-    **Every network call in here is guarded.** The first version fetched the
-    results page OUTSIDE the retry loop, so one read timeout on a free proxy —
-    which happens constantly — killed the whole scrape with a traceback after
-    the geo probe had already succeeded.
-    """
-    page_url = season_archive_url(season)
-    for _ in range(tries):
-        c, label = _archive_geo_client(proxy, verbose=verbose, season=season)
-        if c is None:
-            continue
-        try:
-            html = c._get(page_url).text
-            mm = _AJAX_URL_RE.search(
-                html.replace('\\"', '"').replace("\\/", "/"))
-            if mm:
-                return c, mm.group(1), page_url, label
-            if verbose:
-                print(f"[odds] geo {label}: no ajaxUrl for {season}")
-        except Exception as e:
-            if verbose:
-                print(f"[odds] geo {label}: {type(e).__name__} "
-                      f"fetching the {season} page")
-    return None, None, page_url, None
 
 
 def fetch_historic_odds(season: int = 2025, pages: int = 60,
@@ -15414,7 +16271,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
         except (OSError, ValueError):
             cache = {}
 
-    c, ajax, page_url, label = _archive_session(season, proxy, verbose)
+    c, ajax, page_url, label = Archive._archive_session(season, proxy, verbose)
     if c is None:
         if verbose:
             print(f"[odds] {season}: no geo served the archive. The US geo "
@@ -15424,7 +16281,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
     found = 0
     expected = None
     t0 = time.time()
-    _progress(f"{season}  starting (geo {label})")
+    Archive._progress(f"{season}  starting (geo {label})")
     # An explicit counter, not `for page in range(...)`: an empty page 1 has to
     # RETRY page 1 on a different geo, and `continue` in a for-loop would skip
     # to page 2 and quietly lose the first fifty games.
@@ -15435,7 +16292,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
         data = None
         for attempt in range(3):
             try:
-                r = c._get(_archive_feed_path(ajax, page), referer=page_url)
+                r = c._get(Archive._archive_feed_path(ajax, page), referer=page_url)
                 data = c.decode_feed(r.text)
                 break
             except Exception as e:
@@ -15447,7 +16304,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
                 # the old one returns an EMPTY feed — indistinguishable from
                 # "end of results". That silently truncated 2024 at 50 games
                 # of 2,473 and reported success.
-                c2, ajax2, _, lbl2 = _archive_session(season, None,
+                c2, ajax2, _, lbl2 = Archive._archive_session(season, None,
                                                       verbose=False, tries=3)
                 if c2 is None:
                     break
@@ -15475,8 +16332,8 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
                 if verbose:
                     print(f"[odds] page 1 EMPTY on geo {label} — this geo "
                           f"cannot serve {season}; re-selecting")
-                _progress(f"{season}  page 1 empty on geo {label}, re-selecting")
-                c2, ajax2, _, lbl2 = _archive_session(season, None,
+                Archive._progress(f"{season}  page 1 empty on geo {label}, re-selecting")
+                c2, ajax2, _, lbl2 = Archive._archive_session(season, None,
                                                       verbose=verbose, tries=3)
                 if c2 is None:
                     if verbose:
@@ -15524,7 +16381,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
         pct = (len(cache) / expected) if expected else 0.0
         rate = (time.time() - t0) / max(page, 1)
         left = max((pag.get("pageCount") or pages) - page, 0)
-        _progress(f"{season}  page {page}/{pag.get('pageCount') or '?'}  "
+        Archive._progress(f"{season}  page {page}/{pag.get('pageCount') or '?'}  "
                   f"{len(cache)}/{expected or '?'} games ({pct:.0%})  "
                   f"~{left * rate / 60:.0f} min left")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -15539,7 +16396,7 @@ def fetch_historic_odds(season: int = 2025, pages: int = 60,
     # must not read as "met the expectation" — that is how a backfill that did
     # nothing printed "complete".
     short = (expected is None) or len(cache) < expected * 0.98
-    _progress(f"{season}  FINISHED {len(cache)}/{expected or '?'} games"
+    Archive._progress(f"{season}  FINISHED {len(cache)}/{expected or '?'} games"
               + ("  ** SHORT — re-run to backfill **" if short else "  complete"))
     return cache
 
@@ -15583,13 +16440,161 @@ EVENT_ODDS_MARKETS = (3, 2, 5)      # moneyline, totals, run line
 EVENT_ODDS_GEOS = ("pl", "jp")      # measured: `direct`/`gb`/`es` give nothing
 
 
-def event_odds_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
-    return Path(save_dir) / EVENT_ODDS_PATH_FMT.format(season=season)
+class EventOdds:
+    """Per-event odds: opening prices, totals, run lines, period markets."""
+
+    @staticmethod
+    def event_odds_path(season: int, save_dir: Path = SAVE_DIR) -> Path:
+        return Path(save_dir) / EVENT_ODDS_PATH_FMT.format(season=season)
+
+    @staticmethod
+    def _oddsportal_geos() -> Dict[str, Optional[str]]:
+        """{label: proxy} for the geos that answer. Discovered, not hardcoded —
+        the free proxy IPs rotate, so a pinned list goes stale silently."""
+        try:
+            import live_scores_widget as _lsw
+            locs = _lsw._webshare_locations() or {}
+        except Exception:
+            locs = {}
+        out = {g: locs.get(g) for g in EVENT_ODDS_GEOS if locs.get(g)}
+        if not out:
+            raise RuntimeError(
+                "mlb_sim: no OddsPortal proxy available. A US egress IP returns "
+                "ZERO outcomes on this endpoint (the event page still resolves, so "
+                "it reads like a parse failure). Set ODDSPORTAL_PROXIES or "
+                "Creds.ODDSPORTAL_PROXIES.")
+        return out
+
+    @staticmethod
+    def _pack_outcome(o) -> dict:
+        """One outcome, compact. Short keys because this is ~64 lines x ~1,900
+        games and the long-key version is several times the size for nothing."""
+        d = {"n": o.name, "a": o.avg_odds, "o": o.opening_avg,
+             "x": o.max_odds, "b": o.n_books}
+        # the time axis: when the price was first hung and last moved. Averaged
+        # across books, because per-book detail is not what a CLV study needs and
+        # it is 20x the bytes.
+        if o.opened_at:
+            d["t0"] = int(statistics.median(o.opened_at.values()))
+        if o.changed_at:
+            d["t1"] = int(statistics.median(o.changed_at.values()))
+        return {k: v for k, v in d.items() if v is not None}
+
+    @staticmethod
+    def _pack_event(eo) -> dict:
+        lines = getattr(eo, "markets", None)
+        lines = lines() if callable(lines) else lines
+        out = {"home": eo.home, "away": eo.away,
+               "start_ts": getattr(eo, "start_ts", None), "lines": []}
+        for m in (lines or []):
+            outs = [EventOdds._pack_outcome(o) for o in (m.outcomes or [])]
+            if not outs:
+                continue
+            out["lines"].append({"bt": m.betting_type_id,
+                                 "sc": getattr(m, "scope_id", 1),
+                                 "h": m.handicap, "o": outs})
+        return out
+
+    @staticmethod
+    def fetch_event_odds(season: Optional[int] = None, limit: Optional[int] = None,
+                         workers: int = 8, timeout: float = 25.0,
+                         save_dir: Path = SAVE_DIR,
+                         verbose: bool = True) -> Dict[str, dict]:
+        """Opening + closing prices for every market, per event. RESUMABLE.
+
+        Reads the event list (and the `#encodedId` fragments) off the archive cache
+        `fetch_historic_odds` already built, so it adds no discovery cost.
+
+        **Reports cached-against-expected and shouts when SHORT.** On this source
+        "empty" and "done" are identical — that is the sentence behind five of the
+        seven bugs in section 3d — so a run that fetched nothing must not look like
+        a run that finished.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        archive = load_historic_odds(season, save_dir)
+        if not archive:
+            raise FileNotFoundError(
+                f"mlb_sim: no historic_odds_{season}.json — run "
+                f"`fetch_historic_odds({season})` first; this reads its event ids "
+                f"and #encodedId fragments.")
+        geos = EventOdds._oddsportal_geos()
+        proxies = [geos[g] for g in sorted(geos)]
+        cache = load_event_odds(season, save_dir)
+        todo = [(k, v["url"]) for k, v in archive.items()
+                if v.get("url") and "#" in v["url"] and k not in cache]
+        no_frag = sum(1 for v in archive.values()
+                      if v.get("url") and "#" not in v["url"])
+        # `is not None`, not truthiness: `--limit 0` read as "no limit" and quietly
+        # started a full 1,870-event run instead of fetching nothing.
+        if limit is not None:
+            todo = todo[:max(0, limit)]
+        if verbose:
+            print(f"[eventodds] {season}: {len(archive)} games in the archive, "
+                  f"{len(cache)} already cached, {len(todo)} to fetch"
+                  + (f", {no_frag} have NO #encodedId and are unfetchable"
+                     if no_frag else ""))
+            print(f"[eventodds] geos {sorted(geos)}, {workers} workers "
+                  f"(~17s/event each)")
+        Archive._progress(f"eventodds {season}: {len(todo)} to fetch, {len(cache)} cached")
+        if not todo:
+            return cache
+
+        path = EventOdds.event_odds_path(season, save_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        jobs = [(k, u, proxies, timeout) for k, u in todo]
+        done = fail = 0
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            for ev_id, packed in ex.map(_event_odds_worker, jobs):
+                if packed:
+                    cache[ev_id] = packed
+                    done += 1
+                else:
+                    fail += 1
+                n = done + fail
+                if n % 25 == 0 or n == len(jobs):
+                    rate = (time.time() - t0) / n
+                    left = (len(jobs) - n) * rate
+                    msg = (f"{season}  {n}/{len(jobs)}  ok {done} fail {fail}  "
+                           f"{rate:.1f}s/event  ~{left/60:.0f} min left")
+                    Archive._progress(f"eventodds {msg}")
+                    if verbose:
+                        print(f"[eventodds] {msg}", flush=True)
+                    with open(path, "w") as fh:
+                        json.dump(cache, fh)
+        with open(path, "w") as fh:
+            json.dump(cache, fh)
+        have, want = len(cache), len(archive) - no_frag
+        if verbose:
+            print(f"\n[eventodds] {season}: {have}/{want} events cached "
+                  f"({fail} failed this run) -> {path}")
+            if have < want:
+                print(f"** SHORT by {want - have} — re-run to backfill. Re-runs "
+                      f"merge by event id, so it is idempotent. **")
+        Archive._progress(f"eventodds {season} FINISHED {have}/{want}")
+        return cache
+
+    @staticmethod
+    def event_totals(packed: dict, scope: int = 1) -> Dict[float, dict]:
+        """{line: {"over": {...}, "under": {...}}} from a packed event."""
+        out: Dict[float, dict] = {}
+        for ln in packed.get("lines", []):
+            if ln.get("bt") != 2 or ln.get("sc", 1) != scope:
+                continue
+            h = ln.get("h")
+            if h is None:
+                continue
+            side = {}
+            for o in ln.get("o", []):
+                side[str(o.get("n", "")).lower()] = o
+            if "over" in side and "under" in side:
+                out[float(h)] = side
+        return out
 
 
 def load_event_odds(season: int, save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
     """Cached per-event odds, keyed by the archive's event id. {} when absent."""
-    path = event_odds_path(season, save_dir)
+    path = EventOdds.event_odds_path(season, save_dir)
     if not path.exists():
         return {}
     try:
@@ -15598,54 +16603,6 @@ def load_event_odds(season: int, save_dir: Path = SAVE_DIR) -> Dict[str, dict]:
         return got if isinstance(got, dict) else {}
     except (OSError, ValueError):
         return {}
-
-
-def _oddsportal_geos() -> Dict[str, Optional[str]]:
-    """{label: proxy} for the geos that answer. Discovered, not hardcoded —
-    the free proxy IPs rotate, so a pinned list goes stale silently."""
-    try:
-        import live_scores_widget as _lsw
-        locs = _lsw._webshare_locations() or {}
-    except Exception:
-        locs = {}
-    out = {g: locs.get(g) for g in EVENT_ODDS_GEOS if locs.get(g)}
-    if not out:
-        raise RuntimeError(
-            "mlb_sim: no OddsPortal proxy available. A US egress IP returns "
-            "ZERO outcomes on this endpoint (the event page still resolves, so "
-            "it reads like a parse failure). Set ODDSPORTAL_PROXIES or "
-            "Creds.ODDSPORTAL_PROXIES.")
-    return out
-
-
-def _pack_outcome(o) -> dict:
-    """One outcome, compact. Short keys because this is ~64 lines x ~1,900
-    games and the long-key version is several times the size for nothing."""
-    d = {"n": o.name, "a": o.avg_odds, "o": o.opening_avg,
-         "x": o.max_odds, "b": o.n_books}
-    # the time axis: when the price was first hung and last moved. Averaged
-    # across books, because per-book detail is not what a CLV study needs and
-    # it is 20x the bytes.
-    if o.opened_at:
-        d["t0"] = int(statistics.median(o.opened_at.values()))
-    if o.changed_at:
-        d["t1"] = int(statistics.median(o.changed_at.values()))
-    return {k: v for k, v in d.items() if v is not None}
-
-
-def _pack_event(eo) -> dict:
-    lines = getattr(eo, "markets", None)
-    lines = lines() if callable(lines) else lines
-    out = {"home": eo.home, "away": eo.away,
-           "start_ts": getattr(eo, "start_ts", None), "lines": []}
-    for m in (lines or []):
-        outs = [_pack_outcome(o) for o in (m.outcomes or [])]
-        if not outs:
-            continue
-        out["lines"].append({"bt": m.betting_type_id,
-                             "sc": getattr(m, "scope_id", 1),
-                             "h": m.handicap, "o": outs})
-    return out
 
 
 def _event_odds_worker(job):
@@ -15660,107 +16617,12 @@ def _event_odds_worker(job):
             cl = _OP.OddsPortalClient(verbose=False, timeout=timeout,
                                       proxy=proxy)
             eo = cl.get_event_odds(path, markets=EVENT_ODDS_MARKETS)
-            packed = _pack_event(eo)
+            packed = EventOdds._pack_event(eo)
             if packed["lines"]:
                 return ev_id, packed
         except Exception:
             continue
     return ev_id, None
-
-
-def fetch_event_odds(season: int = 2026, limit: Optional[int] = None,
-                     workers: int = 8, timeout: float = 25.0,
-                     save_dir: Path = SAVE_DIR,
-                     verbose: bool = True) -> Dict[str, dict]:
-    """Opening + closing prices for every market, per event. RESUMABLE.
-
-    Reads the event list (and the `#encodedId` fragments) off the archive cache
-    `fetch_historic_odds` already built, so it adds no discovery cost.
-
-    **Reports cached-against-expected and shouts when SHORT.** On this source
-    "empty" and "done" are identical — that is the sentence behind five of the
-    seven bugs in section 3d — so a run that fetched nothing must not look like
-    a run that finished.
-    """
-    archive = load_historic_odds(season, save_dir)
-    if not archive:
-        raise FileNotFoundError(
-            f"mlb_sim: no historic_odds_{season}.json — run "
-            f"`fetch_historic_odds({season})` first; this reads its event ids "
-            f"and #encodedId fragments.")
-    geos = _oddsportal_geos()
-    proxies = [geos[g] for g in sorted(geos)]
-    cache = load_event_odds(season, save_dir)
-    todo = [(k, v["url"]) for k, v in archive.items()
-            if v.get("url") and "#" in v["url"] and k not in cache]
-    no_frag = sum(1 for v in archive.values()
-                  if v.get("url") and "#" not in v["url"])
-    # `is not None`, not truthiness: `--limit 0` read as "no limit" and quietly
-    # started a full 1,870-event run instead of fetching nothing.
-    if limit is not None:
-        todo = todo[:max(0, limit)]
-    if verbose:
-        print(f"[eventodds] {season}: {len(archive)} games in the archive, "
-              f"{len(cache)} already cached, {len(todo)} to fetch"
-              + (f", {no_frag} have NO #encodedId and are unfetchable"
-                 if no_frag else ""))
-        print(f"[eventodds] geos {sorted(geos)}, {workers} workers "
-              f"(~17s/event each)")
-    _progress(f"eventodds {season}: {len(todo)} to fetch, {len(cache)} cached")
-    if not todo:
-        return cache
-
-    path = event_odds_path(season, save_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    jobs = [(k, u, proxies, timeout) for k, u in todo]
-    done = fail = 0
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        for ev_id, packed in ex.map(_event_odds_worker, jobs):
-            if packed:
-                cache[ev_id] = packed
-                done += 1
-            else:
-                fail += 1
-            n = done + fail
-            if n % 25 == 0 or n == len(jobs):
-                rate = (time.time() - t0) / n
-                left = (len(jobs) - n) * rate
-                msg = (f"{season}  {n}/{len(jobs)}  ok {done} fail {fail}  "
-                       f"{rate:.1f}s/event  ~{left/60:.0f} min left")
-                _progress(f"eventodds {msg}")
-                if verbose:
-                    print(f"[eventodds] {msg}", flush=True)
-                with open(path, "w") as fh:
-                    json.dump(cache, fh)
-    with open(path, "w") as fh:
-        json.dump(cache, fh)
-    have, want = len(cache), len(archive) - no_frag
-    if verbose:
-        print(f"\n[eventodds] {season}: {have}/{want} events cached "
-              f"({fail} failed this run) -> {path}")
-        if have < want:
-            print(f"** SHORT by {want - have} — re-run to backfill. Re-runs "
-                  f"merge by event id, so it is idempotent. **")
-    _progress(f"eventodds {season} FINISHED {have}/{want}")
-    return cache
-
-
-def event_totals(packed: dict, scope: int = 1) -> Dict[float, dict]:
-    """{line: {"over": {...}, "under": {...}}} from a packed event."""
-    out: Dict[float, dict] = {}
-    for ln in packed.get("lines", []):
-        if ln.get("bt") != 2 or ln.get("sc", 1) != scope:
-            continue
-        h = ln.get("h")
-        if h is None:
-            continue
-        side = {}
-        for o in ln.get("o", []):
-            side[str(o.get("n", "")).lower()] = o
-        if "over" in side and "under" in side:
-            out[float(h)] = side
-    return out
 
 
 def market_total(packed: dict, scope: int = 1,
@@ -15790,7 +16652,7 @@ def market_total(packed: dict, scope: int = 1,
     """
     key = "o" if price == "open" else "a"
     best = None
-    for line, side in event_totals(packed, scope).items():
+    for line, side in EventOdds.event_totals(packed, scope).items():
         over, under = side["over"].get(key), side["under"].get(key)
         if not over or not under:
             continue
@@ -15831,14 +16693,15 @@ def score_totals_vs_market(bt: dict, season: Optional[int] = None,
     # **Reuse `odds_by_game`'s key rather than re-deriving it.** It maps the
     # archive's full club names through `_team_index` to board abbreviations and
     # applies `_ARCHIVE_LOCAL_SHIFT` to the timestamp; hand-rolling either gives
-    # a join that matches nothing and looks like missing data. It also DROPS
-    # doubleheaders, which the archive cannot disambiguate.
-    rows = odds_by_game(season, save_dir)
+    # a join that matches nothing and looks like missing data. Keyed by gamePk
+    # rather than by the (date, home, away) triple, so a DOUBLEHEADER is priced
+    # instead of dropped — `odds_by_pk` pairs the two games on their scores.
+    rows = odds_by_pk(season, save_dir)
     ev_by_url = {}
     for k, a in arch.items():
         if k in ev:
             ev_by_url[a.get("url")] = ev[k]
-    book: Dict[tuple, float] = {}
+    book: Dict[int, float] = {}
     for key, row in rows.items():
         packed = ev_by_url.get(row.get("url"))
         if packed is None:
@@ -15850,7 +16713,7 @@ def score_totals_vs_market(bt: dict, season: Optional[int] = None,
     mk: List[float] = []
     at: List[float] = []
     for g in bt["games"]:
-        key = (g["date"], g["home"], g["away"])
+        key = g["pk"]
         if key not in book:
             continue
         mm.append(g["model_mean"])
@@ -15884,9 +16747,10 @@ def score_totals_vs_market(bt: dict, season: Optional[int] = None,
     return out
 
 
-def available_asof_cutoffs(season: int = 2026,
+def available_asof_cutoffs(season: Optional[int] = None,
                            save_dir: Path = SAVE_DIR) -> List[str]:
     """Cutoff dates with BOTH boards cached. Sorted."""
+    season = CURRENT_SEASON if season is None else int(season)
     d = Path(save_dir) / "asof"
     if not d.exists():
         return []
@@ -15949,6 +16813,7 @@ def _backtest_worker(job):
     _PRIOR_CURVE.clear(); _PRIOR_LEAGUE.clear()
     _SLATE_TABLES.clear(); _DEPLOY.clear()
     _PIT_ROWS.clear(); _BAT_ROWS.clear()
+    _PLATOON_GAPS.clear(); _CHED.clear(); _MILB_THROWS.clear()
     save_dir = Path(save_dir)
 
     bat_t, _ = build_rates_asof("bat", season, cut, save_dir=save_dir)
@@ -15962,10 +16827,10 @@ def _backtest_worker(job):
     # `by_cutoff` lives in `backtest()`; this is a WORKER and only receives its
     # own `cut`. The cutoff SET is what freezes the feature, and it comes from
     # the same source `backtest()` groups on.
-    _cq = (club_quality_asof(season, save_dir,
+    _cq = (Pricing.club_quality_asof(season, save_dir,
                              cutoffs=available_asof_cutoffs(season, save_dir))
            if TEAM_QUALITY_GAIN else {})
-    for idx, row in enumerate(rows):
+    for row in rows:
         hb, ab = bases.get(row["home"]), bases.get(row["away"])
         if hb is None or ab is None:
             continue
@@ -16017,12 +16882,12 @@ def _backtest_worker(job):
             # `PitcherLine.r`; the backtest simply discarded it, the same way
             # it discarded the margin distribution before `joint`. Read the
             # attribution caveat in `_staff_split` before using it.
-            **_staff_split(res, home, away),
+            **Pricing._staff_split(res, home, away),
             # Runs-per-half-inning histogram, "runs" -> count, pooled over all
             # sims. Compact, and the only thing needed to test whether the
             # engine under-clusters within an inning.
-            "inn_h": _half_inning_hist(res, "home"),
-            "inn_a": _half_inning_hist(res, "away"),
+            "inn_h": Pricing._half_inning_hist(res, "home"),
+            "inn_a": Pricing._half_inning_hist(res, "away"),
             "actual_total": sum(row["home_innings"]) + sum(row["away_innings"]),
             "actual_home": sum(row["home_innings"]),
             "actual_away": sum(row["away_innings"]),
@@ -16031,7 +16896,7 @@ def _backtest_worker(job):
     return out
 
 
-def backtest(season: int = 2026, reps: int = 60, seed: int = 17,
+def backtest(season: Optional[int] = None, reps: int = 60, seed: int = 17,
              limit: Optional[int] = None,
              odds: Optional[Dict[int, dict]] = None,
              workers: Optional[int] = None,
@@ -16042,6 +16907,7 @@ def backtest(season: int = 2026, reps: int = 60, seed: int = 17,
     produces projections and scores them against the ACTUAL results, which is
     still a real out-of-sample test of the model — just not a CLV number.
     """
+    season = CURRENT_SEASON if season is None else int(season)
     slate = season_slate(season, save_dir=save_dir)
     cutoffs = available_asof_cutoffs(season, save_dir)
     if not cutoffs:
@@ -16138,7 +17004,7 @@ LADDER_MIN_BOOKS = 3
 
 
 def handicap_ladder(season: int, price: str = "a",
-                    min_books: int = LADDER_MIN_BOOKS,
+                    min_books: Optional[int] = None,
                     save_dir: Path = SAVE_DIR) -> Dict[tuple, dict]:
     """{(date, home, away): {"rungs": {m: P(D>=m)}, "ml": p_home, ...}}.
 
@@ -16149,6 +17015,7 @@ def handicap_ladder(season: int, price: str = "a",
     that `odds_by_game` already validates — and the score is kept on the row so
     a caller can verify the join instead of trusting it.
     """
+    min_books = LADDER_MIN_BOOKS if min_books is None else int(min_books)
     events = load_event_odds(season, save_dir)
     keyed = {}
     for row in load_historic_odds(season, save_dir).values():
@@ -16237,132 +17104,136 @@ def ladder_report(season: int, save_dir: Path = SAVE_DIR,
                 m for v in lad.values() for m in v["rungs"]).items()))}
 
 
-def differential_rows(bt: dict, season: int,
-                      save_dir: Path = SAVE_DIR) -> List[dict]:
-    """One row a game: the model's D distribution, the market's, the result.
+class Differential:
+    """The run-differential instrument."""
 
-    `bt` must be an arm carrying the `joint` run histogram — `joint_margins`
-    raises otherwise, because an arm cached before that field existed would
-    report a distribution of nothing and read as a clean null.
-    """
-    lad = handicap_ladder(season, save_dir=save_dir)
-    out = []
-    for g in bt["games"]:
-        marg = joint_margins(g)
-        n = sum(marg.values())
-        mu = sum(d * c for d, c in marg.items()) / n
-        var = sum((d - mu) ** 2 * c for d, c in marg.items()) / n
-        mh = sum(int(k.split(",")[0]) * c for k, c in g["joint"].items()) / n
-        ma = sum(int(k.split(",")[1]) * c for k, c in g["joint"].items()) / n
-        ad = g["actual_home"] - g["actual_away"]
-        row = {"pk": g["pk"], "date": g["date"], "season": season,
-               "home": g["home"], "away": g["away"],
-               "marg": marg, "n": n, "model_d": mu, "model_sd": math.sqrt(var),
-               "model_home_runs": mh, "model_away_runs": ma,
-               "p_home": g["p_home"], "actual_d": ad,
-               "actual_home": g["actual_home"], "actual_away": g["actual_away"],
-               "home_won": g["home_won"], "mkt_ml": None, "rungs": {}}
-        v = lad.get((g["date"], g["home"], g["away"]))
-        # Verified join: clubs play three-game series, so a date and two names
-        # agreeing is not proof. The score is.
-        if v is not None and v["actual_d"] == ad:
-            row["mkt_ml"] = v["ml"]
-            row["rungs"] = v["rungs"]
-        out.append(row)
-    return out
+    @staticmethod
+    def differential_rows(bt: dict, season: int,
+                          save_dir: Path = SAVE_DIR) -> List[dict]:
+        """One row a game: the model's D distribution, the market's, the result.
 
+        `bt` must be an arm carrying the `joint` run histogram — `joint_margins`
+        raises otherwise, because an arm cached before that field existed would
+        report a distribution of nothing and read as a clean null.
+        """
+        lad = handicap_ladder(season, save_dir=save_dir)
+        out = []
+        for g in bt["games"]:
+            marg = joint_margins(g)
+            n = sum(marg.values())
+            mu = sum(d * c for d, c in marg.items()) / n
+            var = sum((d - mu) ** 2 * c for d, c in marg.items()) / n
+            mh = sum(int(k.split(",")[0]) * c for k, c in g["joint"].items()) / n
+            ma = sum(int(k.split(",")[1]) * c for k, c in g["joint"].items()) / n
+            ad = g["actual_home"] - g["actual_away"]
+            row = {"pk": g["pk"], "date": g["date"], "season": season,
+                   "home": g["home"], "away": g["away"],
+                   "marg": marg, "n": n, "model_d": mu, "model_sd": math.sqrt(var),
+                   "model_home_runs": mh, "model_away_runs": ma,
+                   "p_home": g["p_home"], "actual_d": ad,
+                   "actual_home": g["actual_home"], "actual_away": g["actual_away"],
+                   "home_won": g["home_won"], "mkt_ml": None, "rungs": {}}
+            v = lad.get((g["date"], g["home"], g["away"]))
+            # Verified join: clubs play three-game series, so a date and two names
+            # agreeing is not proof. The score is.
+            if v is not None and v["actual_d"] == ad:
+                row["mkt_ml"] = v["ml"]
+                row["rungs"] = v["rungs"]
+            out.append(row)
+        return out
 
-def _slope(xs: Sequence[float], ys: Sequence[float]) -> Tuple[float, float]:
-    """OLS slope of y on x with its standard error."""
-    xm, ym = statistics.mean(xs), statistics.mean(ys)
-    sxx = sum((x - xm) ** 2 for x in xs)
-    b = sum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / sxx
-    res = [y - (ym + b * (x - xm)) for x, y in zip(xs, ys)]
-    return b, math.sqrt(sum(r * r for r in res) / (len(xs) - 2) / sxx)
+    @staticmethod
+    def _slope(xs: Sequence[float], ys: Sequence[float]) -> Tuple[float, float]:
+        """OLS slope of y on x with its standard error."""
+        xm, ym = statistics.mean(xs), statistics.mean(ys)
+        sxx = sum((x - xm) ** 2 for x in xs)
+        b = sum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / sxx
+        res = [y - (ym + b * (x - xm)) for x, y in zip(xs, ys)]
+        return b, math.sqrt(sum(r * r for r in res) / (len(xs) - 2) / sxx)
 
+    @staticmethod
+    def score_differential(rows: Sequence[dict]) -> dict:
+        """Score an arm on the run differential — the instrument the total cannot see.
 
-def score_differential(rows: Sequence[dict]) -> dict:
-    """Score an arm on the run differential — the instrument the total cannot see.
+        Everything here is against ACTUAL results; the market only ever enters as
+        a bucketing variable, never as ground truth.
+        """
+        got = {"n": len(rows)}
+        got["model_mean_d"] = statistics.mean(r["model_d"] for r in rows)
+        got["actual_mean_d"] = statistics.mean(r["actual_d"] for r in rows)
+        got["model_sd_d"] = statistics.stdev([r["model_d"] for r in rows])
+        b, se = Differential._slope([r["model_d"] for r in rows], [r["actual_d"] for r in rows])
+        got["calib_slope"] = b
+        got["calib_slope_se"] = se
+        # conditional spread: the sim's own Var(D) against the real residual. The
+        # real residual also carries the model's ERROR, so it is an UPPER bound on
+        # the truth — the sim exceeding it is a contradiction, matching it is
+        # already suspicious.
+        got["sim_var_d"] = statistics.mean(r["model_sd"] ** 2 for r in rows)
+        got["resid_var_d"] = statistics.mean(
+            (r["actual_d"] - r["model_d"]) ** 2 for r in rows)
+        # tail calibration of D, both directions
+        tails = {}
+        for m in range(-7, 9):
+            ps = [sum(c for d, c in r["marg"].items() if d >= m) / r["n"]
+                  for r in rows]
+            ys = [1.0 if r["actual_d"] >= m else 0.0 for r in rows]
+            mp = statistics.mean(ps)
+            if mp < 0.01 or mp > 0.99:
+                continue
+            se_ = math.sqrt(sum(p * (1 - p) for p in ps)) / len(ps)
+            tails[m] = {"model": mp, "actual": statistics.mean(ys),
+                        "t": (statistics.mean(ys) - mp) / se_}
+        got["tails"] = tails
+        # favourite buckets, folded so the favourite is always the positive side
+        priced = [r for r in rows if r["mkt_ml"] is not None]
+        got["n_priced"] = len(priced)
+        buckets = {}
+        for lo, hi in ((.50, .55), (.55, .60), (.60, .65), (.65, 1.01)):
+            sub = [r for r in priced if lo <= max(r["mkt_ml"], 1 - r["mkt_ml"]) < hi]
+            if len(sub) < 25:
+                continue
+            sgn = [1 if r["mkt_ml"] >= 0.5 else -1 for r in sub]
+            md = [s * r["model_d"] for s, r in zip(sgn, sub)]
+            adl = [s * r["actual_d"] for s, r in zip(sgn, sub)]
+            pm = [(r["p_home"] if s > 0 else 1 - r["p_home"])
+                  for s, r in zip(sgn, sub)]
+            won = [1.0 * ((r["home_won"]) if s > 0 else (not r["home_won"]))
+                   for s, r in zip(sgn, sub)]
+            sed = statistics.stdev([a - m for a, m in zip(adl, md)]) / math.sqrt(len(sub))
+            sew = math.sqrt(sum(p * (1 - p) for p in pm)) / len(sub)
+            buckets[f"{lo:.2f}-{hi:.2f}"] = {
+                "n": len(sub), "model_d": statistics.mean(md),
+                "actual_d": statistics.mean(adl),
+                "gap": statistics.mean(adl) - statistics.mean(md),
+                "t": (statistics.mean(adl) - statistics.mean(md)) / sed,
+                "model_p": statistics.mean(pm), "actual_p": statistics.mean(won),
+                "t_p": (statistics.mean(won) - statistics.mean(pm)) / sew}
+        got["fav_buckets"] = buckets
+        return got
 
-    Everything here is against ACTUAL results; the market only ever enters as
-    a bucketing variable, never as ground truth.
-    """
-    got = {"n": len(rows)}
-    got["model_mean_d"] = statistics.mean(r["model_d"] for r in rows)
-    got["actual_mean_d"] = statistics.mean(r["actual_d"] for r in rows)
-    got["model_sd_d"] = statistics.stdev([r["model_d"] for r in rows])
-    b, se = _slope([r["model_d"] for r in rows], [r["actual_d"] for r in rows])
-    got["calib_slope"] = b
-    got["calib_slope_se"] = se
-    # conditional spread: the sim's own Var(D) against the real residual. The
-    # real residual also carries the model's ERROR, so it is an UPPER bound on
-    # the truth — the sim exceeding it is a contradiction, matching it is
-    # already suspicious.
-    got["sim_var_d"] = statistics.mean(r["model_sd"] ** 2 for r in rows)
-    got["resid_var_d"] = statistics.mean(
-        (r["actual_d"] - r["model_d"]) ** 2 for r in rows)
-    # tail calibration of D, both directions
-    tails = {}
-    for m in range(-7, 9):
-        ps = [sum(c for d, c in r["marg"].items() if d >= m) / r["n"]
-              for r in rows]
-        ys = [1.0 if r["actual_d"] >= m else 0.0 for r in rows]
-        mp = statistics.mean(ps)
-        if mp < 0.01 or mp > 0.99:
-            continue
-        se_ = math.sqrt(sum(p * (1 - p) for p in ps)) / len(ps)
-        tails[m] = {"model": mp, "actual": statistics.mean(ys),
-                    "t": (statistics.mean(ys) - mp) / se_}
-    got["tails"] = tails
-    # favourite buckets, folded so the favourite is always the positive side
-    priced = [r for r in rows if r["mkt_ml"] is not None]
-    got["n_priced"] = len(priced)
-    buckets = {}
-    for lo, hi in ((.50, .55), (.55, .60), (.60, .65), (.65, 1.01)):
-        sub = [r for r in priced if lo <= max(r["mkt_ml"], 1 - r["mkt_ml"]) < hi]
-        if len(sub) < 25:
-            continue
-        sgn = [1 if r["mkt_ml"] >= 0.5 else -1 for r in sub]
-        md = [s * r["model_d"] for s, r in zip(sgn, sub)]
-        adl = [s * r["actual_d"] for s, r in zip(sgn, sub)]
-        pm = [(r["p_home"] if s > 0 else 1 - r["p_home"])
-              for s, r in zip(sgn, sub)]
-        won = [1.0 * ((r["home_won"]) if s > 0 else (not r["home_won"]))
-               for s, r in zip(sgn, sub)]
-        sed = statistics.stdev([a - m for a, m in zip(adl, md)]) / math.sqrt(len(sub))
-        sew = math.sqrt(sum(p * (1 - p) for p in pm)) / len(sub)
-        buckets[f"{lo:.2f}-{hi:.2f}"] = {
-            "n": len(sub), "model_d": statistics.mean(md),
-            "actual_d": statistics.mean(adl),
-            "gap": statistics.mean(adl) - statistics.mean(md),
-            "t": (statistics.mean(adl) - statistics.mean(md)) / sed,
-            "model_p": statistics.mean(pm), "actual_p": statistics.mean(won),
-            "t_p": (statistics.mean(won) - statistics.mean(pm)) / sew}
-    got["fav_buckets"] = buckets
-    return got
-
-
-def print_differential(sc: dict, label: str = "") -> None:
-    print(f"\nRUN DIFFERENTIAL{(' — ' + label) if label else ''}   "
-          f"n {sc['n']} ({sc['n_priced']} priced)")
-    print(f"  mean D      model {sc['model_mean_d']:+.4f}   "
-          f"actual {sc['actual_mean_d']:+.4f}   "
-          f"bias {sc['model_mean_d'] - sc['actual_mean_d']:+.4f}")
-    print(f"  sd of model E[D] across games {sc['model_sd_d']:.4f}")
-    print(f"  calibration slope actual~model {sc['calib_slope']:+.4f} "
-          f"+- {sc['calib_slope_se']:.4f}  "
-          f"(t vs 1 = {(sc['calib_slope'] - 1) / sc['calib_slope_se']:+.2f})")
-    print(f"  sim Var(D) {sc['sim_var_d']:.3f}  vs real residual "
-          f"{sc['resid_var_d']:.3f}   ratio {sc['sim_var_d'] / sc['resid_var_d']:.4f}")
-    print(f"\n  {'rung':>10} {'model':>8} {'actual':>8} {'t':>7}")
-    for m, v in sorted(sc["tails"].items()):
-        print(f"  P(D>={m:+d}) {v['model']:8.4f} {v['actual']:8.4f} {v['t']:+7.2f}")
-    print(f"\n  {'fav bucket':>12} {'n':>5} {'modelE[D]':>10} {'actual':>9} "
-          f"{'gap':>8} {'t':>7} | {'modelP':>7} {'actualP':>8} {'t':>7}")
-    for k, v in sc["fav_buckets"].items():
-        print(f"  {k:>12} {v['n']:5d} {v['model_d']:+10.3f} {v['actual_d']:+9.3f} "
-              f"{v['gap']:+8.3f} {v['t']:+7.2f} | {v['model_p']:7.4f} "
-              f"{v['actual_p']:8.4f} {v['t_p']:+7.2f}")
+    @staticmethod
+    def print_differential(sc: dict, label: str = "") -> None:
+        print(f"\nRUN DIFFERENTIAL{(' — ' + label) if label else ''}   "
+              f"n {sc['n']} ({sc['n_priced']} priced)")
+        print(f"  mean D      model {sc['model_mean_d']:+.4f}   "
+              f"actual {sc['actual_mean_d']:+.4f}   "
+              f"bias {sc['model_mean_d'] - sc['actual_mean_d']:+.4f}")
+        print(f"  sd of model E[D] across games {sc['model_sd_d']:.4f}")
+        print(f"  calibration slope actual~model {sc['calib_slope']:+.4f} "
+              f"+- {sc['calib_slope_se']:.4f}  "
+              f"(t vs 1 = {(sc['calib_slope'] - 1) / sc['calib_slope_se']:+.2f})")
+        print(f"  sim Var(D) {sc['sim_var_d']:.3f}  vs real residual "
+              f"{sc['resid_var_d']:.3f}   ratio {sc['sim_var_d'] / sc['resid_var_d']:.4f}")
+        print(f"\n  {'rung':>10} {'model':>8} {'actual':>8} {'t':>7}")
+        for m, v in sorted(sc["tails"].items()):
+            print(f"  P(D>={m:+d}) {v['model']:8.4f} {v['actual']:8.4f} {v['t']:+7.2f}")
+        print(f"\n  {'fav bucket':>12} {'n':>5} {'modelE[D]':>10} {'actual':>9} "
+              f"{'gap':>8} {'t':>7} | {'modelP':>7} {'actualP':>8} {'t':>7}")
+        for k, v in sc["fav_buckets"].items():
+            print(f"  {k:>12} {v['n']:5d} {v['model_d']:+10.3f} {v['actual_d']:+9.3f} "
+                  f"{v['gap']:+8.3f} {v['t']:+7.2f} | {v['model_p']:7.4f} "
+                  f"{v['actual_p']:8.4f} {v['t_p']:+7.2f}")
 
 
 def score_backtest(bt: dict) -> dict:
@@ -16449,14 +17320,15 @@ def load_historic_odds(season: int, save_dir: Path = SAVE_DIR
 _ARCHIVE_LOCAL_SHIFT = datetime.timedelta(hours=8)
 
 
-def odds_by_game(season: int, save_dir: Path = SAVE_DIR
-                 ) -> Dict[tuple, dict]:
-    """{(date, home_abbr, away_abbr): odds row} from the results archive.
+def _archive_groups(season: int, save_dir: Path = SAVE_DIR
+                    ) -> Dict[tuple, List[dict]]:
+    """{(local date, home abbr, away abbr): [archive rows]} for a season.
 
-    Ambiguous keys are DROPPED rather than resolved. A repeated key is a
-    doubleheader, and the archive gives no way to tell game one from game two;
-    guessing would attach the wrong price to both. `odds_join_report` counts
-    what this costs.
+    A key with two rows is a doubleheader. `odds_by_game` drops those because
+    its triple cannot tell the games apart; `odds_by_pk` resolves them against
+    the slate. Both built this identical grouping, including the
+    `_ARCHIVE_LOCAL_SHIFT` correction that turns the archive's UTC timestamp
+    into the game's LOCAL date.
     """
     idx = _team_index()
     groups: Dict[tuple, List[dict]] = {}
@@ -16469,7 +17341,90 @@ def odds_by_game(season: int, save_dir: Path = SAVE_DIR
         d = (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
              - _ARCHIVE_LOCAL_SHIFT).date()
         groups.setdefault((d.isoformat(), h["abbr"], a["abbr"]), []).append(row)
+    return groups
+
+
+def odds_by_game(season: int, save_dir: Path = SAVE_DIR
+                 ) -> Dict[tuple, dict]:
+    """{(date, home_abbr, away_abbr): odds row} from the results archive.
+
+    Ambiguous keys are DROPPED rather than resolved: a repeated key is a
+    doubleheader, and this TRIPLE cannot name game one from game two.
+
+    That is a limit of the key, not of the data — **`odds_by_pk` resolves them**
+    by pairing the two archive rows against the slate on their final scores,
+    which is what every consumer here now joins on (36 games in 2026, 56 in
+    2025). This function stays because the triple is the natural identity when
+    there is no gamePk to hand, and dropping is still the right answer for a
+    key that genuinely cannot tell the two games apart.
+    `odds_join_report` prints both counts.
+    """
+    groups = _archive_groups(season, save_dir)
     return {k: v[0] for k, v in groups.items() if len(v) == 1}
+
+
+def odds_by_pk(season: int, save_dir: Path = SAVE_DIR) -> Dict[int, dict]:
+    """{StatsAPI gamePk: odds row} — doubleheaders INCLUDED.
+
+    `odds_by_game`'s triple cannot name game one from game two, so it drops
+    both. The rows themselves can: every doubleheader pair in the archive
+    carries two distinct final scores, and the slate carries the same pair in
+    `home_innings`/`away_innings`. Pairing on the SCORE recovered 36 games in
+    2026 and 56 in 2025, and the order fallback below never fired in either.
+
+    **Pair on the score, NOT on the clock, even though both sides have a
+    timestamp.** The two clocks disagree by hours: the archive gives game two a
+    real ~3-6h offset (median 5.5h in 2026, never less than 3.0h), while
+    StatsAPI schedules it as a PLACEHOLDER five minutes after game one — a
+    doubleheader's second start is genuinely unknown until the first ends. So
+    nearest-time matching maps BOTH slate rows onto archive game one and
+    silently prices game two with game one's number, which is the exact error
+    dropping them was meant to avoid. Start time survives only as ORDER, which
+    is used when two games of a pair ended in the same score.
+
+    A pair that resolves neither way is still dropped. So is one where the two
+    sides disagree on how many games were played — three in 2025, one in 2026,
+    all suspended or rescheduled games the archive and the schedule count
+    differently.
+    """
+    arch = _archive_groups(season, save_dir)
+
+    slate: Dict[tuple, List[dict]] = {}
+    for r in season_slate(season, save_dir=save_dir):
+        slate.setdefault((r["date"], r["home"], r["away"]), []).append(r)
+
+    def _archive_score(r: dict) -> Optional[Tuple[int, int]]:
+        h = str(r.get("home_score") or "").strip()
+        a = str(r.get("away_score") or "").strip()
+        return (int(h), int(a)) if h.isdigit() and a.isdigit() else None
+
+    def _slate_score(r: dict) -> Optional[Tuple[int, int]]:
+        hi, ai = r.get("home_innings"), r.get("away_innings")
+        return (sum(hi), sum(ai)) if hi and ai else None
+
+    out: Dict[int, dict] = {}
+    for key, rows in arch.items():
+        games = slate.get(key) or []
+        if not games or len(rows) != len(games):
+            continue
+        if len(rows) == 1:
+            out[games[0]["pk"]] = rows[0]
+            continue
+        av = [_archive_score(r) for r in rows]
+        sv = [_slate_score(g) for g in games]
+        if (all(x is not None for x in av) and all(x is not None for x in sv)
+                and len(set(av)) == len(av) and len(set(sv)) == len(sv)
+                and sorted(av) == sorted(sv)):
+            by_score = {sc: r for sc, r in zip(av, rows)}
+            for g, sc in zip(games, sv):
+                out[g["pk"]] = by_score[sc]
+            continue
+        # Same score in both games of a pair, or a missing one. Order is all
+        # that is left, and it is only ever a tie-break — see the docstring.
+        for r, g in zip(sorted(rows, key=lambda r: r["start_ts"]),
+                        sorted(games, key=lambda g: g["start"])):
+            out[g["pk"]] = r
+    return out
 
 
 def odds_join_report(season: int, save_dir: Path = SAVE_DIR) -> dict:
@@ -16480,6 +17435,7 @@ def odds_join_report(season: int, save_dir: Path = SAVE_DIR) -> dict:
     """
     raw = load_historic_odds(season, save_dir)
     book = odds_by_game(season, save_dir)
+    by_pk = odds_by_pk(season, save_dir)
     slate = season_slate(season, save_dir=save_dir)
     seen = collections.Counter((r["date"], r["home"], r["away"])
                                for r in slate)
@@ -16487,158 +17443,136 @@ def odds_join_report(season: int, save_dir: Path = SAVE_DIR) -> dict:
     return {"archive_rows": len(raw), "unique_keys": len(book),
             "slate": len(slate),
             "slate_doubleheaders": sum(c for c in seen.values() if c > 1),
-            "matched": matched}
+            "matched": matched,
+            # what the consumers actually join on now; the gap between the two
+            # is the doubleheaders `odds_by_game`'s triple cannot name
+            "matched_by_pk": len(by_pk)}
 
 
-def clv_vs_closing(bt: dict, season: int = 2026, edge: float = 0.03,
-                   price: str = "avg", save_dir: Path = SAVE_DIR) -> dict:
-    """Score a backtest's moneylines against the de-vigged CLOSING price.
+class ClosingScore:
+    """The model against the de-vigged CLOSING line."""
 
-    `edge` is the probability difference that counts as a signal — 0.03 means
-    the model has to disagree with the close by three points before the game is
-    a pick. `price` is `avg` (the book average, a fair-value test) or `max`
-    (best available, what could actually be bet).
+    @staticmethod
+    def clv_vs_closing(bt: dict, season: Optional[int] = None, edge: float = 0.03,
+                       price: str = "avg", save_dir: Path = SAVE_DIR) -> dict:
+        """Score a backtest's moneylines against the de-vigged CLOSING price.
 
-    Returns per-pick rows plus the summary. **Both the FILTERED and the ALL
-    buckets are reported**, because a filter that selects nothing is the null
-    result and it looks identical to a filter that selects badly unless the
-    unfiltered number is next to it.
-    """
-    book = odds_by_game(season, save_dir)
-    rows: List[dict] = []
-    matched = 0
-    mismatched = 0
-    for g in bt["games"]:
-        row = book.get((g["date"], g["home"], g["away"]))
-        if row is None:
-            continue
-        decs = row.get(f"{price}_odds") or []
-        if len(decs) != 2 or not all(decs):
-            continue
-        p = devig(decs)
-        if p[0] is None:
-            continue
-        # **The archive carries its own final score, so the join can be
-        # VERIFIED rather than trusted.** Team names and a date agreeing is
-        # not proof: clubs play three-game series, so an off-by-one-day join
-        # matches on both and attaches the neighbouring game's price. Scores
-        # agreeing is proof, and it costs one comparison.
-        try:
-            if (int(row["home_score"]), int(row["away_score"])) != (
-                    g["actual_home"], g["actual_away"]):
-                mismatched += 1
+        `edge` is the probability difference that counts as a signal — 0.03 means
+        the model has to disagree with the close by three points before the game is
+        a pick. `price` is `avg` (the book average, a fair-value test) or `max`
+        (best available, what could actually be bet).
+
+        Returns per-pick rows plus the summary. **Both the FILTERED and the ALL
+        buckets are reported**, because a filter that selects nothing is the null
+        result and it looks identical to a filter that selects badly unless the
+        unfiltered number is next to it.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        book = odds_by_pk(season, save_dir)
+        rows: List[dict] = []
+        matched = 0
+        mismatched = 0
+        for g in bt["games"]:
+            row = book.get(g["pk"])
+            if row is None:
                 continue
-        except (KeyError, TypeError, ValueError):
-            pass
-        matched += 1
-        mkt_home = p[0]                      # outcome 1 is HOME — validated
-        d = g["p_home"] - mkt_home
-        side = "home" if d > 0 else "away"
-        rows.append({
-            "pk": g["pk"], "date": g["date"],
-            "home": g["home"], "away": g["away"],
-            "model_home": g["p_home"], "mkt_home": mkt_home,
-            "edge": abs(d), "side": side,
-            "dec": decs[0] if side == "home" else decs[1],
-            "mkt_fair": mkt_home if side == "home" else 1.0 - mkt_home,
-            "won": (g["home_won"] if side == "home" else not g["home_won"]),
-            "n_books": row.get("n_books"),
-        })
-    # **The edge filter is applied to a Monte Carlo ESTIMATE of p_home, so the
-    # rep count decides what it selects.** At 40 sims the standard error on a
-    # near-even probability is 0.079 — more than twice the 0.03 threshold — so
-    # the "edge > 3%" bucket would be mostly games where the SIMULATOR got
-    # lucky, not games where the model disagrees. Selection on a noisy score
-    # then regresses: the picked set's true edge is far smaller than its
-    # measured one, which dilutes ROI toward zero and flattens the bucket
-    # profile. In other words the failure is quiet and it points the wrong way.
-    reps = max(int(bt.get("reps") or 1), 1)
-    mc_se = (0.25 / reps) ** 0.5
-    return {"season": season, "edge": edge, "price": price,
-            "matched": matched, "mismatched": mismatched,
-            "reps": reps, "mc_se": mc_se,
-            "n_games": len(bt["games"]),
-            "picks": rows,
-            "filtered": summarize_clv_bucket([r for r in rows
-                                              if r["edge"] > edge]),
-            "all": summarize_clv_bucket(rows),
-            "buckets": clv_edge_buckets(rows)}
+            decs = row.get(f"{price}_odds") or []
+            if len(decs) != 2 or not all(decs):
+                continue
+            p = Pricing.devig(decs)
+            if p[0] is None:
+                continue
+            # **The archive carries its own final score, so the join can be
+            # VERIFIED rather than trusted.** Team names and a date agreeing is
+            # not proof: clubs play three-game series, so an off-by-one-day join
+            # matches on both and attaches the neighbouring game's price. Scores
+            # agreeing is proof, and it costs one comparison.
+            try:
+                if (int(row["home_score"]), int(row["away_score"])) != (
+                        g["actual_home"], g["actual_away"]):
+                    mismatched += 1
+                    continue
+            except (KeyError, TypeError, ValueError):
+                pass
+            matched += 1
+            mkt_home = p[0]                      # outcome 1 is HOME — validated
+            d = g["p_home"] - mkt_home
+            side = "home" if d > 0 else "away"
+            rows.append({
+                "pk": g["pk"], "date": g["date"],
+                "home": g["home"], "away": g["away"],
+                "model_home": g["p_home"], "mkt_home": mkt_home,
+                "edge": abs(d), "side": side,
+                "dec": decs[0] if side == "home" else decs[1],
+                "mkt_fair": mkt_home if side == "home" else 1.0 - mkt_home,
+                "won": (g["home_won"] if side == "home" else not g["home_won"]),
+                "n_books": row.get("n_books"),
+            })
+        # **The edge filter is applied to a Monte Carlo ESTIMATE of p_home, so the
+        # rep count decides what it selects.** At 40 sims the standard error on a
+        # near-even probability is 0.079 — more than twice the 0.03 threshold — so
+        # the "edge > 3%" bucket would be mostly games where the SIMULATOR got
+        # lucky, not games where the model disagrees. Selection on a noisy score
+        # then regresses: the picked set's true edge is far smaller than its
+        # measured one, which dilutes ROI toward zero and flattens the bucket
+        # profile. In other words the failure is quiet and it points the wrong way.
+        reps = max(int(bt.get("reps") or 1), 1)
+        mc_se = (0.25 / reps) ** 0.5
+        return {"season": season, "edge": edge, "price": price,
+                "matched": matched, "mismatched": mismatched,
+                "reps": reps, "mc_se": mc_se,
+                "n_games": len(bt["games"]),
+                "picks": rows,
+                "filtered": ClosingScore.summarize_clv_bucket([r for r in rows
+                                                  if r["edge"] > edge]),
+                "all": ClosingScore.summarize_clv_bucket(rows),
+                "buckets": AbHarness.clv_edge_buckets(rows)}
 
+    @staticmethod
+    def summarize_clv_bucket(rows: Sequence[dict]) -> dict:
+        """Hit rate and ROI for one set of picks, with a standard error.
 
-def summarize_clv_bucket(rows: Sequence[dict]) -> dict:
-    """Hit rate and ROI for one set of picks, with a standard error.
-
-    The se is what stops a 4% ROI on 90 picks from being read as an edge: at
-    even money it is ~10 points, so anything inside ~2 se is noise. Every
-    published MLB edge that turned out to be nothing looked like this first.
-    """
-    n = len(rows)
-    if not n:
-        return {"n": 0}
-    won = [1.0 if r["won"] else 0.0 for r in rows]
-    ret = [(r["dec"] - 1.0) if r["won"] else -1.0 for r in rows]
-    mkt = [1.0 / r["dec"] for r in rows]          # WITH vig, the bettable price
-    devigged = [r["mkt_fair"] for r in rows]      # the market's actual opinion
-    fair = [(r["model_home"] if r["side"] == "home"
-             else 1.0 - r["model_home"]) for r in rows]
-    roi = statistics.mean(ret)
-    se = (statistics.pstdev(ret) / n ** 0.5) if n > 1 else float("nan")
-    return {
-        "n": n,
-        "hit": statistics.mean(won),
-        "mkt_implied": statistics.mean(mkt),
-        "mkt_fair": statistics.mean(devigged),
-        "model_implied": statistics.mean(fair),
-        "roi": roi, "roi_se": se, "t": (roi / se) if se else float("nan"),
-        "avg_dec": statistics.mean(r["dec"] for r in rows),
-    }
+        The se is what stops a 4% ROI on 90 picks from being read as an edge: at
+        even money it is ~10 points, so anything inside ~2 se is noise. Every
+        published MLB edge that turned out to be nothing looked like this first.
+        """
+        n = len(rows)
+        if not n:
+            return {"n": 0}
+        won = [1.0 if r["won"] else 0.0 for r in rows]
+        ret = [(r["dec"] - 1.0) if r["won"] else -1.0 for r in rows]
+        mkt = [1.0 / r["dec"] for r in rows]          # WITH vig, the bettable price
+        devigged = [r["mkt_fair"] for r in rows]      # the market's actual opinion
+        fair = [(r["model_home"] if r["side"] == "home"
+                 else 1.0 - r["model_home"]) for r in rows]
+        roi = statistics.mean(ret)
+        se = (statistics.pstdev(ret) / n ** 0.5) if n > 1 else float("nan")
+        return {
+            "n": n,
+            "hit": statistics.mean(won),
+            "mkt_implied": statistics.mean(mkt),
+            "mkt_fair": statistics.mean(devigged),
+            "model_implied": statistics.mean(fair),
+            "roi": roi, "roi_se": se, "t": (roi / se) if se else float("nan"),
+            "avg_dec": statistics.mean(r["dec"] for r in rows),
+        }
 
 
 # ---------------------------------------------------------------------------
 # The model against the OPENING line — CLV. sim_state.md 0.
 # ---------------------------------------------------------------------------
-# Beating the CLOSE is the bar an edge has to clear. CLV asks a different and
-# far more SENSITIVE question: priced against the market before it had finished
-# forming its opinion, did the price move TOWARD the model? It needs no game
-# result, so it converges in a season rather than a decade — which is why the
-# NHL model in `NHLvacuum/model_test.py` found CLV to be the signal where ROI
+# Beating the CLOSE is the bar. CLV asks a more SENSITIVE question — priced
+# before the market finished forming its opinion, did the price move TOWARD the
+# model? It needs no result, so it converges in a season rather than a decade,
+# which is why `NHLvacuum/model_test.py` found CLV to be the signal where ROI
 # was not.
 #
-# **Four ways this measurement can fake a positive, each handled explicitly:**
+# **Four ways this can fake a positive, each handled explicitly:**
 #
 #   1. **The overround shrinks as a game approaches.** A raw implied
 #      probability is `fair x overround`, so as the book tightens BOTH sides
-#      drift in the same direction at once — down, here, since the overround
-#      falls. Differencing raw numbers therefore adds a constant to every pick
-#      whichever side was taken. Measured on the real card the overround goes
-#      1.049 -> 1.043, which biases raw CLV DOWNWARD: the uncorrected version
-#      of this test understates the model rather than flattering it, which is
-#      the opposite of what was assumed when writing it. Both ends are
-#      de-vigged, and `vig_report` prints what the number would have been
-#      without that, which is the only way to show the correction does work.
-#
-#      Note what is NOT a check here, because it looks like one: CLV on a
-#      RANDOMLY chosen side. After de-vigging, both ends sum to 1, so
-#      `clv_away == -clv_home` identically and a random side averages to zero
-#      whatever is wrong upstream. That null is a TAUTOLOGY, not evidence, and
-#      it was written and deleted here rather than shipped as reassurance.
-#   2. **The join must be verified by SCORE.** Clubs play series, so an
-#      off-by-one-day join matches on teams and a date both (3d.1). This reuses
-#      `odds_by_game`, which drops doubleheaders rather than guessing, and then
-#      re-checks the archive's own final score.
-#   3. **The opener's AGE decides what is being beaten.** If the line is hung
-#      AFTER our board cutoff we are not beating a market, we are beating a
-#      stale number while holding newer information. The packed outcomes carry
-#      `t0`, so the lag from cutoff to open is measured and printed.
-#   4. **A line quoted at only one end cannot be differenced.** `both_ends`
-#      forces the totals line to be priced at open AND close, otherwise the
-#      selected line silently changes between the two.
-#
-# The model's side is all this needs — not its probability — so it runs off the
-# CACHED backtest arms with no re-simulation. That matters for totals: the
-# cache carries `model_total` (the implied MEDIAN line, the right quantity to
-# compare against a book's line) but no distribution, so `p_over` at an
-# arbitrary line is unavailable and is not needed.
+#      drift the same way. Differencing raw numbers adds a constant to every
+#      pick whichever side was taken. Measured on the real card the overround
 
 MIN_BOOKS_FOR_CLV_OPEN = 3
 
@@ -16659,12 +17593,13 @@ def _event_line(packed: dict, bt_id: int, scope: int = 1,
 
 
 def line_open_close(ln: Optional[dict],
-                    min_books: int = MIN_BOOKS_FOR_CLV_OPEN) -> Optional[dict]:
+                    min_books: Optional[int] = None) -> Optional[dict]:
     """De-vigged OPEN and CLOSE probabilities for a two-way line.
 
     Both ends de-vigged, which is the whole point — see this section's header.
     Returns None unless both ends are fully priced by `min_books` books.
     """
+    min_books = MIN_BOOKS_FOR_CLV_OPEN if min_books is None else int(min_books)
     if not ln:
         return None
     outs = ln["o"]
@@ -16674,7 +17609,7 @@ def line_open_close(ln: Optional[dict],
     cd = [o.get("a") for o in outs]
     if not all(od) or not all(cd):
         return None
-    op, cp = devig(od), devig(cd)
+    op, cp = Pricing.devig(od), Pricing.devig(cd)
     if not all(x is not None for x in op) or not all(x is not None for x in cp):
         return None
     t0 = [o.get("t0") for o in outs if o.get("t0")]
@@ -16724,26 +17659,96 @@ def _home_index(names: Sequence[str], home_abbr: str) -> Optional[int]:
     return None
 
 
-def _clv_summary(rows: Sequence[dict], key: str = "clv") -> dict:
-    """Mean CLV with a standard error, and the share that moved our way.
+class OpeningClv:
+    """The model against the OPENING line — closing line value."""
 
-    The se is the point. A 0.4-point mean CLV on 1,800 picks is a finding; the
-    same number on 90 is not, and they read identically without it.
-    """
-    n = len(rows)
-    if not n:
-        return {"n": 0}
-    v = [r[key] for r in rows]
-    mu = statistics.mean(v)
-    se = (statistics.pstdev(v) / n ** 0.5) if n > 1 else float("nan")
-    return {"n": n, "clv": mu, "se": se,
-            "t": (mu / se) if se else float("nan"),
-            "hit": statistics.mean(1.0 if x > 0 else 0.0 for x in v),
-            "moved": statistics.mean(0.0 if x == 0 else 1.0 for x in v)}
+    @staticmethod
+    def _clv_summary(rows: Sequence[dict], key: str = "clv") -> dict:
+        """Mean CLV with a standard error, and the share that moved our way.
+
+        The se is the point. A 0.4-point mean CLV on 1,800 picks is a finding; the
+        same number on 90 is not, and they read identically without it.
+        """
+        n = len(rows)
+        if not n:
+            return {"n": 0}
+        v = [r[key] for r in rows]
+        mu = statistics.mean(v)
+        se = (statistics.pstdev(v) / n ** 0.5) if n > 1 else float("nan")
+        return {"n": n, "clv": mu, "se": se,
+                "t": (mu / se) if se else float("nan"),
+                "hit": statistics.mean(1.0 if x > 0 else 0.0 for x in v),
+                "moved": statistics.mean(0.0 if x == 0 else 1.0 for x in v)}
+
+    @staticmethod
+    def _open_after_cutoff(rows: Sequence[dict]) -> Optional[float]:
+        """Share of picks whose OPENING price was hung after our board cutoff.
+
+        This is the one way the number below could flatter the model without any
+        bug: a line hung after the cutoff is a market that already knows everything
+        we know, and one hung before it is a market that does not. It does not
+        invalidate CLV either way — it decides how the result should be READ — so
+        it is measured rather than argued about.
+        """
+        got = [r for r in rows if r.get("open_ts") and r.get("cutoff")]
+        if not got:
+            return None
+        n = 0
+        for r in got:
+            try:
+                cut = datetime.date.fromisoformat(r["cutoff"])
+            except (TypeError, ValueError):
+                continue
+            opened = datetime.datetime.fromtimestamp(
+                r["open_ts"], datetime.timezone.utc).date()
+            if opened > cut:
+                n += 1
+        return n / len(got)
+
+    @staticmethod
+    def vig_report(rows: Sequence[dict]) -> dict:
+        """What the de-vig is worth, measured rather than asserted.
+
+        A market's overround shrinks between open and close, so RAW implied
+        probabilities rise on BOTH sides. `clv_raw` is CLV computed on those raw
+        numbers — the result this test would have reported without the correction.
+        If it is materially above the de-vigged figure, the correction is carrying
+        that drift and reporting the raw one would have been a fake positive on
+        every pick regardless of which side was backed.
+        """
+        got = [r for r in rows if r.get("clv_raw") is not None]
+        if not got:
+            return {"n": 0}
+        out = {"n": len(got),
+               "open_overround": statistics.mean(r["open_ov"] for r in got),
+               "close_overround": statistics.mean(r["close_ov"] for r in got)}
+        out["raw"] = OpeningClv._clv_summary(got, "clv_raw")
+        out["devigged"] = OpeningClv._clv_summary(got, "clv")
+        return out
+
+    @staticmethod
+    def clv_open_buckets(rows: Sequence[dict],
+                         edges: Sequence[float] = (0.0, 0.02, 0.04, 0.06, 0.09)
+                         ) -> List[dict]:
+        """CLV by how far the model disagreed with the OPEN.
+
+        The SHAPE is the finding, not any single bucket: if the model carries real
+        information, the games it disagreed with most should be the ones the market
+        moved furthest toward. A flat profile is noise however good the top bucket
+        looks — the same reading that killed the edge curve in 3d.1.
+        """
+        out = []
+        for i, lo in enumerate(edges):
+            hi = edges[i + 1] if i + 1 < len(edges) else float("inf")
+            got = [r for r in rows if lo <= r["edge"] < hi]
+            s = OpeningClv._clv_summary(got)
+            s["lo"], s["hi"] = lo, hi
+            out.append(s)
+        return out
 
 
-def clv_vs_opening(bt: dict, season: int = 2026,
-                   min_books: int = MIN_BOOKS_FOR_CLV_OPEN,
+def clv_vs_opening(bt: dict, season: Optional[int] = None,
+                   min_books: Optional[int] = None,
                    save_dir: Path = SAVE_DIR) -> dict:
     """Score a backtest against the market's OPEN -> CLOSE movement.
 
@@ -16757,8 +17762,10 @@ def clv_vs_opening(bt: dict, season: int = 2026,
     opening price did not — the sharpest instrument available here, and it does
     not need a single game result.
     """
+    min_books = MIN_BOOKS_FOR_CLV_OPEN if min_books is None else int(min_books)
+    season = CURRENT_SEASON if season is None else int(season)
     events = load_event_odds(season, save_dir)
-    book = odds_by_game(season, save_dir)
+    book = odds_by_pk(season, save_dir)
     if not events:
         raise FileNotFoundError(
             f"mlb_sim: no event_odds_{season}.json — run "
@@ -16772,7 +17779,7 @@ def clv_vs_opening(bt: dict, season: int = 2026,
     lags: List[float] = []
 
     for g in bt["games"]:
-        row = book.get((g["date"], g["home"], g["away"]))
+        row = book.get(g["pk"])
         if row is None:
             continue
         # Verified by SCORE, not by teams and a date (see the header).
@@ -16855,75 +17862,9 @@ def clv_vs_opening(bt: dict, season: int = 2026,
         "no_event": no_event, "no_home_side": no_home,
         "n_games": len(bt["games"]),
         "open_lag_days": (statistics.median(lags) if lags else None),
-        "open_after_cutoff": _open_after_cutoff(ml_rows),
+        "open_after_cutoff": OpeningClv._open_after_cutoff(ml_rows),
         "moneyline": ml_rows, "totals": tot_rows,
     }
-
-
-def _open_after_cutoff(rows: Sequence[dict]) -> Optional[float]:
-    """Share of picks whose OPENING price was hung after our board cutoff.
-
-    This is the one way the number below could flatter the model without any
-    bug: a line hung after the cutoff is a market that already knows everything
-    we know, and one hung before it is a market that does not. It does not
-    invalidate CLV either way — it decides how the result should be READ — so
-    it is measured rather than argued about.
-    """
-    got = [r for r in rows if r.get("open_ts") and r.get("cutoff")]
-    if not got:
-        return None
-    n = 0
-    for r in got:
-        try:
-            cut = datetime.date.fromisoformat(r["cutoff"])
-        except (TypeError, ValueError):
-            continue
-        opened = datetime.datetime.fromtimestamp(
-            r["open_ts"], datetime.timezone.utc).date()
-        if opened > cut:
-            n += 1
-    return n / len(got)
-
-
-def vig_report(rows: Sequence[dict]) -> dict:
-    """What the de-vig is worth, measured rather than asserted.
-
-    A market's overround shrinks between open and close, so RAW implied
-    probabilities rise on BOTH sides. `clv_raw` is CLV computed on those raw
-    numbers — the result this test would have reported without the correction.
-    If it is materially above the de-vigged figure, the correction is carrying
-    that drift and reporting the raw one would have been a fake positive on
-    every pick regardless of which side was backed.
-    """
-    got = [r for r in rows if r.get("clv_raw") is not None]
-    if not got:
-        return {"n": 0}
-    out = {"n": len(got),
-           "open_overround": statistics.mean(r["open_ov"] for r in got),
-           "close_overround": statistics.mean(r["close_ov"] for r in got)}
-    out["raw"] = _clv_summary(got, "clv_raw")
-    out["devigged"] = _clv_summary(got, "clv")
-    return out
-
-
-def clv_open_buckets(rows: Sequence[dict],
-                     edges: Sequence[float] = (0.0, 0.02, 0.04, 0.06, 0.09)
-                     ) -> List[dict]:
-    """CLV by how far the model disagreed with the OPEN.
-
-    The SHAPE is the finding, not any single bucket: if the model carries real
-    information, the games it disagreed with most should be the ones the market
-    moved furthest toward. A flat profile is noise however good the top bucket
-    looks — the same reading that killed the edge curve in 3d.1.
-    """
-    out = []
-    for i, lo in enumerate(edges):
-        hi = edges[i + 1] if i + 1 < len(edges) else float("inf")
-        got = [r for r in rows if lo <= r["edge"] < hi]
-        s = _clv_summary(got)
-        s["lo"], s["hi"] = lo, hi
-        out.append(s)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -16972,7 +17913,12 @@ AB_ARMS: Dict[str, Dict[str, object]] = {
     # while `stuff_stabilize` captured it as a frozen default — so that run used
     # arsenal FEATURES against five-column RELIABILITIES. A hybrid, not what
     # ships. This arm turns the prior off against the current shipped model.
-    "nostuff": {"USE_STUFF_PRIOR": False},
+    "nostuff": {"USE_STUFF_PRIOR": False, "USE_CHED_PRIOR": False},
+    # CHED against the incumbent stuff prior, and against neither.
+    "stuffprior": {"USE_STUFF_PRIOR": True, "USE_CHED_PRIOR": False},
+    "ched": {"USE_CHED_PRIOR": True, "USE_STUFF_PRIOR": False},
+    "ched-full": {"USE_CHED_PRIOR": True, "USE_STUFF_PRIOR": False,
+                  "CHED_PRIOR_SCALE": 1.0},
     # --- the HITTER playing-time prior (4e) -------------------------------
     # 4e localises the whole heavy-favourite gap to games where the UNDERDOG's
     # posted nine is thin (+1.271 runs, t +3.65 at a market price of 0.65+,
@@ -17241,11 +18187,48 @@ AB_ARMS: Dict[str, Dict[str, object]] = {
 ML_FOLD_FOR_SEASON: Dict[int, str] = {2025: "f25", 2026: "f26"}
 
 
-def ml_fold_span(fold: str) -> str:
-    """Human description of what a fold saw, so a live run says it out loud."""
-    import mlb_ml
-    tr, va, _ = mlb_ml.FOLDS[fold]
-    return f"{'+'.join(str(s) for s in tr)}, validated {va}"
+class AbHarness:
+    """The A/B harness — one rate-layer change against the close."""
+
+    @staticmethod
+    def ml_fold_span(fold: str) -> str:
+        """Human description of what a fold saw, so a live run says it out loud."""
+        import mlb_ml
+        tr, va, _ = mlb_ml.FOLDS[fold]
+        return f"{'+'.join(str(s) for s in tr)}, validated {va}"
+
+    @staticmethod
+    def _ab_ll(p: float, y: float) -> float:
+        return -(y * math.log(max(p, 1e-9)) + (1 - y) * math.log(max(1 - p, 1e-9)))
+
+    @staticmethod
+    def _ab_paired(d: Sequence[float]) -> Tuple[float, float, float]:
+        n = len(d)
+        if n < 2:
+            return 0.0, float("nan"), float("nan")
+        mu = statistics.mean(d)
+        se = statistics.pstdev(d) / n ** 0.5
+        return mu, se, (mu / se if se else float("nan"))
+
+    @staticmethod
+    def clv_edge_buckets(rows: Sequence[dict],
+                         edges: Sequence[float] = (0.0, 0.02, 0.04, 0.06, 0.09)
+                         ) -> List[dict]:
+        """Hit rate by how far the model disagreed with the close.
+
+        The shape matters more than any single bucket: a real edge grows with
+        disagreement. A flat profile with one good bucket is the signature of
+        noise, and it is the failure mode this table exists to expose.
+        """
+        out = []
+        for lo, hi in zip(edges, list(edges[1:]) + [1.0]):
+            sel = [r for r in rows if lo <= r["edge"] < hi]
+            if sel:
+                s = ClosingScore.summarize_clv_bucket(sel)
+                s["lo"], s["hi"] = lo, hi
+                out.append(s)
+        return out
+
 
 # **HISTORICAL arms: scored, never re-run.** Some changes are CODE rather than
 # a constant — the posted-lineup fallback fix lives inside `_game_side` and no
@@ -17400,7 +18383,7 @@ def ab_run_arm(season: int, name: str, reps: int, fresh: bool = False,
                      "re-run with --fresh before reading it against a "
                      "freshly built arm **" if stale else ""), flush=True)
         return got
-    _progress(f"ab: {season} {name} starting, {reps} sims/game")
+    Archive._progress(f"ab: {season} {name} starting, {reps} sims/game")
     t = time.time()
     # verbose=True so the per-cutoff progress reaches the terminal — a silent
     # eight-minute arm is indistinguishable from a hung one.
@@ -17414,7 +18397,7 @@ def ab_run_arm(season: int, name: str, reps: int, fresh: bool = False,
             f"[{time.time() - t:.0f}s]")
     if verbose:
         print(f"  {line}", flush=True)
-    _progress(f"ab: {line}")
+    Archive._progress(f"ab: {line}")
     bt["_constants"] = fp
     with open(path, "w") as fh:
         json.dump(bt, fh)
@@ -17440,19 +18423,6 @@ def _ab_fingerprint() -> str:
     blob = json.dumps({k: o[k] for k in sorted(o)},
                       default=str, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
-
-
-def _ab_ll(p: float, y: float) -> float:
-    return -(y * math.log(max(p, 1e-9)) + (1 - y) * math.log(max(1 - p, 1e-9)))
-
-
-def _ab_paired(d: Sequence[float]) -> Tuple[float, float, float]:
-    n = len(d)
-    if n < 2:
-        return 0.0, float("nan"), float("nan")
-    mu = statistics.mean(d)
-    se = statistics.pstdev(d) / n ** 0.5
-    return mu, se, (mu / se if se else float("nan"))
 
 
 def ab_score(by_season: Dict[int, Dict[str, dict]],
@@ -17488,7 +18458,7 @@ def ab_score(by_season: Dict[int, Dict[str, dict]],
                       f"{t['disagreement_sd']:12.3f} "
                       f"{t['vs_actual']['corr']:+14.4f} "
                       f"{t['vs_actual']['slope']:7.3f}")
-        picks = {a: clv_vs_closing(bt, season, edge=0.03, price="avg",
+        picks = {a: ClosingScore.clv_vs_closing(bt, season, edge=0.03, price="avg",
                                   save_dir=save_dir)
                  for a, bt in got.items()}
         rows = {a: {(p["pk"], p["date"]): p for p in picks[a]["picks"]}
@@ -17515,17 +18485,17 @@ def ab_score(by_season: Dict[int, Dict[str, dict]],
         y = [1.0 if (base[k]["won"] if base[k]["side"] == "home"
                      else not base[k]["won"]) else 0.0 for k in shared]
         mkt = [base[k]["mkt_home"] for k in shared]
-        lm = [_ab_ll(p, o) for p, o in zip(mkt, y)]
+        lm = [AbHarness._ab_ll(p, o) for p, o in zip(mkt, y)]
         print(f"    {'arm':9s} {'log-loss':>10s} {'vs mkt t':>9s} "
               f"{'vs base':>9s} {'ROI':>8s}")
         print(f"    {'market':9s} {statistics.mean(lm):10.5f}")
         lb = None
         for a in arms:
             xp = [rows[a][k]["model_home"] for k in shared]
-            lx = [_ab_ll(p, o) for p, o in zip(xp, y)]
-            t_mkt = _ab_paired([u - v for u, v in zip(lm, lx)])[2]
+            lx = [AbHarness._ab_ll(p, o) for p, o in zip(xp, y)]
+            t_mkt = AbHarness._ab_paired([u - v for u, v in zip(lm, lx)])[2]
             t_base = (float("nan") if lb is None else
-                      _ab_paired([u - v for u, v in zip(lb, lx)])[2])
+                      AbHarness._ab_paired([u - v for u, v in zip(lb, lx)])[2])
             ret = [(rows[a][k]["dec"] - 1.0) if rows[a][k]["won"] else -1.0
                    for k in shared]
             print(f"    {a:9s} {statistics.mean(lx):10.5f} {t_mkt:+9.2f} "
@@ -17540,17 +18510,17 @@ def ab_score(by_season: Dict[int, Dict[str, dict]],
     if len(by_season) < 2 or not pool["base"]["y"]:
         return
     print(f"\n  POOLED  n {len(pool['base']['y'])}")
-    lm = [_ab_ll(p, o) for p, o in zip(pool["base"]["m"], pool["base"]["y"])]
+    lm = [AbHarness._ab_ll(p, o) for p, o in zip(pool["base"]["m"], pool["base"]["y"])]
     print(f"    {'arm':9s} {'log-loss':>10s} {'vs mkt t':>9s} "
           f"{'vs base':>9s} {'ROI':>8s}")
     print(f"    {'market':9s} {statistics.mean(lm):10.5f}")
     lb = None
     for a in arms:
         d = pool[a]
-        lx = [_ab_ll(p, o) for p, o in zip(d["x"], d["y"])]
-        t_mkt = _ab_paired([u - v for u, v in zip(lm, lx)])[2]
+        lx = [AbHarness._ab_ll(p, o) for p, o in zip(d["x"], d["y"])]
+        t_mkt = AbHarness._ab_paired([u - v for u, v in zip(lm, lx)])[2]
         t_base = (float("nan") if lb is None else
-                  _ab_paired([u - v for u, v in zip(lb, lx)])[2])
+                  AbHarness._ab_paired([u - v for u, v in zip(lb, lx)])[2])
         print(f"    {a:9s} {statistics.mean(lx):10.5f} {t_mkt:+9.2f} "
               f"{t_base:+9.2f} {statistics.mean(d['ret']):+8.4f}")
         if lb is None:
@@ -17558,25 +18528,6 @@ def ab_score(by_season: Dict[int, Dict[str, dict]],
     print("\n  A pooled t inside ~2 is not an edge, and an arm that helps one "
           "season while\n  hurting the other is noise however good the pooled "
           "number looks (3d.1, 3d.3).\n  Same sign in BOTH seasons is the bar.")
-
-
-def clv_edge_buckets(rows: Sequence[dict],
-                     edges: Sequence[float] = (0.0, 0.02, 0.04, 0.06, 0.09)
-                     ) -> List[dict]:
-    """Hit rate by how far the model disagreed with the close.
-
-    The shape matters more than any single bucket: a real edge grows with
-    disagreement. A flat profile with one good bucket is the signature of
-    noise, and it is the failure mode this table exists to expose.
-    """
-    out = []
-    for lo, hi in zip(edges, list(edges[1:]) + [1.0]):
-        sel = [r for r in rows if lo <= r["edge"] < hi]
-        if sel:
-            s = summarize_clv_bucket(sel)
-            s["lo"], s["hi"] = lo, hi
-            out.append(s)
-    return out
 
 
 def _corr(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
@@ -17617,15 +18568,6 @@ def _corr(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
 # reads, a season of ~640 hitters is ~40 MB rather than ~1.3 GB.
 
 BMIELKE_DIR = SAVE_DIR / "bmielke"
-SAVANT_DETAIL_URL = (
-    "https://baseballsavant.mlb.com/statcast_search/csv"
-    "?hfPT=&hfAB=&hfGT=R%7C&hfPR=&hfZ=&hfStadium=&hfBBL=&hfNewZones=&hfPull="
-    "&hfC=&hfSea={season}%7C&hfSit=&player_type=batter"
-    "&hfOuts=&hfOpponent=&pitcher_throws=&batter_stands=&hfSA=&min_pitches=0"
-    "&min_results=0&group_by=name&sort_col=pitches"
-    "&player_event_sort=api_p_release_speed&sort_order=desc&min_abs=0"
-    "&type=details&player_id={pid}"
-)
 # What `bmielke()` reads, PLUS the launch angle and the realised event, which
 # the contact->outcome mapping needs (§3d.7). Everything else in that CSV is
 # ~90% of its bytes and none of its information here.
@@ -17639,10 +18581,84 @@ _BM_FIELDS = ("date", "desc", "bat_speed", "attack_angle", "icept_y",
 BM_CACHE_VERSION = "v2"
 
 
-def bmielke_detail_path(pid: int, season: int,
-                        save_dir: Path = SAVE_DIR) -> Path:
-    return (Path(save_dir) / "bmielke" / BM_CACHE_VERSION / f"{season}"
-            / f"{pid}.json.gz")
+class Bmielke:
+    """BMIELKE — a contact-quality prior for thin-sample hitters."""
+
+    @staticmethod
+    def bmielke_detail_path(pid: int, season: int,
+                            save_dir: Path = SAVE_DIR) -> Path:
+        return (Path(save_dir) / "bmielke" / BM_CACHE_VERSION / f"{season}"
+                / f"{pid}.json.gz")
+
+    @staticmethod
+    def fetch_bmielke_season(pids: Sequence[int], season: int, workers: int = 10,
+                             save_dir: Path = SAVE_DIR,
+                             verbose: bool = True) -> int:
+        """Cache the detail for a list of hitters. Idempotent — skips what exists."""
+        todo = [p for p in pids
+                if not Bmielke.bmielke_detail_path(p, season, save_dir).exists()]
+        if verbose:
+            print(f"[bmielke] {season}: {len(todo)} of {len(pids)} to fetch",
+                  flush=True)
+        got = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, rows in enumerate(
+                    ex.map(lambda p: fetch_bmielke_detail(p, season, save_dir,
+                                                      allow_fetch=True),
+                           todo), 1):
+                got += bool(rows)
+                if verbose and i % 25 == 0:
+                    Archive._progress(f"bmielke {season}  {i}/{len(todo)}  ({got} with rows)")
+        if verbose:
+            print(f"[bmielke] {season}: {got}/{len(todo)} returned rows")
+        return got
+
+    @staticmethod
+    def bmielke_relative(pids: Sequence[int], season: int,
+                         as_of: Optional[str] = None,
+                         save_dir: Path = SAVE_DIR) -> Dict[int, float]:
+        """{pid: relative contact quality, 1.0 = this population's average}.
+
+        **Three things had to be right here and the first draft got two of them
+        wrong**, both in the direction that quietly moves the run level:
+
+        1. **Use `raw`, not `wobacon`.** `bmielke()` returns both: `wobacon` is the
+           hitter's RAW observed xwOBAcon and `raw` is the model's PREDICTION. The
+           signal test scored `raw` at corr +0.70 against `wobacon`'s +0.56 — so
+           wiring `wobacon` shipped the weaker of the two after validating the
+           stronger. Validate one thing and ship another and the measurement means
+           nothing.
+        2. **Divide by `_bmielke_ref(n)`, not the league constant.** `raw` lives on
+           the model's own scale, whose reference mean is ~0.3729 and which the
+           metric deliberately varies with sample size; `BMIELKE_LG_WOBACON` is
+           0.3807. Dividing by the wrong one put the population at 0.955 — every
+           hitter 4.5% below league — and cost 0.146 runs a game.
+        3. **CENTRE on the population it is applied to.** Even with the right
+           reference the lineup population reads 0.975 rather than 1.000, because
+           the reference is anchored on 2025 regulars and this is a different set
+           of hitters in a different year. Uncentred, that is a league-wide tilt
+           wearing the clothes of a player adjustment — the fifth instance of the
+           trap §8 records after fatigue, the park term, the platoon gap and the
+           fatigue opening penalty.
+
+        Centring is over the PLAYERS, unweighted, because the prior is applied per
+        player rather than per plate appearance and the quantity being neutralised
+        is the average tilt handed to a hitter.
+        """
+        rel: Dict[int, float] = {}
+        for pid in pids:
+            bm = bmielke_asof(int(pid), season, as_of, save_dir)
+            if not bm:
+                continue
+            ref_mean, _ = bmielke_core._bmielke_ref(bm["bbe"])
+            if ref_mean > 0:
+                rel[int(pid)] = bm["raw"] / ref_mean
+        if not rel:
+            return {}
+        centre = statistics.mean(rel.values())
+        if centre <= 0:
+            return {}
+        return {pid: v / centre for pid, v in rel.items()}
 
 
 _BM_DETAIL: Dict[tuple, List[dict]] = {}
@@ -17661,7 +18677,7 @@ def fetch_bmielke_detail(pid: int, season: int, save_dir: Path = SAVE_DIR,
     got = _BM_DETAIL.get(key)
     if got is not None:
         return got
-    path = bmielke_detail_path(pid, season, save_dir)
+    path = Bmielke.bmielke_detail_path(pid, season, save_dir)
     if path.exists():
         try:
             with gzip.open(path, "rt") as fh:
@@ -17670,12 +18686,6 @@ def fetch_bmielke_detail(pid: int, season: int, save_dir: Path = SAVE_DIR,
             return data
         except (OSError, ValueError):
             pass
-
-    def fnum(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
 
     # **A cache MISS must not become a network call here.** `bmielke_asof` runs
     # inside `build_rates`, which runs inside a pool worker: a player who was
@@ -17699,16 +18709,16 @@ def fetch_bmielke_detail(pid: int, season: int, save_dir: Path = SAVE_DIR,
                 rows.append({
                     "date": row.get("game_date") or "",
                     "desc": row.get("description") or "",
-                    "bat_speed": fnum(row.get("bat_speed")),
-                    "attack_angle": fnum(row.get("attack_angle")),
-                    "icept_y": fnum(row.get(
+                    "bat_speed": _fnum(row.get("bat_speed")),
+                    "attack_angle": _fnum(row.get("attack_angle")),
+                    "icept_y": _fnum(row.get(
                         "intercept_ball_minus_batter_pos_y_inches")),
-                    "ev": fnum(row.get("launch_speed")),
-                    "la": fnum(row.get("launch_angle")),
+                    "ev": _fnum(row.get("launch_speed")),
+                    "la": _fnum(row.get("launch_angle")),
                     "event": row.get("events") or "",
-                    "hc_x": fnum(row.get("hc_x")),
-                    "hc_y": fnum(row.get("hc_y")),
-                    "xwoba": fnum(row.get("estimated_woba_using_speedangle")),
+                    "hc_x": _fnum(row.get("hc_x")),
+                    "hc_y": _fnum(row.get("hc_y")),
+                    "xwoba": _fnum(row.get("estimated_woba_using_speedangle")),
                 })
     except Exception:
         return []
@@ -17720,29 +18730,6 @@ def fetch_bmielke_detail(pid: int, season: int, save_dir: Path = SAVE_DIR,
         pass
     _BM_DETAIL[key] = rows
     return rows
-
-
-def fetch_bmielke_season(pids: Sequence[int], season: int, workers: int = 10,
-                         save_dir: Path = SAVE_DIR,
-                         verbose: bool = True) -> int:
-    """Cache the detail for a list of hitters. Idempotent — skips what exists."""
-    todo = [p for p in pids
-            if not bmielke_detail_path(p, season, save_dir).exists()]
-    if verbose:
-        print(f"[bmielke] {season}: {len(todo)} of {len(pids)} to fetch",
-              flush=True)
-    got = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for i, rows in enumerate(
-                ex.map(lambda p: fetch_bmielke_detail(p, season, save_dir,
-                                                  allow_fetch=True),
-                       todo), 1):
-            got += bool(rows)
-            if verbose and i % 25 == 0:
-                _progress(f"bmielke {season}  {i}/{len(todo)}  ({got} with rows)")
-    if verbose:
-        print(f"[bmielke] {season}: {got}/{len(todo)} returned rows")
-    return got
 
 
 _BM_CACHE: Dict[tuple, Optional[dict]] = {}
@@ -17799,53 +18786,6 @@ BMIELKE_PRIOR_SCALE = 1.0
 # to the pool. Named for what it is: the per-hitter CONTACT profile of §3d.7,
 # not §3d.6's single BMIELKE multiplier, which is retired.
 USE_CONTACT_PRIOR = False
-
-
-def bmielke_relative(pids: Sequence[int], season: int,
-                     as_of: Optional[str] = None,
-                     save_dir: Path = SAVE_DIR) -> Dict[int, float]:
-    """{pid: relative contact quality, 1.0 = this population's average}.
-
-    **Three things had to be right here and the first draft got two of them
-    wrong**, both in the direction that quietly moves the run level:
-
-    1. **Use `raw`, not `wobacon`.** `bmielke()` returns both: `wobacon` is the
-       hitter's RAW observed xwOBAcon and `raw` is the model's PREDICTION. The
-       signal test scored `raw` at corr +0.70 against `wobacon`'s +0.56 — so
-       wiring `wobacon` shipped the weaker of the two after validating the
-       stronger. Validate one thing and ship another and the measurement means
-       nothing.
-    2. **Divide by `_bmielke_ref(n)`, not the league constant.** `raw` lives on
-       the model's own scale, whose reference mean is ~0.3729 and which the
-       metric deliberately varies with sample size; `BMIELKE_LG_WOBACON` is
-       0.3807. Dividing by the wrong one put the population at 0.955 — every
-       hitter 4.5% below league — and cost 0.146 runs a game.
-    3. **CENTRE on the population it is applied to.** Even with the right
-       reference the lineup population reads 0.975 rather than 1.000, because
-       the reference is anchored on 2025 regulars and this is a different set
-       of hitters in a different year. Uncentred, that is a league-wide tilt
-       wearing the clothes of a player adjustment — the fifth instance of the
-       trap §8 records after fatigue, the park term, the platoon gap and the
-       fatigue opening penalty.
-
-    Centring is over the PLAYERS, unweighted, because the prior is applied per
-    player rather than per plate appearance and the quantity being neutralised
-    is the average tilt handed to a hitter.
-    """
-    rel: Dict[int, float] = {}
-    for pid in pids:
-        bm = bmielke_asof(int(pid), season, as_of, save_dir)
-        if not bm:
-            continue
-        ref_mean, _ = bmielke_core._bmielke_ref(bm["bbe"])
-        if ref_mean > 0:
-            rel[int(pid)] = bm["raw"] / ref_mean
-    if not rel:
-        return {}
-    centre = statistics.mean(rel.values())
-    if centre <= 0:
-        return {}
-    return {pid: v / centre for pid, v in rel.items()}
 
 
 def bmielke_prior(league: Sequence[float], rel: float) -> List[float]:
@@ -17932,139 +18872,263 @@ CONTACT_SHRINK_K = 40.0
 CONTACT_CLASSES = (S1B, S2B, S3B, HR, GB_OUT, AIR_OUT)
 
 
-def _contact_bins(ev: float, la: float, hc_x: float, hc_y: float):
-    """(ev_bin, la_bin, spray_bin) or None when the ball is unusable."""
-    if ev is None or la is None or hc_x is None or hc_y is None:
-        return None
-    e = int((min(max(ev, CONTACT_EV_LO), CONTACT_EV_HI - 1e-9)
-             - CONTACT_EV_LO) // CONTACT_EV_STEP)
-    a = int((min(max(la, CONTACT_LA_LO), CONTACT_LA_HI - 1e-9)
-             - CONTACT_LA_LO) // CONTACT_LA_STEP)
-    hla = spray_to_hla(hc_x, hc_y)
-    if hla is None:
-        return None
-    # `spray_to_hla` gives the physics convention (0 = centre, +45 = RF line);
-    # shift to the stadium polar 0-90 the rest of the module uses.
-    polar = hla + 45.0
-    # **CLAMP into the fair field, do not reject.** Rejecting everything
-    # outside [0, 90] threw away 8.3% of batted balls and did it NON-RANDOMLY:
-    # 17.8% of the discards were doubles against 5.3% of those kept, because a
-    # ball down the line is both the most likely to compute slightly foul and
-    # the most likely to go for extra bases. It dragged the league doubles rate
-    # from 6.2% to 5.3% — a bias built straight into the mapping.
-    #
-    # A ball at polar -8 is a left-field-line ball whose coordinates are a
-    # degree or two off; one at -45 is behind the plate and is bad data. So
-    # tolerate a margin and clamp, reject beyond it.
-    if polar < -CONTACT_POLAR_TOL or polar > 90.0 + CONTACT_POLAR_TOL:
-        return None
-    polar = min(max(polar, 0.0), 90.0 - 1e-9)
-    sbin = min(int(polar / (90.0 / CONTACT_SPRAY_BINS)),
-               CONTACT_SPRAY_BINS - 1)
-    return e, a, sbin
+class Contact:
+    """Contact quality -> outcome vector: the league EV/LA/spray map (sim_state.md 3d.7)."""
 
+    @staticmethod
+    def _contact_bins(ev: float, la: float, hc_x: float, hc_y: float):
+        """(ev_bin, la_bin, spray_bin) or None when the ball is unusable."""
+        if ev is None or la is None or hc_x is None or hc_y is None:
+            return None
+        e = int((min(max(ev, CONTACT_EV_LO), CONTACT_EV_HI - 1e-9)
+                 - CONTACT_EV_LO) // CONTACT_EV_STEP)
+        a = int((min(max(la, CONTACT_LA_LO), CONTACT_LA_HI - 1e-9)
+                 - CONTACT_LA_LO) // CONTACT_LA_STEP)
+        hla = spray_to_hla(hc_x, hc_y)
+        if hla is None:
+            return None
+        # `spray_to_hla` gives the physics convention (0 = centre, +45 = RF line);
+        # shift to the stadium polar 0-90 the rest of the module uses.
+        polar = hla + 45.0
+        # **CLAMP into the fair field, do not reject.** Rejecting everything
+        # outside [0, 90] threw away 8.3% of batted balls and did it NON-RANDOMLY:
+        # 17.8% of the discards were doubles against 5.3% of those kept, because a
+        # ball down the line is both the most likely to compute slightly foul and
+        # the most likely to go for extra bases. It dragged the league doubles rate
+        # from 6.2% to 5.3% — a bias built straight into the mapping.
+        #
+        # A ball at polar -8 is a left-field-line ball whose coordinates are a
+        # degree or two off; one at -45 is behind the plate and is bad data. So
+        # tolerate a margin and clamp, reject beyond it.
+        if polar < -CONTACT_POLAR_TOL or polar > 90.0 + CONTACT_POLAR_TOL:
+            return None
+        polar = min(max(polar, 0.0), 90.0 - 1e-9)
+        sbin = min(int(polar / (90.0 / CONTACT_SPRAY_BINS)),
+                   CONTACT_SPRAY_BINS - 1)
+        return e, a, sbin
 
-def _contact_class(event: str, bb_type: str) -> Optional[int]:
-    """A realised batted ball -> one of the six outcome classes."""
-    e = (event or "").strip()
-    if e == "single":
-        return S1B
-    if e == "double":
-        return S2B
-    if e == "triple":
-        return S3B
-    if e == "home_run":
-        return HR
-    # Everything else that reached this function is a ball in play that did
-    # not go for a hit: outs, fielder's choices, sacrifices AND errors, which
-    # the board counts inside its outs (see the module note on ROE).
-    return GB_OUT if (bb_type or "").strip() == "ground_ball" else AIR_OUT
+    @staticmethod
+    def _contact_class(event: str, bb_type: str) -> Optional[int]:
+        """A realised batted ball -> one of the six outcome classes."""
+        e = (event or "").strip()
+        if e == "single":
+            return S1B
+        if e == "double":
+            return S2B
+        if e == "triple":
+            return S3B
+        if e == "home_run":
+            return HR
+        # Everything else that reached this function is a ball in play that did
+        # not go for a hit: outs, fielder's choices, sacrifices AND errors, which
+        # the board counts inside its outs (see the module note on ROE).
+        return GB_OUT if (bb_type or "").strip() == "ground_ball" else AIR_OUT
 
+    @staticmethod
+    def build_contact_map(seasons: Sequence[int],
+                          save_dir: Path = SAVE_DIR,
+                          bbe_dir: Optional[Path] = None) -> dict:
+        """League P(outcome | EV, launch angle, spray) from realised batted balls.
 
-def build_contact_map(seasons: Sequence[int],
-                      save_dir: Path = SAVE_DIR,
-                      bbe_dir: Optional[Path] = None) -> dict:
-    """League P(outcome | EV, launch angle, spray) from realised batted balls.
+        `seasons` MUST predate the season being scored — the whole point is a
+        league mapping that could have been known beforehand. A 2025 backtest gets
+        2024; a 2026 backtest gets 2024+2025.
 
-    `seasons` MUST predate the season being scored — the whole point is a
-    league mapping that could have been known beforehand. A 2025 backtest gets
-    2024; a 2026 backtest gets 2024+2025.
+        Three nested tallies are kept, not one: the full cell, its (EV, LA) parent
+        and its LA grandparent. A batted ball at 118 mph and 41 degrees down the
+        line has a handful of league-wide examples a season, and its own cell is
+        noise; its parents are not.
+        """
+        root = Path(bbe_dir) if bbe_dir else _APP_ROOT
+        cell: Dict[tuple, List[float]] = {}
+        pair: Dict[tuple, List[float]] = {}
+        la_only: Dict[int, List[float]] = {}
+        glob = [0.0] * N_OUTCOMES
+        n_rows = n_used = 0
 
-    Three nested tallies are kept, not one: the full cell, its (EV, LA) parent
-    and its LA grandparent. A batted ball at 118 mph and 41 degrees down the
-    line has a handful of league-wide examples a season, and its own cell is
-    noise; its parents are not.
-    """
-    root = Path(bbe_dir) if bbe_dir else Path(__file__).resolve().parent
-    cell: Dict[tuple, List[float]] = {}
-    pair: Dict[tuple, List[float]] = {}
-    la_only: Dict[int, List[float]] = {}
-    glob = [0.0] * N_OUTCOMES
-    n_rows = n_used = 0
+        def add(acc, key, cls):
+            v = acc.get(key)
+            if v is None:
+                v = acc[key] = [0.0] * N_OUTCOMES
+            v[cls] += 1.0
 
-    def add(acc, key, cls):
-        v = acc.get(key)
-        if v is None:
-            v = acc[key] = [0.0] * N_OUTCOMES
-        v[cls] += 1.0
+        for season in seasons:
+            path = root / f"savant_bbe_{season}.csv"
+            if not path.exists():
+                continue
+            with open(path) as fh:
+                for row in csv.DictReader(fh):
+                    n_rows += 1
+                    b = Contact._contact_bins(_fnum(row.get("launch_speed")),
+                                      _fnum(row.get("launch_angle")),
+                                      _fnum(row.get("hc_x")),
+                                      _fnum(row.get("hc_y")))
+                    if b is None:
+                        continue
+                    cls = Contact._contact_class(row.get("events"), row.get("bb_type"))
+                    if cls is None:
+                        continue
+                    n_used += 1
+                    add(cell, b, cls)
+                    add(pair, (b[0], b[1]), cls)
+                    add(la_only, b[1], cls)
+                    glob[cls] += 1.0
 
-    for season in seasons:
-        path = root / f"savant_bbe_{season}.csv"
-        if not path.exists():
-            continue
-        with open(path) as fh:
-            for row in csv.DictReader(fh):
-                n_rows += 1
-                b = _contact_bins(_fnum(row.get("launch_speed")),
-                                  _fnum(row.get("launch_angle")),
-                                  _fnum(row.get("hc_x")),
-                                  _fnum(row.get("hc_y")))
-                if b is None:
-                    continue
-                cls = _contact_class(row.get("events"), row.get("bb_type"))
-                if cls is None:
-                    continue
-                n_used += 1
-                add(cell, b, cls)
-                add(pair, (b[0], b[1]), cls)
-                add(la_only, b[1], cls)
-                glob[cls] += 1.0
+        if n_used == 0:
+            raise RuntimeError(
+                f"mlb_sim: no batted balls for {list(seasons)} under {root}")
 
-    if n_used == 0:
-        raise RuntimeError(
-            f"mlb_sim: no batted balls for {list(seasons)} under {root}")
+        def norm(v):
+            t = sum(v)
+            return [x / t for x in v] if t > 0 else None
 
-    def norm(v):
-        t = sum(v)
-        return [x / t for x in v] if t > 0 else None
+        g = norm(glob)
 
-    g = norm(glob)
+        def blended(counts, parent):
+            n = sum(counts)
+            w = n / (n + CONTACT_SHRINK_K)
+            own = [c / n for c in counts]
+            return [w * o + (1.0 - w) * p for o, p in zip(own, parent)]
 
-    def blended(counts, parent):
-        n = sum(counts)
-        w = n / (n + CONTACT_SHRINK_K)
-        own = [c / n for c in counts]
-        return [w * o + (1.0 - w) * p for o, p in zip(own, parent)]
+        la_p = {k: blended(v, g) for k, v in la_only.items()}
+        pair_p = {k: blended(v, la_p.get(k[1], g)) for k, v in pair.items()}
+        cell_p = {k: blended(v, pair_p.get((k[0], k[1]), g)) for k, v in cell.items()}
+        return {"seasons": list(seasons), "n_rows": n_rows, "n_used": n_used,
+                "cell": cell_p, "pair": pair_p, "la": la_p, "global": g}
 
-    la_p = {k: blended(v, g) for k, v in la_only.items()}
-    pair_p = {k: blended(v, la_p.get(k[1], g)) for k, v in pair.items()}
-    cell_p = {k: blended(v, pair_p.get((k[0], k[1]), g)) for k, v in cell.items()}
-    return {"seasons": list(seasons), "n_rows": n_rows, "n_used": n_used,
-            "cell": cell_p, "pair": pair_p, "la": la_p, "global": g}
+    @staticmethod
+    def contact_lookup(cmap: dict, ev, la, hc_x, hc_y) -> Optional[List[float]]:
+        """The outcome distribution for one batted ball, most specific first."""
+        b = Contact._contact_bins(ev, la, hc_x, hc_y)
+        if b is None:
+            return None
+        v = cmap["cell"].get(b)
+        if v is not None:
+            return v
+        v = cmap["pair"].get((b[0], b[1]))
+        if v is not None:
+            return v
+        return cmap["la"].get(b[1], cmap["global"])
 
+    @staticmethod
+    def hitter_contact_profile(rows: Sequence[dict], cmap: dict,
+                               as_of: Optional[str] = None
+                               ) -> Optional[Tuple[List[float], int]]:
+        """(expected contact distribution, n balls) for one hitter's batted balls.
 
-def contact_lookup(cmap: dict, ev, la, hc_x, hc_y) -> Optional[List[float]]:
-    """The outcome distribution for one batted ball, most specific first."""
-    b = _contact_bins(ev, la, hc_x, hc_y)
-    if b is None:
-        return None
-    v = cmap["cell"].get(b)
-    if v is not None:
-        return v
-    v = cmap["pair"].get((b[0], b[1]))
-    if v is not None:
-        return v
-    return cmap["la"].get(b[1], cmap["global"])
+        Each of HIS balls is looked up in the LEAGUE map and the results averaged,
+        so the answer is "what does a league-average defence in a league-average
+        park do with the contact this hitter makes" — his profile, not his luck.
+        """
+        acc = [0.0] * N_OUTCOMES
+        n = 0
+        for r in rows:
+            if as_of and (not r.get("date") or r["date"] >= as_of):
+                continue
+            v = Contact.contact_lookup(cmap, r.get("ev"), r.get("la"),
+                               r.get("hc_x"), r.get("hc_y"))
+            if v is None:
+                continue
+            n += 1
+            for i in CONTACT_CLASSES:
+                acc[i] += v[i]
+        if n < CONTACT_MIN_BBE:
+            return None
+        return [a / n for a in acc], n
+
+    @staticmethod
+    def contact_prior(league: Sequence[float], profile: Sequence[float],
+                      n: int, lg_profile: Sequence[float]) -> List[float]:
+        """`league`, with its BALL-IN-PLAY mass redistributed by a hitter's profile.
+
+        K, BB and HBP are untouched — a contact model has nothing to say about
+        them and they already stabilise correctly. The in-play mass is held exactly
+        constant and only its SHAPE moves, so this cannot shift a hitter's contact
+        RATE, only what his contact turns into. That is the whole difference from
+        §3d.6's single multiplier, which moved the shape and the rate together and
+        could not tell a singles hitter from a slugger.
+
+        `lg_profile` is the population's own average profile, so the ratio is
+        relative and a year in which batted balls simply carry further cannot leak
+        in as everyone being better — which out of sample is worth +2.65% of
+        wOBAcon (§3d.7).
+        """
+        w = n / (n + CONTACT_SHRINK_BBE)
+        bip_lg = sum(league[i] for i in CONTACT_CLASSES)
+        if bip_lg <= 0:
+            return list(league)
+        out = list(league)
+        tot = 0.0
+        shape = []
+        for i in CONTACT_CLASSES:
+            base = lg_profile[i]
+            rel = (profile[i] / base) if base > 0 else 1.0
+            v = league[i] * (1.0 + (rel - 1.0) * w)
+            shape.append(v)
+            tot += v
+        if tot <= 0:
+            return list(league)
+        # renormalise the in-play block to exactly the mass it started with
+        for i, v in zip(CONTACT_CLASSES, shape):
+            out[i] = v * bip_lg / tot
+        return _normalize(out)
+
+    @staticmethod
+    def contact_map_for(season: int, save_dir: Path = SAVE_DIR) -> Optional[dict]:
+        """The league map a run scoring `season` is allowed to use.
+
+        Strictly earlier seasons only — the map is league knowledge that could
+        have been had before the season started, and fitting it on the season
+        being scored would be the same leak as a season-final board.
+        """
+        key = (int(season), str(save_dir))
+        if key in _CMAP_CACHE:
+            return _CMAP_CACHE[key]
+        root = _APP_ROOT
+        have = sorted(int(p.stem.rsplit("_", 1)[1]) for p in
+                      root.glob("savant_bbe_*.csv"))
+        use = [y for y in have if y < season]
+        out = None
+        if use:
+            try:
+                out = Contact.build_contact_map(use, save_dir)
+            except RuntimeError:
+                out = None
+        _CMAP_CACHE[key] = out
+        return out
+
+    @staticmethod
+    def contact_profiles(pids: Sequence[int], season: int,
+                         as_of: Optional[str] = None,
+                         save_dir: Path = SAVE_DIR
+                         ) -> Tuple[Dict[int, Tuple[List[float], int]], List[float]]:
+        """{pid: (profile, n)} and the POPULATION's own average profile.
+
+        The population average is what every hitter is compared against, so a
+        season in which batted balls simply carry further shows up as nobody being
+        better rather than everybody. Out of sample that is worth +2.65% of
+        wOBAcon, which would otherwise land straight on the run level.
+        """
+        cmap = Contact.contact_map_for(season, save_dir)
+        if cmap is None:
+            return {}, []
+        out: Dict[int, Tuple[List[float], int]] = {}
+        for pid in pids:
+            rows = fetch_bmielke_detail(int(pid), season, save_dir)
+            if not rows:
+                continue
+            got = Contact.hitter_contact_profile(rows, cmap, as_of)
+            if got is not None:
+                out[int(pid)] = got
+        if not out:
+            return {}, []
+        # Weighted by the balls behind each profile: the population mean is meant
+        # to be the league's contact, and a 30-ball hitter is not a thirtieth of
+        # the league's evidence for that.
+        tot = float(sum(n for _, n in out.values())) or 1.0
+        lg = [sum(prof[i] * n for prof, n in out.values()) / tot
+              if i in CONTACT_CLASSES else 0.0 for i in range(N_OUTCOMES)]
+        return out, lg
 
 
 def _fnum(v) -> Optional[float]:
@@ -18082,127 +19146,7 @@ CONTACT_MIN_BBE = 25
 CONTACT_SHRINK_BBE = 120.0
 
 
-def hitter_contact_profile(rows: Sequence[dict], cmap: dict,
-                           as_of: Optional[str] = None
-                           ) -> Optional[Tuple[List[float], int]]:
-    """(expected contact distribution, n balls) for one hitter's batted balls.
-
-    Each of HIS balls is looked up in the LEAGUE map and the results averaged,
-    so the answer is "what does a league-average defence in a league-average
-    park do with the contact this hitter makes" — his profile, not his luck.
-    """
-    acc = [0.0] * N_OUTCOMES
-    n = 0
-    for r in rows:
-        if as_of and (not r.get("date") or r["date"] >= as_of):
-            continue
-        v = contact_lookup(cmap, r.get("ev"), r.get("la"),
-                           r.get("hc_x"), r.get("hc_y"))
-        if v is None:
-            continue
-        n += 1
-        for i in CONTACT_CLASSES:
-            acc[i] += v[i]
-    if n < CONTACT_MIN_BBE:
-        return None
-    return [a / n for a in acc], n
-
-
-def contact_prior(league: Sequence[float], profile: Sequence[float],
-                  n: int, lg_profile: Sequence[float]) -> List[float]:
-    """`league`, with its BALL-IN-PLAY mass redistributed by a hitter's profile.
-
-    K, BB and HBP are untouched — a contact model has nothing to say about
-    them and they already stabilise correctly. The in-play mass is held exactly
-    constant and only its SHAPE moves, so this cannot shift a hitter's contact
-    RATE, only what his contact turns into. That is the whole difference from
-    §3d.6's single multiplier, which moved the shape and the rate together and
-    could not tell a singles hitter from a slugger.
-
-    `lg_profile` is the population's own average profile, so the ratio is
-    relative and a year in which batted balls simply carry further cannot leak
-    in as everyone being better — which out of sample is worth +2.65% of
-    wOBAcon (§3d.7).
-    """
-    w = n / (n + CONTACT_SHRINK_BBE)
-    bip_lg = sum(league[i] for i in CONTACT_CLASSES)
-    if bip_lg <= 0:
-        return list(league)
-    out = list(league)
-    tot = 0.0
-    shape = []
-    for i in CONTACT_CLASSES:
-        base = lg_profile[i]
-        rel = (profile[i] / base) if base > 0 else 1.0
-        v = league[i] * (1.0 + (rel - 1.0) * w)
-        shape.append(v)
-        tot += v
-    if tot <= 0:
-        return list(league)
-    # renormalise the in-play block to exactly the mass it started with
-    for i, v in zip(CONTACT_CLASSES, shape):
-        out[i] = v * bip_lg / tot
-    return _normalize(out)
-
-
 _CMAP_CACHE: Dict[tuple, dict] = {}
-
-
-def contact_map_for(season: int, save_dir: Path = SAVE_DIR) -> Optional[dict]:
-    """The league map a run scoring `season` is allowed to use.
-
-    Strictly earlier seasons only — the map is league knowledge that could
-    have been had before the season started, and fitting it on the season
-    being scored would be the same leak as a season-final board.
-    """
-    key = (int(season), str(save_dir))
-    if key in _CMAP_CACHE:
-        return _CMAP_CACHE[key]
-    root = Path(__file__).resolve().parent
-    have = sorted(int(p.stem.rsplit("_", 1)[1]) for p in
-                  root.glob("savant_bbe_*.csv"))
-    use = [y for y in have if y < season]
-    out = None
-    if use:
-        try:
-            out = build_contact_map(use, save_dir)
-        except RuntimeError:
-            out = None
-    _CMAP_CACHE[key] = out
-    return out
-
-
-def contact_profiles(pids: Sequence[int], season: int,
-                     as_of: Optional[str] = None,
-                     save_dir: Path = SAVE_DIR
-                     ) -> Tuple[Dict[int, Tuple[List[float], int]], List[float]]:
-    """{pid: (profile, n)} and the POPULATION's own average profile.
-
-    The population average is what every hitter is compared against, so a
-    season in which batted balls simply carry further shows up as nobody being
-    better rather than everybody. Out of sample that is worth +2.65% of
-    wOBAcon, which would otherwise land straight on the run level.
-    """
-    cmap = contact_map_for(season, save_dir)
-    if cmap is None:
-        return {}, []
-    out: Dict[int, Tuple[List[float], int]] = {}
-    for pid in pids:
-        rows = fetch_bmielke_detail(int(pid), season, save_dir)
-        if not rows:
-            continue
-        got = hitter_contact_profile(rows, cmap, as_of)
-        if got is not None:
-            out[int(pid)] = got
-    if not out:
-        return {}, []
-    # Weighted by the balls behind each profile: the population mean is meant
-    # to be the league's contact, and a 30-ball hitter is not a thirtieth of
-    # the league's evidence for that.
-    tot = float(sum(n for _, n in out.values())) or 1.0
-    lg = [sum(prof[i] * n for prof, n in out.values()) / tot
-          if i in CONTACT_CLASSES else 0.0 for i in range(N_OUTCOMES)]
-    return out, lg
 
 
 # ===========================================================================
@@ -18242,40 +19186,43 @@ ADV_PER_SD = 0.077
 _ADV: Optional[dict] = None
 
 
-def load_runner_advance() -> dict:
-    global _ADV
-    if _ADV is None:
-        try:
-            with open(RUNNER_ADV_PATH) as fh:
-                _ADV = json.load(fh)
-        except (OSError, ValueError):
-            _ADV = {}
-    return _ADV
+class RunnerAdvance:
+    """Runner advancement, per runner, from three sources."""
 
+    @staticmethod
+    def load_runner_advance() -> dict:
+        global _ADV
+        if _ADV is None:
+            try:
+                with open(RUNNER_ADV_PATH) as fh:
+                    _ADV = json.load(fh)
+            except (OSError, ValueError):
+                _ADV = {}
+        return _ADV
 
-def runner_advance_rates(pid: Optional[int], xbr: float = 0.0,
-                         spd: float = 4.13) -> Dict[str, float]:
-    """This runner's advancement rates, blending history, XBR and speed."""
-    lg = {"first_to_third": P_FIRST_TO_THIRD_ON_1B,
-          "second_scores": P_SECOND_SCORES_ON_1B,
-          "first_scores_2b": P_FIRST_SCORES_ON_2B}
-    # Composite z: XBR is the better predictor, speed fills in when XBR is
-    # thin. Board-wide sd: XBR 1.34, Spd 1.61.
-    z = 0.6 * (xbr / 1.34) + 0.4 * ((spd - 4.13) / 1.61)
-    prior = {k: min(max(v + ADV_PER_SD * z * (v / P_FIRST_TO_THIRD_ON_1B),
-                        0.02), 0.95) for k, v in lg.items()}
-    rec = load_runner_advance().get(str(pid or ""), {})
-    out = {}
-    for key, tag in (("first_to_third", "1B_on1"),
-                     ("second_scores", "1B_on2"),
-                     ("first_scores_2b", "2B_on1")):
-        n = float(rec.get(tag + "_n", 0))
-        y = float(rec.get(tag + "_y", 0))
-        w = n / (n + STABILIZE_ADVANCE)
-        obs = (y / n) if n else prior[key]
-        out[key] = w * obs + (1.0 - w) * prior[key]
-    return out
-
+    @staticmethod
+    def runner_advance_rates(pid: Optional[int], xbr: float = 0.0,
+                             spd: float = 4.13) -> Dict[str, float]:
+        """This runner's advancement rates, blending history, XBR and speed."""
+        lg = {"first_to_third": P_FIRST_TO_THIRD_ON_1B,
+              "second_scores": P_SECOND_SCORES_ON_1B,
+              "first_scores_2b": P_FIRST_SCORES_ON_2B}
+        # Composite z: XBR is the better predictor, speed fills in when XBR is
+        # thin. Board-wide sd: XBR 1.34, Spd 1.61.
+        z = 0.6 * (xbr / 1.34) + 0.4 * ((spd - 4.13) / 1.61)
+        prior = {k: min(max(v + ADV_PER_SD * z * (v / P_FIRST_TO_THIRD_ON_1B),
+                            0.02), 0.95) for k, v in lg.items()}
+        rec = RunnerAdvance.load_runner_advance().get(str(pid or ""), {})
+        out = {}
+        for key, tag in (("first_to_third", "1B_on1"),
+                         ("second_scores", "1B_on2"),
+                         ("first_scores_2b", "2B_on1")):
+            n = float(rec.get(tag + "_n", 0))
+            y = float(rec.get(tag + "_y", 0))
+            w = n / (n + STABILIZE_ADVANCE)
+            obs = (y / n) if n else prior[key]
+            out[key] = w * obs + (1.0 - w) * prior[key]
+        return out
 
 
 # ===========================================================================
@@ -18298,12 +19245,10 @@ def runner_advance_rates(pid: Optional[int], xbr: float = 0.0,
 # wOBA on contact over 2,652 starts). It is a real effect and a SMALL one —
 # anything here that moves scoring by a run is wrong.
 
-SAVANT_OAA_URL = "https://baseballsavant.mlb.com/leaderboard/outs_above_average"
-SAVANT_ARM_URL = "https://baseballsavant.mlb.com/leaderboard/arm-strength"
 
 
 def _savant_csv(url: str, params: dict) -> List[dict]:
-    r = requests.get(url, params=params, timeout=40)
+    r = requests.get(url, params=params, timeout=Savant.TIMEOUT)
     r.raise_for_status()
     text = r.text.lstrip("﻿")
     return list(csv.DictReader(io.StringIO(text)))
@@ -18341,16 +19286,17 @@ def _savant_club(name: str, by_name: Dict[str, str]) -> Optional[str]:
     return hits.pop() if len(hits) == 1 else None
 
 
-def export_defense(season: int = 2026) -> Path:
+def export_defense(season: Optional[int] = None) -> Path:
     """Team OAA and outfield arm strength -> MLBAnalytics CSV."""
+    season = CURRENT_SEASON if season is None else int(season)
     idx = _team_index()
     by_name = {}
     for norm, rec in idx.items():
         by_name[norm] = rec["abbr"]
 
-    oaa = _savant_csv(SAVANT_OAA_URL, {"type": "Fielder", "year": str(season),
+    oaa = _savant_csv(Savant.OAA_URL, {"type": "Fielder", "year": str(season),
                                        "csv": "true", "min": "10"})
-    arm = _savant_csv(SAVANT_ARM_URL, {"type": "player", "year": str(season),
+    arm = _savant_csv(Savant.ARM_URL, {"type": "player", "year": str(season),
                                        "csv": "true"})
 
     team_oaa: Dict[str, float] = {}
@@ -18425,7 +19371,6 @@ def export_defense(season: int = 2026) -> Path:
 _DEF: Dict[int, Dict[str, dict]] = {}          # keyed on SEASON
 
 
-SAVANT_FRAMING_URL = "https://baseballsavant.mlb.com/leaderboard/catcher-framing"
 
 _FRAMING: Dict[int, Dict[str, float]] = {}     # keyed on SEASON
 # Whether the 'no framing file for a lagged season' notice has been said.
@@ -18435,7 +19380,7 @@ _FRAMING: Dict[int, Dict[str, float]] = {}     # keyed on SEASON
 _FRAMING_WARNED = False
 
 
-def export_framing(season: int = 2026) -> Path:
+def export_framing(season: Optional[int] = None) -> Path:
     """Per-club catcher framing runs -> MLBAnalytics/team_framing_<season>.csv.
 
     **One request per club, because the league-wide CSV is unusable**: its `id`
@@ -18456,6 +19401,7 @@ def export_framing(season: int = 2026) -> Path:
     instead. The thorough route is to rebuild framing from `statcast_search`,
     which does honour dates (§3c).
     """
+    season = CURRENT_SEASON if season is None else int(season)
     if season != datetime.date.today().year:
         raise ValueError(
             f"mlb_sim: Savant's framing leaderboard ignores `year` — asking it "
@@ -18463,14 +19409,14 @@ def export_framing(season: int = 2026) -> Path:
             f"team_framing_{season}.csv would mislabel it. Rebuild from "
             f"statcast_search if a dated version is needed.")
     path = MLBA_DIR / f"team_framing_{season}.csv"
-    with open(SAVE_DIR / f"mlb_roster_{season}.json") as fh:
+    with open(SHARED_DIR / f"mlb_roster_{season}.json") as fh:
         teams = json.load(fh)["teams"]
     sess = requests.Session()
     sess.headers["User-Agent"] = "Mozilla/5.0"
     rows = []
     for t in teams:
         abbr = normalize_club(t.get("abbreviation") or "")
-        r = sess.get(SAVANT_FRAMING_URL,
+        r = sess.get(Savant.FRAMING_URL,
                      params={"year": season, "team": t["id"], "min": "1",
                              "type": "Cat", "csv": "true"}, timeout=60)
         got = [x for x in csv.DictReader(io.StringIO(r.text)) if x.get("rv_tot")]
@@ -18489,8 +19435,9 @@ def export_framing(season: int = 2026) -> Path:
     return path
 
 
-def load_team_framing(season: int = 2026) -> Dict[str, float]:
+def load_team_framing(season: Optional[int] = None) -> Dict[str, float]:
     """{club: framing runs saved over the season}. Empty when unavailable."""
+    season = CURRENT_SEASON if season is None else int(season)
     # **Keyed on SEASON.** The memo was a bare global, so the first season
     # loaded was served for every later request — which would have made
     # `TEAM_CONTEXT_LAG` a no-op that reported success.
@@ -18574,72 +19521,460 @@ FR_Z_LO, FR_Z_HI, FR_Z_STEP = -3.0, 3.0, 0.075
 FR_SIGMA = 1.0
 
 
-def framing_pitch_dir(season: int, save_dir: Path = SAVE_DIR) -> Path:
-    return (Path(save_dir) / "framing_pitches" / FRAMING_PITCH_VERSION
-            / str(season))
+class Framing:
+    """Framing rebuilt from pitch level — the date-aware series (9d)."""
 
+    @staticmethod
+    def _factor_codes(rows: Sequence[dict], fn):
+        """(integer code per row, the ordered level values) for one factor.
 
-def _fr_nx() -> int:
-    return int(round((FR_X_HI - FR_X_LO) / FR_X_STEP))
+        The random-effect fits need every grouping variable — catcher, pitcher,
+        umpire — as dense 0..k-1 codes. Both fitters had their own nested copy
+        of this.
+        """
+        import numpy as np
+        vals = sorted({fn(r) for r in rows}, key=str)
+        idx = {v: i for i, v in enumerate(vals)}
+        return np.array([idx[fn(r)] for r in rows]), vals
 
+    @staticmethod
+    def framing_pitch_dir(season: int, save_dir: Path = SAVE_DIR) -> Path:
+        return (Path(save_dir) / "framing_pitches" / FRAMING_PITCH_VERSION
+                / str(season))
 
-def _fr_nz() -> int:
-    return int(round((FR_Z_HI - FR_Z_LO) / FR_Z_STEP))
+    @staticmethod
+    def _fr_nx() -> int:
+        return int(round((FR_X_HI - FR_X_LO) / FR_X_STEP))
 
+    @staticmethod
+    def _fr_nz() -> int:
+        return int(round((FR_Z_HI - FR_Z_LO) / FR_Z_STEP))
 
-def load_framing_takes(season: int = 2026, upto: Optional[str] = None,
-                       save_dir: Path = SAVE_DIR) -> List[dict]:
-    """Every taken pitch, normalised for the model.
+    @staticmethod
+    def load_framing_takes(season: Optional[int] = None, upto: Optional[str] = None,
+                           save_dir: Path = SAVE_DIR) -> List[dict]:
+        """Every taken pitch, normalised for the model.
 
-    `plate_x` needs no normalisation — the plate is 17 inches for everyone.
-    `plate_z` does, because `sz_top`/`sz_bot` are per BATTER, so it is carried
-    as `(z - mid) / half`: -1..+1 inside the zone whatever the hitter's
-    height. The published reference implementation skips this and says so; the
-    fields are here at 100%, so there is no reason to.
+        `plate_x` needs no normalisation — the plate is 17 inches for everyone.
+        `plate_z` does, because `sz_top`/`sz_bot` are per BATTER, so it is carried
+        as `(z - mid) / half`: -1..+1 inside the zone whatever the hitter's
+        height. The published reference implementation skips this and says so; the
+        fields are here at 100%, so there is no reason to.
 
-    `blocked_ball` is excluded: blocking is a different skill from receiving.
-    """
-    import gzip
-    rows: List[dict] = []
-    d = framing_pitch_dir(season, save_dir)
-    for path in sorted(d.glob("*.json.gz")):
-        with gzip.open(path, "rt") as fh:
-            for x in json.load(fh):
-                if x.get("description") not in ("ball", "called_strike"):
+        `blocked_ball` is excluded: blocking is a different skill from receiving.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        import gzip
+        rows: List[dict] = []
+        d = Framing.framing_pitch_dir(season, save_dir)
+        for path in sorted(d.glob("*.json.gz")):
+            with gzip.open(path, "rt") as fh:
+                for x in json.load(fh):
+                    if x.get("description") not in ("ball", "called_strike"):
+                        continue
+                    if upto and x.get("game_date", "") > upto:
+                        continue
+                    try:
+                        px, pz = float(x["plate_x"]), float(x["plate_z"])
+                        top, bot = float(x["sz_top"]), float(x["sz_bot"])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if not top > bot:
+                        continue
+                    mid, half = (top + bot) / 2.0, (top - bot) / 2.0
+                    rows.append({
+                        "x": px, "zn": (pz - mid) / half,
+                        "date": x.get("game_date", ""),
+                        "s": 1 if x["description"] == "called_strike" else 0,
+                        "c": x.get("fielder_2"), "stand": x.get("stand") or "R",
+                        "pk": x.get("game_pk"), "pit": x.get("pitcher"),
+                        # The FIELDING side owns the catcher: top of the inning
+                        # means the away team bats, so the HOME club is catching.
+                        #
+                        # **NORMALISED HERE, at the source.** Savant spells seven
+                        # clubs differently from the FanGraphs board this engine
+                        # keys on — SF/SFG, TB/TBR, WSH/WSN, KC/KCR, SD/SDP,
+                        # AZ/ARI, CWS/CHW — so a model stored under Savant's
+                        # codes hands `build_side` a miss on a QUARTER of the
+                        # league. It does not raise: the lookup returns 0.0 and
+                        # those clubs simply get no framing, which is why an A/B
+                        # of it read as "no effect". `normalize_club` maps
+                        # Savant's spelling ONTO the board's, so it has to be
+                        # applied to the stored key, not to the query.
+                        "club": normalize_club(
+                            (x.get("home_team") if x.get("inning_topbot") == "Top"
+                             else x.get("away_team")) or "")})
+        return rows
+
+    @staticmethod
+    def _fr_smooth2d(a, sigma_bins: Optional[float] = None, radius: int = 4):
+        """Separable Gaussian blur. numpy only — scipy is not a dependency."""
+        sigma_bins = FR_SIGMA if sigma_bins is None else float(sigma_bins)
+        import numpy as np
+        k = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma_bins) ** 2)
+        k /= k.sum()
+        out = np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 0, a)
+        return np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 1, out)
+
+    @staticmethod
+    def build_framing_surface(rows: Sequence[dict], sigma: Optional[float] = None):
+        """{stance: (rate_grid, count_grid)} — smoothed empirical P(called strike).
+
+        Fitted per batter STANCE, which moves the zone edges ~2 percentage points.
+        """
+        sigma = FR_SIGMA if sigma is None else float(sigma)
+        import numpy as np
+        nx, nz = Framing._fr_nx(), Framing._fr_nz()
+        out = {}
+        for stand in ("L", "R"):
+            n = np.zeros((nx, nz))
+            st_ = np.zeros((nx, nz))
+            for r in rows:
+                if r["stand"] != stand:
                     continue
-                if upto and x.get("game_date", "") > upto:
+                i = int((r["x"] - FR_X_LO) / FR_X_STEP)
+                j = int((r["zn"] - FR_Z_LO) / FR_Z_STEP)
+                if 0 <= i < nx and 0 <= j < nz:
+                    n[i, j] += 1
+                    st_[i, j] += r["s"]
+            ns, ss = Framing._fr_smooth2d(n, sigma), Framing._fr_smooth2d(st_, sigma)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                rate = np.where(ns > 0, ss / np.maximum(ns, 1e-9), np.nan)
+            out[stand] = (rate, ns)
+        return out
+
+    @staticmethod
+    def measure_framing(season: Optional[int] = None, upto: Optional[str] = None,
+                        save_dir: Path = SAVE_DIR, sigma: Optional[float] = None,
+                        rounds: int = 8, with_pitcher: bool = True,
+                        with_umpire: bool = True, verbose: bool = True,
+                        out_path: Optional[Path] = None) -> dict:
+        """Per-catcher and per-club framing runs, as of `upto`.
+
+        Three layers: the location SURFACE, a CALIBRATION that makes the thing
+        zero-sum by construction, then EB-shrunk random effects for umpire,
+        pitcher and catcher fitted by coordinate ascent.
+
+        **Why the pitcher and umpire effects.** `actual - expected` credits the
+        catcher with everything location does not explain — including the
+        pitcher's command and the umpire's zone. A catcher who receives
+        good-command arms looks good. Statcast applies a pitcher adjustment;
+        Baseball Prospectus's CSAA additionally fits umpire and batter. Umpire is
+        available here at a 100% join and Statcast does not use it at all.
+        """
+        sigma = FR_SIGMA if sigma is None else float(sigma)
+        season = CURRENT_SEASON if season is None else int(season)
+        import numpy as np
+        rows = Framing.load_framing_takes(season, upto, save_dir)
+        if not rows:
+            raise SystemExit(
+                f"mlb_sim: no framing pitches for {season} under "
+                f"{Framing.framing_pitch_dir(season, save_dir)}. Run "
+                f"`python scrape_framing.py {season}` first.")
+        try:
+            with open(Path(save_dir) / f"umpires_{season}.json") as fh:
+                ump = {int(k): v for k, v in json.load(fh).items()}
+        except (OSError, ValueError):
+            ump = {}
+            if with_umpire and verbose:
+                print(f"[framing] no umpires_{season}.json — umpire effect OFF")
+            with_umpire = False
+
+        surf = Framing.build_framing_surface(rows, sigma)
+        base = np.array([framing_expected(r, surf) for r in rows])
+        y = np.array([r["s"] for r in rows], dtype=float)
+        ca, cb = fit_framing_calibration(_fr_logit(base), y)
+        eta = ca + cb * _fr_logit(base)
+        if verbose:
+            p0 = _fr_expit(eta)
+            print(f"[framing] {season}{' thru ' + upto if upto else ''}: "
+                  f"{len(rows):,} takes")
+            print(f"  calibration a={ca:+.4f} b={cb:+.4f}   drift "
+                  f"{(y.sum()-base.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} -> "
+                  f"{(y.sum()-p0.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} runs")
+
+        def codes_for(fn):
+            return Framing._factor_codes(rows, fn)
+
+        groups = []
+        if with_umpire:
+            groups.append(("umpire", *codes_for(
+                lambda r: ump.get(int(r["pk"]), "?") if r.get("pk") else "?")))
+        if with_pitcher:
+            groups.append(("pitcher", *codes_for(lambda r: r["pit"])))
+        groups.append(("catcher", *codes_for(lambda r: r["c"])))
+
+        eff = {nm: np.zeros(len(vals)) for nm, _, vals in groups}
+        taus: Dict[str, float] = {}
+        rnd = -1
+        for rnd in range(rounds):
+            moved = 0.0
+            for nm, codes, vals in groups:
+                held = eta - eff[nm][codes]          # hold the other effects fixed
+                new, tau2 = fit_framing_random_effect(held, y, codes, len(vals))
+                moved = max(moved, float(np.abs(new - eff[nm]).max()))
+                eff[nm] = new
+                taus[nm] = tau2
+                eta = held + eff[nm][codes]
+            # One Newton step on the INTERCEPT each round, so the zero-sum
+            # identity the calibration established survives the random effects.
+            pp = _fr_expit(eta)
+            eta = eta + (y.sum() - pp.sum()) / max(float(np.sum(pp * (1 - pp))),
+                                                   1e-9)
+            if moved < 1e-7:
+                break
+        if verbose:
+            pp = _fr_expit(eta)
+            print("  " + "  ".join(f"{nm} sd {math.sqrt(taus[nm]):.4f}"
+                                   for nm, _, _ in groups)
+                  + f"   rounds {rnd+1}   final drift "
+                    f"{(y.sum()-pp.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} runs")
+
+        # The catcher's credit is measured against a prediction that EXCLUDES his
+        # own effect but keeps the umpire's and the pitcher's.
+        cat = [g for g in groups if g[0] == "catcher"][0]
+        p_nc = _fr_expit(eta - eff["catcher"][cat[1]])
+        per_c: Dict[str, list] = {}
+        per_club: Dict[str, list] = {}
+        club_games: Dict[str, set] = {}
+        cat_games: Dict[str, set] = {}
+        for i, r in enumerate(rows):
+            if r["club"]:
+                club_games.setdefault(r["club"], set()).add(r.get("pk"))
+            if r["c"]:
+                cat_games.setdefault(r["c"], set()).add(r.get("pk"))
+            for d, k in ((per_c, r["c"]), (per_club, r["club"])):
+                if k is None:
                     continue
-                try:
-                    px, pz = float(x["plate_x"]), float(x["plate_z"])
-                    top, bot = float(x["sz_top"]), float(x["sz_bot"])
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if not top > bot:
-                    continue
-                mid, half = (top + bot) / 2.0, (top - bot) / 2.0
-                rows.append({
-                    "x": px, "zn": (pz - mid) / half,
-                    "date": x.get("game_date", ""),
-                    "s": 1 if x["description"] == "called_strike" else 0,
-                    "c": x.get("fielder_2"), "stand": x.get("stand") or "R",
-                    "pk": x.get("game_pk"), "pit": x.get("pitcher"),
-                    # The FIELDING side owns the catcher: top of the inning
-                    # means the away team bats, so the HOME club is catching.
-                    #
-                    # **NORMALISED HERE, at the source.** Savant spells seven
-                    # clubs differently from the FanGraphs board this engine
-                    # keys on — SF/SFG, TB/TBR, WSH/WSN, KC/KCR, SD/SDP,
-                    # AZ/ARI, CWS/CHW — so a model stored under Savant's
-                    # codes hands `build_side` a miss on a QUARTER of the
-                    # league. It does not raise: the lookup returns 0.0 and
-                    # those clubs simply get no framing, which is why an A/B
-                    # of it read as "no effect". `normalize_club` maps
-                    # Savant's spelling ONTO the board's, so it has to be
-                    # applied to the stored key, not to the query.
-                    "club": normalize_club(
-                        (x.get("home_team") if x.get("inning_topbot") == "Top"
-                         else x.get("away_team")) or "")})
-    return rows
+                v = d.setdefault(k, [0.0, 0.0, 0])
+                v[0] += y[i]
+                v[1] += p_nc[i]
+                v[2] += 1
+        out = {
+            "season": season, "upto": upto, "sigma": sigma,
+            "calibration": {"a": ca, "b": cb},
+            "tau": {k: math.sqrt(v) for k, v in taus.items()},
+            "effects": {nm: {str(v): float(eff[nm][i])
+                             for i, v in enumerate(vals)}
+                        for nm, _, vals in groups},
+            # **`games` is counted here, not looked up.** An AS-OF framing total
+            # covers only the games played by that date, so dividing it by the
+            # club's full-season game count — which is what `build_side` does for
+            # the Savant CSV — would understate every club in April by a factor of
+            # four. Distinct `game_pk` in the window is exact and free.
+            "club": {k: {"runs": (v[0] - v[1]) * FRAMING_RUNS_PER_STRIKE,
+                         "csaa": v[0] - v[1], "chances": v[2],
+                         "games": len(club_games.get(k) or ())}
+                     for k, v in per_club.items()},
+            # `games` per CATCHER for the same reason as per club: framing is a
+            # rate, and a backup who caught 30 games is not a tenth of a starter.
+            "catcher": {str(k): {"runs": (v[0] - v[1]) * FRAMING_RUNS_PER_STRIKE,
+                                 "csaa": v[0] - v[1], "chances": v[2],
+                                 "games": len(cat_games.get(k) or ())}
+                        for k, v in per_c.items()}}
+        dest = (Path(out_path) if out_path
+                else framing_model_path(season, upto, save_dir))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "w") as fh:
+            json.dump(out, fh, indent=1)
+        if verbose:
+            print(f"  {len(out['club'])} clubs, {len(out['catcher'])} catchers, "
+                  f"club sum {sum(v['runs'] for v in out['club'].values()):+.2f} "
+                  f"runs -> {dest.name}")
+        return out
+
+    @staticmethod
+    def framing_validate_report(season: Optional[int] = None,
+                                path: Optional[Path] = None,
+                                save_dir: Path = SAVE_DIR) -> dict:
+        """Does the rebuild reproduce SAVANT's published per-club numbers?
+
+        **The go/no-go.** The point is not to beat Statcast, it is to get a
+        date-aware series; so the test is that the same code over the FULL season
+        lands on Savant's own numbers, and the as-of versions then inherit that.
+
+        Compared LIKE FOR LIKE. Savant's leaderboard applies a minimum-chances
+        qualifier and `export_framing` summed only those catchers, while this
+        includes every catcher — so each club is scored on its top-N by chances
+        with N taken from Savant's own `catchers` column. A catcher's runs are
+        pro-rated by the share of his chances at that club, because a traded
+        catcher (Patrick Bailey, CLE 3,360 / SFG 2,053) belongs to both.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        got = json.load(open(path or framing_model_path(season, None, save_dir)))
+        ref: Dict[str, dict] = {}
+        with open(MLBA_DIR / f"team_framing_{season}.csv") as fh:
+            for r in csv.DictReader(fh):
+                ref[normalize_club(r["team"])] = {
+                    "runs": float(r["framing_runs"]), "n": int(r["catchers"])}
+        rows = Framing.load_framing_takes(season, got.get("upto"), save_dir)
+        tot = collections.Counter()
+        by_club: Dict[str, collections.Counter] = {}
+        for r in rows:
+            tot[r["c"]] += 1
+            by_club.setdefault(normalize_club(r["club"] or ""),
+                               collections.Counter())[r["c"]] += 1
+        cat = got["catcher"]
+        keys = sorted(set(by_club) & set(ref))
+        a, b = [], []
+        for k in keys:
+            top = sorted(by_club[k].items(), key=lambda z: -z[1])[:ref[k]["n"]]
+            a.append(sum((cat.get(str(c)) or {}).get("runs", 0.0) * (n / tot[c])
+                         for c, n in top if tot[c]))
+            b.append(ref[k]["runs"])
+        mx, my = statistics.mean(a), statistics.mean(b)
+        sxx = sum((x - mx) ** 2 for x in a)
+        syy = sum((x - my) ** 2 for x in b)
+        sxy = sum((x - mx) * (y2 - my) for x, y2 in zip(a, b))
+        corr = sxy / (sxx * syy) ** 0.5 if sxx and syy else 0.0
+        rmse = (sum((x - y2) ** 2 for x, y2 in zip(a, b)) / len(a)) ** 0.5
+        print(f"\nFRAMING vs Savant — {season}, {len(keys)} clubs, like-for-like")
+        print(f"  correlation {corr:+.4f}   slope {sxy/sxx if sxx else 0:+.4f}"
+              f"   RMSE {rmse:.2f} runs")
+        print(f"  our sd {statistics.pstdev(a):.2f}   Savant sd "
+              f"{statistics.pstdev(b):.2f}   our sum {sum(a):+.1f}")
+        print(f"\n  {'club':<6s}{'ours':>9s}{'Savant':>9s}{'diff':>8s}")
+        for k, x, y2 in sorted(zip(keys, a, b), key=lambda z: -z[2]):
+            print(f"  {k:<6s}{x:>9.2f}{y2:>9.2f}{x-y2:>8.2f}")
+        return {"corr": corr, "slope": sxy / sxx if sxx else 0.0, "rmse": rmse,
+                "n": len(keys)}
+
+    @staticmethod
+    def framing_repeatability_report(season: Optional[int] = None,
+                                     split: Optional[str] = None,
+                                     min_chances: int = 400,
+                                     save_dir: Path = SAVE_DIR) -> dict:
+        """SPLIT-HALF: does adjusting for pitcher and umpire give a BETTER catcher
+        estimate, or does it strip real skill?
+
+        **Agreement with Savant cannot answer this** — Savant applies a pitcher
+        adjustment and no umpire adjustment at all, so diverging from it is what
+        the change is FOR. "We disagree because we are better" is a story, and
+        this file's rule is that a story is not a measurement (5.11.2). So the
+        instrument is the one 3d.8 used for the stuff prior: fit on the first half
+        of a season, and score the estimate against what actually happened in the
+        second.
+
+        Both variants are scored the SAME way on the same held-out pitches, with
+        only the catcher term differing, so the comparison is of the estimate and
+        nothing else.
+
+        > **Read the two numbers separately.** Raw predictive power can FAVOUR the
+        > unadjusted estimate for a bad reason: a catcher works the same staff in
+        > both halves, so a metric that quietly carries his pitchers' command will
+        > "predict" the second half partly by carrying it again. That is exactly
+        > the confound the adjustment exists to remove, and for THIS engine it is
+        > disqualifying either way — the sim already prices the pitcher's own
+        > K/BB rates, so framing that contains his command double-counts it.
+        """
+        season = CURRENT_SEASON if season is None else int(season)
+        import numpy as np
+        rows = Framing.load_framing_takes(season, save_dir=save_dir)
+        if not rows:
+            raise SystemExit(f"mlb_sim: no framing pitches for {season}")
+        dates = sorted({r["date"] for r in rows if r["date"]})
+        split = split or dates[len(dates) // 2]
+        h1 = [r for r in rows if r["date"] and r["date"] <= split]
+        h2 = [r for r in rows if r["date"] and r["date"] > split]
+        print(f"\nFRAMING split-half — {season}, split at {split}")
+        print(f"  first half {len(h1):,} takes   second half {len(h2):,}")
+
+        try:
+            with open(Path(save_dir) / f"umpires_{season}.json") as fh:
+                ump = {int(k): v for k, v in json.load(fh).items()}
+        except (OSError, ValueError):
+            ump = {}
+
+        # ONE surface, fitted on the first half only, used for both variants and
+        # for scoring — so nothing about the location model differs between arms.
+        surf = Framing.build_framing_surface(h1, FR_SIGMA)
+        y1 = np.array([r["s"] for r in h1], dtype=float)
+        e1 = _fr_logit(np.array([framing_expected(r, surf) for r in h1]))
+        ca, cb = fit_framing_calibration(e1, y1)
+
+        def codes(rws, fn):
+            return Framing._factor_codes(rws, fn)
+
+        c_codes, c_vals = codes(h1, lambda r: r["c"])
+        variants = {}
+        for name, adj in (("catcher only", False), ("+ pitcher + umpire", True)):
+            eta = ca + cb * e1
+            eff = {"catcher": np.zeros(len(c_vals))}
+            groups = [("catcher", c_codes, c_vals)]
+            if adj:
+                groups = [("umpire", *codes(h1, lambda r: ump.get(int(r["pk"]), "?")
+                                            if r.get("pk") else "?")),
+                          ("pitcher", *codes(h1, lambda r: r["pit"]))] + groups
+                for nm, _, vals in groups:
+                    eff[nm] = np.zeros(len(vals))
+            for _ in range(8):
+                for nm, cd, vals in groups:
+                    held = eta - eff[nm][cd]
+                    eff[nm], _ = fit_framing_random_effect(held, y1, cd, len(vals))
+                    eta = held + eff[nm][cd]
+            variants[name] = dict(zip(c_vals, eff["catcher"]))
+
+        # score the SECOND half: same surface, same calibration, catcher term only
+        ch2 = collections.Counter(r["c"] for r in h2)
+        ch1 = collections.Counter(r["c"] for r in h1)
+        keep = {c for c in ch2 if ch2[c] >= min_chances and ch1[c] >= min_chances}
+        sub = [r for r in h2 if r["c"] in keep]
+        y2 = np.array([r["s"] for r in sub], dtype=float)
+        base2 = ca + cb * _fr_logit(np.array([framing_expected(r, surf)
+                                              for r in sub]))
+        print(f"  scored on {len(sub):,} second-half takes from {len(keep)} "
+              f"catchers with {min_chances}+ in BOTH halves")
+        out = {}
+        p0 = _fr_expit(base2)
+        ll0 = float(-(y2 * np.log(np.clip(p0, 1e-9, 1)) +
+                      (1 - y2) * np.log(np.clip(1 - p0, 1e-9, 1))).mean())
+        print(f"\n  {'variant':<22s}{'held-out logloss':>18s}{'vs no-catcher':>15s}"
+              f"{'corr w/ H2':>12s}")
+        print(f"  {'no catcher term':<22s}{ll0:>18.6f}{'--':>15s}{'--':>12s}")
+        # the second half's own catcher deviation, measured identically for both
+        h2_dev = {}
+        for c in keep:
+            m_ = [i for i, r in enumerate(sub) if r["c"] == c]
+            h2_dev[c] = float(y2[m_].mean() - p0[m_].mean())
+        for name, eff_c in variants.items():
+            adjv = np.array([eff_c.get(r["c"], 0.0) for r in sub])
+            p = _fr_expit(base2 + adjv)
+            ll = float(-(y2 * np.log(np.clip(p, 1e-9, 1)) +
+                         (1 - y2) * np.log(np.clip(1 - p, 1e-9, 1))).mean())
+            xs = [eff_c.get(c, 0.0) for c in sorted(keep)]
+            ys = [h2_dev[c] for c in sorted(keep)]
+            mx, my = statistics.mean(xs), statistics.mean(ys)
+            sxx = sum((a - mx) ** 2 for a in xs)
+            syy = sum((b - my) ** 2 for b in ys)
+            r_ = (sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+                  / (sxx * syy) ** 0.5) if sxx and syy else 0.0
+            out[name] = {"logloss": ll, "gain": ll0 - ll, "corr": r_}
+            print(f"  {name:<22s}{ll:>18.6f}{ll0-ll:>+15.6f}{r_:>+12.4f}")
+        return out
+
+    @staticmethod
+    def catcher_framing_per_game(catcher_id: Optional[int], season: int,
+                                 save_dir: Path = SAVE_DIR) -> Optional[float]:
+        """THIS catcher's framing runs per game, or None when he is not on file.
+
+        **Framing is a PLAYER skill, and the club aggregate is the wrong object.**
+        A club's number is a roster property: Patrick Bailey split CLE 3,360 /
+        SFG 2,053 inside one season, so last year's Cleveland figure carries the
+        framing of a man now in San Francisco. Lagging THAT is measuring the wrong
+        thing — which is what the first framing A/B did, and why it came back
+        negative (see sim_state.md).
+
+        Lagging a CATCHER is fine: his skill travels with him, so a prior-season
+        per-catcher value is both leak-free and meaningful, and needs no as-of
+        snapshot.
+        """
+        if catcher_id is None:
+            return None
+        got = load_framing_model(season, FRAMING_ASOF or None, save_dir)
+        rec = (got.get("catcher") or {}).get(str(int(catcher_id)))
+        if not rec or not rec.get("games"):
+            return None
+        return float(rec["runs"]) / float(rec["games"])
 
 
 def _fr_logit(p, eps: float = 1e-6):
@@ -18655,41 +19990,6 @@ def _fr_expit(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -35, 35)))
 
 
-def _fr_smooth2d(a, sigma_bins: float = FR_SIGMA, radius: int = 4):
-    """Separable Gaussian blur. numpy only — scipy is not a dependency."""
-    import numpy as np
-    k = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma_bins) ** 2)
-    k /= k.sum()
-    out = np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 0, a)
-    return np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), 1, out)
-
-
-def build_framing_surface(rows: Sequence[dict], sigma: float = FR_SIGMA):
-    """{stance: (rate_grid, count_grid)} — smoothed empirical P(called strike).
-
-    Fitted per batter STANCE, which moves the zone edges ~2 percentage points.
-    """
-    import numpy as np
-    nx, nz = _fr_nx(), _fr_nz()
-    out = {}
-    for stand in ("L", "R"):
-        n = np.zeros((nx, nz))
-        st_ = np.zeros((nx, nz))
-        for r in rows:
-            if r["stand"] != stand:
-                continue
-            i = int((r["x"] - FR_X_LO) / FR_X_STEP)
-            j = int((r["zn"] - FR_Z_LO) / FR_Z_STEP)
-            if 0 <= i < nx and 0 <= j < nz:
-                n[i, j] += 1
-                st_[i, j] += r["s"]
-        ns, ss = _fr_smooth2d(n, sigma), _fr_smooth2d(st_, sigma)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            rate = np.where(ns > 0, ss / np.maximum(ns, 1e-9), np.nan)
-        out[stand] = (rate, ns)
-    return out
-
-
 def framing_expected(r: dict, surf: dict) -> float:
     """Off-grid takes get 0.0, and that is MEASURED rather than assumed:
     13,754 of them (5.06%) fall outside these extents and FOUR were called
@@ -18700,7 +20000,7 @@ def framing_expected(r: dict, surf: dict) -> float:
     rate, _ = got
     i = int((r["x"] - FR_X_LO) / FR_X_STEP)
     j = int((r["zn"] - FR_Z_LO) / FR_Z_STEP)
-    if not (0 <= i < _fr_nx() and 0 <= j < _fr_nz()):
+    if not (0 <= i < Framing._fr_nx() and 0 <= j < Framing._fr_nz()):
         return 0.0
     v = rate[i, j]
     return 0.0 if v != v else float(v)
@@ -18770,314 +20070,6 @@ def framing_model_path(season: int, upto: Optional[str] = None,
     return Path(save_dir) / f"{stem}.json"
 
 
-def measure_framing(season: int = 2026, upto: Optional[str] = None,
-                    save_dir: Path = SAVE_DIR, sigma: float = FR_SIGMA,
-                    rounds: int = 8, with_pitcher: bool = True,
-                    with_umpire: bool = True, verbose: bool = True,
-                    out_path: Optional[Path] = None) -> dict:
-    """Per-catcher and per-club framing runs, as of `upto`.
-
-    Three layers: the location SURFACE, a CALIBRATION that makes the thing
-    zero-sum by construction, then EB-shrunk random effects for umpire,
-    pitcher and catcher fitted by coordinate ascent.
-
-    **Why the pitcher and umpire effects.** `actual - expected` credits the
-    catcher with everything location does not explain — including the
-    pitcher's command and the umpire's zone. A catcher who receives
-    good-command arms looks good. Statcast applies a pitcher adjustment;
-    Baseball Prospectus's CSAA additionally fits umpire and batter. Umpire is
-    available here at a 100% join and Statcast does not use it at all.
-    """
-    import numpy as np
-    rows = load_framing_takes(season, upto, save_dir)
-    if not rows:
-        raise SystemExit(
-            f"mlb_sim: no framing pitches for {season} under "
-            f"{framing_pitch_dir(season, save_dir)}. Run "
-            f"`python scrape_framing.py {season}` first.")
-    try:
-        with open(Path(save_dir) / f"umpires_{season}.json") as fh:
-            ump = {int(k): v for k, v in json.load(fh).items()}
-    except (OSError, ValueError):
-        ump = {}
-        if with_umpire and verbose:
-            print(f"[framing] no umpires_{season}.json — umpire effect OFF")
-        with_umpire = False
-
-    surf = build_framing_surface(rows, sigma)
-    base = np.array([framing_expected(r, surf) for r in rows])
-    y = np.array([r["s"] for r in rows], dtype=float)
-    ca, cb = fit_framing_calibration(_fr_logit(base), y)
-    eta = ca + cb * _fr_logit(base)
-    if verbose:
-        p0 = _fr_expit(eta)
-        print(f"[framing] {season}{' thru ' + upto if upto else ''}: "
-              f"{len(rows):,} takes")
-        print(f"  calibration a={ca:+.4f} b={cb:+.4f}   drift "
-              f"{(y.sum()-base.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} -> "
-              f"{(y.sum()-p0.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} runs")
-
-    def codes_for(fn):
-        vals = sorted({fn(r) for r in rows}, key=str)
-        idx = {v: i for i, v in enumerate(vals)}
-        return np.array([idx[fn(r)] for r in rows]), vals
-
-    groups = []
-    if with_umpire:
-        groups.append(("umpire", *codes_for(
-            lambda r: ump.get(int(r["pk"]), "?") if r.get("pk") else "?")))
-    if with_pitcher:
-        groups.append(("pitcher", *codes_for(lambda r: r["pit"])))
-    groups.append(("catcher", *codes_for(lambda r: r["c"])))
-
-    eff = {nm: np.zeros(len(vals)) for nm, _, vals in groups}
-    taus: Dict[str, float] = {}
-    for rnd in range(rounds):
-        moved = 0.0
-        for nm, codes, vals in groups:
-            held = eta - eff[nm][codes]          # hold the other effects fixed
-            new, tau2 = fit_framing_random_effect(held, y, codes, len(vals))
-            moved = max(moved, float(np.abs(new - eff[nm]).max()))
-            eff[nm] = new
-            taus[nm] = tau2
-            eta = held + eff[nm][codes]
-        # One Newton step on the INTERCEPT each round, so the zero-sum
-        # identity the calibration established survives the random effects.
-        pp = _fr_expit(eta)
-        eta = eta + (y.sum() - pp.sum()) / max(float(np.sum(pp * (1 - pp))),
-                                               1e-9)
-        if moved < 1e-7:
-            break
-    if verbose:
-        pp = _fr_expit(eta)
-        print("  " + "  ".join(f"{nm} sd {math.sqrt(taus[nm]):.4f}"
-                               for nm, _, _ in groups)
-              + f"   rounds {rnd+1}   final drift "
-                f"{(y.sum()-pp.sum())*FRAMING_RUNS_PER_STRIKE:+.2f} runs")
-
-    # The catcher's credit is measured against a prediction that EXCLUDES his
-    # own effect but keeps the umpire's and the pitcher's.
-    cat = [g for g in groups if g[0] == "catcher"][0]
-    p_nc = _fr_expit(eta - eff["catcher"][cat[1]])
-    per_c: Dict[str, list] = {}
-    per_club: Dict[str, list] = {}
-    club_games: Dict[str, set] = {}
-    cat_games: Dict[str, set] = {}
-    for i, r in enumerate(rows):
-        if r["club"]:
-            club_games.setdefault(r["club"], set()).add(r.get("pk"))
-        if r["c"]:
-            cat_games.setdefault(r["c"], set()).add(r.get("pk"))
-        for d, k in ((per_c, r["c"]), (per_club, r["club"])):
-            if k is None:
-                continue
-            v = d.setdefault(k, [0.0, 0.0, 0])
-            v[0] += y[i]
-            v[1] += p_nc[i]
-            v[2] += 1
-    out = {
-        "season": season, "upto": upto, "sigma": sigma,
-        "calibration": {"a": ca, "b": cb},
-        "tau": {k: math.sqrt(v) for k, v in taus.items()},
-        "effects": {nm: {str(v): float(eff[nm][i])
-                         for i, v in enumerate(vals)}
-                    for nm, _, vals in groups},
-        # **`games` is counted here, not looked up.** An AS-OF framing total
-        # covers only the games played by that date, so dividing it by the
-        # club's full-season game count — which is what `build_side` does for
-        # the Savant CSV — would understate every club in April by a factor of
-        # four. Distinct `game_pk` in the window is exact and free.
-        "club": {k: {"runs": (v[0] - v[1]) * FRAMING_RUNS_PER_STRIKE,
-                     "csaa": v[0] - v[1], "chances": v[2],
-                     "games": len(club_games.get(k) or ())}
-                 for k, v in per_club.items()},
-        # `games` per CATCHER for the same reason as per club: framing is a
-        # rate, and a backup who caught 30 games is not a tenth of a starter.
-        "catcher": {str(k): {"runs": (v[0] - v[1]) * FRAMING_RUNS_PER_STRIKE,
-                             "csaa": v[0] - v[1], "chances": v[2],
-                             "games": len(cat_games.get(k) or ())}
-                    for k, v in per_c.items()}}
-    dest = (Path(out_path) if out_path
-            else framing_model_path(season, upto, save_dir))
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "w") as fh:
-        json.dump(out, fh, indent=1)
-    if verbose:
-        print(f"  {len(out['club'])} clubs, {len(out['catcher'])} catchers, "
-              f"club sum {sum(v['runs'] for v in out['club'].values()):+.2f} "
-              f"runs -> {dest.name}")
-    return out
-
-
-def framing_validate_report(season: int = 2026,
-                            path: Optional[Path] = None,
-                            save_dir: Path = SAVE_DIR) -> dict:
-    """Does the rebuild reproduce SAVANT's published per-club numbers?
-
-    **The go/no-go.** The point is not to beat Statcast, it is to get a
-    date-aware series; so the test is that the same code over the FULL season
-    lands on Savant's own numbers, and the as-of versions then inherit that.
-
-    Compared LIKE FOR LIKE. Savant's leaderboard applies a minimum-chances
-    qualifier and `export_framing` summed only those catchers, while this
-    includes every catcher — so each club is scored on its top-N by chances
-    with N taken from Savant's own `catchers` column. A catcher's runs are
-    pro-rated by the share of his chances at that club, because a traded
-    catcher (Patrick Bailey, CLE 3,360 / SFG 2,053) belongs to both.
-    """
-    got = json.load(open(path or framing_model_path(season, None, save_dir)))
-    ref: Dict[str, dict] = {}
-    with open(MLBA_DIR / f"team_framing_{season}.csv") as fh:
-        for r in csv.DictReader(fh):
-            ref[normalize_club(r["team"])] = {
-                "runs": float(r["framing_runs"]), "n": int(r["catchers"])}
-    rows = load_framing_takes(season, got.get("upto"), save_dir)
-    tot = collections.Counter()
-    by_club: Dict[str, collections.Counter] = {}
-    for r in rows:
-        tot[r["c"]] += 1
-        by_club.setdefault(normalize_club(r["club"] or ""),
-                           collections.Counter())[r["c"]] += 1
-    cat = got["catcher"]
-    keys = sorted(set(by_club) & set(ref))
-    a, b = [], []
-    for k in keys:
-        top = sorted(by_club[k].items(), key=lambda z: -z[1])[:ref[k]["n"]]
-        a.append(sum((cat.get(str(c)) or {}).get("runs", 0.0) * (n / tot[c])
-                     for c, n in top if tot[c]))
-        b.append(ref[k]["runs"])
-    mx, my = statistics.mean(a), statistics.mean(b)
-    sxx = sum((x - mx) ** 2 for x in a)
-    syy = sum((x - my) ** 2 for x in b)
-    sxy = sum((x - mx) * (y2 - my) for x, y2 in zip(a, b))
-    corr = sxy / (sxx * syy) ** 0.5 if sxx and syy else 0.0
-    rmse = (sum((x - y2) ** 2 for x, y2 in zip(a, b)) / len(a)) ** 0.5
-    print(f"\nFRAMING vs Savant — {season}, {len(keys)} clubs, like-for-like")
-    print(f"  correlation {corr:+.4f}   slope {sxy/sxx if sxx else 0:+.4f}"
-          f"   RMSE {rmse:.2f} runs")
-    print(f"  our sd {statistics.pstdev(a):.2f}   Savant sd "
-          f"{statistics.pstdev(b):.2f}   our sum {sum(a):+.1f}")
-    print(f"\n  {'club':<6s}{'ours':>9s}{'Savant':>9s}{'diff':>8s}")
-    for k, x, y2 in sorted(zip(keys, a, b), key=lambda z: -z[2]):
-        print(f"  {k:<6s}{x:>9.2f}{y2:>9.2f}{x-y2:>8.2f}")
-    return {"corr": corr, "slope": sxy / sxx if sxx else 0.0, "rmse": rmse,
-            "n": len(keys)}
-
-
-def framing_repeatability_report(season: int = 2026,
-                                 split: Optional[str] = None,
-                                 min_chances: int = 400,
-                                 save_dir: Path = SAVE_DIR) -> dict:
-    """SPLIT-HALF: does adjusting for pitcher and umpire give a BETTER catcher
-    estimate, or does it strip real skill?
-
-    **Agreement with Savant cannot answer this** — Savant applies a pitcher
-    adjustment and no umpire adjustment at all, so diverging from it is what
-    the change is FOR. "We disagree because we are better" is a story, and
-    this file's rule is that a story is not a measurement (5.11.2). So the
-    instrument is the one 3d.8 used for the stuff prior: fit on the first half
-    of a season, and score the estimate against what actually happened in the
-    second.
-
-    Both variants are scored the SAME way on the same held-out pitches, with
-    only the catcher term differing, so the comparison is of the estimate and
-    nothing else.
-
-    > **Read the two numbers separately.** Raw predictive power can FAVOUR the
-    > unadjusted estimate for a bad reason: a catcher works the same staff in
-    > both halves, so a metric that quietly carries his pitchers' command will
-    > "predict" the second half partly by carrying it again. That is exactly
-    > the confound the adjustment exists to remove, and for THIS engine it is
-    > disqualifying either way — the sim already prices the pitcher's own
-    > K/BB rates, so framing that contains his command double-counts it.
-    """
-    import numpy as np
-    rows = load_framing_takes(season, save_dir=save_dir)
-    if not rows:
-        raise SystemExit(f"mlb_sim: no framing pitches for {season}")
-    dates = sorted({r["date"] for r in rows if r["date"]})
-    split = split or dates[len(dates) // 2]
-    h1 = [r for r in rows if r["date"] and r["date"] <= split]
-    h2 = [r for r in rows if r["date"] and r["date"] > split]
-    print(f"\nFRAMING split-half — {season}, split at {split}")
-    print(f"  first half {len(h1):,} takes   second half {len(h2):,}")
-
-    try:
-        with open(Path(save_dir) / f"umpires_{season}.json") as fh:
-            ump = {int(k): v for k, v in json.load(fh).items()}
-    except (OSError, ValueError):
-        ump = {}
-
-    # ONE surface, fitted on the first half only, used for both variants and
-    # for scoring — so nothing about the location model differs between arms.
-    surf = build_framing_surface(h1, FR_SIGMA)
-    y1 = np.array([r["s"] for r in h1], dtype=float)
-    e1 = _fr_logit(np.array([framing_expected(r, surf) for r in h1]))
-    ca, cb = fit_framing_calibration(e1, y1)
-
-    def codes(rws, fn):
-        vals = sorted({fn(r) for r in rws}, key=str)
-        idx = {v: i for i, v in enumerate(vals)}
-        return np.array([idx[fn(r)] for r in rws]), vals
-
-    c_codes, c_vals = codes(h1, lambda r: r["c"])
-    variants = {}
-    for name, adj in (("catcher only", False), ("+ pitcher + umpire", True)):
-        eta = ca + cb * e1
-        eff = {"catcher": np.zeros(len(c_vals))}
-        groups = [("catcher", c_codes, c_vals)]
-        if adj:
-            groups = [("umpire", *codes(h1, lambda r: ump.get(int(r["pk"]), "?")
-                                        if r.get("pk") else "?")),
-                      ("pitcher", *codes(h1, lambda r: r["pit"]))] + groups
-            for nm, _, vals in groups:
-                eff[nm] = np.zeros(len(vals))
-        for _ in range(8):
-            for nm, cd, vals in groups:
-                held = eta - eff[nm][cd]
-                eff[nm], _ = fit_framing_random_effect(held, y1, cd, len(vals))
-                eta = held + eff[nm][cd]
-        variants[name] = dict(zip(c_vals, eff["catcher"]))
-
-    # score the SECOND half: same surface, same calibration, catcher term only
-    ch2 = collections.Counter(r["c"] for r in h2)
-    ch1 = collections.Counter(r["c"] for r in h1)
-    keep = {c for c in ch2 if ch2[c] >= min_chances and ch1[c] >= min_chances}
-    sub = [r for r in h2 if r["c"] in keep]
-    y2 = np.array([r["s"] for r in sub], dtype=float)
-    base2 = ca + cb * _fr_logit(np.array([framing_expected(r, surf)
-                                          for r in sub]))
-    print(f"  scored on {len(sub):,} second-half takes from {len(keep)} "
-          f"catchers with {min_chances}+ in BOTH halves")
-    out = {}
-    p0 = _fr_expit(base2)
-    ll0 = float(-(y2 * np.log(np.clip(p0, 1e-9, 1)) +
-                  (1 - y2) * np.log(np.clip(1 - p0, 1e-9, 1))).mean())
-    print(f"\n  {'variant':<22s}{'held-out logloss':>18s}{'vs no-catcher':>15s}"
-          f"{'corr w/ H2':>12s}")
-    print(f"  {'no catcher term':<22s}{ll0:>18.6f}{'--':>15s}{'--':>12s}")
-    # the second half's own catcher deviation, measured identically for both
-    h2_dev = {}
-    for c in keep:
-        m_ = [i for i, r in enumerate(sub) if r["c"] == c]
-        h2_dev[c] = float(y2[m_].mean() - p0[m_].mean())
-    for name, eff_c in variants.items():
-        adjv = np.array([eff_c.get(r["c"], 0.0) for r in sub])
-        p = _fr_expit(base2 + adjv)
-        ll = float(-(y2 * np.log(np.clip(p, 1e-9, 1)) +
-                     (1 - y2) * np.log(np.clip(1 - p, 1e-9, 1))).mean())
-        xs = [eff_c.get(c, 0.0) for c in sorted(keep)]
-        ys = [h2_dev[c] for c in sorted(keep)]
-        mx, my = statistics.mean(xs), statistics.mean(ys)
-        sxx = sum((a - mx) ** 2 for a in xs)
-        syy = sum((b - my) ** 2 for b in ys)
-        r_ = (sum((a - mx) * (b - my) for a, b in zip(xs, ys))
-              / (sxx * syy) ** 0.5) if sxx and syy else 0.0
-        out[name] = {"logloss": ll, "gain": ll0 - ll, "corr": r_}
-        print(f"  {name:<22s}{ll:>18.6f}{ll0-ll:>+15.6f}{r_:>+12.4f}")
-    return out
-
-
 # **OFF until an A/B says otherwise.** The pitch-level series is better
 # measured (split-half: held-out logloss 0.124600 against the unadjusted
 # 0.124704, correlation with the held-out half +0.487 against +0.447) but
@@ -19097,9 +20089,10 @@ FRAMING_ASOF = ""
 _FRAMING_MODEL: Dict[tuple, dict] = {}
 
 
-def load_framing_model(season: int = 2026, upto: Optional[str] = None,
+def load_framing_model(season: Optional[int] = None, upto: Optional[str] = None,
                        save_dir: Path = SAVE_DIR) -> dict:
     """The cached pitch-level framing model, or {} when it was not built."""
+    season = CURRENT_SEASON if season is None else int(season)
     key = (int(season), upto or "")
     if key in _FRAMING_MODEL:
         return _FRAMING_MODEL[key]
@@ -19109,30 +20102,6 @@ def load_framing_model(season: int = 2026, upto: Optional[str] = None,
     except (OSError, ValueError):
         _FRAMING_MODEL[key] = {}
     return _FRAMING_MODEL[key]
-
-
-def catcher_framing_per_game(catcher_id: Optional[int], season: int,
-                             save_dir: Path = SAVE_DIR) -> Optional[float]:
-    """THIS catcher's framing runs per game, or None when he is not on file.
-
-    **Framing is a PLAYER skill, and the club aggregate is the wrong object.**
-    A club's number is a roster property: Patrick Bailey split CLE 3,360 /
-    SFG 2,053 inside one season, so last year's Cleveland figure carries the
-    framing of a man now in San Francisco. Lagging THAT is measuring the wrong
-    thing — which is what the first framing A/B did, and why it came back
-    negative (see sim_state.md).
-
-    Lagging a CATCHER is fine: his skill travels with him, so a prior-season
-    per-catcher value is both leak-free and meaningful, and needs no as-of
-    snapshot.
-    """
-    if catcher_id is None:
-        return None
-    got = load_framing_model(season, FRAMING_ASOF or None, save_dir)
-    rec = (got.get("catcher") or {}).get(str(int(catcher_id)))
-    if not rec or not rec.get("games"):
-        return None
-    return float(rec["runs"]) / float(rec["games"])
 
 
 def team_framing_per_game(season: int, abbr: str, fallback_games: float,
@@ -19155,7 +20124,8 @@ def team_framing_per_game(season: int, abbr: str, fallback_games: float,
     return load_team_framing(season).get(abbr, 0.0) / fallback_games
 
 
-def load_team_defense(season: int = 2026) -> Dict[str, dict]:
+def load_team_defense(season: Optional[int] = None) -> Dict[str, dict]:
+    season = CURRENT_SEASON if season is None else int(season)
     if season in _DEF:
         return _DEF[season]
     path = MLBA_DIR / f"team_defense_{season}.csv"
