@@ -28,19 +28,21 @@ from NovigClient import (
     NovigError,
     NovigQueries,
     SGP_IMPLICATION_PAIRS,
-    _EVENT_FIELDS,
-    _GAME_FIELDS,
-    _MARKET_FIELDS,
-    _event_to_dump_entry,
+    _NV_EVENT_MARKETS_QUERY,
+    _NV_HOME_QUERY,
+    _event_to_dump_entries,
     _find_outcome,
+    _nv_children_where,
+    _nv_list_where,
+    _nv_market_where,
+    _nv_normalize_listing_event,
+    _nv_normalize_market_event,
+    get_novig_token,
+    write_events_index,
+    write_event_sidecars,
     fmt_american,
     summarize_parlay_quote,
 )
-
-try:
-    from Creds import NOVIG_AUTH_TOKEN
-except ImportError:
-    NOVIG_AUTH_TOKEN = ""
 
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5)
@@ -51,13 +53,13 @@ DEFAULT_LEAGUES: tuple[str, ...] = (
 
 
 def _headers() -> dict:
-    if not NOVIG_AUTH_TOKEN:
-        raise NovigError(
-            "No Novig bearer token. Set NOVIG_AUTH_TOKEN in Creds.py.")
+    # get_novig_token() validates expiry and raises NovigError with an
+    # actionable message if the token is missing/expired, so the scrape fails
+    # loud instead of 401ing and falling back to a stale dump.
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {NOVIG_AUTH_TOKEN}",
+        "Authorization": f"Bearer {get_novig_token()}",
         "Origin": "https://novig.com",
         "Referer": "https://novig.com/",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NovigClient/0.1-async",
@@ -94,34 +96,39 @@ async def gql_async(session: aiohttp.ClientSession,
 
 
 async def list_events_async(session: aiohttp.ClientSession,
-                            league: str,
+                            league: Optional[str] = None,
                             status_in: tuple[str, ...] = (
                                 "OPEN_PREGAME", "OPEN_INGAME"),
                             visible_only: bool = True,
                             limit: int = 200) -> list[dict]:
-    where: dict = {
-        "league": {"_eq": league},
-        "status": {"_in": list(status_in)},
-        "parent_event_id": {"_is_null": True},
-    }
-    if visible_only:
-        where["_or"] = [
-            {"is_visible_pregame": {"_eq": True}},
-            {"is_visible_live": {"_eq": True}},
-        ]
-    query = f"""
-    query ListEvents($where: event_bool_exp!, $limit: Int!) {{
-      event(where: $where, limit: $limit,
-            order_by: {{scheduled_start: asc}}) {{
-        {_EVENT_FIELDS}
-        game {{ {_GAME_FIELDS} }}
-      }}
-    }}
-    """
-    data = await gql_async(session, query,
-                           {"where": where, "limit": limit},
-                           operation_name="ListEvents")
-    return data.get("event", [])
+    # league=None omits the league filter so the response covers every
+    # sport Novig exposes in one round-trip (mirrors the sync
+    # NovigClient.list_events no-filter path). Used by the leagues=None
+    # scrape so PGA/UFC/ATP/WTA/MLS/NCAABSB aren't silently dropped the
+    # way a hardcoded league enum drops them.
+    data = await gql_async(
+        session, _NV_HOME_QUERY,
+        {"where_event": _nv_list_where(league, status_in, visible_only),
+         "order_by_event": [{"scheduled_start": "asc"}],
+         "limit_count": limit},
+        operation_name="Home_Query")
+    return [_nv_normalize_listing_event(e) for e in data.get("event", [])]
+
+
+async def _event_node_async(session: aiohttp.ClientSession, event_id: str,
+                            market_where: dict) -> Optional[dict]:
+    data = await gql_async(
+        session, _NV_EVENT_MARKETS_QUERY,
+        {"eventId": event_id, "marketVisibleWhere": market_where},
+        operation_name="EventMarkets_Query")
+    events = data.get("event", [])
+    return _nv_normalize_market_event(events[0]) if events else None
+
+
+# Per-tournament cap on concurrent child fetches. Deliberately NOT the
+# scrape's shared semaphore: a parent holding a slot while its children wait
+# on the same pool deadlocks once every slot is a tournament.
+_CHILD_CONCURRENCY = 4
 
 
 async def get_event_markets_async(session: aiohttp.ClientSession,
@@ -129,48 +136,29 @@ async def get_event_markets_async(session: aiohttp.ClientSession,
                                   only_available: bool = False,
                                   tree_depth: int = 3
                                   ) -> Optional[dict]:
-    """Async port of NovigQueries.get_event_markets. Walks sub-events to
-    `tree_depth` levels so periods / props / SGP groups are included in
-    one round-trip."""
-    if only_available:
-        market_where = {
-            "_and": [
-                {"status": {"_eq": "OPEN"}},
-                {"_or": [
-                    {"is_consensus": {"_eq": True}},
-                    {"outcomes": {"available": {"_is_null": False}}},
-                ]},
-            ],
-        }
-    else:
-        market_where: dict = {}
+    """Async port of NovigQueries.get_event_markets: one event's markets,
+    plus a tournament container's live child matches as `events[]` when
+    tree_depth > 0 (Novig only nests one level)."""
+    market_where = _nv_market_where(only_available)
+    node = await _event_node_async(session, event_id, market_where)
+    if node is None or tree_depth <= 0 or node.get("type") != "Tournament":
+        return node
+    data = await gql_async(
+        session, _NV_HOME_QUERY,
+        {"where_event": _nv_children_where(event_id),
+         "order_by_event": [{"scheduled_start": "asc"}],
+         "limit_count": 1000},
+        operation_name="Home_Query")
+    sem = asyncio.Semaphore(_CHILD_CONCURRENCY)
 
-    def _nested(depth: int) -> str:
-        if depth <= 0:
-            return ""
-        return f"""
-        events {{
-          {_EVENT_FIELDS}
-          markets(where: $where) {{ {_MARKET_FIELDS} }}
-          {_nested(depth - 1)}
-        }}
-        """
+    async def one(child_id: str) -> Optional[dict]:
+        async with sem:
+            return await _event_node_async(session, child_id, market_where)
 
-    query = f"""
-    query EventMarkets($eventId: uuid!, $where: market_bool_exp!) {{
-      event(where: {{id: {{_eq: $eventId}}}}) {{
-        {_EVENT_FIELDS}
-        game {{ {_GAME_FIELDS} }}
-        markets(where: $where) {{ {_MARKET_FIELDS} }}
-        {_nested(tree_depth)}
-      }}
-    }}
-    """
-    data = await gql_async(session, query,
-                           {"eventId": event_id, "where": market_where},
-                           operation_name="EventMarkets")
-    events = data.get("event", [])
-    return events[0] if events else None
+    children = await asyncio.gather(
+        *(one(c["id"]) for c in data.get("event", [])))
+    node["events"] = [c for c in children if c is not None]
+    return node
 
 
 # ============================================================================
@@ -178,13 +166,19 @@ async def get_event_markets_async(session: aiohttp.ClientSession,
 # ============================================================================
 
 async def FetchAllLeaguesAsync(*,
-                               leagues: Sequence[str] = DEFAULT_LEAGUES,
+                               leagues: Optional[Sequence[str]] = None,
                                max_concurrent: int = 10,
                                only_available: bool = False,
                                save: bool = True,
                                dump_dir: Optional[pathlib.Path] = None,
                                progress: bool = True) -> dict:
-    """Concurrent multi-league scrape.
+    """Concurrent full-slate scrape.
+
+    leagues=None (the default, used by LiquidityWidget) does a single
+    no-filter listing that covers EVERY sport Novig exposes — tennis
+    (ATP/WTA), golf (PGA), UFC, soccer (MLS), etc. — instead of looping a
+    hardcoded enum that silently dropped them. Pass an explicit tuple
+    (e.g. ("MLB", "NBA")) to scope to a subset.
 
     Output shape is identical to NovigQueries.scrape_all_leagues (and
     ProphetX's all_markets_combined dump), so LiquidityWidget's loader
@@ -194,17 +188,29 @@ async def FetchAllLeaguesAsync(*,
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as session:
-        # Step 1: list events across all leagues (concurrent across leagues,
-        # 2 status filters each).
-        if progress:
-            print(f"[novig.async] listing events for {len(leagues)} leagues...")
-
-        list_tasks = []
-        for lg in leagues:
-            list_tasks.append(list_events_async(
-                session, lg, status_in=("OPEN_PREGAME",), limit=200))
-            list_tasks.append(list_events_async(
-                session, lg, status_in=("OPEN_INGAME",), limit=100))
+        # Step 1: list events. leagues=None → one no-filter pregame +
+        # one no-filter ingame call (bigger limits because the response
+        # spans every sport). Otherwise iterate the requested leagues,
+        # two status filters each.
+        if leagues is None:
+            if progress:
+                print("[novig.async] listing ALL leagues (one-shot)...")
+            list_tasks = [
+                list_events_async(session, None,
+                                  status_in=("OPEN_PREGAME",), limit=1000),
+                list_events_async(session, None,
+                                  status_in=("OPEN_INGAME",), limit=500),
+            ]
+        else:
+            if progress:
+                print(f"[novig.async] listing events for "
+                      f"{len(leagues)} leagues...")
+            list_tasks = []
+            for lg in leagues:
+                list_tasks.append(list_events_async(
+                    session, lg, status_in=("OPEN_PREGAME",), limit=200))
+                list_tasks.append(list_events_async(
+                    session, lg, status_in=("OPEN_INGAME",), limit=100))
         list_results = await asyncio.gather(*list_tasks, return_exceptions=True)
 
         events: list[dict] = []
@@ -229,8 +235,10 @@ async def FetchAllLeaguesAsync(*,
             print(f"[novig.async] {len(unique)} unique events "
                   f"(max_concurrent={max_concurrent})")
 
-        # Step 2: fetch markets for each event under semaphore.
-        async def fetch_with_sem(ev: dict) -> tuple[str, Optional[dict]]:
+        # Step 2: fetch markets for each event under semaphore. One listed
+        # event can expand into several matchable entries (tennis/golf
+        # tournament containers -> per-match children).
+        async def fetch_with_sem(ev: dict) -> list[tuple[str, dict]]:
             async with semaphore:
                 try:
                     node = await get_event_markets_async(
@@ -238,10 +246,10 @@ async def FetchAllLeaguesAsync(*,
                 except NovigError as e:
                     if progress:
                         print(f"  {ev.get('description')}: {e}")
-                    return ev["id"], None
+                    return []
                 if not node:
-                    return ev["id"], None
-                return ev["id"], _event_to_dump_entry(node)
+                    return []
+                return _event_to_dump_entries(node)
 
         tasks = [fetch_with_sem(ev) for ev in unique]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -253,15 +261,17 @@ async def FetchAllLeaguesAsync(*,
                 if progress:
                     print(f"  [{i}/{len(unique)}] exception: {res}")
                 continue
-            eid, entry = res
-            if entry is None:
+            if not res:
                 continue
-            dump[eid] = entry
-            ok += 1
+            for sub_id, entry in res:
+                dump[sub_id] = entry
+                ok += 1
             if progress:
-                n = len((entry.get("data") or {}).get("markets") or [])
-                name = entry["event_metadata"].get("name", "")[:30]
-                print(f"  [{i}/{len(unique)}] {name:30s} ({n} markets)")
+                head = res[0][1]
+                extra = f" +{len(res) - 1} more" if len(res) > 1 else ""
+                n = len((head.get("data") or {}).get("markets") or [])
+                name = head["event_metadata"].get("name", "")[:30]
+                print(f"  [{i}/{len(unique)}] {name:30s} ({n} markets){extra}")
 
     if progress:
         print(f"[novig.async] {ok}/{len(unique)} events scraped")
@@ -276,10 +286,22 @@ async def FetchAllLeaguesAsync(*,
 
 def _save_dump_sync(dump: dict, dump_dir: pathlib.Path,
                     progress: bool = True) -> None:
+    # Single overwritten file — we don't archive dump history. Writing a fresh
+    # timestamped file each scrape used to pile up (41 files / 805MB) and the
+    # glob+stat of all of them was a ~146ms main-thread stall. The "_latest"
+    # suffix keeps it matching the existing all_events_combined_*.json glob
+    # readers. Atomic temp+replace so a concurrent match-map read never sees a
+    # half-written file. ([PERF-DIAG])
     dump_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = dump_dir / f"all_events_combined_{ts}.json"
-    out.write_text(json.dumps(dump, indent=2, default=str))
+    out = dump_dir / "all_events_combined_latest.json"
+    tmp = dump_dir / "all_events_combined_latest.json.tmp"
+    tmp.write_text(json.dumps(dump, indent=2, default=str))
+    tmp.replace(out)
+    # Slim metadata-only companion for the startup match-map build (see
+    # write_events_index / NOVIG_EVENTS_INDEX_NAME in NovigClient).
+    write_events_index(dump, dump_dir)
+    # Per-event sidecars for the widget's lazy market hydration.
+    write_event_sidecars(dump, dump_dir)
     if progress:
         size_mb = out.stat().st_size / (1024 * 1024)
         print(f"[novig.async] wrote {out}  ({size_mb:.2f} MB)")
@@ -420,10 +442,19 @@ def get_cached_wallet_id() -> Optional[str]:
 
 
 def _novig_geo_token() -> Optional[str]:
-    """Pull the latest geolocation transaction id from Creds.py. Novig
-    rotates these via a third-party SDK on the site; there's no clean way
-    to refresh them headlessly, so the user grabs one from DevTools and
-    pastes it into Creds.NOVIG_GEO_TX_ID periodically."""
+    """Resolve the latest geolocationTransactionId. Lookup order:
+    NovigClient.geo_harvester's runtime cache (populated by the
+    Tampermonkey userscript via the local listener) →
+    Creds.NOVIG_GEO_TX_ID (one-time manual seed). Place-order on a
+    "Geolocation validation has expired" 400 triggers a background
+    refresh that repopulates the cache."""
+    try:
+        from NovigClient import geo_harvester
+        v = geo_harvester.get_cached_geo_tx()
+        if v:
+            return v
+    except ImportError:
+        pass
     try:
         from Creds import NOVIG_GEO_TX_ID as _g
         return _g or None
@@ -493,17 +524,51 @@ async def place_order_async(session: aiohttp.ClientSession,
         "type": "PLACE",
         "walletId": wid,
     }
-    try:
-        async with session.post(url, json=payload, headers=_headers(),
-                                timeout=REQUEST_TIMEOUT) as r:
-            text = await r.text()
-            if r.status not in (200, 201):
+    # Single retry on geo-expired 400: drive a headless Selenium refresh
+    # (snapshot Firefox places a COIN bet, which mints a fresh PREWAGER
+    # geolocationTransactionId; the injected harvester captures it off the
+    # outbound /orders body and POSTs it to the local listener), rebuild
+    # the payload with the new value, and re-fire. Limit to one retry so a
+    # persistent failure surfaces to the caller instead of looping.
+    for attempt in (0, 1):
+        try:
+            async with session.post(url, json=payload, headers=_headers(),
+                                    timeout=REQUEST_TIMEOUT) as r:
+                text = await r.text()
+                if r.status in (200, 201):
+                    body = json.loads(text) if text else {}
+                    _harvest_wallet_id(body)
+                    return body
+                if (attempt == 0 and r.status == 400
+                        and "Geolocation validation has expired" in text):
+                    try:
+                        from NovigClient import geo_harvester
+                    except ImportError:
+                        raise NovigError(
+                            f"NBX orders HTTP {r.status}: {text[:500]}")
+                    # refresh_geo_tx drives the browser itself, so it
+                    # works even when novig.com isn't open in the user's
+                    # real Firefox (unlike force_refresh_geo_async, which
+                    # only passively waits for an external POST).
+                    # place_bet=False: harvest the geo_tx at the geolocation
+                    # step WITHOUT placing a COIN bet, so the token stays
+                    # unconsumed and this retry can actually spend it.
+                    ok = await geo_harvester.refresh_geo_tx(
+                        headless=True, timeout_s=30.0, place_bet=False)
+                    if not ok:
+                        raise NovigError(
+                            "geo refresh failed — run "
+                            "`python NovigClient.py --refresh-geo` "
+                            "to bootstrap a fresh token")
+                    fresh = _novig_geo_token()
+                    if not fresh:
+                        raise NovigError("geo refresh harvested nothing")
+                    payload["geolocationTransactionId"] = fresh
+                    continue
                 raise NovigError(f"NBX orders HTTP {r.status}: {text[:500]}")
-            body = json.loads(text) if text else {}
-    except aiohttp.ClientError as e:
-        raise NovigError(f"transport: {e}")
-    _harvest_wallet_id(body)
-    return body
+        except aiohttp.ClientError as e:
+            raise NovigError(f"transport: {e}")
+    raise NovigError("unreachable: place_order_async retry loop exited")
 
 
 def stake_to_qty_centi(stake_usd: float, price: float) -> int:

@@ -17,6 +17,7 @@ markets) will be added on top.
 """
 
 import asyncio
+import base64
 import json
 import os
 import pathlib
@@ -114,9 +115,76 @@ class NovigError(RuntimeError):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Auth token (Auth0 access token)
+# ---------------------------------------------------------------------------
+# NOVIG_AUTH_TOKEN (Creds.py) is an Auth0 RS256 access token, ~30-day TTL.
+# There is NO browserless way to refresh it (investigated 2026-06-26): Novig's
+# web SPA isn't issued a refresh token (the authorization_code exchange returns
+# only access_token + id_token), and Auth0 enforces MFA on silent re-auth
+# (/authorize?prompt=none -> "Multifactor authentication required"). So renewal
+# is a manual ~monthly paste: novig.com -> DevTools -> Network filter "token"
+# -> the auth.novig.us/oauth/token response -> copy `access_token` -> paste
+# into NOVIG_AUTH_TOKEN. get_novig_token() decodes the expiry so a lapsed token
+# fails LOUD with a clear "re-paste it" message, instead of silently 401ing
+# every call and leaving the LiquidityWidget serving a stale dump (daily slates
+# like MLB then vanish while multi-day events mask the failure).
+
+def _novig_token_exp(token: str) -> Optional[float]:
+    """Decode a JWT's exp claim (no signature check). None if unparseable."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(part)).get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
+# Decoded once at import — the token doesn't change within a process (a re-paste
+# needs a restart to reload Creds anyway), so per-request header builds don't
+# re-decode the JWT.
+_NOVIG_TOKEN_EXP = _novig_token_exp(NOVIG_AUTH_TOKEN) if NOVIG_AUTH_TOKEN else None
+
+
+def novig_token_status() -> dict:
+    """Snapshot of NOVIG_AUTH_TOKEN's validity — powers the widget's loud
+    'token expired, re-paste it' message. Keys: has_token, expired, exp_epoch,
+    exp_iso, seconds_left."""
+    now = time.time()
+    exp = _NOVIG_TOKEN_EXP
+    return {
+        "has_token": bool(NOVIG_AUTH_TOKEN),
+        "expired": (exp is not None and exp <= now),
+        "exp_epoch": exp,
+        "exp_iso": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp))
+                    if exp else None),
+        "seconds_left": (exp - now) if exp else None,
+    }
+
+
+def get_novig_token() -> str:
+    """Return the configured Novig access token, or raise NovigError with an
+    actionable message if it's missing or expired — so expired auth surfaces
+    loudly rather than degrading to a silent stale-data fallback."""
+    if not NOVIG_AUTH_TOKEN:
+        raise NovigError(
+            "No Novig bearer token. Set NOVIG_AUTH_TOKEN in Creds.py.")
+    if _NOVIG_TOKEN_EXP is not None and _NOVIG_TOKEN_EXP <= time.time():
+        raise NovigError(
+            "Novig access token EXPIRED at "
+            f"{datetime.fromtimestamp(_NOVIG_TOKEN_EXP):%Y-%m-%d %H:%M}. Paste "
+            "a fresh one into NOVIG_AUTH_TOKEN in Creds.py (novig.com -> "
+            "DevTools -> Network filter 'token' -> the auth.novig.us/oauth/"
+            "token response -> copy access_token).")
+    return NOVIG_AUTH_TOKEN
+
+
 class NovigClient:
     def __init__(self, bearer: Optional[str] = None, timeout: float = 30.0):
-        token = bearer or NOVIG_AUTH_TOKEN
+        # Validate via get_novig_token() so an expired token fails loud here
+        # instead of 401ing every call. An explicit bearer= overrides (tests).
+        token = bearer or get_novig_token()
         if not token:
             raise NovigError(
                 "No Novig bearer token. Set NOVIG_AUTH_TOKEN in Creds.py or "
@@ -441,77 +509,751 @@ def summarize_book(book_entry: dict) -> dict:
 # ---------------------------------------------------------------------------
 # High-level query helpers
 # ---------------------------------------------------------------------------
-# Field selections are built against the introspected schema (see
-# novig_schema.json). Tables we use:
-#   event   — wagerable container (game, period, prop bucket); forms a tree
-#             via parent_event / events[]
-#   market  — SPREAD/TOTAL/MONEY/CUSTOM; carries strike, is_consensus, volume
-#   outcome — order-book side; last (price), available (size), altLast/altAvailable
-#   game    — live state (scores, situation) attached to top-level event
+# Novig's Hasura endpoint enforces a query ALLOW-LIST (since ~Sept 2026):
+# any document that isn't one novig.com itself sends is rejected with
+# "query is not allowed" / validation-failed -- regardless of auth. Comparison
+# is on the parsed document, so whitespace is free but every field, alias,
+# argument and fragment must match. So we can't hand-build selections any
+# more; we send the web app's own documents verbatim and only vary the
+# VARIABLES (which aren't checked -- where-clauses are free-form).
 #
-# Filter shape replicates the captured EventMarkets_Query:
+# Source: the graphql-codegen *_QueryDocument ASTs compiled into novig.com's
+# /_expo/static/js/web/index-<hash>.js, printed with graphql-js print().
+# When Novig ships a new bundle and these start failing again, re-extract:
+# fetch index.html -> the index-*.js bundle -> eval each
+# X={kind:"Document",...} literal exported as <Name>_QueryDocument ->
+# graphql.print(). Both docs are fragment-complete (fragments inlined).
+#
+# Tables: event (Game / Future / Tournament; tournaments parent per-match
+# child events one level deep -- no grandchildren, games have no children),
+# market (strike, is_consensus, volume), outcome (available = price,
+# altAvailable), game (live state). The site docs carry no outcome last
+# price and no flat competitorId/playerId -- _nv_normalize_* derive the
+# latter from the nested competitor/player objects.
+#
+# Market filter for only_available mirrors the site's marketVisibleWhere:
 #   status = "OPEN" AND (is_consensus = true OR outcomes.available IS NOT NULL)
-# i.e. consensus aggregate OR a real orderbook side with liquidity.
 
+# Event listing. Variables: where_event, order_by_event, limit_count (Int!).
+_NV_HOME_QUERY = """
+query Home_Query($order_by_event: [event_order_by!], $where_event: event_bool_exp, $limit_count: Int!) @cached(ttl: 5) {
+  event(where: $where_event, order_by: $order_by_event, limit: $limit_count) {
+    id
+    type
+    description
+    status
+    league
+    scheduled_start
+    parent_event {
+      id
+      description
+    }
+    game {
+      id
+      home_rotation_number
+      away_rotation_number
+      homeTeam {
+        ranking
+      }
+      awayTeam {
+        ranking
+      }
+    }
+    market_volume_aggregate: markets_aggregate {
+      aggregate {
+        sum {
+          volume
+        }
+      }
+    }
+    future_markets: markets(distinct_on: type) {
+      id
+      type
+    }
+    winner_markets: markets(
+      where: {type: {_eq: "WINNER"}, is_consensus: {_eq: true}, status: {_eq: "OPEN"}}
+      order_by: [{volume: desc_nulls_last}]
+    ) {
+      id
+      ...MarketData_Frag
+      outcomes {
+        ...Outcome_Frag
+      }
+    }
+    active_event_locks: event_locks(where: {deleted_at: {_is_null: true}}) {
+      id
+      event_id
+      minute_duration
+      created_at
+    }
+    ...EventData_Frag
+    ...CustomEvent_Frag
+    ...GameEvent_Frag
+  }
+}
 
-_EVENT_FIELDS = """
+fragment BaseEvent_Frag on event {
   id
+  status
   type
+  description
   league
-  status
-  description
   scheduled_start
-  is_visible_pregame
-  is_visible_live
-  is_status_locked
-  parent_event_id
-  game_id
-"""
+  event_locks(order_by: {created_at: desc}, where: {deleted_at: {_is_null: true}}) {
+    id
+    event_id
+    minute_duration
+    created_at
+  }
+}
 
-_GAME_FIELDS = """
-  id
-  league
-  sport
-  status
-  scheduled_start
-  period
-  time_remaining
-  home_score
-  away_score
-  homeTeam { id name symbol primary_color }
-  awayTeam { id name symbol primary_color }
-"""
-
-_OUTCOME_FIELDS = """
-  id
-  description
-  type
-  index
-  status
-  last
-  available
-  altLast
-  altAvailable
-  competitorId
-  competitor { id name symbol }
-"""
-
-_MARKET_FIELDS = f"""
+fragment MarketData_Frag on market {
   id
   type
-  status
-  description
   strike
-  is_consensus
-  volume
+  status
+  re_settled_at
+  competitor {
+    id
+    name
+    country
+  }
+  market_locks(
+    order_by: {created_at: desc}
+    where: {deleted_at: {_is_null: true}}
+  ) {
+    id
+    market_id
+    created_at
+    minute_duration
+  }
+  player {
+    id
+    full_name
+  }
+}
+
+fragment Outcome_Frag on outcome {
+  id
+  available
+  altAvailable
+  index
+  description
+  competitor {
+    id
+    symbol
+  }
+}
+
+fragment MarketPills_Market_Frag on market {
+  ...MarketData_Frag
+  outcomes {
+    ...Outcome_Frag
+  }
+}
+
+fragment EventData_Frag on event {
+  id
+  type
+  status
+  scheduled_start
   league
-  competitorId
-  playerId
-  competitor {{ id name symbol }}
-  player {{ id }}
-  market_detail {{ question }}
-  outcomes {{ {_OUTCOME_FIELDS} }}
+  game {
+    id
+    league
+    sport
+    scheduled_start
+    period
+    time_remaining
+    home_score
+    away_score
+    awayTeam {
+      id
+      name
+      symbol
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      wins
+      losses
+      draws
+      country
+    }
+    homeTeam {
+      id
+      name
+      symbol
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      wins
+      losses
+      draws
+      country
+    }
+  }
+}
+
+fragment CustomEvent_Frag on event {
+  ...BaseEvent_Frag
+  custom_event_markets_aggregate: markets_aggregate(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+  ) {
+    aggregate {
+      count
+    }
+  }
+  custom_event_volume_aggregate: markets_aggregate(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+  ) {
+    aggregate {
+      sum {
+        volume
+      }
+    }
+  }
+  custom_event_markets: markets(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+    order_by: {volume: desc}
+  ) {
+    ...MarketData_Frag
+    description
+    volume
+    market_detail {
+      question
+    }
+    outcomes {
+      ...Outcome_Frag
+    }
+  }
+}
+
+fragment GameEvent_Frag on event {
+  ...BaseEvent_Frag
+  game {
+    id
+    sport
+    period
+    time_remaining
+    home_score
+    away_score
+    down
+    distance
+    yardLine
+    yardline_territory
+    awayTeam {
+      id
+      symbol
+      name
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      ranking
+      wins
+      losses
+      draws
+      country
+    }
+    homeTeam {
+      id
+      symbol
+      name
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      ranking
+      wins
+      losses
+      draws
+      country
+    }
+  }
+  markets_aggregate(
+    where: {is_consensus: {_eq: true}, type: {_nin: ["MONEY", "SPREAD", "TOTAL", "FIRST_ROUND_MONEYLINE", "SECOND_ROUND_MONEYLINE", "THIRD_ROUND_MONEYLINE", "FOURTH_ROUND_MONEYLINE"]}}
+  ) {
+    aggregate {
+      count
+    }
+  }
+  total_volume_aggregate: markets_aggregate {
+    aggregate {
+      sum {
+        volume
+      }
+    }
+  }
+  markets(
+    where: {is_consensus: {_eq: true}, type: {_in: ["MONEY", "SPREAD", "TOTAL", "FIRST_ROUND_MONEYLINE", "SECOND_ROUND_MONEYLINE", "THIRD_ROUND_MONEYLINE", "FOURTH_ROUND_MONEYLINE"]}}
+  ) {
+    ...MarketPills_Market_Frag
+  }
+}
 """
+
+# One event + all its markets. Variables: eventId, marketVisibleWhere.
+_NV_EVENT_MARKETS_QUERY = """
+query EventMarkets_Query($eventId: uuid, $marketVisibleWhere: market_bool_exp) @cached(ttl: 5) {
+  event(where: {id: {_eq: $eventId}}) {
+    ...MarketSelector_Frag
+    ...EventData_Frag
+    ...EventScoreboard_Frag
+    ...CustomEvent_Frag
+    id
+    description
+    type
+    league
+    scheduled_start
+    status
+    tournament_markets: markets {
+      type
+    }
+    game {
+      id
+      awayTeam {
+        id
+        name
+        symbol
+        primary_color
+        secondary_color
+        swish_id
+        optic_odds_id
+      }
+      homeTeam {
+        id
+        name
+        symbol
+        primary_color
+        secondary_color
+        swish_id
+        optic_odds_id
+      }
+      end_date
+      away_score
+      home_score
+      time_remaining
+      sport
+    }
+  }
+}
+
+fragment MarketData_Frag on market {
+  id
+  type
+  strike
+  status
+  re_settled_at
+  competitor {
+    id
+    name
+    country
+  }
+  market_locks(
+    order_by: {created_at: desc}
+    where: {deleted_at: {_is_null: true}}
+  ) {
+    id
+    market_id
+    created_at
+    minute_duration
+  }
+  player {
+    id
+    full_name
+  }
+}
+
+fragment Outcome_Frag on outcome {
+  id
+  available
+  altAvailable
+  index
+  description
+  competitor {
+    id
+    symbol
+  }
+}
+
+fragment StrikePriceSelector_Frag on market {
+  id
+  description
+  eventId
+  strike
+  ...MarketData_Frag
+  outcomes {
+    id
+    index
+    description
+    ...Outcome_Frag
+  }
+}
+
+fragment TennisScoreboard_Frag on game {
+  events {
+    id
+    status
+  }
+  home_set_1
+  home_set_2
+  home_set_3
+  home_set_4
+  home_set_5
+  away_set_1
+  away_set_2
+  away_set_3
+  away_set_4
+  away_set_5
+  possession
+  home_game_score
+  away_game_score
+  homeTeam {
+    id
+    name
+  }
+  awayTeam {
+    id
+    name
+  }
+}
+
+fragment BaseEvent_Frag on event {
+  id
+  status
+  type
+  description
+  league
+  scheduled_start
+  event_locks(order_by: {created_at: desc}, where: {deleted_at: {_is_null: true}}) {
+    id
+    event_id
+    minute_duration
+    created_at
+  }
+}
+
+fragment MarketSelector_Frag on event {
+  id
+  type
+  league
+  markets(where: $marketVisibleWhere) {
+    is_consensus
+    id
+    strike
+    type
+    description
+    status
+    volume
+    market_detail {
+      question
+    }
+    ...MarketData_Frag
+    ...StrikePriceSelector_Frag
+    outcomes {
+      id
+      index
+      description
+      available
+      ...Outcome_Frag
+    }
+    market_locks(
+      order_by: {created_at: desc}
+      where: {deleted_at: {_is_null: true}}
+    ) {
+      id
+      market_id
+      minute_duration
+      created_at
+    }
+    player {
+      id
+      full_name
+      logo
+      jersey_number
+      player_competitors {
+        competitor {
+          id
+          name
+          short_name
+          symbol
+          swish_id
+          optic_odds_id
+          primary_color
+          secondary_color
+          country
+        }
+      }
+    }
+    competitor {
+      id
+      name
+      short_name
+      symbol
+      swish_id
+      optic_odds_id
+      primary_color
+      secondary_color
+      country
+    }
+  }
+  event_locks(order_by: {created_at: desc}, where: {deleted_at: {_is_null: true}}) {
+    id
+    event_id
+    minute_duration
+    created_at
+  }
+}
+
+fragment EventData_Frag on event {
+  id
+  type
+  status
+  scheduled_start
+  league
+  game {
+    id
+    league
+    sport
+    scheduled_start
+    period
+    time_remaining
+    home_score
+    away_score
+    awayTeam {
+      id
+      name
+      symbol
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      wins
+      losses
+      draws
+      country
+    }
+    homeTeam {
+      id
+      name
+      symbol
+      short_name
+      mascot
+      primary_color
+      secondary_color
+      swish_id
+      optic_odds_id
+      wins
+      losses
+      draws
+      country
+    }
+  }
+}
+
+fragment EventScoreboard_Frag on event {
+  id
+  type
+  status
+  description
+  league
+  scheduled_start
+  game {
+    id
+    ...TennisScoreboard_Frag
+    status
+    home_score
+    away_score
+    period
+    time_remaining
+    down
+    distance
+    yardLine
+    yardline_territory
+    league
+    sport
+    homeTeam {
+      id
+      name
+      short_name
+      mascot
+      symbol
+      primary_color
+      secondary_color
+      wins
+      losses
+      draws
+      swish_id
+      optic_odds_id
+      ranking
+      country
+    }
+    awayTeam {
+      id
+      name
+      short_name
+      mascot
+      symbol
+      primary_color
+      secondary_color
+      wins
+      losses
+      draws
+      swish_id
+      optic_odds_id
+      ranking
+      country
+    }
+  }
+  parent_event {
+    id
+    description
+  }
+  scoreboard_markets: markets(where: {type: {_eq: "MONEY"}}, limit: 1) {
+    id
+    type
+    outcomes {
+      id
+      index
+      status
+    }
+  }
+  custom_markets: markets(where: {type: {_eq: "CUSTOM"}}, limit: 1) {
+    id
+    type
+  }
+}
+
+fragment CustomEvent_Frag on event {
+  ...BaseEvent_Frag
+  custom_event_markets_aggregate: markets_aggregate(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+  ) {
+    aggregate {
+      count
+    }
+  }
+  custom_event_volume_aggregate: markets_aggregate(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+  ) {
+    aggregate {
+      sum {
+        volume
+      }
+    }
+  }
+  custom_event_markets: markets(
+    where: {type: {_eq: "CUSTOM"}, status: {_eq: "OPEN"}}
+    order_by: {volume: desc}
+  ) {
+    ...MarketData_Frag
+    description
+    volume
+    market_detail {
+      question
+    }
+    outcomes {
+      ...Outcome_Frag
+    }
+  }
+}
+"""
+
+# Child-event statuses worth fetching. _event_to_dump_entries drops finished
+# children anyway; filtering server-side saves an EventMarkets call for each
+# of the (often 100+) completed matches a tennis/golf container still parents.
+_NV_DEAD_STATUSES = ["FINAL", "CANCELED", "CANCELLED"]
+
+
+def _nv_list_where(league: Optional[str], status_in: tuple[str, ...],
+                   visible_only: bool) -> dict:
+    """where_event for a top-level listing (Home_Query)."""
+    where: dict = {
+        "status": {"_in": list(status_in)},
+        "parent_event_id": {"_is_null": True},  # top-level only
+    }
+    if league is not None:
+        where["league"] = {"_eq": league}
+    if visible_only:
+        # PREGAME events use is_visible_pregame; INGAME use is_visible_live.
+        where["_or"] = [
+            {"is_visible_pregame": {"_eq": True}},
+            {"is_visible_live": {"_eq": True}},
+        ]
+    return where
+
+
+def _nv_children_where(parent_id: str) -> dict:
+    """where_event for a tournament container's live child matches."""
+    return {"parent_event_id": {"_eq": parent_id},
+            "status": {"_nin": _NV_DEAD_STATUSES}}
+
+
+def _nv_market_where(only_available: bool) -> dict:
+    """marketVisibleWhere: the site's consensus-OR-has-liquidity filter, or
+    no filter at all."""
+    if not only_available:
+        return {}
+    return {
+        "_and": [
+            {"status": {"_eq": "OPEN"}},
+            {"_or": [
+                {"is_consensus": {"_eq": True}},
+                {"outcomes": {"available": {"_is_null": False}}},
+            ]},
+        ],
+    }
+
+
+def _nv_normalize_market(m: dict, league: Optional[str]) -> dict:
+    """Restore the flat ids the old hand-built selection carried (the
+    allow-listed docs only have nested competitor/player objects)."""
+    m = dict(m)
+    m["competitorId"] = (m.get("competitor") or {}).get("id")
+    m["playerId"] = (m.get("player") or {}).get("id")
+    m.setdefault("league", league)
+    outs = []
+    for o in m.get("outcomes") or []:
+        o = dict(o)
+        o["competitorId"] = (o.get("competitor") or {}).get("id")
+        outs.append(o)
+    m["outcomes"] = outs
+    return m
+
+
+def _nv_normalize_listing_event(node: dict) -> dict:
+    """Shape a Home_Query row like the old listing node: no market subtree
+    (markets are hydrated lazily, and Home_Query's `markets` is only the
+    consensus pills) and a markets_aggregate carrying sum(volume), which
+    _event_to_dump_entry falls back to for the event's stake."""
+    node = dict(node)
+    node["parent_event_id"] = (node.get("parent_event") or {}).get("id")
+    node["game_id"] = (node.get("game") or {}).get("id")
+    node.pop("markets", None)
+    node["markets_aggregate"] = node.get("market_volume_aggregate") or {}
+    return node
+
+
+def _nv_normalize_market_event(node: dict) -> dict:
+    """Shape an EventMarkets_Query row like the old get_event_markets node."""
+    node = dict(node)
+    node["parent_event_id"] = (node.get("parent_event") or {}).get("id")
+    node["game_id"] = (node.get("game") or {}).get("id")
+    node["markets"] = [_nv_normalize_market(m, node.get("league"))
+                       for m in node.get("markets") or []]
+    return node
 
 
 # ============================================================================
@@ -558,19 +1300,22 @@ query ActivePortfolioOrders_Query($trader_id: uuid!, $item_sort: jsonb!,
 }
 """.strip()
 
-_NV_REQUEST_HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {NOVIG_AUTH_TOKEN}",
-    "Origin": "https://novig.com",
-    "Referer": "https://novig.com/",
-}
+def _nv_request_headers() -> dict:
+    # get_novig_token() raises NovigError if the token is missing/expired, so
+    # the async path fails loud too rather than firing a doomed 401.
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {get_novig_token()}",
+        "Origin": "https://novig.com",
+        "Referer": "https://novig.com/",
+    }
 
 
 async def _nv_post_gql_async(session, operation_name: str,
                              query: str, variables: dict) -> dict:
     payload = {"operationName": operation_name,
                "query": query, "variables": variables}
-    async with session.post(NOVIG_GRAPHQL_URL, headers=_NV_REQUEST_HEADERS,
+    async with session.post(NOVIG_GRAPHQL_URL, headers=_nv_request_headers(),
                             data=json.dumps(payload)) as r:
         r.raise_for_status()
         return await r.json()
@@ -674,84 +1419,54 @@ class NovigQueries:
         by scrape_all_leagues to avoid maintaining a hard-coded enum
         of Novig's league codes and silently dropping tennis/UFC/PGA/
         most soccer comps the way the old per-league loop did)."""
-        where: dict = {
-            "status": {"_in": list(status_in)},
-            "parent_event_id": {"_is_null": True},  # top-level only
-        }
-        if league is not None:
-            where["league"] = {"_eq": league}
-        if visible_only:
-            # PREGAME events use is_visible_pregame; INGAME use is_visible_live.
-            where["_or"] = [
-                {"is_visible_pregame": {"_eq": True}},
-                {"is_visible_live": {"_eq": True}},
-            ]
-        query = f"""
-        query ListEvents($where: event_bool_exp!, $limit: Int!) {{
-          event(where: $where, limit: $limit, order_by: {{scheduled_start: asc}}) {{
-            {_EVENT_FIELDS}
-            game {{ {_GAME_FIELDS} }}
-            markets_aggregate {{ aggregate {{ sum {{ volume }} }} }}
-          }}
-        }}
-        """
-        data = self.client.gql(query, {"where": where, "limit": limit},
-                               operation_name="ListEvents")
-        return data.get("event", [])
+        data = self.client.gql(
+            _NV_HOME_QUERY,
+            {"where_event": _nv_list_where(league, status_in, visible_only),
+             "order_by_event": [{"scheduled_start": "asc"}],
+             "limit_count": limit},
+            operation_name="Home_Query")
+        return [_nv_normalize_listing_event(e) for e in data.get("event", [])]
+
+    def _event_node(self, event_id: str,
+                    market_where: dict) -> Optional[dict]:
+        data = self.client.gql(
+            _NV_EVENT_MARKETS_QUERY,
+            {"eventId": event_id, "marketVisibleWhere": market_where},
+            operation_name="EventMarkets_Query")
+        events = data.get("event", [])
+        return _nv_normalize_market_event(events[0]) if events else None
 
     def get_event_markets(self, event_id: str,
                           only_available: bool = True,
                           tree_depth: int = 3) -> Optional[dict]:
-        """Fetch one event with its markets + outcomes, recursively walking
-        sub-events to tree_depth levels. Mirrors EventMarkets_Query but
-        extended to include child events (periods, props, etc.).
+        """Fetch one event with its markets + outcomes. A tournament
+        container also gets its live child matches attached as `events[]`
+        (each with its own markets) when tree_depth > 0 -- that's the only
+        nesting Novig has, one level deep.
 
-        only_available=True applies the captured filter: status=OPEN AND
+        The allow-listed EventMarkets_Query covers a single event, so this
+        is 1 call for a game and 2 + N for a tournament with N live matches.
+
+        only_available=True applies the site's filter: status=OPEN AND
         (is_consensus OR has an outcome with non-null available liquidity).
         """
-        if only_available:
-            market_where = {
-                "_and": [
-                    {"status": {"_eq": "OPEN"}},
-                    {"_or": [
-                        {"is_consensus": {"_eq": True}},
-                        {"outcomes": {"available": {"_is_null": False}}},
-                    ]},
-                ],
-            }
-        else:
-            market_where = {}
-
-        # Build nested events { markets, events { markets, ... } } selection
-        # to the requested depth. Markets at each level use the same filter.
-        def _nested(depth: int) -> str:
-            if depth <= 0:
-                return ""
-            return f"""
-            events {{
-              {_EVENT_FIELDS}
-              markets(where: $where) {{ {_MARKET_FIELDS} }}
-              {_nested(depth - 1)}
-            }}
-            """
-
-        query = f"""
-        query EventMarkets($eventId: uuid!, $where: market_bool_exp!) {{
-          event(where: {{id: {{_eq: $eventId}}}}) {{
-            {_EVENT_FIELDS}
-            game {{ {_GAME_FIELDS} }}
-            markets(where: $where) {{ {_MARKET_FIELDS} }}
-            {_nested(tree_depth)}
-          }}
-        }}
-        """
+        market_where = _nv_market_where(only_available)
+        node = self._event_node(event_id, market_where)
+        if node is None or tree_depth <= 0 or node.get("type") != "Tournament":
+            return node
         data = self.client.gql(
-            query,
-            {"eventId": event_id, "where": market_where},
-            operation_name="EventMarkets",
-        )
-        events = data.get("event", [])
-        return events[0] if events else None
+            _NV_HOME_QUERY,
+            {"where_event": _nv_children_where(event_id),
+             "order_by_event": [{"scheduled_start": "asc"}],
+             "limit_count": 1000},
+            operation_name="Home_Query")
+        children = []
+        for child in data.get("event", []):
+            c = self._event_node(child["id"], market_where)
+            if c is not None:
+                children.append(c)
+        node["events"] = children
+        return node
 
     @staticmethod
     def flatten_markets(event_node: dict) -> list[dict]:

@@ -110,7 +110,7 @@ class BrowserPanel(QWidget):
         self.layout.addWidget(self.web_view, 1)
 
         # Set initial URL
-        self.initial_url = "https://the.streameast.app"
+        self.initial_url = "https://thestreameast.top"
         self.web_view.load(QUrl(self.initial_url))
         self.url_input.setText(self.initial_url)
 
@@ -140,19 +140,26 @@ class BrowserPanel(QWidget):
         """Inject JavaScript to isolate and maximize the video element"""
         js_code = """
         (function() {
-            // Store original styles if not already stored
-            if (!window.originalPageStyles) {
+            try {
+                // Store original styles if not already stored
+                if (!window.originalPageStyles) {
                 window.originalPageStyles = {
                     bodyStyle: document.body.style.cssText,
                     htmlStyle: document.documentElement.style.cssText,
-                    hiddenElements: []
+                    // list of {el, style} for every element we touch, so restore is exact
+                    modified: []
                 };
             }
-            
+
+            // Helper: remember an element's inline style before we change it
+            function remember(el) {
+                window.originalPageStyles.modified.push({ el: el, style: el.getAttribute('style') });
+            }
+
             // Find all video elements
             const videos = document.querySelectorAll('video');
             let targetVideo = null;
-            
+
             // Find the largest or most likely main video
             if (videos.length > 0) {
                 targetVideo = Array.from(videos).reduce((prev, current) => {
@@ -161,13 +168,13 @@ class BrowserPanel(QWidget):
                     return currentArea > prevArea ? current : prev;
                 });
             }
-            
+
             // If no video found, try to find iframe players
             if (!targetVideo) {
                 const iframes = document.querySelectorAll('iframe');
                 for (let iframe of iframes) {
-                    if (iframe.src.includes('youtube') || 
-                        iframe.src.includes('twitch') || 
+                    if (iframe.src.includes('youtube') ||
+                        iframe.src.includes('twitch') ||
                         iframe.src.includes('player') ||
                         iframe.offsetWidth > 400) {
                         targetVideo = iframe;
@@ -175,7 +182,7 @@ class BrowserPanel(QWidget):
                     }
                 }
             }
-            
+
             // If still no video, try to find video containers
             if (!targetVideo) {
                 const selectors = [
@@ -184,7 +191,7 @@ class BrowserPanel(QWidget):
                     '[class*="stream"]', '[id*="stream"]',
                     '.jwplayer', '.video-js', '.vjs-tech'
                 ];
-                
+
                 for (let selector of selectors) {
                     const elements = document.querySelectorAll(selector);
                     if (elements.length > 0) {
@@ -193,53 +200,150 @@ class BrowserPanel(QWidget):
                     }
                 }
             }
-            
+
             if (targetVideo) {
-                // Hide all other elements
-                const allElements = document.querySelectorAll('*');
-                allElements.forEach(el => {
-                    if (!targetVideo.contains(el) && !el.contains(targetVideo)) {
-                        if (el.style.display !== 'none') {
-                            window.originalPageStyles.hiddenElements.push({
-                                element: el,
-                                originalDisplay: el.style.display
-                            });
-                            el.style.display = 'none';
+                // Figure out the ACTUAL media element to display. targetVideo may be a real
+                // <video>/<iframe>, or it may be a container div (the selector fallback). If
+                // it's a container, dig out the largest media descendant inside it -- that's
+                // what the user is actually watching.
+                let media = targetVideo;
+                const ttag = targetVideo.tagName;
+                if (ttag !== 'VIDEO' && ttag !== 'IFRAME' && ttag !== 'CANVAS') {
+                    const inner = targetVideo.querySelectorAll('video, canvas, iframe');
+                    if (inner.length > 0) {
+                        media = Array.from(inner).reduce((p, c) =>
+                            (c.offsetWidth * c.offsetHeight) > (p.offsetWidth * p.offsetHeight) ? c : p);
+                    }
+                }
+
+                // The element we pin fullscreen. If we found a real media element, pin IT
+                // directly (simplest, most reliable). Only fall back to the container when no
+                // media descendant exists.
+                const pinned = (media && media !== targetVideo) ? media : targetVideo;
+
+                // THE GOTCHA: position:fixed is relative to the nearest ancestor that has a
+                // transform / filter / perspective / will-change (any of these creates a
+                // "containing block"). On StreamEast a player wrapper has a transform, so a
+                // naive fixed element ends up relative to that wrapper -> "slight zoom" instead
+                // of true fullscreen. So we must neutralize those properties on EVERY ancestor.
+                let ancestor = pinned.parentElement;
+                while (ancestor && ancestor !== document.documentElement) {
+                    const cs = window.getComputedStyle(ancestor);
+                    const needsFix = (cs.transform !== 'none') ||
+                                     (cs.filter !== 'none') ||
+                                     (cs.perspective !== 'none') ||
+                                     (cs.willChange !== 'auto') ||
+                                     (cs.contain !== 'none') ||
+                                     (cs.overflow !== 'visible');
+                    if (needsFix) {
+                        remember(ancestor);
+                        ancestor.style.setProperty('transform', 'none', 'important');
+                        ancestor.style.setProperty('filter', 'none', 'important');
+                        ancestor.style.setProperty('perspective', 'none', 'important');
+                        ancestor.style.setProperty('will-change', 'auto', 'important');
+                        ancestor.style.setProperty('contain', 'none', 'important');
+                        ancestor.style.setProperty('overflow', 'visible', 'important');
+                    }
+                    ancestor = ancestor.parentElement;
+                }
+
+                // Pin the chosen element fullscreen. object-fit: cover fills the whole panel
+                // (cropping the overflowing edges) instead of letterboxing with black bars.
+                remember(pinned);
+                const baseFixed = 'position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; min-width: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; transform: none !important; z-index: 2147483647 !important; background: #000 !important; border: none !important;';
+                if (pinned.tagName === 'VIDEO' || pinned.tagName === 'CANVAS') {
+                    // For a real media element object-fit: cover crops to fill the panel.
+                    pinned.style.cssText = baseFixed + ' object-fit: cover !important;';
+                } else if (pinned.tagName === 'IFRAME') {
+                    // Cross-origin iframe: we can't touch the inner video, and object-fit does
+                    // nothing on an iframe. The inner player letterboxes its 16:9 video into
+                    // whatever box we give the iframe -> black bars. So instead we size the
+                    // IFRAME ITSELF to a 16:9 box scaled to COVER the viewport, centered. The
+                    // viewport clips the overflow; the inner 16:9 video now matches the iframe's
+                    // 16:9 box and fills it with no internal bars.
+                    //
+                    // Expressed in pure CSS (vw/vh + max()) so it RECOMPUTES automatically on
+                    // every panel resize / monitor move -- no stale pixel math, fully
+                    // resolution-independent (1920x1080, 2560x1080 ultrawide, HiDPI, etc.):
+                    //   16:9 cover  ->  width  = max(100vw, (16/9)*100vh) = max(100vw, 177.78vh)
+                    //                   height = max(100vh, (9/16)*100vw) = max(100vh, 56.25vw)
+                    // Centered via top/left 50% + translate(-50%,-50%) (ancestor transforms
+                    // were already neutralized above, so this transform is viewport-relative).
+                    pinned.style.cssText = 'position: fixed !important; top: 50% !important; left: 50% !important; width: max(100vw, 177.78vh) !important; height: max(100vh, 56.25vw) !important; max-width: none !important; max-height: none !important; min-width: 0 !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; transform: translate(-50%, -50%) !important; border: none !important; z-index: 2147483647 !important; background: #000 !important;';
+                } else {
+                    // container fallback
+                    pinned.style.cssText = baseFixed;
+                }
+
+                // If we had to pin a CONTAINER (no reachable media element, e.g. cross-origin
+                // iframe nested oddly), also force every wrapper from the container down to the
+                // media to fill 100%, so the inner media stretches to the panel instead of
+                // keeping its native 16:9 box (the black-bar-half-fill bug).
+                if (pinned === targetVideo && media && media !== targetVideo) {
+                    let node = media.parentElement;
+                    while (node && node !== targetVideo) {
+                        remember(node);
+                        node.style.cssText = 'display: block !important; width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; min-width: 0 !important; min-height: 0 !important; aspect-ratio: auto !important; position: relative !important; top: 0 !important; left: 0 !important; margin: 0 !important; padding: 0 !important; transform: none !important; overflow: hidden !important;';
+                        node = node.parentElement;
+                    }
+                    remember(media);
+                    if (media.tagName === 'VIDEO' || media.tagName === 'CANVAS') {
+                        media.style.cssText = 'display: block !important; width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; object-fit: cover !important; position: relative !important; top: 0 !important; left: 0 !important; transform: none !important; margin: 0 !important; background: #000 !important;';
+                    } else {
+                        media.style.cssText = 'display: block !important; width: 100% !important; height: 100% !important; border: none !important; position: relative !important; top: 0 !important; left: 0 !important; margin: 0 !important;';
+                    }
+                }
+
+                // Hide EVERYTHING except the video's branch. Walk from the pinned element up
+                // to <body> and, at each level, hide all siblings of the current node. This
+                // leaves only the chain of ancestors that contain the video (and the video
+                // itself) visible -> kills the live-chat iframe, ads, headers, and any other
+                // page chrome that would otherwise show around/under the video.
+                let cur = pinned;
+                while (cur && cur !== document.body && cur !== document.documentElement) {
+                    const par = cur.parentElement;
+                    if (par) {
+                        const kids = par.children;
+                        for (let i = 0; i < kids.length; i++) {
+                            if (kids[i] !== cur) {
+                                remember(kids[i]);
+                                kids[i].style.setProperty('display', 'none', 'important');
+                            }
                         }
                     }
-                });
-                
-                // Style the video container and parents
-                let current = targetVideo;
-                while (current && current !== document.body) {
-                    current.style.width = '100vw';
-                    current.style.height = '100vh';
-                    current.style.position = 'fixed';
-                    current.style.top = '0';
-                    current.style.left = '0';
-                    current.style.zIndex = '9999';
-                    current.style.margin = '0';
-                    current.style.padding = '0';
-                    current.style.border = 'none';
-                    current = current.parentElement;
+                    cur = par;
                 }
-                
-                // Style the page
-                document.body.style.margin = '0';
-                document.body.style.padding = '0';
-                document.body.style.overflow = 'hidden';
-                document.body.style.backgroundColor = '#000';
-                document.documentElement.style.margin = '0';
-                document.documentElement.style.padding = '0';
-                document.documentElement.style.overflow = 'hidden';
-                
-                return 'Video isolated successfully';
+
+                // Style the page background black (keep it scrollable for navigation)
+                document.body.style.cssText = 'margin: 0 !important; padding: 0 !important; background-color: #000 !important; overflow: hidden !important;';
+                document.documentElement.style.cssText = 'margin: 0 !important; padding: 0 !important; background-color: #000 !important; overflow: hidden !important;';
+
+                // Diagnostics: report exactly what we grabbed and how it ended up rendering.
+                const allVids = document.querySelectorAll('video');
+                const allIframes = document.querySelectorAll('iframe');
+                const mr = media.getBoundingClientRect();
+                const mcs = window.getComputedStyle(media);
+                const diag = ' [DIAG'
+                    + ' viewport=' + window.innerWidth + 'x' + window.innerHeight
+                    + ' videos=' + allVids.length
+                    + ' iframes=' + allIframes.length
+                    + ' pinned=' + pinned.tagName + '.' + (pinned.className || '').toString().slice(0,40)
+                    + ' media=' + media.tagName + '.' + (media.className || '').toString().slice(0,40)
+                    + ' mediaRect=' + Math.round(mr.width) + 'x' + Math.round(mr.height)
+                    + ' mediaObjFit=' + mcs.objectFit
+                    + ' mediaPos=' + mcs.position
+                    + ']';
+
+                return 'Video isolated successfully' + diag;
             }
-            
-            return 'No video element found';
+
+                return 'No video element found';
+            } catch (error) {
+                return 'Error: ' + error.message;
+            }
         })();
         """
-        
+
         self.web_view.page().runJavaScript(js_code, self._on_video_isolation_result)
 
     def _on_video_isolation_result(self, result):
@@ -248,7 +352,7 @@ class BrowserPanel(QWidget):
             self.video_isolated = True
             self.video_isolate_btn.setText("🔄")
             self.video_isolate_btn.setToolTip(f"Restore Page View for Stream {self.index+1}")
-            print(f"Stream {self.index+1}: {result}")
+            print(f"\n===== ISOLATE DIAG (Stream {self.index+1}) =====\n{result}\n=================================\n")
         else:
             print(f"Stream {self.index+1}: Failed to isolate video - {result}")
 
@@ -256,25 +360,37 @@ class BrowserPanel(QWidget):
         """Restore the original page layout"""
         js_code = """
         (function() {
-            if (window.originalPageStyles) {
-                // Restore body and html styles
-                document.body.style.cssText = window.originalPageStyles.bodyStyle;
-                document.documentElement.style.cssText = window.originalPageStyles.htmlStyle;
-                
-                // Restore hidden elements
-                window.originalPageStyles.hiddenElements.forEach(item => {
-                    item.element.style.display = item.originalDisplay;
-                });
-                
-                // Clear stored styles
-                window.originalPageStyles = null;
-                
-                return 'Page restored successfully';
+            try {
+                if (window.originalPageStyles) {
+                    // Restore body and html styles
+                    document.body.style.cssText = window.originalPageStyles.bodyStyle;
+                    document.documentElement.style.cssText = window.originalPageStyles.htmlStyle;
+
+                    // Restore every element we touched, in reverse order, to its exact
+                    // original inline style (null/absent => remove the style attribute).
+                    const modified = window.originalPageStyles.modified || [];
+                    for (let i = modified.length - 1; i >= 0; i--) {
+                        const entry = modified[i];
+                        if (!entry || !entry.el) continue;
+                        if (entry.style === null || entry.style === undefined) {
+                            entry.el.removeAttribute('style');
+                        } else {
+                            entry.el.setAttribute('style', entry.style);
+                        }
+                    }
+
+                    // Clear stored styles
+                    window.originalPageStyles = null;
+
+                    return 'Page restored successfully';
+                }
+                return 'No original styles found';
+            } catch (error) {
+                return 'Error restoring: ' + error.message;
             }
-            return 'No original styles found';
         })();
         """
-        
+
         self.web_view.page().runJavaScript(js_code, self._on_page_restoration_result)
 
     def _on_page_restoration_result(self, result):
@@ -289,7 +405,7 @@ class BrowserPanel(QWidget):
         # If video is isolated, restore page first
         if self.video_isolated:
             self.restore_page()
-            
+
         url = self.url_input.text()
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -327,7 +443,7 @@ class BrowserPanel(QWidget):
         """Load a specified URL"""
         if self.video_isolated:
             self.restore_page()
-            
+
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         self.web_view.load(QUrl(url))
@@ -354,21 +470,14 @@ class QuadBoxBrowser(QMainWindow):
         self.toolbar.setMovable(False)
         self.addToolBar(self.toolbar)
 
-        # Create fullscreen button
-        self.fullscreen_action = QAction("Fullscreen", self)
+        # Create theater mode button (combines fullscreen + clean view + video isolation)
+        self.fullscreen_action = QAction("Theater Mode", self)
         self.fullscreen_action.setShortcut(QKeySequence("F11"))
-        self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        self.fullscreen_action.triggered.connect(self.toggle_theater_mode)
         self.toolbar.addAction(self.fullscreen_action)
 
-        # Create clean view toggle button
-        self.clean_view_action = QAction("Clean View", self)
-        self.clean_view_action.setShortcut(QKeySequence("F10"))
-        self.clean_view_action.setCheckable(True)
-        self.clean_view_action.toggled.connect(self.toggle_clean_view)
-        self.toolbar.addAction(self.clean_view_action)
-
-        # Video isolation for all streams
-        self.video_isolate_all_action = QAction("Isolate All Videos", self)
+        # Video isolation for all streams (kept for manual control)
+        self.video_isolate_all_action = QAction("Isolate Videos", self)
         self.video_isolate_all_action.setShortcut(QKeySequence("F9"))
         self.video_isolate_all_action.triggered.connect(self.toggle_all_video_isolation)
         self.toolbar.addAction(self.video_isolate_all_action)
@@ -387,7 +496,7 @@ class QuadBoxBrowser(QMainWindow):
         self.stream_presets.addItems([
             "Select Stream Preset",
             "ESPN",
-            "NFL Network", 
+            "NFL Network",
             "CBS Sports",
             "NBC Sports",
             "Fox Sports",
@@ -454,13 +563,45 @@ class QuadBoxBrowser(QMainWindow):
         self.setMouseTracking(True)
         self.content_container.setMouseTracking(True)
 
+    def toggle_theater_mode(self):
+        """Toggle theater mode: fullscreen + clean view + video isolation"""
+        if not self.is_fullscreen:
+            # Enter theater mode
+            self.showFullScreen()
+            self.is_fullscreen = True
+            self.fullscreen_action.setText("Exit Theater Mode")
+
+            # Enable clean view
+            if not self.is_clean_view:
+                self.toggle_clean_view(True)
+
+            # Isolate videos in all visible panels
+            visible_browsers = [b for b in self.browsers if b.isVisible()]
+            for browser in visible_browsers:
+                if not browser.video_isolated:
+                    browser.isolate_video()
+        else:
+            # Exit theater mode
+            self.showNormal()
+            self.is_fullscreen = False
+            self.fullscreen_action.setText("Theater Mode")
+
+            # Disable clean view
+            if self.is_clean_view:
+                self.toggle_clean_view(False)
+
+            # Restore all isolated videos
+            for browser in self.browsers:
+                if browser.video_isolated:
+                    browser.restore_page()
+
     def toggle_all_video_isolation(self):
         """Toggle video isolation for all visible browser panels"""
         visible_browsers = [b for b in self.browsers if b.isVisible()]
         if visible_browsers:
             # Check if any video is currently isolated
             any_isolated = any(b.video_isolated for b in visible_browsers)
-            
+
             # If any are isolated, restore all; otherwise isolate all
             for browser in visible_browsers:
                 if any_isolated and browser.video_isolated:
@@ -496,7 +637,6 @@ class QuadBoxBrowser(QMainWindow):
             enable = not self.is_clean_view
 
         self.is_clean_view = enable
-        self.clean_view_action.setChecked(enable)
 
         # Hide/show global toolbar
         if enable:
@@ -510,22 +650,26 @@ class QuadBoxBrowser(QMainWindow):
 
     def handle_escape(self):
         """Handle escape key press"""
-        # First priority: restore any isolated videos
+        # If in theater mode (fullscreen), exit completely
+        if self.is_fullscreen:
+            self.toggle_theater_mode()
+            return
+
+        # If any videos are isolated but not in fullscreen, just restore videos
         isolated_browsers = [b for b in self.browsers if b.video_isolated]
         if isolated_browsers:
             for browser in isolated_browsers:
                 browser.restore_page()
             return
-            
+
+        # If a browser is maximized, restore grid
         if self.maximized_browser is not None:
-            # If a browser is maximized, restore grid
             self.restore_grid()
-        elif self.is_clean_view:
-            # If in clean view mode, exit clean view
+            return
+
+        # If in clean view mode without fullscreen, exit clean view
+        if self.is_clean_view:
             self.toggle_clean_view(False)
-        elif self.is_fullscreen:
-            # If in fullscreen mode, exit fullscreen
-            self.toggle_fullscreen()
 
     def mouseMoveEvent(self, event):
         """Handle mouse movement to temporarily show controls in clean view mode"""
