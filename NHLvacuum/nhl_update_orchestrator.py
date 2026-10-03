@@ -738,6 +738,89 @@ class NHLUpdateOrchestrator:
             duration_seconds=duration
         )
 
+    def _playoff_roster_player_ids(self, playoff_games: List[GameToUpdate]) -> Optional[Set[str]]:
+        """Player IDs on teams that are actually in the current playoffs.
+
+        Only ~16 teams reach the playoffs, so downloading playoff CSVs for all ~939
+        players generates ~335 guaranteed 404s. We restrict the playoff player
+        download to the current-season rosters of the playoff teams (derived from the
+        games table + existing regular-season MoneyPuck stats).
+
+        Returns None if it can't be determined, so the caller falls back to all players.
+        """
+        game_ids = [g.game_id for g in playoff_games]
+        if not game_ids:
+            return None
+        try:
+            conn = self.conn or sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+
+            # Playoff team_ids from the games being processed
+            ph = ','.join('?' for _ in game_ids)
+            cur.execute(
+                f"SELECT home_team_id FROM games WHERE game_id IN ({ph}) "
+                f"UNION SELECT away_team_id FROM games WHERE game_id IN ({ph})",
+                game_ids + game_ids
+            )
+            team_ids = [r[0] for r in cur.fetchall() if r[0] is not None]
+            if not team_ids:
+                return None
+
+            # Current-season player rosters for those teams (skaters + goalies)
+            season_prefix = self._get_current_season_code()[:4]  # e.g. '2025'
+            tph = ','.join('?' for _ in team_ids)
+            roster: Set[str] = set()
+            for tbl in ('mp_skater_game_stats', 'mp_goalie_game_stats'):
+                cur.execute(
+                    f"SELECT DISTINCT player_id FROM {tbl} "
+                    f"WHERE team_id IN ({tph}) AND CAST(game_id AS TEXT) LIKE ?",
+                    team_ids + [f'{season_prefix}%']
+                )
+                roster.update(str(r[0]) for r in cur.fetchall() if r[0] is not None)
+            return roster or None
+        except sqlite3.Error as e:
+            logger.warning(f"Could not derive playoff rosters ({e}); will download all players for playoffs.")
+            return None
+
+    def _reconcile_game_venues(self):
+        """Correct games.home_team_id / away_team_id from MoneyPuck's authoritative
+        mp_home_or_away flag.
+
+        NST filenames don't reliably encode which team was home, so games rows created
+        during NST import end up with ~50% of home/away inverted. MoneyPuck's venue flag
+        matches the NHL API ground truth, so we reconcile against it after every MoneyPuck
+        import. Idempotent and fast; also self-heals any historical drift.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                WITH venue AS (
+                    SELECT game_id,
+                           MAX(CASE WHEN mp_home_or_away='HOME' THEN team_id END) AS home_id,
+                           MAX(CASE WHEN mp_home_or_away='AWAY' THEN team_id END) AS away_id
+                    FROM mp_team_game_stats
+                    WHERE situation_id = (SELECT situation_id FROM situations
+                                          WHERE LOWER(situation_code) LIKE '%all%' LIMIT 1)
+                    GROUP BY game_id
+                    HAVING home_id IS NOT NULL AND away_id IS NOT NULL
+                )
+                UPDATE games
+                SET home_team_id = (SELECT home_id FROM venue v WHERE v.game_id = games.game_id),
+                    away_team_id = (SELECT away_id FROM venue v WHERE v.game_id = games.game_id)
+                WHERE game_id IN (SELECT game_id FROM venue)
+                  AND home_team_id <> (SELECT home_id FROM venue v WHERE v.game_id = games.game_id)
+            """)
+            corrected = cur.rowcount
+            conn.commit()
+            conn.close()
+            if corrected > 0:
+                logger.info(f"Reconciled game venues from MoneyPuck: {corrected} games corrected")
+            else:
+                logger.info("Game venues already consistent with MoneyPuck")
+        except Exception as e:
+            logger.warning(f"Venue reconciliation failed (non-fatal): {e}")
+
     def update_moneypuck_data(self, games: List[GameToUpdate]) -> UpdateResult:
         """
         Update MoneyPuck data (team, player, shots).
@@ -864,7 +947,25 @@ class NHLUpdateOrchestrator:
         if playoff_games_needing_mp:
             logger.info("Downloading MoneyPuck PLAYOFF data...")
             moneypuck_downloader.download_team_data(teams, output_dir, max_workers=4, skip_existing=False, season_type='playoffs')
-            moneypuck_downloader.download_player_data(players_dict, output_dir, max_workers=3, skip_existing=False, season_type='playoffs')
+
+            # Restrict playoff player downloads to rosters of teams actually in the
+            # playoffs (avoids ~335 guaranteed 404s for eliminated/non-playoff players).
+            roster_ids = self._playoff_roster_player_ids(playoff_games_needing_mp)
+            if roster_ids:
+                po_players = {
+                    'skaters': [p for p in players_dict['skaters'] if p[0] in roster_ids],
+                    'goalies': [p for p in players_dict['goalies'] if p[0] in roster_ids],
+                }
+                logger.info(
+                    f"Filtered playoff player download to {len(po_players['skaters'])} skaters + "
+                    f"{len(po_players['goalies'])} goalies (from {len(players_dict['skaters'])} + "
+                    f"{len(players_dict['goalies'])}) on {len(roster_ids)} playoff-rostered players"
+                )
+            else:
+                po_players = players_dict
+                logger.info("Could not derive playoff rosters; downloading all players for playoffs.")
+
+            moneypuck_downloader.download_player_data(po_players, output_dir, max_workers=3, skip_existing=False, season_type='playoffs')
 
         # Cleanup temp file
         if temp_players_file and os.path.exists(temp_players_file):
@@ -900,6 +1001,11 @@ class NHLUpdateOrchestrator:
             logger.info("Importing MoneyPuck PLAYOFF data...")
             mp_import.MoneyPuckTeamImporter.import_all(game_ids=game_ids_to_import, season_type='playoffs')
             mp_import.MoneyPuckPlayerImporter.import_all(game_ids=game_ids_to_import, season_type='playoffs')
+
+        # Correct games home/away from MoneyPuck's authoritative venue flag.
+        # (NST filenames don't reliably encode venue, so newly created game rows
+        # can have inverted home/away; this self-heals after the MP import.)
+        self._reconcile_game_venues()
 
         # Import current season shots data (updates existing data)
         logger.info(f"Importing shots data for {shots_season_year-1}-{shots_season_year} season...")
@@ -1125,6 +1231,15 @@ class NHLUpdateOrchestrator:
             if update_edge:
                 result = self.update_edge_data(games_to_update)
                 self.results.append(result)
+
+            # Step 2b: resolve players imported under UNKNOWN_* placeholder ids (rookies / new signings the NST
+            # import couldn't map yet). Runs after every source so player_ids.txt is already refreshed. Non-fatal.
+            try:
+                import fix_player_ids
+                logger.info("Resolving UNKNOWN_* player ids (fix_player_ids)...")
+                fix_player_ids.fix_player_ids(self.db_path)
+            except Exception as e:
+                logger.warning(f"fix_player_ids failed (non-fatal): {e}")
 
             # Step 3: Generate summary
             duration = (datetime.now() - start_time).total_seconds()

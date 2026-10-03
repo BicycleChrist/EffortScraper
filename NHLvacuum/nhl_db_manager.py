@@ -21,6 +21,17 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import unicodedata
+
+# (NST name, 'D' | 'F') -> NHL id for active players who share a full name.
+# Linemate/opposition CSVs only carry a generic 'F', so a D twin referenced there
+# still resolves to the F id — player-level rows (individual/on-ice) are exact.
+NAME_TWINS = {
+    ('Elias Pettersson', 'F'): '8480012',  # VAN C
+    ('Elias Pettersson', 'D'): '8483678',  # VAN D, debut 2024-25
+    ('Sebastian Aho', 'F'): '8478427',     # CAR
+    ('Sebastian Aho', 'D'): '8480222',     # NYI
+}
 from threading import Lock
 from queue import Queue
 from functools import lru_cache
@@ -306,8 +317,15 @@ class NHLDatabaseManager:
             if key in self.player_map:
                 return self.player_map[key]
 
-        # Get NHL player ID from mapping, or generate a placeholder
-        nhl_player_id = self.nhl_player_ids.get(player_name)
+        # Get NHL player ID from mapping, or generate a placeholder.
+        # Same-name players first: player_ids.txt is name-keyed, so it can only hold one of them.
+        nhl_player_id = NAME_TWINS.get((player_name, 'D' if position == 'D' else 'F'))
+        if not nhl_player_id:
+            nhl_player_id = self.nhl_player_ids.get(player_name)
+        if not nhl_player_id:
+            # Accent-insensitive fallback (NST "Aatu Räty" vs player_ids.txt "Aatu Raty")
+            ascii_name = unicodedata.normalize('NFKD', player_name).encode('ascii', 'ignore').decode()
+            nhl_player_id = self.nhl_player_ids.get(ascii_name)
 
         if not nhl_player_id:
             # If not found, create a placeholder ID (use negative numbers)

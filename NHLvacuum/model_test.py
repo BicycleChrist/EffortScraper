@@ -5,6 +5,8 @@ import sqlite3
 import os
 import random
 import datetime
+import re
+import json
 
 import jax
 import jax.numpy as jnp
@@ -50,6 +52,117 @@ MODEL_PARAMS_PATH = "advanced_model_params_v6.npz"
 STATS_PATH = "advanced_standardize_stats_v6.npz"
 CALIBRATION_PATH = "model_calibration_v6.npz"
 RANDOM_SEED = None   # Best performer from random seed testing (4237426529, val loss -0.4517)
+# ---------------------------
+# Preseason exclusion (2026-10-02). NST imports include preseason games (game_type 1, ids 20YY01xxxx). Every
+# connection model_test opens shadows these tables with TEMP views holding regular-season + playoff rows only, so
+# no rolling window, goalie form, linemate/matchup feature or training row can ever see a preseason game.
+# (SQLite resolves temp objects before main ones; queries are unchanged.)
+# ---------------------------
+_PRESEASON_FILTERED = ['games', 'team_game_overview', 'player_game_stats', 'goalie_game_stats', 'line_combinations',
+                       'player_linemate_stats', 'player_opposition_stats', 'player_onice_stats', 'player_shift_stats',
+                       'edge_pbp_events']
+
+def _connect(db_path):
+    con = sqlite3.connect(db_path)
+    for t in _PRESEASON_FILTERED:
+        con.execute(f"CREATE TEMP VIEW IF NOT EXISTS {t} AS SELECT * FROM main.{t} "
+                    f"WHERE substr(game_id, 5, 2) IN ('02', '03')")
+    return con
+
+# Rest days are capped at REST_CAP (1 = back-to-back, 2 = one day off, 3 = 2+ days off). 2026-10-02: the old
+# cap of 10 let the net extrapolate on season openers (10/10 rest -> ~6 pts off the home side), while the data
+# shows no effect past a few days (home win 54.0% overall vs 53.6% when both teams rested 7+).
+REST_CAP = 3
+
+_TAG = os.environ.get('NHL_MODEL_TAG')   # EXPERIMENT 2026-10: write/read a separate model (never the production files)
+if _TAG:
+    MODEL_PARAMS_PATH = f"advanced_model_params_v6_{_TAG}.npz"
+    STATS_PATH = f"advanced_standardize_stats_v6_{_TAG}.npz"
+    CALIBRATION_PATH = f"model_calibration_v6_{_TAG}.npz"
+FEATURE_LIST_PATH = f"feature_list_{_TAG}.npz" if _TAG else "feature_list.npz"
+if os.environ.get('NHL_SEED'):   # EXPERIMENT 2026-09: fixed seed for paired A/B runs (unset = random, as before)
+    RANDOM_SEED = int(os.environ['NHL_SEED'])
+
+# ---------------------------
+# Rolling-feature mode  (EXPERIMENT 2026-09 — production default is 'window'; see roll_mean)
+#   window : x.shift(1).rolling(n).mean()  — the original features, bit-identical
+#   shrink : exponentially weighted mean shrunk toward a 2022-23 league prior (NHL_ROLL_PRIORS json)
+#   capture: window values + records each long series' games 83-164 (= 2022-23) to build those priors
+# ---------------------------
+ROLL_MODE = os.environ.get('NHL_ROLL_MODE', 'window')
+_ROLL_PRIORS = {}
+_ROLL_CAPTURE = {}
+# (half-life games, shrink games) by stat type, fitted on 2022-23 targets only (before every walk-forward fold)
+_ROLL_PARAMS = {'rate': (20, 5), 'luck': (40, 40), 'special': (80, 40)}
+_ROLL_CLASS = {   # explicit, by raw column name; anything unlisted is 'rate'
+    'sh_pct': 'luck', 'hd_finish_pct': 'luck', 'md_finish_pct': 'luck', 'hd_save_pct': 'luck',
+    'md_save_pct': 'luck', 'goals_for': 'luck', 'gsax': 'luck', 'hd_gsax': 'luck', 'rcr': 'luck',
+    'hd_shot_pct': 'luck', 'pp_xg60': 'special', 'pp_efficiency': 'special', 'pk_xga60': 'special',
+    'pk_xgf60': 'special', 'pk_g60': 'special'}
+_KNOWN_PRIORS = {'gsax': 0.0, 'hd_gsax': 0.0}   # GSAx is 0 by construction; everything else from the 2021-22 capture
+
+def roll_mean(x, n, min_periods=1, col=None):
+    """Pre-game rolling mean of one team's (or goalie's) per-game series x, in game order.
+    col = the raw column name (inside groupby.transform the series name is the GROUP key, not the column)."""
+    if ROLL_MODE in ('window', 'capture'):
+        if ROLL_MODE == 'capture' and len(x) >= 300:   # existed since 2021-22 -> games 83-164 ~ 2022-23
+            _ROLL_CAPTURE.setdefault(col, []).append(x.values[82:164].astype(float))   # (2021-22 EDGE is zero-filled)
+        return x.shift(1).rolling(n, min_periods=min_periods).mean()
+    from scipy.signal import lfilter
+    H, k = _ROLL_PARAMS[_ROLL_CLASS.get(col, 'rate')]
+    if n <= 3:
+        H = 5                                   # short-memory 'trend' variant
+    elif n >= 20:
+        H = 2 * H
+    mu = _KNOWN_PRIORS.get(col, _ROLL_PRIORS.get(col))
+    v = x.shift(1).astype(float)
+    ok = v.notna().values.astype(float)
+    d = 0.5 ** (1.0 / H)
+    S = lfilter([1.0], [1.0, -d], np.nan_to_num(v.values))     # decayed sum of prior games
+    W = lfilter([1.0], [1.0, -d], ok)                           # decayed count
+    if mu is None or not np.isfinite(mu):                       # no prior known: plain decayed mean
+        est = np.where(W > 0, S / np.maximum(W, 1e-12), np.nan)
+    else:
+        est = np.where(W > 0, (S + k * mu) / (W + k), np.nan)  # no history -> NaN, as the window version
+    return pd.Series(est, index=x.index)
+
+def roll_ratio(df, num_col, den_col, n, col, team_col='team_id'):
+    """Pre-game RATIO OF SUMS over a team's previous games (2026-10-02 fix for mean-of-ratios blow-ups, e.g. a
+    5-second power play with a goal scoring 3.5 goals/min and dominating an 8-game average).
+    window mode: sum(num)/sum(den) over the previous n games; shrink mode: exponentially decayed sums.
+    Both add pseudo-games of league-average denominator at the PREVIOUS season's league ratio (leak-free),
+    so a game counts in proportion to its denominator and early windows can't explode.
+    df must be sorted by (team, game order). Returns a Series aligned to df."""
+    from scipy.signal import lfilter
+    yr = df['game_id'].astype(str).str[:4].astype(int)
+    tot = df.groupby(yr)[[num_col, den_col]].sum()
+    lr = tot[num_col] / tot[den_col].replace(0, np.nan)
+    mu_y = lr.shift(1).fillna(lr)                                   # previous season's league ratio
+    dbar_all = df.groupby(yr)[den_col].mean()
+    dbar_y = dbar_all.shift(1).fillna(dbar_all)                     # previous season's mean denominator per game
+    mu = yr.map(mu_y).astype(float).values
+    dbar = yr.map(dbar_y).astype(float).values
+    g = df.groupby(team_col, sort=False)
+    if ROLL_MODE == 'shrink':
+        H, k = _ROLL_PARAMS[_ROLL_CLASS.get(col, 'rate')]
+        H = 5 if n <= 3 else (2 * H if n >= 20 else H)
+        d = 0.5 ** (1.0 / H)
+        dec = lambda x: pd.Series(lfilter([0, d], [1, -d], x.astype(float).fillna(0).values), index=x.index)
+        S_n = g[num_col].transform(dec).values
+        S_d = g[den_col].transform(dec).values
+    else:
+        k = 1.0
+        S_n = g[num_col].transform(lambda x: x.shift(1).rolling(n, min_periods=1).sum()).fillna(0).values
+        S_d = g[den_col].transform(lambda x: x.shift(1).rolling(n, min_periods=1).sum()).fillna(0).values
+    est = (S_n + k * dbar * mu) / np.maximum(S_d + k * dbar, 1e-12)
+    return pd.Series(est, index=df.index)
+
+if ROLL_MODE == 'shrink':
+    import json as _json
+    _pp = os.environ.get('NHL_ROLL_PRIORS')
+    if not _pp or not os.path.exists(_pp):
+        raise SystemExit("NHL_ROLL_MODE=shrink needs NHL_ROLL_PRIORS=<priors json from a capture run>")
+    _ROLL_PRIORS = _json.load(open(_pp))
 
 DEFAULT_EPOCHS = 1000
 DEFAULT_BATCH = 64
@@ -126,29 +239,25 @@ def process_special_teams(con) -> pd.DataFrame:
     pp = df[df['situation_code'] == 'PP'].copy()
     pk = df[df['situation_code'] == 'PK'].copy()
 
-    # Calculate Rates
-    pp['pp_xg60'] = pp['xg_for'] / (pp['toi'] / 60 + 0.2)
-    pp['pp_efficiency'] = pp['goals_for'] / (pp['toi'] / 60 + 0.2) # PP Goals per 60
-    
-    pk['pk_xga60'] = pk['xg_against'] / (pk['toi'] / 60 + 0.2)
-    pk['pk_xgf60'] = pk['xg_for'] / (pk['toi'] / 60 + 0.2)
-    pk['pk_g60'] = pk['goals_against'] / (pk['toi'] / 60 + 0.2) # PK Goals Against per 60
+    # Rates per PP/PK MINUTE as a ratio of sums over the window (2026-10-02). The old per-game
+    # goals/(minutes+0.2) then averaged let a 5-second PP with a goal score 3.5/min and dominate the window.
+    pp['pp_min'] = pp['toi'] / 60.0
+    pk['pk_min'] = pk['toi'] / 60.0
+    pp = pp.sort_values(['team_id', 'game_id']).reset_index(drop=True)
+    pk = pk.sort_values(['team_id', 'game_id']).reset_index(drop=True)
 
-    pp = pp.sort_values(['team_id', 'game_id'])
-    pk = pk.sort_values(['team_id', 'game_id'])
+    pp['roll_pp_xg60'] = roll_ratio(pp, 'xg_for', 'pp_min', 8, 'pp_xg60')
+    pp['roll_pp_efficiency'] = roll_ratio(pp, 'goals_for', 'pp_min', 8, 'pp_efficiency')
+    pk['roll_pk_xga60'] = roll_ratio(pk, 'xg_against', 'pk_min', 8, 'pk_xga60')
+    pk['roll_pk_xgf60'] = roll_ratio(pk, 'xg_for', 'pk_min', 8, 'pk_xgf60')
+    pk['roll_pk_g60'] = roll_ratio(pk, 'goals_against', 'pk_min', 8, 'pk_g60')
 
-    # Rolling
-    pp['roll_pp_xg60'] = pp.groupby('team_id')['pp_xg60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-    pp['roll_pp_efficiency'] = pp.groupby('team_id')['pp_efficiency'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-    
-    pk['roll_pk_xga60'] = pk.groupby('team_id')['pk_xga60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-    pk['roll_pk_xgf60'] = pk.groupby('team_id')['pk_xgf60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-    pk['roll_pk_g60'] = pk.groupby('team_id')['pk_g60'].transform(lambda x: x.shift(1).rolling(8, min_periods=1).mean())
-
-    # Merge
+    # Merge (a team-game missing one side gets that column's median, never 0)
     out = pd.merge(pp[['game_id', 'team_id', 'roll_pp_xg60', 'roll_pp_efficiency']],
                    pk[['game_id', 'team_id', 'roll_pk_xga60', 'roll_pk_xgf60', 'roll_pk_g60']],
-                   on=['game_id', 'team_id'], how='outer').fillna(0.0)
+                   on=['game_id', 'team_id'], how='outer')
+    for c in ['roll_pp_xg60', 'roll_pp_efficiency', 'roll_pk_xga60', 'roll_pk_xgf60', 'roll_pk_g60']:
+        out[c] = out[c].fillna(out[c].median())
                    
     # Fill defaults if missing (league avg approx)
     if out['roll_pp_xg60'].mean() == 0: out['roll_pp_xg60'] = 7.0
@@ -321,16 +430,36 @@ def process_goalie_metrics(con) -> pd.DataFrame:
     df = df.sort_values(['player_id', 'game_id'])
     grp_goalie = df.groupby('player_id')
 
-    # 6. Rolling averages (PER GOALIE)
-    df['roll_gsax'] = grp_goalie['gsax'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
-    )
-    df['roll_hd_gsax'] = grp_goalie['hd_gsax'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
-    )
-    df['roll_rcr'] = grp_goalie['rcr'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
-    )
+    # 6. Goalie form, SHRUNK BY SAMPLE SIZE (2026-10-02). Last 10 games are pulled toward the goalie's career
+    # level (worth K_WIN games), and the career level toward the average NEW goalie (worth K_CAREER games).
+    # A 2-game call-up therefore sits near new-goalie level instead of looking elite off one hot night.
+    n_prior = grp_goalie.cumcount()                          # this goalie's earlier games in the DB
+    def _career_sum(c):
+        return grp_goalie[c].cumsum() - df[c]
+    def _window_sum(c, w=10):
+        return grp_goalie[c].transform(lambda x: x.shift(1).rolling(w, min_periods=1).sum()).fillna(0.0)
+    n_win = grp_goalie['gsax'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).count()).fillna(0.0)
+    K_CAREER, K_WIN = 20.0, 5.0
+    new_goalie = n_prior < 20
+    # League constants come from the PREVIOUS season (first season: its own), so no row sees its own game or later.
+    yr = df['game_id'].astype(str).str[:4].astype(int)
+    def _prev_season(by_year):
+        # every season present in df gets the latest EARLIER season's value (a season can be absent from by_year,
+        # e.g. no new goalie has played yet this October); the first season falls back to its own value
+        by_year = by_year.reindex(sorted(yr.unique()))
+        prev = by_year.ffill().shift(1)
+        return yr.map(prev.fillna(by_year).bfill()).astype(float)
+    for c in ('gsax', 'hd_gsax'):
+        mu_new = _prev_season(df[new_goalie].groupby(yr[new_goalie])[c].mean())   # avg goalie in his first 20 games
+        career = (_career_sum(c) + K_CAREER * mu_new) / (n_prior + K_CAREER)
+        df[f'roll_{c}'] = (_window_sum(c) + K_WIN * career) / (n_win + K_WIN)
+    # rebound control = 1 - rebounds per save, as a ratio of sums with the same two-level shrink
+    sv_bar = _prev_season(df.groupby(yr)['mp_saves'].mean())
+    _tot = df.groupby(yr)[['mp_rebounds', 'mp_saves']].sum()
+    mu_rate = _prev_season(_tot['mp_rebounds'] / _tot['mp_saves'].clip(lower=1.0))
+    career_rate = (_career_sum('mp_rebounds') + K_CAREER * sv_bar * mu_rate) / (_career_sum('mp_saves') + K_CAREER * sv_bar)
+    win_rate = (_window_sum('mp_rebounds') + K_WIN * sv_bar * career_rate) / (_window_sum('mp_saves') + K_WIN * sv_bar)
+    df['roll_rcr'] = 1.0 - win_rate
     df['roll_fatigue_index'] = grp_goalie['weighted_workload'].transform(
         lambda x: x.shift(1).rolling(5, min_periods=1).sum()
     )
@@ -347,19 +476,17 @@ def process_goalie_metrics(con) -> pd.DataFrame:
     # Check if games_played is small
     df['games_played_cum'] = grp_goalie.cumcount() + 1
     
-    # Default values for new goalies
-    LEAGUE_AVG_RCR = 0.82
+    # Defaults. gsax / hd_gsax / rcr are already sample-size shrunk above (no NaNs, no first-games override);
+    # fatigue keeps its league-average default for a goalie's first games.
+    LEAGUE_AVG_RCR = 1.0 - mu_rate          # per-row previous-season value
     LEAGUE_AVG_FATIGUE = 150.0
-    
+
     df['roll_gsax'] = df['roll_gsax'].fillna(0.0)
     df['roll_hd_gsax'] = df['roll_hd_gsax'].fillna(0.0)
     df['roll_rcr'] = df['roll_rcr'].fillna(LEAGUE_AVG_RCR)
     df['roll_fatigue_index'] = df['roll_fatigue_index'].fillna(LEAGUE_AVG_FATIGUE)
-    
-    # Enforce defaults for first 5 games (unstable)
+
     mask_new = df['games_played_cum'] < 5
-    df.loc[mask_new, 'roll_hd_gsax'] = 0.0
-    df.loc[mask_new, 'roll_rcr'] = LEAGUE_AVG_RCR
     df.loc[mask_new, 'roll_fatigue_index'] = LEAGUE_AVG_FATIGUE
 
     # 9. Return PER-GOALIE features (DO NOT AGGREGATE TO TEAM LEVEL)
@@ -388,19 +515,15 @@ def process_nst_metrics(con) -> pd.DataFrame:
     # Calculate hdcf_share for each team
     df['hdcf_share'] = df['hdcf'] / (df['hdcf'] + df['hdca'] + 0.1)
 
-    # Sort and calculate rolling average
-    df = df.sort_values(['team_id', 'game_id'])
-    grp = df.groupby('team_id')
+    # Sort and calculate rolling share as a RATIO OF SUMS (2026-10-02)
+    df = df.sort_values(['team_id', 'game_id']).reset_index(drop=True)
+    df['_hd_tot'] = df['hdcf'] + df['hdca']
 
     # Standard 10-game rolling
-    df['roll_hdcf_share'] = grp['hdcf_share'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
-    )
+    df['roll_hdcf_share'] = roll_ratio(df, 'hdcf', '_hd_tot', 10, 'hdcf_share')
 
     # HDSM (High-Danger Shot Momentum): 3-game vs 10-game differential
-    df['roll3_hdcf_share'] = grp['hdcf_share'].transform(
-        lambda x: x.shift(1).rolling(3, min_periods=1).mean()
-    )
+    df['roll3_hdcf_share'] = roll_ratio(df, 'hdcf', '_hd_tot', 3, 'hdcf_share')
     df['hdsm'] = df['roll3_hdcf_share'] - df['roll_hdcf_share']
 
     # Fill NaNs with league average
@@ -486,42 +609,50 @@ def process_advanced_metrics(con) -> pd.DataFrame:
     # Denominator: Successful Clears + Failed Clears (Sustained Pressure Against)
     df['dzone_clearance_rate'] = df['play_cont_out'] / (df['play_cont_out'] + df['play_cont_zone_ag'] + 0.1)
 
-    df = df.sort_values(['team_id', 'game_id'])
+    df = df.sort_values(['team_id', 'game_id']).reset_index(drop=True)
     grp = df.groupby('team_id')
 
+    # Numerators / denominators for the ratio features (2026-10-02: rolled as RATIO OF SUMS via roll_ratio;
+    # the per-game ratio columns above are kept only for the league-average fills further down)
+    df['_fo_tot'] = df['fo_won'] + df['fo_against']
+    df['_sac_tot'] = df['sa_corsi_for'] + df['sa_corsi_against']
+    df['_hd_saves'] = df['hd_shots_against'] - df['hd_goals_against']
+    df['_md_saves'] = df['md_shots_against'] - df['md_goals_against']
+    df['_clear_tot'] = df['play_cont_out'] + df['play_cont_zone_ag']
+
     # Rolling averages
-    df['roll_hd_shot_pct'] = grp['hd_shot_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_sh_pct'] = grp['sh_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_rebound_xgf'] = grp['rebound_xgf'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_fo_pct'] = grp['fo_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_sa_corsi_pct'] = grp['sa_corsi_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    df['roll_hd_shot_pct'] = roll_ratio(df, 'hd_shots_for', 'sog_for', 10, 'hd_shot_pct')
+    df['roll_sh_pct'] = roll_ratio(df, 'gf', 'sog_for', 10, 'sh_pct')
+    df['roll_rebound_xgf'] = grp['rebound_xgf'].transform(lambda x: roll_mean(x, 10, 1, 'rebound_xgf'))
+    df['roll_fo_pct'] = roll_ratio(df, 'fo_won', '_fo_tot', 10, 'fo_pct')
+    df['roll_sa_corsi_pct'] = roll_ratio(df, 'sa_corsi_for', '_sac_tot', 10, 'sa_corsi_pct')
     
     # New features rolling
-    df['roll_freeze_ag'] = grp['freeze_ag'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_pen_diff'] = grp['pen_diff'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    df['roll_freeze_ag'] = grp['freeze_ag'].transform(lambda x: roll_mean(x, 10, 1, 'freeze_ag'))
+    df['roll_pen_diff'] = grp['pen_diff'].transform(lambda x: roll_mean(x, 10, 1, 'pen_diff'))
     
     # Added advanced features rolling
-    df['roll_flurry_delta'] = grp['flurry_delta'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_hd_finish_pct'] = grp['hd_finish_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_hd_save_pct'] = grp['hd_save_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_md_finish_pct'] = grp['md_finish_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_md_save_pct'] = grp['md_save_pct'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_block_rate'] = grp['block_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    df['roll_flurry_delta'] = grp['flurry_delta'].transform(lambda x: roll_mean(x, 10, 1, 'flurry_delta'))
+    df['roll_hd_finish_pct'] = roll_ratio(df, 'hd_goals_for', 'hd_shots_for', 10, 'hd_finish_pct')
+    df['roll_hd_save_pct'] = roll_ratio(df, '_hd_saves', 'hd_shots_against', 10, 'hd_save_pct')
+    df['roll_md_finish_pct'] = roll_ratio(df, 'md_goals_for', 'md_shots_for', 10, 'md_finish_pct')
+    df['roll_md_save_pct'] = roll_ratio(df, '_md_saves', 'md_shots_against', 10, 'md_save_pct')
+    df['roll_block_rate'] = roll_ratio(df, 'blocks_for', 'corsi_against_raw', 10, 'block_rate')
     
     # Pressure Rolling
-    df['roll_pressure_rate'] = grp['pressure_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    df['roll_dzone_clearance_rate'] = grp['dzone_clearance_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    df['roll_pressure_rate'] = roll_ratio(df, 'play_cont_zone', 'raw_attempts_for', 10, 'pressure_rate')
+    df['roll_dzone_clearance_rate'] = roll_ratio(df, 'play_cont_out', '_clear_tot', 10, 'dzone_clearance_rate')
 
     # --- Trend Features (Short & Long Term) ---
     # Short term (Last 3) - Hot/Cold streaks
-    df['roll3_sh_pct'] = grp['sh_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
-    df['roll3_sa_corsi_pct'] = grp['sa_corsi_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
-    df['roll3_hd_save_pct'] = grp['hd_save_pct'].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    df['roll3_sh_pct'] = roll_ratio(df, 'gf', 'sog_for', 3, 'sh_pct')
+    df['roll3_sa_corsi_pct'] = roll_ratio(df, 'sa_corsi_for', '_sac_tot', 3, 'sa_corsi_pct')
+    df['roll3_hd_save_pct'] = roll_ratio(df, '_hd_saves', 'hd_shots_against', 3, 'hd_save_pct')
     
     # Long term (Last 20) - Structural strength
-    df['roll20_sh_pct'] = grp['sh_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
-    df['roll20_sa_corsi_pct'] = grp['sa_corsi_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
-    df['roll20_hd_save_pct'] = grp['hd_save_pct'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+    df['roll20_sh_pct'] = roll_ratio(df, 'gf', 'sog_for', 20, 'sh_pct')
+    df['roll20_sa_corsi_pct'] = roll_ratio(df, 'sa_corsi_for', '_sac_tot', 20, 'sa_corsi_pct')
+    df['roll20_hd_save_pct'] = roll_ratio(df, '_hd_saves', 'hd_shots_against', 20, 'hd_save_pct')
 
     # Update new_features list to include these
     trend_features = [
@@ -768,7 +899,7 @@ def process_skater_chemistry(con) -> pd.DataFrame:
     
     cols = ['linemate_xgf_boost', 'linemate_hdcf_synergy', 'dpair_xgf_boost']
     for c in cols:
-        out[f'roll_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        out[f'roll_{c}'] = grp[c].transform(lambda x: roll_mean(x, 10, 1, c))
         
     # Fill NaNs
     out['roll_linemate_xgf_boost'] = out['roll_linemate_xgf_boost'].fillna(0.0)
@@ -857,8 +988,8 @@ def process_matchup_metrics(con) -> pd.DataFrame:
     out = out.sort_values(['team_id', 'game_id'])
     grp = out.groupby('team_id')
     
-    out['roll_suppression_factor'] = grp['suppression_factor'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
-    out['roll_matchup_rate'] = grp['matchup_rate'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    out['roll_suppression_factor'] = grp['suppression_factor'].transform(lambda x: roll_mean(x, 10, 1, 'suppression_factor'))
+    out['roll_matchup_rate'] = grp['matchup_rate'].transform(lambda x: roll_mean(x, 10, 1, 'matchup_rate'))
     
     # Defaults
     out['roll_suppression_factor'] = out['roll_suppression_factor'].fillna(0.0)
@@ -967,7 +1098,7 @@ def process_opposition_adjusted_xg(con) -> pd.DataFrame:
     # Sort and calculate rolling average defensive quality
     df = df.sort_values(['team_id', 'game_id'])
     df['roll_xga_per_60'] = df.groupby('team_id')['xga_per_60'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+        lambda x: roll_mean(x, 10, 1, 'xga_per_60')
     )
 
     # Calculate league average for normalization
@@ -1042,7 +1173,9 @@ def process_edge_metrics(con) -> pd.DataFrame:
         return pd.DataFrame(columns=['game_id', 'team_id'] + ALL_EXPECTED_EDGE_COLUMNS)
 
     # Map NHL API IDs to Internal IDs
-    teams_map_query = "SELECT NHL_TEAM_ID, team_id FROM teams WHERE NHL_TEAM_ID IS NOT NULL"
+    # team_nhl_id_aliases: extra NHL API ids after rebrands (Utah Mammoth = 68, teams row has 59)
+    teams_map_query = ("SELECT NHL_TEAM_ID, team_id FROM teams WHERE NHL_TEAM_ID IS NOT NULL "
+                       "UNION SELECT nhl_team_id, team_id FROM team_nhl_id_aliases")
     api_to_internal = pd.read_sql_query(teams_map_query, con).set_index('NHL_TEAM_ID')['team_id'].to_dict()
             
     df_events['team_id'] = df_events['nhl_api_team_id'].map(api_to_internal)
@@ -1090,6 +1223,273 @@ def process_rush_metrics(con) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=['game_id', 'team_id', 'rush_attempts_for'])
     return df
+
+
+# Lineup-aggregated RAPM (roster-aware team strength). Ratings come from
+# compute_rapm_by_season.py (rapm_by_season.csv) — leakage-safe per-season
+# (each season uses prior seasons). For each team-game we TOI-weight the actual
+# dressed skaters' D-RAPM (validated defensive signal) + O-RAPM. Low-TOI players
+# (call-ups who barely played in the rating window) and players with no rating
+# fall back to that season's league-average rating so a 1-2 game cameo can't skew
+# the team aggregate.
+PLAYER_PROJ = os.environ.get('NHL_PLAYER_PROJ') == '1'   # EXPERIMENT 2026-09 (off = production)
+
+def process_player_projection(con) -> pd.DataFrame:
+    """EXPERIMENT 2026-09. Lineup-built 5v5 projection per team-game from PRIOR games only:
+    each dressed skater's on-ice xGF/xGA/CF/CA per hour over his earlier games (any team, since 2018),
+    half-life 40 of his games, shrunk 60 5v5-min toward the previous season's league rate; weighted by
+    his prior mean 5v5 TOI share (half-life 20) — never the target game's own ice time.
+    TOI-weighted on-ice rates == the team rate within a game, so these are directly team-scale."""
+    from scipy.signal import lfilter
+    cols = ['proj_xgf60', 'proj_xga60', 'proj_cf_pct', 'proj_xg_pct']
+    sk = pd.read_sql_query("""
+        SELECT game_id, team_id, player_id, mp_game_date d, mp_ice_time toi, mp_onice_f_xgoals fxg,
+               mp_onice_a_xgoals axg, mp_onice_f_shot_attempts fsa, mp_onice_a_shot_attempts asa
+        FROM mp_skater_game_stats WHERE situation_id = 1 AND mp_ice_time > 0 AND game_id >= '2018'""", con)
+    if sk.empty:
+        return pd.DataFrame(columns=['game_id', 'team_id'] + cols)
+    sk['game_id'] = sk['game_id'].astype(str)
+    sk = sk[sk['game_id'].str[4:6].isin(['02', '03'])]
+    sk['yr'] = sk['game_id'].str[:4].astype(int)
+    q = ['fxg', 'axg', 'fsa', 'asa']
+    lg = sk.groupby('yr')[q + ['toi']].sum()
+    lg_rate = lg[q].div(lg['toi'], axis=0) * 3600                    # league per-hour rates by season
+    sk = sk.sort_values(['player_id', 'd', 'game_id']).reset_index(drop=True)
+    mu = lg_rate.shift(1).bfill().reindex(sk['yr']).values            # previous season's (first season: own); AFTER the sort
+    sk['share'] = sk['toi'] / sk.groupby(['game_id', 'team_id'])['toi'].transform('sum')
+    starts = np.r_[np.where(np.r_[True, sk['player_id'].values[1:] != sk['player_id'].values[:-1]])[0], len(sk)]
+    def prior(x, H):   # per player: decayed sum over his EARLIER rows only
+        dd = 0.5 ** (1.0 / H); out = np.empty(len(x))
+        for a, b in zip(starts[:-1], starts[1:]):
+            out[a:b] = lfilter([0, dd], [1, -dd], x[a:b])
+        return out
+    cnt, sh = prior(np.ones(len(sk)), 20), prior(sk['share'].values, 20)
+    w = np.where(cnt > 1e-9, sh / np.maximum(cnt, 1e-9), sk['share'].median())
+    S_toi = prior(sk['toi'].values.astype(float), 40)
+    S = np.stack([prior(sk[c].values.astype(float) * 3600, 40) for c in q], 1)
+    kps = 60 * 60.0
+    rate = (S + kps * mu) / (S_toi + kps)[:, None]                    # shrunk per-hour on-ice rates
+    out = pd.DataFrame(rate * w[:, None], columns=q)
+    out['w'] = w; out['game_id'] = sk['game_id'].values; out['team_id'] = sk['team_id'].values
+    g = out[out['game_id'] >= '2021'].groupby(['game_id', 'team_id']).sum()
+    f, a, fs, as_ = [g[c] / g['w'] for c in q]
+    res = pd.DataFrame({'proj_xgf60': f, 'proj_xga60': a, 'proj_cf_pct': fs / (fs + as_),
+                        'proj_xg_pct': f / (f + a)}).reset_index()
+    res['team_id'] = res['team_id'].astype(int)
+    return res[['game_id', 'team_id'] + cols]
+
+LINEUP_OVERRIDE = os.environ.get('NHL_LINEUP_OVERRIDE') == '1'   # EXPERIMENT 2026-09 (off = production)
+# EXPERIMENT 2026-10 bet-time test: NHL_BETTIME=L|LG -> validation rows use only what was knowable at the open:
+#   L : lineup-driven inputs from the team's PREVIOUS game lineup;  LG: + previous game's starting goalie
+_BETTIME = None   # set only inside train() while building the bet-time feature frame
+_BT_LINEUP_COLS = ['roster_drapm', 'roster_orapm', 'proj_xgf60', 'proj_xga60', 'proj_cf_pct', 'proj_xg_pct']
+_BT_GOALIE_COLS = ['goalie_roll_gsax', 'goalie_roll_hd_gsax', 'goalie_roll_rcr', 'goalie_roll_fatigue_index', 'goalie_ghsf']
+
+def _bettime_shift(df, cols):
+    """replace each team-game's values with the team's previous game's values (first game keeps its own)"""
+    df = df.sort_values(['team_id', 'mp_game_date'])
+    for c in cols:
+        if c in df.columns:
+            df[c] = df.groupby('team_id')[c].shift(1).fillna(df[c])
+    return df
+OVR_FULL_TRUST = 0.85      # continuity at/above which team form is fully trusted
+OVR_WINDOW = 10            # games behind the 10-game team-form inputs
+# team-form column -> (lineup-projection column, scale): form + scale * (proj_tonight - proj_window)
+OVR_DELTA = {'roll_xgf': ('proj_xgf60', 0.8), 'roll3_xgf': ('proj_xgf60', 0.8),
+             'roll_goals_for': ('proj_xgf60', 0.8), 'roll3_goals_for': ('proj_xgf60', 0.8),
+             'roll_xga': ('proj_xga60', 0.8), 'roll3_xga': ('proj_xga60', 0.8),
+             'roll_sa_corsi_pct': ('proj_cf_pct', 1.0), 'roll3_sa_corsi_pct': ('proj_cf_pct', 1.0),
+             'roll_hdcf_share': ('proj_xg_pct', 1.0), 'roll3_hdcf_share': ('proj_xg_pct', 1.0)}
+
+def _lineup_continuity(con) -> pd.DataFrame:
+    """EXPERIMENT 2026-09. Per team-game: ice-time overlap between this game's dressed skaters (weighted by
+    each one's PRIOR mean TOI share, any team) and the skaters who played the team's previous OVR_WINDOW games."""
+    from scipy.signal import lfilter
+    lu = pd.read_sql_query("""SELECT s.game_id, s.team_id, s.player_id, s.mp_ice_time toi, g.game_date d
+        FROM mp_skater_game_stats s JOIN games g ON g.game_id = s.game_id
+        WHERE s.situation_id = 2 AND s.mp_ice_time > 0""", con)
+    lu['game_id'] = lu['game_id'].astype(str); lu['player_id'] = lu['player_id'].astype(str)
+    lu['share'] = lu['toi'] / lu.groupby(['game_id', 'team_id'])['toi'].transform('sum')
+    lu = lu.sort_values(['player_id', 'd', 'game_id']).reset_index(drop=True)
+    starts = np.r_[np.where(np.r_[True, lu['player_id'].values[1:] != lu['player_id'].values[:-1]])[0], len(lu)]
+    dd = 0.5 ** (1 / 20.0); cnt = np.empty(len(lu)); sh = np.empty(len(lu))
+    for a_, b_ in zip(starts[:-1], starts[1:]):
+        cnt[a_:b_] = lfilter([0, dd], [1, -dd], np.ones(b_ - a_))
+        sh[a_:b_] = lfilter([0, dd], [1, -dd], lu['share'].values[a_:b_])
+    lu['w'] = np.where(cnt > 1e-9, sh / np.maximum(cnt, 1e-9), lu['share'].median())   # prior share only
+    out = []
+    for tid, t in lu.groupby('team_id'):
+        order = t[['game_id', 'd']].drop_duplicates().sort_values(['d', 'game_id'])['game_id'].tolist()
+        A = t.pivot_table(index='game_id', columns='player_id', values='toi', aggfunc='sum').reindex(order).fillna(0).values
+        Wt = t.pivot_table(index='game_id', columns='player_id', values='w', aggfunc='sum').reindex(order).fillna(0).values
+        Wt = Wt / np.maximum(Wt.sum(1, keepdims=True), 1e-12)
+        C = np.vstack([np.zeros(A.shape[1]), np.cumsum(A, 0)])
+        cont = np.full(len(order), np.nan)
+        for g in range(1, len(order)):
+            win = C[g] - C[max(0, g - OVR_WINDOW)]
+            if win.sum() > 0:
+                cont[g] = np.minimum(win / win.sum(), Wt[g]).sum()
+        out.append(pd.DataFrame({'game_id': order, 'team_id': int(tid), 'lineup_continuity': cont}))
+    return pd.concat(out, ignore_index=True)
+
+def apply_lineup_override(df, con) -> pd.DataFrame:
+    """EXPERIMENT 2026-09 (NHL_LINEUP_OVERRIDE=1, needs NHL_ROLL_MODE=shrink + NHL_PLAYER_PROJ=1).
+    Team-form inputs re-anchored to the lineup actually dressed, using only pre-game information:
+      * columns with a lineup analogue: form + scale * (projection of this lineup - mean projection of the
+        lineups that played the previous OVR_WINDOW games)
+      * other rolling team stats: shrunk toward the 2022-23 league prior by trust w = min(1, continuity/0.85)
+      * adds `lineup_continuity` as a feature."""
+    cont = _lineup_continuity(con)
+    df = df.merge(cont, on=['game_id', 'team_id'], how='left')
+    df['lineup_continuity'] = df['lineup_continuity'].fillna(1.0)
+    if _BETTIME:   # tonight's lineup unknown -> previous game's continuity
+        df = _bettime_shift(df, ['lineup_continuity'])
+    df = df.sort_values(['team_id', 'mp_game_date'])
+    for pc in {v[0] for v in OVR_DELTA.values()}:
+        win = df.groupby('team_id')[pc].transform(lambda x: x.shift(1).rolling(OVR_WINDOW, min_periods=1).mean())
+        df[f'_d_{pc}'] = (df[pc] - win).fillna(0.0)
+    _override_columns(df, {pc: df[f'_d_{pc}'] for pc in {v[0] for v in OVR_DELTA.values()}}, df['lineup_continuity'])
+    return df.drop(columns=[c for c in df.columns if c.startswith('_d_')])
+
+def _override_columns(obj, deltas, continuity):
+    """Shared by training (DataFrame) and the sim (one team Series): roster-delta on analogue columns,
+    continuity-weighted shrink toward the 2022-23 prior on the rest, rebuild consolidated EDGE columns. In place."""
+    cols = list(obj.columns) if isinstance(obj, pd.DataFrame) else list(obj.index)
+    for col, (pc, k) in OVR_DELTA.items():
+        if col in cols:
+            obj[col] = obj[col] + k * deltas[pc]
+    w = np.minimum(1.0, continuity / OVR_FULL_TRUST)
+    for col in cols:
+        if not col.startswith(('roll_', 'roll3_', 'roll5_', 'roll10_', 'roll20_')) or col in OVR_DELTA:
+            continue
+        base = col.split('_', 1)[1]
+        base = {'win_rate': 'win'}.get(base, base)      # roll5/roll10_win_rate are rolled from raw column 'win'
+        mu = _ROLL_PRIORS.get(base)
+        if mu is not None and np.isfinite(mu):
+            obj[col] = w * obj[col] + (1 - w) * mu
+    # consolidated EDGE features are sums/ratios of the (now shrunk) zone columns: rebuild them
+    if all(c in cols for c in ['roll10_edge_giveaway_d', 'roll10_edge_giveaway_n', 'roll10_edge_giveaway_o']):
+        obj['roll_edge_giveaway_total'] = obj['roll10_edge_giveaway_d'] + obj['roll10_edge_giveaway_n'] + obj['roll10_edge_giveaway_o']
+        obj['roll_edge_giveaway_dzone_pct'] = obj['roll10_edge_giveaway_d'] / (obj['roll_edge_giveaway_total'] + 0.1)
+        obj['roll3_edge_giveaway_total'] = obj['roll3_edge_giveaway_d'] + obj['roll3_edge_giveaway_n'] + obj['roll3_edge_giveaway_o']
+    if 'roll10_edge_blocked_shot_d' in cols:
+        obj['roll_edge_dzone_blocks'] = obj['roll10_edge_blocked_shot_d']
+        obj['roll3_edge_dzone_blocks'] = obj['roll3_edge_blocked_shot_d']
+    return obj
+
+def project_lineup_asof(con, player_ids, before_date):
+    """EXPERIMENT 2026-10 (sim side). Same math as process_player_projection, for ANY lineup, using each
+    player's games strictly before `before_date` (YYYY-MM-DD). Returns {proj_xgf60, proj_xga60, proj_cf_pct, proj_xg_pct}."""
+    from scipy.signal import lfilter
+    sk = pd.read_sql_query("""
+        SELECT game_id, team_id, player_id, mp_game_date d, mp_ice_time toi, mp_onice_f_xgoals fxg,
+               mp_onice_a_xgoals axg, mp_onice_f_shot_attempts fsa, mp_onice_a_shot_attempts asa
+        FROM mp_skater_game_stats WHERE situation_id = 1 AND mp_ice_time > 0 AND game_id >= '2018'""", con)
+    sk['game_id'] = sk['game_id'].astype(str); sk['player_id'] = sk['player_id'].astype(str)
+    sk = sk[sk['game_id'].str[4:6].isin(['02', '03'])]
+    sk['yr'] = sk['game_id'].str[:4].astype(int)
+    q = ['fxg', 'axg', 'fsa', 'asa']
+    lg = sk.groupby('yr')[q + ['toi']].sum(); lg_rate = lg[q].div(lg['toi'], axis=0) * 3600
+    tonight_yr = int(before_date[:4]) if int(before_date[5:7]) >= 9 else int(before_date[:4]) - 1
+    prev = [y for y in lg_rate.index if y < tonight_yr]
+    mu = lg_rate.loc[prev[-1] if prev else lg_rate.index.min()].values
+    sk['share'] = sk['toi'] / sk.groupby(['game_id', 'team_id'])['toi'].transform('sum')
+    dkey = before_date.replace('-', '')
+    hist = sk[sk['d'].astype(str).str.replace('-', '') < dkey].sort_values(['player_id', 'd', 'game_id'])
+    kps = 60 * 60.0
+    rates, weights = [], []
+    for pid in [str(p) for p in player_ids]:
+        h = hist[hist['player_id'] == pid]
+        if h.empty:
+            rates.append(mu); weights.append(sk['share'].median()); continue
+        def post(x, H):   # decayed sum over ALL his earlier rows, as of the next game
+            dd = 0.5 ** (1.0 / H)
+            return lfilter([0, dd], [1, -dd], np.r_[x, 0.0])[-1]
+        cnt, shs = post(np.ones(len(h)), 20), post(h['share'].values, 20)
+        weights.append(shs / cnt if cnt > 1e-9 else sk['share'].median())
+        S_toi = post(h['toi'].values.astype(float), 40)
+        S = np.array([post(h[c].values.astype(float) * 3600, 40) for c in q])
+        rates.append((S + kps * mu) / (S_toi + kps))
+    rates, weights = np.array(rates), np.array(weights)
+    f, a, fs, as_ = (rates * weights[:, None]).sum(0) / weights.sum()
+    return {'proj_xgf60': f, 'proj_xga60': a, 'proj_cf_pct': fs / (fs + as_), 'proj_xg_pct': f / (f + a)}
+
+def continuity_asof(con, team_id, player_ids, before_date):
+    """EXPERIMENT 2026-10 (sim side). Same measure as _lineup_continuity, for ANY lineup: overlap between the
+    lineup (each player weighted by his prior mean TOI share, any team, H=20) and the team's last OVR_WINDOW games
+    before `before_date`."""
+    from scipy.signal import lfilter
+    lu = pd.read_sql_query("""SELECT s.game_id, s.team_id, s.player_id, s.mp_ice_time toi, g.game_date d
+        FROM mp_skater_game_stats s JOIN games g ON g.game_id = s.game_id
+        WHERE s.situation_id = 2 AND s.mp_ice_time > 0 AND g.game_date < ?""", con, params=[before_date])
+    lu['game_id'] = lu['game_id'].astype(str); lu['player_id'] = lu['player_id'].astype(str)
+    lu['share'] = lu['toi'] / lu.groupby(['game_id', 'team_id'])['toi'].transform('sum')
+    med = lu['share'].median()
+    wts = {}
+    for pid in [str(p) for p in player_ids]:
+        h = lu[lu['player_id'] == pid].sort_values(['d', 'game_id'])
+        dd = 0.5 ** (1 / 20.0)
+        cnt = lfilter([0, dd], [1, -dd], np.r_[np.ones(len(h)), 0.0])[-1]
+        sh = lfilter([0, dd], [1, -dd], np.r_[h['share'].values, 0.0])[-1]
+        wts[pid] = sh / cnt if cnt > 1e-9 else med
+    t = lu[lu['team_id'] == int(team_id)]
+    last = t[['game_id', 'd']].drop_duplicates().sort_values(['d', 'game_id']).tail(OVR_WINDOW)['game_id']
+    win = t[t['game_id'].isin(last)].groupby('player_id')['toi'].sum()
+    if win.sum() <= 0:
+        return 1.0
+    win = win / win.sum()
+    W = pd.Series(wts); W = W / W.sum()
+    return float(np.minimum(win.reindex(W.index).fillna(0.0), W).sum())
+
+ROSTER_RAPM_PATH = "rapm_by_season.csv"
+ROSTER_MIN_TOI = 150.0  # 5v5 minutes in the rating window to trust an individual rating
+
+def process_roster_rapm(con) -> pd.DataFrame:
+    cols = ['game_id', 'team_id', 'roster_drapm', 'roster_orapm']
+    if not os.path.exists(ROSTER_RAPM_PATH):
+        print(f"Note: {ROSTER_RAPM_PATH} not found — roster RAPM features will be 0. "
+              f"Run compute_rapm_by_season.py to enable.")
+        return pd.DataFrame(columns=cols)
+
+    rt = pd.read_csv(ROSTER_RAPM_PATH)
+    rt['player_id'] = rt['player_id'].astype(str)
+    rt['ok'] = rt['toi_5v5_min'] >= ROSTER_MIN_TOI
+
+    # per-season league averages over trustworthy (qualified-TOI) players
+    qual = rt[rt['ok']]
+    lg = qual.groupby('season').agg(lg_d=('d_rapm', 'mean'), lg_o=('o_rapm', 'mean'))
+    lg_d_all, lg_o_all = qual['d_rapm'].mean(), qual['o_rapm'].mean()
+
+    all_id = get_situation_id(con)
+    ros = pd.read_sql_query(f"""
+        SELECT s.game_id, s.team_id, s.player_id, s.mp_ice_time AS toi, g.season
+        FROM mp_skater_game_stats s JOIN games g ON s.game_id = g.game_id
+        WHERE s.situation_id = {all_id} AND s.mp_ice_time > 0
+    """, con)
+    if ros.empty:
+        return pd.DataFrame(columns=cols)
+    ros['player_id'] = ros['player_id'].astype(str)
+    ros['game_id'] = ros['game_id'].astype(str)
+
+    ros = ros.merge(rt[['season', 'player_id', 'd_rapm', 'o_rapm', 'ok']],
+                    on=['season', 'player_id'], how='left')
+    ros['ok'] = ros['ok'].fillna(False)
+    # league-average fallback (per season, else global)
+    ros['lg_d'] = ros['season'].map(lg['lg_d']).fillna(lg_d_all)
+    ros['lg_o'] = ros['season'].map(lg['lg_o']).fillna(lg_o_all)
+    ros['d_use'] = np.where(ros['ok'], ros['d_rapm'], ros['lg_d'])
+    ros['o_use'] = np.where(ros['ok'], ros['o_rapm'], ros['lg_o'])
+
+    def wavg(g, c):
+        w = g['toi'].values
+        return float(np.average(g[c].values, weights=w)) if w.sum() > 0 else 0.0
+    agg = (ros.groupby(['game_id', 'team_id'])
+              .apply(lambda g: pd.Series({'roster_drapm': wavg(g, 'd_use'),
+                                          'roster_orapm': wavg(g, 'o_use')}),
+                     include_groups=False)
+              .reset_index())
+    agg['team_id'] = agg['team_id'].astype(int)
+    return agg[cols]
 
 
 # ---------------------------
@@ -1224,7 +1624,7 @@ def validate_training_data(df, verbose=True):
         print("DATA QUALITY VALIDATION")
         print("=" * 70)
         print(f"Dataset size: {len(df)} games")
-        print(f"Feature count: {len(feature_cols)}")
+        print(f"Column count (pre-selection): {len(feature_cols)}  (model feature count printed at training start)")
 
         if issues:
             print(f"\n⚠️  CRITICAL ISSUES ({len(issues)}):")
@@ -1290,10 +1690,10 @@ def process_win_rate_features(con) -> pd.DataFrame:
     
     # Rolling win rates (shift to avoid leakage)
     team_games['roll5_win_rate'] = grp['win'].transform(
-        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+        lambda x: roll_mean(x, 5, 1, 'win')
     )
     team_games['roll10_win_rate'] = grp['win'].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
+        lambda x: roll_mean(x, 10, 1, 'win')
     )
     
     # Fill NaNs with 0.5 (neutral)
@@ -1396,8 +1796,47 @@ def process_home_ice_features(con) -> pd.DataFrame:
     return out
 
 
+# EXPERIMENT 2026-10: cross-season FORM DISCOUNT. Rolling team-form windows run straight through the offseason, so on
+# opening night a team's "form" is last spring's games played by a different roster. The share of each window that
+# comes from LAST season is pulled toward the previous season's league mean by (1 - carry); carry per feature is the
+# measured cross-season persistence relative to within-season persistence (form_carry.json, fit on seasons <= 2022-23).
+FORM_DISCOUNT = os.environ.get('NHL_FORM_DISCOUNT') == '1'
+FORM_CARRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'form_carry.json')
+_FORM_RE = re.compile(r'^(roll\d*_|home_ice_|opp_xg_suppression$|hdsm$)')
+
+def _form_window(c):
+    mm = re.match(r'roll(\d+)_', c)
+    return int(mm.group(1)) if mm else (20 if c.startswith('home_ice_') else (3 if c == 'hdsm' else 10))
+
+def form_discount_factor(c, games_this_season, carry):
+    """Multiplier on (value - league mean): 1 when the window is all this season, carry when it is all last season."""
+    n = _form_window(c)
+    w_prev = np.clip((n - np.asarray(games_this_season, dtype=float)) / n, 0.0, 1.0)
+    return 1.0 - w_prev * (1.0 - carry.get(c, carry['_default']))
+
+def _load_form_carry():
+    with open(FORM_CARRY_PATH) as fh:
+        return {k: v for k, v in json.load(fh).items() if k != '_note'}
+
+def apply_form_discount(df):
+    """df: team-level rows (team_id, game_id, roll_* ...). Leak-free: league means are the PREVIOUS season's."""
+    if ROLL_MODE != 'window':
+        raise SystemExit("NHL_FORM_DISCOUNT is only defined for window rolling (NHL_ROLL_MODE unset)")
+    carry = _load_form_carry()
+    df = df.sort_values(['team_id', 'mp_game_date', 'game_id']).copy()
+    season = df['game_id'].astype(str).str[:4].astype(int)
+    g = df.groupby(['team_id', season]).cumcount().values                # this team's games this season before this one
+    had_prev = (df.groupby('team_id').cumcount().values - g) > 0         # team has games from an earlier season
+    g = np.where(had_prev, g, 10_000)                                    # first season in the DB: nothing to discount
+    cols = [c for c in df.columns if _FORM_RE.match(c) and pd.api.types.is_numeric_dtype(df[c])]
+    for c in cols:
+        by_year = df.groupby(season)[c].mean()
+        mu = season.map(by_year.shift(1).fillna(by_year)).astype(float).values
+        df[c] = mu + (df[c].values - mu) * form_discount_factor(c, g, carry)
+    return df
+
 def get_base_team_stats(db_path, use_complete_games_filter=True):
-    con = sqlite3.connect(db_path)
+    con = _connect(db_path)
     ALL_ID = get_situation_id(con)
 
     # Get filtered game list if enabled
@@ -1443,11 +1882,12 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
 
     df['mp_game_date'] = pd.to_datetime(df['mp_game_date'])
 
-    for func in [process_special_teams, process_nst_metrics,
+    for func in ([process_special_teams, process_nst_metrics,
                   process_shot_metrics, process_advanced_metrics, process_edge_metrics,
                   process_opposition_adjusted_xg, process_linemate_synergy, process_rush_metrics,
                   process_skater_chemistry, process_matchup_metrics, process_win_rate_features,
-                  process_home_ice_features]:
+                  process_home_ice_features, process_roster_rapm]
+                 + ([process_player_projection] if PLAYER_PROJ else [])):
         extra = func(con)
         if not extra.empty:
             df = pd.merge(df, extra, on=['game_id', 'team_id'], how='left')
@@ -1494,7 +1934,7 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     
     # Fill missing goalie features (games where goalie data unavailable)
     # Default values based on league averages calculated in process_goalie_metrics
-    LEAGUE_AVG_RCR = 0.82
+    LEAGUE_AVG_RCR = 0.92   # measured mean rebound control (1 - rebounds/saves); was 0.82
     LEAGUE_AVG_FATIGUE = 150.0
     
     for c in ['goalie_roll_gsax', 'goalie_roll_hd_gsax', 'goalie_ghsf']:
@@ -1508,6 +1948,11 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     else: df['goalie_roll_fatigue_index'] = LEAGUE_AVG_FATIGUE
 
     con.close()
+    # 2026-10-02: a rolled input that is MISSING for a team-game (e.g. no linemate/matchup rows) gets the column
+    # median, not 0 — a 0 read as a real extreme value (roll_matchup_rate = 0 was -21 SD).
+    for _c in [c for c in df.columns if c.startswith(('roll_', 'roll3_', 'roll5_', 'roll10_', 'roll20_'))]:
+        if df[_c].isna().any():
+            df[_c] = df[_c].fillna(df[_c].median())
     df = df.fillna(0);
     assert(df is not None), "dataframe got nuked";
     df = df.sort_values(['team_id', 'mp_game_date'])
@@ -1515,11 +1960,11 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
     grp = df.groupby('team_id')
     for c in ['xgf', 'xga', 'pens', 'goals_for', 'rush_attempts_for', 'avg_dist', 'avg_angle']:
         # Standard 10-game rolling
-        df[f'roll_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        df[f'roll_{c}'] = grp[c].transform(lambda x: roll_mean(x, 10, 1, c))
 
         # Trend rolling (3 and 20)
-        df[f'roll3_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
-        df[f'roll20_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+        df[f'roll3_{c}'] = grp[c].transform(lambda x: roll_mean(x, 3, 1, c))
+        df[f'roll20_{c}'] = grp[c].transform(lambda x: roll_mean(x, 20, 1, c))
 
         # Fill NaNs
         league_avg = df[c].mean()
@@ -1528,7 +1973,7 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
 
     # Roll LSS: 10-game shifted window so it's always pre-game information
     if 'lss' in df.columns:
-        df['roll_lss'] = grp['lss'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        df['roll_lss'] = grp['lss'].transform(lambda x: roll_mean(x, 10, 1, 'lss'))
         df['roll_lss'] = df['roll_lss'].fillna(0.0)
 
     # Apply rolling averages to edge_giveaway and edge_blocked_shot features
@@ -1544,10 +1989,10 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
 
     for c in edge_cols_to_roll:
         # 3-game rolling average
-        df[f'roll3_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+        df[f'roll3_{c}'] = grp[c].transform(lambda x: roll_mean(x, 3, 1, c))
 
         # 10-game rolling average
-        df[f'roll10_{c}'] = grp[c].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+        df[f'roll10_{c}'] = grp[c].transform(lambda x: roll_mean(x, 10, 1, c))
 
         # Fill NaNs with league average
         league_avg = df[c].mean()
@@ -1592,8 +2037,19 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
         df['roll_edge_dzone_blocks'] = 0.0
         df['roll3_edge_dzone_blocks'] = 0.0
 
+    if FORM_DISCOUNT:   # EXPERIMENT 2026-10 (off = production)
+        df = apply_form_discount(df)
+
     df['prev_date'] = grp['mp_game_date'].shift(1)
-    df['rest_days'] = (df['mp_game_date'] - df['prev_date']).dt.days.fillna(2).clip(0, 10)
+    df['rest_days'] = (df['mp_game_date'] - df['prev_date']).dt.days.fillna(2).clip(0, REST_CAP)
+
+    if _BETTIME:   # EXPERIMENT 2026-10: bet-time information only (see train())
+        df = _bettime_shift(df, _BT_LINEUP_COLS + (_BT_GOALIE_COLS if _BETTIME == 'LG' else []))
+
+    if LINEUP_OVERRIDE:   # EXPERIMENT 2026-09
+        if not (PLAYER_PROJ and ROLL_MODE == 'shrink'):
+            raise SystemExit("NHL_LINEUP_OVERRIDE=1 needs NHL_ROLL_MODE=shrink and NHL_PLAYER_PROJ=1")
+        _c = _connect(db_path); df = apply_lineup_override(df, _c); _c.close()
 
     home = df[df['side'] == 'HOME'].rename(columns=lambda c: f"home_{c}" if c not in ['game_id'] else c)
     away = df[df['side'] == 'AWAY'].rename(columns=lambda c: f"away_{c}" if c not in ['game_id'] else c)
@@ -1652,6 +2108,23 @@ def get_base_team_stats(db_path, use_complete_games_filter=True):
         final['goalie_hd_gsax_diff'] = 0.0
         final['home_goalie_quality'] = 0.0
         final['away_goalie_quality'] = 0.0
+
+    # ROSTER RAPM MATCHUP: lineup-aggregated defensive RAPM is the validated signal.
+    # d_rapm is lower=better defense; a team's GOALS are driven by the OPPONENT's
+    # lineup defense, so expose each side's offense-vs-opponent-defense matchup.
+    if 'home_roster_drapm' in final.columns and 'away_roster_drapm' in final.columns:
+        for c in ['home_roster_drapm', 'away_roster_drapm', 'home_roster_orapm', 'away_roster_orapm']:
+            if c in final.columns:
+                final[c] = final[c].fillna(0.0)
+        # home attack faces away defense; away attack faces home defense
+        final['home_roster_off_vs_def'] = final['home_roster_orapm'] - final['away_roster_drapm']
+        final['away_roster_off_vs_def'] = final['away_roster_orapm'] - final['home_roster_drapm']
+        # net lineup-defense edge (positive = home has the stronger defensive lineup)
+        final['roster_drapm_diff'] = final['away_roster_drapm'] - final['home_roster_drapm']
+    else:
+        for c in ['home_roster_drapm', 'away_roster_drapm', 'home_roster_orapm', 'away_roster_orapm',
+                  'home_roster_off_vs_def', 'away_roster_off_vs_def', 'roster_drapm_diff']:
+            final[c] = 0.0
 
     # LEAGUE-WIDE HOME ICE TREND: Rolling home win % across entire league
     # Captures macro trend (e.g., 2024-25 season's depressed ~42.5% home win rate)
@@ -1947,8 +2420,17 @@ def get_features(df):
             features.append(c)
             continue
 
-        if base_c in ['rest', 'osa_xg', 'hdsm', 'opp_xg_suppression', 'sted',
-                      'goalie_gsax_diff', 'goalie_hd_gsax_diff', 'goalie_quality']:
+        # 2c. KEEP roster-aggregated RAPM matchup (game-level diff, known pre-game)
+        if c == 'roster_drapm_diff':
+            features.append(c)
+            continue
+
+        if base_c in (['rest', 'osa_xg', 'hdsm', 'opp_xg_suppression', 'sted',
+                      'goalie_gsax_diff', 'goalie_hd_gsax_diff', 'goalie_quality',
+                      # roster-aware lineup RAPM (D-RAPM validated; O-RAPM low-signal but kept)
+                      'roster_drapm', 'roster_orapm', 'roster_off_vs_def']
+                     + (['proj_xgf60', 'proj_xga60', 'proj_cf_pct', 'proj_xg_pct'] if PLAYER_PROJ else [])
+                     + (['lineup_continuity'] if LINEUP_OVERRIDE else [])):
             features.append(c)
             continue
 
@@ -2291,10 +2773,10 @@ def odds_backtest(val_game_ids, val_pred_home, val_pred_away, val_actual_home, v
 # ---------------------------
 # Train & Forecast
 # ---------------------------
-def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, use_pruned_features=False, use_adam=False):
+def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, use_pruned_features=False, use_adam=False, val_start=None, val_end=None, dump_preds=None):
     print("preparing training data...")
     print(f"game filtering: {'ENABLED' if use_complete_games_filter else 'DISABLED'}")
-    print(f"feature set: {'PRUNED (~40)' if use_pruned_features else 'FULL (~124)'}")
+    print(f"feature set: {'PRUNED' if use_pruned_features else 'FULL'} (exact count printed at training start)")
     print(f"optimizer: {'ADAM' if use_adam else 'SGD'}\n")
     df = prepare_training_data(db, use_complete_games_filter=use_complete_games_filter)
     if df.empty:
@@ -2311,8 +2793,36 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
     # Temporal Validation Split: train on older games, validate on most recent
     # Sort by date so split is chronological (no future leakage)
     df = df.sort_values('mp_game_date').reset_index(drop=True)
-    val_size = int(len(df) * 0.08)
-    train_size = len(df) - val_size
+    if val_start is not None:
+        # Walk-forward fold: train = games before val_start; val = [val_start, val_end);
+        # games on/after val_end are FUTURE and dropped entirely (no leakage).
+        vs = pd.to_datetime(val_start)
+        ve = pd.to_datetime(val_end) if val_end else (df['mp_game_date'].max() + pd.Timedelta(days=1))
+        df = df[df['mp_game_date'] < ve].reset_index(drop=True)
+        train_size = int((df['mp_game_date'] < vs).sum())
+        if train_size < 100 or train_size >= len(df):
+            print(f"⚠  walk-forward fold has too few train/val games (train={train_size}, total={len(df)}); skipping")
+            return
+        val_size = len(df) - train_size
+    else:
+        val_size = int(len(df) * 0.08)
+        train_size = len(df) - val_size
+
+    if os.environ.get('NHL_BETTIME') in ('L', 'LG'):   # EXPERIMENT 2026-10
+        global _BETTIME
+        _BETTIME = os.environ['NHL_BETTIME']
+        try:
+            dfb = prepare_training_data(db, use_complete_games_filter=use_complete_games_filter).set_index('game_id')
+        finally:
+            _BETTIME = None
+        vids = df.loc[train_size:, 'game_id'].values
+        missing = set(vids) - set(dfb.index)
+        assert not missing, f"bet-time frame lacks {len(missing)} validation games"
+        before = df.loc[train_size:, feats].values.copy()
+        df.loc[train_size:, feats] = dfb.loc[vids, feats].values
+        changed = (np.abs(df.loc[train_size:, feats].values - before) > 1e-12).any(axis=0)
+        print(f"[BET-TIME {os.environ['NHL_BETTIME']}] validation rows rebuilt from pre-game information; "
+              f"{int(changed.sum())} feature columns differ from actual-lineup values")
 
     split_date = df.iloc[train_size]['mp_game_date']
     print(f"\nTemporal split: train up to {df.iloc[train_size - 1]['mp_game_date'].date()} | validate from {split_date.date()}")
@@ -2422,13 +2932,26 @@ def train(db, epochs, batch, lr, hidden, seed, use_complete_games_filter=True, u
         # Fallback if weirdly nothing improved (unlikely)
         np.savez(MODEL_PARAMS_PATH, **{k: np.array(v) for k, v in params.items()})
 
-    np.savez("feature_list.npz", features=np.array(feats))
+    np.savez(FEATURE_LIST_PATH, features=np.array(feats))
 
     # Calculate calibration factor on validation set
     print("\nCalculating calibration factor on validation set...")
     final_params = best_params if best_params is not None else params
     # Forward pass WITHOUT dropout for calibration
     val_predictions = forward(final_params, X_val, training=False, rng_key=None, dropout_rate=0.0)
+
+    # Optionally dump val-set predictions (raw lambdas) for external backtests
+    # (e.g. walk-forward against opening lines). game_ids are the val rows of the
+    # date-sorted df.
+    if dump_preds:
+        vp = np.array(val_predictions)
+        val_gids = df.iloc[train_size:]['game_id'].values
+        pd.DataFrame({
+            'game_id': val_gids,
+            'pred_home': vp[:, 0], 'pred_away': vp[:, 1],
+            'actual_home': np.array(Y_val[:, 0]), 'actual_away': np.array(Y_val[:, 1]),
+        }).to_csv(dump_preds, index=False)
+        print(f"dumped {len(val_gids)} val predictions -> {dump_preds}")
 
     # Calculate predicted average goals per team
     predicted_home_avg = float(jnp.mean(val_predictions[:, 0]))
@@ -2683,15 +3206,20 @@ def get_latest_stats_for_manual(db_path):
     combined = pd.concat([home_latest, away_latest]).sort_values(['team_id', 'mp_game_date'])
     latest = combined.drop_duplicates('team_id', keep='last')
 
-    teams = pd.read_sql_query("SELECT team_id, team_abbr FROM teams", sqlite3.connect(db_path))
+    teams = pd.read_sql_query("SELECT team_id, team_abbr FROM teams", _connect(db_path))
     teams['normalized_abbr'] = teams['team_abbr'].apply(lambda x: norm(x))
     latest = pd.merge(teams, latest, on='team_id', how='left').fillna(0)
     latest['mp_game_date'] = pd.to_datetime(latest['mp_game_date'])
+    if FORM_DISCOUNT:   # per-season league means of the form columns, for discounting a stale (last-season) row
+        _sea = df['game_id'].astype(str).str[:4].astype(int)
+        _fc = [c[5:] for c in df.columns if c.startswith('home_') and _FORM_RE.match(c[5:]) and f'away_{c[5:]}' in df.columns]
+        _form_mu = pd.DataFrame({c: pd.concat([df[f'home_{c}'], df[f'away_{c}']]).groupby(
+            pd.concat([_sea, _sea])).mean() for c in _fc})
 
     # NEW: Identify primary starter for each team
     # (Goalie who has started the most games in the last 10 games)
 
-    con = sqlite3.connect(db_path)
+    con = _connect(db_path)
     recent_starters_query = """
     WITH recent_games AS (
         SELECT g.game_id, g.game_date, g.home_team_id, g.away_team_id
@@ -2738,10 +3266,12 @@ def get_latest_stats_for_manual(db_path):
         
     con.close()
     
+    if FORM_DISCOUNT:
+        latest.attrs['form_mu'] = _form_mu   # set last: merges drop attrs
     return latest
 
 
-def _resolve_goalie_features(goalie_features_df, goalie_id, team_id, primary_goalie_id, side_label):
+def _resolve_goalie_features(goalie_features_df, goalie_id, team_id, primary_goalie_id, side_label, team_verified=False):
     """Return the latest per-goalie feature row for a forecast.
 
     Falls back to the team's primary starter (never league averages / zeros) when
@@ -2767,7 +3297,10 @@ def _resolve_goalie_features(goalie_features_df, goalie_id, team_id, primary_goa
     row = latest_row_for(goalie_id)
     if not row.empty:
         row_team = int(row['team_id'].iloc[0])
-        if int(team_id) == row_team:
+        if int(team_id) == row_team or team_verified:   # team_verified: starter confirmed on the CURRENT roster (pregame)
+            if int(team_id) != row_team:
+                print(f"  {side_label}: goalie {clean(goalie_id)} last played for team {row_team}; "
+                      f"accepted (on the current roster per pregame feed), using his latest form.")
             return row
         print(f"⚠  {side_label}: goalie {clean(goalie_id)} last played for team {row_team}, "
               f"not the requested team {int(team_id)} (likely a typo/swapped or traded goalie). "
@@ -2787,7 +3320,12 @@ def _resolve_goalie_features(goalie_features_df, goalie_id, team_id, primary_goa
     return pd.DataFrame()
 
 
-def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a_odd, n_sims, home_goalie_id=None, away_goalie_id=None, use_calibration=True):
+def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a_odd, n_sims, home_goalie_id=None, away_goalie_id=None, use_calibration=True, pregame=None, ensemble_tags=None):
+    global LINEUP_OVERRIDE
+    if (PLAYER_PROJ or LINEUP_OVERRIDE) and pregame is None:
+        raise SystemExit("NHL_PLAYER_PROJ / NHL_LINEUP_OVERRIDE need tonight's lineup: run without --offline.")
+    if LINEUP_OVERRIDE and not (PLAYER_PROJ and ROLL_MODE == 'shrink'):
+        raise SystemExit("NHL_LINEUP_OVERRIDE=1 needs NHL_ROLL_MODE=shrink and NHL_PLAYER_PROJ=1")
     if not os.path.exists(MODEL_PARAMS_PATH):
         print("No model – train first.")
         return
@@ -2796,10 +3334,27 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     h_norm = norm(home_abbr)
     a_norm = norm(away_abbr)
 
-    params = {k: jnp.array(v) for k, v in np.load(MODEL_PARAMS_PATH).items()}
-    feats = np.load("feature_list.npz")['features'].tolist()
+    # Model set(s): production = one model; --override = the tagged seed models, averaged (pooled sims)
+    if ensemble_tags:
+        sets = [(f"advanced_model_params_v6_{t}.npz", f"advanced_standardize_stats_v6_{t}.npz",
+                 f"model_calibration_v6_{t}.npz", f"feature_list_{t}.npz") for t in ensemble_tags]
+    else:
+        sets = [(MODEL_PARAMS_PATH, STATS_PATH, CALIBRATION_PATH, FEATURE_LIST_PATH)]
+    models = []
+    for mp, sp, cp, fp in sets:
+        if not all(os.path.exists(f) for f in (mp, sp, fp)):
+            raise SystemExit(f"missing model files for {mp} — train it first")
+        models.append(({k: jnp.array(v) for k, v in np.load(mp).items()}, sp, cp, np.load(fp)['features'].tolist()))
+    feats = models[0][3]
+    assert all(m[3] == feats for m in models), "ensemble models were trained on different feature lists"
+    params = models[0][0]
 
-    latest = get_latest_stats_for_manual(db)
+    _ovr_flag = LINEUP_OVERRIDE
+    LINEUP_OVERRIDE = False   # history rows un-overridden; tonight's override is applied below from TONIGHT's lineup
+    try:
+        latest = get_latest_stats_for_manual(db)
+    finally:
+        LINEUP_OVERRIDE = _ovr_flag
 
     h_candidates = latest[latest['normalized_abbr'] == h_norm]
     if h_candidates.empty:
@@ -2813,17 +3368,75 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
         return
     a_row = a_candidates.sort_values('roll_goals_for', ascending=False).iloc[0]
 
+    # Pre-game context (pregame.py): tonight's lineup ratings, real rest, feed goalies
+    goalie_verified = {'home': False, 'away': False}
+    if pregame is not None:
+        h_row, a_row = h_row.copy(), a_row.copy()
+        for side, row in (('home', h_row), ('away', a_row)):
+            row['roster_drapm'] = pregame[side]['roster_drapm']
+            row['roster_orapm'] = pregame[side]['roster_orapm']
+        print(f"pregame: roster ratings from tonight's projected lineups "
+              f"(home D {h_row['roster_drapm']:+.4f} O {h_row['roster_orapm']:+.4f} | "
+              f"away D {a_row['roster_drapm']:+.4f} O {a_row['roster_orapm']:+.4f})")
+        if home_goalie_id is None and pregame['home'].get('goalie_id'):
+            home_goalie_id = pregame['home']['goalie_id']; goalie_verified['home'] = True
+            print(f"pregame: home goalie {pregame['home']['goalie_name']} [{pregame['home']['goalie_status']}]")
+        if away_goalie_id is None and pregame['away'].get('goalie_id'):
+            away_goalie_id = pregame['away']['goalie_id']; goalie_verified['away'] = True
+            print(f"pregame: away goalie {pregame['away']['goalie_name']} [{pregame['away']['goalie_status']}]")
+
+    if FORM_DISCOUNT:   # EXPERIMENT 2026-10: a team that has not played yet this season carries last season's form
+        _d = pd.to_datetime(date_str or str(datetime.date.today()))
+        _tonight_season = _d.year if _d.month >= 8 else _d.year - 1
+        _carry, _mu = _load_form_carry(), latest.attrs['form_mu']
+        h_row, a_row = h_row.copy(), a_row.copy()
+        for side, row in (('home', h_row), ('away', a_row)):
+            _ld = pd.Timestamp(row['mp_game_date']); _row_season = _ld.year if _ld.month >= 8 else _ld.year - 1
+            if _row_season < _tonight_season and _row_season in _mu.index:
+                for c in _mu.columns:
+                    if c in row.index:
+                        row[c] = _mu.at[_row_season, c] + (row[c] - _mu.at[_row_season, c]) * float(form_discount_factor(c, 0, _carry))
+                print(f"form-discount {side}: first game of {_tonight_season}-{_tonight_season + 1 - 2000} -> "
+                      f"{_row_season} form carried at {_carry['_default']:.0%} (roll_xgf now {row['roll_xgf']:.2f})")
+    if PLAYER_PROJ and pregame is not None:   # EXPERIMENT 2026-10: tonight's lineup projections (+ override)
+        tonight = date_str or str(datetime.date.today())
+        _c = _connect(db)
+        pcols = ['proj_xgf60', 'proj_xga60', 'proj_cf_pct', 'proj_xg_pct']
+        proj_hist = process_player_projection(_c) if LINEUP_OVERRIDE else None
+        gd = dict(_c.execute("SELECT game_id, game_date FROM games")) if LINEUP_OVERRIDE else {}
+        for side, row in (('home', h_row), ('away', a_row)):
+            ids = [p['id'] for p in pregame[side]['lineup'] if p.get('id')]
+            pj = project_lineup_asof(_c, ids, tonight)
+            msg = f"pregame-proj {side}: " + ", ".join(f"{k} {v:.3f}" for k, v in pj.items())
+            if LINEUP_OVERRIDE:
+                tid = int(row['team_id'])
+                ph = proj_hist[proj_hist['team_id'] == tid].copy()
+                ph['d'] = ph['game_id'].map(gd)
+                ph = ph[ph['d'] < tonight].sort_values(['d', 'game_id']).tail(OVR_WINDOW)
+                cont = continuity_asof(_c, tid, ids, tonight)
+                _override_columns(row, {k: pj[k] - ph[k].mean() for k in pcols}, cont)
+                row['lineup_continuity'] = cont
+                msg += f" | continuity {cont:.2f} | Δxgf60 {pj['proj_xgf60'] - ph['proj_xgf60'].mean():+.3f} Δxga60 {pj['proj_xga60'] - ph['proj_xga60'].mean():+.3f}"
+            for k, v in pj.items():
+                row[k] = v
+            print(msg)
+        _c.close()
+
     # Calculate rest days from game date
     if (date_str is not None):
       print(f"\ncalculating rest days from date: {date_str}")
       target = pd.to_datetime(date_str)
-      h_rest = min(max((target - h_row['mp_game_date']).days, 0), 10)
-      a_rest = min(max((target - a_row['mp_game_date']).days, 0), 10)
+      h_rest = min(max((target - h_row['mp_game_date']).days, 0), REST_CAP)
+      a_rest = min(max((target - a_row['mp_game_date']).days, 0), REST_CAP)
     else:
-      # Clip manual rest inputs to match training distribution [0, 10]
-      h_rest = min(max(h_rest, 0), 10)
-      a_rest = min(max(a_rest, 0), 10)
+      # Clip manual rest inputs to match training distribution [0, REST_CAP]
+      h_rest = min(max(h_rest, 0), REST_CAP)
+      a_rest = min(max(a_rest, 0), REST_CAP)
     
+    if pregame is not None:   # real last-game dates (the DB's last game may be behind)
+        h_rest = min(max(pregame['home']['rest'], 0), REST_CAP)
+        a_rest = min(max(pregame['away']['rest'], 0), REST_CAP)
+        print("pregame: rest days from each team's actual last game")
     print(f"rest-days (home): {h_rest}")
     print(f"rest-days (away): {a_rest}")
     print(f"rest-days (diff): {h_rest - a_rest}")
@@ -2833,13 +3446,13 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
         home_goalie_id = h_row.get('primary_goalie_id', None)
         print(f"Using primary starter for {h_norm}: {home_goalie_id}")
     else:
-        print(f"User-specified goalie for {h_norm}: {home_goalie_id}")
+        print(f"{'Pregame-feed' if goalie_verified['home'] else 'User-specified'} goalie for {h_norm}: {home_goalie_id}")
 
     if away_goalie_id is None:
         away_goalie_id = a_row.get('primary_goalie_id', None)
         print(f"Using primary starter for {a_norm}: {away_goalie_id}")
     else:
-        print(f"User-specified goalie for {a_norm}: {away_goalie_id}")
+        print(f"{'Pregame-feed' if goalie_verified['away'] else 'User-specified'} goalie for {a_norm}: {away_goalie_id}")
         
     # Clean IDs for lookup
     if home_goalie_id: home_goalie_id = str(home_goalie_id).replace(' [G]', '').strip()
@@ -2848,7 +3461,7 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     print("\n")
 
     # NEW: Get goalie features for specified goalies
-    con = sqlite3.connect(db)
+    con = _connect(db)
     goalie_features_df = process_goalie_metrics(con)
     con.close()
 
@@ -2864,10 +3477,10 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     # used to validate membership after selecting the goalie's latest row.
     home_goalie_features = _resolve_goalie_features(
         goalie_features_df, home_goalie_id, h_row['team_id'],
-        h_row.get('primary_goalie_id', None), f"{h_norm} (home)")
+        h_row.get('primary_goalie_id', None), f"{h_norm} (home)", team_verified=goalie_verified['home'])
     away_goalie_features = _resolve_goalie_features(
         goalie_features_df, away_goalie_id, a_row['team_id'],
-        a_row.get('primary_goalie_id', None), f"{a_norm} (away)")
+        a_row.get('primary_goalie_id', None), f"{a_norm} (away)", team_verified=goalie_verified['away'])
 
     matchup = {}
     for f in feats:
@@ -2906,7 +3519,7 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
         #    matchup[f] = h_rest - a_rest
         elif f == 'league_home_win_pct':
             # Compute current league-wide home win % from recent games
-            con2 = sqlite3.connect(db)
+            con2 = _connect(db)
             league_query = """
             SELECT
                 COALESCE(h.mp_goals_for, 0) as home_goals,
@@ -2942,8 +3555,8 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     away_gsax = matchup.get('away_goalie_roll_gsax', 0.0)
     home_hd_gsax = matchup.get('home_goalie_roll_hd_gsax', 0.0)
     away_hd_gsax = matchup.get('away_goalie_roll_hd_gsax', 0.0)
-    home_rcr = matchup.get('home_goalie_roll_rcr', 0.82)  # Default to league avg
-    away_rcr = matchup.get('away_goalie_roll_rcr', 0.82)
+    home_rcr = matchup.get('home_goalie_roll_rcr', 0.92)  # Default to league avg (measured)
+    away_rcr = matchup.get('away_goalie_roll_rcr', 0.92)
 
     # Compute differential features
     if 'goalie_gsax_diff' in feats:
@@ -2959,37 +3572,69 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
             away_gsax * 0.4 + away_hd_gsax * 0.4 + (1.0 - away_rcr) * 0.2
         ) * GOALIE_BOOST_FACTOR
 
+    # ROSTER RAPM matchup features: recompute from each team's latest roster aggregate
+    # (home_/away_roster_drapm|orapm are filled by the generic handler from h_row/a_row).
+    h_rd = matchup.get('home_roster_drapm', 0.0); a_rd = matchup.get('away_roster_drapm', 0.0)
+    h_ro = matchup.get('home_roster_orapm', 0.0); a_ro = matchup.get('away_roster_orapm', 0.0)
+    if 'home_roster_off_vs_def' in feats:
+        matchup['home_roster_off_vs_def'] = h_ro - a_rd
+    if 'away_roster_off_vs_def' in feats:
+        matchup['away_roster_off_vs_def'] = a_ro - h_rd
+    if 'roster_drapm_diff' in feats:
+        matchup['roster_drapm_diff'] = a_rd - h_rd
+
+    # Matchup-specific team inputs, same formulas as training's final section. FIX 2026-10-01: these were
+    # copied from each team's LAST game, i.e. computed against LAST game's opponent, not tonight's.
+    if 'home_sted' in feats or 'away_sted' in feats:
+        hs = ((h_row.get('roll_pp_xg60', 0.0) - a_row.get('roll_pk_xga60', 0.0)) -
+              (a_row.get('roll_pp_xg60', 0.0) - h_row.get('roll_pk_xga60', 0.0)))
+        if 'home_sted' in feats: matchup['home_sted'] = hs
+        if 'away_sted' in feats: matchup['away_sted'] = -hs
+    if 'home_osa_xg' in feats:
+        matchup['home_osa_xg'] = h_row.get('roll_xgf', 0.0) * a_row.get('opp_xg_suppression', 1.0)
+    if 'away_osa_xg' in feats:
+        matchup['away_osa_xg'] = a_row.get('roll_xgf', 0.0) * h_row.get('opp_xg_suppression', 1.0)
+
     print("matchup")
     for (k,v) in matchup.items():
       print(f"  {k}: {v}")
     print("\n")
 
-    X = standardize_data(pd.DataFrame([matchup])[feats], feats, STATS_PATH, 'predict')
-    lam = forward(params, jnp.array(X.values))[0]
-    lh_raw, la_raw = float(lam[0]), float(lam[1])
+    rates = []
+    for mi, (params, STATS_PATH_i, CALIBRATION_PATH_i, _f) in enumerate(models):
+        if len(models) > 1:
+            print(f"--- model {mi + 1}/{len(models)}: {ensemble_tags[mi]}")
+        X = standardize_data(pd.DataFrame([matchup])[feats], feats, STATS_PATH_i, 'predict')
+        lam = forward(params, jnp.array(X.values))[0]
+        lh_raw, la_raw = float(lam[0]), float(lam[1])
 
-    # Load and apply calibration factors
-    if use_calibration and os.path.exists(CALIBRATION_PATH):
-        cal_data = np.load(CALIBRATION_PATH)
-        cal_factor_home = float(cal_data['calibration_factor_home'])
-        cal_factor_away = float(cal_data['calibration_factor_away'])
-        cal_factor_total = float(cal_data['calibration_factor_total'])
+        # Load and apply calibration factors
+        if use_calibration and os.path.exists(CALIBRATION_PATH_i):
+            cal_data = np.load(CALIBRATION_PATH_i)
+            cal_factor_home = float(cal_data['calibration_factor_home'])
+            cal_factor_away = float(cal_data['calibration_factor_away'])
+            cal_factor_total = float(cal_data['calibration_factor_total'])
 
-        # Apply calibration
-        lh = lh_raw * cal_factor_home
-        la = la_raw * cal_factor_away
+            # Apply calibration
+            lh = lh_raw * cal_factor_home
+            la = la_raw * cal_factor_away
 
-        print(f"\nRaw Predicted Rates → {h_row['team_abbr']} {lh_raw:.2f} | {a_row['team_abbr']} {la_raw:.2f} (Total: {lh_raw + la_raw:.2f})")
-        print(f"Calibration Applied → {h_row['team_abbr']} {cal_factor_home:.4f} | {a_row['team_abbr']} {cal_factor_away:.4f}")
-        print(f"Calibrated Rates    → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f} (Total: {lh + la:.2f})\n")
-    elif not use_calibration:
-        lh, la = lh_raw, la_raw
-        print(f"\n⚠️  Calibration disabled - using raw predictions")
-        print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
-    else:
-        lh, la = lh_raw, la_raw
-        print(f"\n⚠️  No calibration file found - using raw predictions")
-        print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+            print(f"\nRaw Predicted Rates → {h_row['team_abbr']} {lh_raw:.2f} | {a_row['team_abbr']} {la_raw:.2f} (Total: {lh_raw + la_raw:.2f})")
+            print(f"Calibration Applied → {h_row['team_abbr']} {cal_factor_home:.4f} | {a_row['team_abbr']} {cal_factor_away:.4f}")
+            print(f"Calibrated Rates    → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f} (Total: {lh + la:.2f})\n")
+        elif not use_calibration:
+            lh, la = lh_raw, la_raw
+            print(f"\n⚠️  Calibration disabled - using raw predictions")
+            print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+        else:
+            lh, la = lh_raw, la_raw
+            print(f"\n⚠️  No calibration file found - using raw predictions")
+            print(f"Projected Rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f}\n")
+        rates.append((lh, la))
+    lh = float(np.mean([r[0] for r in rates])); la = float(np.mean([r[1] for r in rates]))
+    if len(rates) > 1:
+        print(f"Ensemble mean rates → {h_row['team_abbr']} {lh:.2f} | {a_row['team_abbr']} {la:.2f} (Total: {lh + la:.2f})  "
+              f"[{len(rates)} models; sims pooled = probabilities averaged]\n")
 
     print(f"Simulating {n_sims:,} games...\n{'=' * 60}")
 
@@ -3002,7 +3647,7 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
     REGULATION_SHARE = 58.0 / 60.0  # 0.9667 - periods' share of the game rate
     EN_BASE_SHARE = 2.0 / 60.0      # 0.0333 - EN phase base (normal 2-min scoring rate)
 
-    con_sim = sqlite3.connect(db)
+    con_sim = _connect(db)
     period_query = """
     SELECT period,
            SUM(CASE WHEN shot_on_empty_net = 0 OR shot_on_empty_net IS NULL THEN 1 ELSE 0 END) as non_en_goals
@@ -3029,50 +3674,59 @@ def manual_forecast(db, home_abbr, away_abbr, date_str, h_rest, a_rest, h_odd, a
 
     from scipy.stats import norm as _norm, poisson as _poisson
 
-    # --- Correlated regulation scoring (Gaussian copula) ---
-    # Draw the two teams' 58-min regulation goal totals with the empirical NEGATIVE
-    # correlation (score effects) baked in, while preserving exact Poisson marginals.
-    lam_h_reg = lh * REGULATION_SHARE
-    lam_a_reg = la * REGULATION_SHARE
+    # FIX 2026-10-01 (sim conservation). The network's rates (lh, la) are trained on REAL goals, which already
+    # include empty-net goals and real OT goals. The old sim ADDED goalie-pull multipliers and an OT +1 on top
+    # (~+0.4 goals/game, ~0.3 of it double counting). Now each team's rates are scaled so that its expected REAL
+    # goals (regulation + EN + real OT goals) equal lh / la exactly; the EN/OT logic only shapes margins and scores.
+    # Reported totals follow the market convention: real goals + 1 for the shootout winner.
+    OT_GOAL_SHARE = 0.674   # measured 2026-10-01: share of OT games settled by a real OT goal (6,568 reg-season games)
     cov = [[1.0, HOME_AWAY_RHO_GAUSS], [HOME_AWAY_RHO_GAUSS, 1.0]]
-    z = np.random.multivariate_normal([0.0, 0.0], cov, n_sims)
-    u = _norm.cdf(z)
-    cur_h = _poisson.ppf(u[:, 0], lam_h_reg).astype(np.int64)
-    cur_a = _poisson.ppf(u[:, 1], lam_a_reg).astype(np.int64)
-    diff = cur_h - cur_a
 
-    # --- Empty net phase: final ~2 minutes of regulation ---
-    # Base rate = normal 2-min scoring rate; multipliers model goalie-pull effect.
-    rh = np.full(n_sims, lh * EN_BASE_SHARE)
-    ra = np.full(n_sims, la * EN_BASE_SHARE)
+    def _sim(lh, la, p_home_ot, sh, sa, n, seed=None):
+        rng = np.random.default_rng(seed)
+        # --- Correlated regulation scoring (Gaussian copula): exact Poisson marginals, negative correlation ---
+        z = rng.multivariate_normal([0.0, 0.0], cov, n)
+        u = _norm.cdf(z)
+        c_h = _poisson.ppf(u[:, 0], lh * sh * REGULATION_SHARE).astype(np.int64)
+        c_a = _poisson.ppf(u[:, 1], la * sa * REGULATION_SHARE).astype(np.int64)
+        d = c_h - c_a
+        # --- Empty net phase: final ~2 minutes; multipliers model the goalie-pull effect ---
+        r_h = np.full(n, lh * sh * EN_BASE_SHARE)
+        r_a = np.full(n, la * sa * EN_BASE_SHARE)
+        p_h = (d >= -3) & (d < 0)   # home trailing by 1-3, pulls goalie
+        p_a = (d <= 3) & (d > 0)    # away trailing by 1-3, pulls goalie
+        r_h[p_a] *= EMPTY_NET_MULTIPLIER_FOR
+        r_a[p_a] *= EMPTY_NET_MULTIPLIER_AGAINST
+        r_h[p_h] *= EMPTY_NET_MULTIPLIER_AGAINST
+        r_a[p_h] *= EMPTY_NET_MULTIPLIER_FOR
+        e_h, e_a = rng.poisson(r_h), rng.poisson(r_a)
+        g_h, g_a = c_h + e_h, c_a + e_a
+        # --- Overtime / shootout: tied games get +1 for the winner (OT goal or the shootout-winner convention) ---
+        t = g_h == g_a
+        hw = rng.random(n) < p_home_ot
+        by_goal = rng.random(n) < OT_GOAL_SHARE
+        return dict(cur_h=c_h, cur_a=c_a, diff=d, en_h=e_h, en_a=e_a, reg_h=g_h, reg_a=g_a, tied=t,
+                    real_h=g_h + (t & hw & by_goal), real_a=g_a + (t & ~hw & by_goal),
+                    final_h=g_h + (t & hw), final_a=g_a + (t & ~hw))
 
-    pull_h = (diff >= -3) & (diff < 0)  # home trailing by 1-3, pulls goalie
-    pull_a = (diff <= 3) & (diff > 0)   # away trailing by 1-3, pulls goalie
-
-    rh[pull_a] *= EMPTY_NET_MULTIPLIER_FOR
-    ra[pull_a] *= EMPTY_NET_MULTIPLIER_AGAINST
-    rh[pull_h] *= EMPTY_NET_MULTIPLIER_AGAINST
-    ra[pull_h] *= EMPTY_NET_MULTIPLIER_FOR
-
-    en_h = np.random.poisson(rh)
-    en_a = np.random.poisson(ra)
-
-    # End-of-regulation score
-    reg_h = cur_h + en_h
-    reg_a = cur_a + en_a
-
-    # --- Overtime / shootout resolution ---
-    # NHL games cannot tie. Tied regulation games go to OT/SO; the winner gets +1
-    # (a real sudden-death OT goal or the NHL-convention shootout goal). Home win
-    # prob anchored at the empirical ~53% and tilted by relative team strength.
-    tied = reg_h == reg_a
-    p_home_ot = float(np.clip(OT_HOME_WIN_BASE + OT_STRENGTH_TILT * (lh - la), 0.30, 0.70))
-    home_wins_ot = np.random.random(n_sims) < p_home_ot
-
-    final_h = reg_h.copy()
-    final_a = reg_a.copy()
-    final_h[tied & home_wins_ot] += 1
-    final_a[tied & ~home_wins_ot] += 1
+    parts = []
+    for mi, (lh_i, la_i) in enumerate(rates):   # one conserved sim per model, equal shares, pooled
+        p_ot_i = float(np.clip(OT_HOME_WIN_BASE + OT_STRENGTH_TILT * (lh_i - la_i), 0.30, 0.70))
+        sh = sa = 1.0
+        for _ in range(3):   # fixed-point: expected REAL goals == the network's rate, per team (seeded 200k pilot)
+            pilot = _sim(lh_i, la_i, p_ot_i, sh, sa, 200000, seed=20261001)
+            sh *= lh_i / pilot['real_h'].mean()
+            sa *= la_i / pilot['real_a'].mean()
+        n_i = n_sims // len(rates) + (n_sims % len(rates) if mi == len(rates) - 1 else 0)
+        o_i = _sim(lh_i, la_i, p_ot_i, sh, sa, n_i)
+        parts.append(o_i)
+        print(f"Sim conservation{f' [{ensemble_tags[mi]}]' if len(rates) > 1 else ''}: rate scale home {sh:.3f} away {sa:.3f} | "
+              f"real goals {np.mean(o_i['real_h'] + o_i['real_a']):.2f} (network {lh_i + la_i:.2f}) | "
+              f"+ shootout-winner goals {np.mean(o_i['final_h'] + o_i['final_a'] - o_i['real_h'] - o_i['real_a']):.2f}")
+    _o = {k: np.concatenate([o[k] for o in parts]) for k in parts[0]}
+    cur_h, cur_a, diff, en_h, en_a = _o['cur_h'], _o['cur_a'], _o['diff'], _o['en_h'], _o['en_a']
+    reg_h, reg_a, tied = _o['reg_h'], _o['reg_a'], _o['tied']
+    final_h, final_a = _o['final_h'].copy(), _o['final_a'].copy()
     total = final_h + final_a
 
     ot_rate = float(np.mean(tied))
@@ -3175,12 +3829,25 @@ Examples:
 
     # Feature set toggle
     p.add_argument("--pruned", dest='use_pruned', action='store_true',
-                   help="Use pruned feature set (~40 high-signal features instead of ~124)")
+                   help="Use pruned high-signal feature set instead of the full set")
 
     # Optimizer toggle
+    p.add_argument("--val-start", dest='val_start', default=None,
+                   help="Walk-forward: train on games before this date (YYYY-MM-DD), validate from it")
+    p.add_argument("--val-end", dest='val_end', default=None,
+                   help="Walk-forward: end of validation window (YYYY-MM-DD, exclusive); games after are dropped")
+    p.add_argument("--dump-preds", dest='dump_preds', default=None,
+                   help="Write val-set predictions (game_id, pred/actual goals) to this CSV for external backtests")
     p.add_argument("--optimizer", choices=['sgd', 'adam'], default='sgd',
                    help="Training optimizer (default: sgd)")
 
+    p.add_argument("--override", action='store_true',
+                   help="manual mode: price with the lineup-override model (seeds ovr_s101/202/303 averaged; "
+                        "shrunk form + lineup projections + override; priors override_roll_priors.json)")
+    p.add_argument("--offline", action='store_true',
+                   help="manual mode: skip the pre-game check (no lineup feed / freshness check) — prices off the DB only")
+    p.add_argument("--allow-stale", dest='allow_stale', action='store_true',
+                   help="manual mode: price even if the DB is missing these teams' completed games")
     rest_days_args = p.add_mutually_exclusive_group()
     rest_days_args.add_argument("--date", type=str, help="calculate rest-days from Game date YYYY-MM-DD (manual mode)")
     rest_days_args.add_argument("--today", dest="date", action="store_const", const=str(datetime.datetime.now().date()), help="use today's date for rest-diff calculations")
@@ -3191,7 +3858,7 @@ Examples:
     
     home_goalie_id = None
     away_goalie_id = None
-    db_conn = sqlite3.connect(a.db)
+    db_conn = _connect(a.db)
     if (a.home_goalie is not None): home_goalie_id = lookup_player_id(a.home_goalie, db_conn);
     if (a.away_goalie is not None): away_goalie_id = lookup_player_id(a.away_goalie, db_conn);
     db_conn.close()
@@ -3202,14 +3869,31 @@ Examples:
         print("=" * 70)
         print(f"Database: {a.db}")
         print(f"Complete games filter: {'ENABLED' if a.use_filter else 'DISABLED'}")
-        print(f"Feature set: {'PRUNED (~40)' if a.use_pruned else 'FULL (~124)'}")
+        print(f"Feature set: {'PRUNED' if a.use_pruned else 'FULL'} (exact feature count printed at training start)")
         print(f"Epochs: {a.epochs} | Batch: {a.batch} | LR: {a.lr} | Hidden: {a.hidden} | Optimizer: {a.optimizer.upper()}")
         print("=" * 70 + "\n")
 
-        train(a.db, a.epochs, a.batch, a.lr, a.hidden, RANDOM_SEED, use_complete_games_filter=a.use_filter, use_pruned_features=a.use_pruned, use_adam=(a.optimizer == 'adam'))
+        train(a.db, a.epochs, a.batch, a.lr, a.hidden, RANDOM_SEED, use_complete_games_filter=a.use_filter, use_pruned_features=a.use_pruned, use_adam=(a.optimizer == 'adam'), val_start=a.val_start, val_end=a.val_end, dump_preds=a.dump_preds)
     elif a.mode == 'manual':
+        tags = None
+        if a.override:   # same feature modes the override models were trained with
+            import json as _json
+            ROLL_MODE = 'shrink'
+            _ROLL_PRIORS = _json.load(open('override_roll_priors.json'))
+            PLAYER_PROJ = True
+            LINEUP_OVERRIDE = True
+            tags = ['ovr_s101', 'ovr_s202', 'ovr_s303']
+            print("OVERRIDE MODEL: shrunk form + lineup projections + lineup override | 3-seed ensemble")
+        ctx = None
+        if not a.offline:
+            import pregame_query
+            ctx = pregame_query.build_context(a.db, a.date or str(datetime.date.today()), a.away, a.home,
+                                        allow_stale=a.allow_stale)
+            if ctx is None:
+                raise SystemExit(1)
         manual_forecast(a.db, a.home, a.away, a.date, a.rest[0], a.rest[1],
                        a.h_odds, a.a_odds, a.n_sims,
                        home_goalie_id=home_goalie_id,
                        away_goalie_id=away_goalie_id,
-                       use_calibration=a.use_calibration)
+                       use_calibration=a.use_calibration,
+                       pregame=ctx, ensemble_tags=tags)

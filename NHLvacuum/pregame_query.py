@@ -279,7 +279,7 @@ CONTINUITY_WARN = 0.70
 def _form_continuity(con, tid, players):
     """Ice-time overlap between tonight's expected lineup and the skaters who played the team's last
     FORM_WINDOW games in the DB (the games its rolling team-form inputs are computed from)."""
-    gids = [r[0] for r in con.execute("""SELECT game_id FROM games WHERE home_team_id=? OR away_team_id=?
+    gids = [r[0] for r in con.execute("""SELECT game_id FROM games WHERE (home_team_id=? OR away_team_id=?) AND game_type IN (2, 3)
                                         ORDER BY game_date DESC, game_id DESC LIMIT ?""", (tid, tid, FORM_WINDOW))]
     if not gids or not players:
         return None, [], []
@@ -331,7 +331,7 @@ def build_context(db, date, away, home, allow_stale=False, verbose=True):
         in_mp = {r[0] for r in con.execute(f"""SELECT DISTINCT game_id FROM mp_team_game_stats WHERE team_id=?
                                               AND game_id IN ({','.join('?' * len(done))})""", [tid] + [g for g, _ in done])} if done else set()
         missing += [g for g, _ in done if g in in_db and g not in in_mp]
-        db_last = con.execute("""SELECT game_id, game_date FROM games WHERE home_team_id=? OR away_team_id=?
+        db_last = con.execute("""SELECT game_id, game_date FROM games WHERE (home_team_id=? OR away_team_id=?) AND game_type IN (2, 3)
                                  ORDER BY game_date DESC, game_id DESC LIMIT 1""", (tid, tid)).fetchone()
         if missing:
             stale_any = True
