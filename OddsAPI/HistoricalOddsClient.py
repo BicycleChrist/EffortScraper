@@ -812,15 +812,15 @@ class EventMatcher:
         # entire title — rendered as "A vs. B @ A vs. B" AND fed as a long garbage
         # string into the fuzzy matcher, whose cost is quadratic in length. That
         # was 80% of all cross-platform matching CPU on a menu load.
-        if ' at ' in base_title:
-            away, home = base_title.split(' at ', 1)
-            return away.strip(), home.strip()
-        elif ' vs. ' in base_title:
-            away, home = base_title.split(' vs. ', 1)
-            return away.strip(), home.strip()
-        elif ' vs ' in base_title:
-            away, home = base_title.split(' vs ', 1)
-            return away.strip(), home.strip()
+        # ' vs. ' / ' vs ' are tried BEFORE ' at ': a team name can contain
+        # " at " ("Delaware St. vs University at Albany" split on 'at' into
+        # "Delaware St. vs University" @ "Albany"), but never " vs ". Checked
+        # over all 1,267 open Kalshi GAME titles (112 series, 2026-10-03): that
+        # title is the only one whose parse changes.
+        for sep in (' vs. ', ' vs ', ' at '):
+            if sep in base_title:
+                away, home = base_title.split(sep, 1)
+                return away.strip(), home.strip()
 
         return base_title, base_title
 
@@ -920,11 +920,50 @@ class EventMatcher:
         from difflib import SequenceMatcher
         return SequenceMatcher(None, na, nb).ratio() >= 0.88
 
+    # College sports: generic token-subset matching is unsafe ("Indiana" vs
+    # "Indiana State", "Georgia" vs "Georgia Tech", "Miami" vs "Miami (OH)" are
+    # DIFFERENT schools, and a Big 12 Saturday can carry both "Arizona vs Kansas"
+    # and "Arizona State vs Kansas State"). Kalshi also abbreviates State
+    # ("NC St.") where Polymarket spells it out.
+    _COLLEGE_SPORTS = frozenset({'College Football', 'NCAAF'})
+    _COLLEGE_NOISE = frozenset({'university', 'the', 'of', 'college', 'u', 'at'})
+
+    @staticmethod
+    def _college_tokens(name: str) -> tuple:
+        t = EventMatcher._generic_normalize(name).split()
+        if t and t[-1] == 'st':
+            t[-1] = 'state'          # "Arkansas St." -> arkansas state
+        if t and t[0] == 'st':
+            t[0] = 'saint'           # "St. Thomas"   -> saint thomas
+        return tuple(t)
+
+    @staticmethod
+    @lru_cache(maxsize=8192)
+    def _teams_match_college(team1: str, team2: str) -> bool:
+        """Exact school name (after St.->State), or differing ONLY by noise
+        words ("University at Albany" vs "Albany" style). Never fuzzy, never a
+        bare subset — measured on the 2026-10-03 slate: 184/271 Kalshi games
+        paired (every one with identical normalized names; the rest have no
+        Polymarket counterpart), vs 181 for the generic matcher."""
+        ta = EventMatcher._college_tokens(team1)
+        tb = EventMatcher._college_tokens(team2)
+        if not ta or not tb:
+            return False
+        if ta == tb:
+            return True
+        sa, sb = set(ta), set(tb)
+        noise = EventMatcher._COLLEGE_NOISE
+        return ((sa < sb and (sb - sa) <= noise)
+                or (sb < sa and (sa - sb) <= noise))
+
     @staticmethod
     def teams_match(team1: str, team2: str, sport: str = None) -> bool:
         """Check if two team names refer to the same team. Big-4 sports use the
         curated alias tables (UNCHANGED behavior); every other sport uses the
         generic alias-free matcher."""
+        # --- College: strict school-name match (see _teams_match_college) ---
+        if sport in EventMatcher._COLLEGE_SPORTS:
+            return EventMatcher._teams_match_college(team1, team2)
         # --- Big-4: original alias-based logic, untouched ---
         if sport and sport in EventMatcher.TEAM_ALIASES_BY_SPORT:
             norm1 = EventMatcher.normalize_team_name(team1, sport)
@@ -1747,7 +1786,11 @@ class PolymarketHistoricalOddsClient:
                 lambda: self.polymarket_client.get_sport_markets(
                     sport,
                     series_id=series_id,
-                    limit=100,
+                    # Gamma pages at 100; get_sport_markets now follows the
+                    # offset while pages come back full (college football has
+                    # ~320 events in the window). Sports under 100 stop after
+                    # one page exactly as before.
+                    limit=500,
                     include_orderbook=False,  # Skip orderbook for faster loading
                     include_trades=False,     # Skip trades for faster loading
                     days_ahead=10,  # Near-term window; the unfiltered series
@@ -5858,6 +5901,23 @@ class HistoricalOddsWidget(QWidget):
         # Auto-map non-big-4 Kalshi leagues -> PM gamma series_id (World Cup, etc.)
         # so they merge cross-platform via the generic matcher.
         pm_series_map = self._build_kalshi_pm_series_map(ranked)
+        # Leagues whose names share no words across platforms get an explicit
+        # PM sport slug, resolved to the CURRENT season's series id (Polymarket
+        # starts a new series each season). Resolved off the loop: the first
+        # lookup hits gamma /sports.
+        _games = {r.get('game') for r in ranked}
+        _want = {g: slug for g, slug in self.KALSHI_PM_SPORT_SLUG.items()
+                 if g in _games}
+        if _want:
+            _pm = getattr(self.polymarket_client, 'polymarket_client',
+                          self.polymarket_client)
+            try:
+                _ids = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: {g: _pm._series_id_for(slug)
+                                   for g, slug in _want.items()})
+                pm_series_map.update({g: i for g, i in _ids.items() if i})
+            except Exception as e:
+                print(f"[allsports] explicit PM series map skipped: {e}")
         # League -> sport-category map (from the ranked-series tags) so the volume
         # heat map can put each league under its sport. Built here where the big-4
         # labels (PM_SPORT_BY_GAME) and non-big-4 series labels are both known.
@@ -6151,6 +6211,14 @@ class HistoricalOddsWidget(QWidget):
             print(f"⚠️  series cache refresh failed: {e}")
         finally:
             self._series_refresh_inflight = False
+
+    # Kalshi GAME series -> Polymarket sport slug, for leagues the title-token
+    # matcher in _build_kalshi_pm_series_map can never pair: Kalshi says
+    # "College Football", Polymarket "CFB 2026" (no shared word). Without this,
+    # every college game loaded Kalshi-only (0 matches, 2026-10-03).
+    KALSHI_PM_SPORT_SLUG = {
+        'KXNCAAFGAME': 'CFB',
+    }
 
     def _build_kalshi_pm_series_map(self, kalshi_ranked):
         """Map each non-big-4 Kalshi GAME-series ticker -> a Polymarket gamma
