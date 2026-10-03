@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QCheckBox, QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QHBoxLayout, QFrame, QSizePolicy, QGridLayout, QSplitter, QLineEdit,
     QInputDialog, QScrollArea, QToolButton, QStyledItemDelegate, QStyle,
-    QStyleOptionViewItem
+    QStyleOptionViewItem, QRubberBand
 )
 from propQuery import PropClient
 from OddsAPIQuery import league_query, odds_query, scores_query, get_game_status
@@ -53,8 +53,10 @@ from prediction_markets_worker import PredictionMarketsWorker
 from LiquidityWidget import ProphetXBrowser
 from prophetx_async import ProphetXWorker
 import OwlsInsightClient as owlsinsight_adapter
+from OwlsInsightClient import OIHistoryPopup
 import feedparser
 import re
+import time
 import traceback
 import qasync
 import asyncio
@@ -203,6 +205,15 @@ class LeagueTabData:
         # cell_links: (row_label, bm_title) -> raw dollar limit. Only the
         # exchanges + Pinnacle return these.
         self.cell_limits = {}
+        # Betting splits (OI Circa/DK handle%/tickets%), keyed like
+        # cell_limits: (row_label, bm_title) -> (tag, tooltip). Rendered in
+        # the same right-segment as bet limits (a cell never has both:
+        # limits are exchanges+Pinnacle, splits are DK/Circa).
+        self.cell_splits = {}
+        # Closing-price context for LIVE OI games, same key/value shape:
+        # "CLO" marks a frozen Pinnacle quote (no live market — displayed
+        # price IS the closer), "c+155" shows a book's derived closer.
+        self.cell_closing = {}
         self.color_palette = [
             QColor(232, 240, 254),  # Sky Blue
             QColor(240, 247, 255),  # Ice Blue
@@ -881,6 +892,121 @@ class QueryList(QWidget):
 
 
 
+class LiveScoresTabPage(QWidget):
+    """Permanent LIVE tab page in the odds tab-widget. Empty shell whose first
+    showEvent constructs the real LiveScoresWidget — lazy because the import
+    pulls in the Flashscore/OddsPortal clients and the widget's __init__ fires
+    its first network fetch, none of which should run before the tab is
+    actually seen. Once built, the widget's own hide/showEvents pause its
+    auto-refresh whenever another tab is current."""
+
+    def __init__(self, ensure_cb, parent=None):
+        super().__init__(parent)
+        self._ensure_cb = ensure_cb
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._ensure_cb()
+
+
+class SplitterCornerGrip(QWidget):
+    """Transparent drag grip overlaid on a corner of a splitter child.
+
+    Replaces a full-height visible QSplitter handle: near-invisible until
+    hovered (then it lights up), and dragging it horizontally moves the split
+    between the splitter's first two children exactly like the native handle —
+    setSizes() still honors each child's min/max widths. The host widget is
+    responsible for positioning it (see ModernOddsWindow.eventFilter)."""
+
+    def __init__(self, splitter, host):
+        super().__init__(host)
+        self._splitter = splitter
+        self._press_gx = None
+        self._press_sizes = None
+        self._band = None
+        self._hover = False
+        self.setFixedSize(12, 36)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        self.setToolTip("Drag to resize")
+        self.show()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._hover or self._press_gx is not None:
+            p.setBrush(QColor(224, 176, 80, 55))
+            p.setPen(QPen(QColor(224, 176, 80, 130), 1))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5), 3, 3)
+            dot = QColor(224, 176, 80, 230)
+        else:
+            dot = QColor(126, 135, 148, 70)  # barely-there idle dots
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(dot)
+        cx, cy = self.width() / 2, self.height() / 2
+        for i in (-2, -1, 0, 1, 2):
+            p.drawEllipse(QPointF(cx, cy + i * 5), 1.2, 1.2)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._press_gx = e.globalPosition().x()
+            self._press_sizes = self._splitter.sizes()
+            # Non-opaque drag, like the native handles (setOpaqueResize(False)):
+            # calling setSizes() per mouse move relayouts the whole left pane
+            # (odds/scores tables) synchronously — ~125ms per move, a visible
+            # stutter. Instead track the drag with a rubber-band line and apply
+            # setSizes() ONCE on release.
+            if self._band is None:
+                self._band = QRubberBand(QRubberBand.Shape.Line, self._splitter)
+            self._band.setGeometry(self._band_geometry(0))
+            self._band.show()
+            self.update()
+
+    def _band_geometry(self, delta):
+        s = self._press_sizes or self._splitter.sizes()
+        x = s[0] + self._splitter.handleWidth() // 2 + delta if s else delta
+        return QRect(int(x), 0, 2, self._splitter.height())
+
+    def _clamped_delta(self, e):
+        """Drag delta clamped to the two children's min/max widths so the
+        rubber band can't suggest a position setSizes() would refuse."""
+        delta = int(e.globalPosition().x() - self._press_gx)
+        s = self._press_sizes
+        left, right = (self._splitter.widget(0), self._splitter.widget(1))
+        lo = max(left.minimumWidth() - s[0], s[1] - right.maximumWidth())
+        hi = min(left.maximumWidth() - s[0], s[1] - right.minimumWidth())
+        return max(lo, min(delta, hi))
+
+    def mouseMoveEvent(self, e):
+        if self._press_gx is None or self._press_sizes is None:
+            return
+        if self._band is not None:
+            self._band.setGeometry(self._band_geometry(self._clamped_delta(e)))
+
+    def mouseReleaseEvent(self, e):
+        if self._press_gx is not None and self._press_sizes is not None:
+            delta = self._clamped_delta(e)
+            s = self._press_sizes
+            if len(s) >= 2 and delta:
+                self._splitter.setSizes([s[0] + delta, s[1] - delta] + list(s[2:]))
+        if self._band is not None:
+            self._band.hide()
+        self._press_gx = None
+        self._press_sizes = None
+        self.update()
+
+
 class ModernOddsWindow(QMainWindow):
     """Main window for displaying and managing odds data"""
 
@@ -1017,7 +1143,9 @@ class ModernOddsWindow(QMainWindow):
         self.layout.setSpacing(1)  # Minimize spacing between all main layout elements
         # Bottom margin 0 so the bottom-most element (the vertical splitter / its
         # historical-odds pane) extends flush to the top of the instance banner.
-        self.layout.setContentsMargins(5, 5, 5, 0)  # Tight margins
+        # Left/right 0 so the news feed and the historical plot + DEPTH/VIEW
+        # panel run flush to the window edges (the old 5px was dead space).
+        self.layout.setContentsMargins(0, 5, 0, 0)  # Tight margins
 
         # --------- TOP SECTION ---------
         # league_selector kept headless — still used by populate_leagues / handle_league_change
@@ -1123,6 +1251,15 @@ class ModernOddsWindow(QMainWindow):
         self.props_button.setEnabled(False)
         self.props_button.setStyleSheet(self.props_button_style)
 
+        # Standalone MLB viewer (EffortMLB): lineup rail, SP form + bullpen,
+        # player detail. No odds in it — it is the stats half of a prop read.
+        self.mlb_button = QPushButton("MLB ⚾")
+        self.mlb_button.setObjectName("market_mlb")
+        self.mlb_button.setStyleSheet(self.props_button_style)
+        self.mlb_button.setToolTip(
+            "EffortMLB — lineups, SP form, bullpen availability, "
+            "batter detail (no odds)")
+
         self.tt_button = QPushButton("TT🏓")
         self.tt_button.setObjectName("market_tt")
         self.tt_button.setStyleSheet(self.props_button_style)
@@ -1146,6 +1283,7 @@ class ModernOddsWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         buttons_layout.addWidget(self.fetch_odds_button)
         buttons_layout.addWidget(self.props_button)
+        buttons_layout.addWidget(self.mlb_button)
         buttons_layout.addWidget(self.tt_button)
         buttons_layout.addWidget(self.screen_button)
         buttons_layout.addWidget(self.props_availability_label)
@@ -1236,6 +1374,14 @@ class ModernOddsWindow(QMainWindow):
         # --------- ODDS SECTION ---------
         # Tab widget for different leagues
         self.tab_widget = QTabWidget()
+
+        # Permanent LIVE tab (index 0): full live-scores widget, built lazily
+        # on the page's first show (see LiveScoresTabPage). League tabs are
+        # only ever ADDED to this tab widget, never removed/cleared, so the
+        # tab persists. handle_tab_change early-outs for it.
+        self.live_scores_widget = None
+        self.live_scores_page = LiveScoresTabPage(self._ensure_live_scores_widget)
+        self.tab_widget.addTab(self.live_scores_page, "⚡ LIVE")
 
         # Odds-table filter bar. Rather than consuming a row above the table or
         # riding the tab bar, it's overlaid onto the current table's horizontal
@@ -1452,6 +1598,17 @@ class ModernOddsWindow(QMainWindow):
         self.odds_liquidity_splitter.addWidget(self.tab_widget)  # Odds table on left
         self.odds_liquidity_splitter.addWidget(self.liquidity_widget)  # Liquidity widget on right
         self.odds_liquidity_splitter.setSizes([850, 150])  # ~85% odds table, ~15% liquidity widget
+        # The native handle shrinks to a 1px divider line (objectName-scoped so
+        # nested splitters inside the tabs keep their normal handles); resizing
+        # moves to a discreet corner grip overlaid on the liquidity widget,
+        # positioned bottom-left in eventFilter and lit up on hover.
+        self.odds_liquidity_splitter.setObjectName("oddsLiqSplit")
+        self.odds_liquidity_splitter.setHandleWidth(1)
+        self.odds_liquidity_splitter.setStyleSheet(
+            "QSplitter#oddsLiqSplit::handle{background:#222a35;}")
+        self.liq_resize_grip = SplitterCornerGrip(
+            self.odds_liquidity_splitter, self.liquidity_widget)
+        self.liquidity_widget.installEventFilter(self)
 
         # Now create the vertical splitter with odds+liquidity on top and horizontal splitter on bottom
         self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1465,6 +1622,13 @@ class ModernOddsWindow(QMainWindow):
 
         # Add the vertical splitter to the main layout
         self.layout.addWidget(self.vertical_splitter, 1)  # The 1 gives it stretch
+
+        # Remember the native divider width, then collapse/restore it in
+        # _sync_bottom_section_visibility: with news + historical both hidden
+        # the handle is a dead grip strip under the odds table, so it (and the
+        # bottom section) start reclaimed until a bottom widget is toggled on.
+        self._v_splitter_handle_w = self.vertical_splitter.handleWidth()
+        self._sync_bottom_section_visibility()
 
         # --------- AUTO-UPDATE CONTROLS ---------
         # Checkbox + interval live in a popup behind a ⚙ button parked in the
@@ -1523,6 +1687,7 @@ class ModernOddsWindow(QMainWindow):
         self.oi_live_timer.timeout.connect(self._on_oi_live_tick)
         self.oi_live_timer.start()
         self._oi_tick_task = None
+        self._oi_tick_count = 0
 
         # Game ordering for oi: tabs (applied on the next Fetch Odds)
         oi_sort_row = QHBoxLayout()
@@ -1652,9 +1817,42 @@ class ModernOddsWindow(QMainWindow):
                 "border-radius: 3px; font-family: monospace; font-size: 9px;")
 
     def _set_banner_state(self, text, color="#5d6a7a"):
+        # A real state change supersedes any transient flash — cancel its
+        # pending restore so it can't clobber this text with a stale snapshot.
+        self._banner_flash_restore = None
+        t = getattr(self, '_banner_flash_timer', None)
+        if t is not None:
+            t.stop()
         self.banner_state_label.setText(f"● {text}")
         self.banner_state_label.setStyleSheet(
             f"color: {color}; font-family: monospace; font-size: 9px;")
+
+    def _flash_banner_message(self, text, ms=3000, color="#e0b050"):
+        """Transiently show a message in the instance banner's state slot, then
+        restore whatever was there. Replaces QMainWindow.statusBar() usage —
+        first call to statusBar() CREATES a second banner below the instance
+        banner, which is exactly the dead strip we want to avoid."""
+        lbl = self.banner_state_label
+        # Only snapshot the underlying state on the first of back-to-back
+        # flashes, so a rapid second flash doesn't save the first as "real".
+        if getattr(self, '_banner_flash_restore', None) is None:
+            self._banner_flash_restore = (lbl.text(), lbl.styleSheet())
+        lbl.setText(f"● {text}")
+        lbl.setStyleSheet(
+            f"color: {color}; font-family: monospace; font-size: 9px;")
+        t = getattr(self, '_banner_flash_timer', None)
+        if t is None:
+            t = self._banner_flash_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._end_banner_flash)
+        t.start(ms)
+
+    def _end_banner_flash(self):
+        saved = getattr(self, '_banner_flash_restore', None)
+        self._banner_flash_restore = None
+        if saved is not None:
+            self.banner_state_label.setText(saved[0])
+            self.banner_state_label.setStyleSheet(saved[1])
 
     def _on_hist_loading(self, value):
         """Reflect the historical-odds chart loading state in the bottom banner.
@@ -1775,6 +1973,7 @@ class ModernOddsWindow(QMainWindow):
         self.props_button.clicked.connect(self.handle_props_button)
         self.news_toggle_button.clicked.connect(self.toggle_news_feed)
         self.tt_button.clicked.connect(self.handle_tt_button)
+        self.mlb_button.clicked.connect(self.handle_mlb_button)
         self.search_bar.textChanged.connect(self.filter_table)
 
 
@@ -1846,6 +2045,14 @@ class ModernOddsWindow(QMainWindow):
     def handle_tab_change(self, index):
         """Handle tab switching events, properly sync best lines data and main table data"""
         if index >= 0:
+            if self.tab_widget.widget(index) is self.live_scores_page:
+                # LIVE tab: not a league table — skip the league/best-lines
+                # bookkeeping and stow the odds-table filter bar (it overlays
+                # a QTableWidget header that doesn't exist here)
+                if hasattr(self, 'search_bar'):
+                    self._current_header = None
+                    self.search_bar.hide()
+                return
             self.current_league = self.tab_widget.tabText(index)
             # Extract the league name without the market info
             if "(" in self.current_league:
@@ -1888,6 +2095,11 @@ class ModernOddsWindow(QMainWindow):
             table_widget.itemSelectionChanged.connect(self.on_market_selection_changed)
             # Double-click a cell to open that book's betslip deep-link
             table_widget.cellDoubleClicked.connect(self.on_odds_cell_double_clicked)
+            # Single-click a Game header (col 0) for the OI history mini-plot;
+            # hovering the header prefetches so the click is usually instant
+            table_widget.cellClicked.connect(self.on_game_header_clicked)
+            table_widget.setMouseTracking(True)
+            table_widget.itemEntered.connect(self.on_game_header_hovered)
 
             self.tab_widget.addTab(table_widget, tab_id)
             self.league_tabs[tab_id] = tab_data
@@ -2067,15 +2279,32 @@ class ModernOddsWindow(QMainWindow):
                         or tab_data.bookmaker_links.get((game_id, bm)))
                 item.setData(Qt.ItemDataRole.UserRole, link)
 
-                # Liquidity tag for books that report bet limits
+                # Right-segment tag: closing marker (live games) + limit
+                # (exchanges/Pinnacle) or splits (DK/Circa). Always set the
+                # role (None clears) — recycled items keep stale tags
+                # otherwise.
                 limit = tab_data.cell_limits.get((row_label, bm))
-                item.setData(BET_LIMIT_ROLE, format_bet_limit(limit) if limit else None)
+                split = (None if limit else
+                         getattr(tab_data, 'cell_splits', {}).get((row_label, bm)))
+                closing = getattr(tab_data, 'cell_closing', {}).get((row_label, bm))
+                tag_parts = []
+                if closing:
+                    tag_parts.append(closing[0])
+                if limit:
+                    tag_parts.append(format_bet_limit(limit))
+                elif split:
+                    tag_parts.append(split[0])
+                item.setData(BET_LIMIT_ROLE, " ".join(tag_parts) or None)
 
                 tips = []
                 if link and current_value:
                     tips.append("Double-click to open betslip")
                 if limit:
                     tips.append(bet_limit_tooltip(bm, limit))
+                if split:
+                    tips.append(split[1])
+                if closing:
+                    tips.append(closing[1])
                 item.setToolTip("\n".join(tips))
 
                 # Only update if value has changed
@@ -2304,6 +2533,14 @@ class ModernOddsWindow(QMainWindow):
         self.historical_odds_widget.updateGeometry()
         QTimer.singleShot(10, self.update)
 
+    def _ensure_live_scores_widget(self):
+        """Build the LIVE tab's widget on first show (see LiveScoresTabPage)."""
+        if self.live_scores_widget is not None:
+            return
+        from live_scores_widget import LiveScoresWidget
+        self.live_scores_widget = LiveScoresWidget()
+        self.live_scores_page.layout().addWidget(self.live_scores_widget)
+
     def _sync_bottom_section_visibility(self):
         """Reclaim/yield the bottom splitter section (news + historical) by driving
         the VERTICAL splitter's sizes — not by hiding the horizontal_splitter.
@@ -2320,6 +2557,15 @@ class ModernOddsWindow(QMainWindow):
         (and its live render is skipped) when collapsed."""
         any_bottom = (self.news_container.isVisible()
                       or self.historical_odds_container.isVisible())
+        # No bottom content -> the divider handle is a dead grip strip; zero it
+        # out (and disable it) so the odds table runs flush to the banner.
+        # Restored to the native width whenever a bottom widget is shown.
+        default_w = getattr(self, '_v_splitter_handle_w', None)
+        if default_w is not None:
+            self.vertical_splitter.setHandleWidth(default_w if any_bottom else 0)
+            handle = self.vertical_splitter.handle(1)
+            if handle is not None:
+                handle.setEnabled(any_bottom)
         sizes = self.vertical_splitter.sizes()
         total = sum(sizes) or self.vertical_splitter.height()
         if total <= 0:
@@ -2360,57 +2606,262 @@ class ModernOddsWindow(QMainWindow):
         if link:
             QDesktopServices.openUrl(QUrl(link))
         else:
-            self.statusBar().showMessage("No betslip link available for this cell", 3000)
+            self._flash_banner_message("No betslip link available for this cell")
+
+    @staticmethod
+    def _parse_market_row(row_label):
+        """Split a market row label built by format_market_label —
+        "Home vs Away | Spread: Team -1.5" — into (market_key, side, point).
+        None for rows that aren't moneyline/spread/total."""
+        if ' | ' not in row_label:
+            return None
+        mk = row_label.split(' | ', 1)[1].strip()
+        for prefix, key in (("3-Way Moneyline: ", 'h2h_3way'),
+                            ("Moneyline: ", 'h2h')):
+            if mk.startswith(prefix):
+                return key, mk[len(prefix):].strip(), None
+        for prefix, key in (("Spread: ", 'spreads'), ("Total ", 'totals')):
+            if mk.startswith(prefix):
+                side, _, pt = mk[len(prefix):].strip().rpartition(' ')
+                try:
+                    return key, side.strip(), float(pt)
+                except ValueError:
+                    return key, mk[len(prefix):].strip(), None
+        return None
 
     def on_market_selection_changed(self):
-        """Handle market selection in the odds table"""
+        """Odds-table selection -> point the historical widget at the matching
+        Kalshi/Polymarket event + market. The widget's own pickers stay usable.
+
+        Sportsbook history is NOT fetched: TheOddsAPI /historical is a paid
+        endpoint (HistoricalOddsWidget.set_market is that path, left unwired)."""
+        if not (hasattr(self, 'historical_odds_widget')
+                and self.historical_odds_container.isVisible()):
+            return
         table = self.tab_widget.currentWidget()
-        if not table or not isinstance(table, QTableWidget):
+        if not isinstance(table, QTableWidget):
             return
-
-        current_row = table.currentRow()
-        if current_row < 0:
+        row = table.currentRow()
+        tab_data = next((td for td in self.league_tabs.values()
+                         if td.table_widget is table), None)
+        if tab_data is None or not (0 <= row < len(tab_data.table_rows)):
             return
-
-        # Get event and market info from the selected row
-        header_item = table.item(current_row, 0)
-        if not header_item:
+        row_label = tab_data.table_rows[row]
+        meta = tab_data.table_data.get(row_label) or {}
+        if meta.get('is_header'):
             return
-
-        row_label = header_item.text()
-        market_type = ""
-
-        # Skip header rows
-        if "Game:" in row_label:
+        parsed = self._parse_market_row(row_label)
+        if parsed is None:
             return
+        market_key, side, point = parsed
 
-        # Try to determine market type from the row label
-        if "Moneyline" in row_label:
-            market_type = "h2h"
-        elif "Spread" in row_label:
-            market_type = "spreads"
-        elif "Total" in row_label:
-            market_type = "totals"
-        else:
-            # If we can't determine, don't update
+        # Teams from the game's header metadata (OI path stores them);
+        # the plain OddsAPI path only has the "Home vs Away" label prefix.
+        game_id = meta.get('game_id')
+        hdr = next((tab_data.table_data[r] for r in tab_data.table_rows
+                    if tab_data.table_data.get(r, {}).get('is_header')
+                    and tab_data.table_data[r].get('game_id') == game_id), {})
+        home, away = hdr.get('home_team'), hdr.get('away_team')
+        if not (home and away):
+            game_text = row_label.split(' | ', 1)[0]
+            if ' vs ' not in game_text:
+                return
+            home, away = [t.strip() for t in game_text.split(' vs ', 1)]
+
+        widget = self.historical_odds_widget
+
+        async def link():
+            try:
+                found = await widget.link_table_market(
+                    home, away, market_key, side, point,
+                    hdr.get('commence_time'))
+                if not found:
+                    self._flash_banner_message(
+                        f"No Kalshi/Polymarket market for {away} @ {home}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[link] historical widget link failed: {e!r}")
+
+        asyncio.ensure_future(link())
+
+    def _oi_header_meta(self, table, row):
+        """Resolve a table cell to (oi_sport, home, away, meta) if it's a
+        Game header row on an OI-covered sport, else None."""
+        tab_data = next((td for td in self.league_tabs.values()
+                         if td.table_widget is table), None)
+        if tab_data is None or row >= len(tab_data.table_rows):
+            return None
+        meta = tab_data.table_data.get(tab_data.table_rows[row]) or {}
+        home, away = meta.get('home_team'), meta.get('away_team')
+        if not (meta.get('is_header') and home and away):
+            return None
+        sport_key = tab_data.sport_key or ""
+        oi_sport = (sport_key.split(":", 1)[1] if sport_key.startswith("oi:")
+                    else owlsinsight_adapter.map_sport_key(sport_key))
+        if not oi_sport:
+            return None
+        return oi_sport, home, away, meta
+
+    def _oi_history_task(self, oi_sport, home, away, commence):
+        """Shared (deduped) history fetch for one event. Returns the cached
+        (ticks, limits) tuple's asyncio.Task; hover-prefetch and click both
+        funnel through here so a click after a hover usually hits a task
+        that is already done or in flight."""
+        if not hasattr(self, '_oi_history_cache'):
+            self._oi_history_cache = {}
+            self._oi_history_inflight = {}
+        cache_key = (oi_sport, home, away)
+        cached = self._oi_history_cache.get(cache_key)
+        if cached and (datetime.now(timezone.utc) - cached[0]).total_seconds() < 180:
+            fut = asyncio.get_event_loop().create_future()
+            fut.set_result((cached[1], cached[2]))
+            return fut
+        inflight = self._oi_history_inflight.get(cache_key)
+        if inflight is not None and not inflight.done():
+            return inflight
+
+        async def load():
+            hedge_session = None
+            try:
+                t0 = time.perf_counter()
+                # Persistent session skips the per-click TLS handshake.
+                # The archive endpoint's latency is BIMODAL (~0.4s normally,
+                # random 5-8s+ stalls; measured 2026-07-14): hedge it — if
+                # the first request hasn't answered in 1.8s, race a second
+                # one on a fresh connection and take whichever lands first.
+                session = getattr(self, '_oi_history_session', None)
+                if session is None or session.closed:
+                    session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=8, connect=4))
+                    self._oi_history_session = session
+
+                def fetch(sess):
+                    return owlsinsight_adapter.fetch_oi_history_ticks(
+                        sess, oi_sport, home, away, commence,
+                        raise_errors=True)
+
+                tasks = [asyncio.create_task(fetch(session))]
+                done, _ = await asyncio.wait(tasks, timeout=1.8)
+                if not done:
+                    print("[OI] history slow — hedging on a fresh connection")
+                    hedge_session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=8, connect=4))
+                    tasks.append(asyncio.create_task(fetch(hedge_session)))
+                ticks, last_err = None, None
+                pending = set(tasks)
+                while pending and ticks is None:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            ticks = t.result()
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            last_err = e
+                for t in pending:
+                    t.cancel()
+                if ticks is None:
+                    raise last_err or RuntimeError("history fetch failed")
+                t1 = time.perf_counter()
+                # sync on purpose: exact-name SQL path is ~2ms and qasync's
+                # executor behavior is not worth the unknown
+                limits = owlsinsight_adapter.ledger_limit_series(
+                    oi_sport, home, away)
+                # OI's archive skips whole competitions (NPB/CPBL under
+                # mlb, realtime-only sports): if it returned no Pinnacle
+                # rows, fall back to our own passively recorded prices.
+                if not any(t["book"] in ("pinnacle", "ps3838")
+                           for t in ticks):
+                    local = owlsinsight_adapter.ledger_price_series(
+                        oi_sport, home, away)
+                    if local:
+                        ticks = sorted(ticks + local, key=lambda t: t["ts"])
+                        print(f"[OI] archive empty for {away} @ {home} — "
+                              f"using {len(local)} locally recorded "
+                              "Pinnacle ticks")
+                print(f"[OI] history {away} @ {home}: "
+                      f"ticks {t1 - t0:.2f}s ({len(ticks)})")
+                self._oi_history_cache[cache_key] = (
+                    datetime.now(timezone.utc), ticks, limits)
+                return ticks, limits
+            finally:
+                self._oi_history_inflight.pop(cache_key, None)
+                if hedge_session is not None and not hedge_session.closed:
+                    asyncio.ensure_future(hedge_session.close())
+
+        task = asyncio.ensure_future(load())
+        # hover prefetches are fire-and-forget: consume any exception so a
+        # timed-out prefetch never logs "Task exception was never retrieved"
+        task.add_done_callback(
+            lambda t: None if t.cancelled() else t.exception())
+        self._oi_history_inflight[cache_key] = task
+        return task
+
+    def on_game_header_hovered(self, item):
+        """Mouse resting on a Game header row → start the history prefetch,
+        so the popup is usually instant by the time the user clicks.
+        Debounced 350ms: sweeping the cursor down the table must not
+        burst-fire a request per header it crosses."""
+        try:
+            if item.column() != 0:
+                return
+            resolved = self._oi_header_meta(item.tableWidget(), item.row())
+            if resolved is None:
+                return
+            oi_sport, home, away, meta = resolved
+            self._oi_hover_pending = (oi_sport, home, away,
+                                      meta.get('commence_time'))
+            timer = getattr(self, '_oi_hover_timer', None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.setInterval(350)
+                timer.timeout.connect(self._fire_oi_hover_prefetch)
+                self._oi_hover_timer = timer
+            timer.start()   # restart on every new header entered
+        except Exception:
+            pass    # prefetch is best-effort, never surface errors
+
+    def _fire_oi_hover_prefetch(self):
+        pending = getattr(self, '_oi_hover_pending', None)
+        if pending is None:
             return
+        try:
+            self._oi_history_task(*pending)
+        except Exception:
+            pass
 
-        # Find the game ID from the item
-        if not hasattr(header_item, 'game_id'): return;
-        game_id = header_item.game_id
+    def on_game_header_clicked(self, row, col):
+        """Single click on a Game header cell (col 0) → OI history mini-plot.
 
-        # Get league and sport info
-        league_name = self.league_selector.currentText()
-        sport_key = self.data_manager.league_map.get(league_name)
+        Shows archived odds ticks (ticks accumulate pre-match) with the
+        current Pinnacle limit from the local ledger. Silently does nothing
+        for non-header rows or sports OI has no coverage for."""
+        if col != 0:
+            return
+        resolved = self._oi_header_meta(self.sender(), row)
+        if resolved is None:
+            return
+        oi_sport, home, away, meta = resolved
 
-        game_text = header_item.text().split('|', maxsplit=1)[0].strip()
-        (home_team, away_team) = [text.strip() for text in game_text.split(' vs ', maxsplit=1)]
+        from PyQt6.QtGui import QCursor
+        popup = OIHistoryPopup(home, away, meta.get('league'), parent=self)
+        popup.show_at(QCursor.pos())
+        self._oi_history_popup = popup      # keep a ref; Qt.Popup self-closes
 
-        # Only update the historical odds widget if it's visible
-        if self.historical_odds_container.isVisible() and hasattr(self, 'historical_odds_widget'):
-            self.historical_odds_widget.set_market(sport_key, game_id, market_type, home_team, away_team)
+        task = self._oi_history_task(oi_sport, home, away,
+                                     meta.get('commence_time'))
 
+        async def deliver():
+            try:
+                ticks, limits = await task
+                if popup.isVisible():
+                    popup.set_data(ticks, limits)
+            except Exception as e:
+                print(f"[OI] history popup load failed: {e!r}")
+                if popup.isVisible():
+                    popup.set_data([], {})
 
+        asyncio.ensure_future(deliver())
 
     def handle_tt_button(self):
         """Handle Table Tennis button click to open TableTennisGUI."""
@@ -2429,6 +2880,34 @@ class ModernOddsWindow(QMainWindow):
         self.tt_window = TableTennisGUI()
         self.tt_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # Qt will delete the widget when closed
         self.tt_window.show()
+
+    def handle_mlb_button(self):
+        """Open the standalone EffortMLB viewer."""
+        # RAISE an open window instead of rebuilding it, unlike the Props/TT
+        # handlers above: EffortMLB pulls the whole slate (rosters, StatsAPI
+        # game logs, Savant, FanGraphs boards) on startup, so a second click
+        # would throw away ~45s of loading and re-download it.
+        win = getattr(self, "mlb_window", None)
+        if win is not None and win.isVisible():
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+            return
+
+        # Imported here, not at module scope: EffortMLB is a heavy module and
+        # this window is opened on demand.
+        try:
+            from EffortMLB import MLBWindow, prune_slate_cache
+        except Exception as e:
+            print(f"MLB button: EffortMLB import failed: {e}")
+            return
+
+        prune_slate_cache()
+        self.mlb_window = MLBWindow()
+        # NOT WA_DeleteOnClose — the reuse check above holds a reference, and
+        # a deleted C++ object behind a live Python one raises on isVisible()
+        self.mlb_window.resize(1900, 1040)
+        self.mlb_window.show()
 
 
 
@@ -2466,6 +2945,23 @@ class ModernOddsWindow(QMainWindow):
             changes = {}
 
             async with aiohttp.ClientSession() as session:
+                # Multi-tab OI: start every oi: slot's fetch NOW so their
+                # network time overlaps (the shared per-loop semaphore in
+                # the client keeps total concurrency within the API tier).
+                # The loop below awaits each task when it reaches the slot.
+                oi_prefetch = {
+                    idx: asyncio.ensure_future(
+                        owlsinsight_adapter.fetch_oi_games(
+                            session, s_key, wanted_markets=mkts,
+                            sort_mode=self.oi_sort_combo.currentData()))
+                    for idx, (s_key, _l, mkts, _r) in enumerate(queries)
+                    if s_key.startswith("oi:")
+                }
+                for t in oi_prefetch.values():
+                    # if an error aborts the slot loop, orphaned prefetches
+                    # must not log "Task exception was never retrieved"
+                    t.add_done_callback(
+                        lambda t: None if t.cancelled() else t.exception())
                 for slot_idx, (sport_key, league_name, current_markets, region_set) in enumerate(queries):
                     region_str = ",".join(sorted(region_set)) if region_set else "us"
                     slot_base = slot_idx / total_slots
@@ -2487,9 +2983,7 @@ class ModernOddsWindow(QMainWindow):
                     oi_slate = None
                     if is_oi_slot:
                         scores_data = None
-                        games = await owlsinsight_adapter.fetch_oi_games(
-                            session, sport_key, wanted_markets=current_markets,
-                            sort_mode=self.oi_sort_combo.currentData())
+                        games = await oi_prefetch[slot_idx]
                     else:
                         self.data_manager.prop_client = PropClient(sport_key)
                         scores_data = await scores_query(sport_key, session=session)
@@ -2503,6 +2997,14 @@ class ModernOddsWindow(QMainWindow):
                         if self.oi_books_check.isChecked():
                             oi_slate = await owlsinsight_adapter.fetch_oi_slate(
                                 session, sport_key, wanted_markets=current_markets)
+
+                    # Circa/DK betting splits (US majors only, 1 request).
+                    # Applies to oi: tabs and TheOddsAPI tabs alike; None
+                    # for uncovered sports = zero-cost no-op below.
+                    oi_splits = None
+                    if is_oi_slot or self.oi_books_check.isChecked():
+                        oi_splits = await owlsinsight_adapter.fetch_oi_splits(
+                            session, sport_key)
                     print(f"[{league_name}] Fetched {len(games) if isinstance(games, list) else 0} games")
 
                     if not isinstance(games, list):
@@ -2513,6 +3015,8 @@ class ModernOddsWindow(QMainWindow):
                     new_table_rows = []
                     new_table_data = {}
                     new_cell_limits = {}
+                    new_cell_splits = {}
+                    new_cell_closing = {}
                     bookmakers_seen = set()
                     consolidated_odds_data = {'bookmakers': []}
                     bookmakers_map = {}
@@ -2554,6 +3058,8 @@ class ModernOddsWindow(QMainWindow):
                             # OI feeds carry an explicit isLive flag from the
                             # realtime window — trust it over the crude
                             # "started by clock = LIVE for 4h" heuristic.
+                            if odds.get('scores_text'):
+                                scores_text = odds['scores_text']
                             if odds.get('is_live'):
                                 status_text, is_live = "🔴 LIVE", True
                             elif is_live:
@@ -2596,6 +3102,9 @@ class ModernOddsWindow(QMainWindow):
                             # sort metadata for live re-ordering (OI sort)
                             'commence_time': odds.get('commence_time'),
                             'league': odds.get('league'),
+                            # for the header-click history mini-plot —
+                            # parsing them back out of the label is fragile
+                            'home_team': home_team, 'away_team': away_team,
                         }
 
                         for bm in odds.get('bookmakers', []):
@@ -2625,6 +3134,28 @@ class ModernOddsWindow(QMainWindow):
                                     new_table_data[unique_label][bm_title] = self.format_price(outcome)
                                     if outcome.get('bet_limit'):
                                         new_cell_limits[(unique_label, bm_title)] = outcome['bet_limit']
+                                    if oi_splits is not None:
+                                        st = oi_splits.for_cell(
+                                            bm_title, home_team, away_team,
+                                            market_key, outcome)
+                                        if st:
+                                            new_cell_splits[(unique_label, bm_title)] = st
+                                    if is_oi_slot and odds.get('is_live'):
+                                        if (odds.get('pinnacle_frozen')
+                                                and owlsinsight_adapter._canon(bm_title) == 'pinnacle'):
+                                            new_cell_closing[(unique_label, bm_title)] = (
+                                                "CLO",
+                                                "Pinnacle never opened a live market for this event —\n"
+                                                "the displayed price is its FROZEN CLOSING quote, not live.")
+                                        else:
+                                            cp = owlsinsight_adapter.closing_for_cell(
+                                                odds, market_key, outcome, bm_title)
+                                            if cp is not None:
+                                                new_cell_closing[(unique_label, bm_title)] = (
+                                                    f"c{cp:+d}",
+                                                    f"Closing price: {cp:+d}\n"
+                                                    "(last recorded tick before start — approximate "
+                                                    "for rolling-schedule events)")
                                     if outcome.get('link'):
                                         tab_data.cell_links[(unique_label, bm_title)] = outcome['link']
 
@@ -2655,6 +3186,8 @@ class ModernOddsWindow(QMainWindow):
                     tab_data.table_rows  = new_table_rows
                     tab_data.table_data  = new_table_data
                     tab_data.cell_limits = new_cell_limits
+                    tab_data.cell_splits = new_cell_splits
+                    tab_data.cell_closing = new_cell_closing
                     self.update_table_with_changes(tab_data, slot_changes)
 
                     if hasattr(self, 'best_lines_widget') and self.best_lines_widget:
@@ -2860,15 +3393,32 @@ class ModernOddsWindow(QMainWindow):
                          or tab_data.bookmaker_links.get((game_id, bm)))
                  item.setData(Qt.ItemDataRole.UserRole, link)
 
-                 # Liquidity tag for books that report bet limits
+                 # Right-segment tag: closing marker (live games) + limit
+                 # (exchanges/Pinnacle) or splits (DK/Circa). Always set the
+                 # role (None clears) — recycled items keep stale tags
+                 # otherwise.
                  limit = tab_data.cell_limits.get((row_label, bm))
-                 item.setData(BET_LIMIT_ROLE, format_bet_limit(limit) if limit else None)
+                 split = (None if limit else
+                          getattr(tab_data, 'cell_splits', {}).get((row_label, bm)))
+                 closing = getattr(tab_data, 'cell_closing', {}).get((row_label, bm))
+                 tag_parts = []
+                 if closing:
+                     tag_parts.append(closing[0])
+                 if limit:
+                     tag_parts.append(format_bet_limit(limit))
+                 elif split:
+                     tag_parts.append(split[0])
+                 item.setData(BET_LIMIT_ROLE, " ".join(tag_parts) or None)
 
                  tips = []
                  if link and current_value:
                      tips.append("Double-click to open betslip")
                  if limit:
                      tips.append(bet_limit_tooltip(bm, limit))
+                 if split:
+                     tips.append(split[1])
+                 if closing:
+                     tips.append(closing[1])
                  item.setToolTip("\n".join(tips))
 
                  # Check if this cell has changed
@@ -2947,17 +3497,27 @@ class ModernOddsWindow(QMainWindow):
                 return tab_data
         return None
 
+    # every Nth tick also pulls the unified v1 feed so FanDuel/DraftKings/
+    # Novig cells track live alongside Pinnacle (they serve in-play prices
+    # there, refreshed upstream every ~30-90s; a locked/suspended market
+    # simply drops out of the feed and its cell refills on the first tick
+    # after it unlocks). CRIS/Stake/HardRock stay full-refresh only.
+    _OI_UNIFIED_EVERY = 4
+
     async def _oi_fast_tick(self):
         tab_data = self._find_visible_oi_tab()
         if tab_data is None:
             return
+        self._oi_tick_count += 1
+        with_unified = self._oi_tick_count % self._OI_UNIFIED_EVERY == 0
         try:
             async with aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=15, connect=6)) as session:
-                # realtime window only — small payload, live/imminent events
+                # realtime window every tick; unified every Nth (see above)
                 games = await owlsinsight_adapter.fetch_oi_games(
                     session, tab_data.sport_key, wanted_markets=None,
-                    include_unified=False, log=lambda *a: None)
+                    include_unified=with_unified, include_v2=False,
+                    log=lambda *a: None)
         except Exception as e:  # noqa: BLE001 — the tick must never crash the UI
             _gated_print(f"[OI live] tick fetch failed: {e}")
             return
@@ -3014,9 +3574,13 @@ class ModernOddsWindow(QMainWindow):
 
     def _apply_oi_live_update(self, tab_data, games):
         table = tab_data.table_widget
-        if table is None or "Pinnacle" not in tab_data.bookmakers:
+        if table is None or not tab_data.bookmakers:
             return
-        col = tab_data.bookmakers.index("Pinnacle") + 1   # col 0 = label
+        # col 0 = label; realtime-only ticks carry just Pinnacle, unified
+        # ticks bring FanDuel/DraftKings/Novig too — update whatever book
+        # columns the tab already has (new books wait for a full refresh)
+        book_cols = {title: ix + 1
+                     for ix, title in enumerate(tab_data.bookmakers)}
         line_rows, header_rows, block_end = self._oi_index_rows(tab_data)
         changed = 0
 
@@ -3045,19 +3609,19 @@ class ModernOddsWindow(QMainWindow):
             except (ValueError, IndexError, TypeError):
                 pass
 
-        def update_cell(row, label, new_val, limit, gid):
+        def update_cell(row, label, new_val, limit, gid, book, col):
             nonlocal changed
             rd = tab_data.table_data.get(label)
             item = table.item(row, col)
             if rd is None or item is None:
                 return
             if limit:
-                tab_data.cell_limits[(label, "Pinnacle")] = limit
+                tab_data.cell_limits[(label, book)] = limit
                 item.setData(BET_LIMIT_ROLE, format_bet_limit(limit))
-            old_val = rd.get("Pinnacle", "")
+            old_val = rd.get(book, "")
             if not new_val or new_val == old_val:
                 return
-            rd["Pinnacle"] = new_val
+            rd[book] = new_val
             item.setText(new_val)
             flash(item, new_val, old_val, rd.get("game_id", gid))
             changed += 1
@@ -3083,8 +3647,10 @@ class ModernOddsWindow(QMainWindow):
                             status["text"], status["is_live"] = "🔴 LIVE", True
 
             for bm in g.get("bookmakers", []):
-                if bm.get("title") != "Pinnacle":
-                    continue
+                book = bm.get("title")
+                col = book_cols.get(book)
+                if col is None:
+                    continue   # column doesn't exist yet — full refresh adds it
                 for market in bm.get("markets", []):
                     mkey = market.get("key")
                     for outcome in market.get("outcomes", []):
@@ -3097,20 +3663,20 @@ class ModernOddsWindow(QMainWindow):
                             if group and float(pt) in group:
                                 row = group[float(pt)]
                                 update_cell(row, tab_data.table_rows[row],
-                                            new_val, limit, gid)
+                                            new_val, limit, gid, book, col)
                                 continue
                             if not group:
                                 continue   # market absent — full refresh adds it
-                            # THE LINE MOVED (e.g. -1.5 -> -2.5): vacate the
-                            # stale Pinnacle cells, then land the new point on
+                            # THE LINE MOVED (e.g. -1.5 -> -2.5): vacate this
+                            # book's stale cells, then land the new point on
                             # a fresh row inserted at the game block's end.
                             for orow in group.values():
                                 olabel = tab_data.table_rows[orow]
                                 ord_ = tab_data.table_data.get(olabel, {})
-                                if ord_.get("Pinnacle"):
-                                    ord_.pop("Pinnacle", None)
+                                if ord_.get(book):
+                                    ord_.pop(book, None)
                                     tab_data.cell_limits.pop(
-                                        (olabel, "Pinnacle"), None)
+                                        (olabel, book), None)
                                     itm = table.item(orow, col)
                                     if itm is not None:
                                         itm.setText("")
@@ -3134,15 +3700,16 @@ class ModernOddsWindow(QMainWindow):
                             tab_data.table_data[new_label] = {"game_id": gid}
                             bump_indexes(row)
                             group[float(pt)] = row
-                            update_cell(row, new_label, new_val, limit, gid)
+                            update_cell(row, new_label, new_val, limit, gid,
+                                        book, col)
                         else:
                             row = (group or {}).get(None)
                             if row is None:
                                 continue
                             update_cell(row, tab_data.table_rows[row],
-                                        new_val, limit, gid)
+                                        new_val, limit, gid, book, col)
         if changed:
-            _gated_print(f"[OI live] {changed} Pinnacle cells updated")
+            _gated_print(f"[OI live] {changed} cells updated")
 
     def _on_oi_sort_changed(self, _ix):
         """Live re-sort of the visible oi: tab. Reorders the game blocks in
@@ -3386,6 +3953,14 @@ class ModernOddsWindow(QMainWindow):
                 and getattr(self, 'best_lines_widget', None) is not None
                 and self.best_lines_widget.isVisible()):
             self._position_bestlines_overlay()
+        # Keep the liquidity-widget resize grip pinned to its bottom-left corner,
+        # lifted just above the collapsed Bet Slip bar so its "▲" stays clickable.
+        if (obj is getattr(self, 'liquidity_widget', None)
+                and event.type() == QEvent.Type.Resize
+                and getattr(self, 'liq_resize_grip', None) is not None):
+            g = self.liq_resize_grip
+            g.move(0, obj.height() - g.height() - 26)
+            g.raise_()
         return super().eventFilter(obj, event)
 
     def _position_bestlines_overlay(self, initial=False):
@@ -3605,6 +4180,21 @@ class ModernOddsWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean up when the application is closing"""
         print("Application closing, cleaning up background operations...")
+
+        # Close the persistent OI history-popup session
+        session = getattr(self, '_oi_history_session', None)
+        if session is not None and not session.closed:
+            try:
+                asyncio.ensure_future(session.close())
+            except Exception:
+                pass
+
+        # Abandon the live-scores worker pools (non-daemon threads: an
+        # in-flight Flashscore/OddsPortal fetch would otherwise hold the
+        # closed app open while the interpreter joins them)
+        if getattr(self, 'live_scores_widget', None) is not None:
+            print("Shutting down live scores widget...")
+            self.live_scores_widget.shutdown()
 
         # Stop the prediction markets worker
         if hasattr(self, 'prediction_markets_worker'):

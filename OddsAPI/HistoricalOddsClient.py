@@ -4,10 +4,11 @@ import aiohttp
 import orjson
 import time as _time   # module-level alias for the per-frame Live hot path (no per-call import)
 from datetime import datetime, timedelta
+from functools import lru_cache
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QEvent
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea, QSizePolicy,
@@ -797,11 +798,28 @@ class EventMatcher:
         # Remove suffixes like ": Spread", ": Total Points"
         base_title = title.split(':')[0].strip()
 
+        # Kalshi lists the AWAY side first under BOTH separators — "Colorado at
+        # Washington" and "Colorado vs Washington" are the same game at Nationals
+        # Park, and the ticker agrees (KXMLBGAME-26AUG271305COLWSH = away+home).
+        # The ' vs ' branch used to read the first team as HOME, so every event
+        # Kalshi titles with "vs" (which is most of them — "at" is the exception)
+        # rendered its matchup backwards in the selector. Verified against MLB
+        # StatsAPI: away-first held for all 20 scheduled games on 2026-08-27/28.
+        # ' vs. ' (with the period) is Kalshi's separator for the esports series
+        # (CS2, LoL: "Wave Esports vs. Misa Esports"). It does NOT contain ' vs ',
+        # so without its own branch the whole title fell through to the
+        # return-title-twice fallback and every such event got away == home == the
+        # entire title — rendered as "A vs. B @ A vs. B" AND fed as a long garbage
+        # string into the fuzzy matcher, whose cost is quadratic in length. That
+        # was 80% of all cross-platform matching CPU on a menu load.
         if ' at ' in base_title:
             away, home = base_title.split(' at ', 1)
             return away.strip(), home.strip()
+        elif ' vs. ' in base_title:
+            away, home = base_title.split(' vs. ', 1)
+            return away.strip(), home.strip()
         elif ' vs ' in base_title:
-            home, away = base_title.split(' vs ', 1)
+            away, home = base_title.split(' vs ', 1)
             return away.strip(), home.strip()
 
         return base_title, base_title
@@ -873,8 +891,14 @@ class EventMatcher:
         return EventMatcher._NATIONAL_TEAM_ALIASES.get(n, n)
 
     @staticmethod
+    @lru_cache(maxsize=8192)
     def _teams_match_generic(team1: str, team2: str) -> bool:
-        """Alias-free participant match for non-big-4 sports. Handles the real
+        """Alias-free participant match for non-big-4 sports.
+
+        Memoized: the merge compares every Kalshi event against every PM game, so
+        the same (name, name) pair recurs constantly — measured 42k calls over 18k
+        distinct pairs on one menu load. Pure function of two strings over static
+        alias tables, so caching is safe. Handles the real
         cross-platform naming differences observed (Kalshi 'IR Iran' vs PM 'Iran';
         'Congo DR' vs 'DR Congo') via a TOKEN-SET test, a national-team dual-name
         table, plus diacritics + fuzzy."""
@@ -1155,6 +1179,19 @@ class MarketMatcher:
             r"saves|strikeouts|hits|total bases|home runs|rbis|runs)\s+"
             r"o/u\s+\d", text.strip()):
             return 'prop'
+        # Any other "Name: <stat> O/U N" (Polymarket's MLB "Hits + Runs + RBIs",
+        # "Outs Recorded", "Stolen Bases" ...). A game total's colon prefix is the
+        # matchup ("A vs. B: O/U 8.5") and a team total names itself, so a prefix
+        # with no vs/@ and no "team total" is a player.
+        m = re.match(r"^([^:]+):\s*[^:]*\bo/u\s+\d", text.strip())
+        if m and not re.search(r"\s(?:vs\.?|@)\s", m.group(1)) \
+                and 'team total' not in text:
+            return 'prop'
+
+        # Team totals ("Cleveland Guardians Team Total: O/U 4.5") before the game
+        # total check — otherwise they pair with Kalshi GAME totals at the same line.
+        if 'team total' in text:
+            return 'team_total'
 
         # Spread indicators (check first, more specific)
         if 'spread' in text or 'wins by' in text or re.search(r'\([+-]\d+', text):
@@ -1263,6 +1300,49 @@ class MarketMatcher:
         return bool(n1) and bool(n2) and (n1 == n2 or n1 in n2 or n2 in n1)
 
     @staticmethod
+    def kalshi_market_type(kalshi_market):
+        """Market type of a Kalshi market, keyed off its SERIES ticker.
+
+        Kalshi's titles changed format (2026): game markets are "Carolina wins"
+        (no "Winner?"), totals "Full Game: Over 4.5 goals scored" — the first
+        classified as nothing, the second as a player prop ('goal'), so neither
+        could pair with Polymarket. The series (KX<LEAGUE>GAME / SPREAD / TOTAL /
+        TEAMTOTAL) is the stable signal; titles are the fallback for anything else."""
+        ticker = (kalshi_market.get('ticker') or '').upper()
+        series = ticker.split('-', 1)[0]
+        if series.startswith('KX') and not series.startswith('KXMVE'):
+            if series.endswith('TEAMTOTAL'):
+                return 'team_total'
+            if series.endswith('TOTAL'):
+                return 'total'
+            if series.endswith('SPREAD'):
+                return 'spread'
+            if series.endswith('GAME'):
+                return 'moneyline'
+        return MarketMatcher.get_market_type(kalshi_title=kalshi_market.get('title', ''))
+
+    @staticmethod
+    def kalshi_line_value(kalshi_market):
+        """The half-point line of a Kalshi spread/total market (4.5 for "Over 4.5
+        goals"). floor_strike is authoritative; titles next. The ticker suffix
+        last: older totals encoded N for an N.5 line (KXNFLTOTAL-...-61 = 61.5),
+        but current ones round UP (KXNHLTOTAL-...-5 = 4.5), so it's only trusted
+        when nothing else is there."""
+        fs = kalshi_market.get('floor_strike')
+        if fs is not None:
+            try:
+                return float(fs)
+            except (TypeError, ValueError):
+                pass
+        title = kalshi_market.get('title', '') or ''
+        v = (MarketMatcher.extract_spread_value(title)
+             or MarketMatcher.extract_total_value(title))
+        if v is not None:
+            return v
+        t = MarketMatcher.extract_total_value('', ticker=kalshi_market.get('ticker'))
+        return t + 0.5 if t is not None else None
+
+    @staticmethod
     def markets_match(kalshi_market, poly_market, home_team, away_team, sport=None):
         """
         Check if a Kalshi market and Polymarket market represent the same bet.
@@ -1281,7 +1361,7 @@ class MarketMatcher:
         p_question = poly_market.question.lower()
 
         # Get market types
-        k_type = MarketMatcher.get_market_type(kalshi_title=k_title)
+        k_type = MarketMatcher.kalshi_market_type(kalshi_market)
         p_type = MarketMatcher.get_market_type(poly_question=p_question)
         # Must be same type
         if k_type != p_type or k_type is None:
@@ -1289,8 +1369,24 @@ class MarketMatcher:
 
         # Moneyline: just check it's a winner market
         if k_type == 'moneyline':
-            # Both are moneyline/winner markets - they match!
-            return True
+            # Full-game winner on both sides — PM also lists "X to win the 1st
+            # inning?" style markets that classify as moneyline.
+            return (MarketMatcher.get_market_period(k_title)
+                    == MarketMatcher.get_market_period(p_question) == 'full_game')
+
+        # Team total: same line AND same team. Kalshi "Will Cleveland score over
+        # 1.5 runs?" / "WAS Commanders over 3.5 points scored"; Polymarket
+        # "Cleveland Guardians Team Total: O/U 1.5".
+        if k_type == 'team_total':
+            import re
+            k_v = MarketMatcher.kalshi_line_value(kalshi_market)
+            p_v = MarketMatcher.extract_total_value(p_question)
+            if k_v is None or p_v is None or abs(k_v - p_v) >= 0.01:
+                return False
+            km = re.match(r"^(?:will\s+)?(.+?)\s+(?:score\s+)?over\s+\d", k_title)
+            pm = re.match(r"^(.+?)\s+team total", p_question)
+            return bool(km and pm and EventMatcher.teams_match(
+                km.group(1).strip(), pm.group(1).strip(), sport))
 
         # Spread: must have same spread value, same period, AND same team favored
         if k_type == 'spread':
@@ -1301,7 +1397,7 @@ class MarketMatcher:
             if k_period != p_period:
                 return False
 
-            k_spread = MarketMatcher.extract_spread_value(k_title)
+            k_spread = MarketMatcher.kalshi_line_value(kalshi_market)
             p_spread = MarketMatcher.extract_spread_value(p_question)
 
             if k_spread is None or p_spread is None:
@@ -1351,24 +1447,13 @@ class MarketMatcher:
             if k_period != p_period:
                 return False
 
-            # Extract total from Kalshi ticker (e.g., KXNFLTOTAL-25NOV17DALLV-61 -> 61.0)
-            k_total = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
-            # Extract total from Polymarket question (e.g., "O/U 63.5" -> 63.5)
-            p_total_raw = MarketMatcher.extract_total_value(p_question)
-
-            # Both must have values to match
-            if k_total is not None and p_total_raw is not None:
-                # Polymarket uses half-points (50.5, 51.5), Kalshi uses whole numbers (50, 51)
-                # Round down Polymarket's value to match Kalshi's format
-                # 50.5 -> 50, 51.5 -> 51, etc.
-                import math
-                p_total = math.floor(p_total_raw)
-
-                # Now compare
-                return abs(k_total - p_total) < 0.01
-
-            # If either is missing a value, can't match
-            return False
+            # Both sides are half-point lines: Kalshi "Over 4.5" (floor_strike),
+            # Polymarket "O/U 4.5".
+            k_total = MarketMatcher.kalshi_line_value(kalshi_market)
+            p_total = MarketMatcher.extract_total_value(p_question)
+            if k_total is None or p_total is None:
+                return False
+            return abs(k_total - p_total) < 0.01
 
         # Player props: same player + same stat + same implied strike.
         # Kalshi phrases the line as "N+" (over N-0.5); Polymarket as
@@ -1753,7 +1838,7 @@ class PolymarketHistoricalOddsClient:
                 market_key = 'h2h'  # Default to moneyline
                 if market_type == 'spread':
                     market_key = 'spreads'
-                elif market_type == 'total':
+                elif market_type in ('total', 'team_total'):
                     market_key = 'totals'
                 elif market_type == 'moneyline':
                     market_key = 'h2h'
@@ -1931,7 +2016,7 @@ class KalshiHistoricalOddsClient:
                 market_key = 'h2h'  # Default to moneyline
                 if market_type == 'spread':
                     market_key = 'spreads'
-                elif market_type == 'total':
+                elif market_type in ('total', 'team_total'):
                     market_key = 'totals'
                 elif market_type == 'moneyline':
                     market_key = 'h2h'
@@ -1939,7 +2024,7 @@ class KalshiHistoricalOddsClient:
                 # For totals and spreads, Kalshi has YES/NO within single market
                 # YES = Over/Favorite, NO = Under/Underdog
                 # We need to create TWO outcomes per snapshot
-                if market_type in ['total', 'spread']:
+                if market_type in ['total', 'team_total', 'spread']:
                     # Get YES price (Over/Favorite)
                     yes_price_cents = close_price
                     yes_american_odds = kalshi_cents_to_american_odds(yes_price_cents)
@@ -1965,12 +2050,12 @@ class KalshiHistoricalOddsClient:
                                     'key': market_key,
                                     'outcomes': [
                                         {
-                                            'name': f'Over {line_value}' if market_type == 'total' else f'{line_value}',
+                                            'name': f'Over {line_value}' if market_type in ('total', 'team_total') else f'{line_value}',
                                             'price': yes_american_odds,
                                             'kalshi_cents': yes_price_cents,
                                         },
                                         {
-                                            'name': f'Under {line_value}' if market_type == 'total' else f'Not {line_value}',
+                                            'name': f'Under {line_value}' if market_type in ('total', 'team_total') else f'Not {line_value}',
                                             'price': no_american_odds,
                                             'kalshi_cents': no_price_cents,
                                         }
@@ -2849,12 +2934,11 @@ class HistoricalOddsWidget(QWidget):
     def init_ui(self):
         """Initialize the UI components"""
         layout = QVBoxLayout(self)
-        # Margins zeroed top & bottom: the controls now float over the plot (no
-        # header rows) and the progress bar is gone, so the plot runs flush from
-        # the top of the widget to the host banner. Right margin is 0 so the
-        # DEPTH/VIEW panel sits flush against the window's right edge (the old 5px
-        # left a dead dark strip beside the order book).
-        layout.setContentsMargins(5, 0, 0, 0)
+        # All margins zeroed: the controls float over the plot (no header rows),
+        # the progress bar is gone, and the plot + DEPTH/VIEW panel run flush to
+        # every edge of the widget (the old 5px left margin was a dead strip
+        # beside the %-axis).
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # Controls live in a translucent strip that FLOATS over the plot's top
         # edge (parented to the plot below, after it exists) instead of consuming
@@ -2970,8 +3054,13 @@ class HistoricalOddsWidget(QWidget):
             background="#0d1117",
             axisItems={'bottom': date_axis}
         )
-        self.plot_widget.setLabel('left', 'Implied %')
+        # No left-axis label: the rotated "Implied %" title cost a ~20px empty
+        # column down the plot's full height, and the tick text ("55.0% (-122)")
+        # already self-describes the units.
         self.plot_widget.setLabel('bottom', 'Time')
+        # Zero the PlotItem's internal 1px margins so the plotting surface runs
+        # truly flush against the DEPTH/VIEW panel's 1px divider.
+        self.plot_widget.plotItem.layout.setContentsMargins(0, 0, 0, 0)
         #self.plot_widget.addLegend()
         # showGrid draws gridlines aligned to the real axis ticks instead of a
         # GridItem, which previously painted raw-unit ghost labels (e.g.
@@ -3149,26 +3238,28 @@ class HistoricalOddsWidget(QWidget):
             #depthPanel QCheckBox { color:#cfd6df; font-family:monospace; font-size:11px; }
             #depthPanel QComboBox { background:#161b22; color:#cfd6df; border:1px solid #2b333d;
                 font-family:monospace; font-size:11px; padding:1px 3px; }
-            #depthHandle { background:transparent; color:#5b6675; border:none;
-                font-size:13px; font-weight:bold; }
-            #depthHandle:hover { background:rgba(224,176,80,40); color:#e0b050; }
         """)
         self._panel_body_w = 238  # includes room for the vertical scrollbar
-        self._handle_w = 14
-        # Outer = [thin transparent handle][collapsible body], handle flush against
-        # the graph's right edge so toggling expands the body leftward over... no:
-        # the body sits to the RIGHT of the handle and pushes the graph left.
+        # Outer holds just the collapsible body — the panel sits flush against
+        # the graph's right edge (its 1px #depthBody border-left is the divider).
         outer = QHBoxLayout(self.right_panel)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
 
-        # Always-visible transparent toggle handle (vertical strip at graph edge)
-        self.panel_handle = QPushButton("⟨")
-        self.panel_handle.setObjectName("depthHandle")
-        self.panel_handle.setFixedWidth(self._handle_w)
-        self.panel_handle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        # Discreet floating toggle pinned to the plot's right edge (positioned in
+        # _position_overlays), replacing the old full-height 14px handle strip.
+        self.panel_handle = QPushButton("⟨", self.plot_widget)
+        self.panel_handle.setFixedSize(14, 44)
+        self.panel_handle.setStyleSheet(
+            "QPushButton { background: rgba(13,17,23,222); color:#5b6675;"
+            " border:1px solid #2a3340; border-radius:3px; font-size:11px; }"
+            " QPushButton:hover { background: rgba(224,176,80,40); color:#e0b050; }")
         self.panel_handle.setToolTip("Show depth / view panel")
         self.panel_handle.clicked.connect(self._toggle_right_panel)
-        outer.addWidget(self.panel_handle)
+        self.panel_handle.show()
+        # Overlays are positioned in plot-widget space, so re-pin them whenever
+        # the PLOT resizes — panel expand/collapse changes the plot's width
+        # without resizing the top-level widget (see eventFilter).
+        self.plot_widget.installEventFilter(self)
 
         # Collapsible body (content lives inside a scroll area so expanding any
         # section scrolls within the panel instead of growing the whole window).
@@ -3410,7 +3501,7 @@ class HistoricalOddsWidget(QWidget):
         self.live_controls.setVisible(False)
         self.ob_section.setVisible(False)
         self.order_entry_section.setVisible(False)
-        # Start collapsed: just the thin transparent handle shows at the graph edge.
+        # Start collapsed: only the small floating toggle on the plot shows.
         self._panel_collapsed = True
         self.panel_scroll.setVisible(False)
         self.panel_handle.setText("⟨")
@@ -3597,6 +3688,9 @@ class HistoricalOddsWidget(QWidget):
             return []
 
         def _norm(s):
+            # PM soccer says "Draw", Kalshi's third market "Tie".
+            if (s or '').strip().lower() in ('draw', 'tie'):
+                return 'draw'
             try:
                 return EventMatcher.normalize_team_name(s or '', sport)
             except Exception:
@@ -4502,7 +4596,7 @@ class HistoricalOddsWidget(QWidget):
             market_type = getattr(getattr(self, 'current_unified_market', None), 'market_type', None)
             if market_type == 'spread':
                 market_key = 'spreads'
-            elif market_type == 'total':
+            elif market_type in ('total', 'team_total'):
                 market_key = 'totals'
 
             synthetic_snapshot = {
@@ -5240,8 +5334,9 @@ class HistoricalOddsWidget(QWidget):
         await self._refresh_open_orders()
 
     def _toggle_right_panel(self):
-        """Show/hide the DEPTH/VIEW body. Collapsed = just the thin transparent
-        handle at the graph's right edge; expanding pushes the graph left."""
+        """Show/hide the DEPTH/VIEW body. Collapsed = only the small floating
+        toggle on the plot's right edge; expanding pushes the graph left, with
+        the panel body flush against it (1px border-left as the divider)."""
         self._panel_collapsed = not getattr(self, '_panel_collapsed', True)
         if self._panel_collapsed:
             self.panel_scroll.setVisible(False)
@@ -5251,6 +5346,8 @@ class HistoricalOddsWidget(QWidget):
             self.panel_scroll.setVisible(True)
             self.panel_handle.setText("⟩")
             self.panel_handle.setToolTip("Hide depth / view panel")
+        # Overlay re-pinning happens in eventFilter when the plot's resize
+        # actually lands (the layout recalculates asynchronously).
 
     # ---- Live control handlers ----
     def _on_follow_toggled(self, state):
@@ -5733,10 +5830,18 @@ class HistoricalOddsWidget(QWidget):
         import time as _tp_all, sys as _sp_all
         _all_t0 = _tp_all.perf_counter()
         ranked = self.kalshi_client.kalshi_client.read_cached_event_series()
+        _age = self.kalshi_client.kalshi_client.cached_series_age_s()
         if not ranked:
             ranked = [{'game': g, 'tag': t} for g, t in (
                 ('KXNFLGAME', 'Football'), ('KXNBAGAME', 'Basketball'),
                 ('KXMLBGAME', 'Baseball'), ('KXNHLGAME', 'Hockey'))]
+            asyncio.ensure_future(self._refresh_series_cache_bg())
+        elif _age is not None and _age > self.SERIES_CACHE_MAX_AGE_S:
+            # Serve the stale menu now, rescan behind it (the bg task reloads when
+            # it lands). Without this the cache was only ever built ONCE — the
+            # refresh hung off the `not ranked` branch — so the league list stayed
+            # frozen on a months-old snapshot and never picked up a new season.
+            print(f"↻ Kalshi series cache is {_age/3600:.1f}h old — rescanning in background")
             asyncio.ensure_future(self._refresh_series_cache_bg())
 
         # Load every ACTIVE league (matched + unmatched) — the filterable picker
@@ -6020,11 +6125,22 @@ class HistoricalOddsWidget(QWidget):
         """Readable league label for a discovered series row (e.g. 'World Cup',
         'NPB', 'WNBA') from its title, falling back to the ticker."""
         t = (r.get('title') or '').replace(' Game', '').replace(' Match', '').strip()
-        return t or r.get('game', '').replace('KX', '').replace('GAME', '')
+        return t or (r.get('game', '').replace('KX', '')
+                     .replace('GAME', '').replace('MATCH', ''))
+
+    # The discovery scan walks every sports series on the exchange, so it is paced
+    # well under the read limit and takes ~1-2 min. Rescan daily: the league set
+    # turns over with the seasons, not with the hour.
+    SERIES_CACHE_MAX_AGE_S = 24 * 3600
 
     async def _refresh_series_cache_bg(self):
         """Build/refresh the volume-ranked event-series cache off-thread, then
-        reload the menu with the full set. Runs once when no cache exists yet."""
+        reload the menu with the full set. Single-flight — the scan is the most
+        request-hungry thing the widget does, so overlapping runs would double the
+        load for no benefit."""
+        if getattr(self, '_series_refresh_inflight', False):
+            return
+        self._series_refresh_inflight = True
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
@@ -6033,6 +6149,8 @@ class HistoricalOddsWidget(QWidget):
             await self.load_all_sports()
         except Exception as e:
             print(f"⚠️  series cache refresh failed: {e}")
+        finally:
+            self._series_refresh_inflight = False
 
     def _build_kalshi_pm_series_map(self, kalshi_ranked):
         """Map each non-big-4 Kalshi GAME-series ticker -> a Polymarket gamma
@@ -6158,6 +6276,10 @@ class HistoricalOddsWidget(QWidget):
 
         active_pm = [g for g in pm_games
                      if getattr(g, 'active', True) and not getattr(g, 'closed', False)]
+        # Parse each PM title ONCE. This used to sit in the inner loop, so it ran
+        # once per (kalshi_event x pm_game) pair rather than once per PM game.
+        pm_parsed = [(g,) + EventMatcher.parse_polymarket_title(g.title)
+                     for g in active_pm]
         out, matched = [], set()
         for k_event in kalshi_events:
             k_away, k_home = EventMatcher.parse_kalshi_title(k_event.get('title', ''))
@@ -6169,12 +6291,17 @@ class HistoricalOddsWidget(QWidget):
             # moneyline + live feed) are present regardless of which event is the
             # closest-time one. Closest-time is the PRIMARY (for id/title/start).
             related, primary, best = [], None, float('inf')
-            for g in active_pm:
+            for g, p1, p2 in pm_parsed:
                 if g.id in matched:
                     continue
-                p1, p2 = EventMatcher.parse_polymarket_title(g.title)
-                if (EventMatcher.events_match(k_away, k_home, p1, p2, sport_label)
-                        and EventMatcher.dates_compatible(et, g.start_time)):
+                # Cheap gate FIRST. events_match runs four fuzzy string compares
+                # (~100us); dates_compatible is a regex + timestamp diff (~4us).
+                # `and` short-circuits left-to-right, so the old order made EVERY
+                # candidate pair pay the expensive test and the cheap one ran only
+                # on the survivors (12,084 vs 128 calls per load, ~1.2s of CPU on
+                # the qasync loop — which is the UI thread).
+                if (EventMatcher.dates_compatible(et, g.start_time)
+                        and EventMatcher.events_match(k_away, k_home, p1, p2, sport_label)):
                     related.append(g)
                     d = EventMatcher.start_time_delta_hours(et, g.start_time)
                     if d < best or primary is None:
@@ -6201,10 +6328,9 @@ class HistoricalOddsWidget(QWidget):
                     ue.start_time = primary.start_time
             out.append(ue)
         # Second pass: unmatched (non-stale) PM games as PM-only rows.
-        for g in active_pm:
+        for g, p1, p2 in pm_parsed:
             if g.id in matched or EventMatcher.poly_game_is_stale(g.start_time):
                 continue
-            p1, p2 = EventMatcher.parse_polymarket_title(g.title)
             out.append(UnifiedEvent(
                 sport=sport_label, home_team=p2, away_team=p1,
                 start_time=g.start_time, polymarket_game_id=g.id,
@@ -6737,7 +6863,8 @@ class HistoricalOddsWidget(QWidget):
                     elif 'NCAAF' in series_ticker:
                         sport_prefix = 'NCAAF'
                     else:
-                        sport_prefix = series_ticker.replace('KX', '').replace('GAME', '')[:6]
+                        sport_prefix = (series_ticker.replace('KX', '')
+                                        .replace('GAME', '').replace('MATCH', ''))[:6]
 
                 if sport_prefix:
                     display_title = f"[{sport_prefix}] {event_title}"
@@ -6824,12 +6951,27 @@ class HistoricalOddsWidget(QWidget):
         self.market_selector.setCurrentIndex(0)
         await self.on_market_changed()
 
-    async def load_markets_for_unified_event(self, unified_event: UnifiedEvent):
+    @staticmethod
+    def _kalshi_display_name(k_market, market_type):
+        """Menu label for a Kalshi-led market. Totals get the line spelled out
+        when the title doesn't carry it (older "X at Y: Total Points" titles)."""
+        title = (k_market.get('title') or k_market.get('ticker') or '').rstrip('?')
+        if market_type in ('total', 'team_total'):
+            v = MarketMatcher.kalshi_line_value(k_market)
+            if v is not None and f"{v:g}" not in title:
+                return f"{title} O/U {v:g}"
+        return title
+
+    async def load_markets_for_unified_event(self, unified_event: UnifiedEvent, pick=None):
         """
         Load markets from both Kalshi and Polymarket for a unified event.
 
         Args:
             unified_event: UnifiedEvent containing data from both sources
+            pick: optional callable returning the market_selector index to
+                auto-select instead of the first market (-1 = keep first).
+                Used by link_table_market so a table click loads the clicked
+                market once rather than the first market and then the target.
         """
         # Futures: dedicated, much simpler path (N-candidate single market).
         if getattr(unified_event, 'is_future', False):
@@ -6909,6 +7051,7 @@ class HistoricalOddsWidget(QWidget):
                         'KXMLBGAME',           # Moneylines
                         'KXMLBSPREAD',         # Run line (spread)
                         'KXMLBTOTAL',          # Totals
+                        'KXMLBTEAMTOTAL',      # Team Totals
 
                     ]
                 elif sport == 'NHL':
@@ -6987,7 +7130,7 @@ class HistoricalOddsWidget(QWidget):
         moneyline_markets_kalshi = []
         if unified_event.has_kalshi():
             for idx, k_market in enumerate(kalshi_markets):
-                k_type = MarketMatcher.get_market_type(kalshi_title=k_market.get('title', ''))
+                k_type = MarketMatcher.kalshi_market_type(k_market)
                 if k_type == 'moneyline':
                     moneyline_markets_kalshi.append((idx, k_market))
 
@@ -6997,7 +7140,8 @@ class HistoricalOddsWidget(QWidget):
             poly_moneyline = None
             poly_moneyline_idx = None
             for p_idx, p_market in enumerate(poly_markets):
-                if MarketMatcher.get_market_type(poly_question=p_market.question) == 'moneyline':
+                if (MarketMatcher.get_market_type(poly_question=p_market.question) == 'moneyline'
+                        and MarketMatcher.get_market_period(p_market.question) == 'full_game'):
                     poly_moneyline = p_market
                     poly_moneyline_idx = p_idx
                     matched_poly_indices.add(p_idx)
@@ -7020,7 +7164,9 @@ class HistoricalOddsWidget(QWidget):
                 k_event_ticker = first_ticker or unified_event.kalshi_event_ticker
 
             # Create unified moneyline market
-            display_name = poly_moneyline.question if poly_moneyline else k_titles_list[0]
+            # Kalshi titles are per side ("Carolina wins") — name the game instead.
+            display_name = (poly_moneyline.question if poly_moneyline else
+                            f"{unified_event.away_team} @ {unified_event.home_team}: Winner")
 
             unified_moneyline = UnifiedMarket(
                 market_type='moneyline',
@@ -7062,7 +7208,7 @@ class HistoricalOddsWidget(QWidget):
                 matched_p_market = None
                 matched_p_idx = None
 
-                k_type = MarketMatcher.get_market_type(kalshi_title=k_title)
+                k_type = MarketMatcher.kalshi_market_type(k_market)
                 print(f"    Kalshi: {k_title[:60]} (type: {k_type}, ticker: {k_ticker})")
 
                 for p_idx, p_market in enumerate(poly_markets):
@@ -7094,19 +7240,11 @@ class HistoricalOddsWidget(QWidget):
                 market_type = k_type
 
                 if matched_p_market:
-                    # Both sources available - use Polymarket's more descriptive name if available
-                    if matched_p_market.question and len(matched_p_market.question) > len(k_title):
-                        display_name = matched_p_market.question
-                    else:
-                        # For Kalshi totals, extract the line value from ticker and add to display
-                        if market_type == 'total' and k_ticker:
-                            total_value = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
-                            if total_value:
-                                display_name = f"{k_title.replace('?', '')} O/U {total_value + 0.5}"
-                            else:
-                                display_name = k_title
-                        else:
-                            display_name = k_title
+                    # Both sources available - label with Polymarket's question: it
+                    # names both teams and the line ("A vs. B: O/U 5.5"), where
+                    # Kalshi's titles are one side of the bet.
+                    display_name = (matched_p_market.question
+                                    or self._kalshi_display_name(k_market, market_type))
 
                     unified_market = UnifiedMarket(
                         market_type=market_type or 'unknown',
@@ -7124,14 +7262,7 @@ class HistoricalOddsWidget(QWidget):
                 else:
                     # Kalshi only
                     # For totals, add the line value to display name
-                    if market_type == 'total' and k_ticker:
-                        total_value = MarketMatcher.extract_total_value(k_title, ticker=k_ticker)
-                        if total_value:
-                            display_name = f"{k_title.replace('?', '')} O/U {total_value + 0.5}"
-                        else:
-                            display_name = k_title
-                    else:
-                        display_name = k_title
+                    display_name = self._kalshi_display_name(k_market, market_type)
                     unified_market = UnifiedMarket(
                         market_type=market_type or 'unknown',
                         display_name=display_name,
@@ -7167,7 +7298,8 @@ class HistoricalOddsWidget(QWidget):
         #   1. Matched markets (has both Kalshi and Polymarket) - priority 0
         #   2. Single-source markets - priority 1
         # Within each priority group, sort by: moneyline, spread, total, props, unknown
-        type_order = {'moneyline': 0, 'spread': 1, 'total': 2, 'prop': 3, 'unknown': 4}
+        type_order = {'moneyline': 0, 'spread': 1, 'total': 2, 'team_total': 3,
+                      'prop': 4, 'unknown': 5}
 
         def sort_key(m):
             # Props always sort below the game lines (they live under a
@@ -7176,8 +7308,11 @@ class HistoricalOddsWidget(QWidget):
             # markets first, then by type, then by name.
             is_prop = 1 if m.market_type == 'prop' else 0
             has_both = 0 if (m.has_kalshi() and m.has_polymarket()) else 1
-            market_type_order = type_order.get(m.market_type, 4)
-            return (is_prop, has_both, market_type_order, m.display_name)
+            market_type_order = type_order.get(m.market_type, 5)
+            # Numeric-aware name order: (-2.5) before (-10.5), O/U 8.5 before 10.5.
+            name_key = tuple(float(tok) if i % 2 else tok.lower() for i, tok in
+                             enumerate(re.split(r'(\d+(?:\.\d+)?)', m.display_name or '')))
+            return (is_prop, has_both, market_type_order, name_key)
 
         unified_markets.sort(key=sort_key)
 
@@ -7210,7 +7345,13 @@ class HistoricalOddsWidget(QWidget):
         # Enable widget if we have markets
         if unified_markets:
             self.set_enabled(True)
-            # Auto-select first market
+            # Auto-select first market (or the caller's pick)
+            if pick is not None:
+                idx = pick()
+                if idx >= 0 and idx != self.market_selector.currentIndex():
+                    self.market_selector.blockSignals(True)
+                    self.market_selector.setCurrentIndex(idx)
+                    self.market_selector.blockSignals(False)
             await self.on_market_changed()
         else:
             # No markets available - keep disabled
@@ -7560,6 +7701,147 @@ class HistoricalOddsWidget(QWidget):
 
         # Start new data load
         self._load_task = asyncio.create_task(self.load_data())
+
+    # --- Odds-table -> widget link ---------------------------------------------
+    # A click in EffortOdds' odds table points this widget at the matching
+    # Kalshi/Polymarket event + market through the normal picker path, so the
+    # pickers stay usable afterwards. (set_market above is the TheOddsAPI
+    # /historical path — a paid endpoint, deliberately not called from the table.)
+    _TABLE_MARKET_TYPES = {'h2h': 'moneyline', 'h2h_3way': 'moneyline',
+                           'h2h_3_way': 'moneyline', 'spreads': 'spread',
+                           'totals': 'total'}
+
+    def _restore_pickers(self):
+        """Undo set_market()'s TheOddsAPI takeover: show the event/market pickers
+        again and leave the 'theoddsapi' data source (the Kalshi-path branches in
+        on_event_changed / on_market_changed / auto-refresh bail out under it)."""
+        if self.data_source == 'theoddsapi':
+            self.data_source = 'kalshi'
+            self.client = self.kalshi_client
+        self.event_selector.setVisible(True)
+        self.market_selector.setVisible(True)
+        self.market_info.hide()
+
+    def _find_table_event(self, home, away, commence=None):
+        """event_selector index of the game between home and away (either
+        orientation), nearest to commence when the same pair appears more than
+        once (a series, a doubleheader). -1 if not listed."""
+        target = FilterableEventCombo._epoch(commence)
+        best, best_d = -1, None
+        for i in range(self.event_selector.count()):
+            ev = self.event_selector.itemData(i)
+            if not isinstance(ev, UnifiedEvent) or ev.is_future:
+                continue
+            s = ev.sport
+            tm = EventMatcher.teams_match
+            if not ((tm(home, ev.home_team, s) and tm(away, ev.away_team, s))
+                    or (tm(home, ev.away_team, s) and tm(away, ev.home_team, s))):
+                continue
+            ev_t = FilterableEventCombo._epoch(ev.start_time)
+            d = abs(ev_t - target) if (target is not None and ev_t is not None) else 0
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    @staticmethod
+    def _spread_team(text):
+        """Team a spread market is quoted on: Kalshi 'X wins by over N ...' or
+        Polymarket 'Spread: X (-N)'."""
+        import re
+        t = (text or '').lower()
+        if 'wins by' in t:
+            return t.split('wins by', 1)[0].strip()
+        m = re.search(r'spread:\s*([^(]+)\s*\(', t)
+        return m.group(1).strip() if m else None
+
+    def _find_table_market(self, market_type, side, point, home, away, sport):
+        """market_selector index best matching a table row, -1 if the event has
+        no market of that type. Spreads/totals match on the line; a +N underdog
+        spread maps to the favourite's 'wins by over N' market (its NO side)."""
+        want = self._TABLE_MARKET_TYPES.get(market_type)
+        if want is None:
+            return -1
+        tm = EventMatcher.teams_match
+        fav = None
+        if want == 'spread' and side and point is not None and point != 0:
+            if point < 0:
+                fav = side
+            else:
+                fav = away if tm(side, home, sport) else home
+        best, best_score = -1, -1
+        for i in range(self.market_selector.count()):
+            um = self.market_selector.itemData(i)
+            if not isinstance(um, UnifiedMarket) or um.market_type != want:
+                continue
+            texts = [t for t in ([um.display_name, um.polymarket_question]
+                                 + list(um.kalshi_titles or [])) if t]
+            score = 0
+            if MarketMatcher.get_market_period(um.display_name) == 'full_game':
+                score += 4
+            if um.has_kalshi() and um.has_polymarket():
+                score += 1
+            if want == 'spread' and point is not None:
+                vals = [MarketMatcher.extract_spread_value(t) for t in texts]
+                if any(v is not None and abs(v - abs(point)) < 0.01 for v in vals):
+                    score += 8
+                teams = [self._spread_team(t) for t in texts]
+                if fav and any(t and tm(t, fav, sport) for t in teams):
+                    score += 4
+            elif want == 'total' and point is not None:
+                vals = [MarketMatcher.extract_total_value(t) for t in texts]
+                if any(v is not None and abs(v - point) < 0.01 for v in vals):
+                    score += 8
+            if score > best_score:
+                best, best_score = i, score
+        return best
+
+    async def link_table_market(self, home, away, market_type, side=None,
+                                point=None, commence=None):
+        """Select the Kalshi/Polymarket event + market matching an odds-table row.
+        Returns False when no prediction market lists the game."""
+        self._link_seq = getattr(self, '_link_seq', 0) + 1
+        seq = self._link_seq
+        self._restore_pickers()
+        ev_idx = self._find_table_event(home, away, commence)
+        if ev_idx < 0:
+            print(f"[link] no K/PM event for {away} @ {home}")
+            return False
+        ev = self.event_selector.itemData(ev_idx)
+
+        def pick():
+            return self._find_table_market(market_type, side, point,
+                                           home, away, ev.sport)
+
+        if self.current_unified_event is not ev:
+            self.event_selector.blockSignals(True)
+            self.event_selector.setCurrentIndex(ev_idx)
+            self.event_selector.blockSignals(False)
+            self._is_future_market = False
+            await self.load_markets_for_unified_event(ev, pick=pick)
+        else:
+            idx = pick()
+            if idx >= 0 and idx != self.market_selector.currentIndex():
+                self.market_selector.blockSignals(True)
+                self.market_selector.setCurrentIndex(idx)
+                self.market_selector.blockSignals(False)
+                await self.on_market_changed()
+        if seq != self._link_seq:
+            return True     # a newer click superseded this one
+
+        # Follow the clicked outcome in the live view (moneyline team, Over/Under).
+        # Not spreads: an underdog +N row is the favourite market's NO side, which
+        # the side labels don't name.
+        if self.live_mode and side and market_type != 'spreads':
+            for i in range(self.side_combo.count()):
+                lbl = self.side_combo.itemData(i)
+                if not isinstance(lbl, str) or lbl in ('all', 'top5', 'top10'):
+                    continue
+                if (lbl.strip().lower() == side.strip().lower()
+                        or EventMatcher.teams_match(lbl, side, ev.sport)):
+                    if i != self.side_combo.currentIndex():
+                        self.side_combo.setCurrentIndex(i)  # -> _on_side_changed
+                    break
+        return True
 
     @qasync.asyncSlot()
     async def on_event_changed(self):
@@ -8642,18 +8924,46 @@ class HistoricalOddsWidget(QWidget):
             print(f"⚠️  PM seed history fetch failed: {e}")
             return []
 
+    # Upper bound on carry-forward filler ticks per seeded series (see below).
+    _SEED_FILL_MAX_TICKS = 20000
+
     @staticmethod
     def _seed_ticks_from_ohlc(candles):
-        """Expand each historical 1-min OHLC candle into 4 synthetic ticks
-        (open→high→low→close, spaced within its minute) so the live 60s candle
-        aggregator reconstructs the real bar. Returns a live_ticks-shaped list."""
+        """Expand each historical OHLC candle into 4 synthetic ticks
+        (open→high→low→close, spaced within the minute ending at its
+        end_period_ts) so the live candle aggregator reconstructs the bar.
+        Returns a live_ticks-shaped list.
+
+        Gaps are then filled by carrying the last close forward, mirroring the
+        continuous-grid resample _fetch_pm_seed_ticks does for Polymarket. Two
+        things leave Kalshi's history gapped otherwise:
+          * Kalshi OMITS periods in which nothing changed (no trade, no bid/ask
+            move) — multi-hour holes on a quiet pregame market.
+          * For markets older than ~3.4 days the seed is HOURLY (_seed_window),
+            but the 4 ticks above land in the period's LAST minute, so at any
+            render bucket finer than an hour each hour drew one candle and
+            ~59 empty minutes — the dotted Kalshi rows next to solid PM ones.
+        Filler ticks sit strictly between one candle's end and the next candle's
+        final minute, so the real OHLC ticks are untouched. Cadence is 1 minute,
+        coarsened for very long histories (futures) to cap the filler count."""
         ticks = []
+        candles = sorted(candles, key=lambda cd: cd['t'])
+        span = (candles[-1]['t'] - candles[0]['t']) if len(candles) > 1 else 0
+        step = max(60, math.ceil(span / HistoricalOddsWidget._SEED_FILL_MAX_TICKS / 60) * 60)
+        prev_end, prev_close = None, None
         for cd in candles:
-            bs = cd['t'] - 60  # start of the 1-min period ending at end_period_ts
+            bs = cd['t'] - 60  # start of the final minute of the period ending at end_period_ts
+            if prev_close is not None:
+                ft = prev_end + 30
+                while ft < bs:
+                    ticks.append({'t': ft, 'price': prev_close, 'bid': None, 'ask': None})
+                    ft += step
             for off, price in ((1, cd['o']), (20, cd['h']), (40, cd['l']), (59, cd['c'])):
                 if price is None or not (0 < price < 100):
                     continue
                 ticks.append({'t': bs + off, 'price': price, 'bid': None, 'ask': None})
+            if cd['c'] is not None and 0 < cd['c'] < 100:
+                prev_end, prev_close = cd['t'], cd['c']
         return ticks
 
     def _exit_live_mode(self):
@@ -9415,6 +9725,13 @@ class HistoricalOddsWidget(QWidget):
         w = self.plot_widget.width()
         h = self.plot_widget.height()
 
+        # Depth/view panel toggle: small tab hugging the plot's right edge,
+        # vertically centered (where the old full-height handle strip lived).
+        ph = getattr(self, 'panel_handle', None)
+        if ph is not None:
+            ph.move(w - ph.width() - 1, (h - ph.height()) // 2)
+            ph.raise_()
+
         # --- Floating control strip + its toggle (top-CENTER, HUGGING its content
         # so it never spans the graph width). The toggle sits just right of the
         # strip when shown, or centered alone when the strip is hidden. ---
@@ -9509,6 +9826,14 @@ class HistoricalOddsWidget(QWidget):
         # Keep the control strip, watermarks + summaries pinned when the widget
         # (and plot) resizes.
         self._position_overlays()
+
+    def eventFilter(self, obj, event):
+        # The floating overlays live in plot-widget space; the plot resizes
+        # WITHOUT a top-level resizeEvent when the DEPTH/VIEW panel expands or
+        # collapses, so re-pin them the moment the plot's new geometry lands.
+        if obj is getattr(self, 'plot_widget', None) and event.type() == QEvent.Type.Resize:
+            self._position_overlays()
+        return super().eventFilter(obj, event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -10165,10 +10490,10 @@ class HistoricalOddsWidget(QWidget):
             if not getattr(self, 'live_mode', False):
                 self.plot_widget.getViewBox().enableAutoRange(axis='y', enable=True)
 
-            # Y-axis label + ticks: implied % primary, american odds in parens,
-            # at round values with fainter minor gridlines. Ticks are (re)built
-            # from the visible range here and on every zoom/pan (sigYRangeChanged).
-            self.plot_widget.getAxis('left').setLabel('Implied %')
+            # Y-axis ticks: implied % primary, american odds in parens, at round
+            # values with fainter minor gridlines. Ticks are (re)built from the
+            # visible range here and on every zoom/pan (sigYRangeChanged). No
+            # axis label — the tick text self-describes the units.
             self._update_y_ticks()
 
     def _update_y_ticks(self):

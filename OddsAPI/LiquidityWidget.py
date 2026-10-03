@@ -11,8 +11,13 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QPushButton, QProgressBar, QTreeWidget, QTreeWidgetItem,
     QStyledItemDelegate, QDoubleSpinBox, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread, QSize, QObject, QThreadPool, QRunnable
+from PyQt6.QtCore import Qt, QTimer, QElapsedTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRectF, QPointF, QThread, QSize, QObject, QThreadPool, QRunnable
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QRadialGradient, QPainterPath, QFontMetrics
+from PyQt6.QtCore import QUrl, QEvent
+try:
+    from PyQt6.QtQuick import QQuickView
+except Exception:  # no QtQuick on this machine -> QPainter overlay only
+    QQuickView = None
 import asyncio
 import json
 import math
@@ -544,198 +549,332 @@ class MatchMapWorker(QThread):
 
 class OrderBookLoadingOverlay(QWidget):
     """
-    Animated loading overlay for orderbook widget.
-    Features a sophisticated scanning/pulsing effect with particle-like elements.
+    Loading overlay for the order book: a clean "skeleton" ladder with a
+    shimmer sweep, plus a small status caption. Deliberately lightweight so
+    it stays smooth while the main thread is busy with the very fetch/parse
+    it is covering.
+
+    Two design choices make it jank-resistant:
+      * Time-based, not tick-based. Every animated value is derived from a
+        QElapsedTimer, so a dropped/late frame (a GIL burst from the PX
+        parse, populate, or render) never freezes or slows the motion — the
+        next frame simply lands at the correct phase. The old overlay
+        advanced by a fixed delta per tick, so contention made it both
+        stutter AND run slow.
+      * Cheap per frame. One background fill, a handful of rounded skeleton
+        blocks, and a single moving-gradient shimmer band — no per-frame
+        radial gradients, particle loops, or rotating arcs. Static paint
+        resources (colors) are built once in __init__.
+
+    show()/hide() are a soft opacity cross-fade driven off the same clock,
+    so the reveal reads as one settle: the overlay fades out over the
+    already-rendered book underneath instead of popping off.
     """
 
-    def __init__(self, parent=None):
+    # ~40fps: smooth enough to read as continuous motion, ~1.6x cheaper than
+    # 60fps and far more tolerant of missed deadlines during the load burst.
+    _FRAME_MS = 25
+    _FADE_SECONDS = 0.18          # cross-fade in/out duration
+    _SHIMMER_PERIOD = 1.35        # seconds for one shimmer sweep L->R
+    _ROW_PERIOD = 2.4             # seconds for the row breathing cycle
+
+    def __init__(self, parent=None, compact_mode: bool = False):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setStyleSheet("background: transparent;")
-
-        # Animation state
-        self.scan_offset = 0.0
-        self.pulse_phase = 0.0
-        self.particle_phase = 0.0
-        self.glow_intensity = 0.0
-
-        # Fake orderbook rows for skeleton effect
-        self.skeleton_rows = 12
-
-        # Timer for animation (~60fps)
-        self.animation_timer = QTimer(self)
-        self.animation_timer.timeout.connect(self._updateAnimation)
-
-        # Status text
+        self.compact_mode = compact_mode
         self.status_text = "Fetching live orderbook..."
 
+        # Fade state (0 = fully hidden, 1 = fully shown). Driven dt-based in
+        # _tick so it interpolates by real elapsed time, immune to stutter.
+        self._alpha = 0.0
+        self._alpha_target = 0.0
+        self._last_ms = 0
+
+        # Monotonic animation clock. Never reset mid-run so phase stays
+        # continuous across repeated start() calls (status text changes).
+        self._clock = QElapsedTimer()
+        self._clock.start()
+
+        # Cached paint resources (built once).
+        self._bg_color = QColor(12, 14, 19)          # alpha applied per frame
+        self._ask_tint = QColor(248, 113, 113)       # faint red (top half)
+        self._bid_tint = QColor(52, 211, 153)         # faint green (bottom)
+        self._block_color = QColor(255, 255, 255)
+        self._text_color = QColor(150, 165, 182)
+        self._caption_font = QFont("SF Mono", 10 if compact_mode else 11,
+                                   QFont.Weight.DemiBold)
+
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(self._tick)
+
+    # ------------------------------------------------------------------
     def start(self, status_text: str = "Fetching live orderbook..."):
-        """Start the loading animation"""
+        """Show (or keep showing) the overlay, fading in. Idempotent: if
+        already visible this only updates the caption — it does NOT restart
+        the fade from zero, so a status change mid-load doesn't flicker."""
         self.status_text = status_text
-        self.scan_offset = 0.0
-        self.pulse_phase = 0.0
-        self.show()
-        self.raise_()
-        self.animation_timer.start(16)  # ~60fps
+        self._alpha_target = 1.0
+        if not self.isVisible():
+            self._last_ms = self._clock.elapsed()
+            self.show()
+            self.raise_()
+        if not self.animation_timer.isActive():
+            self._last_ms = self._clock.elapsed()
+            self.animation_timer.start(self._FRAME_MS)
 
     def stop(self):
-        """Stop the loading animation"""
-        self.animation_timer.stop()
-        self.hide()
+        """Begin fading out; the widget hides itself once fully faded (see
+        _tick). The fade-out over the already-rendered book is the reveal
+        cross-fade."""
+        if not self.isVisible():
+            return
+        self._alpha_target = 0.0
+        if not self.animation_timer.isActive():
+            self._last_ms = self._clock.elapsed()
+            self.animation_timer.start(self._FRAME_MS)
 
-    def _updateAnimation(self):
-        """Update animation state each frame"""
-        self.scan_offset = (self.scan_offset + 3) % (self.height() + 100)
-        self.pulse_phase = (self.pulse_phase + 0.08) % (2 * math.pi)
-        self.particle_phase = (self.particle_phase + 0.03) % (2 * math.pi)
-        self.glow_intensity = 0.5 + 0.5 * math.sin(self.pulse_phase)
+    # ------------------------------------------------------------------
+    def _tick(self):
+        """Advance the fade toward its target by real elapsed time, then
+        repaint. Stops the timer + hides once fully faded out; stops the
+        timer (but keeps painting the static-motion frames) once fully faded
+        in — motion itself is clock-derived in paintEvent, so we must keep
+        ticking while shown."""
+        now = self._clock.elapsed()
+        dt = max(0, now - self._last_ms) / 1000.0
+        self._last_ms = now
+
+        step = dt / self._FADE_SECONDS if self._FADE_SECONDS > 0 else 1.0
+        if self._alpha < self._alpha_target:
+            self._alpha = min(self._alpha_target, self._alpha + step)
+        elif self._alpha > self._alpha_target:
+            self._alpha = max(self._alpha_target, self._alpha - step)
+
+        if self._alpha_target <= 0.0 and self._alpha <= 0.0:
+            self.animation_timer.stop()
+            self.hide()
+            return
         self.update()
 
+    # ------------------------------------------------------------------
     def paintEvent(self, event):
+        a = self._alpha
+        if a <= 0.0:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         w, h = self.width(), self.height()
+        t = self._clock.elapsed() / 1000.0
 
-        # Semi-transparent dark background
-        painter.fillRect(self.rect(), QColor(13, 15, 20, 230))
+        # Dim scrim over the book.
+        self._bg_color.setAlpha(int(236 * a))
+        painter.fillRect(self.rect(), self._bg_color)
 
-        # Draw skeleton orderbook rows
-        self._drawSkeletonRows(painter, w, h)
+        rows = self._skeletonRows(w, h)
+        self._paintSkeleton(painter, rows, w, t, a)
+        self._paintShimmer(painter, rows, w, t, a)
+        self._paintCaption(painter, w, h, t, a)
 
-        # Draw scanning line effect
-        self._drawScanLine(painter, w, h)
+    # ------------------------------------------------------------------
+    def _skeletonRows(self, w: int, h: int):
+        """Compute the skeleton ladder geometry for the current size. Cheap
+        (a short list of ints); recomputed per frame so it always tracks a
+        resize without any cached-invalidation bookkeeping."""
+        row_h = 20 if self.compact_mode else 26
+        gap = 4
+        top = 10
+        bottom = h - (30 if self.compact_mode else 38)  # leave caption room
+        rows = []
+        y = top
+        while y + row_h <= bottom:
+            rows.append(y)
+            y += row_h + gap
+        return {"ys": rows, "row_h": row_h}
 
-        # Draw central glow orb
-        self._drawGlowOrb(painter, w, h)
-
-        # Draw status text
-        self._drawStatusText(painter, w, h)
-
-        # Draw floating particles
-        self._drawParticles(painter, w, h)
-
-    def _drawSkeletonRows(self, painter: QPainter, w: int, h: int):
-        """Draw faint skeleton orderbook rows that pulse"""
-        row_height = 28
-        start_y = 60  # Below header area
-
-        for i in range(self.skeleton_rows):
-            y = start_y + i * row_height
-            if y > h - 40:
-                break
-
-            # Alternating bid/ask colors with pulse
-            phase_offset = i * 0.3
-            alpha = int(20 + 15 * math.sin(self.pulse_phase + phase_offset))
-
-            if i < self.skeleton_rows // 2:
-                # Ask side (red tint)
-                color = QColor(248, 113, 113, alpha)
-            else:
-                # Bid side (green tint)
-                color = QColor(52, 211, 153, alpha)
-
-            # Draw row background
-            painter.fillRect(10, y, w - 20, row_height - 2, color)
-
-            # Draw fake content bars
-            bar_alpha = int(30 + 20 * math.sin(self.pulse_phase + phase_offset + 0.5))
-            painter.fillRect(15, y + 8, 50, 12, QColor(255, 255, 255, bar_alpha))
-            painter.fillRect(75, y + 8, 80, 12, QColor(255, 255, 255, bar_alpha))
-            painter.fillRect(w - 70, y + 8, 50, 12, QColor(255, 255, 255, bar_alpha))
-
-    def _drawScanLine(self, painter: QPainter, w: int, h: int):
-        """Draw animated scanning line that sweeps down"""
-        scan_y = self.scan_offset
-
-        # Create gradient for scan line
-        gradient = QLinearGradient(0, scan_y - 50, 0, scan_y + 50)
-        gradient.setColorAt(0.0, QColor(74, 158, 255, 0))
-        gradient.setColorAt(0.4, QColor(74, 158, 255, 100))
-        gradient.setColorAt(0.5, QColor(74, 158, 255, 200))
-        gradient.setColorAt(0.6, QColor(74, 158, 255, 100))
-        gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
-
-        painter.fillRect(0, int(scan_y - 50), w, 100, gradient)
-
-        # Bright center line
-        painter.setPen(QPen(QColor(74, 158, 255, 255), 2))
-        painter.drawLine(0, int(scan_y), w, int(scan_y))
-
-    def _drawGlowOrb(self, painter: QPainter, w: int, h: int):
-        """Draw central pulsing glow orb"""
-        center_x, center_y = w // 2, h // 2
-
-        # Outer glow
-        outer_radius = 60 + 20 * self.glow_intensity
-        gradient = QRadialGradient(center_x, center_y, outer_radius)
-        gradient.setColorAt(0.0, QColor(74, 158, 255, int(80 * self.glow_intensity)))
-        gradient.setColorAt(0.5, QColor(74, 158, 255, int(40 * self.glow_intensity)))
-        gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
-
-        painter.setBrush(gradient)
+    def _paintSkeleton(self, painter, rows, w, t, a):
+        """Faint bid/ask ladder blocks with a slow breathing pulse."""
+        ys = rows["ys"]
+        row_h = rows["row_h"]
+        n = len(ys)
+        if n == 0:
+            return
+        pad = 8
+        block_h = row_h - 8
+        by = 4
+        # Breathing pulse shared across rows (time-based).
+        pulse = 0.5 + 0.5 * math.sin(t * (2 * math.pi / self._ROW_PERIOD))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QPointF(center_x, center_y), outer_radius, outer_radius)
+        for i, y in enumerate(ys):
+            tint = self._ask_tint if i < n / 2 else self._bid_tint
+            # Row background wash (very faint, tinted by side).
+            tint.setAlpha(int((10 + 6 * pulse) * a))
+            painter.setBrush(tint)
+            painter.drawRoundedRect(QRectF(pad, y, w - 2 * pad, row_h), 3, 3)
+            # Content blocks: label · bar · number. Widths scale with size.
+            self._block_color.setAlpha(int((22 + 12 * pulse) * a))
+            painter.setBrush(self._block_color)
+            label_w = 34 if self.compact_mode else 46
+            num_w = 30 if self.compact_mode else 42
+            bar_w = max(20, (w - 2 * pad) - label_w - num_w - 24)
+            x = pad + 6
+            painter.drawRoundedRect(QRectF(x, y + by, label_w, block_h), 2, 2)
+            painter.drawRoundedRect(QRectF(x + label_w + 8, y + by, bar_w,
+                                           block_h), 2, 2)
+            painter.drawRoundedRect(QRectF(w - pad - 6 - num_w, y + by, num_w,
+                                           block_h), 2, 2)
 
-        # Inner bright core
-        inner_radius = 8 + 4 * self.glow_intensity
-        gradient2 = QRadialGradient(center_x, center_y, inner_radius)
-        gradient2.setColorAt(0.0, QColor(255, 255, 255, 255))
-        gradient2.setColorAt(0.5, QColor(74, 158, 255, 200))
-        gradient2.setColorAt(1.0, QColor(74, 158, 255, 0))
+    def _paintShimmer(self, painter, rows, w, t, a):
+        """A single translucent highlight band sweeping left->right across
+        the ladder — the whole 'alive' cue, one gradient per frame."""
+        ys = rows["ys"]
+        if not ys:
+            return
+        top = ys[0]
+        bottom = ys[-1] + rows["row_h"]
+        frac = (t / self._SHIMMER_PERIOD) % 1.0
+        band = w * 0.38
+        # Sweep the band fully off-screen on both ends for a clean in/out.
+        cx = -band + (w + 2 * band) * frac
+        grad = QLinearGradient(cx - band / 2, 0, cx + band / 2, 0)
+        peak = QColor(120, 170, 235, int(34 * a))
+        edge = QColor(120, 170, 235, 0)
+        grad.setColorAt(0.0, edge)
+        grad.setColorAt(0.5, peak)
+        grad.setColorAt(1.0, edge)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(grad)
+        painter.drawRect(QRectF(0, top, w, bottom - top))
 
-        painter.setBrush(gradient2)
-        painter.drawEllipse(QPointF(center_x, center_y), inner_radius, inner_radius)
+    def _paintCaption(self, painter, w, h, t, a):
+        """Small status caption + animated ellipsis at the bottom."""
+        painter.setFont(self._caption_font)
+        self._text_color.setAlpha(int(215 * a))
+        painter.setPen(self._text_color)
+        dots = "." * (1 + int(t / 0.4) % 3)
+        cap_h = 22
+        rect = QRectF(0, h - cap_h - 8, w, cap_h)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
+                         f"{self.status_text}{dots}")
 
-        # Rotating arc around the orb
-        arc_radius = 30 + 10 * self.glow_intensity
-        painter.setPen(QPen(QColor(74, 158, 255, 180), 3))
-        arc_angle = int(self.pulse_phase * 180 / math.pi * 2) % 360
-        painter.drawArc(
-            int(center_x - arc_radius), int(center_y - arc_radius),
-            int(arc_radius * 2), int(arc_radius * 2),
-            arc_angle * 16, 90 * 16
-        )
 
-    def _drawStatusText(self, painter: QPainter, w: int, h: int):
-        """Draw status text below the glow orb"""
-        font = QFont("SF Mono", 11, QFont.Weight.DemiBold)
-        painter.setFont(font)
+QML_DIR = Path(__file__).resolve().parent / "qml"
 
-        # Pulsing text alpha
-        text_alpha = int(180 + 75 * math.sin(self.pulse_phase))
-        painter.setPen(QColor(200, 210, 220, text_alpha))
 
-        text_rect = QRectF(0, h // 2 + 50, w, 30)
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self.status_text)
+class _GuiSyncThrottle(QObject):
+    """Event filter for the loader's QQuickView: lets at most one
+    UpdateRequest through per `ms`.
 
-        # Animated dots
-        dots = "." * (1 + int(self.pulse_phase / (math.pi / 2)) % 4)
-        dots_rect = QRectF(0, h // 2 + 75, w, 20)
-        painter.drawText(dots_rect, Qt.AlignmentFlag.AlignCenter, dots)
+    While ANY Animator runs, Qt's threaded render loop posts the window an
+    UpdateRequest every vsync, and handling one makes the GUI thread
+    polishAndSync — blocking until the render thread comes out of its
+    vsync-locked swap. Measured on this loader: 75 syncs/s, GUI thread
+    blocked ~95% of its idle time; in the real app that cost the startup
+    ~1.1s. Animators don't need those syncs (they advance on the render
+    thread; same reason they survive a frozen GUI), so dropping them leaves
+    the render thread at vsync rate with ~0 GUI syncs. A real scene change
+    (the caption) still gets a sync within `ms`. Removed for the fade, whose
+    `faded` signal is delivered via the GUI-side animation proxies.
+    Verified by perf_runs/quick_loader_sync_test.py (THROTTLE_MS=100)."""
 
-    def _drawParticles(self, painter: QPainter, w: int, h: int):
-        """Draw floating particle effects"""
-        center_x, center_y = w // 2, h // 2
-        num_particles = 8
+    def __init__(self, ms: int, parent=None):
+        super().__init__(parent)
+        self._ms = ms
+        self._clock = QElapsedTimer()
+        self._clock.start()
+        self._last = -(1 << 30)
 
-        for i in range(num_particles):
-            angle = (2 * math.pi * i / num_particles) + self.particle_phase
-            radius = 80 + 20 * math.sin(self.particle_phase * 2 + i)
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.UpdateRequest:
+            now = self._clock.elapsed()
+            if now - self._last < self._ms:
+                return True
+            self._last = now
+        return False
 
-            px = center_x + radius * math.cos(angle)
-            py = center_y + radius * math.sin(angle)
 
-            # Particle glow
-            particle_alpha = int(100 + 50 * math.sin(self.particle_phase + i * 0.5))
-            gradient = QRadialGradient(px, py, 8)
-            gradient.setColorAt(0.0, QColor(74, 158, 255, particle_alpha))
-            gradient.setColorAt(1.0, QColor(74, 158, 255, 0))
+class QuickBookLoader(QObject):
+    """Startup loading overlay for the WHOLE ProphetXBrowser, animated on Qt
+    Quick's render thread.
 
-            painter.setBrush(gradient)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QPointF(px, py), 8, 8)
+    Why not the QPainter OrderBookLoadingOverlay: during app startup the GUI
+    thread is starved — EffortOdds' other panels run their own bursts and
+    ~10 worker threads (TuneIn crawl, Polymarket/Kalshi loads) compete for
+    the GIL — so a QTimer-driven paint lands at ~25fps with 150-850ms
+    freezes (measured 2026-10-02, perf_runs/liq_startup_probe.py). Qt allows
+    no other thread to paint widgets, so the animation has to be something
+    that is NOT a widget: a QQuickView whose Animators run on the render
+    thread, needing neither the GUI thread nor the GIL (qml/BookLoader.qml;
+    proven by perf_runs/quick_loader_block_test.py: ~75fps, 15ms worst gap,
+    with the GUI thread frozen and 8 threads holding the GIL).
+
+    Same hosting as EffortMLB's QuickSeamLoader: createWindowContainer (a
+    native CHILD window keeps the threaded render loop), NEVER QQuickWidget
+    (renders on the GUI thread). Verified it does not make the splitter
+    ancestors native. It covers the whole panel, so the combos/table are not
+    seen assembling underneath; the reveal is an OpacityAnimator fade.
+
+    Construction raises if QML can't load; the caller falls back to the
+    QPainter overlay."""
+
+    def __init__(self, host: QWidget, label: str):
+        super().__init__(host)
+        if QQuickView is None:
+            raise RuntimeError("QtQuick unavailable")
+        v = QQuickView()
+        v.setColor(QColor(0, 0, 0, 0))   # fade dissolves into the panel
+        v.setResizeMode(QQuickView.ResizeMode.SizeRootObjectToView)
+        v.setSource(QUrl.fromLocalFile(str(QML_DIR / "BookLoader.qml")))
+        if v.status() != QQuickView.Status.Ready:
+            raise RuntimeError("BookLoader.qml failed to load: "
+                               + "; ".join(e.toString() for e in v.errors()))
+        self._view = v
+        self._root = v.rootObject()
+        self._root.faded.connect(self._on_faded)
+        self._throttle = _GuiSyncThrottle(100, self)
+        v.installEventFilter(self._throttle)
+        self._container = QWidget.createWindowContainer(v, host)
+        self._container.setGeometry(host.rect())
+        self.set_label(label)
+        self._container.show()
+        self._container.raise_()
+        self._finishing = False
+
+    @property
+    def active(self) -> bool:
+        """True until finish() is called (fading counts as done)."""
+        return self._root is not None and not self._finishing
+
+    def set_label(self, text: str):
+        if self._root is not None:
+            # The QML adds its own animated dots.
+            self._root.setProperty("label", (text or "").rstrip(". …"))
+
+    def sync_geometry(self, rect):
+        if self._container is not None:
+            self._container.setGeometry(rect)
+            self._container.raise_()
+
+    def finish(self):
+        if self._root is None or self._finishing:
+            return
+        self._finishing = True
+        # Unthrottle first: the fade's `faded` signal needs GUI-side ticks.
+        if self._view is not None:
+            self._view.removeEventFilter(self._throttle)
+        self._root.setProperty("fading", True)
+        # Safety net: the fade is 280ms — never leave the cover up if the
+        # signal is lost.
+        QTimer.singleShot(1500, self._on_faded)
+
+    def _on_faded(self):
+        if self._container is None:
+            return  # already torn down (signal + safety timer both fire)
+        c, self._container = self._container, None
+        self._view = self._root = None
+        if c is not None:
+            c.hide()
+            c.deleteLater()
 
 
 class BetSlipDrawer(QWidget):
@@ -2157,7 +2296,8 @@ class OrderBookWidget(QWidget):
 
     def _setupLoadingOverlay(self):
         """Setup the loading overlay widget"""
-        self.loading_overlay = OrderBookLoadingOverlay(self)
+        self.loading_overlay = OrderBookLoadingOverlay(
+            self, compact_mode=self.compact_mode)
         self.loading_overlay.hide()
         self.loading_overlay.setGeometry(self.rect())
 
@@ -2174,6 +2314,12 @@ class OrderBookWidget(QWidget):
                 and self.sgp_panel.isVisible()):
             return
         self.is_loading = True
+        # The reveal gates key off is_loading, so it is set either way; the
+        # QPainter overlay is skipped while ProphetXBrowser's render-thread
+        # startup loader covers the whole panel (it would only burn GUI-thread
+        # paints underneath it).
+        if getattr(self, "_visual_overlay_suppressed", False):
+            return
         self.loading_overlay.setGeometry(self.rect())
         self.loading_overlay.start(status_text)
 
@@ -4164,6 +4310,13 @@ class ProphetXBrowser(QWidget):
         super().__init__(parent)
         self.all_events = {}
         self.filtered_events = []
+        # Compact event combo stores only the event-id STRING as item data;
+        # the event dict lives here. Storing the dict itself made PyQt deep-
+        # convert the whole event payload (every market + order) to a
+        # QVariantMap on each addItem/setItemData, and back to a fresh copy on
+        # each itemData() read — ~90ms per full pass over a 241-event dump,
+        # several passes per startup reveal (measured 2026-10-02).
+        self._combo_events: Dict[str, dict] = {}
         self.current_event_data = None
         self.current_event_id = None
         self.compact_mode = compact_mode
@@ -4555,7 +4708,7 @@ class ProphetXBrowser(QWidget):
             combo.blockSignals(True)
             try:
                 for i in range(combo.count()):
-                    ev = combo.itemData(i)
+                    ev = self._comboEvent(i)
                     if ev and str((ev.get("metadata") or {}).get("id")) == target:
                         combo.setCurrentIndex(i)
                         break
@@ -4890,12 +5043,33 @@ class ProphetXBrowser(QWidget):
         panel.setStyleSheet("background-color: #0d0f14;")
         return panel
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        ql = getattr(self, '_quick_loader', None)
+        if ql is not None:
+            ql.sync_geometry(self.rect())
+
     def _loadInitialData(self):
         """
         Initial data load on startup.
         Shows loading animation and requests fresh data fetch.
         Falls back to stale JSON if available while waiting.
         """
+        # Startup gets the render-thread loader over the WHOLE panel (see
+        # QuickBookLoader); EFFORTODDS_LIQ_QUICK_LOADER=0 forces the old
+        # QPainter overlay for an A/B. Per-event loads later keep the light
+        # QPainter overlay — the app is idle by then.
+        self._quick_loader = None
+        import os as _os
+        if _os.environ.get("EFFORTODDS_LIQ_QUICK_LOADER", "1") != "0":
+            try:
+                self._quick_loader = QuickBookLoader(self, "Initializing ProphetX")
+                self.orderbook._visual_overlay_suppressed = True
+            except Exception as e:
+                print(f"[LiquidityWidget] Quick loader unavailable, using "
+                      f"QPainter overlay: {e}")
+                self._quick_loader = None
+
         # Show loading state immediately
         self.showLoading("Initializing ProphetX...")
         self._pending_fresh_fetch = True
@@ -5097,12 +5271,23 @@ class ProphetXBrowser(QWidget):
 
     def showLoading(self, status_text: str = "Fetching live orderbook..."):
         """Show loading animation on the orderbook"""
+        ql = getattr(self, '_quick_loader', None)
+        if ql is not None and ql.active:
+            ql.set_label(status_text)
         if hasattr(self, 'orderbook'):
             self.orderbook.showLoading(status_text)
         self.loading_state_changed.emit(True)
 
     def hideLoading(self):
         """Hide loading animation on the orderbook"""
+        ql = getattr(self, '_quick_loader', None)
+        if ql is not None:
+            # First reveal: fade the panel-wide loader out (render thread) and
+            # hand later loads back to the order book's QPainter overlay.
+            self._quick_loader = None
+            ql.finish()
+            if hasattr(self, 'orderbook'):
+                self.orderbook._visual_overlay_suppressed = False
         if hasattr(self, 'orderbook'):
             self.orderbook.hideLoading()
         self._pending_fresh_fetch = False
@@ -5191,9 +5376,8 @@ class ProphetXBrowser(QWidget):
             combo.setUpdatesEnabled(False)
             try:
                 for i in range(combo.count()):
-                    data = combo.itemData(i)
-                    eid = data.get('id') if isinstance(data, dict) else None
-                    if eid is None:
+                    eid = combo.itemData(i)
+                    if not isinstance(eid, str):
                         continue
                     source = self._event_source_for(eid)
                     # Badge + role depend only on the source; skip the Qt
@@ -5280,6 +5464,12 @@ class ProphetXBrowser(QWidget):
 
             self.event_list.addItem(item)
 
+    def _comboEvent(self, index: int) -> Optional[dict]:
+        """Event dict for a compact-combo row (None for the FUTURES separator
+        or an out-of-range index)."""
+        key = self.event_combo.itemData(index)
+        return self._combo_events.get(key) if isinstance(key, str) else None
+
     def refreshCompactEventCombo(self):
         """Refresh the compact event combo box. Uses the same
         _EventSourceDelegate as the QListWidget — installed on the
@@ -5329,11 +5519,15 @@ class ProphetXBrowser(QWidget):
                 combo.setItemDelegate(delegate)
 
             same_structure = combo.count() == len(rows)
+            # The fresh dicts back every row (selection reads them via
+            # _comboEvent), whichever branch below runs.
+            self._combo_events = {key: event for key, _d, _s, event in rows
+                                  if event is not None}
+
             if same_structure:
                 for i, (key, _d, _s, _e) in enumerate(rows):
                     data = combo.itemData(i)
-                    cur_key = (str(data['id']) if isinstance(data, dict)
-                               else "__SEP__")
+                    cur_key = data if isinstance(data, str) else "__SEP__"
                     if cur_key != key:
                         same_structure = False
                         break
@@ -5344,14 +5538,14 @@ class ProphetXBrowser(QWidget):
                         continue  # separator text/style never changes
                     if combo.itemText(i) != display:
                         combo.setItemText(i, display)
-                    # Always refresh the stored dict — it carries the fresh
-                    # 'data' payload onCompactEventSelected renders from.
-                    combo.setItemData(i, event)
-                    combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
+                    # The fresh 'data' payload is in _combo_events (above);
+                    # only the delegate's source role lives on the item.
+                    if combo.itemData(i, _EVENT_SOURCE_ROLE) != source:
+                        combo.setItemData(i, source, _EVENT_SOURCE_ROLE)
             else:
                 combo.clear()
                 for key, display, source, event in rows:
-                    combo.addItem(display, event)
+                    combo.addItem(display, key if event is not None else None)
                     i = combo.count() - 1
                     if event is None:
                         sep_model_item = combo.model().item(i)
@@ -5366,11 +5560,9 @@ class ProphetXBrowser(QWidget):
                 # listed (signals are blocked — no re-render fires). Falls
                 # back to item 0, as before, when it's gone.
                 if self.current_event_id is not None:
+                    target = str(self.current_event_id)
                     for i in range(combo.count()):
-                        data = combo.itemData(i)
-                        if (isinstance(data, dict)
-                                and str(data.get('id'))
-                                    == str(self.current_event_id)):
+                        if combo.itemData(i) == target:
                             combo.setCurrentIndex(i)
                             break
         finally:
@@ -5383,7 +5575,7 @@ class ProphetXBrowser(QWidget):
         if index < 0:
             return
 
-        event = self.event_combo.itemData(index)
+        event = self._comboEvent(index)
         if not event:
             return
 

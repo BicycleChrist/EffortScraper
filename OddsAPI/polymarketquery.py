@@ -724,11 +724,11 @@ class PolymarketSportsClient:
     # Sports series IDs (static fallback; discover_sports_series() supersedes this
     # dynamically from the gamma /sports endpoint).
     SPORTS_SERIES = {
-        "NFL": 10187,
+        "NFL": 12185,
         "NBA": 10345,
         "NHL": 10346,
         "MLB": 3,
-        "CFB": 10210,
+        "CFB": 12756,
         "NCAAB": 39
     }
     _SERIES_CACHE_PATH = os.path.join(
@@ -760,6 +760,22 @@ class PolymarketSportsClient:
             return out or dict(self.SPORTS_SERIES)
         except Exception:
             return dict(self.SPORTS_SERIES)
+
+    # Process-wide cache of discover_sports_series(); filled on first use.
+    _discovered_series: Optional[Dict[str, int]] = None
+
+    def _series_id_for(self, sport: Optional[str]) -> Optional[int]:
+        """Current gamma series_id for a sport name. Polymarket starts a NEW
+        series each season (NFL 10187 -> 12185, CFB 10210 -> 12756 in 2026), and
+        the old id then lists zero open games — every game silently showed as
+        Kalshi-only. So resolve via /sports first, static table as fallback."""
+        if not sport:
+            return None
+        cls = type(self)
+        if cls._discovered_series is None:
+            cls._discovered_series = self.discover_sports_series()
+        return (cls._discovered_series.get(sport.lower())
+                or self.SPORTS_SERIES.get(sport))
 
     def discover_event_series_ranked(self, max_age_s: int = 6 * 3600,
                                      refresh: bool = False) -> List[Dict]:
@@ -885,7 +901,7 @@ class PolymarketSportsClient:
         # Accept an explicit series_id (for discovered non-big-4 leagues like the
         # World Cup) or resolve one from the sport name.
         if series_id is None:
-            series_id = self.SPORTS_SERIES.get(sport)
+            series_id = self._series_id_for(sport)
         if not series_id:
             raise ValueError(f"Unknown sport: {sport}. Available: {list(self.SPORTS_SERIES.keys())}")
 

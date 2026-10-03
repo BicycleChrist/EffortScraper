@@ -53,6 +53,10 @@ ODDS_FORMATS = [("American", "us"), ("Decimal", "dec")]
 # bound request volume (the LIVE-all view can have hundreds of live events).
 MAX_PROGRESS_FETCHES = 80
 
+# Sports whose rows get no logo/headshot. Tennis "logos" are player headshots:
+# ~570 per day's draw, ~1 in 5 missing (404), and not wanted (user, 2026-10-03).
+NO_LOGO_SPORTS = {"tennis"}
+
 # Field-of-competitors sports (not head-to-head, not golf). Each spec defines
 # the table columns and how to pull each cell from a raw participant record.
 # "nested" sports group events as venue -> races (by start time).
@@ -111,12 +115,46 @@ DROPPING_PERIOD = 2
 DROPPING_BS = 1
 DROPPING_MAX_PAGES = 10
 
+# Forward window (days) for a head-to-head sport's schedule. The Flashscore day
+# feed is anchored to the local day (see _local_utc_offset_hours), so day 0 is
+# today's full results + live + upcoming; extra days extend the UPCOMING section
+# so each sport shows a respectable near-term schedule. fetch_schedule fetches
+# these PROGRESSIVELY (day 0 first for an instant render, the rest merged in
+# behind it), so widening this window costs nothing on first paint — only the
+# volume of the eventual UPCOMING list. 3 gives daily sports a couple of days of
+# fixtures without soccer's multi-day feed exploding into thousands of rows.
+# (Replaces the removed "Window" spinbox — reintroduce a control here later.)
+SCHEDULE_DAYS_AHEAD = 3
+
+# Search-mode historical depth: OddsPortal serves 20 finished matches per page
+# (a hard server cap — no page-size override exists), newest first. A season is
+# ~162 MLB / ~82 NBA-NHL / ~40+ soccer games, so 10 pages (up to 200) still
+# covers a full MLB season while cutting the request burst that trips OddsPortal's
+# rate limit. The fetch stops early at the participant's real page_count, page
+# fetches are concurrency-capped (SEARCH_PAGE_CONCURRENCY), and results are
+# date-filtered to the current season before display.
+SEARCH_HISTORY_PAGES = 10
+
+# Offseason detection for the "this season" slice: within a season a team never
+# goes this long between games (All-Star / international breaks are <3wk), but
+# every offseason gap is months — so the first gap wider than this, walking back
+# from the most recent match, marks the current season's start.
+SEASON_GAP_DAYS = 55
+
 # Flashscore image CDN — team logos / player headshots (Event.home_logo etc.).
 LOGO_BASE = "https://static.flashscore.com/res/image/data/"
 LOGO_PX = 18  # rendered icon size
 
 _PUNCT_RE = re.compile(r"[^a-z0-9 ]")
 _WS_RE = re.compile(r"\s+")
+
+
+def _local_utc_offset_hours():
+    """The machine's current UTC offset in whole hours (DST-aware), for the
+    Flashscore `tz` feed parameter so day 0 == the local calendar day."""
+    if time.daylight and time.localtime().tm_isdst > 0:
+        return -time.altzone // 3600
+    return -time.timezone // 3600
 
 
 def _norm_name(name):
@@ -130,6 +168,12 @@ def _norm_name(name):
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = _PUNCT_RE.sub(" ", s.lower())
     return _WS_RE.sub(" ", s).strip()
+
+
+# Master switch for multi-geo proxy fetching. When False, all OddsPortal odds
+# requests go through the direct connection (your own IP) only — no env/Creds
+# proxies, no webshare discovery.
+MULTI_GEO_PROXIES_ENABLED = True
 
 
 def _oddsportal_locations():
@@ -220,7 +264,25 @@ MOVE_BAR_CAP = 50.0  # |%| that renders a full-width bar
 _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-class ScheduleWorker(QObject):
+class _AbandonablePool:
+    """Mixin for workers whose ThreadPoolExecutor runs only abandonable network
+    fetches. The pools' threads are non-daemon (the interpreter joins them at
+    exit), so an embedding app must call shutdown() from its closeEvent or an
+    in-flight fetch (≤6s proxy timeout) holds the closed app open. _submit
+    swallows the post-shutdown RuntimeError so a straggler queued signal can't
+    traceback into a dead pool."""
+
+    def _submit(self, fn):
+        try:
+            self._pool.submit(fn)
+        except RuntimeError:
+            pass  # pool already shut down (app closing) — drop the request
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+class ScheduleWorker(QObject, _AbandonablePool):
     """Runs blocking FlashscoreClient calls on daemon threads and emits results.
 
     Each request carries a monotonically increasing token; the widget ignores
@@ -245,22 +307,29 @@ class ScheduleWorker(QObject):
     def fetch_schedule(self, token: int, sport: str, days_ahead: int):
         def run():
             try:
-                days = list(range(0, days_ahead + 1))
-                sched = self.client.get_schedule(sports=[sport], days=days)
-                events = sched.get(sport, [])
+                # Single combined fetch: all days in one parallel round (~200-
+                # 400ms warm — the days fetch concurrently, so the whole window
+                # costs about the same as one day). One emit, every event
+                # rendered together — no today-vs-upcoming staging or blink.
+                events = self.client.get_schedule(
+                    sports=[sport],
+                    days=list(range(0, days_ahead + 1))).get(sport, [])
                 self.scheduleReady.emit(token, sport, events)
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def fetch_live_all(self, token: int):
         def run():
             try:
+                # Single uniform fetch of every sport's live games (~0.9s warm,
+                # ~1.5s cold for all 30). Every live row is handled identically —
+                # no priority tiering, so nothing blinks in/out between phases.
                 live = self.client.snapshot_live(sports=list(SPORT_IDS.keys()))
-                self.liveReady.emit(token, live)
+                self.liveReady.emit(token, list(live))
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def fetch_golf(self, token: int, day: int):
         def run():
@@ -268,7 +337,7 @@ class ScheduleWorker(QObject):
                 self.golfReady.emit(token, self.client.get_golf_leaderboards(day))
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def fetch_participants(self, token: int, sport: str, day: int):
         def run():
@@ -277,7 +346,7 @@ class ScheduleWorker(QObject):
                 self.participantsReady.emit(token, sport, evs)
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def fetch_detail(self, token: int, sport_id: int, event_id: str):
         def run():
@@ -287,10 +356,10 @@ class ScheduleWorker(QObject):
                 self.detailReady.emit(token, event_id, detail)
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
 
-class OddsWorker(QObject):
+class OddsWorker(QObject, _AbandonablePool):
     """Runs blocking OddsPortalClient calls on daemon threads and emits results.
 
     Mirrors ScheduleWorker's token-guard pattern so stale results are dropped.
@@ -317,21 +386,37 @@ class OddsWorker(QObject):
                 self.droppingReady.emit(token, sport_urlname, drops)
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
-    def fetch_search_matches(self, token: int, query: str, sport=None):
+    def fetch_search_matches(self, token: int, query: str, sport=None,
+                             match_name=None):
         """Resolve a free-text query to a participant's historical matches
         (with inline odds + event urls) via the OddsPortal search surface.
         This is the past-results source: Flashscore only serves a ±2wk window,
-        so anything older is reached here."""
+        so anything older is reached here.
+
+        The auto-search runs on the typed `query` (best recall); `match_name`
+        (the disambiguated full team name from the local hit) only scores which
+        returned participant to pick, and `sport` (OddsPortal url-name) narrows
+        it to the right entity."""
         def run():
+            emitted = {"n": 0}
+
+            def emit(ms):
+                emitted["n"] += 1
+                self.searchMatchesReady.emit(token, query, list(ms))
+
             try:
-                ms = self.client.search_matches(
-                    query, results=True, pages=1, sport=sport)
-                self.searchMatchesReady.emit(token, query, ms)
+                # progressive: the newest page paints in ~1 RTT, then the full
+                # season fills in — instead of blocking on all pages at once.
+                self.client.search_matches(
+                    query, results=True, pages=SEARCH_HISTORY_PAGES,
+                    sport=sport, match_name=match_name, on_batch=emit)
+                if not emitted["n"]:  # nothing resolved: clear any stale section
+                    self.searchMatchesReady.emit(token, query, [])
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def _staged_odds(self, event_url: str, locations: dict, emit):
         """Fetch odds with staged delivery: with multiple geos configured, emit
@@ -341,21 +426,30 @@ class OddsWorker(QObject):
         if not locations or len(locations) <= 1:
             emit(self.client.get_event_odds(event_url))
             return
-        delivered = False
-        direct = OddsPortalClient._geo_client(None, GEO_CLIENT_KWARGS)
-        try:
-            eo = direct.get_event_odds(event_url)
-            if eo.outcomes:
+        delivered = [False]
+
+        def _emit(eo):
+            if eo is not None and eo.outcomes:
                 emit(eo)
-                delivered = True
-        except Exception:
-            pass
-        try:  # direct result is cached, so the merge re-reads it for free
+                delivered[0] = True
+
+        # Go straight to the fan-out. This used to fetch the direct client
+        # SERIALLY first for a fast first paint, which delayed every proxy
+        # request by that whole round trip (~1s) — the geos sat idle while the
+        # US result was fetched. on_partial already paints the first
+        # books-bearing geo the instant it lands (usually direct, since it is
+        # the fastest exit anyway), so the early paint is kept and the slow
+        # geos now start ~1s sooner, pulling the FINAL merge in by the same
+        # amount. The final emit unions every geo.
+        try:
             emit(OddsPortalClient.get_event_odds_multi(
-                event_url, locations, client_kwargs=GEO_CLIENT_KWARGS))
+                event_url, locations, client_kwargs=GEO_CLIENT_KWARGS,
+                on_partial=_emit))
         except Exception:
-            if not delivered:
-                raise
+            if not delivered[0]:
+                # every geo failed — fall back to a plain direct fetch so a
+                # proxy outage degrades to US books rather than to nothing
+                emit(self.client.get_event_odds(event_url))
 
     def fetch_event_odds(self, token: int, event_url: str, locations: dict):
         """Full per-bookmaker odds for one event, staged direct-first then
@@ -367,7 +461,7 @@ class OddsWorker(QObject):
                     lambda eo: self.eventOddsReady.emit(token, event_url, eo))
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
     def prefetch_event_odds(self, event_url: str, locations: dict):
         """Warm an event's odds in the background (on hover) so the click that
@@ -381,7 +475,7 @@ class OddsWorker(QObject):
                     lambda eo: self.oddsPrefetched.emit(event_url, eo))
             except Exception:
                 pass
-        self._pool.submit(run)
+        self._submit(run)
 
     def resolve_and_fetch_odds(self, token: int, home: str, away: str,
                                sport, start_ts, locations: dict):
@@ -398,30 +492,49 @@ class OddsWorker(QObject):
                 if m is None or not m.url:
                     self.failed.emit(token, f"no OddsPortal match for {home} v {away}")
                     return
-                url = m.url.split("#")[0]
+                url = m.url  # keep any #<encodedId> fragment: it selects the
+                # specific meeting (see _event_page_config)
                 self._staged_odds(
                     url, locations,
                     lambda eo: self.eventOddsReady.emit(token, url, eo))
             except Exception as e:
                 self.failed.emit(token, str(e))
-        self._pool.submit(run)
+        self._submit(run)
 
 
-class ImageLoader(QObject):
+class ImageLoader(QObject, _AbandonablePool):
     """Downloads Flashscore logos/headshots on daemon threads and emits the raw
     bytes back to the GUI thread (QPixmap must be built on the GUI thread). One
     in-flight request per URL; the widget owns the decoded-pixmap cache.
 
     A persistent on-disk byte cache (keyed by a hash of the URL) means logos
-    load instantly on every run after the first — no network at all on a hit."""
+    load instantly on every run after the first — no network at all on a hit.
+
+    Two queues, measured 2026-10-03 (perf_runs/logo_probe.py): with ONE FIFO
+    pool, opening football queued ~5,300 logo requests (every row of four days
+    of leagues) and disk hits waited ~14s behind network downloads; switching
+    sport left that backlog in front of the new sport's logos, which then never
+    arrived. Now disk reads run on their own pool (never behind the network),
+    and every job re-checks `wanted(url)` right before doing work, so requests
+    for rows a newer render replaced are dropped instead of fetched."""
 
     loaded = pyqtSignal(str, bytes)  # url, raw bytes (empty on failure)
 
-    def __init__(self, parent=None):
+    _MISS_TTL = 7 * 24 * 3600   # how long a remembered 404 is trusted
+
+    def __init__(self, parent=None, wanted=None):
         super().__init__(parent)
         self._inflight = set()
+        # _lock orders "is it still wanted?" against a re-request of the same
+        # url: callers register the row (making it wanted) BEFORE request(), so
+        # a worker either sees that registration or releases the url for the
+        # new request to resubmit — a wanted url can never be silently dropped.
+        self._lock = threading.Lock()
+        self._wanted = wanted or (lambda _url: True)
         self._pool = ThreadPoolExecutor(max_workers=6,
                                         thread_name_prefix="img")
+        self._disk_pool = ThreadPoolExecutor(max_workers=2,
+                                             thread_name_prefix="img-disk")
         self._sess = requests.Session()
         self._sess.headers["User-Agent"] = "Mozilla/5.0"
         self._dir = os.path.join(
@@ -437,32 +550,88 @@ class ImageLoader(QObject):
         h = hashlib.sha1(url.encode()).hexdigest()
         return os.path.join(self._dir, h + ".img")
 
-    def request(self, url: str):
-        if url in self._inflight:
-            return
-        self._inflight.add(url)
+    def shutdown(self):
+        super().shutdown()
+        self._disk_pool.shutdown(wait=False, cancel_futures=True)
 
-        def run():
+    def _still_wanted(self, url):
+        """True to proceed; False releases the url (no emit) because no live
+        row is waiting for it any more."""
+        with self._lock:
+            try:
+                if self._wanted(url):
+                    return True
+            except Exception:
+                return True  # never drop a request on a predicate error
+            self._inflight.discard(url)
+            return False
+
+    def _finish(self, url, data):
+        with self._lock:
+            self._inflight.discard(url)
+        self.loaded.emit(url, data)
+
+    def request(self, url: str):
+        with self._lock:
+            if url in self._inflight:
+                return
+            self._inflight.add(url)
+
+        def from_network():
+            if not self._still_wanted(url):
+                return
             data = b""
+            path = self._path(url)
+            try:
+                r = self._sess.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.content
+                    if path and data:
+                        tmp = path + ".tmp"
+                        with open(tmp, "wb") as fh:
+                            fh.write(data)
+                        os.replace(tmp, path)  # atomic
+                elif r.status_code == 404 and path:
+                    # Definitive "no image" (players without a headshot are
+                    # common in tennis): remember it so every launch doesn't
+                    # spend a download slot re-asking. Timeouts/5xx are NOT
+                    # remembered — only a real 404.
+                    open(path + ".404", "wb").close()
+            except Exception:
+                data = b""
+            self._finish(url, data)
+
+        def from_disk():
+            if not self._still_wanted(url):
+                return
             path = self._path(url)
             try:
                 if path and os.path.exists(path):  # disk-cache hit: no network
                     with open(path, "rb") as fh:
                         data = fh.read()
-                else:
-                    r = self._sess.get(url, timeout=10)
-                    if r.status_code == 200:
-                        data = r.content
-                        if path and data:
-                            tmp = path + ".tmp"
-                            with open(tmp, "wb") as fh:
-                                fh.write(data)
-                            os.replace(tmp, path)  # atomic
+                    self._finish(url, data)
+                    return
+                # known-missing (404) within the last week: answer "no image"
+                # without the network; after a week, ask again in case one was
+                # added since.
+                miss = path + ".404" if path else None
+                if miss and os.path.exists(miss) and \
+                        time.time() - os.path.getmtime(miss) < self._MISS_TTL:
+                    self._finish(url, b"")
+                    return
             except Exception:
-                data = b""
-            self._inflight.discard(url)
-            self.loaded.emit(url, data)
-        self._pool.submit(run)
+                pass
+            try:
+                self._pool.submit(from_network)
+            except RuntimeError:
+                with self._lock:   # pool shut down (app closing)
+                    self._inflight.discard(url)
+
+        try:
+            self._disk_pool.submit(from_disk)
+        except RuntimeError:
+            with self._lock:
+                self._inflight.discard(url)
 
 
 class _RightDecorationDelegate(QStyledItemDelegate):
@@ -523,9 +692,30 @@ class _MoveBarDelegate(QStyledItemDelegate):
 
 
 class LiveScoresWidget(QWidget):
-    def __init__(self, client: FlashscoreClient = None, parent=None):
+    # compact-mode host integration (EffortOdds embed): the ⛶ button asks the
+    # host to pop this widget out to a full top-level window; closing that
+    # window (with _reembed_on_close set) asks the host to re-embed it.
+    expandRequested = pyqtSignal()
+    reembedRequested = pyqtSignal()
+
+    def __init__(self, client: FlashscoreClient = None, parent=None,
+                 compact: bool = False):
         super().__init__(parent)
-        self.client = client or FlashscoreClient(verbose=False)
+        # compact: condensed embedded strip — LIVE-all scores only. The sport
+        # nav, mode bar (Dropping/Search) and odds controls are hidden, and
+        # every OddsPortal surface (drop overlay, inline odds) is suppressed so
+        # the embed generates zero OddsPortal traffic (rate-limit exposure).
+        self._compact = bool(compact)
+        self._reembed_on_close = False
+        self._priority_prefetched = False
+        # Anchor the schedule "day" to the user's LOCAL day, not UTC. With the
+        # default tz=0 the day-0 feed is bounded by UTC midnight, so a US user's
+        # evening slate rolls into day+1 and "today" shows only the handful of
+        # games already live at UTC time (e.g. Mexican-league baseball). Passing
+        # the local UTC offset (hours) makes day 0 = the local calendar day, so
+        # every result + upcoming game for today is included.
+        self.client = client or FlashscoreClient(
+            tz=_local_utc_offset_hours(), verbose=False)
         self.worker = ScheduleWorker(self.client)
         self.worker.scheduleReady.connect(self._on_schedule)
         self.worker.liveReady.connect(self._on_live)
@@ -542,11 +732,18 @@ class LiveScoresWidget(QWidget):
         self.odds_worker.searchMatchesReady.connect(self._on_search_matches)
         self.odds_worker.oddsPrefetched.connect(self._on_odds_prefetched)
         self.odds_worker.failed.connect(self._on_odds_failed)
-        self._odds_locations = _oddsportal_locations()  # multi-geo book set
-        # Webshare proxies are discovered async so startup never blocks on
-        # their API; until (unless) they land, fetches run direct-only.
-        threading.Thread(target=self._load_webshare_locations,
-                         daemon=True).start()
+        # Multi-geo proxies: when disabled, every odds fetch goes ONLY through
+        # the direct connection (your own IP) — no env/Creds proxies, no webshare
+        # discovery. Temporarily off while testing whether the proxy fan-out
+        # contributes to OddsPortal rate-limiting. Flip to True to restore.
+        if MULTI_GEO_PROXIES_ENABLED:
+            self._odds_locations = _oddsportal_locations()  # multi-geo book set
+            # Webshare proxies are discovered async so startup never blocks on
+            # their API; until (unless) they land, fetches run direct-only.
+            threading.Thread(target=self._load_webshare_locations,
+                             daemon=True).start()
+        else:
+            self._odds_locations = {"direct": None}  # base request, your IP only
 
         # hover-prefetch: warm an event's odds while the mouse rests on its row so
         # the click renders instantly (the fetch is ~0.5s otherwise). Keyed by
@@ -572,12 +769,19 @@ class LiveScoresWidget(QWidget):
         self._hist_cache = {}           # norm-query -> [SearchMatch]
         self._hist_matches = {}         # event_url -> SearchMatch (click lookup)
         self._hist_fetched_q = None     # norm-query with a fetch already issued
+        self._hist_submit_q = None      # norm-query the user SUBMITTED (Enter /
+                                        # Search button) — the only one allowed
+                                        # to hit the network
 
         # logo/headshot loading: bytes fetched off-thread, pixmaps built + cached
         # here on the GUI thread. _pending_icons maps a not-yet-loaded url to the
         # (render_gen, item, col) sites awaiting it; the gen guard drops sites
         # whose row was rebuilt by a newer render before the image arrived.
-        self.image_loader = ImageLoader(self)
+        # wanted: a url is worth loading only while some row still waits on it
+        # (_pending_icons is cleared on every full re-render), so a sport
+        # switch drops the previous view's backlog instead of fetching it.
+        self.image_loader = ImageLoader(
+            self, wanted=lambda url: url in self._pending_icons)
         self.image_loader.loaded.connect(self._on_image_loaded)
         self._pixmaps = {}              # url -> QPixmap (null pixmap = failed)
         self._pending_icons = {}        # url -> [(render_gen, item, col), ...]
@@ -592,6 +796,8 @@ class LiveScoresWidget(QWidget):
         self._open_odds_key = None      # (kind, id) of the row whose odds are open,
                                         # so a refresh re-render can restore them
         self._open_odds_eo = None       # last EventOdds rendered (restore w/o refetch)
+        self._open_odds_awaiting = None # url whose in-flight hover-prefetch the
+                                        # open row is waiting on (no dup fetch)
         self._drop_index = {}           # (norm_home, norm_away) -> DroppingOdd
         self._drops = []                # last dropping feed for current sport
         self._row_items = {}            # event_id -> QTreeWidgetItem (all H2H rows)
@@ -653,9 +859,16 @@ class LiveScoresWidget(QWidget):
         self._flash_timer.timeout.connect(self._tick_flashes)
 
         # initial selection + background prefetch of the priority sports so the
-        # first switch to each is instant (served from cache).
-        self._select_sport(DEFAULT_SPORT)
-        self._prefetch_priority()
+        # first switch to each is instant (served from cache). Compact embeds
+        # start on LIVE-all and skip the prefetch fan-out entirely — it runs
+        # once on the first expand to full view instead.
+        if self._compact:
+            self._apply_compact_chrome()
+            self._select_sport(None)  # LIVE — All Sports
+        else:
+            self._select_sport(DEFAULT_SPORT)
+            self._prefetch_priority()
+            self._priority_prefetched = True
 
     # -- UI -----------------------------------------------------------------
     def _build_ui(self):
@@ -717,10 +930,18 @@ class LiveScoresWidget(QWidget):
         # search box (visible only in search mode)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search team / player / league…")
-        self.search_edit.returnPressed.connect(self._apply_text_filter)
+        self.search_edit.returnPressed.connect(self._submit_search)
         self.search_edit.textChanged.connect(lambda _t: self._search_debounce.start(220))
         self.search_edit.setVisible(False)
         self.search_edit.setMinimumWidth(220)
+        # Hybrid search (2026-10-03): typing only re-filters the LOCAL index
+        # (in-memory, no network); the OddsPortal past-results search runs on
+        # Enter or this button. As-you-type fired a full 10-page OddsPortal
+        # search on every mid-word pause.
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setToolTip("Search past results on OddsPortal (Enter)")
+        self.search_btn.clicked.connect(self._submit_search)
+        self.search_btn.setVisible(False)
 
         # odds-format selector (we convert client-side; the feeds are decimal)
         self.fmt_combo = QComboBox()
@@ -728,14 +949,6 @@ class LiveScoresWidget(QWidget):
             self.fmt_combo.addItem(label)
         self.fmt_combo.setToolTip("Odds display format")
         self.fmt_combo.currentIndexChanged.connect(self._on_format_changed)
-
-        self.days_spin = QSpinBox()
-        self.days_spin.setRange(0, 14)
-        self.days_spin.setValue(0)
-        self.days_spin.setPrefix("+")
-        self.days_spin.setSuffix(" d")
-        self.days_spin.setToolTip("Days ahead to include in the schedule")
-        self.days_spin.valueChanged.connect(self._on_days_changed)
 
         self.auto_chk = QCheckBox("Auto")
         self.auto_chk.setChecked(True)
@@ -751,6 +964,12 @@ class LiveScoresWidget(QWidget):
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
 
+        # compact-embed only: hand off to the host to pop out the full view
+        self.expand_btn = QPushButton("⛶ Expand")
+        self.expand_btn.setToolTip("Open the full live-scores window")
+        self.expand_btn.clicked.connect(self.expandRequested.emit)
+        self.expand_btn.setVisible(False)
+
         self.status_lbl = QLabel("")
         self.status_lbl.setStyleSheet(f"color: {C_DIM};")
 
@@ -759,14 +978,15 @@ class LiveScoresWidget(QWidget):
         controls.addSpacing(12)
         controls.addLayout(mode_bar)
         controls.addWidget(self.search_edit)
+        controls.addWidget(self.search_btn)
         controls.addStretch(1)
-        controls.addWidget(QLabel("Odds:"))
+        self._fmt_label = QLabel("Odds:")
+        controls.addWidget(self._fmt_label)
         controls.addWidget(self.fmt_combo)
-        controls.addWidget(QLabel("Window:"))
-        controls.addWidget(self.days_spin)
         controls.addWidget(self.auto_chk)
         controls.addWidget(self.interval_spin)
         controls.addWidget(self.refresh_btn)
+        controls.addWidget(self.expand_btn)
 
         # right results tree
         self.results = QTreeWidget()
@@ -950,19 +1170,29 @@ class LiveScoresWidget(QWidget):
         # each mode starts unfiltered (block signals to avoid a spurious render).
         show_box = mode in ("search", "dropping")
         self.search_edit.setVisible(show_box)
+        self.search_btn.setVisible(mode == "search")
         self.search_edit.setPlaceholderText(
             "Filter dropping odds — team / league / sport…" if mode == "dropping"
             else "Search team / player / league…")
         self.search_edit.blockSignals(True)
         self.search_edit.clear()
         self.search_edit.blockSignals(False)
-        # window/auto-refresh controls are irrelevant in search mode
-        for w in (self.days_spin, self.auto_chk, self.interval_spin):
+        # auto-refresh controls are irrelevant in search mode
+        for w in (self.auto_chk, self.interval_spin):
             w.setEnabled(mode != "search")
         if show_box:
             self.search_edit.setFocus()
         self._apply_autorefresh()  # pauses the timer in search mode
         self.refresh()
+
+    def _submit_search(self):
+        """Enter / Search button. In Search mode this is what releases the
+        OddsPortal past-results fetch for the current text; elsewhere (the
+        Dropping filter) it just applies the filter now."""
+        self._search_debounce.stop()
+        if self._mode == "search":
+            self._hist_submit_q = _norm_name(self.search_edit.text().strip())
+        self._apply_text_filter()
 
     def _apply_text_filter(self):
         """Debounced text-box handler. In Search mode it drives the local event
@@ -1000,19 +1230,22 @@ class LiveScoresWidget(QWidget):
             self.worker.fetch_live_all(self._token)
         elif self._current_sport == "golf":
             self.title.setText("Golf")
-            self.worker.fetch_golf(self._token, self.days_spin.value())
+            self.worker.fetch_golf(self._token, 0)  # today's leaderboards
         elif self._current_sport in PARTICIPANT_SPECS:
             self.title.setText(self._current_sport.replace("_", " ").title())
             self.worker.fetch_participants(
-                self._token, self._current_sport, self.days_spin.value())
+                self._token, self._current_sport, 0)  # today's cards/races
         else:
             label = self._current_sport.replace("_", " ").title()
             self.title.setText(label)
-            self.worker.fetch_schedule(self._token, self._current_sport, self.days_spin.value())
+            self.worker.fetch_schedule(
+                self._token, self._current_sport, SCHEDULE_DAYS_AHEAD)
 
     def _refresh_drop_overlay(self):
         """Fetch the dropping feed for the current sport to overlay movement
         badges on score rows. No-op for LIVE-all and unsupported sports."""
+        if self._compact:
+            return  # embedded strip: no OddsPortal traffic at all
         op_sport = self._oddsportal_sport()
         if op_sport is None:
             self._drop_index = {}
@@ -1048,7 +1281,27 @@ class LiveScoresWidget(QWidget):
         for s in SPORT_IDS:
             if s in self._cache or s in PARTICIPANT_SPECS or s == "golf":
                 continue
-            self.worker.fetch_schedule(-1, s, self.days_spin.value())
+            # day 0 only: the all-sports search index just needs today's games to
+            # be comprehensive; the forward window is fetched per-sport on select.
+            self.worker.fetch_schedule(-1, s, 0)
+
+    def _resolve_hint(self, qnorm, pool):
+        """From the local Flashscore hits, derive (resolve_query, op_sport) for
+        the OddsPortal historical fetch: the most common team name that contains
+        the typed query (a disambiguated full name resolves the right
+        participant), and the dominant OddsPortal sport. Both fall back to
+        (None → raw query, None) when there's no local signal."""
+        names, sports = {}, {}
+        for e in pool:
+            osp = SPORT_BRIDGE.get(e.sport)
+            if osp:
+                sports[osp] = sports.get(osp, 0) + 1
+            for nm in (e.home, e.away):
+                if nm and qnorm in _norm_name(nm):
+                    names[nm] = names.get(nm, 0) + 1
+        resolve_q = max(names, key=names.get) if names else None
+        op_sport = max(sports, key=sports.get) if sports else None
+        return resolve_q, op_sport
 
     def _hold_scroll(self, sig):
         """Re-apply the current scroll position after the pending rebuild
@@ -1108,21 +1361,32 @@ class LiveScoresWidget(QWidget):
         # kick a background fetch that appends the section when it arrives.
         raw_q = self.search_edit.text().strip()
         hk = _norm_name(raw_q)
+        hist_hint = ""
         if hk in self._hist_cache:
             self._render_hist_section(self._hist_cache[hk])
+        elif len(raw_q) >= 3 and hk != self._hist_submit_q:
+            # typed but not submitted: past results are an explicit request
+            hist_hint = "  · Enter for past results"
         elif len(raw_q) >= 3 and hk != self._hist_fetched_q:
             # not cached and no fetch already issued for this query (a background
             # sport-warm re-render must not re-launch the same historical fetch)
             self._hist_fetched_q = hk
             self._hist_token += 1
-            self.odds_worker.fetch_search_matches(self._hist_token, raw_q)
+            # Disambiguate off the local Flashscore hits: the matched full team
+            # name + its sport steer OddsPortal's participant pick to the right
+            # entity ("lakers" -> "Los Angeles Lakers" basketball, not Vaxjo
+            # hockey) and skip wrong-sport fetches. The auto-search still runs
+            # on raw_q (full names hurt recall).
+            match_name, op_sport = self._resolve_hint(q, pool)
+            self.odds_worker.fetch_search_matches(
+                self._hist_token, raw_q, op_sport, match_name)
         self.results.expandAll()
         self._restore_open_odds()  # keep a clicked-open breakdown across re-render
         stamp = datetime.now().strftime("%H:%M:%S")
         warming = "" if self._n_cached_sports() >= 18 else "  · indexing more sports…"
         self._status_ready(
             f"“{self.search_edit.text().strip()}”: {len(pool)} matches"
-            f"{warming} · {stamp}")
+            f"{warming}{hist_hint} · {stamp}")
         if self._live_items and not self._suppress_progress:
             self._fetch_live_progress()
 
@@ -1136,7 +1400,7 @@ class LiveScoresWidget(QWidget):
         self._hist_cache[_norm_name(query)] = matches
         for m in matches:
             if m.url:
-                self._hist_matches[m.url.split("#")[0]] = m
+                self._hist_matches[m.url] = m  # full url incl #<encodedId>
         if self._mode != "search":
             return
         if _norm_name(self.search_edit.text()) != _norm_name(query):
@@ -1145,17 +1409,39 @@ class LiveScoresWidget(QWidget):
         self.results.expandAll()
         self._restore_open_odds()  # a past-result row may be the open breakdown
 
+    @staticmethod
+    def _season_slice(matches):
+        """Keep only the current season's matches: walking back from the newest,
+        stop at the first gap wider than SEASON_GAP_DAYS (the offseason). Matches
+        without a timestamp are kept (can't judge). Input need not be sorted."""
+        dated = sorted((m for m in matches if m.start_ts),
+                       key=lambda m: m.start_ts, reverse=True)
+        undated = [m for m in matches if not m.start_ts]
+        if not dated:
+            return matches
+        kept = [dated[0]]
+        gap = SEASON_GAP_DAYS * 86400
+        for prev, m in zip(dated, dated[1:]):
+            if prev.start_ts - m.start_ts > gap:
+                break  # crossed into the previous season
+            kept.append(m)
+        return kept + undated
+
     def _render_hist_section(self, matches):
         """(Re)build the 'PAST RESULTS — OddsPortal' section: historical matches
         grouped by tournament, newest first, each showing closing odds. Kept as
         a distinct top-level section so it can be replaced without disturbing the
-        live in-memory hits above it. Click a row for the full per-book odds."""
+        live in-memory hits above it. Click a row for the full per-book odds.
+
+        Trimmed to the current season (offseason gap) so a deep multi-page fetch
+        doesn't spill last season's games into the list."""
         r = self.results
         for i in range(r.topLevelItemCount()):
             it = r.topLevelItem(i)
             if it.data(0, Qt.ItemDataRole.UserRole) == "__hist__":
                 r.takeTopLevelItem(i)
                 break
+        matches = self._season_slice(matches)
         if not matches:
             return
         section = QTreeWidgetItem([f"PAST RESULTS — OddsPortal  ({len(matches)})"])
@@ -1224,12 +1510,6 @@ class LiveScoresWidget(QWidget):
     def _n_cached_sports(self):
         return sum(1 for v in self._cache.values() if v[0] == "sched")
 
-    def _on_days_changed(self, _value):
-        # cached data is for the old window; drop it and re-warm the priority set
-        self._cache.clear()
-        self.refresh()
-        self._prefetch_priority()
-
     def _prefetch_priority(self):
         """Warm the cache for the priority sports in the background (token -1 =
         cache-only, never rendered) so the first switch to each is instant."""
@@ -1237,16 +1517,20 @@ class LiveScoresWidget(QWidget):
             if s in self._cache or s == self._current_sport:
                 continue
             if s in PARTICIPANT_SPECS:
-                self.worker.fetch_participants(-1, s, self.days_spin.value())
+                self.worker.fetch_participants(-1, s, 0)
             else:
-                self.worker.fetch_schedule(-1, s, self.days_spin.value())
+                self.worker.fetch_schedule(-1, s, SCHEDULE_DAYS_AHEAD)
 
     def _on_schedule(self, token, sport, events):
         self._cache[sport] = ("sched", events)  # cache even prefetched results
         if self._mode == "search":
             # the index just grew — refresh results (debounced so a burst of
-            # background sport-loads coalesces into one re-render)
-            self._search_debounce.start(150)
+            # background sport-loads coalesces into one re-render). Never
+            # RESTART a running debounce: that cut the 220ms typing debounce
+            # short, so a half-typed word ("yank" of "yankees") fired its own
+            # OddsPortal history search. A pending debounce re-renders anyway.
+            if not self._search_debounce.isActive():
+                self._search_debounce.start(150)
             return
         if token != self._token or sport != self._current_sport:
             return
@@ -1431,10 +1715,14 @@ class LiveScoresWidget(QWidget):
                 ("Pos", "c", False), ("Player", "l", True),
                 ("To Par", "c", False), ("Thru", "c", False)])
         else:
+            # col 4 is dual-purpose: closing odds in Search (PAST RESULTS), the
+            # dropping-odds movement heat-bar in Scores — so label it for what
+            # it actually shows in the active mode.
+            col4 = "Odds" if self._mode == "search" else "Move"
             self._configure_columns([
                 ("When", "c", False), ("Home", "r", True),
                 ("Score", "c", False), ("Away", "l", True),
-                ("Move", "c", False, 96)])  # OddsPortal dropping-odds overlay
+                (col4, "c", False, 96)])
 
     def _render_golf(self, boards):
         self._hold_scroll(("golf", self._league_filter))
@@ -1857,6 +2145,8 @@ class LiveScoresWidget(QWidget):
         in when the bytes arrive."""
         if ev is None:
             return
+        if getattr(ev, "sport", None) in NO_LOGO_SPORTS:
+            return
         self._attach_one_logo(item, 1, getattr(ev, "home_logo", None))
         self._attach_one_logo(item, 3, getattr(ev, "away_logo", None))
 
@@ -2119,6 +2409,8 @@ class LiveScoresWidget(QWidget):
         # a Flashscore score row (Scores / Search live hits): show the odds
         # breakdown INLINE under the row. If the dropping feed already gave us
         # the OddsPortal url, use it directly (fast); otherwise resolve by name.
+        if self._compact:
+            return  # embedded strip: no inline odds (OddsPortal suppressed)
         e = self._event_map.get(payload) if isinstance(payload, str) else None
         if e is None or not (e.home and e.away):
             return
@@ -2128,13 +2420,7 @@ class LiveScoresWidget(QWidget):
         if url:
             self._detail_resolving = False
             self._begin_inline_odds(item)
-            eo = self._prefetched(url)
-            if eo is not None:
-                self._deliver_inline_odds(item, eo)
-            else:
-                self._detail_token += 1
-                self.odds_worker.fetch_event_odds(
-                    self._detail_token, url, self._odds_locations)
+            self._request_or_adopt_odds(url, item)
         else:
             self._show_event_resolve_detail(e, item)
 
@@ -2145,13 +2431,7 @@ class LiveScoresWidget(QWidget):
         if not d.event_url:
             return
         self._begin_inline_odds(item)
-        eo = self._prefetched(d.event_url)
-        if eo is not None:
-            self._deliver_inline_odds(item, eo)
-        else:
-            self._detail_token += 1
-            self.odds_worker.fetch_event_odds(
-                self._detail_token, d.event_url, self._odds_locations)
+        self._request_or_adopt_odds(d.event_url, item)
 
     def _oddsportal_sport_for(self, e):
         """OddsPortal url-name for a specific event's sport (independent of the
@@ -2176,11 +2456,27 @@ class LiveScoresWidget(QWidget):
         otherwise a loading row shows while the fetch runs."""
         self._detail_resolving = False
         self._begin_inline_odds(item)
-        url = (m.url or "").split("#")[0]
-        eo = self._prefetched(url) if url else None
+        # keep the #<encodedId> fragment: it picks the specific meeting out of
+        # the shared head-to-head page (see _event_page_config)
+        url = m.url or ""
+        if url:
+            self._request_or_adopt_odds(url, item)
+
+    def _request_or_adopt_odds(self, url, item):
+        """Fill the (already-armed) row's inline odds with the least work:
+        serve a warm prefetch instantly; ADOPT an in-flight hover-prefetch so a
+        click never launches a second, duplicate multi-geo fetch (the prefetch
+        result renders via _on_odds_prefetched); otherwise fire a fresh fetch."""
+        eo = self._prefetched(url)
         if eo is not None:
+            self._open_odds_awaiting = None
             self._deliver_inline_odds(item, eo)
-        elif url:
+        elif url in self._prefetch_inflight:
+            # the hover already kicked this exact fetch — wait for it instead of
+            # doubling network + proxy contention (which made clicks feel slow)
+            self._open_odds_awaiting = url
+        else:
+            self._open_odds_awaiting = None
             self._detail_token += 1
             self.odds_worker.fetch_event_odds(
                 self._detail_token, url, self._odds_locations)
@@ -2210,6 +2506,7 @@ class LiveScoresWidget(QWidget):
         if item is None or sip.isdeleted(item):
             return
         self._odds_target_item = item
+        self._open_odds_awaiting = None
         self._populate_odds_children(item, eo)
         self._open_odds_eo = eo
 
@@ -2245,7 +2542,7 @@ class LiveScoresWidget(QWidget):
             return None
         payload = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(payload, tuple) and payload[0] == "opmatch":
-            return (payload[1].url or "").split("#")[0] or None
+            return (payload[1].url or "") or None  # keep #<encodedId> fragment
         if isinstance(payload, tuple) and payload[0] in ("drop", "dropevt"):
             return payload[1].event_url or None
         if isinstance(payload, str):
@@ -2258,7 +2555,14 @@ class LiveScoresWidget(QWidget):
             return self._resolved_urls.get((e.home, e.away))
         return None
 
+    # Toggle for the hover-prefetch (warm an event's odds while the mouse rests
+    # on its row). Disabled while we test whether it's adding to OddsPortal
+    # rate-limiting; clicks still fetch on demand. Flip to True to re-enable.
+    HOVER_PREFETCH_ENABLED = False
+
     def _on_item_hover(self, item, _col):
+        if not self.HOVER_PREFETCH_ENABLED:
+            return
         url = self._hover_odds_url(item)
         if not url or url in self._prefetch_inflight or self._prefetched(url):
             return
@@ -2274,8 +2578,20 @@ class LiveScoresWidget(QWidget):
 
     def _on_odds_prefetched(self, url, eo):
         self._prefetch_inflight.discard(url)
-        if eo is not None:
-            self._odds_prefetch[url] = (time.time(), eo)
+        if eo is None:
+            return
+        self._odds_prefetch[url] = (time.time(), eo)
+        # if the user clicked this row while its hover-prefetch was still in
+        # flight, we deferred to the prefetch instead of firing a duplicate —
+        # render it now (staged prefetch emits more than once, so each richer
+        # merge repaints the open table).
+        if self._open_odds_awaiting == url:
+            item = self._odds_target_item
+            if item is None or sip.isdeleted(item):
+                item = (self._find_row_by_key(self._open_odds_key)
+                        if self._open_odds_key else None)
+            if item is not None and not sip.isdeleted(item):
+                self._deliver_inline_odds(item, eo)
 
     def _prefetched(self, url):
         """A fresh prefetched EventOdds for url, or None."""
@@ -2292,7 +2608,9 @@ class LiveScoresWidget(QWidget):
             return None
         payload = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(payload, tuple) and payload[0] == "opmatch":
-            url = (payload[1].url or "").split("#")[0]
+            # keep the #<encodedId> fragment so each meeting is a distinct row
+            # identity (they share one head-to-head base url)
+            url = payload[1].url or ""
             return ("opmatch", url) if url else None
         if isinstance(payload, tuple) and payload[0] == "drop":
             d = payload[1]
@@ -2552,6 +2870,82 @@ class LiveScoresWidget(QWidget):
             self.refresh_timer.start(self.interval_spin.value() * 1000)
         else:
             self.refresh_timer.stop()
+
+    # -- compact embed / pop-out ---------------------------------------------
+    def _apply_compact_chrome(self):
+        """Show/hide chrome per the current compact flag. Compact keeps only
+        the results tree + a minimal control row (Auto, Refresh, ⛶ Expand)."""
+        c = self._compact
+        self.nav.setVisible(not c)
+        self.title.setVisible(not c)
+        for b in self._mode_btns.values():
+            b.setVisible(not c)
+        self.search_edit.setVisible(not c and self._mode in ("search", "dropping"))
+        self.search_btn.setVisible(not c and self._mode == "search")
+        self.fmt_combo.setVisible(not c)
+        self._fmt_label.setVisible(not c)
+        self.interval_spin.setVisible(not c)
+        self.expand_btn.setVisible(c)
+
+    def set_compact(self, compact: bool):
+        """Switch between the condensed embedded strip and the full view.
+        The single instance keeps its caches, timers and in-flight fetches
+        across the switch — no duplicate polling between placements."""
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        if compact:
+            # condensed = LIVE-all scores (one refresh, whichever path runs)
+            self._current_sport = None
+            self._league_filter = None
+            if self._mode != "scores":
+                self._set_mode("scores")
+            else:
+                self.refresh()
+        elif not self._priority_prefetched:
+            # first expand to full: warm the priority sports like a normal start
+            self._prefetch_priority()
+            self._priority_prefetched = True
+        self._apply_compact_chrome()
+
+    def closeEvent(self, e):
+        # Popped out of an embedding host: closing the top-level window means
+        # "collapse back into the main UI", not "destroy the widget".
+        if self._reembed_on_close and self.isWindow():
+            e.ignore()
+            self.reembedRequested.emit()
+            return
+        super().closeEvent(e)
+
+    def shutdown(self):
+        """Host-app close: stop timers and abandon the worker pools. Their
+        threads are non-daemon, so without this an in-flight fetch would hold
+        the closed app open (standalone main() uses os._exit for the same
+        reason)."""
+        for t in (self.refresh_timer, self._spin_timer, self._flash_timer,
+                  self._search_debounce, self._prefetch_debounce):
+            t.stop()
+        for w in (self.worker, self.odds_worker, self.image_loader):
+            w.shutdown()
+
+    def hideEvent(self, e):
+        # Embedded in the main UI, this widget may sit on a hidden tab — stop
+        # the auto-refresh network churn while off-screen instead of polling
+        # Flashscore/OddsPortal every interval for a view nobody's looking at.
+        super().hideEvent(e)
+        self._was_hidden = True
+        self.refresh_timer.stop()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # resume the timer per the current toggle/mode; and if we're coming back
+        # from being hidden, refresh once immediately so the view isn't stale
+        # (the initial show is already covered by _select_sport in __init__).
+        self._apply_autorefresh()
+        if getattr(self, "_was_hidden", False) and self._mode != "search":
+            self._was_hidden = False
+            self.refresh()
 
 
 def main():
