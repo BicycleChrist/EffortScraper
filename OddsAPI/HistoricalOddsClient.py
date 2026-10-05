@@ -8,14 +8,17 @@ from functools import lru_cache
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QEvent
+from PyQt6.QtCore import (Qt, QTimer, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty,
+                          pyqtSignal, QEvent, QSize, QPointF, QSettings)
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
     QProgressBar, QCheckBox, QHBoxLayout, QScrollArea, QSizePolicy,
     QSpinBox, QMessageBox, QListWidget, QListWidgetItem, QFrame,
-    QLineEdit, QStyle, QStyleOptionComboBox, QStylePainter, QAbstractItemView
+    QLineEdit, QStyle, QStyleOptionComboBox, QStylePainter, QAbstractItemView,
+    QStyledItemDelegate, QGraphicsSimpleTextItem
 )
-from PyQt6.QtGui import QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics, QAction
+from PyQt6.QtGui import (QColor, QPixmap, QPainter, QFont, QBrush, QPen, QFontMetrics, QAction,
+                         QCursor, QShortcut, QKeySequence)
 from PyQt6.QtWidgets import QApplication as _QApplication
 
 # The volume heat map's QWebEngineView (imported lazily on demand) requires
@@ -25,7 +28,7 @@ from PyQt6.QtWidgets import QApplication as _QApplication
 if _QApplication.instance() is None:
     _QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
-from KalshiClient import KalshiClient, KalshiStreamClient, KalshiLiveBook
+from KalshiClient import KalshiClient, KalshiStreamClient, KalshiLiveBook, tcp_srtt_ms
 from polymarketquery import (PolymarketSportsClient, PolymarketStreamClient,
                              PolymarketLiveBook, place_pm_order, get_pm_open_orders,
                              cancel_pm_order)
@@ -53,7 +56,21 @@ try:
 except Exception as _np_err:  # pragma: no cover - environment dependent
     _native_parsers = None
     NATIVE_PARSERS = False
-    print(f"[parsers] native QuickieParse unavailable, using Python books: {_np_err}")
+    NATIVE_PARSERS_ERR = str(_np_err)
+    # LOUD on purpose: this fallback is silent in the UI, and a system library
+    # upgrade (e.g. simdjson .so.33 -> .so.34, 2026-09-30) once disabled the
+    # native books for days unnoticed. Re-announced on every Live entry
+    # (_enter_live_mode) so it stays visible further down the scroll too.
+    print("\n" + "!" * 78 +
+          "\n!!  NATIVE C++ ORDER-BOOK PARSER (QuickieParse) FAILED TO LOAD"
+          "\n!!  -> falling back to the PURE-PYTHON books (Kalshi + Polymarket), ~3x slower."
+          f"\n!!  reason: {_np_err}"
+          "\n!!  rebuild: cd OddsAPI/cppparser && rm -rf build && cmake -S . -B build"
+          " -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE=<venv>/bin/python"
+          " && cmake --build build -j"
+          "\n" + "!" * 78 + "\n")
+else:
+    NATIVE_PARSERS_ERR = None
 
 # [PERF-DIAG] Timing-probe prints ([task-probe]/[sportmatch-probe]/
 # [allsports-probe]/[post-probe]) are dormant unless the app is launched with
@@ -447,20 +464,40 @@ class EventMatcher:
         live game's Polymarket market with a different day's (untraded) Kalshi
         event - which renders as a flat Kalshi line next to a moving PM line.
 
-        Returns True when the start times are within tolerance_hours. If the
-        Kalshi ticker has no time component, or either side's time is
-        missing/unparseable, returns True so matching falls back to team-only
-        behavior rather than dropping a valid match.
+        Returns True when the start times are within tolerance_hours. A
+        date-only ticker gets a coarse day window instead (see below). If
+        either side's time is missing/unparseable, returns True so matching
+        falls back to team-only behavior rather than dropping a valid match.
         """
         import re
         from datetime import datetime
 
-        # Only enforce the time window when the ticker actually encodes a time
-        # (HHMM after the day). Date-only tickers can't disambiguate by time, so
-        # fall back to team-only matching.
+        # The tolerance_hours window needs a ticker that encodes a time (HHMM
+        # after the day).
         m = re.search(r'-(\d{2})([A-Z]{3})(\d{2})(\d{4})', event_ticker)
         if not m:
-            return True
+            # Date-only ticker (all the tennis MATCH series). It can't split a
+            # doubleheader, but it still rules out a PM game days away: Gamma
+            # keeps settled tennis events active for a week+, and players
+            # rematch (Chidekh/Mayot on PM 10-02 while Kalshi lists the pair
+            # again). Kalshi's date runs BEHIND the PM start, not ahead: Tokyo
+            # 04:00Z Oct 4 is ticketed 26OCT03, and next-round matches are
+            # ticketed on the day they're listed while PM parks them at a
+            # placeholder (Ostapenko/Mertens: 26OCT03 vs PM 03:00Z Oct 5, +51h).
+            # So the window is lopsided: [date-24h, date+96h). The rematch on PM
+            # 10-02 19:00 vs Kalshi 26OCT04 is -29h, outside it.
+            k_day = EventMatcher.parse_kalshi_event_date(event_ticker)
+            if not k_day or not poly_start_time:
+                return True
+            try:
+                from datetime import timedelta, timezone
+                k0 = datetime.fromisoformat(str(k_day)[:10]).replace(tzinfo=timezone.utc)
+                p_dt = datetime.fromisoformat(str(poly_start_time).replace('Z', '+00:00'))
+                if p_dt.tzinfo is None:
+                    p_dt = p_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                return True
+            return k0 - timedelta(hours=24) <= p_dt < k0 + timedelta(hours=96)
 
         k_dt = EventMatcher.parse_kalshi_event_datetime(event_ticker)
         if k_dt is None or not poly_start_time:
@@ -824,6 +861,26 @@ class EventMatcher:
 
         return base_title, base_title
 
+    # A colon prefix naming a sub-market, not an event ("Set 1 Winner: A vs B",
+    # "Completed Match: A vs B") — those must NOT be stripped down to a bare
+    # matchup or they would read as the full-match moneyline.
+    _SUBMARKET_PREFIX = re.compile(
+        r'\b(?:set|sets|map|game|games|half|quarter|period|inning|innings|'
+        r'winner|completed|match|handicap|spread|total|o/u)\b', re.I)
+
+    @staticmethod
+    def _strip_matchup_prefix(title: str) -> str:
+        """Drop ONE leading '<event>: ' when the rest is the matchup and the
+        prefix is an event name (no separator, no sub-market word)."""
+        if ':' not in title:
+            return title
+        pre, post = title.split(':', 1)
+        if (re.search(r'\s(?:vs\.?|@|at)\s', post)
+                and not re.search(r'\s(?:vs\.?|@)\s', pre)
+                and not EventMatcher._SUBMARKET_PREFIX.search(pre)):
+            return post.strip()
+        return title
+
     @staticmethod
     def parse_polymarket_title(title: str) -> tuple[str, str]:
         """
@@ -836,6 +893,11 @@ class EventMatcher:
         """
         # Remove any trailing/leading whitespace
         title = title.strip()
+        # Tennis titles carry the TOURNAMENT as a prefix ("China Open: Alex de
+        # Minaur vs Andrey Rublev"). Left on, it rode along in team1, so the
+        # tournament words joined the first player's token set in the matcher
+        # and the PM-only rows displayed "China Open: Alex de Minaur".
+        title = EventMatcher._strip_matchup_prefix(title)
 
         # Polymarket uses "vs." with period
         if ' vs. ' in title:
@@ -980,6 +1042,52 @@ class EventMatcher:
         # --- All other sports (soccer/intl/esports/college/...): generic ---
         return EventMatcher._teams_match_generic(team1, team2)
 
+    # ---- Tennis ------------------------------------------------------------
+    # Kalshi titles tennis by SURNAME ("Martin Manzano vs Pieri", "de Minaur vs
+    # Rublev"); Polymarket by full name, sometimes truncated ("Juan Martin" for
+    # Juan Cruz Martin Manzano). Sport labels come from the Kalshi series titles:
+    # 'ATP Tennis', 'WTA Tennis', 'Challenger ATP', "ITF Men's", ...
+    _TENNIS_WORDS = frozenset({'atp', 'wta', 'itf', 'tennis'})
+    _TENNIS_PARTICLES = frozenset({'de', 'van', 'von', 'der', 'den', 'da', 'di',
+                                   'del', 'la', 'le', 'du', 'dos', 'jr'})
+
+    @staticmethod
+    def is_tennis(sport) -> bool:
+        return bool(sport) and bool(
+            EventMatcher._TENNIS_WORDS & set(EventMatcher._generic_normalize(sport).split()))
+
+    @staticmethod
+    def _tennis_tokens(name: str) -> frozenset:
+        # Hyphenated surnames split ("Dedura-Palomero" -> dedura, palomero) via
+        # _generic_normalize; particles never identify anyone on their own.
+        t = set(EventMatcher._generic_normalize(name).split())
+        return frozenset(t - EventMatcher._TENNIS_PARTICLES) or frozenset(t)
+
+    @staticmethod
+    @lru_cache(maxsize=8192)
+    def _tennis_player_score(a: str, b: str) -> int:
+        """2 = strong (one name's tokens all inside the other's: surname vs
+        full name, or identical), 1 = weak (share a surname token of >=4 chars,
+        e.g. 'Martin Manzano' vs 'Juan Martin'), 0 = different players."""
+        ta, tb = EventMatcher._tennis_tokens(a), EventMatcher._tennis_tokens(b)
+        if not ta or not tb:
+            return 0
+        if ta <= tb or tb <= ta:
+            return 2
+        return 1 if any(len(t) >= 4 for t in ta & tb) else 0
+
+    @staticmethod
+    def _tennis_events_match(k_a, k_b, p_1, p_2) -> bool:
+        """Both players must be present (either order); one side may be a weak
+        surname-overlap match only when the other is strong. Two weak sides is
+        rejected — that's how common surnames pair the wrong match."""
+        s = EventMatcher._tennis_player_score
+        for x, y in ((p_1, p_2), (p_2, p_1)):
+            sa, sb = s(k_a, x), s(k_b, y)
+            if sa and sb and max(sa, sb) == 2:
+                return True
+        return False
+
     @staticmethod
     def events_match(kalshi_away: str, kalshi_home: str, poly_team1: str, poly_team2: str, sport: str = None) -> bool:
         """
@@ -988,6 +1096,10 @@ class EventMatcher:
         Since Polymarket doesn't always follow strict home/away conventions,
         we match if both teams are present regardless of order.
         """
+        if EventMatcher.is_tennis(sport):
+            return EventMatcher._tennis_events_match(
+                kalshi_away, kalshi_home, poly_team1, poly_team2)
+
         # Check if kalshi_home matches either poly team
         home_matches_1 = EventMatcher.teams_match(kalshi_home, poly_team1, sport)
         home_matches_2 = EventMatcher.teams_match(kalshi_home, poly_team2, sport)
@@ -1176,8 +1288,17 @@ class MarketMatcher:
             return '2p'
         if any(p in text_lower for p in ['3p', 'p3', 'third period', '3rd period']):
             return '3p'
-        if 'overtime' in text_lower or ' ot' in text_lower:
+        # Word-bounded: a bare ' ot' substring also hit player names
+        # ("... vs Otto Virtanen") and pushed a full-match market off full_game.
+        if 'overtime' in text_lower or re.search(r'(?:^|\s)ot\b', text_lower):
             return 'ot'
+
+        # === TENNIS SETS ("Set 1 Winner", "Set 2 Games O/U 9.5", "1st set") ===
+        # "Total Sets O/U 2.5" / "Set Handicap" carry no set number -> full_game.
+        m = (re.search(r'\bset\s+(\d)\b', text_lower)
+             or re.search(r'\b(\d)(?:st|nd|rd|th)\s+set\b', text_lower))
+        if m:
+            return f'{m.group(1)}set'
 
         # === MLB INNINGS ===
         if any(p in text_lower for p in ['f5', 'first 5', 'first five', '1st 5 innings']):
@@ -1185,7 +1306,6 @@ class MarketMatcher:
         if any(p in text_lower for p in ['first inning', '1st inning']):
             return '1inn'
         # Check for specific inning numbers (e.g., "5th inning")
-        import re
         inning_match = re.search(r'(\d+)(?:st|nd|rd|th)\s+inning', text_lower)
         if inning_match:
             return f'{inning_match.group(1)}inn'
@@ -1202,6 +1322,11 @@ class MarketMatcher:
         import re
 
         text = (kalshi_title or poly_question or '').lower()
+        # Tennis full-match moneyline is "China Open: Alex de Minaur vs Andrey
+        # Rublev" — the tournament prefix's colon kept it out of the bare-matchup
+        # regex below (typed None) while "Set 1 Winner: A vs B" typed moneyline,
+        # so the SET market was picked as the event's moneyline.
+        text = EventMatcher._strip_matchup_prefix(text)
 
         # Player props phrased as O/U lines (Polymarket): the stat comes
         # straight after the player's name — "Jalen Brunson: Points O/U
@@ -1356,7 +1481,10 @@ class MarketMatcher:
                 return 'total'
             if series.endswith('SPREAD'):
                 return 'spread'
-            if series.endswith('GAME'):
+            # Individual sports are "<LEAGUE>MATCH" (KXATPMATCH, KXWTAMATCH...):
+            # one per-player "Carlos Alcaraz wins" market each. Without this they
+            # typed None, so the moneyline grouping never fired for tennis.
+            if series.endswith(('GAME', 'MATCH')):
                 return 'moneyline'
         return MarketMatcher.get_market_type(kalshi_title=kalshi_market.get('title', ''))
 
@@ -2619,6 +2747,502 @@ class OrderbookLadderWidget(QWidget):
                    int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight), f"{qty:,}")
 
 
+def _odds_text(pct):
+    """'+115' / '−122' / 'EVEN' for an implied % (None outside 0-100)."""
+    if pct is None or not (0.0 < pct < 100.0):
+        return ""
+    am = (-(pct / (100.0 - pct)) * 100.0) if pct >= 50.0 else (((100.0 - pct) / pct) * 100.0)
+    ai = int(round(am))
+    if abs(ai) == 100:
+        return "EVEN"
+    return f"+{ai}" if ai > 0 else f"−{abs(ai)}"
+
+
+def _fmt_usd_k(v):
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}k" if v >= 1e4 else f"${v / 1e3:.1f}k"
+    return f"${v:.0f}"
+
+
+class BookSummaryWidget(QWidget):
+    """Order-book summary above a depth ladder (replaces the old bid/ask/spr/last
+    text line — spread and last already sit in the ladder's mid row).
+
+    full (one book in view):   'mid 46.5¢   +115'           [·resync]
+                               '$583k ▬▬▬▬▬▬▬▬▬▬▬▬ $2.9M'   (resting $ within
+                               ±DEPTH_WINDOW¢ of mid, bid green | ask red)
+    compact (several books):   'K·FALCONS  46.5¢ +115  ▬▬'  one line, the series
+                               label naming which book this is.
+    Custom-painted: set_data() + one update() per (5 Hz) panel refresh."""
+
+    DEPTH_WINDOW = 2.0   # cents either side of mid counted as "near" depth
+
+    def __init__(self, compact, label, hue, parent=None):
+        super().__init__(parent)
+        self._compact = compact
+        self._label = label
+        self._hue = QColor(*hue)
+        self._mid = None
+        self._bid_usd = self._ask_usd = 0.0
+        self._stale = False
+        self._f = QFont("monospace"); self._f.setPixelSize(11)
+        self._fb = QFont("monospace"); self._fb.setPixelSize(11); self._fb.setBold(True)
+        self._fs = QFont("monospace"); self._fs.setPixelSize(9)
+        self.setFixedHeight(18 if compact else 36)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setToolTip(
+            f"Resting book within ±{self.DEPTH_WINDOW:.0f}¢ of mid, in $ "
+            "(bids green | asks red). Bar = bid share of that depth.")
+
+    def set_data(self, mid, bid_usd, ask_usd, stale):
+        self._mid, self._bid_usd, self._ask_usd, self._stale = mid, bid_usd, ask_usd, stale
+        self.update()
+
+    def _bar(self, p, x, y, w, h):
+        tot = self._bid_usd + self._ask_usd
+        p.fillRect(QRectF(x, y, w, h), QColor(34, 42, 53))
+        if tot <= 0 or w <= 0:
+            return
+        bw = w * (self._bid_usd / tot)
+        p.fillRect(QRectF(x, y, bw, h), QColor(80, 200, 120, 210))
+        p.fillRect(QRectF(x + bw, y, w - bw, h), QColor(220, 90, 90, 210))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(17, 22, 29))
+        p.setPen(QColor(34, 42, 53))
+        p.drawRect(0, 0, w - 1, h - 1)
+        left = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        right = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        mid_txt = _fmt_cents(self._mid) + "¢" if self._mid is not None else "—"
+        odds = _odds_text(self._mid)
+        if self._compact:
+            x = 5
+            p.setFont(self._fs); p.setPen(self._hue)
+            lw = p.fontMetrics().horizontalAdvance(self._label)
+            p.drawText(QRectF(x, 0, lw + 2, h), left, self._label)
+            x += lw + 8
+            p.setFont(self._fb); p.setPen(QColor(220, 226, 232))
+            p.drawText(QRectF(x, 0, 60, h), left, mid_txt)
+            x += p.fontMetrics().horizontalAdvance(mid_txt) + 5
+            p.setFont(self._fs); p.setPen(QColor(126, 135, 148))
+            p.drawText(QRectF(x, 0, 50, h), left, odds)
+            x += p.fontMetrics().horizontalAdvance(odds) + 6
+            bw = max(0, min(40, w - x - 6))
+            self._bar(p, w - 6 - bw, h / 2 - 2, bw, 4)
+            if self._stale:
+                p.setPen(QColor(208, 135, 112)); p.drawText(QRectF(0, 0, w - 50, h), right, "resync")
+            p.end()
+            return
+        # Line 1: mid + odds (+ resync)
+        p.setFont(self._fb); p.setPen(QColor(220, 226, 232))
+        p.drawText(QRectF(6, 1, w - 12, 17), left, f"mid {mid_txt}")
+        p.setFont(self._f); p.setPen(QColor(126, 135, 148))
+        p.drawText(QRectF(6, 1, w - 12, 17), right, odds)
+        if self._stale:
+            ow = p.fontMetrics().horizontalAdvance(odds)
+            p.setPen(QColor(208, 135, 112))
+            p.drawText(QRectF(6, 1, w - 12 - ow - 8, 17), right, "resync")
+        # Line 2: $bid ▬▬▬ $ask
+        p.setFont(self._fs)
+        btxt, atxt = _fmt_usd_k(self._bid_usd), _fmt_usd_k(self._ask_usd)
+        fm = p.fontMetrics()
+        bw_txt, aw_txt = fm.horizontalAdvance(btxt), fm.horizontalAdvance(atxt)
+        p.setPen(QColor(110, 210, 140))
+        p.drawText(QRectF(6, 18, bw_txt + 2, 16), left, btxt)
+        p.setPen(QColor(230, 120, 120))
+        p.drawText(QRectF(w - 6 - aw_txt - 2, 18, aw_txt + 2, 16), right, atxt)
+        bx = 6 + bw_txt + 6
+        self._bar(p, bx, 18 + 8 - 2, max(0, (w - 6 - aw_txt - 6) - bx), 4)
+        p.end()
+
+
+class LiveCornerSummary(QWidget):
+    """Live-mode corner price box (replaces the HTML text gauge in Live only;
+    the historical view keeps its QLabel boxes).
+
+    Row 1: venue logo + big price in the venue colour, dimmed American odds, the
+           ▲/▼ change since opened, clock at the right.
+    Row 2: market-life range (p05–p95) as a thin track — lo / hi at the ends and
+           a marker at the current price.
+    Transparent to the mouse, like the labels it replaces."""
+
+    _PIX = {}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._f_big = QFont("monospace"); self._f_big.setPixelSize(16); self._f_big.setBold(True)
+        self._f_med = QFont("monospace"); self._f_med.setPixelSize(11)
+        self._f_sm = QFont("monospace"); self._f_sm.setPixelSize(9)
+        self._d = None
+        self.hide()
+
+    @classmethod
+    def _logo(cls, path, size=13):
+        if not path:
+            return None
+        pm = cls._PIX.get((path, size))
+        if pm is None:
+            pm = QPixmap(path)
+            pm = pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation) if not pm.isNull() else None
+            cls._PIX[(path, size)] = pm
+        return pm
+
+    def set_data(self, d):
+        """d = {'prices': [(logo_path, (r,g,b), cents, name_or_None)], 'lead': cents,
+        'delta': float|None, 'lo': float|None, 'hi': float|None, 'clock': 'HH:MM:SS'}"""
+        self._d = d
+        # Size to content: row 1 is the widest part.
+        fm_b = QFontMetrics(self._f_big); fm_m = QFontMetrics(self._f_med)
+        fm_s = QFontMetrics(self._f_sm)
+        w = 8
+        for _path, _hue, cents, name in d['prices']:
+            if name:
+                w += fm_s.horizontalAdvance(name) + 5
+            w += 17 + fm_b.horizontalAdvance(f"{cents:.1f}%") + 10
+        w += fm_m.horizontalAdvance(_odds_text(d['lead'])) + 10
+        if d.get('delta') is not None:
+            w += fm_m.horizontalAdvance(f"▲{abs(d['delta']):.1f}") + 10
+        w += fm_s.horizontalAdvance(d['clock']) + 8
+        self.setFixedSize(max(int(w), 210), 46)
+        self.update()
+
+    def paintEvent(self, _e):
+        d = self._d
+        if not d:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(QPen(QColor(47, 57, 71)))
+        p.setBrush(QColor(13, 17, 23, 228))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 4, 4)
+        vc = int(Qt.AlignmentFlag.AlignVCenter)
+        left = int(Qt.AlignmentFlag.AlignLeft) | vc
+        right = int(Qt.AlignmentFlag.AlignRight) | vc
+        # Row 1
+        x, y1, h1 = 8.0, 4.0, 22.0
+        for path, hue, cents, name in d['prices']:
+            col = QColor(*hue)
+            if name:
+                p.setFont(self._f_sm); p.setPen(col)
+                nw = p.fontMetrics().horizontalAdvance(name)
+                p.drawText(QRectF(x, y1, nw + 2, h1), left, name)
+                x += nw + 5
+            pm = self._logo(path)
+            if pm is not None:
+                p.drawPixmap(int(x), int(y1 + (h1 - pm.height()) / 2), pm)
+            else:
+                p.setBrush(col); p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QRectF(x + 2, y1 + h1 / 2 - 4, 8, 8))
+            x += 17
+            txt = f"{cents:.1f}%"
+            p.setFont(self._f_big); p.setPen(col)
+            tw = p.fontMetrics().horizontalAdvance(txt)
+            p.drawText(QRectF(x, y1, tw + 2, h1), left, txt)
+            x += tw + 10
+        odds = _odds_text(d['lead'])
+        p.setFont(self._f_med); p.setPen(QColor(126, 135, 148))
+        ow = p.fontMetrics().horizontalAdvance(odds)
+        p.drawText(QRectF(x, y1 + 1, ow + 2, h1), left, odds)
+        x += ow + 10
+        dl = d.get('delta')
+        if dl is not None:
+            up = dl > 0
+            p.setPen(QColor(80, 200, 120) if up else QColor(220, 90, 90))
+            dt = f"{'▲' if up else '▼'}{abs(dl):.1f}"
+            p.drawText(QRectF(x, y1 + 1, 60, h1), left, dt)
+        p.setFont(self._f_sm); p.setPen(QColor(90, 100, 114))
+        p.drawText(QRectF(0, y1 + 1, w - 8, h1), right, d['clock'])
+        # Row 2: range track
+        lo, hi, cur = d.get('lo'), d.get('hi'), d['lead']
+        y2 = 30.0
+        p.setFont(self._f_sm)
+        if lo is None or hi is None:
+            p.setPen(QColor(90, 100, 114))
+            p.drawText(QRectF(8, y2 - 6, w - 16, 12), left, "range —")
+            p.end()
+            return
+        lt, ht = f"{lo:.1f}", f"{hi:.1f}"
+        fm = p.fontMetrics()
+        p.setPen(QColor(150, 160, 172))
+        p.drawText(QRectF(8, y2 - 6, fm.horizontalAdvance(lt) + 2, 12), left, lt)
+        p.drawText(QRectF(w - 8 - fm.horizontalAdvance(ht) - 2, y2 - 6,
+                          fm.horizontalAdvance(ht) + 2, 12), right, ht)
+        tx0 = 8 + fm.horizontalAdvance(lt) + 7
+        tx1 = w - 8 - fm.horizontalAdvance(ht) - 7
+        if tx1 - tx0 > 10:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(42, 51, 64))
+            p.drawRoundedRect(QRectF(tx0, y2 - 1.5, tx1 - tx0, 3), 1.5, 1.5)
+            frac = 0.5 if hi <= lo else min(1.0, max(0.0, (cur - lo) / (hi - lo)))
+            mx = tx0 + frac * (tx1 - tx0)
+            hue = QColor(*d['prices'][0][1]) if d['prices'] else QColor(200, 200, 200)
+            fill = QColor(hue); fill.setAlpha(90)
+            p.setBrush(fill)
+            p.drawRoundedRect(QRectF(tx0, y2 - 1.5, max(0.0, mx - tx0), 3), 1.5, 1.5)
+            p.setPen(QPen(QColor(13, 17, 23), 1.5))
+            p.setBrush(hue)
+            p.drawEllipse(QPointF(mx, y2), 4.0, 4.0)
+        p.end()
+
+
+class LargeTradeRowDelegate(QStyledItemDelegate):
+    """Paints one LARGE TRADES row as columns: time · YES/NO chip · size ·
+    @price (+ dim YES-equivalent on NO rows) · $notional over a notional bar.
+
+    Display-only: the QListWidgetItem keeps its trade_id (UserRole), text and
+    tooltip exactly as before, so the whale-marker click link is unchanged. The
+    row fields arrive as a dict in ROLE; max_notional (set per render) scales the
+    bars against the largest visible print."""
+
+    ROLE = Qt.ItemDataRole.UserRole + 1
+    ROW_H = 18
+    GAP = 5              # minimum gap between columns
+    MAX_EXTRA_GAP = 10   # cap on the spare width added to each gap
+    RIGHT_MARGIN = 9     # breathing room before the scrollbar
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.max_notional = 1.0
+        self.flash = {}   # trade_id -> monotonic start (set by the widget)
+        self._f = QFont("monospace"); self._f.setPixelSize(11)
+        self._f_chip = QFont("monospace"); self._f_chip.setPixelSize(9); self._f_chip.setBold(True)
+        self._f_dim = QFont("monospace"); self._f_dim.setPixelSize(9)
+        # Column widths from the fonts' own metrics (widest realistic text), so a
+        # font-size change can never clip. Columns run left-to-right with the $
+        # amount right after the price — NOT pinned to the right edge, where it
+        # sat under the scrollbar and clipped.
+        fm, fd, fc = QFontMetrics(self._f), QFontMetrics(self._f_dim), QFontMetrics(self._f_chip)
+        self._w_when = fm.horizontalAdvance("00:00")
+        self._w_tag = 0          # set per render by set_tag_texts (0 = no column)
+        self._fd = fd
+        self._w_chip = fc.horizontalAdvance("YES") + 8
+        self._w_size = fm.horizontalAdvance("9.9k")
+        self._w_price = fm.horizontalAdvance("@99¢")
+        self._w_yeq = fd.horizontalAdvance("Y99")
+        self._fm = fm
+        self._w_usd = fm.horizontalAdvance("$999k")
+
+    def set_usd_texts(self, usds):
+        """Size the $ column for one render from its widest amount (a block
+        trade's ' ◼' included), never narrower than '$999k' so the column doesn't
+        jump around as amounts change."""
+        self._w_usd = max([self._fm.horizontalAdvance("$999k")] +
+                          [self._fm.horizontalAdvance(u) for u in usds if u])
+
+    def set_tag_texts(self, tags):
+        """Size the tag column for one render: widest tag, or 0 when no row has
+        one. Every row then reserves the same column, keeping them aligned."""
+        w = max((self._fd.horizontalAdvance(t) for t in tags if t), default=0)
+        self._w_tag = w
+
+    def sizeHint(self, option, index):
+        # Minimal width on purpose: the view stretches rows to its viewport. A
+        # width taken from option.rect could exceed the viewport, making rows wider
+        # than the visible list — with horizontal scrolling off, the overflow (the
+        # $ column) was silently cut off.
+        return QSize(1, self.ROW_H)
+
+    def paint(self, p, option, index):
+        d = index.data(self.ROLE)
+        if not d:
+            super().paint(p, option, index)
+            return
+        r = QRectF(option.rect)
+        # Second guard: never lay out past the view's visible width.
+        view = option.widget
+        if view is not None and hasattr(view, 'viewport'):
+            vw = float(view.viewport().width())
+            if r.right() > vw:
+                r.setRight(vw)
+        y, h = r.y(), r.height()
+        left = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        right = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        p.save()
+        if option.state & QStyle.StateFlag.State_Selected:
+            p.fillRect(r, QColor(27, 36, 48))
+        col = d['color']
+        # New live print: side-coloured wash fading out over the flash window.
+        t0 = self.flash.get(d.get('tid')) if d.get('tid') else None
+        if t0 is not None:
+            age = _time.monotonic() - t0
+            if age < HistoricalOddsWidget._LT_FLASH_S:
+                wash = QColor(col)
+                wash.setAlpha(int(120 * (1.0 - age / HistoricalOddsWidget._LT_FLASH_S)))
+                p.fillRect(r, wash)
+        # Justified columns: spare width is spread EVENLY over the gaps (up to
+        # MAX_EXTRA_GAP each, any remainder becomes right margin), so the columns
+        # use the whole row instead of bunching left with the $ jammed at the edge.
+        # Every row computes the same layout (widths are per-render constants and
+        # the Y column is reserved on ALL rows when shown), so columns align.
+        x0 = r.x() + 4
+        avail = (r.right() - self.RIGHT_MARGIN) - x0
+        cols = ['when'] + (['tag'] if self._w_tag else []) + ['chip', 'size', 'price']
+        if not self._w_tag:
+            cols.append('yeq')
+        cols.append('usd')
+        widths = {'when': self._w_when, 'tag': self._w_tag, 'chip': self._w_chip,
+                  'size': self._w_size, 'price': self._w_price, 'yeq': self._w_yeq,
+                  'usd': self._w_usd}
+        need = sum(widths[c] for c in cols) + self.GAP * (len(cols) - 1)
+        if need > avail and 'yeq' in cols:      # tight: the dim Y hint goes first
+            cols.remove('yeq')
+            need -= widths['yeq'] + self.GAP
+        if need > avail:
+            # Still tight (narrow panel + tag column + a wide '$73k ◼'): spend most
+            # of the right margin, then tighten the gaps (2px floor) — never push
+            # the $ amount past the visible edge.
+            avail += self.RIGHT_MARGIN - 3
+            shortfall = max(0.0, need - avail)
+            g = max(2.0, self.GAP - shortfall / (len(cols) - 1))
+        else:
+            extra = avail - need
+            g = self.GAP + min(extra / (len(cols) - 1), self.MAX_EXTRA_GAP)
+        x = x0
+        for c in cols:
+            cw = widths[c]
+            if c == 'when':
+                p.setFont(self._f); p.setPen(QColor(126, 135, 148))
+                p.drawText(QRectF(x, y, cw + 2, h), left, d['when'])
+            elif c == 'tag':
+                if d['tag']:
+                    p.setFont(self._f_dim); p.setPen(QColor(154, 164, 176))
+                    p.drawText(QRectF(x, y, cw + 2, h), left, d['tag'])
+            elif c == 'chip':
+                chip = QRectF(x, y + 3, cw, h - 6)
+                p.fillRect(chip, col)
+                p.setFont(self._f_chip); p.setPen(QColor(12, 16, 20))
+                p.drawText(chip, int(Qt.AlignmentFlag.AlignCenter), d['side'])
+            elif c == 'size':
+                p.setFont(self._f); p.setPen(QColor(207, 214, 223))
+                p.drawText(QRectF(x, y, cw, h), right, d['size'])
+            elif c == 'price':
+                p.setFont(self._f); p.setPen(QColor(207, 214, 223))
+                p.drawText(QRectF(x, y, cw + 2, h), left, d['price'])
+            elif c == 'yeq':
+                if d['yeq']:
+                    p.setFont(self._f_dim); p.setPen(QColor(90, 100, 114))
+                    p.drawText(QRectF(x, y, cw + 2, h), left, d['yeq'])
+            elif c == 'usd':
+                # Right-aligned in its column (sized per render by set_usd_texts);
+                # thin underline scaled to the largest visible print.
+                frac = (min(1.0, d['notional'] / self.max_notional)
+                        if self.max_notional > 0 else 0.0)
+                bar = QColor(col); bar.setAlpha(150)
+                p.fillRect(QRectF(x + cw * (1.0 - frac), y + h - 3, cw * frac, 2), bar)
+                p.setFont(self._f); p.setPen(col)
+                p.drawText(QRectF(x, y, cw, h), right, d['usd'])
+            x += cw + g
+        p.restore()
+
+
+class FitRowDelegate(QStyledItemDelegate):
+    """Plain-text list rows that can never be wider than the visible list: the
+    width hint is minimal (the view stretches rows to its viewport) and painting
+    is clamped to the viewport, so with horizontal scrolling off an over-long row
+    ends in Qt's '…' instead of being cut off or forcing a horizontal scrollbar."""
+
+    def sizeHint(self, option, index):
+        sh = super().sizeHint(option, index)
+        return QSize(1, sh.height())
+
+    def paint(self, p, option, index):
+        view = option.widget
+        if view is not None and hasattr(view, 'viewport'):
+            vw = view.viewport().width()
+            if option.rect.right() > vw:
+                option.rect.setRight(vw)
+        super().paint(p, option, index)
+
+
+# Slim vertical scrollbar shared by the panel's lists (6px rounded handle, no
+# arrow buttons, no track fill).
+SLIM_VSCROLL_QSS = (
+    "QScrollBar:vertical{width:6px;background:transparent;margin:1px 0px;}"
+    "QScrollBar::handle:vertical{background:#2f3947;border-radius:3px;min-height:24px;}"
+    "QScrollBar::handle:vertical:hover{background:#4a5462;}"
+    "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}"
+    "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:none;}")
+
+
+def _fit_list_to_width(lw):
+    """No horizontal scrolling, rows fit the visible width, slim scrollbar."""
+    lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    lw.setTextElideMode(Qt.TextElideMode.ElideRight)
+    lw.setItemDelegate(FitRowDelegate(lw))
+    lw.setStyleSheet(lw.styleSheet() + SLIM_VSCROLL_QSS)
+
+
+class SegmentedComboButtons(QFrame):
+    """Compact segmented-button FACE for a QComboBox that stays the source of truth.
+
+    The combo keeps its items, userData and currentIndexChanged handler exactly as
+    before (it is just never shown); a button click only calls
+    combo.setCurrentIndex(i), so every existing reader/handler is untouched — the
+    same backing-state pattern as the Timeframe preset. Buttons are rebuilt ONLY
+    when the label list changes, so the common reselect path (handler repopulates
+    the combo with the same items) never deletes the button being clicked."""
+
+    H = 17  # matches the chip row height
+
+    def __init__(self, combo, parent=None):
+        super().__init__(parent)
+        self.setObjectName("segSel")
+        self._combo = combo
+        self._buttons = []
+        self._sig = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        # Unblocked index changes (e.g. table-driven selection) re-sync the face;
+        # blocked repopulates are synced by the explicit set_options() call.
+        combo.currentIndexChanged.connect(self._sync_checked)
+
+    def set_options(self, labels, tips=None, venues=None):
+        """One short label per combo row, in combo order. tips/venues optional."""
+        sig = tuple(labels), tuple(venues or ())
+        if sig != self._sig:
+            for b in self._buttons:
+                self.layout().removeWidget(b)
+                b.hide()
+                b.deleteLater()
+            self._buttons = []
+            for i, txt in enumerate(labels):
+                b = QPushButton(txt, self)
+                b.setObjectName("seg")
+                b.setCheckable(True)
+                b.setFixedHeight(self.H)
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setProperty("first", i == 0)
+                if venues:
+                    b.setProperty("venue", venues[i])
+                b.clicked.connect(lambda _c=False, i=i: self._pick(i))
+                self.layout().addWidget(b)
+                self._buttons.append(b)
+            self._sig = sig
+        for i, b in enumerate(self._buttons):
+            b.setToolTip(tips[i] if tips and i < len(tips) else "")
+        self._sync_checked()
+
+    def _pick(self, i):
+        if self._combo.currentIndex() != i:
+            self._combo.setCurrentIndex(i)  # -> the combo's existing handler
+        self._sync_checked()  # a click toggles the button itself; re-assert from combo
+
+    def _sync_checked(self, *_):
+        cur = self._combo.currentIndex()
+        for i, b in enumerate(self._buttons):
+            b.setChecked(i == cur)
+
+
 class FilterableEventCombo(QComboBox):
     """Event selector that's a drop-in QComboBox (addItem/itemData/currentIndex…
     all preserved, so on_event_changed fires as usual) but whose popup is a custom
@@ -2678,6 +3302,9 @@ class FilterableEventCombo(QComboBox):
         v = QVBoxLayout(fr); v.setContentsMargins(4, 4, 4, 4); v.setSpacing(3)
         self._search = QLineEdit(); self._search.setPlaceholderText("search team / league…")
         self._search.textChanged.connect(self._rebuild_list)
+        # Keyboard: ↑/↓ move through the matches, Enter opens one, Esc closes —
+        # without leaving the search box (see eventFilter).
+        self._search.installEventFilter(self)
         v.addWidget(self._search)
         row = QHBoxLayout(); row.setSpacing(4)
         self._sort = QComboBox(); self._sort.addItems(['Volume', 'Soonest', 'League', 'A–Z'])
@@ -2690,6 +3317,9 @@ class FilterableEventCombo(QComboBox):
         self._count_lbl = QLabel("")
         v.addWidget(self._count_lbl)
         self._list = QListWidget(); self._list.setFixedHeight(420)
+        # Titles fit the popup width ('…' + full-title tooltip), never a
+        # horizontal scrollbar.
+        _fit_list_to_width(self._list)
         self._list.itemClicked.connect(self._on_pick)
         v.addWidget(self._list)
         self._popup = fr
@@ -2751,15 +3381,140 @@ class FilterableEventCombo(QComboBox):
         self._list.clear()
         for orig_i, text, _e, _l in rows:
             it = QListWidgetItem(text)
+            it.setToolTip(text)   # full title when the row is elided
             it.setData(Qt.ItemDataRole.UserRole, orig_i)
             self._list.addItem(it)
+        if self._list.count():
+            self._list.setCurrentRow(0)   # Enter opens the top match by default
         self._count_lbl.setText(f"{len(rows)} of {self.count()} events")
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, '_search', None) and ev.type() == QEvent.Type.KeyPress:
+            k = ev.key()
+            if k in (Qt.Key.Key_Up, Qt.Key.Key_Down) and self._list.count():
+                row = self._list.currentRow() + (1 if k == Qt.Key.Key_Down else -1)
+                row = max(0, min(self._list.count() - 1, row))
+                self._list.setCurrentRow(row)
+                self._list.scrollToItem(self._list.item(row))
+                return True
+            if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                item = self._list.currentItem() or self._list.item(0)
+                if item is not None:
+                    self._on_pick(item)   # same path as a mouse click
+                return True
+            if k == Qt.Key.Key_Escape:
+                self.hidePopup()
+                return True
+        return super().eventFilter(obj, ev)
 
     def _on_pick(self, item):
         orig_i = item.data(Qt.ItemDataRole.UserRole)
         self.hidePopup()
         if orig_i is not None:
             self.setCurrentIndex(int(orig_i))   # fires currentIndexChanged
+
+
+class ChartWatermark:
+    """Large, faint, centred market watermark drawn BEHIND the chart data (the
+    style of most trading terminals).
+
+    The two text items are children of the ViewBox itself — not added via
+    addItem — at z=-50: above the ViewBox background (z=-1e6), below its data
+    group (z=0), so candles/lines/crosshair draw over it. Being plain children,
+    they stay fixed in widget space (no pan/zoom) and plot_widget.clear() never
+    removes them. Re-centred on every ViewBox resize; the title font shrinks to
+    fit narrow charts."""
+
+    TITLE_PX, SUB_PX = 44, 15
+
+    def __init__(self, viewbox):
+        self._vb = viewbox
+        self.title = QGraphicsSimpleTextItem()
+        self.sub = QGraphicsSimpleTextItem()
+        self._tf = QFont("monospace"); self._tf.setBold(True)
+        self._tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        self._sf = QFont("monospace")
+        self._sf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        self._sf.setPixelSize(self.SUB_PX)
+        self.title.setBrush(QColor(207, 214, 223, 24))
+        self.sub.setBrush(QColor(207, 214, 223, 20))
+        for it in (self.title, self.sub):
+            it.setParentItem(viewbox)
+            it.setZValue(-50)
+            it.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            it.setVisible(False)
+        self.sub.setFont(self._sf)
+        viewbox.sigResized.connect(self._place)
+
+    def set_text(self, title, sub):
+        if self.title.text() != title:
+            self.title.setText(title)
+        if self.sub.text() != sub:
+            self.sub.setText(sub)
+        self.title.setVisible(True)
+        self.sub.setVisible(bool(sub))
+        self._place()
+
+    def hide(self):
+        self.title.setVisible(False)
+        self.sub.setVisible(False)
+
+    def _place(self, *_):
+        if not self.title.isVisible():
+            return
+        r = self._vb.rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return
+        # Fit the title to ~80% of the plot width, capped at TITLE_PX.
+        self._tf.setPixelSize(self.TITLE_PX)
+        self.title.setFont(self._tf)
+        tw = self.title.boundingRect().width()
+        if tw > r.width() * 0.8 and tw > 0:
+            self._tf.setPixelSize(max(14, int(self.TITLE_PX * r.width() * 0.8 / tw)))
+            self.title.setFont(self._tf)
+        tb, sb = self.title.boundingRect(), self.sub.boundingRect()
+        gap = 6 if self.sub.isVisible() else 0
+        total = tb.height() + gap + (sb.height() if self.sub.isVisible() else 0)
+        cx, y0 = r.center().x(), r.center().y() - total / 2.0
+        self.title.setPos(cx - tb.width() / 2.0, y0)
+        self.sub.setPos(cx - sb.width() / 2.0, y0 + tb.height() + gap)
+
+
+class TerminalDateAxis(pg.DateAxisItem):
+    """DateAxisItem with readable date labels. TICK PLACEMENT IS UNCHANGED —
+    pyqtgraph's tickValues/zoom levels pick the positions; only some label
+    strings are swapped, each for one of similar length (so label density, and
+    with it overlap behaviour, stays as before):
+      * day-level ticks: 'Sep 22' on the first tick, a bare day number ('24')
+        after it — not stock's zero-padded '22 … 02'. The 1st of a month is
+        drawn by pyqtgraph's month level ('Oct'), so a two-week view reads
+        'Sep 22 23 … 30 Oct 2 3';
+      * intraday ticks: a tick landing exactly on local midnight reads 'Oct 4'
+        instead of '00:00', marking the day change; all others keep stock text.
+    Month-and-coarser levels (futures spanning years) are left to pyqtgraph."""
+
+    _MON = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+    def tickStrings(self, values, scale, spacing):
+        strings = super().tickStrings(values, scale, spacing)
+        if spacing >= 28 * 86400 or not values:
+            return strings
+        try:
+            dates = [datetime.fromtimestamp(v) for v in values]
+        except (OverflowError, ValueError, OSError):
+            return strings
+        out = []
+        if spacing >= 86400:
+            for i, d in enumerate(dates):
+                out.append(f"{self._MON[d.month - 1]} {d.day}" if i == 0 else str(d.day))
+            return out
+        for d, s in zip(dates, strings):
+            if d.hour == 0 and d.minute == 0 and d.second == 0:
+                out.append(f"{self._MON[d.month - 1]} {d.day}")
+            else:
+                out.append(s)
+        return out
 
 
 class CandleBodyItem(pg.BarGraphItem):
@@ -2920,18 +3675,14 @@ class HistoricalOddsWidget(QWidget):
         self.candle_mode = False
         self.candle_bucket_s = 5        # 1 / 5 / 15 ; 0 == "Max" (one candle/tick)
         self.show_spread_band = True
-        # --- Liquidity heatmap (Bookmap-style resting-depth ribbon) ---------------
-        # When on, each live flush samples the focus series' full depth ladder into
-        # a per-cent column (size at each price level) and renders the accumulated
-        # columns as a phosphor heat ribbon BEHIND the candles. Reads resting book
-        # over time the way the static right-side ladder cannot.
-        self.heatmap_mode = False
-        self._heat_cols = deque(maxlen=900)   # (epoch_t, np.float32[100]) per column
-        self._heat_img = None                 # pg.ImageItem, created lazily in init_ui
-        self._heat_last_sample_t = 0.0        # throttle clock (sec)
-        self._heat_sample_dt = 1.0            # min seconds between sampled columns
-        self._heat_lut = self._build_heat_lut()
         self.live_follow_window_s = 600  # rolling window (sec) for the line view
+        # One-shot: the next live refresh fits the %-axis DIRECTLY instead of
+        # gliding. The glide only advances on flushes, which only happen when data
+        # arrives — on a quiet market a view change (seed, preset, follow on,
+        # market switch) left y stranded far from the data (e.g. 19-60% around a
+        # 46-47% market). Set wherever the view changes; consumed in
+        # _refresh_live_items.
+        self._y_snap_next = False
         self.live_candle_visible_n = 60  # candles to keep in view when following
         # (so candle width stays visually consistent across 1s/5s/15s buckets)
         # Live corner-label running stats (american odds, float; tick-by-tick)
@@ -2960,9 +3711,10 @@ class HistoricalOddsWidget(QWidget):
         self._flush_n = 0
         self._last_panel_t = 0.0   # wall clock of the last heavy-panel update
         # Per-feed last-message monotonic time (freshness/idle gauge) + last measured
-        # ping/pong round-trip latency in ms (None until the first pong lands). RTT is
-        # a true user<->exchange round trip (Kalshi: WS protocol ping/pong; PM: app
-        # 'PING'/'PONG'), clock-skew-free since both stamps are local.
+        # ping/pong round trip in ms (None until the first pong lands). The ping/pong
+        # includes local frame-processing backlog, so it is NOT shown as latency:
+        # the readout uses the kernel TCP RTT and shows (ping/pong - TCP RTT) as
+        # processing lag; ping/pong is the number only where TCP_INFO is absent.
         self._k_last_msg = 0.0
         self._pm_last_msg = 0.0
         self._k_rtt_ms = None
@@ -3016,7 +3768,7 @@ class HistoricalOddsWidget(QWidget):
         # Fixed width keeps long event titles from widening the header; the picker
         # popup carries the search/sort/platform filters and shows full titles.
         self.event_selector.setFixedWidth(230)
-        self.event_selector.setToolTip("Event — click for search / sort / filter")
+        self.event_selector.setToolTip("Event — click for search / sort / filter  [S]")
         self.event_selector.currentIndexChanged.connect(self.on_event_changed)
         header_layout.addWidget(self.event_selector)
 
@@ -3089,7 +3841,7 @@ class HistoricalOddsWidget(QWidget):
 
         # https://pyqtgraph.readthedocs.io/en/latest/api_reference/widgets/plotwidget.html
         # Create plot widget with DateAxisItem from the start to avoid scientific notation
-        date_axis = pg.DateAxisItem(orientation='bottom')
+        date_axis = TerminalDateAxis(orientation='bottom')
         self.plot_widget = pg.PlotWidget(
             # Near-black terminal screen, matching the order-book ladder and DEPTH
             # panel (#0d1117) instead of the old blue-grey (#29313D) — the whole
@@ -3117,19 +3869,14 @@ class HistoricalOddsWidget(QWidget):
             _ax = self.plot_widget.getAxis(_ax_name)
             _ax.setPen(pg.mkPen('#2a3340'))
             _ax.setTextPen(pg.mkPen('#7e8794'))
-        # Fix the %-axis width: its tick labels ("55.0% (-122)") change length as
+        # Fix the %-axis width: its tick labels ("55% −122") change length as
         # the range moves, and letting the axis auto-size makes the whole plot
         # rect shift sideways on every re-tick — visible as chart wobble. Sized
         # to the widest realistic label instead of auto.
         _lw = QFontMetrics(self.plot_widget.getAxis('left').font()
-                           or QFont()).horizontalAdvance("88.88% (-8888)") + 14
+                           or QFont()).horizontalAdvance("88.88%  \u22128888") + 14
         self.plot_widget.getAxis('left').setWidth(_lw)
 
-        # Liquidity heatmap layer — an ImageItem that paints resting book depth as a
-        # phosphor ribbon. Sits at the very back (negative z) so candles, the spread
-        # band, the start line and the crosshair all draw on top of it. Hidden until
-        # the Heat toggle is on; filled per tick in _refresh_heatmap().
-        self._ensure_heat_img()
         self._ensure_whale_scatter()
         # Implied chance is a probability: 0% and 100% are HARD floor/ceiling.
         # Bound the Y view so it can never pan/zoom past the valid range (no more
@@ -3165,6 +3912,16 @@ class HistoricalOddsWidget(QWidget):
         _vb_menu = self.plot_widget.getViewBox().menu
         _vb_menu.addSeparator()
         _vb_menu.addAction(self._follow_action)
+        # Price alerts: the "set" action's level is read from the cursor when the
+        # menu opens (_prep_alert_menu), i.e. wherever the user right-clicked.
+        self._alert_action = QAction("Set price alert here", self)
+        self._alert_action.triggered.connect(
+            lambda: self._alert_pending is not None and self._add_alert(self._alert_pending))
+        self._clear_alerts_action = QAction("Clear price alerts", self)
+        self._clear_alerts_action.triggered.connect(self._clear_alerts)
+        _vb_menu.addAction(self._alert_action)
+        _vb_menu.addAction(self._clear_alerts_action)
+        _vb_menu.aboutToShow.connect(self._prep_alert_menu)
         # Regenerate y-axis ticks from the visible range as the user zooms/pans,
         # so the %-axis densifies/coarsens like the time axis (DateAxisItem) does
         # instead of keeping the load-time tick step forever.
@@ -3197,6 +3954,11 @@ class HistoricalOddsWidget(QWidget):
                 " border-radius:3px; padding:3px 6px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.hide()
+        # Live-mode counterparts (custom-painted price + range track). Per band,
+        # whichever was written last is the one shown — see _set_live_summary /
+        # _set_summary_label — and _summary_w(band) returns the visible one.
+        self.live_summary_top = LiveCornerSummary(self.plot_widget)
+        self.live_summary_bottom = LiveCornerSummary(self.plot_widget)
 
         # The current value ("NN% (+am)") is shown inside the corner summary boxes
         # (see _draw_series_annotations / _update_live_summary_label), not as a
@@ -3281,6 +4043,33 @@ class HistoricalOddsWidget(QWidget):
             #depthPanel QCheckBox { color:#cfd6df; font-family:monospace; font-size:11px; }
             #depthPanel QComboBox { background:#161b22; color:#cfd6df; border:1px solid #2b333d;
                 font-family:monospace; font-size:11px; padding:1px 3px; }
+            /* Live toggles rendered as chips: the SAME QCheckBoxes (signals and
+               handlers unchanged), indicator hidden, lit fill = on. Uniform 1px
+               border in both states so toggling never shifts the row. */
+            #depthPanel QCheckBox#chip { color:#5d6876; font-size:9px; spacing:0px;
+                background:#0f141a; border:1px solid #262e39; border-radius:2px;
+                padding:0px 4px; }
+            #depthPanel QCheckBox#chip::indicator { width:0px; height:0px; border:none; image:none; }
+            #depthPanel QCheckBox#chip:hover { color:#aab3be; }
+            #depthPanel QCheckBox#chip:checked { color:#e6ebf0; background:#1b2430;
+                border-color:#8a6d35; }
+            #depthPanel QCheckBox#chip:disabled { color:#3a4350; }
+            #depthPanel QComboBox#chipCombo { font-size:9px; padding:0px 2px; }
+            #depthPanel QComboBox#chipCombo:disabled { color:#3a4350; }
+            /* Feed / Side segmented faces (SegmentedComboButtons). */
+            #depthPanel QFrame#segSel { background:#0f141a; border:1px solid #2b333d;
+                border-radius:2px; }
+            #depthPanel QPushButton#seg { color:#6b7684; background:transparent;
+                border:none; border-left:1px solid #2b333d;
+                border-bottom:2px solid transparent;
+                font-family:monospace; font-size:9px; padding:0px 6px; }
+            #depthPanel QPushButton#seg[first="true"] { border-left:none; }
+            #depthPanel QPushButton#seg:hover { color:#cfd6df; }
+            #depthPanel QPushButton#seg:checked { color:#e6ebf0; background:#1b2430;
+                border-bottom:2px solid #e0b050; }
+            #depthPanel QPushButton#seg[venue="kalshi"]:checked { border-bottom-color:#00d397; }
+            #depthPanel QPushButton#seg[venue="polymarket"]:checked { border-bottom-color:#2e5cff; }
+            #depthPanel QPushButton#seg[venue="both"]:checked { border-bottom-color:#9aa4b0; }
         """)
         self._panel_body_w = 238  # includes room for the vertical scrollbar
         # Outer holds just the collapsible body — the panel sits flush against
@@ -3290,15 +4079,101 @@ class HistoricalOddsWidget(QWidget):
 
         # Discreet floating toggle pinned to the plot's right edge (positioned in
         # _position_overlays), replacing the old full-height 14px handle strip.
-        self.panel_handle = QPushButton("⟨", self.plot_widget)
-        self.panel_handle.setFixedSize(14, 44)
+        # Labelled tab ("⟨ DEPTH" collapsed / "⟩" expanded) pinned under the top
+        # logo — see _toggle_right_panel and _position_overlays.
+        self.panel_handle = QPushButton("⟨ DEPTH", self.plot_widget)
+        self.panel_handle.setFixedSize(58, 18)
         self.panel_handle.setStyleSheet(
-            "QPushButton { background: rgba(13,17,23,222); color:#5b6675;"
-            " border:1px solid #2a3340; border-radius:3px; font-size:11px; }"
-            " QPushButton:hover { background: rgba(224,176,80,40); color:#e0b050; }")
+            "QPushButton { background: rgba(13,17,23,222); color:#e0b050;"
+            " border:1px solid #2a3340; border-right:none;"
+            " border-top-left-radius:3px; border-bottom-left-radius:3px;"
+            " font-family:monospace; font-size:9px; }"
+            " QPushButton:hover { background: rgba(224,176,80,40); }")
         self.panel_handle.setToolTip("Show depth / view panel")
         self.panel_handle.clicked.connect(self._toggle_right_panel)
         self.panel_handle.show()
+
+        # --- Live-only chart controls (visibility owned by
+        # _sync_live_overlay_controls; positions by _position_overlays) ---------
+        # Zoom presets: each sets the FOLLOW window (view stays pinned to the live
+        # edge at that span) — see _live_render_window / _on_view_preset. They live
+        # in the floating control strip, right after the timeframe dropdown (a
+        # laid-out child, so the strip's adjustSize sizes around them).
+        self._view_preset = None
+        self.preset_bar = QFrame()
+        self.preset_bar.setStyleSheet(
+            "QPushButton { background: rgba(22,27,34,230); color:#7e8794;"
+            " border:1px solid #2f3947; border-radius:2px; padding:0px 7px;"
+            " font-family:monospace; font-size:10px; }"
+            " QPushButton:hover { color:#dcdcdc; }"
+            " QPushButton:checked { color:#e0b050; border-color:#8a6d35; }"
+            " QPushButton:disabled { color:#3a4350; }")
+        _pl = QHBoxLayout(self.preset_bar)
+        _pl.setContentsMargins(0, 0, 0, 0); _pl.setSpacing(2)
+        self._preset_buttons = {}
+        for key, label, tip in (
+                ('game', 'Game', 'Event start − 20 min → live edge'),
+                ('6h', '6h', 'Last 6 hours'),
+                ('24h', '24h', 'Last 24 hours'),
+                ('all', 'All', 'Whole market life (Market Post → live edge)')):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setFixedHeight(20)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip + "  (keeps following)")
+            b.clicked.connect(lambda _c=False, k=key: self._on_view_preset(k))
+            _pl.addWidget(b)
+            self._preset_buttons[key] = b
+        header_layout.insertWidget(header_layout.indexOf(self.timeframe_combo) + 1,
+                                   self.preset_bar)
+        self.preset_bar.hide()
+        # Jump-to-live: shown while NOT following (after a pan/zoom); one click
+        # re-enables follow, which snaps back to the live edge.
+        self.live_jump_btn = QPushButton("LIVE ⇥", self.plot_widget)
+        self.live_jump_btn.setFixedSize(58, 20)
+        self.live_jump_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.live_jump_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.live_jump_btn.setToolTip("Jump back to the live edge and follow it")
+        self.live_jump_btn.setStyleSheet(
+            "QPushButton { background: rgba(13,17,23,235); color:#e0b050;"
+            " border:1px solid #8a6d35; border-radius:2px;"
+            " font-family:monospace; font-size:10px; }"
+            " QPushButton:hover { background: rgba(224,176,80,45); }")
+        self.live_jump_btn.clicked.connect(lambda: self.follow_check.setChecked(True))
+        self.live_jump_btn.hide()
+        # Market watermark: large, faint, centred BEHIND the chart data (which
+        # market this is, even with the control strip hidden). Text set in
+        # _update_watermark; see ChartWatermark.
+        self._watermark = ChartWatermark(self.plot_widget.getViewBox())
+        # Last-price tag: sits over the %-axis at the focus series' latest price
+        # (paired with a dashed in-plot line). See _update_last_price_marker.
+        self._lp_line = None
+        self._lp_hue = None
+        self.last_price_tag = QLabel(self.plot_widget)
+        self.last_price_tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.last_price_tag.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.last_price_tag.hide()
+        # Price alerts (right-click the chart): one-shot levels on the focus series.
+        self._alerts = []             # [{'level': pct, 'line': InfiniteLine}]
+        self._alert_prev_pct = None   # focus price at the previous check
+        self._alert_pending = None    # level under the cursor when the menu opened
+        self.alert_toast = QLabel(self.plot_widget)
+        self.alert_toast.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.alert_toast.setTextFormat(Qt.TextFormat.RichText)
+        self.alert_toast.setStyleSheet(
+            "background: rgba(40,30,10,235); border:1px solid #e0b050; border-radius:3px;"
+            " padding:5px 10px; color:#e0b050; font-family:monospace; font-size:12px;")
+        self.alert_toast.hide()
+        self._alert_toast_timer = QTimer(self)
+        self._alert_toast_timer.setSingleShot(True)
+        self._alert_toast_timer.timeout.connect(self.alert_toast.hide)
+        # New-print flash on the LARGE TRADES tape: trade_id -> monotonic start.
+        self._lt_flash = {}
+        self._lt_flash_timer = QTimer(self)
+        self._lt_flash_timer.setInterval(50)
+        self._lt_flash_timer.timeout.connect(self._lt_flash_tick)
         # Overlays are positioned in plot-widget space, so re-pin them whenever
         # the PLOT resizes — panel expand/collapse changes the plot's width
         # without resizing the top-level widget (see eventFilter).
@@ -3313,93 +4188,114 @@ class HistoricalOddsWidget(QWidget):
         # edge (which is the window's right edge) — the old 6px right margin left a
         # dead dark band beside the numbers.
         pb.setContentsMargins(6, 4, 0, 6); pb.setSpacing(6)
-        # Header title + per-feed ping/pong round-trip latency (K / PM)
-        title_row = QHBoxLayout(); title_row.setContentsMargins(0, 0, 0, 0); title_row.setSpacing(6)
-        self.panel_title = QLabel("DEPTH / VIEW"); self.panel_title.setObjectName("sect")
+        # Header title + Follow chip + per-feed ping/pong round-trip latency (K / PM).
+        # Follow lives here (not in the chip row) so the Feed/Side row keeps room
+        # for a 3-way market + ALL; its visibility tracks live_controls.
+        title_row = QHBoxLayout(); title_row.setContentsMargins(0, 0, 6, 0); title_row.setSpacing(6)
+        self.panel_title = QLabel("DEPTH"); self.panel_title.setObjectName("sect")
         self.latency_label = QLabel("")
         self.latency_label.setTextFormat(Qt.TextFormat.RichText)
         self.latency_label.setStyleSheet("font-family:monospace;font-size:9px;")
         self.latency_label.setToolTip(
             "Feed health per source (K=Kalshi, PM=Polymarket).\n"
-            "Number: true ping/pong round-trip latency to the exchange (Kalshi uses\n"
-            "the WebSocket protocol ping/pong, PM the app-level PING/PONG); falls\n"
-            "back to time-since-last-message until the first pong / when the feed goes\n"
-            "quiet. Clock-skew-free — both timestamps are local, no NTP dependency.\n"
-            "Colour: freshness — green <0.5s, amber <3s, red when stale/idle.")
+            "Number: network round-trip time to the exchange (kernel TCP RTT).\n"
+            "Amber +N: extra local processing lag seen by the ping/pong round trip.\n"
+            "Dot: freshness — green <0.5s, amber <3s, red when stale/idle.")
+        # The live toggles are the original QCheckBoxes restyled as chips
+        # (objectName "chip", see the panel stylesheet): signals, handlers and every
+        # setChecked/blockSignals caller are unchanged.
+        _CHIP_H = SegmentedComboButtons.H
+
+        def _chip(text, tip, checked=False):
+            cb = QCheckBox(text)
+            cb.setObjectName("chip")
+            cb.setToolTip(tip)
+            cb.setChecked(checked)
+            cb.setFixedHeight(_CHIP_H)
+            cb.setCursor(Qt.CursorShape.PointingHandCursor)
+            return cb
+
+        # Follow: HIDDEN backing state (never in a layout, never shown). The UI for
+        # it is the chart's LIVE ⇥ button, the zoom presets, the right-click menu
+        # action and the F key — all of which go through follow_check, so every
+        # existing setChecked/blockSignals caller and _on_follow_toggled still apply.
+        # Parented so it can never surface as a stray top-level window.
+        self.follow_check = _chip(
+            "FOLLOW", "Auto-scroll the time axis to keep the newest ticks in view", True)
+        self.follow_check.setParent(self.panel_body)
+        self.follow_check.hide()
+        self.follow_check.stateChanged.connect(self._on_follow_toggled)
         title_row.addWidget(self.panel_title)
         title_row.addStretch(1)
         title_row.addWidget(self.latency_label)
         pb.addLayout(title_row)
 
-        # --- Live controls (Follow / Candles+bucket / Spread) ---
+        # --- Live controls: Feed/Side segmented row + chip row ---
         self.live_controls = QWidget()
         lc = QVBoxLayout(self.live_controls)
-        lc.setContentsMargins(0, 0, 0, 0); lc.setSpacing(3)
-        row1 = QHBoxLayout(); row1.setSpacing(8)
-        self.follow_check = QCheckBox("Follow")
-        self.follow_check.setToolTip("Auto-scroll the time axis to keep the newest ticks in view")
-        self.follow_check.setChecked(True)
-        self.follow_check.stateChanged.connect(self._on_follow_toggled)
-        self.spread_check = QCheckBox("Spread")
-        self.spread_check.setToolTip("Shade the live bid/ask spread band")
-        self.spread_check.setChecked(True)
-        self.spread_check.stateChanged.connect(self._on_spread_toggled)
-        self.heat_check = QCheckBox("Heat")
-        self.heat_check.setToolTip("Liquidity heatmap: resting book depth as a phosphor ribbon behind the candles")
-        self.heat_check.stateChanged.connect(self._on_heat_toggled)
-        row1.addWidget(self.follow_check); row1.addWidget(self.spread_check)
-        row1.addWidget(self.heat_check); row1.addStretch(1)
-        lc.addLayout(row1)
-        # Feed-source selector on its OWN row — keeping it off the Follow/Spread
-        # row prevents that row from overflowing the fixed-width (238px) panel and
-        # pushing it off-screen. Only shown when the market trades on BOTH Kalshi
-        # and Polymarket; otherwise the sole source is used silently.
+        lc.setContentsMargins(0, 0, 6, 0); lc.setSpacing(4)
+        rowsel = QHBoxLayout(); rowsel.setContentsMargins(0, 0, 0, 0); rowsel.setSpacing(4)
+        # Feed source: shown only when the market trades on BOTH Kalshi and
+        # Polymarket (feed_source_row visibility is still set by
+        # _populate_feed_sources); otherwise the sole source is used silently. The
+        # combo is hidden backing state driven by the segmented face.
         self.feed_source_row = QWidget()
         rowfeed = QHBoxLayout(self.feed_source_row)
-        rowfeed.setContentsMargins(0, 0, 0, 0); rowfeed.setSpacing(6)
-        feed_lbl = QLabel("Feed"); feed_lbl.setStyleSheet("color:#9aa4b0;")
-        self.feed_source_combo = QComboBox()
+        rowfeed.setContentsMargins(0, 0, 0, 0); rowfeed.setSpacing(0)
+        self.feed_source_combo = QComboBox(self.feed_source_row)
         self.feed_source_combo.setToolTip("Live feed source for this market")
-        self.feed_source_combo.setFixedWidth(120)
         self.feed_source_combo.currentIndexChanged.connect(self._on_feed_source_changed)
-        rowfeed.addWidget(feed_lbl); rowfeed.addWidget(self.feed_source_combo)
-        rowfeed.addStretch(1)
+        self.feed_source_combo.hide()
+        self.feed_seg = SegmentedComboButtons(self.feed_source_combo)
+        self.feed_seg.setToolTip("Live feed source")
+        rowfeed.addWidget(self.feed_seg)
         self.feed_source_row.setVisible(False)
-        lc.addWidget(self.feed_source_row)
+        rowsel.addWidget(self.feed_source_row)
         # Side/outcome selector — which logical outcome the live overlay follows
-        # (per venue), or "All" to overlay every outcome at once. Lists the
-        # market's actual outcomes (teams / Over-Under / Home-Draw-Away / Yes-No).
+        # (per venue), or "All" to overlay every outcome at once. Segmented face
+        # for up to 4 short outcomes (teams / O-U / 3-way + ALL); the combo itself
+        # is shown instead for futures and long/ambiguous labels (see
+        # _sync_side_selector). side_row visibility is still set by
+        # _populate_side_combo.
         self.side_row = QWidget()
         rowside = QHBoxLayout(self.side_row)
-        rowside.setContentsMargins(0, 0, 0, 0); rowside.setSpacing(6)
-        side_lbl = QLabel("Side"); side_lbl.setStyleSheet("color:#9aa4b0;")
+        rowside.setContentsMargins(0, 0, 0, 0); rowside.setSpacing(0)
         self.side_combo = QComboBox()
         self.side_combo.setToolTip("Outcome the live feed tracks (or All to overlay every outcome)")
         self.side_combo.setFixedWidth(120)
         self.side_combo.currentIndexChanged.connect(self._on_side_changed)
-        rowside.addWidget(side_lbl); rowside.addWidget(self.side_combo)
-        rowside.addStretch(1)
+        self.side_seg = SegmentedComboButtons(self.side_combo)
+        rowside.addWidget(self.side_seg); rowside.addWidget(self.side_combo)
+        self.side_combo.setVisible(False)
         self.side_row.setVisible(False)
-        lc.addWidget(self.side_row)
-        row2 = QHBoxLayout(); row2.setSpacing(8)
-        self.candle_check = QCheckBox("Candles")
-        self.candle_check.setToolTip("Render the live feed as OHLC candlesticks")
+        rowsel.addWidget(self.side_row)
+        rowsel.addStretch(1)
+        lc.addLayout(rowsel)
+
+        row2 = QHBoxLayout(); row2.setContentsMargins(0, 0, 0, 0); row2.setSpacing(3)
+        self.candle_check = _chip("CANDLES", "Render the live feed as OHLC candlesticks")
         self.candle_check.stateChanged.connect(self._on_candle_toggled)
         self.candle_bucket = QComboBox()
+        self.candle_bucket.setObjectName("chipCombo")
         self.candle_bucket.addItems(["1s", "5s", "15s", "30s", "1m", "5m", "Max"])
         self.candle_bucket.setCurrentText("5s")
-        self.candle_bucket.setFixedWidth(64)
+        self.candle_bucket.setFixedSize(42, _CHIP_H)
         self.candle_bucket.setToolTip("Candle aggregation window (Max = one candle per tick)")
         self.candle_bucket.currentIndexChanged.connect(self._on_candle_bucket_changed)
-        self.whales_check = QCheckBox("Whales")
-        self.whales_check.setChecked(True)
-        self.whales_check.setToolTip(
+        self.spread_check = _chip("SPREAD", "Shade the live bid/ask spread band", True)
+        self.spread_check.stateChanged.connect(self._on_spread_toggled)
+        self.whales_check = _chip(
+            "WHALES",
             "Overlay large trades on the chart as dots sized by notional\n"
-            "(threshold follows the LARGE TRADES $ selector; hover for details)")
+            "(threshold follows the LARGE TRADES $ selector; hover for details)", True)
         self.whales_check.stateChanged.connect(self._on_whales_toggled)
         self.show_whale_dots = True
-        row2.addWidget(self.candle_check); row2.addWidget(self.candle_bucket)
-        row2.addWidget(self.whales_check); row2.addStretch(1)
+        # Candle chip + its bucket combo sit flush, reading as one control.
+        candle_pair = QHBoxLayout(); candle_pair.setContentsMargins(0, 0, 0, 0); candle_pair.setSpacing(0)
+        candle_pair.addWidget(self.candle_check); candle_pair.addWidget(self.candle_bucket)
+        row2.addLayout(candle_pair)
+        row2.addWidget(self.spread_check); row2.addWidget(self.whales_check)
+        row2.addStretch(1)
         lc.addLayout(row2)
         pb.addWidget(self.live_controls)
 
@@ -3407,7 +4303,10 @@ class HistoricalOddsWidget(QWidget):
         self.ob_section = QWidget()
         obl = QVBoxLayout(self.ob_section)
         obl.setContentsMargins(0, 0, 0, 0); obl.setSpacing(2)
-        ob_title = QLabel("ORDER BOOK"); ob_title.setObjectName("sect")
+        # One static section title; each ladder group under it starts with a
+        # BookSummaryWidget (full when one book is in view, compact + series label
+        # when several are — built in _rebuild_ob_ladders).
+        ob_title = QLabel("BOOK"); ob_title.setObjectName("sect")
         obl.addWidget(ob_title)
 
         # Readout style reused by the dynamic per-series ladder groups.
@@ -3449,16 +4348,27 @@ class HistoricalOddsWidget(QWidget):
         self.large_trades_list = QListWidget()
         self.large_trades_list.setStyleSheet(
             "QListWidget{background:#0d1117;border:1px solid #222a35;"
-            "font-family:monospace;font-size:10px;color:#cfd6df;outline:0;}"
+            "font-family:monospace;font-size:11px;color:#cfd6df;outline:0;}"
             "QListWidget::item{padding:1px 4px;}"
-            "QListWidget::item:selected{background:#1b2430;}")
+            "QListWidget::item:selected{background:#1b2430;}"
+            # Slim scrollbar: 6px rounded handle, no arrow buttons, no track fill.
+            "QScrollBar:vertical{width:6px;background:transparent;margin:1px 0px;}"
+            "QScrollBar::handle:vertical{background:#2f3947;border-radius:3px;min-height:24px;}"
+            "QScrollBar::handle:vertical:hover{background:#4a5462;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}"
+            "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:none;}")
         self.large_trades_list.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel)
         # Rows are formatted to fit one line (k-abbreviated size/notional, side
         # carried by the row colour) — a horizontal scrollbar is never warranted.
         self.large_trades_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.large_trades_list.setFixedHeight(150)
+        self.large_trades_list.setFixedHeight(9 * LargeTradeRowDelegate.ROW_H + 2)
+        # Column-painted rows (side chip, YES-equivalent, notional bar).
+        self._lt_delegate = LargeTradeRowDelegate(self.large_trades_list)
+        self.large_trades_list.setItemDelegate(self._lt_delegate)
+        self._lt_delegate.flash = self._lt_flash   # shared dict: new-print flash
+        self.large_trades_list.setUniformItemSizes(True)
         self.large_trades_list.itemClicked.connect(self._on_large_trade_clicked)
         ltl.addWidget(self.large_trades_list)
         obl.addWidget(self.large_trades_box)
@@ -3487,6 +4397,7 @@ class HistoricalOddsWidget(QWidget):
             "QListWidget::item:selected{background:#1b2430;}")
         self.futures_field_list.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel)
+        _fit_list_to_width(self.futures_field_list)
         self.futures_field_list.setToolTip(
             "Left-click: chart this candidate (YES).\n"
             "Right-click: chart its NO (bet against them).")
@@ -3542,12 +4453,13 @@ class HistoricalOddsWidget(QWidget):
 
         # Live sections hidden until Live mode is entered
         self.live_controls.setVisible(False)
+        self._sync_live_overlay_controls()  # presets / LIVE ⇥ / watermark
         self.ob_section.setVisible(False)
         self.order_entry_section.setVisible(False)
         # Start collapsed: only the small floating toggle on the plot shows.
         self._panel_collapsed = True
         self.panel_scroll.setVisible(False)
-        self.panel_handle.setText("⟨")
+        self.panel_handle.setText("⟨ DEPTH")
 
         layout.addLayout(content_layout)
 
@@ -3570,6 +4482,42 @@ class HistoricalOddsWidget(QWidget):
         self.no_data_text.setPos(0.5, 0.5)
 
         # Load all sports on initialization
+        # Remembered view preferences (restore first, THEN connect the save hooks,
+        # so restoring never writes back). See _restore_view_prefs.
+        self._restore_view_prefs()
+
+        # Clicking anywhere in the terminal (chart included — the plot itself
+        # doesn't take focus) gives focus to this widget, so the shortcuts below
+        # work after any click, not only after using a focus-taking control.
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+
+        # Keyboard shortcuts. S / F / C / End are WINDOW-wide: they work whenever
+        # the terminal is visible, no click needed (Qt only activates a widget's
+        # shortcuts while it's visible, so they go quiet when the terminal is
+        # hidden). 1-4 stay scoped to focus inside the terminal, because the
+        # EffortOdds main window already uses 1 (Props) and 2 (Calculator) via its
+        # keyPressEvent, and a window shortcut would take those keys over. Text
+        # inputs anywhere keep their keys: QLineEdit claims ShortcutOverride for
+        # typing keys. F / C / End / 1-4 are no-ops outside Live mode.
+        def _sc(key, fn, window_wide=False):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut if window_wide
+                          else Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
+        _sc("S", self._open_event_search, window_wide=True)   # works outside Live too
+        _sc("F", lambda: self.live_mode and self.follow_check.toggle(), window_wide=True)
+        _sc("End", lambda: self.live_mode and self.follow_check.setChecked(True),
+            window_wide=True)
+        _sc("C", lambda: (self.live_mode and self.candle_check.isEnabled()
+                          and self.candle_check.toggle()), window_wide=True)
+        for _i, _k in enumerate(('game', '6h', '24h', 'all'), 1):
+            _sc(str(_i), lambda k=_k: self._on_view_preset(k))
+        for _i, _k in enumerate(('game', '6h', '24h', 'all'), 1):
+            _b = self._preset_buttons[_k]
+            _b.setToolTip(f"{_b.toolTip()}  [{_i}]")
+        self.live_jump_btn.setToolTip("Jump back to the live edge and follow it  [End / F]")
+        self._follow_action.setText("Follow live edge  [F]")
+
         QTimer.singleShot(100, lambda: asyncio.create_task(self.load_all_sports()))
 
     def _initialize_kalshi_websocket(self):
@@ -3582,7 +4530,7 @@ class HistoricalOddsWidget(QWidget):
             self.kalshi_stream_client.disconnected.connect(self._on_websocket_disconnected)
             self.kalshi_stream_client.error.connect(self._on_websocket_error)
             self.kalshi_stream_client.tick.connect(self._on_websocket_tick)
-            # True ping/pong round-trip latency (ms) — fires every ping_interval.
+            # Ping/pong round trip (ms; network + local backlog) — every ping_interval.
             self.kalshi_stream_client.latency.connect(self._on_k_latency)
             # Sub-second Live feed (additive; only used in "Live" interval mode).
             # Native book: parse the raw frame in C++ (raw_frame) and drive the book
@@ -3608,7 +4556,7 @@ class HistoricalOddsWidget(QWidget):
             self.polymarket_stream_client.connected.connect(self._on_pm_ws_connected)
             self.polymarket_stream_client.disconnected.connect(self._on_pm_ws_disconnected)
             self.polymarket_stream_client.error.connect(self._on_pm_ws_error)
-            # True app-level PING/PONG round-trip latency (ms).
+            # App-level PING/PONG round trip (ms; network + local backlog).
             self.polymarket_stream_client.latency.connect(self._on_pm_latency)
             # Sub-second Live feed signals. With the native book the raw frame
             # string is parsed in C++ (raw_frame) and the book + dirty-flag are
@@ -3761,6 +4709,17 @@ class HistoricalOddsWidget(QWidget):
                     if nl and (_norm(sub) == nl or nl in sub.lower()):
                         k_ticker = km.get('ticker')
                         break
+                if k_ticker is None and EventMatcher.is_tennis(sport):
+                    # PM truncates some names ("Juan Martin" for Kalshi's "Juan
+                    # Cruz Martin Manzano"); the index fallback below then trusts
+                    # list order, which nothing guarantees.
+                    scored = [(EventMatcher._tennis_player_score(
+                                   label, km.get('yes_sub_title') or ''), km)
+                              for km in k_markets]
+                    best = max((sc for sc, _ in scored), default=0)
+                    hits = [km for sc, km in scored if sc == best]
+                    if best and len(hits) == 1:
+                        k_ticker = hits[0].get('ticker')
                 if k_ticker is None and i < len(k_markets):  # index fallback
                     k_ticker = k_markets[i].get('ticker')
             sides.append({'label': label, 'pm_token': pm_token,
@@ -3961,10 +4920,10 @@ class HistoricalOddsWidget(QWidget):
         # Force the next flush to repaint the (freshly rebuilt, empty) ladders
         # immediately rather than waiting out the panel throttle.
         self._last_panel_t = 0.0
-        # The focus book may have changed (different outcome/feed) — start the
-        # heat ribbon fresh so columns from the old book don't splice on.
-        self._heat_cols.clear()
-        self._heat_last_sample_t = 0.0
+        # Feed/side/market changed: alert levels belonged to the old focus series.
+        self._clear_alerts()
+        # Feed/side/market changed -> watermark text + live chart controls.
+        self._sync_live_overlay_controls()
 
     def _rebuild_ob_ladders(self):
         """Rebuild the stacked order-book ladders — one (label + readout + ladder)
@@ -3977,23 +4936,20 @@ class HistoricalOddsWidget(QWidget):
             if w:
                 w.setParent(None)
                 w.deleteLater()
-        for s in self.live_series:
+        # Several books in view -> each summary is the compact one-liner carrying
+        # the series label ('K·FALCONS'); a single book needs no label (the
+        # watermark/Side already say which it is), so it gets the full readout.
+        n_books = sum(1 for s in self.live_series if s.get('show_ob', True))
+        compact = n_books > 1
+        for i, s in enumerate(self.live_series):
             # Futures chart many candidates but only a flagged few get an order book
             # ('show_ob'). Non-OB series still chart — they just have no ladder widget.
             if not s.get('show_ob', True):
                 s['readout'], s['ladder'] = None, None
                 continue
-            r, g, b = s['hue']
-            lbl = QLabel(s['label'].upper())
-            lbl.setStyleSheet(f"color:#{r:02x}{g:02x}{b:02x};font-family:monospace;"
-                              "font-size:9px;letter-spacing:1px;")
-            ro = QLabel("")
-            ro.setTextFormat(Qt.TextFormat.RichText)
-            ro.setStyleSheet(self._ro_style)
-            ro.setMinimumWidth(0)
-            ro.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            label = s['label'].upper().replace(' · ', '·')
+            ro = BookSummaryWidget(compact, label, s['hue'])
             lad = OrderbookLadderWidget(levels=8)
-            self.ob_ladders_layout.addWidget(lbl)
             self.ob_ladders_layout.addWidget(ro)
             self.ob_ladders_layout.addWidget(lad)
             s['readout'], s['ladder'] = ro, lad
@@ -4109,8 +5065,74 @@ class HistoricalOddsWidget(QWidget):
             return
         if tid:
             self._large_trade_ids.add(tid)
+            # Flash the new row (live appends only — the REST seed never comes
+            # through here). Rows filtered out by the $ threshold just expire.
+            self._lt_flash[tid] = _time.monotonic()
+            if not self._lt_flash_timer.isActive():
+                self._lt_flash_timer.start()
         self._large_trades.append(n)
         self._render_large_trades()
+
+    @staticmethod
+    def _fmt_k0(v):
+        """Tape-row number: whole thousands ('4k', '120k') — no decimals, which
+        were most of the row-width overflow. Millions keep one decimal ('1.2M'),
+        since rounding there would be off by up to 20%."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return "—"
+        if abs(v) >= 1e6:
+            return f"{v / 1e6:.1f}M"
+        if abs(v) >= 1e3:
+            return f"{v / 1e3:.0f}k"
+        return f"{v:.0f}"
+
+    def _lt_source_tags(self, rows):
+        """Per-row source tag for the tape, consistent across venues:
+          * several venues visible  -> venue ('K' / 'PM')
+          * several outcomes visible -> outcome code ('ATL' / 'NO')
+          * both                    -> 'K·ATL'
+          * neither                 -> '' (no tag column)
+        READ-ONLY over self.live_series (each series' key -> venue + logical
+        outcome); no matching/ticker logic is touched. One code per logical
+        outcome, preferring the Kalshi ticker's team suffix, so a side reads the
+        same on both venues (previously Kalshi rows said 'ATL' and PM rows 'FAL'
+        for the same Falcons side). A trade whose key isn't an active series'
+        keeps the previous tag (ticker suffix / outcome name, 3 chars)."""
+        by_key = {}
+        for s in self.live_series:
+            by_key.setdefault(str(s.get('key')), s)
+        codes = {}
+        for s in self.live_series:
+            o = s.get('outcome')
+            if s.get('venue') == 'kalshi' and o not in codes:
+                c = self._short_outcome_label(o, s.get('key'))
+                if c:
+                    codes[o] = c
+        for s in self.live_series:
+            o = s.get('outcome')
+            if o not in codes:
+                codes[o] = self._short_outcome_label(o, None) or '?'
+        parts = []
+        for n in rows:
+            s = by_key.get(str(n.get('ticker')))
+            parts.append(None if s is None else
+                         ('K' if s.get('venue') == 'kalshi' else 'PM',
+                          codes.get(s.get('outcome'), '?')))
+        known = [p for p in parts if p]
+        multi_venue = len({p[0] for p in known}) > 1
+        multi_out = len({p[1] for p in known}) > 1
+        legacy_multi = len({n.get('ticker') for n in rows}) > 1
+        out = []
+        for n, p in zip(rows, parts):
+            if p is None:
+                out.append((n.get('outcome') or (n.get('ticker') or '').rsplit('-', 1)[-1])[:3].upper()
+                           if legacy_multi else '')
+            else:
+                out.append('·'.join(([p[0]] if multi_venue else []) +
+                                    ([p[1]] if multi_out else [])))
+        return out
 
     def _render_large_trades(self, *_):
         """Redraw the tape from the cached master list, filtered by the combo
@@ -4123,20 +5145,30 @@ class HistoricalOddsWidget(QWidget):
                 if n['is_block_trade'] or n['notional_usd'] >= thr]
         rows.sort(key=lambda n: n['ts'], reverse=True)
         self.large_trades_list.clear()
-        multi = len({n.get('ticker') for n in rows}) > 1
-        for n in rows[:self._LT_MAX_ROWS]:
-            when = (datetime.fromtimestamp(n['ts']).strftime('%m-%d %H:%M')
-                    if n['ts'] else '—')
+        shown = rows[:self._LT_MAX_ROWS]
+        self._lt_delegate.max_notional = max(
+            (n['notional_usd'] for n in shown), default=1.0) or 1.0
+        tags = self._lt_source_tags(shown)
+        # One tag column width for the WHOLE render (0 = no column), so every
+        # row stays aligned even if only some rows carry a tag.
+        self._lt_delegate.set_tag_texts(tags)
+        self._lt_delegate.set_usd_texts(
+            ['$' + self._fmt_k0(n['notional_usd']) + (' ◼' if n['is_block_trade'] else '')
+             for n in shown])
+        today = datetime.now().date()
+        for n, tag in zip(shown, tags):
+            dt = datetime.fromtimestamp(n['ts']) if n['ts'] else None
+            when = dt.strftime('%m-%d %H:%M') if dt else '—'
+            # Row column: today's prints show the time only; older ones the date
+            # (full timestamp stays in the tooltip).
+            when_short = ('—' if dt is None else
+                          dt.strftime('%H:%M') if dt.date() == today else dt.strftime('%m-%d'))
             side = (n['taker_side'] or '?').upper()
             price = n['no_price'] if side == 'NO' else n['yes_price']
             pc = f"{int(round((price or 0) * 100))}¢"
-            # Distinguish outcomes when several markets stream (e.g. both sides
-            # of a match): Kalshi via the ticker's trailing candidate code, PM
-            # via the outcome name (its token id is 77 meaningless digits).
-            tag = (n.get('outcome') or (n.get('ticker') or '').rsplit('-', 1)[-1])[:3]
-            head = f"{tag:<3} " if multi else ""
-            # One-line row: k-abbreviated size/notional; the taker side is NOT
-            # spelled out — the row colour carries it (green YES / red NO).
+            head = f"{tag} " if tag else ""
+            # Plain-text form of the row (item text / accessibility); what's drawn
+            # is the delegate's column layout.
             txt = (f"{head}{when} {self._fmt_k(n['contracts']):>5}@{pc:<3}"
                    f" {'$' + self._fmt_k(n['notional_usd']):>6}")
             if n['is_block_trade']:
@@ -4144,11 +5176,24 @@ class HistoricalOddsWidget(QWidget):
             item = QListWidgetItem(txt)
             item.setData(Qt.ItemDataRole.UserRole, n.get('trade_id'))
             if n['is_block_trade']:
-                item.setForeground(QColor(255, 191, 64))
+                color = QColor(255, 191, 64)
             elif side == 'NO':
-                item.setForeground(QColor(214, 92, 92))
+                color = QColor(214, 92, 92)
             else:
-                item.setForeground(QColor(94, 201, 124))
+                color = QColor(94, 201, 124)
+            item.setForeground(color)
+            # Painted by LargeTradeRowDelegate. NO rows also show the YES-equivalent
+            # price so every row reads on the YES ladder's scale.
+            yeq = (f"Y{100 - int(round((price or 0) * 100))}"
+                   if side == 'NO' and price is not None else "")
+            item.setData(LargeTradeRowDelegate.ROLE, {
+                'tid': n.get('trade_id'),
+                'when': when_short, 'tag': tag,
+                'side': side if side in ('YES', 'NO') else '?',
+                'size': self._fmt_k0(n['contracts']), 'price': f"@{pc}", 'yeq': yeq,
+                'notional': float(n['notional_usd'] or 0.0),
+                'usd': '$' + self._fmt_k0(n['notional_usd']) + (' ◼' if n['is_block_trade'] else ''),
+                'color': color})
             item.setToolTip(
                 f"{n.get('ticker')}\n{n.get('created_time') or when}\n"
                 f"taker {side}: {n['contracts']:,.2f} contracts\n"
@@ -4161,7 +5206,7 @@ class HistoricalOddsWidget(QWidget):
 
     def _ensure_whale_scatter(self):
         """Create the whale-dot ScatterPlotItem if needed and (re)add it to the
-        scene — same lifecycle as _ensure_heat_img: plot_widget.clear() drops it,
+        scene — same lifecycle as _ensure_crosshair: plot_widget.clear() drops it,
         so every clear() path must re-add. ignoreBounds keeps prints outside the
         view from stretching auto-range; pxMode keeps dot sizes zoom-invariant."""
         if getattr(self, '_whale_scatter', None) is None:
@@ -4402,7 +5447,38 @@ class HistoricalOddsWidget(QWidget):
         if idx >= 0:
             self.side_combo.setCurrentIndex(idx)
         self.side_combo.blockSignals(False)
+        self._sync_side_selector(sides)
         self.side_row.setVisible(self.live_mode and (self._is_future_market or len(sides) > 1))
+
+    @staticmethod
+    def _short_outcome_label(label, k_ticker=None):
+        """Button-sized outcome code: the Kalshi ticker's team suffix when it is a
+        plain 2-4 letter code (…-DETCAR-DET -> 'DET'), else the label's first word
+        (Over -> 'OVER', Yes -> 'YES'), capped at 5 chars."""
+        suf = k_ticker.rsplit('-', 1)[-1] if k_ticker and '-' in k_ticker else ''
+        if 2 <= len(suf) <= 4 and suf.isalpha():
+            return suf.upper()
+        words = (label or '').split()
+        return words[0].upper()[:5] if words else ''
+
+    def _sync_side_selector(self, sides):
+        """Show the Side choice as segmented buttons when it's a short list of
+        distinct short codes; otherwise (futures, >4 options, collisions) show the
+        original combo. Either way side_combo stays the source of truth."""
+        n = self.side_combo.count()
+        k_by_label = {s['label']: s.get('k_ticker') for s in sides}
+        shorts = []
+        for i in range(n):
+            data = self.side_combo.itemData(i)
+            shorts.append('ALL' if data == 'all' else
+                          self._short_outcome_label(data, k_by_label.get(data)))
+        use_seg = (not self._is_future_market and 1 < n <= 4
+                   and all(shorts) and len(set(shorts)) == n)
+        if use_seg:
+            self.side_seg.set_options(
+                shorts, tips=[self.side_combo.itemText(i) for i in range(n)])
+        self.side_seg.setVisible(use_seg)
+        self.side_combo.setVisible(not use_seg)
 
     @qasync.asyncSlot()
     async def _on_side_changed(self):
@@ -4462,6 +5538,9 @@ class HistoricalOddsWidget(QWidget):
         if idx >= 0:
             self.feed_source_combo.setCurrentIndex(idx)
         self.feed_source_combo.blockSignals(False)
+        short = {'kalshi': 'K', 'polymarket': 'PM', 'both': 'K+PM'}
+        self.feed_seg.set_options([short[s] for s in options],
+                                  tips=[labels[s] for s in options], venues=options)
         self.feed_source_row.setVisible(len(sources) > 1)
 
     def _update_order_entry_visibility(self):
@@ -4795,9 +5874,9 @@ class HistoricalOddsWidget(QWidget):
             print(f"Error processing Kalshi raw frame: {e}")
 
     def _on_k_latency(self, rtt_ms):
-        """Record the Kalshi ping/pong round-trip (ms). Emitted from the stream
-        client's `on_pong` every ping_interval — a genuine round trip, not a
-        clock-skew-dependent server-timestamp diff."""
+        """Record the Kalshi ping/pong round trip (ms), emitted from the stream
+        client's `on_pong` every ping_interval. Includes local backlog (the pong
+        queues behind data frames); see _update_latency_label."""
         self._k_rtt_ms = rtt_ms
 
     def _on_pm_latency(self, rtt_ms):
@@ -4832,6 +5911,11 @@ class HistoricalOddsWidget(QWidget):
         if not self.live_mode:
             return
         try:
+            if msg.get('type') == 'ok':
+                # Seq-bearing subscription ack: no ticker, but it advances its
+                # subscription's sequence (see KalshiLiveBook._note_ack).
+                self.live_book.apply(msg)
+                return
             if inner.get('market_ticker') not in self._active_kalshi_keys():
                 return
             self.live_book.apply(msg)
@@ -4842,7 +5926,8 @@ class HistoricalOddsWidget(QWidget):
     def _on_live_book_gap(self, ticker):
         """Sequence gap on the orderbook stream -> request a fresh snapshot.
 
-        Primary recovery is Kalshi's `get_snapshot`: it re-baselines the affected
+        Primary recovery is Kalshi's `update_subscription` / `get_snapshot` action
+        (KalshiStreamClient.get_snapshot): it re-baselines the affected
         books WITHOUT tearing down the subscription, so the delta stream keeps
         flowing and interleaved sibling markets on the same sid aren't disturbed —
         the fragile case for the old unsubscribe+resubscribe (both-sides YES, the
@@ -4886,9 +5971,14 @@ class HistoricalOddsWidget(QWidget):
                     self.kalshi_stream_client.unsubscribe_sids(sids)
                 self.kalshi_stream_client.subscribe_orderbook(active)
                 self._gap_streak = 0
-            else:
+            elif self.kalshi_stream_client.get_snapshot(active, sids):
                 print(f"⚠️  Orderbook seq gap (sid={sids}) — get_snapshot resync {active}")
-                self.kalshi_stream_client.get_snapshot(active, sids)
+            else:
+                # No known sid to target (snapshot requests must name one): use the
+                # full resubscribe instead.
+                print(f"⚠️  Orderbook seq gap (no sid) — full resubscribe {active}")
+                self.kalshi_stream_client.subscribe_orderbook(active)
+                self._gap_streak = 0
         except Exception as e:
             print(f"Failed to recover after gap: {e}")
 
@@ -5140,6 +6230,7 @@ class HistoricalOddsWidget(QWidget):
         v.addLayout(oo_row)
         self.open_orders_list = QListWidget()
         self.open_orders_list.setFixedHeight(80)
+        _fit_list_to_width(self.open_orders_list)
         self.open_orders_list.setToolTip("Resting orders — double-click to cancel")
         self.open_orders_list.itemDoubleClicked.connect(self._on_cancel_order_item)
         v.addWidget(self.open_orders_list)
@@ -5344,6 +6435,10 @@ class HistoricalOddsWidget(QWidget):
             except (TypeError, ValueError):
                 px = str(o.get('price'))
             size = o.get('original_size', o.get('size', '?'))
+            try:   # PM returns sizes as long decimal strings ('123.456789')
+                size = f"{float(size):,.0f}"
+            except (TypeError, ValueError):
+                pass
             item = QListWidgetItem(f"{side} {size} @ {px}")
             item.setData(Qt.ItemDataRole.UserRole, ('polymarket', o.get('id')))
             self.open_orders_list.addItem(item)
@@ -5381,20 +6476,379 @@ class HistoricalOddsWidget(QWidget):
         toggle on the plot's right edge; expanding pushes the graph left, with
         the panel body flush against it (1px border-left as the divider)."""
         self._panel_collapsed = not getattr(self, '_panel_collapsed', True)
+        # Resize the handle BEFORE showing/hiding the panel: setVisible lays the
+        # plot out synchronously, which re-pins the overlays right then — with the
+        # old handle width that left the 18px '⟩' 40px off the panel's edge.
         if self._panel_collapsed:
-            self.panel_scroll.setVisible(False)
-            self.panel_handle.setText("⟨")
+            self.panel_handle.setText("⟨ DEPTH")
+            self.panel_handle.setFixedSize(58, 18)
             self.panel_handle.setToolTip("Show depth / view panel")
+            self.panel_scroll.setVisible(False)
         else:
-            self.panel_scroll.setVisible(True)
             self.panel_handle.setText("⟩")
+            self.panel_handle.setFixedSize(18, 18)
             self.panel_handle.setToolTip("Hide depth / view panel")
+            self.panel_scroll.setVisible(True)
+        # And re-pin explicitly (the plot may not emit a resize at all, e.g. when
+        # the host's layout absorbs the change).
+        self._position_overlays()
         # Overlay re-pinning happens in eventFilter when the plot's resize
         # actually lands (the layout recalculates asynchronously).
+
+    def _claim_focus_if_free(self):
+        """Give this widget keyboard focus only when no other widget has it, so
+        the shortcuts work from the initial view without stealing focus from
+        another EffortOdds panel."""
+        try:
+            fw = _QApplication.focusWidget()
+        except Exception:
+            return
+        if (fw is None or not fw.isVisible()) and self.isVisible():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _open_event_search(self):
+        """S: open the event picker with its search box focused. The popup anchors
+        to the Event dropdown, so show the control strip first if it's hidden."""
+        if self.event_selector.count() == 0:
+            return
+        if not getattr(self, '_controls_visible', True):
+            self._toggle_controls()
+        self.event_selector.showPopup()
+
+    # ---- Live chart controls: zoom presets / LIVE ⇥ / watermark ----
+    _PRESET_SPANS = {'6h': 6 * 3600, '24h': 24 * 3600}
+
+    def _preset_window(self, last_t):
+        """(window_s, right_pad_s) for the active zoom preset, or None (no preset,
+        or it can't apply — e.g. 'game' before the event has started)."""
+        p = self._view_preset
+        if not p:
+            return None
+        if p in self._PRESET_SPANS:
+            span = self._PRESET_SPANS[p]
+        elif p == 'game':
+            es = self._event_start_epoch()
+            if es is None or es >= last_t:
+                return None
+            span = (last_t - es) + 20 * 60
+        elif p == 'all':
+            xlo, _xhi = self._live_x_limits()
+            if xlo is None:
+                return None
+            span = last_t - xlo
+        else:
+            return None
+        return span, max(span * 0.02, 5.0)
+
+    def _on_view_preset(self, key):
+        """Zoom preset clicked: make it the follow window and (re)enable follow, so
+        the view spans the preset while staying pinned to the live edge."""
+        if not self.live_mode or not self._preset_buttons[key].isEnabled():
+            self._sync_preset_buttons()
+            return
+        self._view_preset = key
+        self._sync_preset_buttons()
+        self._y_snap_next = True
+        if self.auto_follow:
+            self._refresh_live_items()          # window changed; follow re-frames
+        else:
+            self.follow_check.setChecked(True)  # -> _on_follow_toggled -> refresh
+
+    def _sync_preset_buttons(self):
+        btns = getattr(self, '_preset_buttons', None)
+        if not btns:
+            return
+        es = self._event_start_epoch() if self.live_mode else None
+        started = es is not None and es <= datetime.now().timestamp()
+        for k, b in btns.items():
+            b.setChecked(k == self._view_preset)
+            if k == 'game':
+                b.setEnabled(started)
+
+    def _sync_live_overlay_controls(self):
+        """Visibility of the live-only chart controls. Presets + watermark show in
+        Live mode; LIVE ⇥ only while Live and NOT following."""
+        if not hasattr(self, 'preset_bar'):
+            return
+        live = bool(self.live_mode)
+        self.preset_bar.setVisible(live)
+        self.live_jump_btn.setVisible(live and not self.auto_follow)
+        if live:
+            self._sync_preset_buttons()
+            self._update_watermark()
+        else:
+            self._watermark.hide()
+            if self._lp_line is not None:
+                self._lp_line.hide()
+            self.last_price_tag.hide()
+            self._clear_alerts()
+            self.alert_toast.hide()
+            self.live_summary_top.hide()
+            self.live_summary_bottom.hide()
+        self._position_overlays()
+
+    def _update_watermark(self):
+        """Background market watermark: matchup (or futures title) over
+        market type · venue · side. Read-only; never touches live state."""
+        wm = getattr(self, '_watermark', None)
+        if wm is None:
+            return
+        ev = self.current_unified_event
+        if not self.live_mode or ev is None:
+            wm.hide()
+            return
+        if getattr(ev, 'is_future', False):
+            title = ev.future_label or ev.home_team or ''
+        else:
+            title = f"{ev.away_team} @ {ev.home_team}"
+        parts = []
+        um = getattr(self, 'current_unified_market', None)
+        if um is not None:
+            mt = (um.market_type or '').upper()
+            if mt:
+                parts.append(mt)
+            if um.market_type not in (None, 'moneyline') and um.display_name:
+                parts.append(re.sub(r'^\[[^\]]*\]\s*', '', um.display_name))
+        parts.append({'kalshi': 'KALSHI', 'polymarket': 'POLYMARKET',
+                      'both': 'KALSHI + POLYMARKET'}.get(self.live_source, ''))
+        sel = self.outcome_sel
+        if sel:
+            parts.append({'all': 'ALL OUTCOMES', 'top5': 'TOP 5',
+                          'top10': f'TOP {getattr(self, "_FUT_MAX_CHART", 10)}'}
+                         .get(sel, str(sel)))
+        sub = " · ".join(p for p in parts if p).upper()
+        wm.set_text(title.upper(), sub)
+
+    # ---- Last-price line + axis tag ----
+    def _focus_price_series(self):
+        """The series the last-price marker and price alerts follow: the first
+        live series (games only — a futures field has no single focus)."""
+        if not self.live_mode or self._is_future_market or not self.live_series:
+            return None
+        return self.live_series[0]
+
+    def _update_last_price_marker(self):
+        """Dashed line at the focus series' latest price + a venue-coloured tag over
+        the %-axis at that level. Returns that price (implied %) or None. The line
+        is re-added lazily whenever plot_widget.clear() has dropped it."""
+        tag = getattr(self, 'last_price_tag', None)
+        if tag is None:
+            return None
+        s = self._focus_price_series()
+        ticks = s['ticks'] if s else None
+        pct = self._cents_to_pct(ticks[-1]['price']) if ticks else None
+        line = self._lp_line
+        if pct is None:
+            if line is not None:
+                line.hide()
+            tag.hide()
+            return None
+        r, g, b = s['hue']
+        if line is None:
+            line = self._lp_line = pg.InfiniteLine(angle=0, movable=False)
+            line.setZValue(150)
+        if line.scene() is not self.plot_widget.scene():
+            self.plot_widget.addItem(line, ignoreBounds=True)
+        if self._lp_hue != (r, g, b):
+            line.setPen(pg.mkPen((r, g, b, 150), width=1, style=Qt.PenStyle.DashLine))
+            tag.setStyleSheet(
+                f"background: rgb({r},{g},{b}); color:#0d1117; font-family:monospace;"
+                " font-size:10px; font-weight:bold; padding:1px 4px; border-radius:2px;")
+            self._lp_hue = (r, g, b)
+        line.setValue(pct)
+        line.show()
+        self._place_last_price_tag(pct)
+        return pct
+
+    def _place_last_price_tag(self, pct=None):
+        """Pin the tag over the %-axis at `pct` (or its current line value)."""
+        tag = getattr(self, 'last_price_tag', None)
+        line = getattr(self, '_lp_line', None)
+        if tag is None or line is None or not line.isVisible():
+            if tag is not None:
+                tag.hide()
+            return
+        if pct is None:
+            pct = line.value()
+        vb = self.plot_widget.getViewBox()
+        (xlo, _xhi), (ylo, yhi) = vb.viewRange()
+        if not (ylo <= pct <= yhi):
+            tag.hide()
+            return
+        # Same format as the axis labels, and as wide as the axis column so it
+        # fully covers the tick label underneath (a narrower tag left e.g. '88%'
+        # poking out beside '88.0%').
+        am = self._am_from_cents_float(pct)
+        if am is None:
+            odds = ""
+        else:
+            ai = int(round(am))
+            odds = "EVEN" if abs(ai) == 100 else (f"+{ai}" if ai > 0 else f"\u2212{abs(ai)}")
+        txt = f"{pct:.1f}%  {odds}".rstrip()
+        ax_w = int(self.plot_widget.getAxis('left').width())
+        if tag.width() != ax_w - 2:
+            tag.setFixedWidth(max(20, ax_w - 2))
+        if tag.text() != txt:
+            tag.setText(txt)
+            tag.adjustSize()
+        wp = self.plot_widget.mapFromScene(vb.mapViewToScene(QPointF(xlo, pct)))
+        tag.move(1, int(wp.y() - tag.height() / 2))
+        tag.show()
+        tag.raise_()
+
+    # ---- Price alerts (right-click menu; one-shot) ----
+    def _prep_alert_menu(self):
+        """Context menu opening: read the price level under the cursor (the menu
+        opens where the user right-clicked) into the 'Set alert' action."""
+        self._alert_pending = None
+        y = None
+        try:
+            vb = self.plot_widget.getViewBox()
+            wp = self.plot_widget.mapFromGlobal(QCursor.pos())
+            y = vb.mapSceneToView(self.plot_widget.mapToScene(wp)).y()
+        except Exception:
+            pass
+        ok = self.live_mode and self._focus_price_series() is not None \
+            and y is not None and 0.0 < y < 100.0
+        if ok:
+            self._alert_pending = round(y, 1)
+            self._alert_action.setText(f"Set price alert at {self._alert_pending:.1f}%")
+        else:
+            self._alert_action.setText("Set price alert here")
+        self._alert_action.setEnabled(ok)
+        self._clear_alerts_action.setEnabled(bool(self._alerts))
+
+    def _add_alert(self, level):
+        if not self.live_mode or not (0.0 < level < 100.0):
+            return
+        line = pg.InfiniteLine(
+            pos=level, angle=0, movable=False,
+            pen=pg.mkPen((224, 176, 80, 200), width=1, style=Qt.PenStyle.DashLine),
+            label=f"⚑ {level:.1f}%",
+            labelOpts={'position': 0.04, 'color': (224, 176, 80),
+                       'fill': (13, 17, 23, 200), 'movable': False})
+        line.setZValue(140)
+        self.plot_widget.addItem(line, ignoreBounds=True)
+        self._alerts.append({'level': level, 'line': line})
+        print(f"⚑ price alert set at {level:.1f}%")
+
+    def _clear_alerts(self):
+        for a in self._alerts:
+            try:
+                if a['line'].scene() is not None:
+                    self.plot_widget.removeItem(a['line'])
+            except Exception:
+                pass
+        self._alerts = []
+        self._alert_prev_pct = None
+
+    def _check_alerts(self, pct):
+        """Fire any alert whose level the focus price crossed since the last check
+        (touching the level counts). Re-adds alert lines a clear() dropped."""
+        if not self._alerts:
+            self._alert_prev_pct = pct
+            return
+        prev, self._alert_prev_pct = self._alert_prev_pct, pct
+        for a in list(self._alerts):
+            if a['line'].scene() is not self.plot_widget.scene():
+                self.plot_widget.addItem(a['line'], ignoreBounds=True)
+            if pct is None or prev is None:
+                continue
+            lv = a['level']
+            if prev < lv <= pct or prev > lv >= pct:
+                self._fire_alert(a, up=pct > prev)
+
+    def _fire_alert(self, a, up):
+        try:
+            if a['line'].scene() is not None:
+                self.plot_widget.removeItem(a['line'])
+        except Exception:
+            pass
+        if a in self._alerts:
+            self._alerts.remove(a)
+        s = self._focus_price_series()
+        name = (s.get('outcome') or s.get('label') or '').upper() if s else ''
+        arrow = '▲' if up else '▼'
+        when = datetime.now().strftime('%H:%M:%S')
+        self.alert_toast.setText(
+            f"⚑ ALERT&nbsp;&nbsp;<b>{name}</b> crossed {arrow} {a['level']:.1f}%"
+            f"&nbsp;&nbsp;<span style='color:#9aa4b0'>{when}</span>")
+        self.alert_toast.adjustSize()
+        self.alert_toast.show()
+        self._position_overlays()
+        self._alert_toast_timer.start(8000)
+        _QApplication.beep()
+        print(f"⚑ ALERT {name} crossed {arrow} {a['level']:.1f}% at {when}")
+
+    # ---- LARGE TRADES new-print flash ----
+    _LT_FLASH_S = 2.0
+
+    def _lt_flash_tick(self):
+        now = _time.monotonic()
+        for tid in [t for t, t0 in self._lt_flash.items() if now - t0 > self._LT_FLASH_S]:
+            del self._lt_flash[tid]
+        self.large_trades_list.viewport().update()
+        if not self._lt_flash:
+            self._lt_flash_timer.stop()
+
+    # ---- Remembered view preferences (QSettings: EffortOdds / PMTerminal) ----
+    def _settings_store(self):
+        st = getattr(self, '_qsettings', None)
+        if st is None:
+            st = self._qsettings = QSettings("EffortOdds", "PMTerminal")
+        return st
+
+    def _pref(self, key, default):
+        try:
+            v = self._settings_store().value(key, default)
+        except Exception:
+            return default
+        return default if v is None else v
+
+    def _pref_bool(self, key, default):
+        v = self._pref(key, default)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ('true', '1', 'yes')
+
+    def _save_pref(self, key, value):
+        try:
+            self._settings_store().setValue(key, value)
+        except Exception:
+            pass
+
+    def _restore_view_prefs(self):
+        """Apply saved chip / threshold preferences, then hook their changes to
+        save. Candle size and candles-vs-lines are applied per market by
+        _apply_live_view_defaults (they're reset on every live entry); only USER
+        changes save them, since that method sets them with signals blocked."""
+        self.spread_check.setChecked(self._pref_bool('spread', True))
+        self.whales_check.setChecked(self._pref_bool('whales', True))
+        try:
+            lt_min = float(self._pref('lt_min', 500.0))
+        except (TypeError, ValueError):
+            lt_min = 500.0
+        i = self.large_trade_min_combo.findData(lt_min)
+        if i >= 0:
+            self.large_trade_min_combo.setCurrentIndex(i)
+        self.spread_check.toggled.connect(lambda on: self._save_pref('spread', bool(on)))
+        self.whales_check.toggled.connect(lambda on: self._save_pref('whales', bool(on)))
+        self.large_trade_min_combo.currentIndexChanged.connect(
+            lambda _i: self._save_pref('lt_min', float(self.large_trade_min_combo.currentData())))
+        self.candle_bucket.currentTextChanged.connect(
+            lambda t: self._save_pref('candle_bucket', t))
+        # Candles vs lines is a GAME preference (futures always default to lines).
+        self.candle_check.toggled.connect(
+            lambda on: (not self._is_future_market) and self._save_pref('candles', bool(on)))
 
     # ---- Live control handlers ----
     def _on_follow_toggled(self, state):
         self.auto_follow = bool(state)
+        if not self.auto_follow and self._view_preset is not None:
+            # A preset IS a follow window; frozen view -> no preset highlighted.
+            self._view_preset = None
+            self._sync_preset_buttons()
+        self._sync_live_overlay_controls()
         # Keep the right-click menu action in lockstep with the checkbox (and with
         # auto-releases from a pan). blockSignals avoids the toggle bouncing back.
         act = getattr(self, '_follow_action', None)
@@ -5406,6 +6860,7 @@ class HistoricalOddsWidget(QWidget):
         if self.auto_follow:
             # Resume scrolling/auto-fit on the next tick.
             if self.live_mode:
+                self._y_snap_next = True   # jumped back to the edge: fit y outright
                 self._refresh_live_items()
         else:
             # Freeze the TIME axis where it is for inspection; the %-axis keeps
@@ -5472,18 +6927,6 @@ class HistoricalOddsWidget(QWidget):
         if self.live_mode and self.candle_mode:
             self._refresh_live_items()
 
-    def _on_heat_toggled(self, state):
-        self.heatmap_mode = bool(state)
-        if self._heat_img is not None:
-            self._heat_img.setVisible(self.heatmap_mode)
-        if not self.heatmap_mode:
-            # Drop accumulated columns so re-enabling starts a fresh ribbon rather
-            # than splicing a stale gap onto the leading edge.
-            self._heat_cols.clear()
-            self._heat_last_sample_t = 0.0
-        elif self.live_mode:
-            self._refresh_heatmap()
-
     @staticmethod
     def _parse_bucket_seconds(text):
         """Candle bucket label -> seconds. 'Max' == 0 (one candle/tick); supports
@@ -5494,20 +6937,20 @@ class HistoricalOddsWidget(QWidget):
             return int(text[:-1]) * 60
         return int(text.removesuffix('s'))
 
-    def _update_ob_readout(self, state, label):
-        """Refresh a per-series inline bid/ask/spread/last readout label."""
-        if label is None:
+    def _update_ob_readout(self, state, widget, lad=None):
+        """Refresh a series' BookSummaryWidget: mid (bid/ask midpoint, else last
+        trade), and the resting $ (price x size) on each side within
+        ±BookSummaryWidget.DEPTH_WINDOW cents of mid, from the ladder snapshot."""
+        if widget is None:
             return
-        def c(v):
-            return f"{_fmt_cents(v)}¢" if v is not None else "—"
-        bid, ask, last = state.get('best_bid'), state.get('best_ask'), state.get('last_trade')
-        spread = (ask - bid) if (bid is not None and ask is not None) else None
-        stale = " <span style='color:#d08770'>·resync</span>" if state.get('stale') else ""
-        label.setText(
-            f"bid <span style='color:#8fbf7f'>{c(bid)}</span>  "
-            f"ask <span style='color:#cf6f6f'>{c(ask)}</span>  "
-            f"spr {c(spread)}  "
-            f"last <span style='color:#cfd6df'>{c(last)}</span>{stale}")
+        bid, ask = state.get('best_bid'), state.get('best_ask')
+        mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else state.get('last_trade')
+        bid_usd = ask_usd = 0.0
+        if lad and mid is not None:
+            win = BookSummaryWidget.DEPTH_WINDOW
+            bid_usd = sum(px * q for px, q in lad.get('bids', []) if px >= mid - win) / 100.0
+            ask_usd = sum(px * q for px, q in lad.get('asks', []) if px <= mid + win) / 100.0
+        widget.set_data(mid, bid_usd, ask_usd, bool(state.get('stale')))
 
     def _flush_live_plot(self):
         """Coalesced per-tick repaint. Records one tick and mutates the persistent
@@ -5555,20 +6998,19 @@ class HistoricalOddsWidget(QWidget):
                 if len(s['ticks']) > 90000:  # cap ~50min of 33ms ticks
                     s['ticks'] = s['ticks'][-90000:]
             any_ticks = any_ticks or bool(s['ticks'])
-            # Per-series readout + depth ladder — throttled (panels_due).
-            if vis and panels_due and s.get('readout') is not None:
-                self._update_ob_readout(st, s['readout'])
+            # Per-series readout + depth ladder — throttled (panels_due). The
+            # ladder snapshot is fetched once and shared (the readout's ±2¢ $
+            # depth comes from the same levels the ladder draws).
             if vis and panels_due and s.get('ladder') is not None:
                 lad = self._series_ladder(s, s['ladder']._levels)
+                if s.get('readout') is not None:
+                    self._update_ob_readout(st, s['readout'], lad)
                 if lad:
                     s['ladder'].set_data(lad['asks'], lad['bids'],
                                          lad.get('last_trade'), lad.get('stale', False))
 
         if not vis:
             return
-        # Liquidity heatmap: sample the focus book into a depth column (self-throttled).
-        if self.heatmap_mode:
-            self._sample_heat_column(now_t)
         if panels_due:
             # Corner summaries + feed-latency readout (throttled).
             self._update_live_summaries(now_t)
@@ -5584,38 +7026,67 @@ class HistoricalOddsWidget(QWidget):
             self._rebuild_live_items()
         self._refresh_live_items()
 
+    # Ping/pong RTT minus network RTT above this (ms) is shown as processing lag.
+    _LAG_SHOW_MS = 50.0
+
     def _update_latency_label(self):
-        """Show the true ping/pong round-trip latency to each exchange next to the
-        DEPTH/VIEW header. The NUMBER is RTT (user<->exchange); the COLOUR is feed
-        freshness (idle age since the last frame) — green fresh, amber idle, red
-        stale. The two are independent: a live feed can have low RTT but you still
-        want red if frames stop arriving."""
+        """Per-feed latency next to the DEPTH header.
+
+        NUMBER = network round-trip time: the kernel's smoothed TCP RTT of the live
+        websocket (Linux TCP_INFO), falling back to the last ping/pong round trip
+        where that's unavailable. The ping/pong round trip alone over-reports under
+        load — websocket-client handles frames serially, so the pong queues behind
+        every data frame and its Python handler — so the DIFFERENCE is shown
+        separately, in amber, as local processing lag ("+120") when it's large.
+        DOT colour = feed freshness (time since any frame): green <0.5s, amber <3s,
+        red after. Freshness never replaces the number; it's in the tooltip."""
         lbl = getattr(self, 'latency_label', None)
         if lbl is None:
             return
         import time as _t
         now = _t.monotonic()
 
-        def chip(name, last, rtt_ms, active):
-            if not active or last <= 0:
-                return f"<span style='color:#5b6675'>{name} —</span>"
-            idle_ms = (now - last) * 1000.0
-            # Colour from freshness (how long since ANY frame): a quiet/dead feed
-            # goes amber->red regardless of the measured round-trip time.
-            color = '#5bd075' if idle_ms < 500 else ('#e0b050' if idle_ms < 3000 else '#cf6f6f')
-            # Number = true round-trip latency once a pong has landed. Fall back to
-            # idle age when the feed is stale (>3s) or no pong seen yet, since a held
-            # RTT reading would be misleading on a dead/just-opened feed.
-            if idle_ms >= 3000 or rtt_ms is None:
-                txt = f"{idle_ms:.0f}ms" if idle_ms < 10000 else f"{idle_ms/1000:.0f}s"
+        def chip(name, full, client, last, ping_ms, active):
+            if not active:
+                return "", ""   # feed not in use for this market: omit entirely
+            net_ms = tcp_srtt_ms(getattr(client, '_ws_app', None)) if client else None
+            idle_ms = (now - last) * 1000.0 if last > 0 else None
+            if idle_ms is None:
+                color = '#3a4350'
             else:
-                txt = f"{rtt_ms:.0f}ms"
-            return f"<span style='color:{color}'>{name} {txt}</span>"
+                color = ('#5bd075' if idle_ms < 500 else
+                         ('#e0b050' if idle_ms < 3000 else '#cf6f6f'))
+            rtt = net_ms if net_ms is not None else ping_ms
+            txt = f"{rtt:.0f}ms" if rtt is not None else "—"
+            lag = (ping_ms - net_ms) if (net_ms is not None and ping_ms is not None) else None
+            lag_html = (f" <span style='color:#e0b050'>+{lag:.0f}</span>"
+                        if lag is not None and lag >= self._LAG_SHOW_MS else "")
+            html = (f"<span style='color:{color}'>●</span>"
+                    f" <span style='color:#9aa4b0'>{name} {txt}</span>{lag_html}")
+            def ms(v):
+                return f"{v:.0f} ms" if v is not None else "n/a"
+            if idle_ms is None:
+                age = "no messages yet"
+            elif idle_ms < 10000:
+                age = f"last message {idle_ms / 1000:.1f}s ago"
+            else:
+                age = f"last message {idle_ms / 1000:.0f}s ago"
+            tip = (f"{full}: network RTT {ms(net_ms)} (TCP)"
+                   f" · ping/pong {ms(ping_ms)}"
+                   + (f" · processing +{lag:.0f} ms" if lag is not None and lag > 0 else "")
+                   + f" · {age}")
+            return html, tip
 
         k_on = self.live_source in ('kalshi', 'both')
         pm_on = self.live_source in ('polymarket', 'both')
-        lbl.setText(chip('K', self._k_last_msg, self._k_rtt_ms, k_on) + " &nbsp; "
-                    + chip('PM', self._pm_last_msg, self._pm_rtt_ms, pm_on))
+        chips = [chip('K', 'Kalshi', self.kalshi_stream_client, self._k_last_msg,
+                      self._k_rtt_ms, k_on),
+                 chip('PM', 'Polymarket', self.polymarket_stream_client,
+                      self._pm_last_msg, self._pm_rtt_ms, pm_on)]
+        lbl.setText(" &nbsp; ".join(h for h, _ in chips if h))
+        tip = "\n".join(t for _, t in chips if t)
+        if tip and tip != lbl.toolTip():
+            lbl.setToolTip(tip)
 
     @staticmethod
     def _am_from_cents_float(cents):
@@ -5706,40 +7177,22 @@ class HistoricalOddsWidget(QWidget):
                 return None
             return lo, (hi if hi is not None else lo)
 
-        def _move_html(s, cents, lead):
-            """Corner-box HTML (condensed 'B2a' layout): a 9pt venue-priced lead
-            with the since-viewing ▲Δ, over a 7pt market-life range gauge —
-            `lo ▁▁▌▁▁ hi` shows WHERE price sits within everything this market
-            has traded (anchored to the seeded history, so it matches the chart
-            and is stable across reopens) — and a dimmed clock."""
-            r, g, b = s['hue']
-            delta = cents - s['_lbl_open']
-            # Delta renders only once there IS a move (>= 0.05 so it can't show
-            # as 0.0) — the old grey '■0.0' placeholder was dead ink.
-            if round(abs(delta), 1) >= 0.1:
-                arrow, dhex = (('▲', '#50c878') if delta > 0
-                               else ('▼', '#dc5a5a'))
-                dspan = (f"&nbsp;&nbsp;<span style='color:{dhex}'>"
-                         f"{arrow}{abs(delta):.1f}</span>")
-            else:
-                dspan = ""
-            lr = _life_range(s)
+        def _data(items, name=None):
+            """LiveCornerSummary data for a band: every series' price; the change
+            and the market-life range track the band's FIRST series."""
+            s0, c0 = items[0]
+            lr = _life_range(s0)
+            lo = hi = None
             if lr:
-                lo, hi = min(lr[0], cents), max(lr[1], cents)
-                frac = 0.5 if hi <= lo else (cents - lo) / (hi - lo)
-                idx = min(5, max(0, int(frac * 6)))
-                cell = '&#9601;'
-                # &nbsp; between the anchors and the track: with the marker at
-                # either extreme it otherwise touches the lo/hi numerals.
-                gauge = (f"{lo:.1f}&nbsp;<span style='color:#4a525c'>{cell * idx}</span>"
-                         f"<span style='color:#{r:02x}{g:02x}{b:02x}'>&#9612;</span>"
-                         f"<span style='color:#4a525c'>{cell * (5 - idx)}</span>&nbsp;{hi:.1f}")
-            else:
-                gauge = "&#8212;"
-            return (
-                f"<div style='font-size:9pt'>{lead}{dspan}</div>"
-                f"<div style='font-size:7pt;color:#aab2bc'>{gauge}"
-                f"&nbsp;&nbsp;<span style='color:#6b7480'>{updated}</span></div>")
+                lo, hi = min(lr[0], c0), max(lr[1], c0)
+            delta = c0 - s0['_lbl_open']
+            return {
+                'prices': [(self._bookmaker_logo_path(s.get('venue')), s['hue'], c,
+                            (name[:16] if name else None)) for s, c in items],
+                'lead': c0,
+                # Only once there IS a move (>= 0.1) — a '▲0.0' is dead ink.
+                'delta': delta if round(abs(delta), 1) >= 0.1 else None,
+                'lo': lo, 'hi': hi, 'clock': updated}
 
         # Futures: too many candidates for the favourite/underdog split — just show the
         # top-2 by current price, one per corner (named, line-coloured).
@@ -5747,16 +7200,11 @@ class HistoricalOddsWidget(QWidget):
             scored = [(s, c) for s in self.live_series if (c := _track(s)) is not None]
             scored.sort(key=lambda sc: sc[1], reverse=True)
             for idx, band in ((0, 'pos'), (1, 'neg')):
-                label = self.summary_label_top if band == 'pos' else self.summary_label_bottom
                 if idx >= len(scored):
-                    label.hide()
+                    self._hide_live_summary(band)
                     continue
                 s, cents = scored[idx]
-                r, g, b = s['hue']
-                mark = self._venue_marker(s.get('venue'), s['hue'], size=11)
-                lead = (f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
-                        f"font-weight:bold'>{s['outcome']} {cents:.1f}%</span>")
-                self._set_summary_label(band, _move_html(s, cents, lead))
+                self._set_live_summary(band, _data([(s, cents)], name=s['outcome']))
             return
 
         bands = {'pos': [], 'neg': []}
@@ -5767,23 +7215,13 @@ class HistoricalOddsWidget(QWidget):
             bands['pos' if cents >= 50.0 else 'neg'].append((s, cents))
 
         for band in ('pos', 'neg'):
-            label = self.summary_label_top if band == 'pos' else self.summary_label_bottom
             items = bands[band]
             if not items:
-                label.hide()
+                self._hide_live_summary(band)
                 continue
-            # Big line: each venue's % tagged with its brand logo + coloured by
-            # venue, so which price is Kalshi vs Polymarket reads at a glance.
-            spans = []
-            for s, cents in items:
-                r, g, b = s['hue']
-                mark = self._venue_marker(s.get('venue'), s['hue'], size=11)
-                spans.append(f"{mark}&nbsp;<span style='color:#{r:02x}{g:02x}{b:02x};"
-                             f"font-weight:bold'>{cents:.1f}%</span>")
-            big = "&nbsp;&nbsp;".join(spans)
-            # Move/range line tracks the band's first series.
-            s0, c0 = items[0]
-            self._set_summary_label(band, _move_html(s0, c0, big))
+            # Each venue's price tagged with its logo + coloured by venue, so which
+            # price is Kalshi vs Polymarket reads at a glance.
+            self._set_live_summary(band, _data(items))
 
     def enable_websocket_updates(self, enable: bool = True):
         """
@@ -5960,6 +7398,23 @@ class HistoricalOddsWidget(QWidget):
             else:
                 all_unified_events.extend(res)  # series volume order preserved
 
+        # Several Kalshi series can map to ONE PM series — 'ATP Tennis' and
+        # 'Challenger ATP' both resolve to PM 'atp', which lists tour AND
+        # challenger matches. Each load emits the PM games it didn't pair as
+        # PM-only rows, so every challenger match paired under 'Challenger ATP'
+        # ALSO showed as a PM-only row under 'ATP Tennis' (and unpaired ones
+        # twice). Drop PM-only rows whose game is paired elsewhere or repeated.
+        _paired_pm = {e.polymarket_game_id for e in all_unified_events
+                      if e.polymarket_game_id and e.kalshi_event_ticker}
+        _seen_pm, _deduped = set(), []
+        for e in all_unified_events:
+            if e.polymarket_game_id and not e.kalshi_event_ticker:
+                if e.polymarket_game_id in _paired_pm or e.polymarket_game_id in _seen_pm:
+                    continue
+                _seen_pm.add(e.polymarket_game_id)
+            _deduped.append(e)
+        all_unified_events = _deduped
+
         # Season-long futures (Kalshi-only) — additive, never blocks the game menu.
         fut_results = await asyncio.gather(
             *[self._load_kalshi_futures(sp) for sp in self.KALSHI_FUTURES_SERIES],
@@ -6028,8 +7483,7 @@ class HistoricalOddsWidget(QWidget):
     # Additive feature in its OWN window: aggregates trailing-24h USD notional
     # across both platforms and rolls it up Sport->League->Event->Market. Reuses
     # gather_unified_events() (existing cross-platform mapping) for data + the
-    # VolumeHeatmap data layer for the roll-up. NOTE: distinct _volmap_* namespace
-    # — unrelated to the liquidity-ribbon _heat*/heatmap_mode state.
+    # VolumeHeatmap data layer for the roll-up (distinct _volmap_* namespace).
     def open_volume_map(self):
         """Open (or re-show) the volume heat map window and start live refresh."""
         if getattr(self, '_volmap_view', None) is None:
@@ -6762,6 +8216,9 @@ class HistoricalOddsWidget(QWidget):
             self.event_selector.addItem(display_title, userData=event)
 
         self.event_selector.blockSignals(False)
+        # Keyboard shortcuts (S etc.) need focus inside this widget; take it now
+        # if nothing else in the app has focus (never steals it from a panel).
+        self._claim_focus_if_free()
 
         # Auto-select first event
         if unified_events:
@@ -8621,7 +10078,8 @@ class HistoricalOddsWidget(QWidget):
         a futures market while already live — otherwise the previous kind's mode (e.g.
         futures' candles-off) sticks and the game renders as a jumbled tick line.
         Tracks _live_view_is_future so the caller only re-applies on an actual change."""
-        want_candles = not self._is_future_market
+        # Games: the user's remembered candles-vs-lines choice (default candles).
+        want_candles = (not self._is_future_market) and self._pref_bool('candles', True)
         self.candle_check.blockSignals(True)
         self.candle_check.setChecked(want_candles)
         self.candle_check.blockSignals(False)
@@ -8630,10 +10088,14 @@ class HistoricalOddsWidget(QWidget):
         # heavy), but the checkbox stays ENABLED so a single focused candidate can be
         # viewed as candles — at ≤10 series the per-flush candle rebuild is affordable.
         self.candle_check.setEnabled(True)
+        # Remembered candle size (default 1m); an unknown saved value falls back.
+        bucket = str(self._pref('candle_bucket', '1m'))
+        if self.candle_bucket.findText(bucket) < 0:
+            bucket = '1m'
         self.candle_bucket.blockSignals(True)
-        self.candle_bucket.setCurrentText("1m")
+        self.candle_bucket.setCurrentText(bucket)
         self.candle_bucket.blockSignals(False)
-        self.candle_bucket_s = 60
+        self.candle_bucket_s = self._parse_bucket_seconds(bucket)
         self.candle_bucket.setEnabled(want_candles)
         # Follow ON: a readable RECENT window (the follow logic sizes X to the last
         # ~N candles) instead of the whole seeded day where 1-min candles are ~1px.
@@ -8641,6 +10103,12 @@ class HistoricalOddsWidget(QWidget):
         self.follow_check.blockSignals(True)
         self.follow_check.setChecked(True)
         self.follow_check.blockSignals(False)
+        # Signals were blocked above, so mirror _on_follow_toggled's UI side here:
+        # default follow window (no preset), LIVE ⇥ hidden.
+        self._view_preset = None
+        self._sync_preset_buttons()
+        self._sync_live_overlay_controls()
+        self._y_snap_next = True
         self._axes_configured = False
         self._live_view_is_future = self._is_future_market
         # Leaving futures clears the futures X-bounds / Y-lock so games get free X
@@ -8686,6 +10154,13 @@ class HistoricalOddsWidget(QWidget):
                 return
 
         print(f"🔴 Entering Live (sub-second) mode [{self.live_source}]")
+        if not NATIVE_PARSERS:
+            print(f"!!  [parsers] Live books are PURE-PYTHON — native QuickieParse not loaded "
+                  f"({NATIVE_PARSERS_ERR}). Rebuild OddsAPI/cppparser.")
+        elif not (self._k_native and self._pm_native):
+            print(f"[parsers] native available but disabled by env: "
+                  f"Kalshi={'native' if self._k_native else 'python'}, "
+                  f"Polymarket={'native' if self._pm_native else 'python'}")
         self.live_mode = True
         self._live_lbl_open = self._live_lbl_min = self._live_lbl_max = None
         # Default to following the first outcome (single series) — matches prior
@@ -8699,6 +10174,7 @@ class HistoricalOddsWidget(QWidget):
         self._apply_live_view_defaults()
 
         self.live_controls.setVisible(True)
+        self._sync_live_overlay_controls()  # presets / LIVE ⇥ / watermark
         self.ob_section.setVisible(True)
         # Build the active series (feed × outcome) + the ladder stack, then the
         # selectors reflect the current choice.
@@ -8819,6 +10295,7 @@ class HistoricalOddsWidget(QWidget):
         # regular game. Both epoch sources return None for futures -> the lines hide.
         self._ensure_market_post_line()
         self._ensure_start_line()
+        self._y_snap_next = True   # history just landed: fit y outright
         self._refresh_live_items()
         # Populate the corner boxes NOW from the seeded history (_track falls
         # back to the newest tick). Waiting for the next flush left them hidden
@@ -8843,6 +10320,22 @@ class HistoricalOddsWidget(QWidget):
             return start, 60, 60      # hourly
         return start, 1440, 1440      # daily
 
+    # Recent span re-fetched at 1-minute when the full-life seed is coarse.
+    _SEED_FINE_WINDOW_S = 24 * 3600
+
+    def _seed_fine_start(self, start, end, interval):
+        """Epoch (hour-aligned) from which a coarse (hourly/daily) seed is replaced
+        by 1-minute history, or None when no fine splice is needed. Two defects of
+        the coarse-only seed on a game posted >3.4 days out: Kalshi only returns
+        CLOSED periods, so everything since the top of the hour was missing (a hole
+        up to ~60 min wide until the live ticks began), and the pregame/game itself
+        rendered at hourly resolution. Futures are skipped — their seed is capped
+        for the candlestick rate limit and a long-horizon chart doesn't need it."""
+        if interval <= 1 or self._is_future_market:
+            return None
+        fine = int((end - self._SEED_FINE_WINDOW_S) // 3600) * 3600
+        return fine if fine > start else None
+
     async def _fetch_seed_ohlc(self, ticker=None):
         """Fetch the FULL Kalshi OHLC history (Market Post -> now) for `ticker`,
         at a span-appropriate interval, so the chart shows the entire market life."""
@@ -8857,11 +10350,28 @@ class HistoricalOddsWidget(QWidget):
         end = datetime.now().timestamp()
         start, interval, _ = self._seed_window(end)
         try:
-            return await self.kalshi_client.get_ohlc_candles(
+            candles = await self.kalshi_client.get_ohlc_candles(
                 mkt, series, start, end, period_interval=interval)
         except Exception as e:
             print(f"⚠️  seed OHLC fetch failed: {e}")
             return []
+        fine_start = self._seed_fine_start(start, end, interval)
+        if fine_start is None:
+            return candles
+        # Splice: coarse periods ending at/before fine_start, 1-minute after. A
+        # coarse candle's ticks sit in its final minute (< fine_start) and the
+        # first kept fine candle ends > fine_start, so the two never overlap. On
+        # failure keep the coarse seed exactly as before.
+        try:
+            fine = await self.kalshi_client.get_ohlc_candles(
+                mkt, series, fine_start, end, period_interval=1)
+        except Exception as e:
+            print(f"⚠️  seed 1-min splice fetch failed: {e}")
+            return candles
+        fine = [cd for cd in fine if cd['t'] > fine_start]
+        if not fine:
+            return candles
+        return [cd for cd in candles if cd['t'] <= fine_start] + fine
 
     async def _seed_pm_books_rest(self, tokens):
         """Seed each PM token's order book from the CLOB REST /book endpoint on
@@ -8947,23 +10457,42 @@ class HistoricalOddsWidget(QWidget):
         try:
             import aiohttp
             url = "https://clob.polymarket.com/prices-history"
-            params = {'market': token, 'startTs': int(start),
-                      'endTs': int(end), 'fidelity': fidelity}
-            async with aiohttp.ClientSession() as session:
+
+            async def _history(session, s_ts, fid):
+                params = {'market': token, 'startTs': int(s_ts),
+                          'endTs': int(end), 'fidelity': fid}
                 async with session.get(url, params=params, timeout=15) as resp:
                     if resp.status != 200:
-                        print(f"⚠️  PM seed history HTTP {resp.status}")
-                        return []
+                        print(f"⚠️  PM seed history HTTP {resp.status} (fidelity={fid})")
+                        return None
                     data = await resp.json()
-            pts = []
-            for pt in data.get('history', []):
-                t, p = pt.get('t'), pt.get('p')
-                if t is None or p is None:
-                    continue
-                pf = float(p)
-                cents = pf * 100.0 if pf <= 1.0 else pf
-                if 0 < cents < 100:
-                    pts.append((float(t), round(cents, 1)))
+                out = []
+                for pt in data.get('history', []):
+                    t, p = pt.get('t'), pt.get('p')
+                    if t is None or p is None:
+                        continue
+                    pf = float(p)
+                    cents = pf * 100.0 if pf <= 1.0 else pf
+                    if 0 < cents < 100:
+                        out.append((float(t), round(cents, 1)))
+                return out
+
+            fine_start = self._seed_fine_start(start, end, fidelity)
+            async with aiohttp.ClientSession() as session:
+                pts = await _history(session, start, fidelity)
+                if pts is None:
+                    return []
+                # Same coarse -> 1-minute splice as the Kalshi seed (see
+                # _seed_fine_start). A failed fine fetch keeps the coarse seed.
+                if fine_start is not None:
+                    try:
+                        fine = await _history(session, fine_start, 1)
+                    except Exception as e:
+                        print(f"⚠️  PM seed 1-min splice fetch failed: {e}")
+                        fine = None
+                    if fine:
+                        pts = [x for x in pts if x[0] < fine_start] + \
+                              [x for x in fine if x[0] >= fine_start]
             if not pts:
                 return []
             # Resample onto a CONTINUOUS 1-minute grid (carry the last known price
@@ -9041,6 +10570,7 @@ class HistoricalOddsWidget(QWidget):
         self._live_dirty = False
         self.live_repaint_timer.stop()
         self.live_controls.setVisible(False)
+        self._sync_live_overlay_controls()  # presets / LIVE ⇥ / watermark
         self.ob_section.setVisible(False)
         self.futures_field_section.setVisible(False)
         self.order_entry_section.setVisible(False)
@@ -9057,11 +10587,6 @@ class HistoricalOddsWidget(QWidget):
         self.side_row.setVisible(False)
         self.live_source = 'kalshi'  # default for the next live entry
         self.outcome_sel = None
-        # Drop the heat ribbon — its book is gone until the next live entry.
-        self._heat_cols.clear()
-        self._heat_last_sample_t = 0.0
-        if self._heat_img is not None:
-            self._heat_img.setVisible(False)
         # Whale dots are live-only chrome — drop them with the overlay.
         if getattr(self, '_whale_scatter', None) is not None:
             self._whale_scatter.setData([])
@@ -9141,7 +10666,6 @@ class HistoricalOddsWidget(QWidget):
         self._ensure_crosshair()
         self._ensure_start_line()
         self._ensure_market_post_line()
-        self._ensure_heat_img()
         self._ensure_whale_scatter()
 
     @staticmethod
@@ -9242,7 +10766,6 @@ class HistoricalOddsWidget(QWidget):
         self._ensure_crosshair()
         self._ensure_start_line()
         self._ensure_market_post_line()
-        self._ensure_heat_img()
         self._ensure_whale_scatter()
 
     def _rebuild_live_items(self):
@@ -9321,7 +10844,10 @@ class HistoricalOddsWidget(QWidget):
             if s['ticks'] and (last_t is None or s['ticks'][-1]['t'] > last_t):
                 last_t = s['ticks'][-1]['t']
         if self.auto_follow and last_t is not None:
-            if self.candle_mode:
+            preset = self._preset_window(last_t)
+            if preset is not None:
+                window, right_pad = preset
+            elif self.candle_mode:
                 eff = self.candle_bucket_s if self.candle_bucket_s > 0 else 0.25
                 window = max(self.live_candle_visible_n * eff, 20)
                 right_pad = eff * 2
@@ -9367,23 +10893,26 @@ class HistoricalOddsWidget(QWidget):
                 self.plot_widget.getViewBox().setLimits(
                     xMin=xlo, xMax=xhi, maxXRange=xhi - xlo)
 
+        snap = self._y_snap_next
+        self._y_snap_next = False
         if follow is not None:
             last_t, right_pad = follow
             vb = self.plot_widget.getViewBox()
             vb.setXRange(xmin, xmax, padding=0)
-            self._fit_live_y(xmin, xmax)
+            self._fit_live_y(xmin, xmax, smooth=not snap)
         else:
             # Manual view: the x-window is frozen, but keep the %-axis fitted to
             # what's visible (incl. the 0-100 overzoom blend) as new ticks land;
             # the smoothed glide damps the per-flush wiggle.
-            self._fit_live_y(xmin, xmax)
-
-        # Repaint the liquidity heatmap from the columns inside the new window.
-        if self.heatmap_mode:
-            self._refresh_heatmap()
+            self._fit_live_y(xmin, xmax, smooth=not snap)
+        # Last-price line/tag (after the y-fit, so the tag lands on the new range)
+        # and one-shot price alerts against that same focus price.
+        self._check_alerts(self._update_last_price_marker())
 
     # How far past the data span the x-view must zoom out before the %-axis
     # reaches the full 0-100 probability box (3.0 == view spans 3x the data).
+    # Games can't zoom that far (x is clamped to the market life), so in practice
+    # this only engages for unbounded views.
     _Y_OVERZOOM_FULL = 3.0
 
     def _fit_live_y(self, xmin, xmax, smooth=True):
@@ -9462,20 +10991,16 @@ class HistoricalOddsWidget(QWidget):
         pad = max(hi - lo, 0.5) * 0.10
         tlo, thi = max(lo - pad, 0.0), min(hi + pad, 100.0)
 
-        # Overzoom blend toward the full probability box. With the x-view clamped
-        # to the market life on BOTH sides (game markets), full 0-100 is reached
-        # exactly when the view fills the ALLOWED x-range — the y-axis absorbs
-        # the zoom-out the confined x can't, in that small horizontal space.
-        # Unbounded x (no limits set) falls back to the fixed 3x-data-span ramp.
+        # Overzoom blend toward the full probability box: starts once the view
+        # is wider than the data and reaches 0-100 at _Y_OVERZOOM_FULL x the data
+        # span. (It used to reach 0-100 when the view filled the ALLOWED x-range,
+        # which for a game market — x clamped to its life — is exactly the
+        # full-history view, so "All" always showed a useless 0-100 axis. A game's
+        # x-limits are only ~10% past its data, so the blend there stays small.)
         vb = self.plot_widget.getViewBox()
         if t_first is not None and t_last is not None:
             ds = max(t_last - t_first, 60.0)
-            xlim = vb.state['limits']['xLimits']
-            # pyqtgraph stores "no limit" as ±1e307 (not None) — treat as unbounded.
-            if all(v is not None and abs(v) < 1e306 for v in xlim):
-                max_vs = xlim[1] - xlim[0]
-            else:
-                max_vs = ds * self._Y_OVERZOOM_FULL
+            max_vs = ds * self._Y_OVERZOOM_FULL
             f = ((xmax - xmin) - ds) / max(max_vs - ds, 1e-9)
             if f > 0:
                 f = min(f, 1.0)
@@ -9532,9 +11057,11 @@ class HistoricalOddsWidget(QWidget):
         bucket = self.candle_bucket_s
         # Adaptive coarsening: cap the rendered candle count so a zoomed-out
         # full-history view doesn't draw thousands of sub-pixel bars. Based on
-        # the WINDOW span (stable under panning), snapped to the ladder.
+        # the WINDOW span (stable under panning), snapped to the ladder. The cap
+        # follows the plot's PIXEL width (~6px per candle): a fixed 700 left
+        # ~2px hairlines on a wide chart (a two-week view drew 30-min dashes).
         if wxmin is not None and wxmax is not None and wxmax > wxmin:
-            MAX_CANDLES = 700
+            MAX_CANDLES = max(60, int(self.plot_widget.getViewBox().width() / 6.0))
             eff = (wxmax - wxmin) / MAX_CANDLES
             if eff > (bucket if bucket > 0 else 0.25):
                 bucket = next((s for s in self._CANDLE_BUCKET_LADDER if s >= eff),
@@ -9605,105 +11132,6 @@ class HistoricalOddsWidget(QWidget):
                         height=body_h, brushes=brushes,
                         pen=pg.mkPen(0, 0, 0, 60))
         cwicks.setData(wick_x, wick_y)
-
-    # ---- Liquidity heatmap -------------------------------------------------
-    def _ensure_heat_img(self):
-        """Create the heatmap ImageItem if needed and (re)add it to the scene —
-        like _ensure_crosshair, it must be re-added after plot_widget.clear()."""
-        if self._heat_img is None:
-            self._heat_img = pg.ImageItem()
-            # col-major: array axis0 -> x. We pass (n_time_cols, 100), so axis0 is
-            # time (x) and axis1 is price cent (y), matching setRect in _refresh.
-            self._heat_img.setOpts(axisOrder='col-major')
-            self._heat_img.setZValue(-100)  # behind candles, band, lines, crosshair
-            self._heat_img.setLookupTable(self._heat_lut)
-        self._heat_img.setVisible(self.heatmap_mode)
-        self.plot_widget.addItem(self._heat_img, ignoreBounds=True)
-
-    @staticmethod
-    def _build_heat_lut():
-        """256-entry RGBA lookup table: a phosphor ramp from transparent (empty
-        book) through faint teal -> teal -> amber -> hot near-white (deepest
-        resting size). Teal/amber keep it in the same family as the venue hues and
-        the UI accent, and the transparent low end lets the black screen and the
-        candles read straight through thin parts of the book."""
-        stops = np.array([0.0, 0.12, 0.40, 0.72, 1.0])
-        cols = np.array([
-            [0,   0,   0,   0],     # empty -> fully transparent
-            [22,  64,  62,  70],    # faint teal
-            [72,  197, 190, 150],   # teal
-            [224, 176, 80,  210],   # amber (UI accent)
-            [255, 245, 215, 255],   # hot near-white
-        ], dtype=float)
-        xs = np.linspace(0.0, 1.0, 256)
-        lut = np.zeros((256, 4), dtype=np.ubyte)
-        for ch in range(4):
-            lut[:, ch] = np.interp(xs, stops, cols[:, ch]).astype(np.ubyte)
-        return lut
-
-    def _heat_focus_series(self):
-        """Series whose depth feeds the heatmap: the primary outcome, including
-        every venue quoting it (their cent prices share the 0-100 scale, so depth
-        sums cleanly). Restricting to ONE outcome avoids smearing complementary
-        sides (e.g. 72c favourite vs 28c underdog) into one ribbon."""
-        if not self.live_series:
-            return []
-        focus = self.live_series[0].get('outcome')
-        return [s for s in self.live_series if s.get('outcome') == focus]
-
-    def _sample_heat_column(self, now_t):
-        """Snapshot the focus book into one per-cent depth column, throttled to
-        ~_heat_sample_dt so the ribbon advances at a steady cadence regardless of
-        tick rate. Bids and asks both contribute resting size at their price."""
-        if now_t - self._heat_last_sample_t < self._heat_sample_dt:
-            return
-        series = self._heat_focus_series()
-        if not series:
-            return
-        col = np.zeros(100, dtype=np.float32)
-        got = False
-        for s in series:
-            lad = self._series_ladder(s, 80)
-            if not lad:
-                continue
-            for price, qty in lad.get('bids', []) + lad.get('asks', []):
-                b = int(price)
-                if 0 <= b < 100:
-                    col[b] += float(qty); got = True
-        if not got:
-            return
-        self._heat_cols.append((now_t, col))
-        self._heat_last_sample_t = now_t
-
-    def _refresh_heatmap(self):
-        """Rebuild the heat ImageItem from the columns inside the visible window.
-        Columns map uniformly across [t0, t1] in x and 0-100c in y; contrast is
-        scaled to the 97th percentile of nonzero depth so one giant wall can't wash
-        the rest of the book to black."""
-        if not self.heatmap_mode or self._heat_img is None:
-            return
-        if len(self._heat_cols) < 2:
-            self._heat_img.setVisible(False)
-            return
-        xmin, _xmax, _ = self._live_render_window()
-        cols = list(self._heat_cols)
-        import bisect
-        i0 = bisect.bisect_left([t for t, _ in cols], xmin - 5.0)
-        sub = cols[i0:]
-        if len(sub) < 2:
-            self._heat_img.setVisible(False)
-            return
-        t0, t1 = sub[0][0], sub[-1][0]
-        arr = np.stack([c for _, c in sub], axis=0)  # (n_cols, 100) == (x, y)
-        pos = arr[arr > 0]
-        if pos.size == 0:
-            self._heat_img.setVisible(False)
-            return
-        vmax = float(np.quantile(pos, 0.97)) or float(pos.max())
-        self._heat_img.setVisible(True)
-        self._heat_img.setImage(arr, levels=(0.0, max(vmax, 1.0)),
-                                autoLevels=False, lut=self._heat_lut)
-        self._heat_img.setRect(QRectF(t0, 0.0, max(t1 - t0, 1.0), 100.0))
 
     def _latest_value_by_team(self, plot_data):
         """Collapse plot_data to {canonical_team: (display_name, latest_value)}.
@@ -9793,12 +11221,9 @@ class HistoricalOddsWidget(QWidget):
         w = self.plot_widget.width()
         h = self.plot_widget.height()
 
-        # Depth/view panel toggle: small tab hugging the plot's right edge,
-        # vertically centered (where the old full-height handle strip lived).
+        # Depth/view panel tab: hugs the plot's right edge just under the top logo
+        # (placed below, once the logo position is known).
         ph = getattr(self, 'panel_handle', None)
-        if ph is not None:
-            ph.move(w - ph.width() - 1, (h - ph.height()) // 2)
-            ph.raise_()
 
         # --- Floating control strip + its toggle (top-CENTER, HUGGING its content
         # so it never spans the graph width). The toggle sits just right of the
@@ -9842,12 +11267,50 @@ class HistoricalOddsWidget(QWidget):
             logo_bot_left = w - pm.width() - margin
             self.logo_label_bottom.move(logo_bot_left, data_bottom - pm.height() - margin)
 
-        if self.summary_label_top.isVisible():
-            s = self.summary_label_top
-            s.move(logo_top_left - gap - s.width(), margin)
-        if self.summary_label_bottom.isVisible():
-            s = self.summary_label_bottom
-            s.move(logo_bot_left - gap - s.width(), data_bottom - s.height() - margin)
+        s_top, s_bot = self._summary_w('pos'), self._summary_w('neg')
+        if s_top.isVisible():
+            s_top.move(logo_top_left - gap - s_top.width(), margin)
+        if s_bot.isVisible():
+            s_bot.move(logo_bot_left - gap - s_bot.width(), data_bottom - s_bot.height() - margin)
+
+        # Panel tab: right edge, below EVERYTHING in the top-right corner — the top
+        # logo and the top summary box. (With no logo the summary box docks into
+        # the corner itself, so "below the logo" alone put the tab on top of it.)
+        top_right_bottom = margin
+        if self.logo_label_top.isVisible() and self.logo_label_top.pixmap():
+            top_right_bottom = margin + self.logo_label_top.pixmap().height()
+        if s_top.isVisible():
+            top_right_bottom = max(top_right_bottom, s_top.y() + s_top.height())
+        if ph is not None:
+            ph.move(w - ph.width(), top_right_bottom + 8)
+            ph.raise_()
+
+        # Live chart controls (the zoom presets sit inside the control strip, laid
+        # out there). LIVE ⇥: right edge, above the bottom logo / summary.
+        left_ax = self.plot_widget.getAxis('left')
+        plot_left = int(left_ax.width()) if left_ax is not None and left_ax.isVisible() else 0
+        jb = getattr(self, 'live_jump_btn', None)
+        if jb is not None and jb.isVisible():
+            # Above everything in the bottom-right corner: the bottom logo and the
+            # bottom summary box (which docks into the corner when there's no logo).
+            above = data_bottom - margin
+            if self.logo_label_bottom.isVisible() and self.logo_label_bottom.pixmap():
+                above = data_bottom - self.logo_label_bottom.pixmap().height() - margin
+            if s_bot.isVisible():
+                above = min(above, s_bot.y())
+            jb.move(w - jb.width() - margin, above - jb.height() - 6)
+            jb.raise_()
+        # (The market watermark is a ViewBox child centred behind the data —
+        # ChartWatermark re-centres itself on resize; nothing to place here.)
+        # Alert banner: top-centre, just under the control strip (or its toggle).
+        toast = getattr(self, 'alert_toast', None)
+        if toast is not None and toast.isVisible():
+            top = 30
+            if ov is not None and getattr(self, '_controls_visible', False):
+                top = 6 + ov.height() + 8
+            toast.move(max(plot_left, (w - toast.width()) // 2), top)
+            toast.raise_()
+        self._place_last_price_tag()
 
 
     def _update_countdown(self):
@@ -9888,6 +11351,8 @@ class HistoricalOddsWidget(QWidget):
     def _hide_summaries(self):
         self.summary_label_top.hide()
         self.summary_label_bottom.hide()
+        self.live_summary_top.hide()
+        self.live_summary_bottom.hide()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -10160,7 +11625,27 @@ class HistoricalOddsWidget(QWidget):
         )
         self._set_summary_label(band_key, summary_html)
 
+    def _summary_w(self, band_key):
+        """The corner box currently showing for a band (live widget or label)."""
+        live = self.live_summary_top if band_key == 'pos' else self.live_summary_bottom
+        if live.isVisible():
+            return live
+        return self.summary_label_top if band_key == 'pos' else self.summary_label_bottom
+
+    def _set_live_summary(self, band_key, data):
+        live = self.live_summary_top if band_key == 'pos' else self.live_summary_bottom
+        label = self.summary_label_top if band_key == 'pos' else self.summary_label_bottom
+        label.hide()
+        live.set_data(data)
+        live.show()
+        self._position_overlays()
+
+    def _hide_live_summary(self, band_key):
+        (self.live_summary_top if band_key == 'pos' else self.live_summary_bottom).hide()
+        (self.summary_label_top if band_key == 'pos' else self.summary_label_bottom).hide()
+
     def _set_summary_label(self, band_key, html):
+        (self.live_summary_top if band_key == 'pos' else self.live_summary_bottom).hide()
         label = self.summary_label_top if band_key == 'pos' else self.summary_label_bottom
         # Centre every line within the box: the box sizes to its WIDEST line (the
         # move/range row), so left-aligned lines left the % row hugging the left edge
@@ -10579,8 +12064,9 @@ class HistoricalOddsWidget(QWidget):
     def _build_pct_ticks(self, lo, hi):
         """Round, evenly-spaced %-axis ticks with a fainter minor gridline level.
 
-        Returns [major, minor] for AxisItem.setTicks: major carries 'NN.N% (+am)'
-        labels (implied % is a float, so one decimal; two when zoomed in tight) at
+        Returns [major, minor] for AxisItem.setTicks: major carries 'NN%  +am'
+        labels (decimals only when the step needs them — 52.5%, 55.25% — and
+        'EVEN' at 50%) at
         a nice step chosen for ~10 visible ticks, minor draws unlabeled gridlines
         at half that step. Anchored to multiples of the step so lines land on round
         probabilities (55.0%, 55.5%, …) instead of arbitrary values.
@@ -10593,17 +12079,23 @@ class HistoricalOddsWidget(QWidget):
         steps = (0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 25, 50)
         major_step = next((s for s in steps if span / s <= 10), 50)
         minor_step = major_step / 2.0
-        dp = 2 if major_step < 0.5 else 1  # decimal places on the % label
+        dp = 2 if major_step < 0.5 else 1  # max decimal places on the % label
 
         major = []
         v = math.ceil(lo / major_step) * major_step
         while v <= hi + 1e-9:
+            # Trim to the decimals this value actually needs: 70%, 52.5%, 55.25%.
+            pct = f"{round(v, dp):.{dp}f}".rstrip('0').rstrip('.')
             am = self._am_from_cents_float(v)
             if am is not None:
                 ai = int(round(am))
-                label = f"{v:.{dp}f}% ({'+' if ai > 0 else ''}{ai})"
+                if abs(ai) == 100:
+                    odds = "EVEN"
+                else:
+                    odds = f"+{ai}" if ai > 0 else f"\u2212{abs(ai)}"
+                label = f"{pct}%  {odds}"
             else:
-                label = f"{v:.{dp}f}%"
+                label = f"{pct}%"
             major.append((v, label))
             v += major_step
 

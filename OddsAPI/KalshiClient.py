@@ -22,6 +22,35 @@ import websocket
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from PyQt6.QtCore import QObject, pyqtSignal
+import socket as _socket
+import struct as _struct
+
+
+# Offset of tcpi_rtt (u32, microseconds) in Linux `struct tcp_info`: 8 bytes of
+# u8 state fields, then u32 rto/ato/snd_mss/rcv_mss/unacked/sacked/lost/retrans/
+# fackets/last_data_sent/last_ack_sent/last_data_recv/last_ack_recv/pmtu/
+# rcv_ssthresh precede it. Verified against connect-time RTT to both exchanges.
+_TCPI_RTT_OFFSET = 68
+
+
+def tcp_srtt_ms(ws_app) -> Optional[float]:
+    """Kernel-smoothed TCP round-trip time (ms) of a websocket-client
+    WebSocketApp's live connection, or None (not connected / not Linux).
+
+    This is the pure NETWORK RTT. A ping/pong round trip measured in the client
+    also includes local backlog: websocket-client handles frames serially, so a
+    pong waits behind every queued data frame and its Python handler."""
+    try:
+        sock = getattr(getattr(ws_app, "sock", None), "sock", None)
+        if sock is None or not hasattr(_socket, "TCP_INFO"):
+            return None
+        buf = sock.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_INFO, 104)
+        if len(buf) < _TCPI_RTT_OFFSET + 4:
+            return None
+        us = _struct.unpack_from("I", buf, _TCPI_RTT_OFFSET)[0]
+        return us / 1000.0 if us else None
+    except Exception:
+        return None
 
 # Valid historical time intervals for kalshi market data: Valid values: 1 (1 minute), 60 (1 hour), 1440 (1 day).
 # Time period length of each candlestick in minutes.
@@ -137,10 +166,8 @@ class KalshiClient:
 
         headers = {
             "Content-Type": "application/json",
+            **self._read_auth_headers(endpoint, method),
         }
-
-        # Note: For now making unauthenticated requests to public endpoints
-        # Full authentication requires RSA signing with private key
 
         # Retry on 429 with exponential backoff. Loading many sports series at once
         # bursts past Kalshi's public rate limit; without this a 429 silently drops
@@ -148,6 +175,7 @@ class KalshiClient:
         last_exc = None
         for attempt in range(4):
             try:
+                self._rate_gate()
                 response = self.session.request(
                     method=method, url=url, headers=headers,
                     params=params, json=data,
@@ -177,6 +205,32 @@ class KalshiClient:
             self._priv_key = serialization.load_pem_private_key(
                 Kalshi_Private_Key.encode(), password=None)
         return self._priv_key
+
+    def _read_auth_headers(self, endpoint: str, method: str = "GET") -> Dict:
+        """RSA-PSS auth headers for a plain READ.
+
+        Kalshi meters anonymous and authenticated reads on very different budgets:
+        measured on this key, unauthenticated /events 429s at 10 req/s (and even
+        loses ~25% at 15 req/s) while the SAME calls signed run clean at 15 req/s.
+        The menu load fans out over ~40 series, so unsigned it was spending a third
+        of its requests on retries — and a 429 that outlives the backoff silently
+        drops a whole league from the picker.
+
+        Never fatal: if signing fails for any reason we fall back to an anonymous
+        request (slower, rate-limited) rather than taking the client down."""
+        try:
+            ts = str(int(time.time() * 1000))
+            path = "/trade-api/v2" + endpoint.split("?")[0]
+            sig = self._get_private_key().sign(
+                (ts + method + path).encode("utf-8"),
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.DIGEST_LENGTH),
+                hashes.SHA256())
+            return {"KALSHI-ACCESS-KEY": self.api_key,
+                    "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
+                    "KALSHI-ACCESS-TIMESTAMP": ts}
+        except Exception:
+            return {}
 
     def _signed_request(self, method: str, endpoint: str,
                         params: Dict = None, data: Dict = None,
@@ -287,6 +341,13 @@ class KalshiClient:
                         "exact match", "goal in every")
     # Companion market-type series sharing a GAME series' league prefix.
     _COMPANION_SUFFIXES = ("SPREAD", "TOTAL", "TEAMTOTAL")
+    # Head-to-head suffixes. Kalshi names team sports "<LEAGUE>GAME" but the
+    # individual/racquet sports "<LEAGUE>MATCH" (KXATPMATCH, KXWTAMATCH,
+    # KXDAVISCUPMATCH, KXTABLETENNISMATCH, KXDARTSMATCH...). classify_market has
+    # always accepted both; the discovery scan globbed GAME only, so every MATCH
+    # league was invisible to the widget. Note KXATPGAME/KXWTAGAME DO exist but
+    # are dead (0 open events) — the live tennis is all on MATCH.
+    _EVENT_SUFFIXES = ("GAME", "MATCH")
     _SERIES_CACHE_PATH = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "kalshi_event_series_cache.json")
 
@@ -311,7 +372,9 @@ class KalshiClient:
             p = {"category": "Sports", "limit": 200}
             if cursor:
                 p["cursor"] = cursor
-            r = self.session.get(f"{self.BASE_URL}/series", params=p, timeout=20)
+            self._rate_gate()
+            r = self.session.get(f"{self.BASE_URL}/series", params=p,
+                                 headers=self._read_auth_headers("/series"), timeout=20)
             if not r.ok:
                 break
             d = r.json()
@@ -321,66 +384,114 @@ class KalshiClient:
                 break
         return out
 
-    def _open_event_count(self, ticker: str, retries: int = 4) -> int:
-        for attempt in range(retries):
-            try:
-                r = self.session.get(f"{self.BASE_URL}/events", params={
-                    "series_ticker": ticker, "status": "open", "limit": 200}, timeout=15)
-                if r.status_code == 429:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                return len(r.json().get("events", [])) if r.ok else 0
-            except Exception:
-                time.sleep(0.3)
-        return 0
+    # ------------------------------------------------------------------
+    # Shared read throttle for EVERY read this client makes.
+    # Kalshi Basic is ~20 read req/s. Pacing UP FRONT beats reacting to 429s:
+    # once the bucket is empty every worker is retrying into the same wall, so a
+    # burst that trips the limit costs far more wall-clock than the spacing it
+    # skipped. Class-level and shared by _make_request, _throttled_get and
+    # get_sports_series, because separate per-caller gates do NOT compose — the
+    # background discovery scan and the widget's 8-way concurrent menu load are
+    # spending from the same exchange-side budget and have to be paced as one.
+    # ------------------------------------------------------------------
+    # 30 req/s. Measured on this key: SIGNED reads sustain 300 requests at 40/s
+    # with zero 429s, so this keeps ~25% headroom; anonymous reads by contrast
+    # start failing at 10/s. Do NOT raise this without re-running that probe —
+    # the gate is what stops the background scan and the widget's concurrent menu
+    # load from colliding, and it is the menu load's dominant cost.
+    _RATE_MIN_INTERVAL = 1.0 / 30.0
+    _rate_lock = threading.Lock()
+    _rate_next = 0.0
 
-    def _series_volume(self, ticker: str, retries: int = 4):
-        """(volume, open_interest) summed over a series' open markets (V2 _fp)."""
+    @classmethod
+    def _rate_gate(cls):
+        """Claim the next send slot, then sleep to it OUTSIDE the lock (holding it
+        across the sleep would serialise the workers instead of just spacing them)."""
+        with cls._rate_lock:
+            slot = max(time.monotonic(), cls._rate_next)
+            cls._rate_next = slot + cls._RATE_MIN_INTERVAL
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def _throttled_get(self, path: str, params: dict, retries: int = 5,
+                       timeout: int = 20):
+        """Rate-gated GET with 429 backoff that honours Retry-After. Returns the
+        decoded body, or None once the retries are spent."""
+        for attempt in range(retries):
+            self._rate_gate()
+            try:
+                r = self.session.get(f"{self.BASE_URL}{path}", params=params,
+                                     headers=self._read_auth_headers(path),
+                                     timeout=timeout)
+            except Exception:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            if r.status_code == 429:
+                try:
+                    wait = float(r.headers.get("Retry-After", "") or 0)
+                except ValueError:
+                    wait = 0.0
+                time.sleep(max(wait, 0.5 * (2 ** attempt)))
+                continue
+            return r.json() if r.ok else None
+        return None
+
+    def _series_open_snapshot(self, ticker: str):
+        """(open_event_count, volume, open_interest) for one series in a SINGLE
+        paginated pass.
+
+        Was two separate walks — /events for the count, then /markets?limit=1000
+        (up to 8 pages) for the volume — i.e. 2-9 requests per series. Asking
+        /events for `with_nested_markets` returns the same open markets inline, so
+        one request usually answers both (verified identical volume totals). With
+        the MATCH leagues in scope the scan covers ~115 series, so this is the
+        difference between ~500 requests and ~120."""
+        n = 0
         vol = oi = 0.0
         cursor = None
         for _ in range(8):
-            for attempt in range(retries):
-                r = self.session.get(f"{self.BASE_URL}/markets", params={
-                    "series_ticker": ticker, "status": "open", "limit": 1000,
-                    **({"cursor": cursor} if cursor else {})}, timeout=20)
-                if r.status_code == 429:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
+            params = {"series_ticker": ticker, "status": "open", "limit": 200,
+                      "with_nested_markets": "true"}
+            if cursor:
+                params["cursor"] = cursor
+            d = self._throttled_get("/events", params)
+            if not d:
                 break
-            if not r.ok:
-                break
-            d = r.json()
-            for m in d.get("markets", []):
-                try:
-                    vol += float(m.get("volume_fp") or 0)
-                    oi += float(m.get("open_interest_fp") or 0)
-                except (TypeError, ValueError):
-                    pass
+            evs = d.get("events", [])
+            n += len(evs)
+            for ev in evs:
+                for m in (ev.get("markets") or []):
+                    try:
+                        vol += float(m.get("volume_fp") or 0)
+                        oi += float(m.get("open_interest_fp") or 0)
+                    except (TypeError, ValueError):
+                        pass
             cursor = d.get("cursor")
             if not cursor:
                 break
-        return vol, oi
+        return n, vol, oi
 
     def discover_event_series_ranked(self, workers: int = 4) -> List[Dict]:
-        """Active head-to-head GAME series, each enriched with companion market
+        """Active head-to-head GAME/MATCH series, each enriched with companion market
         series + volume, sorted by VOLUME desc. Row:
             {game, tag, title, open_events, volume, open_interest, market_series:[...]}
         Live scan (slow + rate-limited) — callers should use load_ranked_event_series."""
         all_series = self.get_sports_series()
         have = {s.get("ticker", "") for s in all_series}
         games = [s for s in all_series
-                 if s.get("ticker", "").endswith("GAME")
+                 if s.get("ticker", "").endswith(self._EVENT_SUFFIXES)
                  and self.classify_market(s["ticker"], s.get("title", "")) == "event"]
 
         def build(s):
             tk = s["ticker"]
-            n = self._open_event_count(tk)
+            n, vol, oi = self._series_open_snapshot(tk)
             if n == 0:
                 return None
-            base = tk[:-4]
+            suffix = next(x for x in self._EVENT_SUFFIXES if tk.endswith(x))
+            base = tk[:-len(suffix)]
             companions = [tk] + [base + suf for suf in self._COMPANION_SUFFIXES
                                  if (base + suf) in have]
-            vol, oi = self._series_volume(tk)
             return {"game": tk, "tag": (s.get("tags") or ["(none)"])[0],
                     "title": s.get("title", ""), "open_events": n,
                     "volume": vol, "open_interest": oi, "market_series": companions}
@@ -389,6 +500,20 @@ class KalshiClient:
             rows = [r for r in ex.map(build, games) if r]
         rows.sort(key=lambda r: -r["volume"])
         return rows
+
+    def cached_series_age_s(self) -> Optional[float]:
+        """Age of the discovery cache in seconds, or None when there is no
+        readable cache. Lets a caller serve the cached menu INSTANTLY and decide
+        separately whether to kick a background rescan — the scan is far too slow
+        to sit in front of the UI, but a cache that is never re-checked freezes the
+        league list on whatever was in season the day it was written."""
+        if not os.path.exists(self._SERIES_CACHE_PATH):
+            return None
+        try:
+            with open(self._SERIES_CACHE_PATH) as f:
+                return max(0.0, time.time() - float(json.load(f).get("ts", 0)))
+        except Exception:
+            return None
 
     def read_cached_event_series(self) -> List[Dict]:
         """Pure cache read (never scans) — for instant startup. [] if no cache."""
@@ -1194,10 +1319,12 @@ class KalshiStreamClient(QObject):
     trade = pyqtSignal(object)
     orderbook = pyqtSignal(object)
     raw_frame = pyqtSignal(str)   # original frame string, for native (C++) parsing
-    # True round-trip latency (ms) from a protocol-level ping/pong exchange. Kalshi
+    # Round trip (ms) of a protocol-level ping/pong exchange. Kalshi
     # has no app-level ping message; this rides the RFC6455 control frames that the
     # websocket-client library already sends on `ping_interval`. Clock-skew-free:
     # both timestamps are local, so no NTP dependency (unlike a server-stamp diff).
+    # Includes local backlog: the pong is read after every queued data frame is
+    # handled. For pure network RTT use tcp_srtt_ms(self._ws_app).
     latency = pyqtSignal(float)
 
     def __init__(
@@ -1381,20 +1508,24 @@ class KalshiStreamClient(QObject):
         interleave on one shared sid (both-sides YES, multi-contract fields), where a
         teardown can starve siblings or land them on a new sid mid-stream.
 
-        `sids` (optional) scopes the request to specific subscriptions; the array
-        `market_tickers` form is the only one the server accepts."""
+        It is an ACTION of `update_subscription` — Kalshi has no standalone
+        `get_snapshot` command (sending one returns error 5 "Unknown command",
+        which silently disabled this resync path). The request must name the
+        subscription(s) via `sids`; returns False (nothing sent) when none is
+        known, so the caller can fall back to a full resubscribe. Verified live
+        2026-10-05: the reply is an `orderbook_snapshot` on the same sid,
+        sequenced in-stream, and the delta stream continues uninterrupted."""
         tickers = [t for t in (tickers or []) if t]
-        if not tickers:
-            return
-        params = {"market_tickers": list(tickers)}
         sids = [s for s in (sids or []) if s is not None]
-        if sids:
-            params["sids"] = list(sids)
+        if not tickers or not sids:
+            return False
         self.send(json.dumps({
             "id": self._msg_id(),
-            "cmd": "get_snapshot",
-            "params": params,
+            "cmd": "update_subscription",
+            "params": {"sids": list(sids), "market_tickers": list(tickers),
+                       "action": "get_snapshot"},
         }))
+        return True
 
     # Convenience helpers
     def subscribe_ticker(self, tickers):
@@ -1433,8 +1564,17 @@ class KalshiStreamClient(QObject):
                     on_pong=self._on_pong
                 )
 
+                # suppress_origin: websocket-client otherwise auto-adds
+                # `Origin: https://api.elections.kalshi.com`. Kalshi's gorilla
+                # upgrader runs a CheckOrigin that rejects ANY Origin header on
+                # this endpoint and answers the handshake with a bare 403
+                # "Forbidden" (recognisable by the `sec-websocket-version: 13`
+                # header gorilla's returnError sets) — which reads like an auth
+                # failure but is not: the same signed headers get a 101 with no
+                # Origin present.
                 self._ws_app.run_forever(
-                    ping_interval=self.ping_interval, ping_timeout=self.ping_timeout
+                    ping_interval=self.ping_interval, ping_timeout=self.ping_timeout,
+                    suppress_origin=True
                 )
 
             except Exception as ex:
@@ -1485,6 +1625,12 @@ class KalshiStreamClient(QObject):
                 self.trade.emit(msg)
                 self._emit_raw_frame(message)
             elif mtype in ("orderbook_snapshot", "orderbook_delta"):
+                self.orderbook.emit(msg)
+                self._emit_raw_frame(message)
+            elif (mtype == "ok" and msg.get("sid") is not None
+                  and msg.get("seq") is not None):
+                # Acks are numbered in their subscription's sequence: forward them
+                # to the books (both paths) so seq continuity counts them. Rare.
                 self.orderbook.emit(msg)
                 self._emit_raw_frame(message)
 
@@ -1607,12 +1753,37 @@ class KalshiLiveBook:
         book = self._books.get(ticker)
         return book.get("sid") if book else None
 
+    def _note_ack(self, msg: dict) -> None:
+        """Subscription acks (e.g. to update_subscription) carry the sub's sid + seq
+        IN the same sequence as its book frames (documented by Kalshi). Not counting
+        them made the next delta look like a gap (snapshot seq 1 -> 'ok' seq 2 ->
+        delta seq 3) and flagged books stale on a clean stream. Advance the sid
+        baseline; a skip in the ack's own seq is a real gap on that sid."""
+        sid, seq = msg.get("sid"), msg.get("seq")
+        if sid is None or seq is None or sid not in self._sid_seq:
+            return
+        prev = self._sid_seq[sid]
+        if seq <= prev:
+            return  # old/duplicate ack: never regress the baseline
+        if seq != prev + 1:
+            hit = None
+            for t, b in self._books.items():
+                if b.get("sid") == sid:
+                    b["stale"] = True
+                    hit = hit or t
+            if hit and self._on_gap:
+                self._on_gap(hit)
+        self._sid_seq[sid] = seq
+
     def apply(self, msg: dict) -> Optional[dict]:
         """Apply a trade/orderbook message. Returns the normalized state for the
         affected market, or None if the message was ignored."""
         if not isinstance(msg, dict):
             return None
         mtype = msg.get("type")
+        if mtype == "ok":
+            self._note_ack(msg)
+            return None
         inner = msg.get("msg", {}) or {}
         ticker = inner.get("market_ticker")
         if not ticker:

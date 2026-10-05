@@ -95,11 +95,16 @@ class KalshiLiveBook {
 public:
     KalshiLiveBook() = default;
 
-    // Ingest one raw frame string. Returns the normalized state dict for the
-    // affected market (or None when the frame was ignored). On a sequence gap the
-    // returned dict carries "gap": True so the CALLER can resubscribe — we don't
-    // hold a Python callback in C++ (that leaks at shutdown and forces a GIL
-    // reacquire mid-parse).
+    // Ingest one raw frame string. Returns a LIGHTWEIGHT signal dict
+    // {"market_ticker": str, "gap": bool} for the affected market (or None when the
+    // frame was ignored). On a sequence gap "gap" is True so the CALLER can resync.
+    //
+    // It deliberately does NOT compute/return the full normalized state here: the
+    // caller only needs to know WHICH market changed (to flag a repaint) and whether
+    // a gap fired; it reads state()/ladder() lazily at render time (a few Hz), not
+    // per frame. Building the full state dict (two map scans + mid + a 6-key dict) on
+    // every delta was pure waste on the hot path. We don't hold a Python callback in
+    // C++ either (that leaks at shutdown and forces a GIL reacquire mid-parse).
     nb::object ingest(const std::string &frame) {
         std::string ticker;
         bool produced = false, gap = false;
@@ -110,13 +115,7 @@ public:
         }
         if (!produced && !gap) return nb::none();
         nb::dict d;
-        if (produced) {
-            nb::object st = state(ticker);
-            if (st.is_none()) { d["market_ticker"] = ticker; }
-            else d = nb::cast<nb::dict>(st);
-        } else {
-            d["market_ticker"] = ticker;  // gap on a market with no book yet
-        }
+        d["market_ticker"] = ticker;
         d["gap"] = gap;
         return d;
     }
@@ -247,6 +246,29 @@ private:
 
         std::string_view mtype;
         if (msg.at_key("type").get(mtype)) return false;
+
+        if (mtype == "ok") {
+            // Subscription acks (e.g. to update_subscription) carry the sub's sid +
+            // seq IN the same sequence as its book frames (documented by Kalshi). Not
+            // counting them made the next delta look like a gap (snapshot seq 1 ->
+            // 'ok' seq 2 -> delta seq 3), flagging books stale on a clean stream.
+            // Advance the sid baseline; a skip in the ack's own seq is a real gap.
+            int64_t sid, seq;
+            if (msg.at_key("sid").get(sid) || msg.at_key("seq").get(seq)) return false;
+            auto sit = sid_seq_.find(sid);
+            if (sit == sid_seq_.end()) return false;  // not a book subscription we track
+            if (seq <= sit->second) return false;     // old/duplicate: never regress
+            if (seq != sit->second + 1) {
+                for (auto &kv : books_) {
+                    if (kv.second.sid && *kv.second.sid == sid) {
+                        kv.second.stale = true;
+                        if (!gap_out) { ticker_out = kv.first; gap_out = true; }
+                    }
+                }
+            }
+            sit->second = seq;
+            return false;  // no book state changed; ingest() surfaces a gap if any
+        }
 
         sj::dom::object inner;
         if (msg.at_key("msg").get_object().get(inner)) return false;
@@ -608,8 +630,9 @@ NB_MODULE(QuickieParse, m) {
     nb::class_<KalshiLiveBook>(m, "KalshiLiveBook")
         .def(nb::init<>())
         .def("ingest", &KalshiLiveBook::ingest, nb::arg("frame"),
-             "Parse a raw websocket frame string and apply it; returns the "
-             "normalized state dict or None.")
+             "Parse a raw websocket frame string and apply it; returns a lightweight "
+             "{'market_ticker': str, 'gap': bool} signal dict (or None if ignored). "
+             "Read state()/ladder() for the actual book.")
         .def("state", &KalshiLiveBook::state, nb::arg("ticker"))
         .def("ladder", &KalshiLiveBook::ladder, nb::arg("ticker"), nb::arg("depth") = 10)
         .def("current_sid", &KalshiLiveBook::current_sid, nb::arg("ticker"))

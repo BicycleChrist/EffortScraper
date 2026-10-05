@@ -761,6 +761,10 @@ class PolymarketSportsClient:
         except Exception:
             return dict(self.SPORTS_SERIES)
 
+    _SPORT_ALIASES = {"NCAAF": "CFB"}
+    _GAMMA_PAGE_CAP = 100   # server-side max events per /events response
+    _GAMMA_MAX_PAGES = 5    # safety bound on the offset paging (500 events)
+
     # Process-wide cache of discover_sports_series(); filled on first use.
     _discovered_series: Optional[Dict[str, int]] = None
 
@@ -771,6 +775,8 @@ class PolymarketSportsClient:
         Kalshi-only. So resolve via /sports first, static table as fallback."""
         if not sport:
             return None
+        # Kalshi/our code says NCAAF; Polymarket's slug is "cfb".
+        sport = self._SPORT_ALIASES.get(sport.upper(), sport)
         cls = type(self)
         if cls._discovered_series is None:
             cls._discovered_series = self.discover_sports_series()
@@ -918,9 +924,22 @@ class PolymarketSportsClient:
             params["end_date_max"] = cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         print(f"📡 Fetching {sport} games (Series ID: {series_id})...")
-        response = self.session.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        events = response.json()
+        # Gamma caps EVERY /events response at 100 regardless of `limit`
+        # (verified 2026-10-03: limit=300/500 -> 100). Page with offset while a
+        # page comes back full — only a large slate pays for it (college
+        # football: 319 events in the 10-day window; the big-4 fit in one page).
+        events = []
+        page_size = min(limit, self._GAMMA_PAGE_CAP)
+        for _page in range(self._GAMMA_MAX_PAGES):
+            response = self.session.get(
+                url, params={**params, "limit": page_size,
+                             "offset": len(events)}, timeout=15)
+            response.raise_for_status()
+            batch = response.json()
+            events.extend(batch)
+            if len(batch) < page_size or len(events) >= limit:
+                break
+        events = events[:limit]
 
         print(f"✅ Found {len(events)} {sport} games")
 
@@ -1347,9 +1366,11 @@ class PolymarketStreamClient(QObject):
     orderbook = pyqtSignal(object)
     trade = pyqtSignal(object)
     best_quote = pyqtSignal(object)
-    # True round-trip latency (ms): the app-level 'PING' send is timestamped and
+    # Round trip (ms): the app-level 'PING' send is timestamped and
     # the matching 'PONG' reply closes the loop. Both stamps local -> no clock-sync
     # dependency (unlike diffing a server timestamp against the local clock).
+    # Includes local backlog (the 'PONG' queues behind data frames); pure network
+    # RTT comes from KalshiClient.tcp_srtt_ms(self._ws_app).
     latency = pyqtSignal(float)
 
     def __init__(
@@ -1532,9 +1553,12 @@ class PolymarketStreamClient(QObject):
                 break
             if (self._ws_app and getattr(self._ws_app, "sock", None)
                     and self._ws_app.sock.connected):
+                # Stamp BEFORE sending: the 'PONG' is handled on the websocket
+                # thread, and stamping after send() returned let a fast reply be
+                # timed against the PREVIOUS ping (~ping_interval too long).
+                self._ping_sent_tm = time.monotonic()
                 try:
                     self._ws_app.send("PING")
-                    self._ping_sent_tm = time.monotonic()
                 except Exception:
                     pass
 
